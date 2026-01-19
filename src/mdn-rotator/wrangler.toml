@@ -6,6 +6,17 @@ account_id = "5313f8b98e20a8915418b2683ad7278c"
 [triggers]
 crons = ["0 5 * * *"]
 
+# Queue for processing SIMs one at a time (no subrequest limit issues)
+[[queues.producers]]
+queue = "mdn-rotation-queue"
+binding = "MDN_QUEUE"
+
+[[queues.consumers]]
+queue = "mdn-rotation-queue"
+max_batch_size = 1
+max_retries = 3
+max_concurrency = 1
+
 [observability.logs]
 enabled = true
 invocation_logs = true

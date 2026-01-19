@@ -3,7 +3,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname !== "/run") {
-      return new Response("details-finalizer ok. Use /run?secret=...&batch=5&wait=12000", { status: 200 });
+      return new Response("reseller-sync ok. Use /run?secret=...&batch=5&wait=12000", { status: 200 });
     }
 
     const secret = url.searchParams.get("secret") || "";

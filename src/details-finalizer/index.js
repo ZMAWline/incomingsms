@@ -13,7 +13,7 @@ export default {
 
     // Run the same logic as cron, but with query params support
     const limitParam = url.searchParams.get("limit");
-    const limit = limitParam ? Math.max(parseInt(limitParam, 25) || 1, 1) : 1000;
+    const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 1, 1) : 1000;
 
     const result = await runFinalizer(env, limit);
     return json(result);
