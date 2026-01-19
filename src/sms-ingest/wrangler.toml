@@ -1,1 +1,4 @@
-
+name = "sms-ingest"
+main = "index.js"
+compatibility_date = "2024-01-01"
+account_id = "5313f8b98e20a8915418b2683ad7278c"
