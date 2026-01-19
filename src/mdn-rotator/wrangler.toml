@@ -5,3 +5,7 @@ account_id = "5313f8b98e20a8915418b2683ad7278c"
 
 [triggers]
 crons = ["0 5 * * *"]
+
+[observability.logs]
+enabled = true
+invocation_logs = true
