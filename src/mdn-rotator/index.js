@@ -15,14 +15,15 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
 
-      const result = await queueSimsForRotation(env);
+      const limit = parseInt(url.searchParams.get("limit") || "0", 10) || null;
+      const result = await queueSimsForRotation(env, { limit });
       return new Response(JSON.stringify(result, null, 2), {
         status: 200,
         headers: { "Content-Type": "application/json" }
       });
     }
 
-    return new Response("mdn-rotator ok. Use /run?secret=...", { status: 200 });
+    return new Response("mdn-rotator ok. Use /run?secret=...&limit=1", { status: 200 });
   },
 
   // Cron handler - runs at 05:00 UTC for rotation
@@ -52,10 +53,12 @@ export default {
 // ===========================
 // Queue all SIMs for rotation (runs at 05:00 UTC or on manual trigger)
 // ===========================
-async function queueSimsForRotation(env) {
-  // Fetch all active SIMs
+async function queueSimsForRotation(env, options = {}) {
+  const queryLimit = options.limit || 10000;
+
+  // Fetch active SIMs
   const sims = await supabaseSelect(env,
-    "sims?select=id,iccid,mobility_subscription_id,status&mobility_subscription_id=not.is.null&status=eq.active&limit=10000"
+    `sims?select=id,iccid,mobility_subscription_id,status&mobility_subscription_id=not.is.null&status=eq.active&limit=${queryLimit}`
   );
 
   if (!Array.isArray(sims) || sims.length === 0) {
