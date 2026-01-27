@@ -31,13 +31,14 @@ export default {
     ctx.waitUntil(queueSimsForRotation(env));
   },
 
-  // Queue consumer - processes one SIM at a time (no subrequest limit issues)
+  // Queue consumer - processes SIMs in batches with cached token
   async queue(batch, env) {
+    // Get cached token once for the entire batch
+    const token = await getCachedToken(env);
+
     for (const message of batch.messages) {
       const sim = message.body;
       try {
-        // Get fresh token for each SIM (tokens may expire during long queues)
-        const token = await hxGetBearerToken(env);
         await rotateSingleSim(env, token, sim);
         message.ack();
         console.log(`SIM ${sim.iccid}: rotation complete`);
@@ -154,6 +155,31 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
 // ===========================
 // Helix API
 // ===========================
+const TOKEN_CACHE_KEY = "helix_token";
+const TOKEN_TTL_SECONDS = 1800; // 30 minutes
+
+async function getCachedToken(env) {
+  // Try to get cached token from KV
+  if (env.TOKEN_CACHE) {
+    const cached = await env.TOKEN_CACHE.get(TOKEN_CACHE_KEY);
+    if (cached) {
+      console.log("Using cached Helix token");
+      return cached;
+    }
+  }
+
+  // Fetch new token
+  console.log("Fetching new Helix token");
+  const token = await hxGetBearerToken(env);
+
+  // Cache the token in KV
+  if (env.TOKEN_CACHE) {
+    await env.TOKEN_CACHE.put(TOKEN_CACHE_KEY, token, { expirationTtl: TOKEN_TTL_SECONDS });
+  }
+
+  return token;
+}
+
 async function hxGetBearerToken(env) {
   const params = new URLSearchParams({
     grant_type: "password",
