@@ -2,10 +2,15 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // NEW: JSON activation endpoint
+    if (url.pathname === "/activate") {
+      return handleActivateJson(request, env);
+    }
+
     // Health check
     if (url.pathname !== "/run") {
       return new Response(
-        "bulk-activator (activation-only) ok. Use /run?secret=...&limit=...",
+        "bulk-activator (activation-only) ok. Use /run?secret=... or POST /activate",
         { status: 200 }
       );
     }
@@ -132,6 +137,113 @@ export default {
   },
 };
 
+/* ================= JSON ACTIVATION ENDPOINT ================= */
+
+async function handleActivateJson(request, env) {
+  // Security check
+  const url = new URL(request.url);
+  const secret = url.searchParams.get("secret") || "";
+  if (!env.BULK_RUN_SECRET || secret !== env.BULK_RUN_SECRET) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  if (request.method !== "POST") {
+    return json({ ok: false, error: "Method must be POST" });
+  }
+
+  try {
+    const body = await request.json();
+    const sims = body.sims || [];
+
+    if (!Array.isArray(sims) || sims.length === 0) {
+      return json({ ok: false, error: "sims array is required" });
+    }
+
+    // Validate input format
+    for (let i = 0; i < sims.length; i++) {
+      const sim = sims[i];
+      if (!sim.iccid || !sim.imei || !Number.isFinite(sim.reseller_id)) {
+        return json({
+          ok: false,
+          error: `Invalid SIM at index ${i}: must have iccid, imei, and reseller_id`
+        });
+      }
+    }
+
+    // Get Helix token once
+    let token = await hxGetBearerToken(env);
+
+    let processed = 0;
+    let skipped = 0;
+    let errors = 0;
+    const results = [];
+
+    // Process each SIM (one at a time for carrier safety)
+    for (const simData of sims) {
+      const iccid = String(simData.iccid || "").trim();
+      const imei = String(simData.imei || "").trim();
+      const resellerId = parseInt(String(simData.reseller_id || "").trim(), 10);
+
+      try {
+        // Check if already activated
+        const existing = await supabaseSelect(
+          env,
+          `sims?select=id,mobility_subscription_id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+        );
+
+        if (existing?.[0]?.mobility_subscription_id) {
+          skipped++;
+          results.push({ iccid, ok: true, skipped: true });
+          continue;
+        }
+
+        // Activate with Helix
+        const activation = await hxActivateWithRetry(env, () => token, async (t) => {
+          token = t;
+        }, { iccid, imei });
+
+        const subId = activation?.mobilitySubscriptionId;
+
+        if (!subId) {
+          throw new Error("Activation succeeded but no mobilitySubscriptionId returned");
+        }
+
+        // Upsert SIM → provisioning
+        const simId = await upsertSim(env, iccid, subId);
+
+        // Assign reseller
+        await assignSimToReseller(env, resellerId, simId);
+
+        processed++;
+        results.push({
+          iccid,
+          ok: true,
+          mobilitySubscriptionId: subId,
+          status: "provisioning",
+        });
+      } catch (e) {
+        errors++;
+        results.push({ iccid, ok: false, error: String(e) });
+      }
+
+      // HARD CARRIER SAFETY GAP BETWEEN SIMS
+      await sleep(10000);
+    }
+
+    return json({
+      ok: true,
+      processed,
+      skipped,
+      errors,
+      attempted: sims.length,
+      results,
+    });
+
+  } catch (error) {
+    return json({ ok: false, error: String(error) });
+  }
+}
+
 /* ================= HELPERS ================= */
 
 function sleep(ms) {
@@ -197,16 +309,18 @@ function normalizeRow(row, len) {
 /* ================= HELIX ================= */
 
 async function hxGetBearerToken(env) {
+  const params = new URLSearchParams({
+    grant_type: "password",
+    client_id: env.HX_CLIENT_ID,
+    audience: env.HX_AUDIENCE,
+    username: env.HX_GRANT_USERNAME,
+    password: env.HX_GRANT_PASSWORD,
+  });
+
   const res = await fetch(env.HX_TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "password",
-      client_id: env.HX_CLIENT_ID,
-      audience: env.HX_AUDIENCE,
-      username: env.HX_GRANT_USERNAME,
-      password: env.HX_GRANT_PASSWORD,
-    }),
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
   });
 
   const { json, text } = await safeReadJsonOrText(res);
@@ -392,7 +506,7 @@ async function upsertSim(env, iccid, subId) {
 async function assignSimToReseller(env, resellerId, simId) {
   const existing = await supabaseSelect(
     env,
-    `reseller_sims?select=id&reseller_id=eq.${resellerId}&sim_id=eq.${simId}&limit=1`
+    `reseller_sims?select=reseller_id,sim_id&reseller_id=eq.${resellerId}&sim_id=eq.${simId}&limit=1`
   );
   if (existing.length) return;
 

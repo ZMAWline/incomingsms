@@ -1,3 +1,9 @@
+// =========================================================
+// MDN ROTATOR WORKER
+// Daily phone number rotation at 5:00 AM UTC
+// Includes: webhook deduplication and retry
+// =========================================================
+
 export default {
   // HTTP endpoint for manual triggering
   async fetch(request, env) {
@@ -19,7 +25,7 @@ export default {
     return new Response("mdn-rotator ok. Use /run?secret=...", { status: 200 });
   },
 
-  // Daily cron at 05:00 UTC - queues all SIMs for rotation
+  // Cron handler - runs at 05:00 UTC for rotation
   async scheduled(event, env, ctx) {
     ctx.waitUntil(queueSimsForRotation(env));
   },
@@ -102,41 +108,62 @@ async function rotateSingleSim(env, token, sim) {
 
   // 3) Update sim_numbers history in database
   await closeCurrentNumber(env, sim.id);
+
+  // 4) Insert new number
   await insertNewNumber(env, sim.id, e164);
 
-  // 4) Send webhook to reseller
-  const resellerId = await findResellerIdBySimId(env, sim.id);
+  // 5) Send number.online webhook immediately
+  await sendNumberOnlineWebhook(env, sim.id, e164, iccid, subId);
+
+  console.log(`SIM ${sim.iccid}: rotated to ${e164}`);
+}
+
+// ===========================
+// Send number.online webhook
+// ===========================
+async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscriptionId) {
+  const resellerId = await findResellerIdBySimId(env, simId);
   const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
 
-  await postWebhook(webhookUrl, {
+  if (!webhookUrl) return;
+
+  await sendWebhookWithDeduplication(env, webhookUrl, {
     event_type: "number.online",
     created_at: new Date().toISOString(),
     data: {
-      number: e164,
+      sim_id: simId,
+      number,
       online: true,
       online_until: nextRotationUtcISO(),
-      iccid: iccid,
-      mobilitySubscriptionId: subId
+      iccid,
+      mobilitySubscriptionId,
     }
+  }, {
+    idComponents: {
+      simId,
+      iccid,
+      number,
+    },
+    resellerId,
   });
-
-  console.log(`SIM ${sim.iccid}: rotated to ${e164}`);
 }
 
 // ===========================
 // Helix API
 // ===========================
 async function hxGetBearerToken(env) {
+  const params = new URLSearchParams({
+    grant_type: "password",
+    client_id: env.HX_CLIENT_ID,
+    audience: env.HX_AUDIENCE,
+    username: env.HX_GRANT_USERNAME,
+    password: env.HX_GRANT_PASSWORD,
+  });
+
   const res = await fetch(env.HX_TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "password",
-      client_id: env.HX_CLIENT_ID,
-      audience: env.HX_AUDIENCE,
-      username: env.HX_GRANT_USERNAME,
-      password: env.HX_GRANT_PASSWORD,
-    }),
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
   });
 
   const json = await res.json().catch(() => ({}));
@@ -245,20 +272,12 @@ async function closeCurrentNumber(env, simId) {
 
 async function insertNewNumber(env, simId, e164) {
   await supabaseInsert(env, "sim_numbers", [
-    { sim_id: simId, e164, valid_from: new Date().toISOString() },
+    {
+      sim_id: simId,
+      e164,
+      valid_from: new Date().toISOString(),
+    },
   ]);
-}
-
-function nextRotationUtcISO() {
-  const now = new Date();
-  const next = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    5, 0, 0
-  ));
-  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-  return next.toISOString();
 }
 
 async function findResellerIdBySimId(env, simId) {
@@ -291,21 +310,175 @@ async function findWebhookUrlByResellerId(env, resellerId) {
   return Array.isArray(data) && data[0]?.url ? data[0].url : null;
 }
 
-async function postWebhook(url, payload) {
-  if (!url) return;
+// ===========================
+// WEBHOOK UTILITIES (with deduplication and retry)
+// ===========================
+
+async function generateMessageIdAsync(components) {
+  const { eventType, simId, iccid, number, from, body, timestamp } = components;
+
+  const roundedTs = timestamp
+    ? new Date(Math.floor(new Date(timestamp).getTime() / 60000) * 60000).toISOString()
+    : new Date(Math.floor(Date.now() / 60000) * 60000).toISOString();
+
+  const str = [eventType, simId, iccid, number, from, (body || '').slice(0, 100), roundedTs].join('|');
+
+  const encoder = new TextEncoder();
+  const data = encoder.encode(str);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  return `${eventType}_${hashHex}`;
+}
+
+async function wasWebhookDelivered(env, messageId) {
+  const res = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
+    {
+      method: 'GET',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+
+  if (!res.ok) return false;
+  const data = await res.json();
+  return Array.isArray(data) && data.length > 0;
+}
+
+async function recordWebhookDelivery(env, delivery) {
+  const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts } = delivery;
+
+  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates',
+    },
+    body: JSON.stringify({
+      message_id: messageId,
+      event_type: eventType,
+      reseller_id: resellerId,
+      webhook_url: webhookUrl,
+      payload,
+      status,
+      attempts,
+      last_attempt_at: new Date().toISOString(),
+      delivered_at: status === 'delivered' ? new Date().toISOString() : null,
+    }),
+  });
+}
+
+async function postWebhookWithRetry(url, payload, options = {}) {
+  const { maxRetries = 4, initialDelayMs = 1000, messageId = 'unknown' } = options;
+
+  let lastError = null;
+  let lastStatus = 0;
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      console.log(`[Webhook] Attempt ${attempt}/${maxRetries + 1} for ${messageId} to ${url}`);
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      lastStatus = res.status;
+
+      if (res.ok) {
+        console.log(`[Webhook] Success ${res.status} for ${messageId} after ${attempt} attempt(s)`);
+        return { ok: true, status: res.status, attempts: attempt };
+      }
+
+      if (res.status >= 400 && res.status < 500) {
+        const txt = await res.text().catch(() => '');
+        console.log(`[Webhook] Client error ${res.status} for ${messageId}: ${txt.slice(0, 200)}`);
+        return { ok: false, status: res.status, attempts: attempt, error: `Client error: ${res.status}` };
+      }
+
+      const txt = await res.text().catch(() => '');
+      lastError = `Server error ${res.status}: ${txt.slice(0, 200)}`;
+      console.log(`[Webhook] ${lastError} for ${messageId}`);
+
+    } catch (err) {
+      lastError = `Network error: ${String(err)}`;
+      lastStatus = 0;
+      console.log(`[Webhook] ${lastError} for ${messageId}`);
+    }
+
+    if (attempt <= maxRetries) {
+      const delayMs = initialDelayMs * Math.pow(2, attempt - 1);
+      console.log(`[Webhook] Retrying ${messageId} in ${delayMs}ms...`);
+      await sleep(delayMs);
+    }
+  }
+
+  console.log(`[Webhook] Failed ${messageId} after ${maxRetries + 1} attempts: ${lastError}`);
+  return { ok: false, status: lastStatus, attempts: maxRetries + 1, error: lastError };
+}
+
+async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = {}) {
+  if (!webhookUrl) {
+    return { ok: false, status: 0, attempts: 0, error: 'No webhook URL' };
+  }
+
+  let messageId = options.messageId;
+  if (!messageId && options.idComponents) {
+    messageId = await generateMessageIdAsync({
+      eventType: payload.event_type,
+      ...options.idComponents,
+    });
+  }
+  if (!messageId) {
+    messageId = `${payload.event_type}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  payload.message_id = messageId;
+
+  const alreadySent = await wasWebhookDelivered(env, messageId);
+  if (alreadySent) {
+    console.log(`[Webhook] Skipping duplicate ${messageId}`);
+    return { ok: true, status: 200, attempts: 0, skipped: true };
+  }
+
+  const result = await postWebhookWithRetry(webhookUrl, payload, { messageId });
 
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+    await recordWebhookDelivery(env, {
+      messageId,
+      eventType: payload.event_type,
+      resellerId: options.resellerId,
+      webhookUrl,
+      payload,
+      status: result.ok ? 'delivered' : 'failed',
+      attempts: result.attempts,
     });
-
-    if (!res.ok) {
-      const txt = await res.text();
-      console.log("Webhook failed:", res.status, txt);
-    }
   } catch (err) {
-    console.log("Webhook error:", String(err));
+    console.log(`[Webhook] Failed to record delivery: ${err}`);
   }
+
+  return result;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function nextRotationUtcISO() {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    5, 0, 0
+  ));
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  return next.toISOString();
 }
