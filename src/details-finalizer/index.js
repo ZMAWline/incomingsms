@@ -149,18 +149,16 @@ function normalizeUS(phone) {
 /* ---------------- Helix ---------------- */
 
 async function hxGetBearerToken(env) {
-  const params = new URLSearchParams({
-    grant_type: "password",
-    client_id: env.HX_CLIENT_ID,
-    audience: env.HX_AUDIENCE,
-    username: env.HX_GRANT_USERNAME,
-    password: env.HX_GRANT_PASSWORD
-  });
-
   const res = await fetch(env.HX_TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params.toString()
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "password",
+      client_id: env.HX_CLIENT_ID,
+      audience: env.HX_AUDIENCE,
+      username: env.HX_GRANT_USERNAME,
+      password: env.HX_GRANT_PASSWORD
+    })
   });
 
   const json = await res.json();

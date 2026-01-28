@@ -181,18 +181,16 @@ async function getCachedToken(env) {
 }
 
 async function hxGetBearerToken(env) {
-  const params = new URLSearchParams({
-    grant_type: "password",
-    client_id: env.HX_CLIENT_ID,
-    audience: env.HX_AUDIENCE,
-    username: env.HX_GRANT_USERNAME,
-    password: env.HX_GRANT_PASSWORD,
-  });
-
   const res = await fetch(env.HX_TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params.toString(),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "password",
+      client_id: env.HX_CLIENT_ID,
+      audience: env.HX_AUDIENCE,
+      username: env.HX_GRANT_USERNAME,
+      password: env.HX_GRANT_PASSWORD,
+    }),
   });
 
   const json = await res.json().catch(() => ({}));
@@ -203,16 +201,31 @@ async function hxGetBearerToken(env) {
 }
 
 async function hxMdnChange(env, token, mobilitySubscriptionId) {
-  const res = await fetch(`${env.HX_API_BASE}/api/mobility-subscriber/ctn`, {
-    method: "PATCH",
+  const url = `${env.HX_API_BASE}/api/mobility-subscriber/ctn`;
+  const method = "PATCH";
+  const requestBody = { mobilitySubscriptionId };
+
+  const res = await fetch(url, {
+    method,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ mobilitySubscriptionId }),
+    body: JSON.stringify(requestBody),
   });
 
   const json = await res.json().catch(() => ({}));
+
+  // Log the API call
+  await logHelixApiCall(env, {
+    endpoint: url,
+    method,
+    request_body: requestBody,
+    response_status: res.status,
+    response_body: json,
+    success: res.ok,
+  });
+
   if (!res.ok) {
     throw new Error(`MDN change failed: ${res.status} ${JSON.stringify(json)}`);
   }
@@ -220,16 +233,31 @@ async function hxMdnChange(env, token, mobilitySubscriptionId) {
 }
 
 async function hxSubscriberDetails(env, token, mobilitySubscriptionId) {
-  const res = await fetch(`${env.HX_API_BASE}/api/mobility-subscriber/details`, {
-    method: "POST",
+  const url = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
+  const method = "POST";
+  const requestBody = { mobilitySubscriptionId };
+
+  const res = await fetch(url, {
+    method,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ mobilitySubscriptionId }),
+    body: JSON.stringify(requestBody),
   });
 
   const json = await res.json().catch(() => ({}));
+
+  // Log the API call
+  await logHelixApiCall(env, {
+    endpoint: url,
+    method,
+    request_body: requestBody,
+    response_status: res.status,
+    response_body: json,
+    success: res.ok,
+  });
+
   if (!res.ok) {
     throw new Error(`Details failed: ${res.status} ${JSON.stringify(json)}`);
   }
@@ -289,6 +317,49 @@ async function supabaseInsert(env, table, rows) {
 
   const txt = await res.text();
   if (!res.ok) throw new Error(`Supabase INSERT failed: ${res.status} ${txt}`);
+}
+
+// ===========================
+// Helix API Logging
+// ===========================
+async function logHelixApiCall(env, logData) {
+  const logPayload = {
+    worker: "mdn-rotator",
+    endpoint: logData.endpoint,
+    method: logData.method,
+    request_body: logData.request_body,
+    response_status: logData.response_status,
+    response_body: logData.response_body,
+    success: logData.success,
+    created_at: new Date().toISOString(),
+  };
+
+  // Always log to console for Cloudflare logs
+  console.log(`[Helix API] ${logData.method} ${logData.endpoint} -> ${logData.response_status} ${logData.success ? 'OK' : 'FAIL'}`);
+  console.log(`[Helix API] Request: ${JSON.stringify(logData.request_body)}`);
+  console.log(`[Helix API] Response: ${JSON.stringify(logData.response_body)}`);
+
+  try {
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify(logPayload),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      console.error(`[Helix API Log] Failed to save to Supabase: ${res.status} ${errText}`);
+    } else {
+      console.log(`[Helix API Log] Saved to helix_api_logs table`);
+    }
+  } catch (err) {
+    console.error(`[Helix API Log] Exception saving to Supabase: ${err}`);
+  }
 }
 
 async function closeCurrentNumber(env, simId) {
