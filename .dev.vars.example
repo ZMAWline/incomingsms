@@ -1,0 +1,69 @@
+# Environment variables for local development
+# Copy this file to .dev.vars and fill in your actual values
+
+# ============================================
+# Supabase Configuration
+# ============================================
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key-here
+
+# ============================================
+# Worker Authentication Secrets
+# ============================================
+# SMS Ingest Gateway Secret
+GATEWAY_SECRET=your-gateway-secret-here
+
+# Details Finalizer Run Secret
+FINALIZER_RUN_SECRET=your-finalizer-secret-here
+
+# MDN Rotator Admin Secret
+ADMIN_RUN_SECRET=your-admin-secret-here
+
+# Bulk Activator Run Secret
+BULK_RUN_SECRET=your-bulk-secret-here
+
+# ============================================
+# Helix API Configuration (AT&T API)
+# ============================================
+HX_TOKEN_URL=https://auth.helixsolo.app/oauth/token
+HX_API_BASE=https://api.helixsolo.app
+HX_CLIENT_ID=your-helix-client-id-here
+HX_AUDIENCE=your-helix-audience-here
+HX_GRANT_USERNAME=your-helix-username-here
+HX_GRANT_PASSWORD=your-helix-password-here
+
+# ============================================
+# Helix Activation Configuration (bulk-activator)
+# ============================================
+HX_ACTIVATION_CLIENT_ID=your-activation-client-id-here
+HX_PLAN_ID=your-plan-id-here
+HX_BAN=your-ban-here
+HX_FAN=your-fan-here
+HX_ADDRESS1=123 Main St
+HX_CITY=Phoenix
+HX_STATE=AZ
+HX_ZIP=85001
+
+# ============================================
+# Bulk Activator CSV Source
+# ============================================
+SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/your-sheet-id/export?format=csv
+
+# ============================================
+# Optional: Reseller Webhook URL (deprecated)
+# ============================================
+RESELLER_WEBHOOK_URL=https://your-webhook-url.com/endpoint
+
+# ============================================
+# Optional: Reseller-Sync Cron Configuration
+# ============================================
+CRON_BATCH=5
+CRON_WAIT_MS=12000
+
+# ============================================
+# Skyline Gateway API (for sending verification SMS)
+# ============================================
+SK_HOST=192.168.1.67
+SK_USERNAME=root
+SK_PASSWORD=your-skyline-password-here
+SK_PORT=80
