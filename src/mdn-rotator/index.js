@@ -55,12 +55,24 @@ export default {
 // Queue all SIMs for rotation (runs at 05:00 UTC or on manual trigger)
 // ===========================
 async function queueSimsForRotation(env, options = {}) {
+  const isManualRun = options.limit && options.limit < 10000;
   const queryLimit = options.limit || 10000;
 
-  // Fetch active SIMs
-  const sims = await supabaseSelect(env,
-    `sims?select=id,iccid,mobility_subscription_id,status&mobility_subscription_id=not.is.null&status=eq.active&limit=${queryLimit}`
-  );
+  // Build query - manual runs prioritize SIMs that were rotated longest ago
+  // NULLS FIRST ensures SIMs that have never been rotated get processed first
+  let query = `sims?select=id,iccid,mobility_subscription_id,status&mobility_subscription_id=not.is.null&status=eq.active`;
+
+  if (isManualRun) {
+    // Manual run: order by oldest rotation first (nulls first = never rotated)
+    query += `&order=last_mdn_rotated_at.asc.nullsfirst&limit=${queryLimit}`;
+    console.log(`[Manual Run] Fetching ${queryLimit} SIMs ordered by oldest rotation first`);
+  } else {
+    // Automatic run: process all active SIMs
+    query += `&order=id.asc&limit=${queryLimit}`;
+    console.log(`[Scheduled Run] Fetching all active SIMs`);
+  }
+
+  const sims = await supabaseSelect(env, query);
 
   if (!Array.isArray(sims) || sims.length === 0) {
     console.log("No active SIMs found.");
@@ -81,7 +93,7 @@ async function queueSimsForRotation(env, options = {}) {
   }
 
   console.log(`Queued ${queued} SIMs for rotation.`);
-  return { ok: true, queued, total: sims.length };
+  return { ok: true, queued, total: sims.length, manual: isManualRun };
 }
 
 // ===========================
@@ -90,19 +102,24 @@ async function queueSimsForRotation(env, options = {}) {
 // ===========================
 async function rotateSingleSim(env, token, sim) {
   const subId = sim.mobility_subscription_id;
+  const iccid = sim.iccid;
+
   if (!subId) {
-    console.log(`SIM ${sim.iccid}: no mobility_subscription_id, skipping`);
+    console.log(`SIM ${iccid}: no mobility_subscription_id, skipping`);
     return;
   }
 
+  // Generate unique run_id for this rotation operation
+  const runId = `rotate_${iccid}_${Date.now()}`;
+
   // 1) MDN change - request new number from carrier
-  const mdnChange = await hxMdnChange(env, token, subId);
+  const mdnChange = await hxMdnChange(env, token, subId, runId, iccid);
 
   // 2) Get the new phone number
-  const details = await hxSubscriberDetails(env, token, subId);
+  const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
   const d = Array.isArray(details) ? details[0] : null;
   const phoneNumber = d?.phoneNumber;
-  const iccid = d?.iccid || sim.iccid;
+  const detailsIccid = d?.iccid || iccid;
 
   if (!phoneNumber) {
     throw new Error(`No phoneNumber returned for SUBID ${subId}`);
@@ -110,16 +127,19 @@ async function rotateSingleSim(env, token, sim) {
 
   const e164 = normalizeUS(phoneNumber);
 
-  // 3) Update sim_numbers history in database
+  // 3) Close current number (set valid_to timestamp)
   await closeCurrentNumber(env, sim.id);
 
-  // 4) Insert new number
+  // 4) Insert new number (with valid_from timestamp, valid_to = null)
   await insertNewNumber(env, sim.id, e164);
 
-  // 5) Send number.online webhook immediately
-  await sendNumberOnlineWebhook(env, sim.id, e164, iccid, subId);
+  // 5) Update SIM rotation tracking
+  await updateSimRotationTimestamp(env, sim.id);
 
-  console.log(`SIM ${sim.iccid}: rotated to ${e164}`);
+  // 6) Send number.online webhook immediately
+  await sendNumberOnlineWebhook(env, sim.id, e164, detailsIccid, subId);
+
+  console.log(`SIM ${iccid}: rotated to ${e164}`);
 }
 
 // ===========================
@@ -200,7 +220,7 @@ async function hxGetBearerToken(env) {
   return json.access_token;
 }
 
-async function hxMdnChange(env, token, mobilitySubscriptionId) {
+async function hxMdnChange(env, token, mobilitySubscriptionId, runId, iccid) {
   const url = `${env.HX_API_BASE}/api/mobility-subscriber/ctn`;
   const method = "PATCH";
   const requestBody = { mobilitySubscriptionId };
@@ -214,16 +234,25 @@ async function hxMdnChange(env, token, mobilitySubscriptionId) {
     body: JSON.stringify(requestBody),
   });
 
-  const json = await res.json().catch(() => ({}));
+  const responseText = await res.text();
+  let json = {};
+  try {
+    json = JSON.parse(responseText);
+  } catch {}
 
-  // Log the API call
+  // Log the API call with correct schema columns
   await logHelixApiCall(env, {
-    endpoint: url,
-    method,
+    run_id: runId,
+    step: "mdn_change",
+    iccid,
+    request_url: url,
+    request_method: method,
     request_body: requestBody,
     response_status: res.status,
-    response_body: json,
-    success: res.ok,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: json,
+    error: res.ok ? null : `MDN change failed: ${res.status}`,
   });
 
   if (!res.ok) {
@@ -232,7 +261,7 @@ async function hxMdnChange(env, token, mobilitySubscriptionId) {
   return json;
 }
 
-async function hxSubscriberDetails(env, token, mobilitySubscriptionId) {
+async function hxSubscriberDetails(env, token, mobilitySubscriptionId, runId, iccid) {
   const url = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
   const method = "POST";
   const requestBody = { mobilitySubscriptionId };
@@ -246,16 +275,25 @@ async function hxSubscriberDetails(env, token, mobilitySubscriptionId) {
     body: JSON.stringify(requestBody),
   });
 
-  const json = await res.json().catch(() => ({}));
+  const responseText = await res.text();
+  let json = {};
+  try {
+    json = JSON.parse(responseText);
+  } catch {}
 
-  // Log the API call
+  // Log the API call with correct schema columns
   await logHelixApiCall(env, {
-    endpoint: url,
-    method,
+    run_id: runId,
+    step: "subscriber_details",
+    iccid,
+    request_url: url,
+    request_method: method,
     request_body: requestBody,
     response_status: res.status,
-    response_body: json,
-    success: res.ok,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: json,
+    error: res.ok ? null : `Details failed: ${res.status}`,
   });
 
   if (!res.ok) {
@@ -294,13 +332,19 @@ async function supabasePatch(env, path, bodyObj) {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "application/json",
-      Prefer: "return=minimal",
+      Prefer: "return=representation",
     },
     body: JSON.stringify(bodyObj),
   });
 
   const txt = await res.text();
   if (!res.ok) throw new Error(`Supabase PATCH failed: ${res.status} ${txt}`);
+
+  // Log what was actually updated
+  try {
+    const data = JSON.parse(txt);
+    console.log(`[DB] PATCH result: ${data.length} rows updated`);
+  } catch {}
 }
 
 async function supabaseInsert(env, table, rows) {
@@ -310,34 +354,48 @@ async function supabaseInsert(env, table, rows) {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "application/json",
-      Prefer: "return=minimal",
+      Prefer: "return=representation",
     },
     body: JSON.stringify(rows),
   });
 
   const txt = await res.text();
   if (!res.ok) throw new Error(`Supabase INSERT failed: ${res.status} ${txt}`);
+
+  // Log what was actually inserted
+  try {
+    const data = JSON.parse(txt);
+    console.log(`[DB] INSERT result: ${data.length} rows inserted`);
+  } catch {}
 }
 
 // ===========================
 // Helix API Logging
 // ===========================
 async function logHelixApiCall(env, logData) {
+  // Use correct schema columns for helix_api_logs table
   const logPayload = {
-    worker: "mdn-rotator",
-    endpoint: logData.endpoint,
-    method: logData.method,
-    request_body: logData.request_body,
+    run_id: logData.run_id,
+    step: logData.step,
+    iccid: logData.iccid || null,
+    imei: logData.imei || null,
+    request_url: logData.request_url,
+    request_method: logData.request_method,
+    request_headers: logData.request_headers || null,
+    request_body: logData.request_body || null,
     response_status: logData.response_status,
-    response_body: logData.response_body,
-    success: logData.success,
+    response_ok: logData.response_ok,
+    response_headers: logData.response_headers || null,
+    response_body_text: logData.response_body_text || null,
+    response_body_json: logData.response_body_json || null,
+    error: logData.error || null,
     created_at: new Date().toISOString(),
   };
 
   // Always log to console for Cloudflare logs
-  console.log(`[Helix API] ${logData.method} ${logData.endpoint} -> ${logData.response_status} ${logData.success ? 'OK' : 'FAIL'}`);
+  console.log(`[Helix API] ${logData.request_method} ${logData.request_url} -> ${logData.response_status} ${logData.response_ok ? 'OK' : 'FAIL'}`);
   console.log(`[Helix API] Request: ${JSON.stringify(logData.request_body)}`);
-  console.log(`[Helix API] Response: ${JSON.stringify(logData.response_body)}`);
+  console.log(`[Helix API] Response: ${JSON.stringify(logData.response_body_json)}`);
 
   try {
     const res = await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
@@ -363,14 +421,17 @@ async function logHelixApiCall(env, logData) {
 }
 
 async function closeCurrentNumber(env, simId) {
+  console.log(`[DB] Closing current number for sim_id=${simId}`);
   await supabasePatch(
     env,
     `sim_numbers?sim_id=eq.${encodeURIComponent(String(simId))}&valid_to=is.null`,
     { valid_to: new Date().toISOString() }
   );
+  console.log(`[DB] Closed current number for sim_id=${simId}`);
 }
 
 async function insertNewNumber(env, simId, e164) {
+  console.log(`[DB] Inserting new number ${e164} for sim_id=${simId}`);
   await supabaseInsert(env, "sim_numbers", [
     {
       sim_id: simId,
@@ -378,6 +439,23 @@ async function insertNewNumber(env, simId, e164) {
       valid_from: new Date().toISOString(),
     },
   ]);
+  console.log(`[DB] Inserted new number ${e164} for sim_id=${simId}`);
+}
+
+async function updateSimRotationTimestamp(env, simId) {
+  const now = new Date().toISOString();
+  console.log(`[DB] Updating rotation timestamp for sim_id=${simId}`);
+  await supabasePatch(
+    env,
+    `sims?id=eq.${encodeURIComponent(String(simId))}`,
+    {
+      last_mdn_rotated_at: now,
+      last_rotation_at: now,
+      rotation_status: 'success',
+      last_rotation_error: null,
+    }
+  );
+  console.log(`[DB] Updated rotation timestamp for sim_id=${simId}`);
 }
 
 async function findResellerIdBySimId(env, simId) {
