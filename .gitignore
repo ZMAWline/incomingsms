@@ -1,5 +1,5 @@
 # Wrangler and Cloudflare Workers
-.dev.vars
+.dev.vars*
 .wrangler/
 dist/
 worker/
