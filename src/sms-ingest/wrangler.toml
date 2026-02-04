@@ -2,7 +2,16 @@ name = "sms-ingest"
 main = "index.js"
 compatibility_date = "2024-01-01"
 account_id = "5313f8b98e20a8915418b2683ad7278c"
+workers_dev = true
 
 [observability.logs]
+enabled = true
+invocation_logs = true
+
+# ============ TEST ENVIRONMENT ============
+[env.test]
+name = "sms-ingest-test"
+
+[env.test.observability.logs]
 enabled = true
 invocation_logs = true

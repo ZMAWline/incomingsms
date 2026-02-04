@@ -32,3 +32,36 @@ service = "phone-number-sync"
 [[services]]
 binding = "RESELLER_SYNC"
 service = "reseller-sync"
+
+# ============ TEST ENVIRONMENT ============
+[env.test]
+name = "dashboard-test"
+
+[env.test.observability.logs]
+enabled = true
+invocation_logs = true
+
+# Service bindings for TEST workers
+[[env.test.services]]
+binding = "SIM_CANCELLER"
+service = "sim-canceller-test"
+
+[[env.test.services]]
+binding = "BULK_ACTIVATOR"
+service = "bulk-activator-test"
+
+[[env.test.services]]
+binding = "DETAILS_FINALIZER"
+service = "details-finalizer-test"
+
+[[env.test.services]]
+binding = "MDN_ROTATOR"
+service = "mdn-rotator-test"
+
+[[env.test.services]]
+binding = "PHONE_NUMBER_SYNC"
+service = "phone-number-sync-test"
+
+[[env.test.services]]
+binding = "RESELLER_SYNC"
+service = "reseller-sync-test"

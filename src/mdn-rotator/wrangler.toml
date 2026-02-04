@@ -2,6 +2,7 @@ name = "mdn-rotator"
 main = "index.js"
 compatibility_date = "2024-01-01"
 account_id = "5313f8b98e20a8915418b2683ad7278c"
+workers_dev = true
 
 [triggers]
 # Daily rotation at 5:00 AM UTC only
@@ -24,5 +25,33 @@ max_retries = 3
 max_concurrency = 1
 
 [observability.logs]
+enabled = true
+invocation_logs = true
+
+# ============ TEST ENVIRONMENT ============
+[env.test]
+name = "mdn-rotator-test"
+
+[env.test.triggers]
+# No crons in test - trigger manually via dashboard
+crons = []
+
+# KV namespace for token caching (TEST)
+[[env.test.kv_namespaces]]
+binding = "TOKEN_CACHE"
+id = "689e9a6ec8c849cfb32bc5154cf8d680"
+
+# Queue for processing SIMs in batches (TEST)
+[[env.test.queues.producers]]
+queue = "mdn-rotation-queue-test"
+binding = "MDN_QUEUE"
+
+[[env.test.queues.consumers]]
+queue = "mdn-rotation-queue-test"
+max_batch_size = 10
+max_retries = 3
+max_concurrency = 1
+
+[env.test.observability.logs]
 enabled = true
 invocation_logs = true
