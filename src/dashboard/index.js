@@ -63,6 +63,10 @@ export default {
       return handleSimOnline(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/helix-query') {
+      return handleHelixQuery(request, env, corsHeaders);
+    }
+
     // Debug endpoint to test worker-to-worker connectivity via service binding
     if (url.pathname === '/api/debug-cancel') {
       try {
@@ -657,6 +661,98 @@ async function handleSimOnline(request, env, corsHeaders) {
   }
 }
 
+async function handleHelixQuery(request, env, corsHeaders) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+
+  try {
+    const body = await request.json();
+    const subId = body.mobility_subscription_id;
+
+    if (!subId) {
+      return new Response(JSON.stringify({ error: 'mobility_subscription_id is required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Get Helix bearer token
+    const tokenRes = await fetch(env.HX_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'password',
+        client_id: env.HX_CLIENT_ID,
+        audience: env.HX_AUDIENCE,
+        username: env.HX_GRANT_USERNAME,
+        password: env.HX_GRANT_PASSWORD,
+      }),
+    });
+
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok || !tokenData.access_token) {
+      return new Response(JSON.stringify({ error: 'Failed to get Helix token', details: tokenData }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const token = tokenData.access_token;
+
+    // Query subscriber details
+    const detailsUrl = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
+    const detailsRes = await fetch(detailsUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ mobilitySubscriptionId: parseInt(subId) }),
+    });
+
+    const detailsText = await detailsRes.text();
+    let detailsData;
+    try {
+      detailsData = JSON.parse(detailsText);
+    } catch {
+      return new Response(JSON.stringify({
+        error: 'Invalid JSON response from Helix',
+        raw: detailsText.slice(0, 500)
+      }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!detailsRes.ok) {
+      return new Response(JSON.stringify({
+        error: 'Helix API error',
+        status: detailsRes.status,
+        details: detailsData
+      }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Return the full response
+    return new Response(JSON.stringify({
+      ok: true,
+      mobility_subscription_id: subId,
+      helix_response: detailsData
+    }, null, 2), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 async function supabaseGet(env, path) {
   return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
@@ -768,6 +864,9 @@ function getHTML() {
                         <button onclick="showCancelModal()" class="bg-red-600 hover:bg-red-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
                             ❌ Cancel SIMs
                         </button>
+                        <button onclick="showHelixQueryModal()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
+                            🔎 Query Helix
+                        </button>
                         <button onclick="loadData()" class="bg-gray-600 hover:bg-gray-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
                             🔄 Refresh Dashboard
                         </button>
@@ -837,6 +936,7 @@ function getHTML() {
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ICCID</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Phone Number</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Sub ID</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Reseller</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">SMS</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last SMS</th>
@@ -845,7 +945,7 @@ function getHTML() {
                         </thead>
                         <tbody class="bg-white divide-y divide-gray-200" id="sims-table">
                             <tr>
-                                <td colspan="8" class="px-4 py-4 text-center text-sm text-gray-500">Loading...</td>
+                                <td colspan="9" class="px-4 py-4 text-center text-sm text-gray-500">Loading...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -921,6 +1021,45 @@ function getHTML() {
                                 class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
                             >
                                 Activate SIMs
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Helix Query Modal -->
+            <div id="helix-query-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
+                <div class="relative top-10 mx-auto p-5 border w-full max-w-2xl shadow-lg rounded-md bg-white">
+                    <div class="mt-3">
+                        <h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Query Helix Subscriber</h3>
+                        <div class="mt-2">
+                            <p class="text-sm text-gray-500 mb-3">
+                                Enter a Mobility Subscription ID to query Helix API:
+                            </p>
+                            <input
+                                type="text"
+                                id="helix-subid-input"
+                                class="w-full px-3 py-2 text-gray-700 border rounded-lg focus:outline-none focus:border-indigo-500 font-mono"
+                                placeholder="e.g. 40033"
+                            />
+                        </div>
+                        <div id="helix-query-result" class="mt-4 hidden">
+                            <h4 class="text-sm font-medium text-gray-700 mb-2">Result:</h4>
+                            <pre id="helix-query-output" class="bg-gray-100 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-96 overflow-y-auto"></pre>
+                        </div>
+                        <div class="flex justify-end space-x-3 mt-4">
+                            <button
+                                onclick="hideHelixQueryModal()"
+                                class="px-4 py-2 bg-gray-300 text-gray-800 rounded-lg hover:bg-gray-400"
+                            >
+                                Close
+                            </button>
+                            <button
+                                onclick="queryHelix()"
+                                id="helix-query-btn"
+                                class="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700"
+                            >
+                                Query
                             </button>
                         </div>
                     </div>
@@ -1003,7 +1142,7 @@ function getHTML() {
                 countEl.textContent = \`Showing \${sims.length} SIM(s)\`;
 
                 if (sims.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-sm text-gray-500">No SIMs found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-sm text-gray-500">No SIMs found</td></tr>';
                     return;
                 }
                 tbody.innerHTML = sims.map(sim => {
@@ -1026,6 +1165,7 @@ function getHTML() {
                                 \${sim.status}
                             </span>
                         </td>
+                        <td class="px-4 py-4 whitespace-nowrap text-sm font-mono text-xs">\${sim.mobility_subscription_id ? \`<button onclick="queryHelixSubId('\${sim.mobility_subscription_id}')" class="text-indigo-600 hover:text-indigo-800 hover:underline">\${sim.mobility_subscription_id}</button>\` : '-'}</td>
                         <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500">\${sim.reseller_name || '-'}</td>
                         <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-900">\${sim.sms_count || 0}</td>
                         <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500">\${lastSms}</td>
@@ -1267,6 +1407,80 @@ function getHTML() {
             } catch (error) {
                 showToast('Error cancelling SIMs', 'error');
                 console.error(error);
+            }
+        }
+
+        function showHelixQueryModal() {
+            document.getElementById('helix-query-modal').classList.remove('hidden');
+            document.getElementById('helix-query-result').classList.add('hidden');
+            document.getElementById('helix-subid-input').value = '';
+            document.getElementById('helix-subid-input').focus();
+        }
+
+        function queryHelixSubId(subId) {
+            document.getElementById('helix-query-modal').classList.remove('hidden');
+            document.getElementById('helix-query-result').classList.add('hidden');
+            document.getElementById('helix-subid-input').value = subId;
+            queryHelix();
+        }
+
+        function hideHelixQueryModal() {
+            document.getElementById('helix-query-modal').classList.add('hidden');
+            document.getElementById('helix-subid-input').value = '';
+            document.getElementById('helix-query-result').classList.add('hidden');
+        }
+
+        async function queryHelix() {
+            const subId = document.getElementById('helix-subid-input').value.trim();
+            if (!subId) {
+                showToast('Please enter a Subscription ID', 'error');
+                return;
+            }
+
+            const btn = document.getElementById('helix-query-btn');
+            btn.disabled = true;
+            btn.textContent = 'Querying...';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/helix-query\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mobility_subscription_id: subId })
+                });
+
+                const result = await response.json();
+                const outputEl = document.getElementById('helix-query-output');
+                const resultDiv = document.getElementById('helix-query-result');
+
+                if (response.ok && result.ok) {
+                    // Format the helix response nicely
+                    const data = Array.isArray(result.helix_response) ? result.helix_response[0] : result.helix_response;
+
+                    // Highlight status and statusReason
+                    let formatted = '';
+                    if (data) {
+                        formatted = \`<span class="text-blue-600 font-bold">status:</span> <span class="\${data.status === 'ACTIVE' ? 'text-green-600' : 'text-red-600'} font-bold">\${data.status || 'N/A'}</span>\\n\`;
+                        if (data.statusReason) {
+                            formatted += \`<span class="text-blue-600 font-bold">statusReason:</span> <span class="text-orange-600 font-bold">\${data.statusReason}</span>\\n\`;
+                        }
+                        formatted += \`\\n<span class="text-gray-500">--- Full Response ---</span>\\n\`;
+                        formatted += JSON.stringify(data, null, 2);
+                    } else {
+                        formatted = JSON.stringify(result.helix_response, null, 2);
+                    }
+
+                    outputEl.innerHTML = formatted;
+                    resultDiv.classList.remove('hidden');
+                } else {
+                    outputEl.innerHTML = \`<span class="text-red-600">Error:</span> \${JSON.stringify(result, null, 2)}\`;
+                    resultDiv.classList.remove('hidden');
+                }
+            } catch (error) {
+                showToast('Error querying Helix', 'error');
+                console.error(error);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Query';
             }
         }
 
