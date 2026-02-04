@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Incoming SMS Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-gray-50">
+    <div class="min-h-screen">
+        <!-- Header -->
+        <header class="bg-white shadow">
+            <div class="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
+                <h1 class="text-3xl font-bold text-gray-900">Incoming SMS Dashboard</h1>
+                <p class="text-sm text-gray-600 mt-1">Monitor SIMs, messages, and system status</p>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
+
+            <!-- Stats Overview -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0 bg-blue-500 rounded-md p-3">
+                            <svg class="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z"></path>
+                            </svg>
+                        </div>
+                        <div class="ml-4">
+                            <p class="text-sm font-medium text-gray-500">Total SIMs</p>
+                            <p class="text-2xl font-semibold text-gray-900" id="total-sims">-</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0 bg-green-500 rounded-md p-3">
+                            <svg class="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                        </div>
+                        <div class="ml-4">
+                            <p class="text-sm font-medium text-gray-500">Active SIMs</p>
+                            <p class="text-2xl font-semibold text-gray-900" id="active-sims">-</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0 bg-yellow-500 rounded-md p-3">
+                            <svg class="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                        </div>
+                        <div class="ml-4">
+                            <p class="text-sm font-medium text-gray-500">Provisioning</p>
+                            <p class="text-2xl font-semibold text-gray-900" id="provisioning-sims">-</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="flex items-center">
+                        <div class="flex-shrink-0 bg-purple-500 rounded-md p-3">
+                            <svg class="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path>
+                            </svg>
+                        </div>
+                        <div class="ml-4">
+                            <p class="text-sm font-medium text-gray-500">Messages (24h)</p>
+                            <p class="text-2xl font-semibold text-gray-900" id="messages-24h">-</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Worker Controls -->
+            <div class="bg-white rounded-lg shadow mb-6">
+                <div class="px-6 py-4 border-b border-gray-200">
+                    <h2 class="text-lg font-semibold text-gray-900">Worker Controls</h2>
+                </div>
+                <div class="p-6">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <button onclick="runWorker('bulk-activator', 'BULK_RUN_SECRET', 3)" class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
+                            🚀 Activate SIMs (Bulk)
+                        </button>
+                        <button onclick="runWorker('details-finalizer', 'FINALIZER_RUN_SECRET', 10)" class="bg-green-600 hover:bg-green-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
+                            ✅ Finalize Details
+                        </button>
+                        <button onclick="runWorker('mdn-rotator', 'ADMIN_RUN_SECRET', 5)" class="bg-orange-600 hover:bg-orange-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
+                            🔄 Rotate Numbers
+                        </button>
+                        <button onclick="runWorker('phone-number-sync', 'SYNC_SECRET', null)" class="bg-purple-600 hover:bg-purple-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
+                            🔍 Sync Phone Numbers
+                        </button>
+                        <button onclick="loadData()" class="bg-gray-600 hover:bg-gray-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
+                            🔄 Refresh Dashboard
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recent SMS -->
+            <div class="bg-white rounded-lg shadow mb-6">
+                <div class="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
+                    <h2 class="text-lg font-semibold text-gray-900">Recent SMS Messages</h2>
+                    <button onclick="loadMessages()" class="text-sm text-blue-600 hover:text-blue-700">Refresh</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">To</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">From</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Message</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ICCID</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200" id="messages-table">
+                            <tr>
+                                <td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500">Loading...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- SIM Status Table -->
+            <div class="bg-white rounded-lg shadow">
+                <div class="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
+                    <h2 class="text-lg font-semibold text-gray-900">SIM Status</h2>
+                    <button onclick="loadSims()" class="text-sm text-blue-600 hover:text-blue-700">Refresh</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ICCID</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Phone Number</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Sub ID</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200" id="sims-table">
+                            <tr>
+                                <td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500">Loading...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Toast Notification -->
+            <div id="toast" class="hidden fixed bottom-4 right-4 bg-gray-900 text-white px-6 py-4 rounded-lg shadow-lg">
+                <p id="toast-message"></p>
+            </div>
+
+        </main>
+    </div>
+
+    <script>
+        const API_BASE = '/api';
+        const SECRETS = {}; // Will be populated from dashboard worker
+
+        // Show toast notification
+        function showToast(message, type = 'info') {
+            const toast = document.getElementById('toast');
+            const toastMessage = document.getElementById('toast-message');
+            toastMessage.textContent = message;
+
+            toast.className = `fixed bottom-4 right-4 px-6 py-4 rounded-lg shadow-lg ${
+                type === 'error' ? 'bg-red-600' :
+                type === 'success' ? 'bg-green-600' :
+                'bg-gray-900'
+            } text-white`;
+
+            toast.classList.remove('hidden');
+            setTimeout(() => toast.classList.add('hidden'), 3000);
+        }
+
+        // Load dashboard data
+        async function loadData() {
+            try {
+                const response = await fetch(`${API_BASE}/stats`);
+                const data = await response.json();
+
+                document.getElementById('total-sims').textContent = data.total_sims || 0;
+                document.getElementById('active-sims').textContent = data.active_sims || 0;
+                document.getElementById('provisioning-sims').textContent = data.provisioning_sims || 0;
+                document.getElementById('messages-24h').textContent = data.messages_24h || 0;
+
+                loadSims();
+                loadMessages();
+            } catch (error) {
+                showToast('Error loading dashboard data', 'error');
+                console.error(error);
+            }
+        }
+
+        // Load SIMs table
+        async function loadSims() {
+            try {
+                const response = await fetch(`${API_BASE}/sims`);
+                const sims = await response.json();
+
+                const tbody = document.getElementById('sims-table');
+
+                if (sims.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500">No SIMs found</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = sims.map(sim => `
+                    <tr class="hover:bg-gray-50">
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${sim.id}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${sim.iccid}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${sim.phone_number || '-'}</td>
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                                sim.status === 'active' ? 'bg-green-100 text-green-800' :
+                                sim.status === 'provisioning' ? 'bg-yellow-100 text-yellow-800' :
+                                'bg-gray-100 text-gray-800'
+                            }">
+                                ${sim.status}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${sim.mobility_subscription_id || '-'}</td>
+                    </tr>
+                `).join('');
+            } catch (error) {
+                showToast('Error loading SIMs', 'error');
+                console.error(error);
+            }
+        }
+
+        // Load messages table
+        async function loadMessages() {
+            try {
+                const response = await fetch(`${API_BASE}/messages`);
+                const messages = await response.json();
+
+                const tbody = document.getElementById('messages-table');
+
+                if (messages.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500">No messages found</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = messages.map(msg => {
+                    const date = new Date(msg.received_at);
+                    const timeStr = date.toLocaleString();
+
+                    return `
+                        <tr class="hover:bg-gray-50">
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${timeStr}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${msg.to_number || '-'}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">${msg.from_number}</td>
+                            <td class="px-6 py-4 text-sm text-gray-900 max-w-md truncate">${msg.body}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${msg.iccid || '-'}</td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (error) {
+                showToast('Error loading messages', 'error');
+                console.error(error);
+            }
+        }
+
+        // Run worker
+        async function runWorker(workerName, secretKey, limit) {
+            if (!confirm(`Run ${workerName}${limit ? ` (limit: ${limit})` : ''}?`)) {
+                return;
+            }
+
+            showToast(`Running ${workerName}...`, 'info');
+
+            try {
+                const response = await fetch(`${API_BASE}/run/${workerName}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ limit })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    showToast(`${workerName} completed successfully`, 'success');
+                    loadData(); // Refresh dashboard
+                } else {
+                    showToast(`Error running ${workerName}: ${result.error}`, 'error');
+                }
+            } catch (error) {
+                showToast(`Error running ${workerName}`, 'error');
+                console.error(error);
+            }
+        }
+
+        // Load data on page load
+        loadData();
+
+        // Auto-refresh every 30 seconds
+        setInterval(loadData, 30000);
+    </script>
+</body>
+</html>

@@ -58,8 +58,8 @@ export default {
           const sim = sims[0];
           const { id: simId, mobility_subscription_id: subId, status } = sim;
 
-          // Skip if already cancelled
-          if (status === 'cancelled') {
+          // Skip if already canceled
+          if (status === 'canceled') {
             results.push({
               iccid,
               ok: true,
@@ -80,15 +80,15 @@ export default {
           }
 
           // Cancel with Helix
-          await hxCancelSubscription(env, token, subId);
+          await hxCancelSubscription(env, token, subId, iccid);
 
-          // Update SIM status to cancelled
+          // Update SIM status to canceled
           await supabasePatch(
             env,
             `sims?id=eq.${simId}`,
             {
-              status: 'cancelled',
-              status_reason: 'Cancelled via sim-canceller'
+              status: 'canceled',
+              status_reason: 'Canceled via sim-canceller'
             }
           );
 
@@ -195,28 +195,132 @@ async function hxGetBearerToken(env) {
   return json.access_token;
 }
 
-async function hxCancelSubscription(env, token, subscriptionId) {
-  const res = await fetch(
-    `${env.HX_API_BASE}/api/mobility-subscriber/disconnect`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ mobilitySubscriptionId: subscriptionId }),
-    }
-  );
+async function hxCancelSubscription(env, token, subscriptionId, iccid) {
+  const runId = `cancel_${Date.now().toString(36)}`;
 
-  const { json, text } = await safeReadJsonOrText(res);
+  // Step 1: Get the current phone number (MDN) from subscriber details
+  const detailsUrl = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
+  const detailsBody = { mobilitySubscriptionId: subscriptionId };
 
-  if (!res.ok) {
+  const detailsRes = await fetch(detailsUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(detailsBody),
+  });
+
+  const detailsData = await safeReadJsonOrText(detailsRes);
+
+  // Log the details request
+  await logHelixApi(env, {
+    runId,
+    step: "cancel_get_details",
+    iccid,
+    requestUrl: detailsUrl,
+    requestMethod: "POST",
+    requestBody: detailsBody,
+    responseStatus: detailsRes.status,
+    responseOk: detailsRes.ok,
+    responseBodyText: detailsData.text,
+    responseBodyJson: detailsData.json,
+  });
+
+  if (!detailsRes.ok) {
     throw new Error(
-      `Cancel subscription failed ${res.status}: ${JSON.stringify(json ?? { raw: text })}`
+      `Get subscriber details failed ${detailsRes.status}: ${JSON.stringify(detailsData.json ?? { raw: detailsData.text })}`
     );
   }
 
-  return json;
+  // Extract phone number from response (array format)
+  const details = Array.isArray(detailsData.json) ? detailsData.json[0] : detailsData.json;
+  const phoneNumber = details?.phoneNumber || details?.subscriberNumber;
+
+  if (!phoneNumber) {
+    throw new Error(`No phone number found for subscription ${subscriptionId}`);
+  }
+
+  console.log(`[Helix] Cancelling subscription ${subscriptionId} with MDN ${phoneNumber}`);
+
+  // Step 2: Cancel using the correct endpoint with MDN
+  const cancelUrl = `${env.HX_API_BASE}/api/mobility-subscriber/ctn`;
+  const cancelBody = {
+    mobilitySubscriptionId: subscriptionId,
+    subscriberNumber: phoneNumber,
+    reasonCode: "CAN",
+    reasonCodeId: 1,
+    subscriberState: "Cancel"
+  };
+
+  const cancelRes = await fetch(cancelUrl, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(cancelBody),
+  });
+
+  const cancelData = await safeReadJsonOrText(cancelRes);
+
+  // Log the cancel request
+  await logHelixApi(env, {
+    runId,
+    step: "cancel_subscription",
+    iccid,
+    requestUrl: cancelUrl,
+    requestMethod: "PATCH",
+    requestBody: cancelBody,
+    responseStatus: cancelRes.status,
+    responseOk: cancelRes.ok,
+    responseBodyText: cancelData.text,
+    responseBodyJson: cancelData.json,
+  });
+
+  if (!cancelRes.ok) {
+    throw new Error(
+      `Cancel subscription failed ${cancelRes.status}: ${JSON.stringify(cancelData.json ?? { raw: cancelData.text })}`
+    );
+  }
+
+  // Check for rejected cancellations
+  if (cancelData.json?.rejected?.length > 0) {
+    throw new Error(
+      `Cancel rejected: ${JSON.stringify(cancelData.json.rejected)}`
+    );
+  }
+
+  console.log(`[Helix] Successfully cancelled MDN ${phoneNumber}`);
+  return cancelData.json;
+}
+
+async function logHelixApi(env, data) {
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        run_id: data.runId,
+        step: data.step,
+        iccid: data.iccid,
+        request_url: data.requestUrl,
+        request_method: data.requestMethod,
+        request_body: data.requestBody,
+        response_status: data.responseStatus,
+        response_ok: data.responseOk,
+        response_body_text: data.responseBodyText?.slice(0, 10000),
+        response_body_json: data.responseBodyJson,
+        error: data.error,
+      }),
+    });
+  } catch (e) {
+    console.log(`[LogHelixApi] Failed to log: ${e}`);
+  }
 }
 
 /* ================= SUPABASE ================= */
