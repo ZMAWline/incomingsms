@@ -1,0 +1,33 @@
+# Wrangler and Cloudflare Workers
+.dev.vars
+.wrangler/
+dist/
+worker/
+
+# Node modules
+node_modules/
+
+# Environment files
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# MCP configuration (contains project refs)
+.mcp.json
+
+# Secrets and credentials
+**/API credentials.txt
+update-secrets.sh
+*.secret
+*.key
