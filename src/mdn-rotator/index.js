@@ -1,6 +1,7 @@
 // =========================================================
 // MDN ROTATOR WORKER
 // Daily phone number rotation at 5:00 AM UTC
+// Error summary notification at 7:00 AM UTC
 // Includes: webhook deduplication and retry
 // =========================================================
 
@@ -23,12 +24,33 @@ export default {
       });
     }
 
-    return new Response("mdn-rotator ok. Use /run?secret=...&limit=1", { status: 200 });
+    if (url.pathname === "/error-summary") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      const result = await sendErrorSummaryToSlack(env);
+      return new Response(JSON.stringify(result, null, 2), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    return new Response("mdn-rotator ok. Use /run?secret=...&limit=1 or /error-summary?secret=...", { status: 200 });
   },
 
-  // Cron handler - runs at 05:00 UTC for rotation
+  // Cron handler
+  // - 05:00 UTC: rotation
+  // - 07:00 UTC: error summary to Slack
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(queueSimsForRotation(env));
+    const hour = new Date(event.scheduledTime).getUTCHours();
+
+    if (hour === 5) {
+      ctx.waitUntil(queueSimsForRotation(env));
+    } else if (hour === 7) {
+      ctx.waitUntil(sendErrorSummaryToSlack(env));
+    }
   },
 
   // Queue consumer - processes SIMs in batches with cached token
@@ -659,4 +681,132 @@ function nextRotationUtcISO() {
   ));
   if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
   return next.toISOString();
+}
+
+// ===========================
+// SLACK ERROR SUMMARY
+// ===========================
+
+async function sendErrorSummaryToSlack(env) {
+  if (!env.SLACK_WEBHOOK_URL) {
+    console.log("[Slack] No SLACK_WEBHOOK_URL configured, skipping error summary");
+    return { ok: false, error: "No SLACK_WEBHOOK_URL configured" };
+  }
+
+  // Get errors from the last 24 hours
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const query = `helix_api_logs?select=iccid,step,error,response_status,created_at&or=(response_ok.eq.false,error.not.is.null)&created_at=gte.${encodeURIComponent(since)}&order=created_at.desc`;
+
+  let errors = [];
+  try {
+    errors = await supabaseSelect(env, query);
+  } catch (err) {
+    console.error(`[Slack] Failed to fetch errors: ${err}`);
+    return { ok: false, error: `Failed to fetch errors: ${err}` };
+  }
+
+  if (!Array.isArray(errors) || errors.length === 0) {
+    console.log("[Slack] No errors in the last 24 hours");
+    // Optionally send a success message
+    if (env.SLACK_NOTIFY_SUCCESS === "true") {
+      await postToSlack(env.SLACK_WEBHOOK_URL, {
+        text: ":white_check_mark: MDN Rotator: No errors in the last 24 hours"
+      });
+    }
+    return { ok: true, errors: 0, message: "No errors to report" };
+  }
+
+  // Deduplicate by ICCID - keep only the most recent error per SIM
+  const errorsByIccid = new Map();
+  for (const err of errors) {
+    const iccid = err.iccid || "unknown";
+    if (!errorsByIccid.has(iccid)) {
+      errorsByIccid.set(iccid, err);
+    }
+  }
+
+  const uniqueErrors = Array.from(errorsByIccid.values());
+  console.log(`[Slack] Found ${errors.length} total errors, ${uniqueErrors.length} unique SIMs`);
+
+  // Format Slack message
+  const errorLines = uniqueErrors.slice(0, 20).map(err => {
+    const iccid = err.iccid || "unknown";
+    const shortIccid = iccid.length > 10 ? `...${iccid.slice(-6)}` : iccid;
+    const step = err.step || "unknown";
+    const status = err.response_status || "N/A";
+    const errorMsg = (err.error || "Unknown error").slice(0, 100);
+    return `• \`${shortIccid}\` [${step}] HTTP ${status}: ${errorMsg}`;
+  });
+
+  if (uniqueErrors.length > 20) {
+    errorLines.push(`_...and ${uniqueErrors.length - 20} more SIMs with errors_`);
+  }
+
+  const slackPayload = {
+    blocks: [
+      {
+        type: "header",
+        text: {
+          type: "plain_text",
+          text: `:warning: MDN Rotator Error Summary`,
+          emoji: true
+        }
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*${uniqueErrors.length} SIM(s)* encountered errors in the last 24 hours:`
+        }
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: errorLines.join("\n")
+        }
+      },
+      {
+        type: "context",
+        elements: [
+          {
+            type: "mrkdwn",
+            text: `Total error events: ${errors.length} | Unique SIMs: ${uniqueErrors.length} | Generated: ${new Date().toISOString()}`
+          }
+        ]
+      }
+    ]
+  };
+
+  const result = await postToSlack(env.SLACK_WEBHOOK_URL, slackPayload);
+
+  return {
+    ok: result.ok,
+    totalErrors: errors.length,
+    uniqueSims: uniqueErrors.length,
+    slackStatus: result.status
+  };
+}
+
+async function postToSlack(webhookUrl, payload) {
+  try {
+    const res = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      console.error(`[Slack] Failed to post: ${res.status} ${txt}`);
+      return { ok: false, status: res.status };
+    }
+
+    console.log("[Slack] Message posted successfully");
+    return { ok: true, status: res.status };
+  } catch (err) {
+    console.error(`[Slack] Exception: ${err}`);
+    return { ok: false, status: 0, error: String(err) };
+  }
 }

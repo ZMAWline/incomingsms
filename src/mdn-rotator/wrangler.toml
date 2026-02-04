@@ -5,8 +5,8 @@ account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
 [triggers]
-# Daily rotation at 5:00 AM UTC only
-crons = ["0 5 * * *"]
+# Daily rotation at 5:00 AM UTC, error summary at 7:00 AM UTC
+crons = ["0 5 * * *", "0 7 * * *"]
 
 # KV namespace for token caching
 [[kv_namespaces]]
