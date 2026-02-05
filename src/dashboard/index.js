@@ -46,6 +46,10 @@ export default {
       return handleResellers(env, corsHeaders);
     }
 
+    if (url.pathname === '/api/gateways') {
+      return handleGateways(request, env, corsHeaders);
+    }
+
     if (url.pathname.startsWith('/api/run/')) {
       const workerName = url.pathname.replace('/api/run/', '');
       return handleRunWorker(request, env, workerName, corsHeaders);
@@ -154,8 +158,8 @@ async function handleSims(env, corsHeaders, url) {
     const resellerFilter = url.searchParams.get('reseller_id');
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
-    // Build query with reseller info
-    let query = `sims?select=id,iccid,status,mobility_subscription_id,sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=100`;
+    // Build query with reseller and gateway info
+    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=100`;
 
     // Apply status filter
     if (statusFilter) {
@@ -206,6 +210,7 @@ async function handleSims(env, corsHeaders, url) {
       return {
         id: sim.id,
         iccid: sim.iccid,
+        port: sim.port,
         status: sim.status,
         mobility_subscription_id: sim.mobility_subscription_id,
         phone_number: sim.sim_numbers?.[0]?.e164 || null,
@@ -213,7 +218,10 @@ async function handleSims(env, corsHeaders, url) {
         sms_count: smsCount,
         last_sms_received: lastReceived,
         reseller_id: resellerId,
-        reseller_name: resellerName
+        reseller_name: resellerName,
+        gateway_id: sim.gateway_id,
+        gateway_code: sim.gateways?.code || null,
+        gateway_name: sim.gateways?.name || null
       };
     }));
 
@@ -493,6 +501,77 @@ async function handleResellers(env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
+}
+
+async function handleGateways(request, env, corsHeaders) {
+  // GET - list all gateways
+  if (request.method === 'GET') {
+    try {
+      const response = await supabaseGet(env, 'gateways?select=id,mac_address,code,name,location,total_ports,active&order=code.asc');
+      const gateways = await response.json();
+      return new Response(JSON.stringify(gateways), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  // POST - add new gateway
+  if (request.method === 'POST') {
+    try {
+      const body = await request.json();
+      const { mac_address, code, name, location, total_ports } = body;
+
+      if (!mac_address || !code) {
+        return new Response(JSON.stringify({ error: 'mac_address and code are required' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=representation',
+        },
+        body: JSON.stringify({
+          mac_address,
+          code,
+          name: name || null,
+          location: location || null,
+          total_ports: total_ports || 64,
+          active: true
+        }),
+      });
+
+      if (!insertRes.ok) {
+        const errText = await insertRes.text();
+        return new Response(JSON.stringify({ error: `Failed to create gateway: ${errText}` }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      const created = await insertRes.json();
+      return new Response(JSON.stringify({ ok: true, gateway: created[0] }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  return new Response('Method not allowed', { status: 405 });
 }
 
 async function handleSimOnline(request, env, corsHeaders) {
@@ -933,6 +1012,7 @@ function getHTML() {
                         <thead class="bg-gray-50">
                             <tr>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Gateway</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ICCID</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Phone Number</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
@@ -945,7 +1025,7 @@ function getHTML() {
                         </thead>
                         <tbody class="bg-white divide-y divide-gray-200" id="sims-table">
                             <tr>
-                                <td colspan="9" class="px-4 py-4 text-center text-sm text-gray-500">Loading...</td>
+                                <td colspan="10" class="px-4 py-4 text-center text-sm text-gray-500">Loading...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -1142,16 +1222,18 @@ function getHTML() {
                 countEl.textContent = \`Showing \${sims.length} SIM(s)\`;
 
                 if (sims.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-sm text-gray-500">No SIMs found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-4 text-center text-sm text-gray-500">No SIMs found</td></tr>';
                     return;
                 }
                 tbody.innerHTML = sims.map(sim => {
                     const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
                     const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
                     const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-green-600" title="Verified">&#10003;</span>' : '';
+                    const gatewayDisplay = sim.gateway_code ? \`<span class="font-semibold">\${sim.gateway_code}</span><span class="text-gray-400 text-xs ml-1">\${sim.port || ''}</span>\` : (sim.port || '-');
                     return \`
                     <tr class="hover:bg-gray-50">
                         <td class="px-4 py-4 whitespace-nowrap text-sm font-medium text-gray-900">\${sim.id}</td>
+                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-700" title="\${sim.gateway_name || ''}">\${gatewayDisplay}</td>
                         <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500 font-mono text-xs">\${sim.iccid}</td>
                         <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-900">\${sim.phone_number || '-'}\${verifiedBadge}</td>
                         <td class="px-4 py-4 whitespace-nowrap">

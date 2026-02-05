@@ -130,6 +130,7 @@ export default {
     const iccid = String(url.searchParams.get("iccid") || "").trim();
     const senderQ = String(url.searchParams.get("sender") || "").trim();
     const port = String(url.searchParams.get("port") || "").trim();
+    const mac = String(url.searchParams.get("mac") || "").trim();
 
     const rawText = await request.text();
 
@@ -140,9 +141,9 @@ export default {
     const simId = iccid ? await findSimIdByIccid(env, iccid) : null;
     const toNumber = simId ? await findCurrentNumberBySimId(env, simId) : "";
 
-    // Update the SIM's port for Skyline SMS sending
-    if (simId && port) {
-      await updateSimPort(env, simId, port);
+    // Update the SIM's port and gateway for Skyline SMS sending
+    if (simId) {
+      await updateSimPortAndGateway(env, simId, port, mac);
     }
 
     const receivedAt = new Date().toISOString();
@@ -298,14 +299,27 @@ async function findSimIdByIccid(env, iccid) {
   return Array.isArray(data) && data[0]?.id ? data[0].id : null;
 }
 
-// Update SIM's port in the sims table (for Skyline SMS sending)
-// Only updates if port is different or null (avoids unnecessary writes)
-async function updateSimPort(env, simId, port) {
-  if (!simId || !port) return;
+// Update SIM's port and gateway in the sims table
+// Links SIM to gateway based on MAC address
+async function updateSimPortAndGateway(env, simId, port, mac) {
+  if (!simId) return;
+
+  const updates = {};
+  if (port) updates.port = port;
+
+  // Look up gateway by MAC address
+  if (mac) {
+    const gatewayId = await findGatewayIdByMac(env, mac);
+    if (gatewayId) {
+      updates.gateway_id = gatewayId;
+    }
+  }
+
+  if (Object.keys(updates).length === 0) return;
+
   try {
-    // Only update if port is different or null (using Supabase filter)
     const res = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${encodeURIComponent(String(simId))}&or=(port.is.null,port.neq.${encodeURIComponent(port)})`,
+      `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${encodeURIComponent(String(simId))}`,
       {
         method: "PATCH",
         headers: {
@@ -314,19 +328,28 @@ async function updateSimPort(env, simId, port) {
           "Content-Type": "application/json",
           Prefer: "return=representation",
         },
-        body: JSON.stringify({ port }),
+        body: JSON.stringify(updates),
       }
     );
     if (res.ok) {
       const data = await res.json();
-      // Only log if a row was actually updated
       if (Array.isArray(data) && data.length > 0) {
-        console.log(`[SMS] Updated SIM ${simId} port to ${port}`);
+        console.log(`[SMS] Updated SIM ${simId}: port=${port}, gateway=${updates.gateway_id || 'unchanged'}`);
       }
     }
   } catch (err) {
-    console.log(`[SMS] Failed to update SIM port: ${err}`);
+    console.log(`[SMS] Failed to update SIM: ${err}`);
   }
+}
+
+// Find gateway ID by MAC address
+async function findGatewayIdByMac(env, mac) {
+  if (!mac) return null;
+  const q = `gateways?select=id&mac_address=eq.${encodeURIComponent(mac)}&active=eq.true&limit=1`;
+  const res = await supabaseGet(env, q);
+  if (!res.ok) return null;
+  const data = await res.json();
+  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
 }
 
 // Find CURRENT number for sim_id (valid_to is null)
