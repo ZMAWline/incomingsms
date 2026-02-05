@@ -1,6 +1,6 @@
 # Helix HX-AX API Reference
 
-**Last Updated:** 01/13/2025
+**Last Updated:** 02/04/2026
 
 ## Overview
 
@@ -15,7 +15,7 @@ The Helix HX-AX API manages cellular SIM card activation and management for T-Mo
 | 3 | Query Sub ID | Get SIM and subscriber info |
 | 4 | Service ZIP Change | Update the service ZIP code |
 | 5 | MDN Change | Change MDN associated with ICCID |
-| 6 | Cancel | Cancel service for the ICCID |
+| 6 | Change Subscriber Status | Suspend / Restore / Cancel service |
 
 ---
 
@@ -30,10 +30,10 @@ The Helix HX-AX API manages cellular SIM card activation and management for T-Mo
 ```json
 {
   "grant_type": "password",
-  "client_id": "YOUR_CLIENT_ID",
+  "client_id": "4cor0JEQHxfwTdlAkGdCfUWiX8Q2sXzk",
   "audience": "https://dev-z8ucfxd1iqdj7bzm.us.auth0.com/api/v2/",
-  "username": "YOUR_USERNAME",
-  "password": "YOUR_PASSWORD"
+  "username": "svc-api9",
+  "password": "Wing1212@!"
 }
 ```
 
@@ -47,7 +47,7 @@ The Helix HX-AX API manages cellular SIM card activation and management for T-Mo
 }
 ```
 
-**Important:** Credentials are shared separately. Use the token in all subsequent requests via `Authorization: Bearer YOUR_TOKEN` header.
+**Important:** Use the token in all subsequent requests via `Authorization: Bearer YOUR_TOKEN` header. Tokens expire in 24 hours.
 
 ---
 
@@ -68,12 +68,11 @@ Activate a new SIM card with subscriber information and address.
   "plan": {
     "id": 985
   },
-  "BAN": "287355952378",
   "FAN": "63654144",
   "activationType": "new_activation",
   "subscriber": {
-    "firstName": "SUB",
-    "lastName": "NINE"
+    "firstName": "FIRST_NAME",
+    "lastName": "LAST_NAME"
   },
   "address": {
     "address1": "ADDRESS_LINE_1",
@@ -96,9 +95,10 @@ Activate a new SIM card with subscriber information and address.
 ```
 
 **Fields to Update:**
-- `address1`, `city`, `state`, `zipCode` - Customer address
-- `imei` - Device IMEI number
-- `iccid` - SIM card ICCID
+- `address1`, `city`, `state`, `zipCode` - Service address
+- `imei` - Device IMEI number (15 digits)
+- `iccid` - SIM card ICCID (19-20 digits)
+- `firstName`, `lastName` - Subscriber name
 
 ---
 
@@ -124,21 +124,54 @@ Fetch subscriber and SIM card details by subscription ID.
 [
   {
     "mobilitySubscriptionId": "40033",
+    "mobilitySubscriptionDetailsId": "40033",
+    "skuId": "11",
     "phoneNumber": "4695042393",
-    "iccid": "89148000006998837205",
+    "oldPhoneNumber": "6468474546",
     "firstName": "SUB",
     "lastName": "NINE",
     "addressLine1": "5600 Tennyson Pkwy",
+    "addressLine2": null,
+    "streetName": "TENNYSON",
+    "streetType": "Pkwy",
+    "streetDirection": "",
+    "streetNumber": "5600",
+    "zip": "75024",
     "city": "Plano",
     "state": "TX",
-    "zip": "75024",
+    "iccid": "89148000006998837205",
+    "eid": null,
+    "billingImei": "355826084427185",
+    "esimActivationCode": null,
+    "syncDate": null,
+    "fan": "V26496855",
+    "attBan": null,
+    "attBanPasscode": null,
+    "planId": "739",
     "planName": "Wing - Tiered",
-    "status": "CANCELED",
+    "operationType": "new_activation",
     "activatedAt": "2025-07-17T15:56:40.101Z",
-    "canceledAt": "2025-07-17T16:15:27.101Z"
+    "status": "ACTIVE",
+    "statusReason": "SUCCESSFULLY PROCESSED THE REQUEST",
+    "resellerId": null,
+    "clientId": "189",
+    "networkType": "LTE",
+    "businessEntityName": "SUB1",
+    "scheduledStatus": null,
+    "scheduledDate": null,
+    "startBillingDate": "2025-07-05T00:00:00.000Z",
+    "endBillingDate": "2025-08-05T00:00:00.000Z",
+    "suspendedAt": null,
+    "canceledAt": null
   }
 ]
 ```
+
+**Key Response Fields:**
+- `status` - Current status: `ACTIVE`, `SUSPENDED`, `CANCELED`
+- `statusReason` - Detailed status message
+- `phoneNumber` - Current MDN
+- `oldPhoneNumber` - Previous MDN (if changed)
 
 ---
 
@@ -176,6 +209,11 @@ Update the ZIP code (and address) associated with an active SIM.
       "mobility_subscription_id": "38105",
       "subscriberNumber": "9726546901",
       "address_line_1": "5600 Tennyson Pkwy",
+      "address_line_2": null,
+      "street_number": "5600",
+      "street_name": "TENNYSON",
+      "street_type": "Pkwy",
+      "street_direction": "",
       "zip": "75024",
       "city": "Plano",
       "state": "TX"
@@ -213,13 +251,13 @@ Change the phone number assigned to a SIM.
 }
 ```
 
-**Critical Note:** If assigning a new area code tied to a different ZIP code, complete the ZIP code change (Section 4) BEFORE initiating the MDN change.
+**CRITICAL NOTE:** If assigning a new area code tied to a different ZIP code, complete the ZIP code change (Section 4) **BEFORE** initiating the MDN change.
 
 ---
 
-## 6. Cancel
+## 6. Change Subscriber Status (Suspend / Restore / Cancel)
 
-Cancel an active SIM subscription.
+Use this endpoint to change the current status of a subscriber. Supports three lifecycle actions.
 
 **Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/ctn`
 
@@ -227,28 +265,92 @@ Cancel an active SIM subscription.
 - `Content-Type: application/json`
 - `Authorization: Bearer YOUR_TOKEN`
 
+### Suspend
+
+Temporarily suspend service.
+
 **Request:**
 ```json
-{
-  "mobilitySubscriptionId": SUBID,
-  "subscriberNumber": "CURRENT_MDN",
-  "reasonCode": "CAN",
-  "reasonCodeId": 1,
-  "subscriberState": "Cancel"
-}
+[
+  {
+    "subscriberNumber": "CURRENT_MDN",
+    "reasonCode": "CR",
+    "reasonCodeId": 22,
+    "subscriberState": "Suspend"
+  }
+]
 ```
 
-**Note:** The request must be an **object** (not an array), and `mobilitySubscriptionId` is required.
+### Restore (Unsuspend)
 
-**Response:**
+Reactivate a previously suspended subscriber.
+
+**Request:**
+```json
+[
+  {
+    "subscriberNumber": "CURRENT_MDN",
+    "reasonCode": "CR",
+    "reasonCodeId": 35,
+    "subscriberState": "Unsuspend"
+  }
+]
+```
+
+### Cancel
+
+Permanently disconnect service.
+
+**Request:**
+```json
+[
+  {
+    "subscriberNumber": "CURRENT_MDN",
+    "reasonCode": "CAN",
+    "reasonCodeId": 1,
+    "subscriberState": "Cancel"
+  }
+]
+```
+
+**Response (Cancel Example):**
 ```json
 {
-  "subscriberNumber": "9452134302",
-  "newSubscriberNumber": "9453384261",
-  "changeStatus": "SUCCESS",
-  "mobilitySubscriptionId": 89660
+  "fulfilled": [
+    {
+      "?xml": {
+        "@_version": "1.0",
+        "@_encoding": "UTF-8"
+      },
+      "resellerOrderResponse": {
+        "messageHeader": {
+          "vendorId": "HELIX",
+          "requestType": "ORDER",
+          "orderType": "MNTMLND",
+          "referenceNumber": "ChangeState_1752773879360",
+          "returnURL": "http://vz-api.helixsolo.app/api/mobility-verizon/returnURL"
+        },
+        "orderResponse": {
+          "returnCode": "00",
+          "returnMessage": "SUCCESSFULLY PROCESSED THE REQUEST"
+        }
+      },
+      "reasonCodeId": 1,
+      "subscriberState": "Cancel",
+      "subscriberNumber": "4697997136"
+    }
+  ],
+  "rejected": []
 }
 ```
+
+### Status Change Reference
+
+| Action | subscriberState | reasonCode | reasonCodeId |
+|--------|-----------------|------------|--------------|
+| Suspend | `Suspend` | `CR` | `22` |
+| Restore | `Unsuspend` | `CR` | `35` |
+| Cancel | `Cancel` | `CAN` | `1` |
 
 ---
 
@@ -261,6 +363,8 @@ Cancel an active SIM subscription.
 **ZIP Code and MDN:** Always update ZIP first if changing area codes to different regions.
 
 **Address Fields Required:** All address fields (address1, city, state, zipCode) must be provided.
+
+**Status Change Failed:** Ensure `subscriberNumber` is the current MDN and use the correct `reasonCodeId` for the action.
 
 ---
 
