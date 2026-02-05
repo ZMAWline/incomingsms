@@ -59,6 +59,14 @@ export default {
       return handleCancelSims(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/suspend') {
+      return handleSuspendSims(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/restore') {
+      return handleRestoreSims(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/activate') {
       return handleActivateSims(request, env, corsHeaders);
     }
@@ -422,6 +430,99 @@ async function handleCancelSims(request, env, corsHeaders) {
       status: cancelResponse.status,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleSuspendSims(request, env, corsHeaders) {
+  return handleStatusChange(request, env, corsHeaders, 'suspend');
+}
+
+async function handleRestoreSims(request, env, corsHeaders) {
+  return handleStatusChange(request, env, corsHeaders, 'restore');
+}
+
+async function handleStatusChange(request, env, corsHeaders, action) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+
+  try {
+    const body = await request.json();
+    const simIds = body.sim_ids || [];
+
+    if (!Array.isArray(simIds) || simIds.length === 0) {
+      return new Response(JSON.stringify({ error: 'sim_ids array is required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!env.STATUS_SECRET) {
+      return new Response(JSON.stringify({ error: 'STATUS_SECRET not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!env.SIM_STATUS_CHANGER) {
+      return new Response(JSON.stringify({ error: 'SIM_STATUS_CHANGER service binding not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    console.log(`[Dashboard] Calling sim-status-changer via service binding for ${action}`);
+    console.log(`[Dashboard] SIM IDs: ${JSON.stringify(simIds)}`);
+
+    let statusResponse;
+    try {
+      // Use service binding for worker-to-worker communication
+      statusResponse = await env.SIM_STATUS_CHANGER.fetch(
+        `https://sim-status-changer/${action}?secret=${encodeURIComponent(env.STATUS_SECRET)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sim_ids: simIds })
+        }
+      );
+    } catch (fetchError) {
+      console.log(`[Dashboard] Fetch error: ${fetchError}`);
+      return new Response(JSON.stringify({
+        error: `Failed to reach sim-status-changer: ${String(fetchError)}`
+      }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    console.log(`[Dashboard] Response status: ${statusResponse.status}`);
+
+    // Handle non-JSON responses
+    const responseText = await statusResponse.text();
+    console.log(`[Dashboard] Response body: ${responseText.slice(0, 500)}`);
+
+    let result;
+    try {
+      result = JSON.parse(responseText);
+    } catch {
+      return new Response(JSON.stringify({
+        error: `Worker returned non-JSON response (${statusResponse.status}): ${responseText.slice(0, 200)}`
+      }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    return new Response(JSON.stringify(result), {
+      status: statusResponse.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+
   } catch (error) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
@@ -940,6 +1041,12 @@ function getHTML() {
                         <button onclick="runWorker('reseller-sync', 50)" class="bg-teal-600 hover:bg-teal-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
                             📤 Reseller Sync
                         </button>
+                        <button onclick="showSuspendModal()" class="bg-yellow-600 hover:bg-yellow-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
+                            ⏸️ Suspend SIMs
+                        </button>
+                        <button onclick="showRestoreModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
+                            ▶️ Restore SIMs
+                        </button>
                         <button onclick="showCancelModal()" class="bg-red-600 hover:bg-red-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
                             ❌ Cancel SIMs
                         </button>
@@ -1064,6 +1171,76 @@ function getHTML() {
                                 class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
                             >
                                 Cancel SIMs
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Suspend Modal -->
+            <div id="suspend-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
+                <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
+                    <div class="mt-3">
+                        <h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Suspend SIMs</h3>
+                        <div class="mt-2">
+                            <p class="text-sm text-gray-500 mb-3">
+                                Enter SIM IDs to suspend (one per line):
+                            </p>
+                            <textarea
+                                id="suspend-input"
+                                rows="10"
+                                class="w-full px-3 py-2 text-gray-700 border rounded-lg focus:outline-none focus:border-yellow-500"
+                                placeholder="1\n2\n3\n..."
+                            ></textarea>
+                            <p class="text-xs text-gray-400 mt-1">Use SIM IDs from the dashboard table (first column)</p>
+                        </div>
+                        <div class="flex justify-end space-x-3 mt-4">
+                            <button
+                                onclick="hideSuspendModal()"
+                                class="px-4 py-2 bg-gray-300 text-gray-800 rounded-lg hover:bg-gray-400"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onclick="suspendSims()"
+                                class="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700"
+                            >
+                                Suspend SIMs
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Restore Modal -->
+            <div id="restore-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
+                <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
+                    <div class="mt-3">
+                        <h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Restore SIMs</h3>
+                        <div class="mt-2">
+                            <p class="text-sm text-gray-500 mb-3">
+                                Enter SIM IDs to restore (one per line):
+                            </p>
+                            <textarea
+                                id="restore-input"
+                                rows="10"
+                                class="w-full px-3 py-2 text-gray-700 border rounded-lg focus:outline-none focus:border-emerald-500"
+                                placeholder="1\n2\n3\n..."
+                            ></textarea>
+                            <p class="text-xs text-gray-400 mt-1">Use SIM IDs from the dashboard table (first column)</p>
+                        </div>
+                        <div class="flex justify-end space-x-3 mt-4">
+                            <button
+                                onclick="hideRestoreModal()"
+                                class="px-4 py-2 bg-gray-300 text-gray-800 rounded-lg hover:bg-gray-400"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onclick="restoreSims()"
+                                class="px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700"
+                            >
+                                Restore SIMs
                             </button>
                         </div>
                     </div>
@@ -1488,6 +1665,136 @@ function getHTML() {
                 }
             } catch (error) {
                 showToast('Error cancelling SIMs', 'error');
+                console.error(error);
+            }
+        }
+
+        function showSuspendModal() {
+            document.getElementById('suspend-modal').classList.remove('hidden');
+            document.getElementById('suspend-input').value = '';
+            document.getElementById('suspend-input').focus();
+        }
+
+        function hideSuspendModal() {
+            document.getElementById('suspend-modal').classList.add('hidden');
+            document.getElementById('suspend-input').value = '';
+        }
+
+        async function suspendSims() {
+            const input = document.getElementById('suspend-input').value.trim();
+            if (!input) {
+                showToast('Please enter at least one SIM ID', 'error');
+                return;
+            }
+
+            const simIds = input.split('\\n')
+                .map(line => line.trim())
+                .filter(line => line.length > 0)
+                .map(id => parseInt(id))
+                .filter(id => !isNaN(id));
+
+            if (simIds.length === 0) {
+                showToast('No valid SIM IDs found', 'error');
+                return;
+            }
+
+            if (!confirm(\`Are you sure you want to suspend \${simIds.length} SIM(s)?\`)) {
+                return;
+            }
+
+            hideSuspendModal();
+            showToast(\`Suspending \${simIds.length} SIM(s)...\`, 'info');
+
+            try {
+                const response = await fetch(\`\${API_BASE}/suspend\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: simIds })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    let msg = \`Suspended \${result.success} SIM(s), \${result.errors} error(s)\`;
+                    if (result.results) {
+                        const firstError = result.results.find(r => !r.ok && !r.skipped);
+                        if (firstError) {
+                            msg += \`: \${firstError.error || 'Unknown error'}\`;
+                        }
+                    }
+                    showToast(msg, result.errors > 0 ? 'error' : 'success');
+                    console.log('Suspend results:', result);
+                    loadData();
+                } else {
+                    showToast(\`Error suspending SIMs: \${result.error}\`, 'error');
+                }
+            } catch (error) {
+                showToast('Error suspending SIMs', 'error');
+                console.error(error);
+            }
+        }
+
+        function showRestoreModal() {
+            document.getElementById('restore-modal').classList.remove('hidden');
+            document.getElementById('restore-input').value = '';
+            document.getElementById('restore-input').focus();
+        }
+
+        function hideRestoreModal() {
+            document.getElementById('restore-modal').classList.add('hidden');
+            document.getElementById('restore-input').value = '';
+        }
+
+        async function restoreSims() {
+            const input = document.getElementById('restore-input').value.trim();
+            if (!input) {
+                showToast('Please enter at least one SIM ID', 'error');
+                return;
+            }
+
+            const simIds = input.split('\\n')
+                .map(line => line.trim())
+                .filter(line => line.length > 0)
+                .map(id => parseInt(id))
+                .filter(id => !isNaN(id));
+
+            if (simIds.length === 0) {
+                showToast('No valid SIM IDs found', 'error');
+                return;
+            }
+
+            if (!confirm(\`Are you sure you want to restore \${simIds.length} SIM(s)?\`)) {
+                return;
+            }
+
+            hideRestoreModal();
+            showToast(\`Restoring \${simIds.length} SIM(s)...\`, 'info');
+
+            try {
+                const response = await fetch(\`\${API_BASE}/restore\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: simIds })
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    let msg = \`Restored \${result.success} SIM(s), \${result.errors} error(s)\`;
+                    if (result.results) {
+                        const firstError = result.results.find(r => !r.ok && !r.skipped);
+                        if (firstError) {
+                            msg += \`: \${firstError.error || 'Unknown error'}\`;
+                        }
+                    }
+                    showToast(msg, result.errors > 0 ? 'error' : 'success');
+                    console.log('Restore results:', result);
+                    loadData();
+                } else {
+                    showToast(\`Error restoring SIMs: \${result.error}\`, 'error');
+                }
+            } catch (error) {
+                showToast('Error restoring SIMs', 'error');
                 console.error(error);
             }
         }

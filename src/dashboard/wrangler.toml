@@ -33,6 +33,10 @@ service = "phone-number-sync"
 binding = "RESELLER_SYNC"
 service = "reseller-sync"
 
+[[services]]
+binding = "SIM_STATUS_CHANGER"
+service = "sim-status-changer"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "dashboard-test"
@@ -65,3 +69,7 @@ service = "phone-number-sync-test"
 [[env.test.services]]
 binding = "RESELLER_SYNC"
 service = "reseller-sync-test"
+
+[[env.test.services]]
+binding = "SIM_STATUS_CHANGER"
+service = "sim-status-changer-test"
