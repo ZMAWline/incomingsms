@@ -949,400 +949,461 @@ function getHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Incoming SMS Dashboard</title>
+    <title>SMS Gateway Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        dark: {
+                            900: '#0d1117',
+                            800: '#161b22',
+                            700: '#1c2128',
+                            600: '#252c35',
+                            500: '#2d333b',
+                        },
+                        accent: '#22c55e',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .progress-ring { transform: rotate(-90deg); }
+        .progress-ring__circle { transition: stroke-dashoffset 0.5s ease; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #161b22; }
+        ::-webkit-scrollbar-thumb { background: #2d333b; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #3d444d; }
+    </style>
 </head>
-<body class="bg-gray-50">
-    <div class="min-h-screen">
-        <header class="bg-white shadow">
-            <div class="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
-                <h1 class="text-3xl font-bold text-gray-900">Incoming SMS Dashboard</h1>
-                <p class="text-sm text-gray-600 mt-1">Monitor SIMs, messages, and system status</p>
+<body class="bg-dark-900 text-gray-100">
+    <div class="flex min-h-screen">
+        <!-- Sidebar -->
+        <aside class="w-16 bg-dark-800 flex flex-col items-center py-4 border-r border-dark-600">
+            <div class="w-10 h-10 bg-accent rounded-lg flex items-center justify-center mb-8">
+                <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path>
+                </svg>
             </div>
-        </header>
-
-        <main class="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-                <div class="bg-white rounded-lg shadow p-6">
-                    <div class="flex items-center">
-                        <div class="flex-shrink-0 bg-blue-500 rounded-md p-3">
-                            <svg class="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z"></path>
-                            </svg>
-                        </div>
-                        <div class="ml-4">
-                            <p class="text-sm font-medium text-gray-500">Total SIMs</p>
-                            <p class="text-2xl font-semibold text-gray-900" id="total-sims">-</p>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="bg-white rounded-lg shadow p-6">
-                    <div class="flex items-center">
-                        <div class="flex-shrink-0 bg-green-500 rounded-md p-3">
-                            <svg class="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                            </svg>
-                        </div>
-                        <div class="ml-4">
-                            <p class="text-sm font-medium text-gray-500">Active SIMs</p>
-                            <p class="text-2xl font-semibold text-gray-900" id="active-sims">-</p>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="bg-white rounded-lg shadow p-6">
-                    <div class="flex items-center">
-                        <div class="flex-shrink-0 bg-yellow-500 rounded-md p-3">
-                            <svg class="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                            </svg>
-                        </div>
-                        <div class="ml-4">
-                            <p class="text-sm font-medium text-gray-500">Provisioning</p>
-                            <p class="text-2xl font-semibold text-gray-900" id="provisioning-sims">-</p>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="bg-white rounded-lg shadow p-6">
-                    <div class="flex items-center">
-                        <div class="flex-shrink-0 bg-purple-500 rounded-md p-3">
-                            <svg class="h-6 w-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path>
-                            </svg>
-                        </div>
-                        <div class="ml-4">
-                            <p class="text-sm font-medium text-gray-500">Messages (24h)</p>
-                            <p class="text-2xl font-semibold text-gray-900" id="messages-24h">-</p>
-                        </div>
-                    </div>
-                </div>
+            <nav class="flex flex-col gap-4">
+                <button onclick="switchTab('dashboard')" class="sidebar-btn active w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Dashboard">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"></path></svg>
+                </button>
+                <button onclick="switchTab('sims')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="SIMs">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
+                </button>
+                <button onclick="switchTab('messages')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Messages">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                </button>
+                <button onclick="switchTab('workers')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Workers">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                </button>
+            </nav>
+            <div class="mt-auto">
+                <button onclick="loadData()" class="w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-accent hover:bg-dark-600 transition" title="Refresh">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                </button>
             </div>
+        </aside>
 
-            <div class="bg-white rounded-lg shadow mb-6">
-                <div class="px-6 py-4 border-b border-gray-200">
-                    <h2 class="text-lg font-semibold text-gray-900">Worker Controls</h2>
+        <!-- Main Content -->
+        <main class="flex-1 p-6 overflow-auto">
+            <!-- Header -->
+            <header class="flex items-center justify-between mb-6">
+                <div>
+                    <h1 class="text-2xl font-bold text-white">SMS Gateway</h1>
+                    <p class="text-sm text-gray-400">Monitor SIMs, messages, and system status</p>
                 </div>
-                <div class="p-6">
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                        <button onclick="showActivateModal()" class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            🚀 Activate SIMs
+                <div class="flex items-center gap-4">
+                    <span id="last-updated" class="text-xs text-gray-500"></span>
+                    <div class="w-2 h-2 bg-accent rounded-full animate-pulse" title="Connected"></div>
+                </div>
+            </header>
+
+            <!-- Dashboard Tab -->
+            <div id="tab-dashboard" class="tab-content">
+                <!-- Stats Cards -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    <!-- Total SIMs -->
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-sm text-gray-400">Total SIMs</span>
+                            <div class="w-8 h-8 rounded-lg bg-blue-500/20 flex items-center justify-center">
+                                <svg class="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
+                            </div>
+                        </div>
+                        <p class="text-3xl font-bold text-white" id="total-sims">-</p>
+                    </div>
+
+                    <!-- Active SIMs with Ring -->
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="flex items-center justify-between">
+                            <div>
+                                <span class="text-sm text-gray-400">Active SIMs</span>
+                                <p class="text-3xl font-bold text-white mt-2" id="active-sims">-</p>
+                            </div>
+                            <div class="relative">
+                                <svg class="progress-ring w-16 h-16" viewBox="0 0 60 60">
+                                    <circle class="text-dark-600" stroke="currentColor" stroke-width="6" fill="none" cx="30" cy="30" r="26"/>
+                                    <circle id="active-ring" class="progress-ring__circle text-accent" stroke="currentColor" stroke-width="6" fill="none" cx="30" cy="30" r="26" stroke-dasharray="163.36" stroke-dashoffset="163.36" stroke-linecap="round"/>
+                                </svg>
+                                <span id="active-percent" class="absolute inset-0 flex items-center justify-center text-xs font-semibold text-accent">0%</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Provisioning -->
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-sm text-gray-400">Provisioning</span>
+                            <div class="w-8 h-8 rounded-lg bg-yellow-500/20 flex items-center justify-center">
+                                <svg class="w-4 h-4 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            </div>
+                        </div>
+                        <p class="text-3xl font-bold text-white" id="provisioning-sims">-</p>
+                    </div>
+
+                    <!-- Messages 24h -->
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-sm text-gray-400">Messages (24h)</span>
+                            <div class="w-8 h-8 rounded-lg bg-purple-500/20 flex items-center justify-center">
+                                <svg class="w-4 h-4 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
+                            </div>
+                        </div>
+                        <p class="text-3xl font-bold text-white" id="messages-24h">-</p>
+                    </div>
+                </div>
+
+                <!-- Quick Actions -->
+                <div class="bg-dark-800 rounded-xl border border-dark-600 mb-6">
+                    <div class="px-5 py-4 border-b border-dark-600">
+                        <h2 class="text-lg font-semibold text-white">Quick Actions</h2>
+                    </div>
+                    <div class="p-5 grid grid-cols-2 md:grid-cols-5 gap-3">
+                        <button onclick="showActivateModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-blue-500/20 flex items-center justify-center group-hover:bg-blue-500/30 transition">
+                                <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Activate</span>
                         </button>
-                        <button onclick="runWorker('details-finalizer', 10)" class="bg-green-600 hover:bg-green-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            ✅ Finalize Details
+                        <button onclick="showSuspendModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-yellow-500/20 flex items-center justify-center group-hover:bg-yellow-500/30 transition">
+                                <svg class="w-5 h-5 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Suspend</span>
                         </button>
-                        <button onclick="runWorker('mdn-rotator', 5)" class="bg-orange-600 hover:bg-orange-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            🔄 Rotate Numbers
+                        <button onclick="showRestoreModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-emerald-500/20 flex items-center justify-center group-hover:bg-emerald-500/30 transition">
+                                <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Restore</span>
                         </button>
-                        <button onclick="runWorker('phone-number-sync', null)" class="bg-purple-600 hover:bg-purple-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            🔍 Sync Phone Numbers
+                        <button onclick="showCancelModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-red-500/20 flex items-center justify-center group-hover:bg-red-500/30 transition">
+                                <svg class="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Cancel</span>
                         </button>
-                        <button onclick="runWorker('reseller-sync', 50)" class="bg-teal-600 hover:bg-teal-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            📤 Reseller Sync
-                        </button>
-                        <button onclick="showSuspendModal()" class="bg-yellow-600 hover:bg-yellow-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            ⏸️ Suspend SIMs
-                        </button>
-                        <button onclick="showRestoreModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            ▶️ Restore SIMs
-                        </button>
-                        <button onclick="showCancelModal()" class="bg-red-600 hover:bg-red-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            ❌ Cancel SIMs
-                        </button>
-                        <button onclick="showHelixQueryModal()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            🔎 Query Helix
-                        </button>
-                        <button onclick="loadData()" class="bg-gray-600 hover:bg-gray-700 text-white font-medium py-3 px-4 rounded-lg transition duration-150">
-                            🔄 Refresh Dashboard
+                        <button onclick="showHelixQueryModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-indigo-500/20 flex items-center justify-center group-hover:bg-indigo-500/30 transition">
+                                <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Query</span>
                         </button>
                     </div>
                 </div>
-            </div>
 
-            <div class="bg-white rounded-lg shadow mb-6">
-                <div class="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
-                    <h2 class="text-lg font-semibold text-gray-900">Recent SMS Messages</h2>
-                    <button onclick="loadMessages()" class="text-sm text-blue-600 hover:text-blue-700">Refresh</button>
-                </div>
-                <div class="overflow-x-auto">
-                    <table class="min-w-full divide-y divide-gray-200">
-                        <thead class="bg-gray-50">
-                            <tr>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">To</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">From</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Message</th>
-                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ICCID</th>
-                            </tr>
-                        </thead>
-                        <tbody class="bg-white divide-y divide-gray-200" id="messages-table">
-                            <tr>
-                                <td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500">Loading...</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="bg-white rounded-lg shadow">
-                <div class="px-6 py-4 border-b border-gray-200">
-                    <div class="flex justify-between items-center mb-4">
-                        <h2 class="text-lg font-semibold text-gray-900">SIM Status</h2>
-                        <button onclick="loadSims()" class="text-sm text-blue-600 hover:text-blue-700">Refresh</button>
+                <!-- Recent Messages Preview -->
+                <div class="bg-dark-800 rounded-xl border border-dark-600">
+                    <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                        <h2 class="text-lg font-semibold text-white">Recent Messages</h2>
+                        <button onclick="switchTab('messages')" class="text-xs text-accent hover:text-green-400 transition">View All</button>
                     </div>
-                    <div class="flex flex-wrap gap-4 items-center">
-                        <div class="flex items-center gap-2">
-                            <label class="text-sm font-medium text-gray-700">Status:</label>
-                            <select id="filter-status" onchange="loadSims()" class="text-sm border-gray-300 rounded-md shadow-sm focus:border-blue-500 focus:ring-blue-500">
-                                <option value="">All (except cancelled)</option>
-                                <option value="all">All (include cancelled)</option>
-                                <option value="active">Active</option>
-                                <option value="provisioning">Provisioning</option>
-                                <option value="pending">Pending</option>
-                                <option value="suspended">Suspended</option>
-                                <option value="canceled">Cancelled</option>
-                                <option value="error">Error</option>
-                            </select>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <label class="text-sm font-medium text-gray-700">Reseller:</label>
-                            <select id="filter-reseller" onchange="loadSims()" class="text-sm border-gray-300 rounded-md shadow-sm focus:border-blue-500 focus:ring-blue-500">
-                                <option value="">All Resellers</option>
-                            </select>
-                        </div>
-                        <span id="sims-count" class="text-sm text-gray-500"></span>
-                    </div>
-                </div>
-                <div class="overflow-x-auto">
-                    <table class="min-w-full divide-y divide-gray-200">
-                        <thead class="bg-gray-50">
-                            <tr>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Gateway</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ICCID</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Phone Number</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Sub ID</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Reseller</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">SMS</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last SMS</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody class="bg-white divide-y divide-gray-200" id="sims-table">
-                            <tr>
-                                <td colspan="10" class="px-4 py-4 text-center text-sm text-gray-500">Loading...</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div id="toast" class="hidden fixed bottom-4 right-4 bg-gray-900 text-white px-6 py-4 rounded-lg shadow-lg">
-                <p id="toast-message"></p>
-            </div>
-
-            <!-- Cancel Modal -->
-            <div id="cancel-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
-                <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
-                    <div class="mt-3">
-                        <h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Cancel SIMs</h3>
-                        <div class="mt-2">
-                            <p class="text-sm text-gray-500 mb-3">
-                                Enter ICCIDs to cancel (one per line):
-                            </p>
-                            <textarea
-                                id="iccids-input"
-                                rows="10"
-                                class="w-full px-3 py-2 text-gray-700 border rounded-lg focus:outline-none focus:border-blue-500"
-                                placeholder="89014103271467425631\n89014103271467425581\n..."
-                            ></textarea>
-                        </div>
-                        <div class="flex justify-end space-x-3 mt-4">
-                            <button
-                                onclick="hideCancelModal()"
-                                class="px-4 py-2 bg-gray-300 text-gray-800 rounded-lg hover:bg-gray-400"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onclick="cancelSims()"
-                                class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
-                            >
-                                Cancel SIMs
-                            </button>
-                        </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase">
+                                    <th class="px-5 py-3 font-medium">Time</th>
+                                    <th class="px-5 py-3 font-medium">To</th>
+                                    <th class="px-5 py-3 font-medium">From</th>
+                                    <th class="px-5 py-3 font-medium">Message</th>
+                                </tr>
+                            </thead>
+                            <tbody id="messages-preview" class="text-sm">
+                                <tr><td colspan="4" class="px-5 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
 
-            <!-- Suspend Modal -->
-            <div id="suspend-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
-                <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
-                    <div class="mt-3">
-                        <h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Suspend SIMs</h3>
-                        <div class="mt-2">
-                            <p class="text-sm text-gray-500 mb-3">
-                                Enter SIM IDs to suspend (one per line):
-                            </p>
-                            <textarea
-                                id="suspend-input"
-                                rows="10"
-                                class="w-full px-3 py-2 text-gray-700 border rounded-lg focus:outline-none focus:border-yellow-500"
-                                placeholder="1\n2\n3\n..."
-                            ></textarea>
-                            <p class="text-xs text-gray-400 mt-1">Use SIM IDs from the dashboard table (first column)</p>
+            <!-- SIMs Tab -->
+            <div id="tab-sims" class="tab-content hidden">
+                <div class="bg-dark-800 rounded-xl border border-dark-600">
+                    <div class="px-5 py-4 border-b border-dark-600">
+                        <div class="flex flex-wrap items-center justify-between gap-4">
+                            <h2 class="text-lg font-semibold text-white">SIM Status</h2>
+                            <div class="flex flex-wrap items-center gap-3">
+                                <select id="filter-status" onchange="loadSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                    <option value="">All (except cancelled)</option>
+                                    <option value="all">All (include cancelled)</option>
+                                    <option value="active">Active</option>
+                                    <option value="provisioning">Provisioning</option>
+                                    <option value="pending">Pending</option>
+                                    <option value="suspended">Suspended</option>
+                                    <option value="canceled">Cancelled</option>
+                                    <option value="error">Error</option>
+                                </select>
+                                <select id="filter-reseller" onchange="loadSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                    <option value="">All Resellers</option>
+                                </select>
+                                <span id="sims-count" class="text-sm text-gray-500"></span>
+                            </div>
                         </div>
-                        <div class="flex justify-end space-x-3 mt-4">
-                            <button
-                                onclick="hideSuspendModal()"
-                                class="px-4 py-2 bg-gray-300 text-gray-800 rounded-lg hover:bg-gray-400"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onclick="suspendSims()"
-                                class="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700"
-                            >
-                                Suspend SIMs
-                            </button>
-                        </div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium">ID</th>
+                                    <th class="px-4 py-3 font-medium">Gateway</th>
+                                    <th class="px-4 py-3 font-medium">ICCID</th>
+                                    <th class="px-4 py-3 font-medium">Phone</th>
+                                    <th class="px-4 py-3 font-medium">Status</th>
+                                    <th class="px-4 py-3 font-medium">Sub ID</th>
+                                    <th class="px-4 py-3 font-medium">Reseller</th>
+                                    <th class="px-4 py-3 font-medium">SMS</th>
+                                    <th class="px-4 py-3 font-medium">Last SMS</th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="sims-table" class="text-sm">
+                                <tr><td colspan="10" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
 
-            <!-- Restore Modal -->
-            <div id="restore-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
-                <div class="relative top-20 mx-auto p-5 border w-96 shadow-lg rounded-md bg-white">
-                    <div class="mt-3">
-                        <h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Restore SIMs</h3>
-                        <div class="mt-2">
-                            <p class="text-sm text-gray-500 mb-3">
-                                Enter SIM IDs to restore (one per line):
-                            </p>
-                            <textarea
-                                id="restore-input"
-                                rows="10"
-                                class="w-full px-3 py-2 text-gray-700 border rounded-lg focus:outline-none focus:border-emerald-500"
-                                placeholder="1\n2\n3\n..."
-                            ></textarea>
-                            <p class="text-xs text-gray-400 mt-1">Use SIM IDs from the dashboard table (first column)</p>
-                        </div>
-                        <div class="flex justify-end space-x-3 mt-4">
-                            <button
-                                onclick="hideRestoreModal()"
-                                class="px-4 py-2 bg-gray-300 text-gray-800 rounded-lg hover:bg-gray-400"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onclick="restoreSims()"
-                                class="px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700"
-                            >
-                                Restore SIMs
-                            </button>
-                        </div>
+            <!-- Messages Tab -->
+            <div id="tab-messages" class="tab-content hidden">
+                <div class="bg-dark-800 rounded-xl border border-dark-600">
+                    <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                        <h2 class="text-lg font-semibold text-white">SMS Messages</h2>
+                        <button onclick="loadMessages()" class="text-xs text-accent hover:text-green-400 transition">Refresh</button>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-5 py-3 font-medium">Time</th>
+                                    <th class="px-5 py-3 font-medium">To</th>
+                                    <th class="px-5 py-3 font-medium">From</th>
+                                    <th class="px-5 py-3 font-medium">Message</th>
+                                    <th class="px-5 py-3 font-medium">ICCID</th>
+                                </tr>
+                            </thead>
+                            <tbody id="messages-table" class="text-sm">
+                                <tr><td colspan="5" class="px-5 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
 
-            <!-- Activate Modal -->
-            <div id="activate-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
-                <div class="relative top-10 mx-auto p-5 border w-2xl max-w-3xl shadow-lg rounded-md bg-white">
-                    <div class="mt-3">
-                        <h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Activate SIMs</h3>
-                        <div class="mt-2">
-                            <p class="text-sm text-gray-500 mb-3">
-                                Enter SIM data (CSV format: iccid,imei,reseller_id - one per line):
-                            </p>
-                            <textarea
-                                id="activate-input"
-                                rows="12"
-                                class="w-full px-3 py-2 text-gray-700 border rounded-lg focus:outline-none focus:border-blue-500 font-mono text-sm"
-                                placeholder="89014103271467425631,123456789012345,1\n89014103271467425581,123456789012346,1\n..."
-                            ></textarea>
-                            <p class="text-xs text-gray-400 mt-1">
-                                Format: ICCID (20 digits), IMEI (15 digits), Reseller ID (number)
-                            </p>
-                        </div>
-                        <div class="flex justify-end space-x-3 mt-4">
-                            <button
-                                onclick="hideActivateModal()"
-                                class="px-4 py-2 bg-gray-300 text-gray-800 rounded-lg hover:bg-gray-400"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onclick="activateSims()"
-                                class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-                            >
-                                Activate SIMs
-                            </button>
-                        </div>
+            <!-- Workers Tab -->
+            <div id="tab-workers" class="tab-content hidden">
+                <div class="bg-dark-800 rounded-xl border border-dark-600">
+                    <div class="px-5 py-4 border-b border-dark-600">
+                        <h2 class="text-lg font-semibold text-white">Worker Controls</h2>
                     </div>
-                </div>
-            </div>
-
-            <!-- Helix Query Modal -->
-            <div id="helix-query-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
-                <div class="relative top-10 mx-auto p-5 border w-full max-w-2xl shadow-lg rounded-md bg-white">
-                    <div class="mt-3">
-                        <h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Query Helix Subscriber</h3>
-                        <div class="mt-2">
-                            <p class="text-sm text-gray-500 mb-3">
-                                Enter a Mobility Subscription ID to query Helix API:
-                            </p>
-                            <input
-                                type="text"
-                                id="helix-subid-input"
-                                class="w-full px-3 py-2 text-gray-700 border rounded-lg focus:outline-none focus:border-indigo-500 font-mono"
-                                placeholder="e.g. 40033"
-                            />
-                        </div>
-                        <div id="helix-query-result" class="mt-4 hidden">
-                            <h4 class="text-sm font-medium text-gray-700 mb-2">Result:</h4>
-                            <pre id="helix-query-output" class="bg-gray-100 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-96 overflow-y-auto"></pre>
-                        </div>
-                        <div class="flex justify-end space-x-3 mt-4">
-                            <button
-                                onclick="hideHelixQueryModal()"
-                                class="px-4 py-2 bg-gray-300 text-gray-800 rounded-lg hover:bg-gray-400"
-                            >
-                                Close
-                            </button>
-                            <button
-                                onclick="queryHelix()"
-                                id="helix-query-btn"
-                                class="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700"
-                            >
-                                Query
-                            </button>
-                        </div>
+                    <div class="p-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <button onclick="runWorker('bulk-activator', 10)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                            <div class="w-12 h-12 rounded-lg bg-blue-500/20 flex items-center justify-center flex-shrink-0">
+                                <svg class="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
+                            </div>
+                            <div>
+                                <p class="font-medium text-white">Bulk Activator</p>
+                                <p class="text-xs text-gray-400">Activate pending SIMs</p>
+                            </div>
+                        </button>
+                        <button onclick="runWorker('details-finalizer', 10)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                            <div class="w-12 h-12 rounded-lg bg-green-500/20 flex items-center justify-center flex-shrink-0">
+                                <svg class="w-6 h-6 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            </div>
+                            <div>
+                                <p class="font-medium text-white">Details Finalizer</p>
+                                <p class="text-xs text-gray-400">Finalize provisioning SIMs</p>
+                            </div>
+                        </button>
+                        <button onclick="runWorker('mdn-rotator', 5)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                            <div class="w-12 h-12 rounded-lg bg-orange-500/20 flex items-center justify-center flex-shrink-0">
+                                <svg class="w-6 h-6 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                            </div>
+                            <div>
+                                <p class="font-medium text-white">MDN Rotator</p>
+                                <p class="text-xs text-gray-400">Rotate phone numbers</p>
+                            </div>
+                        </button>
+                        <button onclick="runWorker('phone-number-sync', null)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                            <div class="w-12 h-12 rounded-lg bg-purple-500/20 flex items-center justify-center flex-shrink-0">
+                                <svg class="w-6 h-6 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                            </div>
+                            <div>
+                                <p class="font-medium text-white">Phone Number Sync</p>
+                                <p class="text-xs text-gray-400">Sync numbers from Helix</p>
+                            </div>
+                        </button>
+                        <button onclick="runWorker('reseller-sync', 50)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                            <div class="w-12 h-12 rounded-lg bg-teal-500/20 flex items-center justify-center flex-shrink-0">
+                                <svg class="w-6 h-6 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                            </div>
+                            <div>
+                                <p class="font-medium text-white">Reseller Sync</p>
+                                <p class="text-xs text-gray-400">Send webhooks to resellers</p>
+                            </div>
+                        </button>
                     </div>
                 </div>
             </div>
         </main>
     </div>
 
+    <!-- Toast -->
+    <div id="toast" class="hidden fixed bottom-4 right-4 px-6 py-4 rounded-lg shadow-lg max-w-md z-50">
+        <p id="toast-message" class="text-sm"></p>
+    </div>
+
+    <!-- Cancel Modal -->
+    <div id="cancel-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Cancel SIMs</h3>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3">Enter ICCIDs to cancel (one per line):</p>
+                <textarea id="iccids-input" rows="8" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631"></textarea>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideCancelModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                <button onclick="cancelSims()" class="px-4 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Cancel SIMs</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Suspend Modal -->
+    <div id="suspend-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Suspend SIMs</h3>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3">Enter SIM IDs to suspend (one per line):</p>
+                <textarea id="suspend-input" rows="8" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="1"></textarea>
+                <p class="text-xs text-gray-500 mt-2">Use SIM IDs from the dashboard table (first column)</p>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideSuspendModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                <button onclick="suspendSims()" class="px-4 py-2 text-sm bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg transition">Suspend SIMs</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Restore Modal -->
+    <div id="restore-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Restore SIMs</h3>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3">Enter SIM IDs to restore (one per line):</p>
+                <textarea id="restore-input" rows="8" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="1"></textarea>
+                <p class="text-xs text-gray-500 mt-2">Use SIM IDs from the dashboard table (first column)</p>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideRestoreModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                <button onclick="restoreSims()" class="px-4 py-2 text-sm bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition">Restore SIMs</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Activate Modal -->
+    <div id="activate-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Activate SIMs</h3>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3">Enter SIM data (CSV: iccid,imei,reseller_id):</p>
+                <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631,123456789012345,1"></textarea>
+                <p class="text-xs text-gray-500 mt-2">Format: ICCID (20 digits), IMEI (15 digits), Reseller ID</p>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideActivateModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                <button onclick="activateSims()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Activate SIMs</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Helix Query Modal -->
+    <div id="helix-query-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Query Helix Subscriber</h3>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3">Enter a Mobility Subscription ID:</p>
+                <input type="text" id="helix-subid-input" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="e.g. 40033"/>
+                <div id="helix-query-result" class="mt-4 hidden">
+                    <h4 class="text-sm font-medium text-gray-400 mb-2">Result:</h4>
+                    <pre id="helix-query-output" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-80 overflow-y-auto text-gray-300 border border-dark-600"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideHelixQueryModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
+                <button onclick="queryHelix()" id="helix-query-btn" class="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Query</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const API_BASE = '/api';
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.sidebar-btn').forEach(el => {
+                el.classList.remove('bg-dark-600', 'text-white');
+                el.classList.add('text-gray-400');
+            });
+            document.getElementById(\`tab-\${tabName}\`).classList.remove('hidden');
+            event.currentTarget.classList.add('bg-dark-600', 'text-white');
+            event.currentTarget.classList.remove('text-gray-400');
+        }
 
         function showToast(message, type = 'info') {
             const toast = document.getElementById('toast');
             const toastMessage = document.getElementById('toast-message');
             toastMessage.textContent = message;
-            toast.className = \`fixed bottom-4 right-4 px-6 py-4 rounded-lg shadow-lg max-w-lg \${
+            toast.className = \`fixed bottom-4 right-4 px-6 py-4 rounded-lg shadow-lg max-w-md z-50 \${
                 type === 'error' ? 'bg-red-600' :
-                type === 'success' ? 'bg-green-600' :
-                'bg-gray-900'
+                type === 'success' ? 'bg-accent' :
+                'bg-dark-700 border border-dark-500'
             } text-white\`;
             toast.classList.remove('hidden');
-            // Errors stay longer (10s), success/info stay 4s
             const duration = type === 'error' ? 10000 : 4000;
             setTimeout(() => toast.classList.add('hidden'), duration);
-            // Also log to console for easy copying
             console.log(\`[\${type.toUpperCase()}] \${message}\`);
+        }
+
+        function updateActiveRing(active, total) {
+            const percent = total > 0 ? Math.round((active / total) * 100) : 0;
+            const circumference = 163.36;
+            const offset = circumference - (percent / 100) * circumference;
+            document.getElementById('active-ring').style.strokeDashoffset = offset;
+            document.getElementById('active-percent').textContent = percent + '%';
         }
 
         async function loadData() {
@@ -1353,6 +1414,8 @@ function getHTML() {
                 document.getElementById('active-sims').textContent = data.active_sims || 0;
                 document.getElementById('provisioning-sims').textContent = data.provisioning_sims || 0;
                 document.getElementById('messages-24h').textContent = data.messages_24h || 0;
+                updateActiveRing(data.active_sims || 0, data.total_sims || 0);
+                document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
                 loadSims();
                 loadMessages();
             } catch (error) {
@@ -1396,40 +1459,39 @@ function getHTML() {
                 const sims = await response.json();
                 const tbody = document.getElementById('sims-table');
                 const countEl = document.getElementById('sims-count');
-                countEl.textContent = \`Showing \${sims.length} SIM(s)\`;
+                countEl.textContent = \`\${sims.length} SIM(s)\`;
 
                 if (sims.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-4 text-center text-sm text-gray-500">No SIMs found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
                     return;
                 }
                 tbody.innerHTML = sims.map(sim => {
                     const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
                     const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
-                    const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-green-600" title="Verified">&#10003;</span>' : '';
-                    const gatewayDisplay = sim.gateway_code ? \`<span class="font-semibold">\${sim.gateway_code}</span><span class="text-gray-400 text-xs ml-1">\${sim.port || ''}</span>\` : (sim.port || '-');
+                    const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-accent" title="Verified">&#10003;</span>' : '';
+                    const gatewayDisplay = sim.gateway_code ? \`<span class="font-medium text-gray-200">\${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">\${sim.port || ''}</span>\` : (sim.port || '-');
+                    const statusClass = {
+                        'active': 'bg-accent/20 text-accent',
+                        'provisioning': 'bg-yellow-500/20 text-yellow-400',
+                        'suspended': 'bg-orange-500/20 text-orange-400',
+                        'canceled': 'bg-red-500/20 text-red-400',
+                        'error': 'bg-red-500/20 text-red-400',
+                    }[sim.status] || 'bg-gray-500/20 text-gray-400';
                     return \`
-                    <tr class="hover:bg-gray-50">
-                        <td class="px-4 py-4 whitespace-nowrap text-sm font-medium text-gray-900">\${sim.id}</td>
-                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-700" title="\${sim.gateway_name || ''}">\${gatewayDisplay}</td>
-                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500 font-mono text-xs">\${sim.iccid}</td>
-                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-900">\${sim.phone_number || '-'}\${verifiedBadge}</td>
-                        <td class="px-4 py-4 whitespace-nowrap">
-                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full \${
-                                sim.status === 'active' ? 'bg-green-100 text-green-800' :
-                                sim.status === 'provisioning' ? 'bg-yellow-100 text-yellow-800' :
-                                sim.status === 'canceled' ? 'bg-red-100 text-red-800' :
-                                sim.status === 'error' ? 'bg-red-100 text-red-800' :
-                                'bg-gray-100 text-gray-800'
-                            }">
-                                \${sim.status}
-                            </span>
+                    <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                        <td class="px-4 py-3 text-gray-300">\${sim.id}</td>
+                        <td class="px-4 py-3 text-gray-400" title="\${sim.gateway_name || ''}">\${gatewayDisplay}</td>
+                        <td class="px-4 py-3 text-gray-400 font-mono text-xs">\${sim.iccid}</td>
+                        <td class="px-4 py-3 text-gray-200">\${sim.phone_number || '-'}\${verifiedBadge}</td>
+                        <td class="px-4 py-3">
+                            <span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${sim.status}</span>
                         </td>
-                        <td class="px-4 py-4 whitespace-nowrap text-sm font-mono text-xs">\${sim.mobility_subscription_id ? \`<button onclick="queryHelixSubId('\${sim.mobility_subscription_id}')" class="text-indigo-600 hover:text-indigo-800 hover:underline">\${sim.mobility_subscription_id}</button>\` : '-'}</td>
-                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500">\${sim.reseller_name || '-'}</td>
-                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-900">\${sim.sms_count || 0}</td>
-                        <td class="px-4 py-4 whitespace-nowrap text-sm text-gray-500">\${lastSms}</td>
-                        <td class="px-4 py-4 whitespace-nowrap text-sm">
-                            \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium py-1 px-2 rounded transition">Send Online</button>\` : '-'}
+                        <td class="px-4 py-3 font-mono text-xs">\${sim.mobility_subscription_id ? \`<button onclick="queryHelixSubId('\${sim.mobility_subscription_id}')" class="text-indigo-400 hover:text-indigo-300 hover:underline">\${sim.mobility_subscription_id}</button>\` : '-'}</td>
+                        <td class="px-4 py-3 text-gray-400">\${sim.reseller_name || '-'}</td>
+                        <td class="px-4 py-3 text-gray-300">\${sim.sms_count || 0}</td>
+                        <td class="px-4 py-3 text-gray-500 text-xs">\${lastSms}</td>
+                        <td class="px-4 py-3">
+                            \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Online</button>\` : '-'}
                         </td>
                     </tr>
                 \`;
@@ -1444,18 +1506,14 @@ function getHTML() {
             if (!confirm(\`Send number.online webhook for \${phoneNumber}?\`)) {
                 return;
             }
-
             showToast(\`Sending online webhook for \${phoneNumber}...\`, 'info');
-
             try {
                 const response = await fetch(\`\${API_BASE}/sim-online\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ sim_id: simId })
                 });
-
                 const result = await response.json();
-
                 if (response.ok && result.ok) {
                     showToast(result.message, 'success');
                 } else {
@@ -1471,24 +1529,46 @@ function getHTML() {
             try {
                 const response = await fetch(\`\${API_BASE}/messages\`);
                 const messages = await response.json();
+
+                // Update main messages table
                 const tbody = document.getElementById('messages-table');
                 if (messages.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500">No messages found</td></tr>';
-                    return;
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-5 py-4 text-center text-gray-500">No messages found</td></tr>';
+                } else {
+                    tbody.innerHTML = messages.map(msg => {
+                        const date = new Date(msg.received_at);
+                        const timeStr = date.toLocaleString();
+                        return \`
+                            <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                                <td class="px-5 py-3 text-gray-400 text-xs">\${timeStr}</td>
+                                <td class="px-5 py-3 text-gray-200">\${msg.to_number || '-'}</td>
+                                <td class="px-5 py-3 text-gray-200">\${msg.from_number}</td>
+                                <td class="px-5 py-3 text-gray-300 max-w-md truncate">\${msg.body}</td>
+                                <td class="px-5 py-3 text-gray-500 font-mono text-xs">\${msg.iccid || '-'}</td>
+                            </tr>
+                        \`;
+                    }).join('');
                 }
-                tbody.innerHTML = messages.map(msg => {
-                    const date = new Date(msg.received_at);
-                    const timeStr = date.toLocaleString();
-                    return \`
-                        <tr class="hover:bg-gray-50">
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">\${timeStr}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">\${msg.to_number || '-'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">\${msg.from_number}</td>
-                            <td class="px-6 py-4 text-sm text-gray-900 max-w-md truncate">\${msg.body}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">\${msg.iccid || '-'}</td>
-                        </tr>
-                    \`;
-                }).join('');
+
+                // Update preview table (first 5)
+                const preview = document.getElementById('messages-preview');
+                const previewMsgs = messages.slice(0, 5);
+                if (previewMsgs.length === 0) {
+                    preview.innerHTML = '<tr><td colspan="4" class="px-5 py-4 text-center text-gray-500">No messages</td></tr>';
+                } else {
+                    preview.innerHTML = previewMsgs.map(msg => {
+                        const date = new Date(msg.received_at);
+                        const timeStr = date.toLocaleTimeString();
+                        return \`
+                            <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                                <td class="px-5 py-3 text-gray-400 text-xs">\${timeStr}</td>
+                                <td class="px-5 py-3 text-gray-200">\${msg.to_number || '-'}</td>
+                                <td class="px-5 py-3 text-gray-200">\${msg.from_number}</td>
+                                <td class="px-5 py-3 text-gray-300 truncate max-w-xs">\${msg.body}</td>
+                            </tr>
+                        \`;
+                    }).join('');
+                }
             } catch (error) {
                 showToast('Error loading messages', 'error');
                 console.error(error);
@@ -1842,26 +1922,22 @@ function getHTML() {
                 const resultDiv = document.getElementById('helix-query-result');
 
                 if (response.ok && result.ok) {
-                    // Format the helix response nicely
                     const data = Array.isArray(result.helix_response) ? result.helix_response[0] : result.helix_response;
-
-                    // Highlight status and statusReason
                     let formatted = '';
                     if (data) {
-                        formatted = \`<span class="text-blue-600 font-bold">status:</span> <span class="\${data.status === 'ACTIVE' ? 'text-green-600' : 'text-red-600'} font-bold">\${data.status || 'N/A'}</span>\\n\`;
+                        formatted = \`<span class="text-blue-400 font-bold">status:</span> <span class="\${data.status === 'ACTIVE' ? 'text-accent' : 'text-red-400'} font-bold">\${data.status || 'N/A'}</span>\\n\`;
                         if (data.statusReason) {
-                            formatted += \`<span class="text-blue-600 font-bold">statusReason:</span> <span class="text-orange-600 font-bold">\${data.statusReason}</span>\\n\`;
+                            formatted += \`<span class="text-blue-400 font-bold">statusReason:</span> <span class="text-orange-400 font-bold">\${data.statusReason}</span>\\n\`;
                         }
                         formatted += \`\\n<span class="text-gray-500">--- Full Response ---</span>\\n\`;
                         formatted += JSON.stringify(data, null, 2);
                     } else {
                         formatted = JSON.stringify(result.helix_response, null, 2);
                     }
-
                     outputEl.innerHTML = formatted;
                     resultDiv.classList.remove('hidden');
                 } else {
-                    outputEl.innerHTML = \`<span class="text-red-600">Error:</span> \${JSON.stringify(result, null, 2)}\`;
+                    outputEl.innerHTML = \`<span class="text-red-400">Error:</span> \${JSON.stringify(result, null, 2)}\`;
                     resultDiv.classList.remove('hidden');
                 }
             } catch (error) {
