@@ -79,6 +79,10 @@ export default {
       return handleHelixQuery(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/send-test-sms') {
+      return handleSendTestSms(request, env, corsHeaders);
+    }
+
     // Debug endpoint to test worker-to-worker connectivity via service binding
     if (url.pathname === '/api/debug-cancel') {
       try {
@@ -933,6 +937,110 @@ async function handleHelixQuery(request, env, corsHeaders) {
   }
 }
 
+async function handleSendTestSms(request, env, corsHeaders) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+
+  try {
+    const body = await request.json();
+    const { gateway_id, port, to_number, message } = body;
+
+    if (!gateway_id || !port || !to_number || !message) {
+      return new Response(JSON.stringify({ error: 'gateway_id, port, to_number, and message are required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Get gateway credentials from database
+    const gwResponse = await supabaseGet(env, `gateways?select=id,code,host,api_port,username,password&id=eq.${gateway_id}&limit=1`);
+    const gateways = await gwResponse.json();
+
+    if (!gateways || gateways.length === 0) {
+      return new Response(JSON.stringify({ error: 'Gateway not found' }), {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const gateway = gateways[0];
+
+    if (!gateway.host || !gateway.username || !gateway.password) {
+      return new Response(JSON.stringify({ error: `Gateway "${gateway.code}" missing credentials (host, username, or password)` }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const apiPort = gateway.api_port || 80;
+    const skylineUrl = `http://${gateway.host}:${apiPort}/goip_post_sms.html`;
+
+    // Build the SMS payload for Skyline API
+    const smsPayload = {
+      type: 'send-sms',
+      task_num: 1,
+      tasks: [{
+        tid: Date.now(),
+        port: port,
+        to: to_number,
+        sms: message,
+        smstype: 0,
+        coding: 0
+      }]
+    };
+
+    console.log(`[SendTestSms] Sending to Skyline (${gateway.code}): ${skylineUrl}`);
+    console.log(`[SendTestSms] Payload: ${JSON.stringify(smsPayload)}`);
+
+    // Send to Skyline API
+    const authHeader = 'Basic ' + btoa(`${gateway.username}:${gateway.password}`);
+    const skylineRes = await fetch(skylineUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': authHeader
+      },
+      body: JSON.stringify(smsPayload)
+    });
+
+    const skylineText = await skylineRes.text();
+    console.log(`[SendTestSms] Skyline response: ${skylineRes.status} - ${skylineText}`);
+
+    let skylineData;
+    try {
+      skylineData = JSON.parse(skylineText);
+    } catch {
+      skylineData = { raw: skylineText };
+    }
+
+    if (skylineRes.ok && skylineData.code === 200) {
+      return new Response(JSON.stringify({
+        ok: true,
+        message: `SMS sent to ${to_number} via ${gateway.code} port ${port}`,
+        skyline_response: skylineData
+      }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    } else {
+      return new Response(JSON.stringify({
+        ok: false,
+        error: skylineData.reason || 'Skyline API error',
+        skyline_response: skylineData
+      }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 async function supabaseGet(env, path) {
   return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
@@ -1082,7 +1190,7 @@ function getHTML() {
                     <div class="px-5 py-4 border-b border-dark-600">
                         <h2 class="text-lg font-semibold text-white">Quick Actions</h2>
                     </div>
-                    <div class="p-5 grid grid-cols-2 md:grid-cols-5 gap-3">
+                    <div class="p-5 grid grid-cols-2 md:grid-cols-6 gap-3">
                         <button onclick="showActivateModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
                             <div class="w-10 h-10 rounded-lg bg-blue-500/20 flex items-center justify-center group-hover:bg-blue-500/30 transition">
                                 <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
@@ -1112,6 +1220,12 @@ function getHTML() {
                                 <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
                             </div>
                             <span class="text-xs text-gray-300">Query</span>
+                        </button>
+                        <button onclick="showTestSmsModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-cyan-500/20 flex items-center justify-center group-hover:bg-cyan-500/30 transition">
+                                <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Test SMS</span>
                         </button>
                     </div>
                 </div>
@@ -1365,6 +1479,43 @@ function getHTML() {
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
                 <button onclick="hideHelixQueryModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
                 <button onclick="queryHelix()" id="helix-query-btn" class="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Query</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Test SMS Modal -->
+    <div id="test-sms-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Send Test SMS</h3>
+            </div>
+            <div class="p-5 space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-400 mb-2">Gateway</label>
+                    <select id="test-sms-gateway" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">
+                        <option value="">Select a gateway...</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-2">Port</label>
+                    <input type="text" id="test-sms-port" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="e.g. 1A, 2B, or 1, 2"/>
+                    <p class="text-xs text-gray-500 mt-1">Port on the selected gateway</p>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-2">To Number</label>
+                    <input type="text" id="test-sms-to" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="e.g. 15551234567"/>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-2">Message</label>
+                    <textarea id="test-sms-message" rows="3" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Your test message..."></textarea>
+                </div>
+                <div id="test-sms-result" class="hidden">
+                    <pre id="test-sms-output" class="bg-dark-900 p-3 rounded-lg text-xs font-mono overflow-x-auto text-gray-300 border border-dark-600"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideTestSmsModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                <button onclick="sendTestSms()" id="test-sms-btn" class="px-4 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition">Send SMS</button>
             </div>
         </div>
     </div>
@@ -1946,6 +2097,83 @@ function getHTML() {
             } finally {
                 btn.disabled = false;
                 btn.textContent = 'Query';
+            }
+        }
+
+        async function showTestSmsModal() {
+            document.getElementById('test-sms-modal').classList.remove('hidden');
+            document.getElementById('test-sms-result').classList.add('hidden');
+            document.getElementById('test-sms-gateway').value = '';
+            document.getElementById('test-sms-port').value = '';
+            document.getElementById('test-sms-to').value = '';
+            document.getElementById('test-sms-message').value = '';
+
+            // Load gateways into dropdown
+            const select = document.getElementById('test-sms-gateway');
+            select.innerHTML = '<option value="">Loading gateways...</option>';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/gateways\`);
+                const gateways = await response.json();
+
+                if (gateways.length === 0) {
+                    select.innerHTML = '<option value="">No gateways found</option>';
+                } else {
+                    select.innerHTML = '<option value="">Select a gateway...</option>' +
+                        gateways.map(gw => \`<option value="\${gw.id}" data-code="\${gw.code}">\${gw.code}\${gw.host ? ' (' + gw.host + ')' : ' (no credentials)'}</option>\`).join('');
+                }
+            } catch (error) {
+                console.error('Failed to load gateways:', error);
+                select.innerHTML = '<option value="">Error loading gateways</option>';
+            }
+
+            document.getElementById('test-sms-gateway').focus();
+        }
+
+        function hideTestSmsModal() {
+            document.getElementById('test-sms-modal').classList.add('hidden');
+        }
+
+        async function sendTestSms() {
+            const gatewayId = document.getElementById('test-sms-gateway').value;
+            const port = document.getElementById('test-sms-port').value.trim();
+            const toNumber = document.getElementById('test-sms-to').value.trim();
+            const message = document.getElementById('test-sms-message').value.trim();
+
+            if (!gatewayId || !port || !toNumber || !message) {
+                showToast('Please fill in all fields', 'error');
+                return;
+            }
+
+            const btn = document.getElementById('test-sms-btn');
+            btn.disabled = true;
+            btn.textContent = 'Sending...';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/send-test-sms\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: gatewayId, port, to_number: toNumber, message })
+                });
+
+                const result = await response.json();
+                const outputEl = document.getElementById('test-sms-output');
+                const resultDiv = document.getElementById('test-sms-result');
+
+                if (response.ok && result.ok) {
+                    outputEl.innerHTML = \`<span class="text-accent">Success!</span> \${result.message}\\n\\n\${JSON.stringify(result.skyline_response, null, 2)}\`;
+                    showToast(result.message, 'success');
+                } else {
+                    outputEl.innerHTML = \`<span class="text-red-400">Error:</span> \${result.error}\\n\\n\${JSON.stringify(result.skyline_response || result, null, 2)}\`;
+                    showToast(\`Error: \${result.error}\`, 'error');
+                }
+                resultDiv.classList.remove('hidden');
+            } catch (error) {
+                showToast('Error sending SMS', 'error');
+                console.error(error);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Send SMS';
             }
         }
 
