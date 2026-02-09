@@ -55,6 +55,10 @@ export default {
       return handleRunWorker(request, env, workerName, corsHeaders);
     }
 
+    if (url.pathname === '/api/rotate-sim') {
+      return handleRotateSim(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/cancel') {
       return handleCancelSims(request, env, corsHeaders);
     }
@@ -266,6 +270,69 @@ async function handleMessages(env, corsHeaders) {
     }));
 
     return new Response(JSON.stringify(formatted), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleRotateSim(request, env, corsHeaders) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+
+  try {
+    const body = await request.json();
+    const iccids = body.iccids || [];
+
+    if (!Array.isArray(iccids) || iccids.length === 0) {
+      return new Response(JSON.stringify({ error: 'iccids array is required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!env.MDN_ROTATOR) {
+      return new Response(JSON.stringify({ error: 'MDN_ROTATOR service binding not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!env.ADMIN_RUN_SECRET) {
+      return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const results = [];
+    for (const iccid of iccids) {
+      const trimmed = iccid.trim();
+      if (!trimmed) continue;
+
+      try {
+        const workerUrl = `https://worker/rotate-sim?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&iccid=${encodeURIComponent(trimmed)}`;
+        const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl);
+        const responseText = await workerResponse.text();
+        let result;
+        try {
+          result = JSON.parse(responseText);
+        } catch {
+          result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
+        }
+        results.push({ iccid: trimmed, ...result });
+      } catch (err) {
+        results.push({ iccid: trimmed, ok: false, error: String(err) });
+      }
+    }
+
+    return new Response(JSON.stringify({ ok: true, results }), {
+      status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -1359,7 +1426,16 @@ function getHTML() {
                             </div>
                             <div>
                                 <p class="font-medium text-white">MDN Rotator</p>
-                                <p class="text-xs text-gray-400">Rotate phone numbers</p>
+                                <p class="text-xs text-gray-400">Rotate phone numbers (batch)</p>
+                            </div>
+                        </button>
+                        <button onclick="showRotateSimModal()" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                            <div class="w-12 h-12 rounded-lg bg-orange-500/20 flex items-center justify-center flex-shrink-0">
+                                <svg class="w-6 h-6 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122"></path></svg>
+                            </div>
+                            <div>
+                                <p class="font-medium text-white">Rotate Specific SIMs</p>
+                                <p class="text-xs text-gray-400">Rotate by ICCID</p>
                             </div>
                         </button>
                         <button onclick="runWorker('phone-number-sync', null)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
@@ -1479,6 +1555,28 @@ function getHTML() {
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
                 <button onclick="hideHelixQueryModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
                 <button onclick="queryHelix()" id="helix-query-btn" class="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Query</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Rotate Specific SIMs Modal -->
+    <div id="rotate-sim-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Rotate Specific SIMs</h3>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3">Enter ICCIDs to rotate (one per line):</p>
+                <textarea id="rotate-sim-input" rows="8" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631"></textarea>
+                <p class="text-xs text-gray-500 mt-2">Each SIM will get a new phone number immediately</p>
+                <div id="rotate-sim-result" class="mt-4 hidden">
+                    <h4 class="text-sm font-medium text-gray-400 mb-2">Results:</h4>
+                    <pre id="rotate-sim-output" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-60 overflow-y-auto text-gray-300 border border-dark-600"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideRotateSimModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
+                <button onclick="rotateSpecificSims()" id="rotate-sim-btn" class="px-4 py-2 text-sm bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Rotate SIMs</button>
             </div>
         </div>
     </div>
@@ -1723,6 +1821,76 @@ function getHTML() {
             } catch (error) {
                 showToast('Error loading messages', 'error');
                 console.error(error);
+            }
+        }
+
+        function showRotateSimModal() {
+            document.getElementById('rotate-sim-modal').classList.remove('hidden');
+            document.getElementById('rotate-sim-result').classList.add('hidden');
+            document.getElementById('rotate-sim-btn').disabled = false;
+            document.getElementById('rotate-sim-btn').textContent = 'Rotate SIMs';
+        }
+
+        function hideRotateSimModal() {
+            document.getElementById('rotate-sim-modal').classList.add('hidden');
+            document.getElementById('rotate-sim-input').value = '';
+            document.getElementById('rotate-sim-result').classList.add('hidden');
+        }
+
+        async function rotateSpecificSims() {
+            const input = document.getElementById('rotate-sim-input').value.trim();
+            if (!input) {
+                showToast('Please enter at least one ICCID', 'error');
+                return;
+            }
+
+            const iccids = input.split('\\n').map(l => l.trim()).filter(Boolean);
+            if (iccids.length === 0) {
+                showToast('Please enter at least one ICCID', 'error');
+                return;
+            }
+
+            if (!confirm(\`Rotate \${iccids.length} SIM(s)? This will assign new phone numbers immediately.\`)) {
+                return;
+            }
+
+            const btn = document.getElementById('rotate-sim-btn');
+            btn.disabled = true;
+            btn.textContent = 'Rotating...';
+            showToast(\`Rotating \${iccids.length} SIM(s)...\`, 'info');
+
+            try {
+                const response = await fetch(\`\${API_BASE}/rotate-sim\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ iccids })
+                });
+                const result = await response.json();
+
+                // Show results in the modal
+                const resultDiv = document.getElementById('rotate-sim-result');
+                const outputPre = document.getElementById('rotate-sim-output');
+                resultDiv.classList.remove('hidden');
+                outputPre.textContent = JSON.stringify(result, null, 2);
+
+                if (response.ok && result.results) {
+                    const succeeded = result.results.filter(r => r.ok).length;
+                    const failed = result.results.filter(r => !r.ok).length;
+                    if (failed === 0) {
+                        showToast(\`All \${succeeded} SIM(s) rotated successfully\`, 'success');
+                    } else {
+                        showToast(\`\${succeeded} succeeded, \${failed} failed\`, failed > 0 ? 'error' : 'success');
+                    }
+                    loadData();
+                } else {
+                    showToast(\`Error: \${result.error || 'Unknown error'}\`, 'error');
+                }
+            } catch (error) {
+                showToast('Error rotating SIMs', 'error');
+                console.error(error);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Rotate SIMs';
             }
         }
 

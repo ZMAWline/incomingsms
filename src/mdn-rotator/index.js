@@ -24,6 +24,27 @@ export default {
       });
     }
 
+    if (url.pathname === "/rotate-sim") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      const iccid = url.searchParams.get("iccid") || "";
+      if (!iccid) {
+        return new Response(JSON.stringify({ error: "iccid parameter is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+
+      const result = await rotateSpecificSim(env, iccid);
+      return new Response(JSON.stringify(result, null, 2), {
+        status: result.ok ? 200 : 500,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
     if (url.pathname === "/error-summary") {
       const secret = url.searchParams.get("secret") || "";
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
@@ -37,7 +58,7 @@ export default {
       });
     }
 
-    return new Response("mdn-rotator ok. Use /run?secret=...&limit=1 or /error-summary?secret=...", { status: 200 });
+    return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?secret=...&iccid=..., or /error-summary?secret=...", { status: 200 });
   },
 
   // Cron handler
@@ -54,20 +75,41 @@ export default {
   },
 
   // Queue consumer - processes SIMs in batches with cached token
+  // After 3 failures, performs cancel + restore cycle then retries once more
   async queue(batch, env) {
     // Get cached token once for the entire batch
     const token = await getCachedToken(env);
 
     for (const message of batch.messages) {
       const sim = message.body;
+      const attempts = message.attempts || 0;
+
       try {
         await rotateSingleSim(env, token, sim);
         message.ack();
         console.log(`SIM ${sim.iccid}: rotation complete`);
       } catch (err) {
-        console.error(`SIM ${sim.iccid} failed: ${err}`);
-        // Retry up to 3 times (configured in wrangler.toml)
-        message.retry();
+        console.error(`SIM ${sim.iccid} failed (attempt ${attempts + 1}): ${err}`);
+
+        if (attempts >= 2) {
+          // 3rd failure — try cancel + restore cycle then re-queue
+          console.log(`SIM ${sim.iccid}: 3 failures reached, starting cancel + restore cycle`);
+          try {
+            await cancelAndRestoreSim(env, token, sim);
+            // Re-queue with a flag so we know this is a post-recovery attempt
+            await env.MDN_QUEUE.send({ ...sim, _recoveryAttempt: true });
+            message.ack(); // Ack the original message since we re-queued it
+            console.log(`SIM ${sim.iccid}: cancel + restore complete, re-queued for rotation`);
+          } catch (recoveryErr) {
+            console.error(`SIM ${sim.iccid}: cancel + restore failed: ${recoveryErr}`);
+            // Record the recovery failure in the database
+            await updateSimRotationError(env, sim.id, `Cancel+Restore failed: ${recoveryErr}`).catch(() => {});
+            message.ack(); // Ack to stop retries — recovery itself failed
+          }
+        } else {
+          // Still have retries left — let the queue retry
+          message.retry();
+        }
       }
     }
   },
@@ -116,6 +158,73 @@ async function queueSimsForRotation(env, options = {}) {
 
   console.log(`Queued ${queued} SIMs for rotation.`);
   return { ok: true, queued, total: sims.length, manual: isManualRun };
+}
+
+// ===========================
+// Rotate a specific SIM by ICCID (manual trigger)
+// ===========================
+async function rotateSpecificSim(env, iccid) {
+  try {
+    // Look up the SIM by ICCID
+    const sims = await supabaseSelect(
+      env,
+      `sims?select=id,iccid,mobility_subscription_id,status&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+    );
+
+    if (!Array.isArray(sims) || sims.length === 0) {
+      return { ok: false, error: `SIM not found with ICCID: ${iccid}` };
+    }
+
+    const sim = sims[0];
+
+    if (!sim.mobility_subscription_id) {
+      return { ok: false, error: `SIM ${iccid} has no mobility_subscription_id` };
+    }
+
+    if (sim.status !== 'active') {
+      return { ok: false, error: `SIM ${iccid} is not active (status: ${sim.status})` };
+    }
+
+    const token = await getCachedToken(env);
+
+    // Try rotation up to 3 times, then cancel+restore and try once more
+    const maxAttempts = 3;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        console.log(`SIM ${iccid}: rotation attempt ${attempt}/${maxAttempts}`);
+        await rotateSingleSim(env, token, sim);
+        return { ok: true, iccid, message: `SIM ${iccid} rotated successfully`, attempts: attempt };
+      } catch (err) {
+        lastError = err;
+        console.error(`SIM ${iccid}: attempt ${attempt} failed: ${err}`);
+        if (attempt < maxAttempts) {
+          await sleep(2000);
+        }
+      }
+    }
+
+    // All 3 attempts failed — try cancel + restore cycle then rotate once more
+    console.log(`SIM ${iccid}: 3 attempts failed, starting cancel + restore cycle`);
+    try {
+      await cancelAndRestoreSim(env, token, sim);
+      console.log(`SIM ${iccid}: cancel + restore complete, attempting final rotation`);
+      await rotateSingleSim(env, token, sim);
+      return { ok: true, iccid, message: `SIM ${iccid} rotated successfully after cancel+restore recovery`, recovered: true };
+    } catch (recoveryErr) {
+      console.error(`SIM ${iccid}: recovery failed: ${recoveryErr}`);
+      await updateSimRotationError(env, sim.id, `Cancel+Restore recovery failed: ${recoveryErr}`).catch(() => {});
+      return {
+        ok: false,
+        iccid,
+        error: `Rotation failed after 3 attempts and cancel+restore recovery. Last rotation error: ${lastError}. Recovery error: ${recoveryErr}`,
+      };
+    }
+  } catch (err) {
+    console.error(`Manual rotation failed for ${iccid}: ${err}`);
+    return { ok: false, iccid, error: String(err) };
+  }
 }
 
 // ===========================
@@ -324,6 +433,95 @@ async function hxSubscriberDetails(env, token, mobilitySubscriptionId, runId, ic
   return json;
 }
 
+// ===========================
+// Cancel + Restore cycle (used after 3 rotation failures)
+// ===========================
+async function cancelAndRestoreSim(env, token, sim) {
+  const subId = sim.mobility_subscription_id;
+  const iccid = sim.iccid;
+  const runId = `recovery_${iccid}_${Date.now()}`;
+
+  // 1) Get current phone number for the subscriber
+  const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
+  const d = Array.isArray(details) ? details[0] : null;
+  const subscriberNumber = d?.phoneNumber;
+
+  if (!subscriberNumber) {
+    throw new Error(`Cannot recover SIM ${iccid}: no phoneNumber found`);
+  }
+
+  // Strip to 10 digits for Helix status change API
+  const mdn = String(subscriberNumber).replace(/\D/g, "").replace(/^1/, "");
+
+  // 2) Cancel the subscriber
+  console.log(`SIM ${iccid}: canceling subscriber ${mdn}`);
+  await hxChangeSubscriberStatus(env, token, {
+    mobilitySubscriptionId: subId,
+    subscriberNumber: mdn,
+    reasonCode: "CAN",
+    reasonCodeId: 1,
+    subscriberState: "Cancel",
+  }, runId, iccid, "cancel");
+
+  // 3) Brief pause to let the cancel propagate
+  await sleep(3000);
+
+  // 4) Restore (Resume On Cancel) the subscriber
+  console.log(`SIM ${iccid}: restoring subscriber ${mdn}`);
+  await hxChangeSubscriberStatus(env, token, {
+    mobilitySubscriptionId: subId,
+    subscriberNumber: mdn,
+    reasonCode: "BBL",
+    reasonCodeId: 20,
+    subscriberState: "Resume On Cancel",
+  }, runId, iccid, "restore");
+
+  // 5) Brief pause to let the restore propagate
+  await sleep(3000);
+
+  console.log(`SIM ${iccid}: cancel + restore cycle complete`);
+}
+
+async function hxChangeSubscriberStatus(env, token, statusPayload, runId, iccid, stepName) {
+  const url = `${env.HX_API_BASE}/api/mobility-subscriber/ctn`;
+  const method = "PATCH";
+  const requestBody = statusPayload;
+
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  const responseText = await res.text();
+  let json = {};
+  try {
+    json = JSON.parse(responseText);
+  } catch {}
+
+  await logHelixApiCall(env, {
+    run_id: runId,
+    step: stepName,
+    iccid,
+    request_url: url,
+    request_method: method,
+    request_body: requestBody,
+    response_status: res.status,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: json,
+    error: res.ok ? null : `${stepName} failed: ${res.status}`,
+  });
+
+  if (!res.ok) {
+    throw new Error(`${stepName} failed: ${res.status} ${JSON.stringify(json)}`);
+  }
+  return json;
+}
+
 function normalizeUS(phone) {
   const digits = String(phone).replace(/\D/g, "");
   if (digits.length === 10) return `+1${digits}`;
@@ -478,6 +676,20 @@ async function updateSimRotationTimestamp(env, simId) {
     }
   );
   console.log(`[DB] Updated rotation timestamp for sim_id=${simId}`);
+}
+
+async function updateSimRotationError(env, simId, errorMessage) {
+  console.log(`[DB] Recording rotation error for sim_id=${simId}`);
+  await supabasePatch(
+    env,
+    `sims?id=eq.${encodeURIComponent(String(simId))}`,
+    {
+      rotation_status: 'failed',
+      last_rotation_error: errorMessage,
+      last_rotation_at: new Date().toISOString(),
+    }
+  );
+  console.log(`[DB] Recorded rotation error for sim_id=${simId}`);
 }
 
 async function findResellerIdBySimId(env, simId) {
@@ -696,7 +908,7 @@ async function sendErrorSummaryToSlack(env) {
   // Get errors from the last 24 hours
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-  const query = `helix_api_logs?select=iccid,step,error,response_status,created_at&or=(response_ok.eq.false,error.not.is.null)&created_at=gte.${encodeURIComponent(since)}&order=created_at.desc`;
+  const query = `helix_api_logs?select=iccid,step,error,response_status,request_body,created_at&or=(response_ok.eq.false,error.not.is.null)&created_at=gte.${encodeURIComponent(since)}&order=created_at.desc`;
 
   let errors = [];
   try {
@@ -731,12 +943,12 @@ async function sendErrorSummaryToSlack(env) {
 
   // Format Slack message
   const errorLines = uniqueErrors.slice(0, 20).map(err => {
-    const iccid = err.iccid || "unknown";
-    const shortIccid = iccid.length > 10 ? `...${iccid.slice(-6)}` : iccid;
+    const subId = err.request_body?.mobilitySubscriptionId || err.request_body?.mobilitySubscriptionId || null;
+    const identifier = subId ? `SUB:${subId}` : (err.iccid || "unknown");
     const step = err.step || "unknown";
     const status = err.response_status || "N/A";
     const errorMsg = (err.error || "Unknown error").slice(0, 100);
-    return `• \`${shortIccid}\` [${step}] HTTP ${status}: ${errorMsg}`;
+    return `• \`${identifier}\` [${step}] HTTP ${status}: ${errorMsg}`;
   });
 
   if (uniqueErrors.length > 20) {
