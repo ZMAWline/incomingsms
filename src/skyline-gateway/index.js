@@ -35,6 +35,9 @@ export default {
       if (request.method === "GET" && url.pathname === "/port-status") {
         return await handlePortStatus(url, env);
       }
+      if (request.method === "GET" && url.pathname === "/port-info") {
+        return await handlePortInfo(url, env);
+      }
       if (request.method === "POST" && url.pathname === "/lock") {
         return await handlePortCommand(request, env, "lock");
       }
@@ -244,6 +247,92 @@ async function handlePortStatus(url, env) {
   }
 
   return json({ ok: true, skyline_response: result.data });
+}
+
+async function handlePortInfo(url, env) {
+  const gatewayId = url.searchParams.get("gateway_id");
+  if (!gatewayId) {
+    return json({ ok: false, error: "gateway_id query param is required" }, 400);
+  }
+
+  const { gateway, error } = await loadAndHandshake(env, gatewayId);
+  if (error) return error;
+
+  // Fetch device status (includes st, iccid, imei, signal, operator per port)
+  const params = new URLSearchParams({
+    version: "1.1",
+    username: gateway.username,
+    password: gateway.password,
+    ports: "all",
+  });
+
+  const infoUrl = `http://${gateway.host}:${gateway.api_port || 80}/goip_get_status.html?${params}`;
+  const result = await bridgeFetch(env, infoUrl, "GET");
+
+  await logSkylineApiCall(env, {
+    action: "port_info",
+    gateway_id: gatewayId,
+    port: "all",
+    requestUrl: infoUrl.replace(gateway.password, "***"),
+    requestBody: null,
+    responseStatus: result.status,
+    responseOk: result.ok,
+    responseBody: null, // skip logging full response (large)
+    error: result.error,
+  });
+
+  if (!result.ok) {
+    return json({ ok: false, error: result.error || "Skyline API error", skyline_response: result.data }, 502);
+  }
+
+  // Also fetch SIM-to-number mapping from Supabase for this gateway
+  const simsRes = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/sims?select=id,iccid,port,slot,status,sim_numbers(e164,verification_status)&gateway_id=eq.${encodeURIComponent(gatewayId)}&sim_numbers.valid_to=is.null&order=id.asc`,
+    {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        Accept: "application/json",
+      },
+    }
+  );
+
+  let simMap = {};
+  if (simsRes.ok) {
+    const sims = await simsRes.json();
+    for (const sim of sims) {
+      if (sim.iccid) {
+        simMap[sim.iccid] = {
+          sim_id: sim.id,
+          port: sim.port,
+          status: sim.status,
+          number: sim.sim_numbers?.[0]?.e164 || null,
+          verified: sim.sim_numbers?.[0]?.verification_status || null,
+        };
+      }
+    }
+  }
+
+  // Merge gateway status with SIM info
+  const ports = (result.data?.status || []).map(p => {
+    const simInfo = simMap[p.iccid] || null;
+    return {
+      port: p.port,
+      st: p.st,
+      iccid: p.iccid || null,
+      imei: p.imei || null,
+      signal: p.sig ?? null,
+      operator: p.opr || null,
+      inserted: p.inserted,
+      active: p.active,
+      sim_id: simInfo?.sim_id || null,
+      number: simInfo?.number || null,
+      sim_status: simInfo?.status || null,
+      verified: simInfo?.verified || null,
+    };
+  });
+
+  return json({ ok: true, gateway: { code: gateway.code, name: gateway.name, mac: result.data?.mac }, ports });
 }
 
 async function handlePortCommand(request, env, op) {

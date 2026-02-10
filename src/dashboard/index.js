@@ -2544,7 +2544,7 @@ function getHTML() {
             grid.innerHTML = '<p class="text-gray-400 text-sm col-span-full text-center py-8">Loading...</p>';
 
             try {
-                const response = await fetch(\`\${API_BASE}/skyline/port-status?gateway_id=\${gatewayId}\`);
+                const response = await fetch(\`\${API_BASE}/skyline/port-info?gateway_id=\${gatewayId}\`);
                 const result = await response.json();
 
                 if (!result.ok) {
@@ -2553,25 +2553,41 @@ function getHTML() {
                     return;
                 }
 
-                const stats = result.skyline_response?.stats || result.skyline_response?.data?.stats || [];
-                if (stats.length === 0) {
+                const ports = result.ports || [];
+                if (ports.length === 0) {
                     grid.innerHTML = '<p class="text-gray-500 text-sm col-span-full text-center py-8">No port data returned</p>';
                     label.textContent = 'No data';
                     return;
                 }
 
-                label.textContent = \`\${stats.length} port(s) - Updated \${new Date().toLocaleTimeString()}\`;
+                label.textContent = \`\${ports.length} port(s) - Updated \${new Date().toLocaleTimeString()}\`;
 
-                grid.innerHTML = stats.map(s => {
-                    const portLabel = s.port + (s.slot ? '.' + s.slot : '');
-                    const status = s.status ?? s.port_status ?? -1;
-                    const info = PORT_STATUS_COLORS[status] || { bg: 'bg-gray-600', label: 'Unknown' };
-                    const sentOk = s.sent_ok ?? 0;
-                    const received = s.received ?? 0;
+                grid.innerHTML = ports.map(p => {
+                    const portLabel = p.port || '?';
+                    const st = p.st ?? -1;
+                    const info = PORT_STATUS_COLORS[st] || { bg: 'bg-gray-600', label: 'Unknown' };
+                    const number = p.number ? p.number.replace('+1', '') : '';
+                    const sig = p.signal != null ? p.signal : '-';
+                    const shortIccid = p.iccid ? '...' + p.iccid.slice(-6) : '';
+
+                    const tooltip = [
+                        'Port ' + portLabel + ': ' + info.label + ' (st=' + st + ')',
+                        p.number ? 'Number: ' + p.number : 'No number assigned',
+                        p.iccid ? 'ICCID: ' + p.iccid : '',
+                        p.imei ? 'IMEI: ' + p.imei : '',
+                        p.operator ? 'Operator: ' + p.operator : '',
+                        'Signal: ' + sig,
+                        p.sim_status ? 'SIM Status: ' + p.sim_status : '',
+                    ].filter(Boolean).join('\\n');
+
                     return \`
-                        <div class="flex flex-col items-center p-2 rounded-lg bg-dark-700 border border-dark-500 hover:border-dark-400 transition cursor-pointer group" title="Port \${portLabel}: \${info.label} (status \${status})\\nSent: \${sentOk}, Rcvd: \${received}" onclick="selectPort('\${portLabel}')">
-                            <div class="w-4 h-4 rounded-full \${info.bg} mb-1"></div>
-                            <span class="text-xs font-medium text-gray-200">\${portLabel}</span>
+                        <div class="flex flex-col items-center p-2 rounded-lg bg-dark-700 border border-dark-500 hover:border-dark-400 transition cursor-pointer group relative" title="\${tooltip}" onclick="selectPort('\${portLabel}')">
+                            <div class="flex items-center gap-1 mb-1">
+                                <div class="w-3 h-3 rounded-full \${info.bg}"></div>
+                                <span class="text-[10px] text-gray-500">\${sig}</span>
+                            </div>
+                            <span class="text-xs font-bold text-gray-200">\${portLabel.split('.')[0]}</span>
+                            \${number ? \`<span class="text-[10px] text-accent font-medium truncate max-w-full">\${number}</span>\` : \`<span class="text-[10px] text-gray-600">---</span>\`}
                             <span class="text-[10px] text-gray-500">\${info.label}</span>
                         </div>
                     \`;
