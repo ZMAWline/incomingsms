@@ -8,6 +8,13 @@ workers_dev = true
 enabled = true
 invocation_logs = true
 
+# ============ REQUIRED SECRETS ============
+# Set these via: wrangler secret put <NAME>
+#   SUPABASE_URL              - Supabase project URL
+#   SUPABASE_SERVICE_ROLE_KEY - Supabase service role key
+#   SKYLINE_SECRET            - Shared secret for worker-to-worker auth
+#   SKYLINE_BRIDGE_SECRET     - Secret for Supabase Edge Function bridge
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "skyline-gateway-test"

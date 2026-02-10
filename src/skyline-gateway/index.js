@@ -66,11 +66,8 @@ async function handleSendSms(request, env) {
     return json({ ok: false, error: "gateway_id, port, to, and message are required" }, 400);
   }
 
-  const gateway = await loadGateway(env, gateway_id);
-  if (!gateway) return json({ ok: false, error: "Gateway not found" }, 404);
-  if (!gateway.host || !gateway.username || !gateway.password) {
-    return json({ ok: false, error: `Gateway "${gateway.code}" missing credentials` }, 400);
-  }
+  const { gateway, error } = await loadAndHandshake(env, gateway_id);
+  if (error) return error;
 
   const payload = {
     type: "send-sms",
@@ -85,7 +82,7 @@ async function handleSendSms(request, env) {
     }],
   };
 
-  const result = await skylineFetch(gateway, "/goip_post_sms.html", "POST", payload);
+  const result = await skylineFetch(env, gateway, "/goip_post_sms.html", "POST", payload);
 
   await logSkylineApiCall(env, {
     action: "send_sms",
@@ -118,14 +115,11 @@ async function handleSwitchSim(request, env) {
     return json({ ok: false, error: "gateway_id and port are required" }, 400);
   }
 
-  const gateway = await loadGateway(env, gateway_id);
-  if (!gateway) return json({ ok: false, error: "Gateway not found" }, 404);
-  if (!gateway.host || !gateway.username || !gateway.password) {
-    return json({ ok: false, error: `Gateway "${gateway.code}" missing credentials` }, 400);
-  }
+  const { gateway, error } = await loadAndHandshake(env, gateway_id);
+  if (error) return error;
 
   const payload = { type: "command", op: "switch", ports: port };
-  const result = await skylineFetch(gateway, "/goip_send_cmd.html", "POST", payload);
+  const result = await skylineFetch(env, gateway, "/goip_send_cmd.html", "POST", payload);
 
   await logSkylineApiCall(env, {
     action: "switch_sim",
@@ -154,14 +148,11 @@ async function handleGetImei(request, env) {
     return json({ ok: false, error: "gateway_id and port are required" }, 400);
   }
 
-  const gateway = await loadGateway(env, gateway_id);
-  if (!gateway) return json({ ok: false, error: "Gateway not found" }, 404);
-  if (!gateway.host || !gateway.username || !gateway.password) {
-    return json({ ok: false, error: `Gateway "${gateway.code}" missing credentials` }, 400);
-  }
+  const { gateway, error } = await loadAndHandshake(env, gateway_id);
+  if (error) return error;
 
   const payload = { type: "command", op: "get", ports: port, prop: "imei" };
-  const result = await skylineFetch(gateway, "/goip_send_cmd.html", "POST", payload);
+  const result = await skylineFetch(env, gateway, "/goip_send_cmd.html", "POST", payload);
 
   await logSkylineApiCall(env, {
     action: "get_imei",
@@ -190,14 +181,11 @@ async function handleSetImei(request, env) {
     return json({ ok: false, error: "gateway_id, port, and imei are required" }, 400);
   }
 
-  const gateway = await loadGateway(env, gateway_id);
-  if (!gateway) return json({ ok: false, error: "Gateway not found" }, 404);
-  if (!gateway.host || !gateway.username || !gateway.password) {
-    return json({ ok: false, error: `Gateway "${gateway.code}" missing credentials` }, 400);
-  }
+  const { gateway, error } = await loadAndHandshake(env, gateway_id);
+  if (error) return error;
 
   const payload = { type: "command", op: "set", ports: port, prop: "imei", value: imei };
-  const result = await skylineFetch(gateway, "/goip_send_cmd.html", "POST", payload);
+  const result = await skylineFetch(env, gateway, "/goip_send_cmd.html", "POST", payload);
 
   await logSkylineApiCall(env, {
     action: "set_imei",
@@ -224,13 +212,10 @@ async function handlePortStatus(url, env) {
     return json({ ok: false, error: "gateway_id query param is required" }, 400);
   }
 
-  const gateway = await loadGateway(env, gatewayId);
-  if (!gateway) return json({ ok: false, error: "Gateway not found" }, 404);
-  if (!gateway.host || !gateway.username || !gateway.password) {
-    return json({ ok: false, error: `Gateway "${gateway.code}" missing credentials` }, 400);
-  }
+  const { gateway, error } = await loadAndHandshake(env, gatewayId);
+  if (error) return error;
 
-  // Use GET with query params for status
+  // Handshake already confirmed connectivity, now fetch full stats via bridge
   const params = new URLSearchParams({
     version: "1.1",
     username: gateway.username,
@@ -240,17 +225,7 @@ async function handlePortStatus(url, env) {
   });
 
   const statusUrl = `http://${gateway.host}:${gateway.api_port || 80}/goip_get_sms_stat.html?${params}`;
-
-  let result;
-  try {
-    const res = await fetch(statusUrl);
-    const text = await res.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
-    result = { url: statusUrl, status: res.status, ok: res.ok && (data.code === 200 || !data.code), data, error: null };
-  } catch (err) {
-    result = { url: statusUrl, status: 0, ok: false, data: null, error: String(err) };
-  }
+  const result = await bridgeFetch(env, statusUrl, "GET");
 
   await logSkylineApiCall(env, {
     action: "port_status",
@@ -279,14 +254,11 @@ async function handlePortCommand(request, env, op) {
     return json({ ok: false, error: "gateway_id and port are required" }, 400);
   }
 
-  const gateway = await loadGateway(env, gateway_id);
-  if (!gateway) return json({ ok: false, error: "Gateway not found" }, 404);
-  if (!gateway.host || !gateway.username || !gateway.password) {
-    return json({ ok: false, error: `Gateway "${gateway.code}" missing credentials` }, 400);
-  }
+  const { gateway, error } = await loadAndHandshake(env, gateway_id);
+  if (error) return error;
 
   const payload = { type: "command", op, ports: port };
-  const result = await skylineFetch(gateway, "/goip_send_cmd.html", "POST", payload);
+  const result = await skylineFetch(env, gateway, "/goip_send_cmd.html", "POST", payload);
 
   await logSkylineApiCall(env, {
     action: op,
@@ -309,6 +281,36 @@ async function handlePortCommand(request, env, op) {
 
 /* ================= CORE FUNCTIONS ================= */
 
+/**
+ * Load gateway from DB, validate credentials, and perform handshake.
+ * Returns { gateway } on success or { error: Response } on failure.
+ */
+async function loadAndHandshake(env, gatewayId) {
+  const gateway = await loadGateway(env, gatewayId);
+  if (!gateway) return { error: json({ ok: false, error: "Gateway not found" }, 404) };
+  if (!gateway.host || !gateway.username || !gateway.password) {
+    return { error: json({ ok: false, error: `Gateway "${gateway.code}" missing credentials` }, 400) };
+  }
+
+  const shake = await handshake(env, gateway);
+  if (!shake.ok) {
+    await logSkylineApiCall(env, {
+      action: "handshake",
+      gateway_id: gatewayId,
+      port: null,
+      requestUrl: `http://${gateway.host}:${gateway.api_port || 80}/goip_get_sms_stat.html`,
+      requestBody: null,
+      responseStatus: 0,
+      responseOk: false,
+      responseBody: null,
+      error: shake.error,
+    });
+    return { error: json({ ok: false, error: shake.error }, 502) };
+  }
+
+  return { gateway };
+}
+
 async function loadGateway(env, gatewayId) {
   const res = await fetch(
     `${env.SUPABASE_URL}/rest/v1/gateways?select=id,code,name,host,api_port,username,password,total_ports&id=eq.${encodeURIComponent(gatewayId)}&limit=1`,
@@ -330,30 +332,77 @@ async function loadGateway(env, gatewayId) {
   return gateways?.[0] || null;
 }
 
-async function skylineFetch(gateway, endpoint, method, payload) {
+/**
+ * Route a request through the Supabase Edge Function bridge
+ * to break out of Cloudflare's network and reach the gateway IP.
+ */
+async function bridgeFetch(env, targetUrl, method, headers, payload) {
+  const bridgeUrl = `${env.SUPABASE_URL}/functions/v1/skyline-bridge`;
+
+  try {
+    const res = await fetch(bridgeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-bridge-secret": env.SKYLINE_BRIDGE_SECRET,
+      },
+      body: JSON.stringify({
+        url: targetUrl,
+        method: method || "GET",
+        headers: headers || undefined,
+        payload: payload || undefined,
+      }),
+    });
+
+    const result = await res.json();
+
+    if (!result.ok) {
+      return { url: targetUrl, status: 0, ok: false, data: null, error: result.error || "Bridge error" };
+    }
+
+    const data = result.data;
+    const ok = result.status >= 200 && result.status < 300 && (data.code === 200 || data.code === undefined);
+    return { url: targetUrl, status: result.status, ok, data, error: ok ? null : (data.reason || `HTTP ${result.status}`) };
+  } catch (err) {
+    return { url: targetUrl, status: 0, ok: false, data: null, error: String(err) };
+  }
+}
+
+/**
+ * Handshake: verify gateway is reachable and credentials are valid
+ * before performing any operation. Uses a lightweight status query via the bridge.
+ */
+async function handshake(env, gateway) {
+  const apiPort = gateway.api_port || 80;
+  const params = new URLSearchParams({
+    version: "1.1",
+    username: gateway.username,
+    password: gateway.password,
+    ports: "1",
+    type: "3",
+  });
+  const url = `http://${gateway.host}:${apiPort}/goip_get_sms_stat.html?${params}`;
+
+  const result = await bridgeFetch(env, url, "GET");
+
+  if (!result.ok) {
+    const errMsg = result.error || "Handshake failed";
+    return { ok: false, error: errMsg.includes("Handshake") ? errMsg : `Handshake failed: ${errMsg}` };
+  }
+
+  console.log(`[SkylineGateway] Handshake OK with ${gateway.code} (${gateway.host}:${apiPort})`);
+  return { ok: true };
+}
+
+async function skylineFetch(env, gateway, endpoint, method, payload) {
   const apiPort = gateway.api_port || 80;
   const url = `http://${gateway.host}:${apiPort}${endpoint}`;
   const authHeader = "Basic " + btoa(`${gateway.username}:${gateway.password}`);
 
-  try {
-    const res = await fetch(url, {
-      method,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: authHeader,
-      },
-      body: payload ? JSON.stringify(payload) : undefined,
-    });
-
-    const text = await res.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
-
-    const ok = res.ok && (data.code === 200 || data.code === undefined);
-    return { url, status: res.status, ok, data, error: ok ? null : (data.reason || `HTTP ${res.status}`) };
-  } catch (err) {
-    return { url, status: 0, ok: false, data: null, error: String(err) };
-  }
+  return await bridgeFetch(env, url, method, {
+    "Content-Type": "application/json",
+    Authorization: authHeader,
+  }, payload);
 }
 
 async function logSkylineApiCall(env, logData) {
