@@ -485,12 +485,14 @@ async function handshake(env, gateway) {
 
 async function skylineFetch(env, gateway, endpoint, method, payload) {
   const apiPort = gateway.api_port || 80;
-  const url = `http://${gateway.host}:${apiPort}${endpoint}`;
-  const authHeader = "Basic " + btoa(`${gateway.username}:${gateway.password}`);
+  const authParams = new URLSearchParams({
+    username: gateway.username,
+    password: gateway.password,
+  });
+  const url = `http://${gateway.host}:${apiPort}${endpoint}?${authParams}`;
 
   return await bridgeFetch(env, url, method, {
     "Content-Type": "application/json",
-    Authorization: authHeader,
   }, payload);
 }
 
