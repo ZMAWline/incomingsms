@@ -87,6 +87,10 @@ export default {
       return handleSendTestSms(request, env, corsHeaders);
     }
 
+    if (url.pathname.startsWith('/api/skyline/')) {
+      return handleSkylineProxy(request, env, url, corsHeaders);
+    }
+
     // Debug endpoint to test worker-to-worker connectivity via service binding
     if (url.pathname === '/api/debug-cancel') {
       try {
@@ -1020,89 +1024,93 @@ async function handleSendTestSms(request, env, corsHeaders) {
       });
     }
 
-    // Get gateway credentials from database
-    const gwResponse = await supabaseGet(env, `gateways?select=id,code,host,api_port,username,password&id=eq.${gateway_id}&limit=1`);
-    const gateways = await gwResponse.json();
-
-    if (!gateways || gateways.length === 0) {
-      return new Response(JSON.stringify({ error: 'Gateway not found' }), {
-        status: 404,
+    // Proxy through SKYLINE_GATEWAY service binding
+    if (!env.SKYLINE_GATEWAY || !env.SKYLINE_SECRET) {
+      return new Response(JSON.stringify({ error: 'SKYLINE_GATEWAY or SKYLINE_SECRET not configured' }), {
+        status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
-    const gateway = gateways[0];
+    console.log(`[SendTestSms] Proxying to skyline-gateway: gateway=${gateway_id} port=${port} to=${to_number}`);
 
-    if (!gateway.host || !gateway.username || !gateway.password) {
-      return new Response(JSON.stringify({ error: `Gateway "${gateway.code}" missing credentials (host, username, or password)` }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
+    const skylineRes = await env.SKYLINE_GATEWAY.fetch(
+      `https://skyline-gateway/send-sms?secret=${encodeURIComponent(env.SKYLINE_SECRET)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gateway_id, port, to: to_number, message }),
+      }
+    );
 
-    const apiPort = gateway.api_port || 80;
-    const skylineUrl = `http://${gateway.host}:${apiPort}/goip_post_sms.html`;
+    const responseText = await skylineRes.text();
+    let result;
+    try { result = JSON.parse(responseText); } catch { result = { raw: responseText }; }
 
-    // Build the SMS payload for Skyline API
-    const smsPayload = {
-      type: 'send-sms',
-      task_num: 1,
-      tasks: [{
-        tid: Date.now(),
-        port: port,
-        to: to_number,
-        sms: message,
-        smstype: 0,
-        coding: 0
-      }]
-    };
-
-    console.log(`[SendTestSms] Sending to Skyline (${gateway.code}): ${skylineUrl}`);
-    console.log(`[SendTestSms] Payload: ${JSON.stringify(smsPayload)}`);
-
-    // Send to Skyline API
-    const authHeader = 'Basic ' + btoa(`${gateway.username}:${gateway.password}`);
-    const skylineRes = await fetch(skylineUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': authHeader
-      },
-      body: JSON.stringify(smsPayload)
+    return new Response(JSON.stringify(result, null, 2), {
+      status: skylineRes.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
-
-    const skylineText = await skylineRes.text();
-    console.log(`[SendTestSms] Skyline response: ${skylineRes.status} - ${skylineText}`);
-
-    let skylineData;
-    try {
-      skylineData = JSON.parse(skylineText);
-    } catch {
-      skylineData = { raw: skylineText };
-    }
-
-    if (skylineRes.ok && skylineData.code === 200) {
-      return new Response(JSON.stringify({
-        ok: true,
-        message: `SMS sent to ${to_number} via ${gateway.code} port ${port}`,
-        skyline_response: skylineData
-      }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    } else {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: skylineData.reason || 'Skyline API error',
-        skyline_response: skylineData
-      }), {
-        status: 502,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
 
   } catch (error) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleSkylineProxy(request, env, url, corsHeaders) {
+  if (!env.SKYLINE_GATEWAY) {
+    return new Response(JSON.stringify({ error: 'SKYLINE_GATEWAY service binding not configured' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+
+  if (!env.SKYLINE_SECRET) {
+    return new Response(JSON.stringify({ error: 'SKYLINE_SECRET not configured' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+
+  // Map /api/skyline/send-sms -> /send-sms, etc.
+  const skylinePath = url.pathname.replace('/api/skyline', '');
+  const targetUrl = `https://skyline-gateway${skylinePath}?secret=${encodeURIComponent(env.SKYLINE_SECRET)}`;
+
+  try {
+    let skylineResponse;
+    if (request.method === 'GET') {
+      // Forward query params for GET requests (like port-status)
+      const params = new URLSearchParams(url.searchParams);
+      params.set('secret', env.SKYLINE_SECRET);
+      skylineResponse = await env.SKYLINE_GATEWAY.fetch(
+        `https://skyline-gateway${skylinePath}?${params}`,
+        { method: 'GET' }
+      );
+    } else {
+      const body = await request.text();
+      skylineResponse = await env.SKYLINE_GATEWAY.fetch(targetUrl, {
+        method: request.method,
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+    }
+
+    const responseText = await skylineResponse.text();
+    let result;
+    try { result = JSON.parse(responseText); } catch { result = { raw: responseText }; }
+
+    return new Response(JSON.stringify(result, null, 2), {
+      status: skylineResponse.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (fetchError) {
+    return new Response(JSON.stringify({
+      error: `Failed to reach skyline-gateway: ${String(fetchError)}`
+    }), {
+      status: 502,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
@@ -1174,6 +1182,9 @@ function getHTML() {
                 </button>
                 <button onclick="switchTab('workers')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Workers">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                </button>
+                <button onclick="switchTab('gateway')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Gateway">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
                 </button>
             </nav>
             <div class="mt-auto">
@@ -1459,6 +1470,74 @@ function getHTML() {
                     </div>
                 </div>
             </div>
+
+            <!-- Gateway Tab -->
+            <div id="tab-gateway" class="tab-content hidden">
+                <!-- Gateway Selector -->
+                <div class="flex flex-wrap items-center gap-4 mb-6">
+                    <select id="gw-select" onchange="loadPortStatus()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-4 py-2 text-gray-200 focus:outline-none focus:border-accent min-w-[200px]">
+                        <option value="">Select a gateway...</option>
+                    </select>
+                    <button onclick="loadPortStatus()" class="px-3 py-2 text-sm bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Refresh</button>
+                    <span id="gw-status-label" class="text-xs text-gray-500"></span>
+                </div>
+
+                <!-- Port Status Grid -->
+                <div class="bg-dark-800 rounded-xl border border-dark-600 mb-6">
+                    <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                        <h2 class="text-lg font-semibold text-white">Port Status</h2>
+                        <div class="flex items-center gap-3 text-xs text-gray-500">
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-green-500 inline-block"></span> Registered</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-yellow-500 inline-block"></span> Registering</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-blue-500 inline-block"></span> Idle</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-red-500 inline-block"></span> Error/No SIM</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-orange-500 inline-block"></span> No Balance</span>
+                        </div>
+                    </div>
+                    <div id="port-grid" class="p-5 grid grid-cols-4 md:grid-cols-8 lg:grid-cols-16 gap-2">
+                        <p class="text-gray-500 text-sm col-span-full text-center py-8">Select a gateway to view port status</p>
+                    </div>
+                </div>
+
+                <!-- Quick Actions -->
+                <div class="bg-dark-800 rounded-xl border border-dark-600">
+                    <div class="px-5 py-4 border-b border-dark-600">
+                        <h2 class="text-lg font-semibold text-white">Gateway Actions</h2>
+                    </div>
+                    <div class="p-5 grid grid-cols-2 md:grid-cols-5 gap-3">
+                        <button onclick="showGwSwitchSimModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-purple-500/20 flex items-center justify-center group-hover:bg-purple-500/30 transition">
+                                <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Switch SIM</span>
+                        </button>
+                        <button onclick="showGwImeiModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-teal-500/20 flex items-center justify-center group-hover:bg-teal-500/30 transition">
+                                <svg class="w-5 h-5 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V8a2 2 0 00-2-2h-5m-4 0V5a2 2 0 114 0v1m-4 0a2 2 0 104 0m-5 8a2 2 0 100-4 2 2 0 000 4zm0 0c1.306 0 2.417.835 2.83 2M9 14a3.001 3.001 0 00-2.83 2M15 11h3m-3 4h2"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">IMEI</span>
+                        </button>
+                        <button onclick="showGwCommandModal('reboot')" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-orange-500/20 flex items-center justify-center group-hover:bg-orange-500/30 transition">
+                                <svg class="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Reboot</span>
+                        </button>
+                        <button onclick="showGwCommandModal('lock')" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-red-500/20 flex items-center justify-center group-hover:bg-red-500/30 transition">
+                                <svg class="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Lock</span>
+                        </button>
+                        <button onclick="showGwCommandModal('unlock')" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-emerald-500/20 flex items-center justify-center group-hover:bg-emerald-500/30 transition">
+                                <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Unlock</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
         </main>
     </div>
 
@@ -1614,6 +1693,79 @@ function getHTML() {
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
                 <button onclick="hideTestSmsModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
                 <button onclick="sendTestSms()" id="test-sms-btn" class="px-4 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition">Send SMS</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Gateway Switch SIM Modal -->
+    <div id="gw-switch-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Switch SIM</h3>
+            </div>
+            <div class="p-5 space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-400 mb-2">Port</label>
+                    <input type="text" id="gw-switch-port" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="e.g. 1A, 2B"/>
+                    <p class="text-xs text-gray-500 mt-1">Switches to the next SIM slot on the port</p>
+                </div>
+                <div id="gw-switch-result" class="hidden">
+                    <pre id="gw-switch-output" class="bg-dark-900 p-3 rounded-lg text-xs font-mono overflow-x-auto text-gray-300 border border-dark-600"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideGwModal('gw-switch-modal')" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                <button onclick="gwSwitchSim()" id="gw-switch-btn" class="px-4 py-2 text-sm bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition">Switch SIM</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Gateway IMEI Modal -->
+    <div id="gw-imei-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">IMEI Management</h3>
+            </div>
+            <div class="p-5 space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-400 mb-2">Port</label>
+                    <input type="text" id="gw-imei-port" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="e.g. 1A"/>
+                </div>
+                <div>
+                    <label class="block text-sm text-gray-400 mb-2">IMEI (for Set only)</label>
+                    <input type="text" id="gw-imei-value" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="15-digit IMEI"/>
+                </div>
+                <div id="gw-imei-result" class="hidden">
+                    <pre id="gw-imei-output" class="bg-dark-900 p-3 rounded-lg text-xs font-mono overflow-x-auto text-gray-300 border border-dark-600 max-h-48 overflow-y-auto"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideGwModal('gw-imei-modal')" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
+                <button onclick="gwGetImei()" id="gw-get-imei-btn" class="px-4 py-2 text-sm bg-teal-600 hover:bg-teal-700 text-white rounded-lg transition">Get IMEI</button>
+                <button onclick="gwSetImei()" id="gw-set-imei-btn" class="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Set IMEI</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Gateway Port Command Modal -->
+    <div id="gw-command-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white" id="gw-command-title">Port Command</h3>
+            </div>
+            <div class="p-5 space-y-4">
+                <div>
+                    <label class="block text-sm text-gray-400 mb-2">Port(s)</label>
+                    <input type="text" id="gw-command-port" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="e.g. 1A or 1A,2A,3A"/>
+                    <p class="text-xs text-gray-500 mt-1">Comma-separated for multiple ports</p>
+                </div>
+                <div id="gw-command-result" class="hidden">
+                    <pre id="gw-command-output" class="bg-dark-900 p-3 rounded-lg text-xs font-mono overflow-x-auto text-gray-300 border border-dark-600"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideGwModal('gw-command-modal')" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                <button onclick="gwRunCommand()" id="gw-command-btn" class="px-4 py-2 text-sm bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Execute</button>
             </div>
         </div>
     </div>
@@ -2345,6 +2497,242 @@ function getHTML() {
             }
         }
 
+        // ===== Gateway Tab Functions =====
+
+        let gwCurrentCommand = 'reboot';
+
+        async function loadGatewayDropdown() {
+            const select = document.getElementById('gw-select');
+            try {
+                const response = await fetch(\`\${API_BASE}/gateways\`);
+                const gateways = await response.json();
+                select.innerHTML = '<option value="">Select a gateway...</option>' +
+                    gateways.map(gw => \`<option value="\${gw.id}">\${gw.code}\${gw.name ? ' - ' + gw.name : ''}</option>\`).join('');
+            } catch (error) {
+                console.error('Failed to load gateways:', error);
+                select.innerHTML = '<option value="">Error loading gateways</option>';
+            }
+        }
+
+        const PORT_STATUS_COLORS = {
+            0: { bg: 'bg-red-500', label: 'No SIM' },
+            1: { bg: 'bg-blue-500', label: 'Idle' },
+            2: { bg: 'bg-yellow-500', label: 'Registering' },
+            3: { bg: 'bg-green-500', label: 'Registered' },
+            4: { bg: 'bg-green-400', label: 'Call' },
+            5: { bg: 'bg-orange-500', label: 'No Balance' },
+            6: { bg: 'bg-red-500', label: 'Reg Failed' },
+            7: { bg: 'bg-gray-500', label: 'Dev Locked' },
+            8: { bg: 'bg-gray-500', label: 'Op Locked' },
+            9: { bg: 'bg-red-600', label: 'SIM Error' },
+            12: { bg: 'bg-gray-500', label: 'User Locked' },
+            15: { bg: 'bg-blue-400', label: 'Mobile Net' },
+            16: { bg: 'bg-red-500', label: 'Timeout' },
+        };
+
+        async function loadPortStatus() {
+            const gatewayId = document.getElementById('gw-select').value;
+            const grid = document.getElementById('port-grid');
+            const label = document.getElementById('gw-status-label');
+
+            if (!gatewayId) {
+                grid.innerHTML = '<p class="text-gray-500 text-sm col-span-full text-center py-8">Select a gateway to view port status</p>';
+                label.textContent = '';
+                return;
+            }
+
+            grid.innerHTML = '<p class="text-gray-400 text-sm col-span-full text-center py-8">Loading...</p>';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/skyline/port-status?gateway_id=\${gatewayId}\`);
+                const result = await response.json();
+
+                if (!result.ok) {
+                    grid.innerHTML = \`<p class="text-red-400 text-sm col-span-full text-center py-8">Error: \${result.error}</p>\`;
+                    label.textContent = '';
+                    return;
+                }
+
+                const stats = result.skyline_response?.stats || result.skyline_response?.data?.stats || [];
+                if (stats.length === 0) {
+                    grid.innerHTML = '<p class="text-gray-500 text-sm col-span-full text-center py-8">No port data returned</p>';
+                    label.textContent = 'No data';
+                    return;
+                }
+
+                label.textContent = \`\${stats.length} port(s) - Updated \${new Date().toLocaleTimeString()}\`;
+
+                grid.innerHTML = stats.map(s => {
+                    const portLabel = s.port + (s.slot ? '.' + s.slot : '');
+                    const status = s.status ?? s.port_status ?? -1;
+                    const info = PORT_STATUS_COLORS[status] || { bg: 'bg-gray-600', label: 'Unknown' };
+                    const sentOk = s.sent_ok ?? 0;
+                    const received = s.received ?? 0;
+                    return \`
+                        <div class="flex flex-col items-center p-2 rounded-lg bg-dark-700 border border-dark-500 hover:border-dark-400 transition cursor-pointer group" title="Port \${portLabel}: \${info.label} (status \${status})\\nSent: \${sentOk}, Rcvd: \${received}" onclick="selectPort('\${portLabel}')">
+                            <div class="w-4 h-4 rounded-full \${info.bg} mb-1"></div>
+                            <span class="text-xs font-medium text-gray-200">\${portLabel}</span>
+                            <span class="text-[10px] text-gray-500">\${info.label}</span>
+                        </div>
+                    \`;
+                }).join('');
+            } catch (error) {
+                grid.innerHTML = \`<p class="text-red-400 text-sm col-span-full text-center py-8">Error: \${error}</p>\`;
+                label.textContent = '';
+            }
+        }
+
+        function selectPort(port) {
+            showToast(\`Port \${port} selected\`, 'info');
+        }
+
+        function getSelectedGatewayId() {
+            return document.getElementById('gw-select').value;
+        }
+
+        function hideGwModal(modalId) {
+            document.getElementById(modalId).classList.add('hidden');
+        }
+
+        // --- Switch SIM ---
+        function showGwSwitchSimModal() {
+            if (!getSelectedGatewayId()) { showToast('Select a gateway first', 'error'); return; }
+            document.getElementById('gw-switch-modal').classList.remove('hidden');
+            document.getElementById('gw-switch-result').classList.add('hidden');
+            document.getElementById('gw-switch-port').value = '';
+            document.getElementById('gw-switch-port').focus();
+        }
+
+        async function gwSwitchSim() {
+            const gatewayId = getSelectedGatewayId();
+            const port = document.getElementById('gw-switch-port').value.trim();
+            if (!port) { showToast('Enter a port', 'error'); return; }
+
+            const btn = document.getElementById('gw-switch-btn');
+            btn.disabled = true; btn.textContent = 'Switching...';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/skyline/switch-sim\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: gatewayId, port })
+                });
+                const result = await response.json();
+                document.getElementById('gw-switch-result').classList.remove('hidden');
+                document.getElementById('gw-switch-output').textContent = JSON.stringify(result, null, 2);
+                showToast(result.ok ? result.message : \`Error: \${result.error}\`, result.ok ? 'success' : 'error');
+                if (result.ok) setTimeout(loadPortStatus, 3000);
+            } catch (error) {
+                showToast('Error switching SIM', 'error');
+            } finally {
+                btn.disabled = false; btn.textContent = 'Switch SIM';
+            }
+        }
+
+        // --- IMEI ---
+        function showGwImeiModal() {
+            if (!getSelectedGatewayId()) { showToast('Select a gateway first', 'error'); return; }
+            document.getElementById('gw-imei-modal').classList.remove('hidden');
+            document.getElementById('gw-imei-result').classList.add('hidden');
+            document.getElementById('gw-imei-port').value = '';
+            document.getElementById('gw-imei-value').value = '';
+            document.getElementById('gw-imei-port').focus();
+        }
+
+        async function gwGetImei() {
+            const gatewayId = getSelectedGatewayId();
+            const port = document.getElementById('gw-imei-port').value.trim();
+            if (!port) { showToast('Enter a port', 'error'); return; }
+
+            const btn = document.getElementById('gw-get-imei-btn');
+            btn.disabled = true; btn.textContent = 'Reading...';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/skyline/get-imei\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: gatewayId, port })
+                });
+                const result = await response.json();
+                document.getElementById('gw-imei-result').classList.remove('hidden');
+                document.getElementById('gw-imei-output').textContent = JSON.stringify(result, null, 2);
+                showToast(result.ok ? 'IMEI read successfully' : \`Error: \${result.error}\`, result.ok ? 'success' : 'error');
+            } catch (error) {
+                showToast('Error reading IMEI', 'error');
+            } finally {
+                btn.disabled = false; btn.textContent = 'Get IMEI';
+            }
+        }
+
+        async function gwSetImei() {
+            const gatewayId = getSelectedGatewayId();
+            const port = document.getElementById('gw-imei-port').value.trim();
+            const imei = document.getElementById('gw-imei-value').value.trim();
+            if (!port || !imei) { showToast('Enter port and IMEI', 'error'); return; }
+            if (imei.length !== 15) { showToast('IMEI must be 15 digits', 'error'); return; }
+            if (!confirm(\`Set IMEI \${imei} on port \${port}?\`)) return;
+
+            const btn = document.getElementById('gw-set-imei-btn');
+            btn.disabled = true; btn.textContent = 'Setting...';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/skyline/set-imei\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: gatewayId, port, imei })
+                });
+                const result = await response.json();
+                document.getElementById('gw-imei-result').classList.remove('hidden');
+                document.getElementById('gw-imei-output').textContent = JSON.stringify(result, null, 2);
+                showToast(result.ok ? result.message : \`Error: \${result.error}\`, result.ok ? 'success' : 'error');
+            } catch (error) {
+                showToast('Error setting IMEI', 'error');
+            } finally {
+                btn.disabled = false; btn.textContent = 'Set IMEI';
+            }
+        }
+
+        // --- Port Commands (reboot, reset, lock, unlock) ---
+        function showGwCommandModal(command) {
+            if (!getSelectedGatewayId()) { showToast('Select a gateway first', 'error'); return; }
+            gwCurrentCommand = command;
+            document.getElementById('gw-command-title').textContent = command.charAt(0).toUpperCase() + command.slice(1) + ' Port';
+            document.getElementById('gw-command-btn').textContent = command.charAt(0).toUpperCase() + command.slice(1);
+            document.getElementById('gw-command-modal').classList.remove('hidden');
+            document.getElementById('gw-command-result').classList.add('hidden');
+            document.getElementById('gw-command-port').value = '';
+            document.getElementById('gw-command-port').focus();
+        }
+
+        async function gwRunCommand() {
+            const gatewayId = getSelectedGatewayId();
+            const port = document.getElementById('gw-command-port').value.trim();
+            if (!port) { showToast('Enter a port', 'error'); return; }
+            if (!confirm(\`\${gwCurrentCommand} port \${port}?\`)) return;
+
+            const btn = document.getElementById('gw-command-btn');
+            btn.disabled = true; btn.textContent = 'Running...';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/skyline/\${gwCurrentCommand}\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: gatewayId, port })
+                });
+                const result = await response.json();
+                document.getElementById('gw-command-result').classList.remove('hidden');
+                document.getElementById('gw-command-output').textContent = JSON.stringify(result, null, 2);
+                showToast(result.ok ? result.message : \`Error: \${result.error}\`, result.ok ? 'success' : 'error');
+                if (result.ok) setTimeout(loadPortStatus, 3000);
+            } catch (error) {
+                showToast(\`Error running \${gwCurrentCommand}\`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = gwCurrentCommand.charAt(0).toUpperCase() + gwCurrentCommand.slice(1);
+            }
+        }
+
+        loadGatewayDropdown();
         loadResellers();
         loadData();
         setInterval(loadData, 30000);

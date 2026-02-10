@@ -275,79 +275,51 @@ async function findSenderSimForVerification(env, excludeSimId) {
 }
 
 async function sendVerificationSms(env, token, senderSim, recipientNumber, verificationCode) {
-  // Use Skyline API to send SMS via the gateway device
-  // Requires SK_HOST, SK_USERNAME, SK_PASSWORD, SK_PORT environment variables
-
-  if (!env.SK_HOST || !env.SK_USERNAME || !env.SK_PASSWORD) {
-    console.log(`[VerifySMS] Skyline credentials not configured, skipping SMS`);
-    return { ok: false, error: "Skyline credentials not configured" };
+  // Use SKYLINE_GATEWAY service binding to send SMS
+  if (!env.SKYLINE_GATEWAY || !env.SKYLINE_SECRET) {
+    console.log(`[VerifySMS] SKYLINE_GATEWAY or SKYLINE_SECRET not configured, skipping SMS`);
+    return { ok: false, error: "Skyline gateway not configured" };
   }
 
   try {
-    const skylinePort = env.SK_PORT || "80";
-    const url = `http://${env.SK_HOST}:${skylinePort}/goip_post_sms.html`;
+    // Look up the SIM's gateway_id and port from DB
+    const simData = await supabaseSelect(env, `sims?select=gateway_id,port&id=eq.${senderSim.id}&limit=1`);
+    const gateway_id = simData?.[0]?.gateway_id;
+    const port = simData?.[0]?.port;
 
-    // Find the port/slot for this SIM based on ICCID (stored in sims table)
-    // For now, we'll need to map the sender SIM to a Skyline port
-    // This requires a port mapping in the database or config
-    const portSlot = await findSkylinePortForSim(env, senderSim.id);
-
-    if (!portSlot) {
-      console.log(`[VerifySMS] No Skyline port mapping found for SIM ${senderSim.iccid}`);
-      return { ok: false, error: "No Skyline port mapping for sender SIM" };
+    if (!gateway_id || !port) {
+      console.log(`[VerifySMS] No gateway/port mapping for SIM ${senderSim.iccid}`);
+      return { ok: false, error: "No gateway/port mapping for sender SIM" };
     }
 
-    const payload = {
-      type: "send-sms",
-      task_num: 1,
-      tasks: [
-        {
-          tid: Date.now(), // Unique task ID
-          port: portSlot, // e.g., "1A" for port 1, slot A
-          to: recipientNumber.replace(/^\+1/, ""), // Remove +1 prefix if present
-          sms: `VERIFY ${verificationCode}`,
-          smstype: 0, // 0 = SMS, 1 = MMS
-          coding: 0   // 0 = GSM 7-bit
-        }
-      ]
-    };
+    console.log(`[VerifySMS] Sending via skyline-gateway: gw=${gateway_id} port=${port} to=${recipientNumber}`);
 
-    // Skyline uses Basic Auth
-    const authHeader = "Basic " + btoa(`${env.SK_USERNAME}:${env.SK_PASSWORD}`);
+    const res = await env.SKYLINE_GATEWAY.fetch(
+      `https://skyline-gateway/send-sms?secret=${encodeURIComponent(env.SKYLINE_SECRET)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          gateway_id,
+          port,
+          to: recipientNumber.replace(/^\+1/, ""),
+          message: `VERIFY ${verificationCode}`,
+        }),
+      }
+    );
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": authHeader,
-      },
-      body: JSON.stringify(payload),
-    });
+    const result = await res.json().catch(() => ({}));
 
-    const json = await res.json().catch(() => ({}));
-
-    if (json.code !== 200) {
-      console.log(`[VerifySMS] Skyline SMS failed: ${json.code} ${json.reason}`);
-      return { ok: false, error: `Skyline SMS failed: ${json.reason || res.status}` };
+    if (!result.ok) {
+      console.log(`[VerifySMS] Skyline SMS failed: ${result.error}`);
+      return { ok: false, error: result.error || "Skyline SMS failed" };
     }
 
-    console.log(`[VerifySMS] Sent VERIFY ${verificationCode} from ${senderSim.e164} (port ${portSlot}) to ${recipientNumber}`);
+    console.log(`[VerifySMS] Sent VERIFY ${verificationCode} from ${senderSim.e164} (gw ${gateway_id} port ${port}) to ${recipientNumber}`);
     return { ok: true };
   } catch (err) {
     console.log(`[VerifySMS] Error: ${err}`);
     return { ok: false, error: String(err) };
-  }
-}
-
-// Find the Skyline port for a SIM
-// This looks up the port column in the sims table (updated by sms-ingest)
-async function findSkylinePortForSim(env, simId) {
-  try {
-    const res = await supabaseSelect(env, `sims?select=port&id=eq.${simId}&limit=1`);
-    return res?.[0]?.port || null;
-  } catch (err) {
-    console.log(`[VerifySMS] Error finding Skyline port: ${err}`);
-    return null;
   }
 }
 

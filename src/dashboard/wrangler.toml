@@ -37,6 +37,10 @@ service = "reseller-sync"
 binding = "SIM_STATUS_CHANGER"
 service = "sim-status-changer"
 
+[[services]]
+binding = "SKYLINE_GATEWAY"
+service = "skyline-gateway"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "dashboard-test"
@@ -73,3 +77,7 @@ service = "reseller-sync-test"
 [[env.test.services]]
 binding = "SIM_STATUS_CHANGER"
 service = "sim-status-changer-test"
+
+[[env.test.services]]
+binding = "SKYLINE_GATEWAY"
+service = "skyline-gateway-test"

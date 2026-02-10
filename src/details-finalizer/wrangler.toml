@@ -11,6 +11,11 @@ crons = ["*/5 * * * *"]
 enabled = true
 invocation_logs = true
 
+# Service binding for Skyline gateway
+[[services]]
+binding = "SKYLINE_GATEWAY"
+service = "skyline-gateway"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "details-finalizer-test"
@@ -18,6 +23,10 @@ name = "details-finalizer-test"
 [env.test.triggers]
 # No crons in test - trigger manually via dashboard
 crons = []
+
+[[env.test.services]]
+binding = "SKYLINE_GATEWAY"
+service = "skyline-gateway-test"
 
 [env.test.observability.logs]
 enabled = true
