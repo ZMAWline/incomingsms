@@ -9,14 +9,15 @@ This skill makes you an expert in the Helix HX-AX API for managing cellular SIM 
 
 ## What This Skill Covers
 
-The Helix API handles six core operations:
+The Helix API handles seven core operations:
 
 1. **Token Authentication** - Get bearer tokens for API access (24-hour validity)
 2. **SIM Activation** - Activate new SIM cards with IMEI, ICCID, subscriber info
 3. **Query Subscriber** - Look up SIM and subscriber details by mobilitySubscriptionId
 4. **ZIP Code Updates** - Change service address/ZIP (required before MDN change for new area codes)
 5. **MDN Changes** - Change phone numbers assigned to SIMs
-6. **Subscriber Status** - Suspend, Restore (Unsuspend), or Cancel service
+6. **Subscriber Status** - Suspend, Restore (Unsuspend), Cancel, or Resume (from Cancel)
+7. **OTA Refresh** - Trigger an OTA refresh/reset for a subscriber's network profile
 
 ## When to Use This Skill
 
@@ -66,6 +67,11 @@ If you skip this order, the phone number assignment may fail.
 1. Use Query Sub ID endpoint
 2. Provide the `mobilitySubscriptionId`
 3. Response includes all subscriber data, current phone number, status, etc.
+
+#### OTA Refresh Flow
+1. Query Sub ID to get the `attBan`, current MDN, and ICCID
+2. Call OTA Refresh endpoint with `ban`, `subscriberNumber`, and `iccid`
+3. Useful when device/SIM needs a network profile refresh
 
 ## Example: Simple Activation Request
 
@@ -118,7 +124,9 @@ curl -X POST https://api.helixsolo.app/api/mobility-activation/activate \
 
 **"MDN change failed"** → Did you update the ZIP code first if changing area codes?
 
-**Status change failed** → Use correct reasonCodeId: Suspend=22, Restore=35, Cancel=1
+**Status change failed** → Use correct reasonCodeId: Suspend=22, Restore=35, Cancel=1, Resume=20
+
+**OTA Refresh failed** → Ensure you have the correct `attBan` from Query Sub ID response, plus current MDN and ICCID.
 
 ## Subscriber Status Changes
 
@@ -127,6 +135,7 @@ curl -X POST https://api.helixsolo.app/api/mobility-activation/activate \
 | Suspend | `Suspend` | `22` |
 | Restore | `Unsuspend` | `35` |
 | Cancel | `Cancel` | `1` |
+| Resume (From Cancel) | `Resume On Cancel` | `20` |
 
 ## How I Can Help
 

@@ -1,12 +1,12 @@
 # Helix HX-AX API Reference
 
-**Last Updated:** 02/04/2026
+**Last Updated:** 02/09/2026
 
 ## Overview
 
 The Helix HX-AX API manages cellular SIM card activation and management for T-Mobile data plans. All API endpoints require bearer token authentication.
 
-## Six Core Operations
+## Seven Core Operations
 
 | Step | Action | Purpose |
 |------|--------|---------|
@@ -16,6 +16,7 @@ The Helix HX-AX API manages cellular SIM card activation and management for T-Mo
 | 4 | Service ZIP Change | Update the service ZIP code |
 | 5 | MDN Change | Change MDN associated with ICCID |
 | 6 | Change Subscriber Status | Suspend / Restore / Cancel service |
+| 7 | OTA Refresh | Trigger an OTA refresh/reset for a subscriber |
 
 ---
 
@@ -344,6 +345,44 @@ Permanently disconnect service.
 }
 ```
 
+### Resume (From Cancel)
+
+Reactivate a previously canceled subscriber.
+
+**Request:**
+```json
+[
+  {
+    "subscriberNumber": "CURRENT_MDN",
+    "reasonCode": "BBL",
+    "reasonCodeId": 20,
+    "subscriberState": "Resume On Cancel"
+  }
+]
+```
+
+**Response:**
+```json
+{
+  "fulfilled": [
+    {
+      "category": {
+        "id": "12",
+        "name": "Mobility Services"
+      },
+      "effectiveDate": "immediately",
+      "href": "/mobility/service/6468842752",
+      "name": "",
+      "status": "Active",
+      "subscriberNumber": "6468842752",
+      "reasonCodeId": 20,
+      "subscriberState": "Resume On Cancel"
+    }
+  ],
+  "rejected": []
+}
+```
+
 ### Status Change Reference
 
 | Action | subscriberState | reasonCode | reasonCodeId |
@@ -351,6 +390,66 @@ Permanently disconnect service.
 | Suspend | `Suspend` | `CR` | `22` |
 | Restore | `Unsuspend` | `CR` | `35` |
 | Cancel | `Cancel` | `CAN` | `1` |
+| Resume (From Cancel) | `Resume On Cancel` | `BBL` | `20` |
+
+---
+
+## 7. OTA Refresh (Reset OTA)
+
+Trigger an OTA refresh/reset for a subscriber. Useful when the device/SIM needs a network profile refresh.
+
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/reset-ota`
+
+**Headers:**
+- `Content-Type: application/json`
+- `Authorization: Bearer YOUR_TOKEN`
+
+**Request:**
+```json
+[
+  {
+    "ban": "BAN_NUMBER",
+    "subscriberNumber": "CURRENT_MDN",
+    "iccid": "ICCID"
+  }
+]
+```
+
+**Fields to Update:**
+- `ban` - The BAN (billing account number). Obtain from Query Sub ID response under `attBan`.
+- `subscriberNumber` - Current MDN of the subscriber
+- `iccid` - SIM card ICCID
+
+**Response:**
+```json
+{
+  "fulfilled": [
+    {
+      "category": {
+        "id": "12",
+        "name": "Mobility Services"
+      },
+      "href": "/mobility/service/6468842752",
+      "name": "",
+      "serviceCharacteristic": [
+        { "name": "subscriberStatus", "value": "S" },
+        { "name": "statusEffectiveDate", "value": "2026-01-19Z" },
+        { "name": "statusReasonCode", "value": "DLC" },
+        { "name": "subscriberActivationDate", "value": "2026-01-16Z" }
+      ],
+      "serviceSpecification": {
+        "href": "/catalogManagement/serviceSpecification/apexMobilityPlan",
+        "id": "apexMobilityPlan"
+      },
+      "status": "Suspended",
+      "subscriberNumber": "6468842752"
+    }
+  ],
+  "rejected": []
+}
+```
+
+**NOTE:** The `ban` (BAN) required for this call can be obtained from the **Query Sub ID** response — use the value returned under `attBan`.
 
 ---
 
