@@ -154,26 +154,41 @@ async function handleGetImei(request, env) {
   const { gateway, error } = await loadAndHandshake(env, gateway_id);
   if (error) return error;
 
-  const payload = { type: "command", op: "get", ports: port, prop: "imei" };
-  const result = await skylineFetch(env, gateway, "/goip_send_cmd.html", "POST", payload);
+  // IMEI is available from the port status endpoint — just fetch and extract
+  const params = new URLSearchParams({
+    version: "1.1",
+    username: gateway.username,
+    password: gateway.password,
+    ports: "all",
+  });
+  const statusUrl = `http://${gateway.host}:${gateway.api_port || 80}/goip_get_status.html?${params}`;
+  const result = await bridgeFetch(env, statusUrl, "GET");
 
   await logSkylineApiCall(env, {
     action: "get_imei",
     gateway_id,
     port,
-    requestUrl: result.url,
-    requestBody: payload,
+    requestUrl: statusUrl.replace(gateway.password, "***"),
+    requestBody: null,
     responseStatus: result.status,
     responseOk: result.ok,
-    responseBody: result.data,
+    responseBody: null,
     error: result.error,
   });
 
   if (!result.ok) {
-    return json({ ok: false, error: result.error || "Skyline API error", skyline_response: result.data }, 502);
+    return json({ ok: false, error: result.error || "Skyline API error" }, 502);
   }
 
-  return json({ ok: true, skyline_response: result.data });
+  // Find the matching port in status data
+  const normalizedPort = normalizePortSlot(port);
+  const portEntry = (result.data?.status || []).find(p => p.port === normalizedPort);
+
+  if (!portEntry) {
+    return json({ ok: false, error: `Port ${port} (${normalizedPort}) not found in device status` }, 404);
+  }
+
+  return json({ ok: true, port: normalizedPort, imei: portEntry.imei || null });
 }
 
 async function handleSetImei(request, env) {
@@ -187,26 +202,48 @@ async function handleSetImei(request, env) {
   const { gateway, error } = await loadAndHandshake(env, gateway_id);
   if (error) return error;
 
-  const payload = { type: "command", op: "set", ports: port, prop: "imei", value: imei };
-  const result = await skylineFetch(env, gateway, "/goip_send_cmd.html", "POST", payload);
+  // Calculate sim_imei index: n = (port_number-1)*slots_per_port + (slot_number-1)
+  const { portNum, slotNum } = parsePortSlot(port);
+  if (!portNum) {
+    return json({ ok: false, error: `Cannot parse port "${port}". Use format like "22A" or "22.01"` }, 400);
+  }
+  const slotsPerPort = gateway.slots_per_port || 1;
+  const n = (portNum - 1) * slotsPerPort + (slotNum - 1);
+
+  // Manual 6.4.3: POST to /goip_send_cmd.html?username=xx&password=xx&op=set
+  // Body is plain text: sim_imei(n)=value
+  const textBody = `sim_imei(${n})=${imei}`;
+  const apiPort = gateway.api_port || 80;
+  const params = new URLSearchParams({
+    username: gateway.username,
+    password: gateway.password,
+    op: "set",
+  });
+  const cmdUrl = `http://${gateway.host}:${apiPort}/goip_send_cmd.html?${params}`;
+
+  const result = await bridgeFetch(env, cmdUrl, "POST", {
+    "Content-Type": "text/plain",
+  }, textBody);
 
   await logSkylineApiCall(env, {
     action: "set_imei",
     gateway_id,
-    port,
-    requestUrl: result.url,
-    requestBody: payload,
+    port: `${portNum}.${String(slotNum).padStart(2, "0")} (n=${n})`,
+    requestUrl: cmdUrl.replace(gateway.password, "***"),
+    requestBody: textBody,
     responseStatus: result.status,
     responseOk: result.ok,
     responseBody: result.data,
     error: result.error,
   });
 
-  if (!result.ok) {
-    return json({ ok: false, error: result.error || "Skyline API error", skyline_response: result.data }, 502);
+  // Success response: {"code":0,"reason":"OK","par_set":1}
+  const ok = result.ok || result.data?.code === 0;
+  if (!ok) {
+    return json({ ok: false, error: result.error || result.data?.reason || "Skyline API error", skyline_response: result.data, debug: { n, textBody } }, 502);
   }
 
-  return json({ ok: true, message: `IMEI set on ${gateway.code} port ${port}`, skyline_response: result.data });
+  return json({ ok: true, message: `IMEI set on ${gateway.code} port ${portNum} slot ${slotNum} (index ${n})`, skyline_response: result.data, debug: { n, textBody } });
 }
 
 async function handlePortStatus(url, env) {
@@ -402,7 +439,7 @@ async function loadAndHandshake(env, gatewayId) {
 
 async function loadGateway(env, gatewayId) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/gateways?select=id,code,name,host,api_port,username,password,total_ports&id=eq.${encodeURIComponent(gatewayId)}&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/gateways?select=id,code,name,host,api_port,username,password,total_ports,slots_per_port&id=eq.${encodeURIComponent(gatewayId)}&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -494,6 +531,51 @@ async function skylineFetch(env, gateway, endpoint, method, payload) {
   return await bridgeFetch(env, url, method, {
     "Content-Type": "application/json",
   }, payload);
+}
+
+const LETTER_TO_SLOT_NUM = { A: 1, B: 2, C: 3, D: 4, E: 5, F: 6, G: 7, H: 8 };
+
+/** Normalize port input to dot notation: "22A" → "22.01", "22.01" → "22.01", "22" → "22" */
+function normalizePortSlot(port) {
+  if (/^\d+\.\d+$/.test(port)) return port;
+  const match = port.match(/^(\d+)([A-Ha-h])$/);
+  if (match) {
+    const slotNum = LETTER_TO_SLOT_NUM[match[2].toUpperCase()] || 1;
+    return `${match[1]}.${String(slotNum).padStart(2, "0")}`;
+  }
+  return port;
+}
+
+/** Parse port input into numeric port and slot: "22A" → {portNum:22, slotNum:1}, "22.01" → {portNum:22, slotNum:1} */
+function parsePortSlot(port) {
+  // Letter notation: "22A"
+  const letterMatch = port.match(/^(\d+)([A-Ha-h])$/);
+  if (letterMatch) {
+    return { portNum: parseInt(letterMatch[1]), slotNum: LETTER_TO_SLOT_NUM[letterMatch[2].toUpperCase()] || 1 };
+  }
+  // Dot notation: "22.01"
+  const dotMatch = port.match(/^(\d+)\.(\d+)$/);
+  if (dotMatch) {
+    return { portNum: parseInt(dotMatch[1]), slotNum: parseInt(dotMatch[2]) };
+  }
+  // Just a number: "22" → assume slot 1
+  const numMatch = port.match(/^(\d+)$/);
+  if (numMatch) {
+    return { portNum: parseInt(numMatch[1]), slotNum: 1 };
+  }
+  return { portNum: null, slotNum: null };
+}
+
+/** GET-based command fetch — all params in query string (avoids JSON body parsing quirks) */
+async function skylineFetchGet(env, gateway, endpoint, cmdParams) {
+  const apiPort = gateway.api_port || 80;
+  const params = new URLSearchParams({
+    username: gateway.username,
+    password: gateway.password,
+    ...cmdParams,
+  });
+  const url = `http://${gateway.host}:${apiPort}${endpoint}?${params}`;
+  return await bridgeFetch(env, url, "GET");
 }
 
 async function logSkylineApiCall(env, logData) {

@@ -191,6 +191,44 @@ result = response.json()
 print(result)
 ```
 
+## Example: Change IMEI (Section 6.4.3)
+
+```python
+import os
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+host = os.getenv('SK_HOST')
+username = os.getenv('SK_USERNAME')
+password = os.getenv('SK_PASSWORD')
+port = os.getenv('SK_PORT', '80')
+
+# IMEI index formula: n = (port_number-1)*slots_per_port + (slot_number-1)
+# Slot A=1, B=2, C=3, D=4
+# For 1 slot/port device: port 22A → n = (22-1)*1 + (1-1) = 21
+# For 4 slot/port device: port 6B  → n = (6-1)*4  + (2-1) = 21
+slots_per_port = 1  # adjust per device
+port_number = 22
+slot_number = 1  # A=1, B=2, C=3, D=4
+n = (port_number - 1) * slots_per_port + (slot_number - 1)
+
+url = f"http://{host}:{port}/goip_send_cmd.html"
+params = {"username": username, "password": password, "op": "set"}
+
+# Body is plain text, NOT JSON
+body = f"sim_imei({n})=865847053403202"
+
+response = requests.post(url, params=params, data=body, headers={"Content-Type": "text/plain"})
+result = response.json()
+
+if result['code'] == 0:
+    print(f"IMEI set successfully (par_set={result.get('par_set')})")
+else:
+    print(f"Error: {result['reason']}")
+```
+
 ## How to Request Scripts
 
 When asking Claude to write code, mention your `.env` setup:

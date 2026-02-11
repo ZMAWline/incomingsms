@@ -26,8 +26,26 @@ The Skyline HTTP API manages multi-port gateway devices with SMS, MMS, call hand
 Configure device to push status updates
 
 ### Command Sending
-**URL:** `/goip_send_cmd.html` (GET/POST)  
+**URL:** `/goip_send_cmd.html` (GET/POST)
 Operations: lock, unlock, switch, reset, reboot, save, ledon, ledoff, get, set
+
+### IMEI Modification (Section 6.4.3)
+**URL:** `/goip_send_cmd.html?username=xx&password=xx&op=set` (POST)
+**Content-Type:** `text/plain`
+**Body:** `sim_imei(n)=IMEI_VALUE` (multiple entries joined with `&`)
+
+**Index formula:** `n = (port_number - 1) * slots_per_port + (slot_number - 1)`
+- Slot A=1, B=2, C=3, D=4, etc.
+- Example (4 slots/port): Port 6B → `n = (6-1)*4 + (2-1) = 21`
+- Example (1 slot/port): Port 22A → `n = (22-1)*1 + (1-1) = 21`
+
+**Success response:** `{"code":0, "reason":"OK", "par_set":N}` (code 0 = success, par_set = count of params set)
+
+**Example:** Set IMEI on two ports:
+```
+POST /goip_send_cmd.html?username=root&password=xxx&op=set
+Body: sim_imei(21)=865847053403202&sim_imei(51)=865847053403213
+```
 
 ### SMS Sending
 **URL:** `/goip_post_sms.html` (POST)  
