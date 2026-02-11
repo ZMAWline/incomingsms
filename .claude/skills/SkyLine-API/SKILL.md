@@ -1,30 +1,29 @@
 ---
 name: skyline-api-expert
-description: Expert knowledge of the Skyline HTTP API for managing multi-port gateway devices with SMS, MMS, call handling, and eSIM capabilities. Use when working with SMS/MMS sending and receiving, device command control, call and SMS statistics, port status monitoring, eSIM management, and building automation scripts for Skyline devices. Helps explain API endpoints, write scripts, debug responses, and guide through multi-step operations. Credentials load from environment variables (SK_HOST, SK_USERNAME, SK_PASSWORD, SK_PORT).
+description: Expert knowledge of the Skyline HTTP API for managing multi-port gateway devices with SMS, MMS, call handling, and eSIM capabilities. Use when working with SMS/MMS sending and receiving, device command control, call and SMS statistics, port status monitoring, eSIM management, IMEI/SIM number configuration, and building automation scripts for Skyline devices. Helps explain API endpoints, write scripts, debug responses, and guide through multi-step operations. Credentials load from environment variables (SK_HOST, SK_USERNAME, SK_PASSWORD, SK_PORT).
 ---
 
 # Skyline API Expert Skill
 
-Expert knowledge of the Skyline HTTP API for controlling multi-port gateway devices and managing SMS, calls, and eSIM profiles.
+Expert knowledge of the Skyline HTTP API (V2.4.0) for controlling multi-port gateway devices.
 
 ## What This Skill Covers
 
-The Skyline API handles these core operations:
-
-1. **Status Notification** - Monitor device and port status
-2. **Command Sending** - Lock/unlock ports, switch SIMs, reboot
-3. **SMS Sending** - Send SMS and MMS messages
-4. **SMS Task Management** - Pause, resume, delete, query SMS tasks
-5. **SMS Receiving** - Receive SMS via HTTP push
-6. **Query SMS** - Retrieve received messages
-7. **SMS Statistics** - Track send/receive metrics
-8. **Call Statistics** - Monitor call metrics (ASR, PDD, ACD)
-9. **MMS Receiving** - Receive MMS via HTTP push
-10. **eSIM Management** - Query, add, and delete eSIM profiles
+1. **Status Notification** - Monitor device and port status, configure reporting
+2. **Command Sending** - Lock/unlock ports, switch SIMs, reboot, LED control
+3. **IMEI Modification** - Change IMEI per SIM slot via `sim_imei(n)` format
+4. **SIM Number Configuration** - Set SIM numbers via `sim_number(n)` format
+5. **SMS Sending** - Send SMS and MMS with task management
+6. **SMS Task Management** - Pause, resume, delete, query SMS tasks
+7. **SMS Receiving** - Receive SMS via HTTP push (BASE64 encoded)
+8. **Query SMS** - Actively retrieve received messages with pagination
+9. **SMS Statistics** - Track send/receive/fail metrics per port/slot
+10. **Call Statistics** - Monitor ASR, PDD, ACD, call counts per port/slot
+11. **MMS Receiving** - Receive MMS via HTTP push (multipart/related)
+12. **eSIM Management** - Query, write, and delete eSIM profiles (async operations)
+13. **Interface Security** - Optional encrypted sessions via MD5-based handshake
 
 ## Environment Variables (SK_ prefix)
-
-The skill uses these variables from your `.env` file:
 
 ```
 SK_HOST=192.168.1.67
@@ -33,59 +32,60 @@ SK_PASSWORD=your_password
 SK_PORT=80
 ```
 
-When you request scripts, Claude automatically writes code that loads these variables using `python-dotenv`.
+## Quick Reference: Endpoints
 
-## When to Use This Skill
+| Endpoint | Method | Auth | Purpose |
+|----------|--------|------|---------|
+| `/goip_get_status.html` | GET | query params | Configure status reporting |
+| `/goip_send_cmd.html` | GET/POST | query params | Commands: lock/unlock/switch/reset/reboot/save/ledon/ledoff/get/set |
+| `/goip_send_cmd.html?op=set` | POST | query params | Set IMEI/SIM numbers (plain text body) |
+| `/goip_post_sms.html` | POST | query params | Send SMS/MMS |
+| `/goip_pause_sms.html` | POST | query params | Pause SMS tasks |
+| `/goip_resume_sms.html` | POST | query params | Resume SMS tasks |
+| `/goip_remove_sms.html` | POST | query params | Delete SMS tasks |
+| `/goip_get_tasks.html` | GET | query params | Query SMS tasks |
+| `/goip_get_sms.html` | GET | query params | Query received SMS |
+| `/goip_get_sms_stat.html` | GET | query params | SMS statistics |
+| `/goip_get_call_stat.html` | GET | query params | Call statistics |
+| `/goip_get_esims.html` | GET | query params | Query eSIM profiles |
+| `/goip_write_esims.html` | POST | query params | Write eSIM profile (async) |
+| `/goip_delete_esims.html` | POST | query params | Delete eSIM profile (async) |
+| `/crypt_sess.json` | GET | MD5 auth | Establish encrypted session |
 
-Use this skill when you need to:
+## Key Concepts
 
-- Explain how an API endpoint works
-- Write automation scripts to control Skyline devices
-- Debug API responses and error codes
-- Build multi-step workflows (send SMS, check status, etc.)
-- Query device statistics (SMS, calls, delivery reports)
-- Manage eSIM profiles (add, remove, query)
-- Handle SMS/MMS sending and receiving
-- Lock/unlock ports and switch SIM cards
-- Configure device status reporting
-
-## Quick Reference: Core Endpoints
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/goip_get_status.html` | GET | Configure status reporting |
-| `/goip_send_cmd.html` | GET/POST | Send device commands |
-| `/goip_post_sms.html` | POST | Send SMS/MMS |
-| `/goip_pause_sms.html` | POST | Pause SMS task |
-| `/goip_resume_sms.html` | POST | Resume SMS task |
-| `/goip_remove_sms.html` | POST | Delete SMS task |
-| `/goip_get_tasks.html` | GET | Query SMS tasks |
-| `/goip_get_sms.html` | GET | Query received SMS |
-| `/goip_get_sms_stat.html` | GET | SMS statistics |
-| `/goip_get_call_stat.html` | GET | Call statistics |
-| `/goip_get_esims.html` | GET | Query eSIM profiles |
-| `/goip_write_esims.html` | POST | Add eSIM profile |
-| `/goip_delete_esims.html` | POST | Delete eSIM profile |
+- **Auth:** All endpoints use `username` & `password` as URL query params
+- **Port notation:** `port.slot` (e.g., `1.01`) or `portLetter` (e.g., `1A`, `2B`)
+- **Port format in commands:** `1A,2B,3C` or `4-32` or `all`/`*`
+- **Device info:** `max-ports` and `max-slots` from dev-status tell you device layout
+- **Response codes:** Most endpoints return `code: 200` for success; config set (`op=set`) returns `code: 0`
 
 ## Port Status Codes
 
-- **0** - No SIM
-- **1** - Idle
-- **2** - Registering
-- **3** - Registered (Ready)
-- **4** - Call connected
-- **5** - No balance
-- **6** - Registration failed
-- **15** - Access Mobile Network
-- **16** - Module timeout
+| Code | Description |
+|------|-------------|
+| 0 | No SIM card |
+| 1 | Idle SIM card |
+| 2 | Registering |
+| 3 | Registered (ready) |
+| 4 | Call connected |
+| 5 | No balance / alarm |
+| 6 | Registration failed |
+| 7 | SIM locked by device |
+| 8 | SIM locked by operator |
+| 9 | SIM card error |
+| 11 | Card detected |
+| 12 | User locked |
+| 13 | Port inter-calling |
+| 14 | Inter-calling holding |
+| 15 | Access Mobile Network |
+| 16 | Module response timeout |
 
 ## Example: Send an SMS
 
 ```python
-import os
-import requests
+import os, requests
 from dotenv import load_dotenv
-
 load_dotenv()
 
 host = os.getenv('SK_HOST')
@@ -94,183 +94,213 @@ password = os.getenv('SK_PASSWORD')
 port = os.getenv('SK_PORT', '80')
 
 url = f"http://{host}:{port}/goip_post_sms.html"
+params = {"username": username, "password": password}
 
 payload = {
     "type": "send-sms",
     "task_num": 1,
-    "tasks": [
-        {
-            "tid": 1,
-            "to": "13686876620",
-            "sms": "Hello World",
-            "smstype": 0,  # 0=SMS, 1=MMS
-            "coding": 0
-        }
-    ]
+    "tasks": [{
+        "tid": 1,
+        "to": "13686876620",
+        "sms": "Hello World",
+        "smstype": 0,  # 0=SMS, 1=MMS, 2=MMS multi-number
+        "coding": 0    # 0=auto, 1=UCS2, 2=7bit
+    }]
 }
 
-response = requests.post(
-    url,
-    json=payload,
-    auth=(username, password)
-)
-
+response = requests.post(url, params=params, json=payload)
 result = response.json()
 if result['code'] == 200:
-    print("SMS sent successfully")
+    print("SMS sent:", result['status'])
 else:
     print(f"Error: {result['reason']}")
 ```
 
-## Example: Query SMS Statistics
+## Example: Send MMS with Attachment
 
 ```python
-import os
-import requests
-from dotenv import load_dotenv
-
-load_dotenv()
-
-host = os.getenv('SK_HOST')
-username = os.getenv('SK_USERNAME')
-password = os.getenv('SK_PASSWORD')
-port = os.getenv('SK_PORT', '80')
-
-url = f"http://{host}:{port}/goip_get_sms_stat.html"
-
-params = {
-    'version': '1.1',
-    'username': username,
-    'password': password,
-    'ports': 'all',
-    'type': 3  # 3 = cumulative
-}
-
-response = requests.get(url, params=params)
-stats = response.json()
-
-for port_stat in stats.get('stats', []):
-    port = port_stat['port']
-    slot = port_stat['slot']
-    sent_ok = port_stat['sent_ok']
-    received = port_stat['received']
-    failed = port_stat['sent_failed']
-    
-    print(f"Port {port}.{slot}: {sent_ok} sent, {received} received, {failed} failed")
-```
-
-## Example: Lock a Port
-
-```python
-import os
-import requests
-from dotenv import load_dotenv
-
-load_dotenv()
-
-host = os.getenv('SK_HOST')
-username = os.getenv('SK_USERNAME')
-password = os.getenv('SK_PASSWORD')
-port = os.getenv('SK_PORT', '80')
-
-url = f"http://{host}:{port}/goip_send_cmd.html"
+import base64
 
 payload = {
-    "type": "command",
-    "op": "lock",
-    "ports": "1A"  # Lock port 1, slot A
+    "type": "send-sms",
+    "task_num": 1,
+    "tasks": [{
+        "tid": 100,
+        "to": "13686876620",
+        "sms": "Check this out",
+        "smstype": 1,
+        "smstitle": "My MMS Subject",
+        "attachments": "jpg|" + base64.b64encode(open("photo.jpg","rb").read()).decode()
+    }]
 }
+# Max 5 attachments, total <100KB, supported: jpg, gif, txt, mp3
+# Multiple: "jpg|<b64>;txt|<b64>"
+```
 
-response = requests.post(
-    url,
-    json=payload,
-    auth=(username, password)
-)
+## Example: Lock/Unlock/Switch Port
 
-result = response.json()
-print(result)
+```python
+url = f"http://{host}:{port}/goip_send_cmd.html"
+params = {"username": username, "password": password}
+
+# Lock a port+slot
+payload = {"type": "command", "op": "lock", "ports": "1A"}
+# Lock entire port (all slots): just use port number
+payload = {"type": "command", "op": "lock", "ports": "1"}
+# Unlock
+payload = {"type": "command", "op": "unlock", "ports": "1A,2B"}
+# Switch to specific slot
+payload = {"type": "command", "op": "switch", "ports": "2.02"}
+# Reset module (port number only)
+payload = {"type": "command", "op": "reset", "ports": "5"}
+# Reboot entire device
+payload = {"type": "command", "op": "reboot"}
+# Multiple commands
+payload = {"type": "command", "op": "multiple", "ops": [
+    {"op": "lock", "ports": "1A"},
+    {"op": "switch", "ports": "2B"}
+]}
+
+response = requests.post(url, params=params, json=payload)
 ```
 
 ## Example: Change IMEI (Section 6.4.3)
 
 ```python
-import os
-import requests
-from dotenv import load_dotenv
+# IMEI index formula: n = (port_number-1) * slots_per_port + (slot_number-1)
+# slots_per_port = device's max-slots (from dev-status)
+# Slot: A=1, B=2, C=3, D=4, etc.
+#
+# 4 slots/port: Port 6B  -> n = (6-1)*4 + (2-1) = 21
+# 1 slot/port:  Port 22A -> n = (22-1)*1 + (1-1) = 21
 
-load_dotenv()
-
-host = os.getenv('SK_HOST')
-username = os.getenv('SK_USERNAME')
-password = os.getenv('SK_PASSWORD')
-port = os.getenv('SK_PORT', '80')
-
-# IMEI index formula: n = (port_number-1)*slots_per_port + (slot_number-1)
-# Slot A=1, B=2, C=3, D=4
-# For 1 slot/port device: port 22A → n = (22-1)*1 + (1-1) = 21
-# For 4 slot/port device: port 6B  → n = (6-1)*4  + (2-1) = 21
-slots_per_port = 1  # adjust per device
+slots_per_port = 1  # from device max-slots
 port_number = 22
-slot_number = 1  # A=1, B=2, C=3, D=4
+slot_number = 1     # A=1
 n = (port_number - 1) * slots_per_port + (slot_number - 1)
 
 url = f"http://{host}:{port}/goip_send_cmd.html"
 params = {"username": username, "password": password, "op": "set"}
 
-# Body is plain text, NOT JSON
+# Body is PLAIN TEXT, NOT JSON
 body = f"sim_imei({n})=865847053403202"
+# Multiple: "sim_imei(21)=865847053403202&sim_imei(51)=865847053403213"
 
-response = requests.post(url, params=params, data=body, headers={"Content-Type": "text/plain"})
+response = requests.post(url, params=params, data=body,
+                         headers={"Content-Type": "text/plain"})
 result = response.json()
-
-if result['code'] == 0:
-    print(f"IMEI set successfully (par_set={result.get('par_set')})")
-else:
-    print(f"Error: {result['reason']}")
+# Success: {"code": 0, "reason": "OK", "par_set": 1}
 ```
 
-## How to Request Scripts
+## Example: Set SIM Card Numbers (Section 6.4.4)
 
-When asking Claude to write code, mention your `.env` setup:
+```python
+# Same index formula as IMEI
+n = (port_number - 1) * slots_per_port + (slot_number - 1)
 
-✅ **Good:**
-"Write a script to send an SMS using my SK_ environment variables."
+url = f"http://{host}:{port}/goip_send_cmd.html"
+params = {"username": username, "password": password, "op": "set"}
 
-✅ **Better:**
-"Write a Python script that reads SK_HOST, SK_USERNAME, SK_PASSWORD, SK_PORT from my .env file and sends 'Test message' to 13686876620."
+body = f"sim_number({n})=1358021178"
 
-Claude will automatically write code that:
-- Imports `dotenv` and loads variables
-- Uses the SK_ variable names
-- Handles authentication correctly
-- Parses JSON responses
+response = requests.post(url, params=params, data=body,
+                         headers={"Content-Type": "text/plain"})
+# Success: {"code": 0, "reason": "OK", "par_set": 1}
+```
 
-## Response Format
+## Example: Query SMS Statistics
 
-All endpoints return JSON:
-
-```json
-{
-  "code": 200,
-  "reason": "OK",
-  "data": {...}
+```python
+url = f"http://{host}:{port}/goip_get_sms_stat.html"
+params = {
+    'version': '1.1', 'username': username, 'password': password,
+    'ports': 'all',  # or '2' or '1-2,4'
+    'slots': 'all',  # or omit for current card
+    'type': 3        # 0=last hour, 1=last 2h, 2=today, 3=cumulative
 }
+
+response = requests.get(url, params=params)
+stats = response.json()
+
+for s in stats.get('stats', []):
+    print(f"Port {s['port']}.{s['slot']}: {s['sent_ok']} sent, {s['received']} recv, {s['sent_failed']} fail")
 ```
 
-- **Code 200** = Success
-- **Non-200** = Error (check `reason` field)
+## Example: Query Received SMS
 
-## How I Can Help
+```python
+url = f"http://{host}:{port}/goip_get_sms.html"
+params = {
+    'username': username, 'password': password,
+    'sms_id': 1,    # start from 1
+    'sms_num': 0,   # 0 = all
+    'sms_del': 0    # 1 = delete after query
+}
 
-Tell me what you want to do with Skyline devices:
+response = requests.get(url, params=params)
+result = response.json()
+# result['ssrc'] changes on reboot -> restart from sms_id=1
+# result['next_sms'] -> use as sms_id for next query
+for sms in result.get('data', []):
+    # [delivery_flag, port, timestamp, sender, recipient, base64_content]
+    import base64
+    content = base64.b64decode(sms[5]).decode('utf-8')
+    print(f"From {sms[3]} on port {sms[1]}: {content}")
+```
 
-- **"Explain how to send an SMS"** - I'll walk through the endpoint, required fields, example request
-- **"Write a script to query SMS stats"** - I'll generate Python code with .env integration
-- **"Why did my SMS send fail?"** - I'll help debug the error code
-- **"How do I switch a SIM card?"** - I'll explain the command and show examples
-- **"Build a script that sends SMS and checks delivery"** - I'll create a multi-step workflow
-- **"Manage eSIM profiles"** - I'll guide you through add/remove/query operations
+## Example: eSIM Management
+
+```python
+# Query eSIM profiles
+url = f"http://{host}:{port}/goip_get_esims.html"
+params = {'version': '1.1', 'username': username, 'password': password, 'ports': 'all'}
+response = requests.get(url, params=params)
+# Returns: port, eid, esim_state, profiles[{slot, enabled, iccid, ac, cc, provider, status}]
+
+# Write eSIM
+url = f"http://{host}:{port}/goip_write_esims.html"
+params = {'version': '1.1', 'username': username, 'password': password}
+data = [{"port": 1, "slot": 1, "ac": "activation_code", "cc": "confirmation_code"}]
+response = requests.post(url, params=params, json=data)
+# Async! status 1=submitted, poll query endpoint for result
+
+# Delete eSIM
+url = f"http://{host}:{port}/goip_delete_esims.html"
+params = {'version': '1.1', 'username': username, 'password': password}
+data = [{"port": 1, "slot": 1}]
+response = requests.post(url, params=params, json=data)
+# Async! status 1=submitted, poll query endpoint for result
+```
+
+## Task Status Codes (SMS operations)
+
+| Code | Description |
+|------|-------------|
+| 0 | OK |
+| 1 | Invalid User |
+| 2 | Invalid Port |
+| 5 | SIM Unregistered |
+| 6 | Timeout |
+| 7 | Server Error |
+| 8 | SMS expected |
+| 9 | TO expected |
+| 10 | Pending Transaction |
+| 11 | TID Expected |
+| 13 | Duplicated TaskId |
+| 14 | Unauthorized |
+| 15 | Invalid CMD |
+| 16 | Too Many Task |
+| 17 | MMS Title expected |
+| 18 | Too Many MMS Attachments |
+| 19 | MMS Attachments expected |
+| 20 | MMS Attachments Cache Overlimit |
+
+## Response Formats
+
+**Most endpoints:** `{"code": 200, "reason": "OK", ...}` (code 200 = success)
+
+**Config set (op=set):** `{"code": 0, "reason": "OK", "par_set": N}` (code 0 = success)
 
 ---
 
-For complete endpoint specifications and field details, see [skyline_api_reference.md](references/skyline_api_reference.md)
+For complete field-level specifications, see [skyline_api_reference.md](skyline_api_reference.md)
