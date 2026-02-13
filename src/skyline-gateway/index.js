@@ -303,6 +303,11 @@ async function handlePortInfo(url, env) {
     ports: "all",
   });
 
+  // Support all_slots=1 to get IMEIs from every SIM slot (multi-slot gateways)
+  if (url.searchParams.get("all_slots") === "1") {
+    params.set("all_slots", "1");
+  }
+
   const infoUrl = `http://${gateway.host}:${gateway.api_port || 80}/goip_get_status.html?${params}`;
   const result = await bridgeFetch(env, infoUrl, "GET");
 

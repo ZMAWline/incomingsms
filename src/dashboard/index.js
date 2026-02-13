@@ -22,13 +22,6 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // Serve HTML dashboard
-    if (url.pathname === '/' || url.pathname === '') {
-      return new Response(getHTML(), {
-        headers: { 'Content-Type': 'text/html' }
-      });
-    }
-
     // API Routes
     if (url.pathname === '/api/stats') {
       return handleStats(env, corsHeaders);
@@ -91,6 +84,19 @@ export default {
       return handleSkylineProxy(request, env, url, corsHeaders);
     }
 
+    if (url.pathname === '/api/fix-sim') {
+      return handleFixSim(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/imei-pool') {
+      if (request.method === 'GET') return handleImeiPoolGet(env, corsHeaders);
+      if (request.method === 'POST') return handleImeiPoolPost(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/import-gateway-imeis' && request.method === 'POST') {
+      return handleImportGatewayImeis(request, env, corsHeaders);
+    }
+
     // Debug endpoint to test worker-to-worker connectivity via service binding
     if (url.pathname === '/api/debug-cancel') {
       try {
@@ -125,7 +131,10 @@ export default {
       }
     }
 
-    return new Response('Not Found', { status: 404 });
+    // Serve HTML dashboard for all non-API paths (SPA routing)
+    return new Response(getHTML(), {
+      headers: { 'Content-Type': 'text/html' }
+    });
   },
 };
 
@@ -1126,6 +1135,362 @@ async function supabaseGet(env, path) {
   });
 }
 
+async function handleFixSim(request, env, corsHeaders) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+
+  try {
+    const body = await request.json();
+    const simIds = body.sim_ids || [];
+
+    if (!Array.isArray(simIds) || simIds.length === 0) {
+      return new Response(JSON.stringify({ error: 'sim_ids array is required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!env.MDN_ROTATOR) {
+      return new Response(JSON.stringify({ error: 'MDN_ROTATOR service binding not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!env.ADMIN_RUN_SECRET) {
+      return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const workerUrl = `https://mdn-rotator/fix-sim?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
+    const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sim_ids: simIds })
+    });
+
+    const responseText = await workerResponse.text();
+    let result;
+    try { result = JSON.parse(responseText); } catch {
+      result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
+    }
+
+    return new Response(JSON.stringify(result, null, 2), {
+      status: workerResponse.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleImeiPoolGet(env, corsHeaders) {
+  try {
+    const response = await supabaseGet(
+      env,
+      'imei_pool?select=id,imei,status,sim_id,assigned_at,previous_sim_id,notes,created_at,sims!imei_pool_sim_id_fkey(iccid,port)&order=id.desc'
+    );
+    const pool = await response.json();
+
+    const stats = {
+      total: pool.length,
+      available: pool.filter(e => e.status === 'available').length,
+      in_use: pool.filter(e => e.status === 'in_use').length,
+      retired: pool.filter(e => e.status === 'retired').length,
+    };
+
+    return new Response(JSON.stringify({ pool, stats }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleImeiPoolPost(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const action = body.action;
+
+    if (action === 'add') {
+      const imeis = body.imeis || [];
+      if (!Array.isArray(imeis) || imeis.length === 0) {
+        return new Response(JSON.stringify({ error: 'imeis array is required' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      // Validate IMEI format
+      const valid = [];
+      const invalid = [];
+      for (const imei of imeis) {
+        const trimmed = imei.trim();
+        if (/^\d{15}$/.test(trimmed)) {
+          valid.push({ imei: trimmed, status: 'available' });
+        } else if (trimmed) {
+          invalid.push(trimmed);
+        }
+      }
+
+      if (valid.length === 0) {
+        return new Response(JSON.stringify({ error: 'No valid IMEIs found', invalid }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      // Bulk insert, ignoring duplicates
+      const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=ignore-duplicates,return=representation',
+        },
+        body: JSON.stringify(valid),
+      });
+
+      const insertText = await insertRes.text();
+      let inserted = [];
+      try { inserted = JSON.parse(insertText); } catch {}
+
+      return new Response(JSON.stringify({
+        ok: true,
+        added: inserted.length,
+        duplicates: valid.length - inserted.length,
+        invalid: invalid.length,
+      }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (action === 'retire') {
+      const id = body.id;
+      if (!id) {
+        return new Response(JSON.stringify({ error: 'id is required' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      // Only retire available entries
+      const patchRes = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${id}&status=eq.available`,
+        {
+          method: 'PATCH',
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation',
+          },
+          body: JSON.stringify({ status: 'retired', updated_at: new Date().toISOString() }),
+        }
+      );
+
+      const patchText = await patchRes.text();
+      let patched = [];
+      try { patched = JSON.parse(patchText); } catch {}
+
+      if (patched.length === 0) {
+        return new Response(JSON.stringify({ error: 'IMEI not found or not available' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+
+      return new Response(JSON.stringify({ ok: true, retired: patched[0] }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    return new Response(JSON.stringify({ error: 'Unknown action. Use "add" or "retire"' }), {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleImportGatewayImeis(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const gatewayId = body.gateway_id;
+
+    if (!gatewayId) {
+      return new Response(JSON.stringify({ error: 'gateway_id is required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!env.SKYLINE_GATEWAY) {
+      return new Response(JSON.stringify({ error: 'SKYLINE_GATEWAY service binding not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!env.SKYLINE_SECRET) {
+      return new Response(JSON.stringify({ error: 'SKYLINE_SECRET not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Fetch all port data with all_slots=1 to get every IMEI (including inactive slots on multi-SIM gateways)
+    const infoParams = new URLSearchParams({
+      gateway_id: gatewayId,
+      secret: env.SKYLINE_SECRET,
+      all_slots: '1',
+    });
+    const infoRes = await env.SKYLINE_GATEWAY.fetch(
+      `https://skyline-gateway/port-info?${infoParams}`,
+      { method: 'GET' }
+    );
+    const infoText = await infoRes.text();
+    let infoData;
+    try { infoData = JSON.parse(infoText); } catch {
+      return new Response(JSON.stringify({ error: `Non-JSON from skyline-gateway: ${infoText.slice(0, 200)}` }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (!infoData.ok) {
+      return new Response(JSON.stringify({ error: infoData.error || 'Gateway returned error', detail: infoData }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const ports = infoData.ports || [];
+    const totalPorts = ports.length;
+
+    // Extract unique, valid IMEIs (15 digits)
+    const seen = new Set();
+    const toInsert = [];
+    let skippedNoImei = 0;
+    // Track sim_id -> IMEI for backfilling sims.imei on active slots
+    const simImeiMap = [];
+
+    for (const p of ports) {
+      const imei = (p.imei || '').trim();
+      if (!imei || !/^\d{15}$/.test(imei)) {
+        skippedNoImei++;
+        continue;
+      }
+      if (!seen.has(imei)) {
+        seen.add(imei);
+        toInsert.push({
+          imei,
+          status: 'in_use',
+          notes: `Imported from gateway ${gatewayId} port ${p.port}${p.iccid ? ' iccid=' + p.iccid : ''}`,
+        });
+      }
+      // For active slots with a matched sim_id, record for backfill
+      if (p.iccid && p.sim_id) {
+        simImeiMap.push({ sim_id: p.sim_id, imei });
+      }
+    }
+
+    if (toInsert.length === 0) {
+      return new Response(JSON.stringify({
+        ok: true, added: 0, duplicates: 0,
+        skipped_no_imei: skippedNoImei, total_ports: totalPorts,
+        message: 'No valid IMEIs found on this gateway',
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    // Bulk insert into imei_pool, ignoring duplicates
+    const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=ignore-duplicates,return=representation',
+      },
+      body: JSON.stringify(toInsert),
+    });
+
+    const insertText = await insertRes.text();
+    let inserted = [];
+    try { inserted = JSON.parse(insertText); } catch {}
+
+    const added = Array.isArray(inserted) ? inserted.length : 0;
+    const duplicates = toInsert.length - added;
+
+    // Backfill sims.imei for active slots that have a matched sim_id
+    let backfilled = 0;
+    for (const entry of simImeiMap) {
+      try {
+        const patchRes = await fetch(
+          `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${encodeURIComponent(String(entry.sim_id))}&imei=is.null`,
+          {
+            method: 'PATCH',
+            headers: {
+              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({ imei: entry.imei }),
+          }
+        );
+        if (patchRes.ok) backfilled++;
+      } catch {}
+    }
+
+    // Set sim_id on imei_pool entries for active SIM slots
+    let linked = 0;
+    for (const entry of simImeiMap) {
+      try {
+        const linkRes = await fetch(
+          `${env.SUPABASE_URL}/rest/v1/imei_pool?imei=eq.${encodeURIComponent(entry.imei)}`,
+          {
+            method: 'PATCH',
+            headers: {
+              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({ sim_id: entry.sim_id }),
+          }
+        );
+        if (linkRes.ok) linked++;
+      } catch {}
+    }
+
+    return new Response(JSON.stringify({
+      ok: true, total_ports: totalPorts,
+      skipped_no_imei: skippedNoImei, found: toInsert.length,
+      added, duplicates, backfilled_sims: backfilled, linked_to_sims: linked,
+    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1185,6 +1550,9 @@ function getHTML() {
                 </button>
                 <button onclick="switchTab('gateway')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Gateway">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                </button>
+                <button onclick="switchTab('imei-pool')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="IMEI Pool">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
                 </button>
             </nav>
             <div class="mt-auto">
@@ -1268,7 +1636,7 @@ function getHTML() {
                     <div class="px-5 py-4 border-b border-dark-600">
                         <h2 class="text-lg font-semibold text-white">Quick Actions</h2>
                     </div>
-                    <div class="p-5 grid grid-cols-2 md:grid-cols-6 gap-3">
+                    <div class="p-5 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
                         <button onclick="showActivateModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
                             <div class="w-10 h-10 rounded-lg bg-blue-500/20 flex items-center justify-center group-hover:bg-blue-500/30 transition">
                                 <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
@@ -1304,6 +1672,12 @@ function getHTML() {
                                 <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
                             </div>
                             <span class="text-xs text-gray-300">Test SMS</span>
+                        </button>
+                        <button onclick="showFixSimModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-amber-500/20 flex items-center justify-center group-hover:bg-amber-500/30 transition">
+                                <svg class="w-5 h-5 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Fix SIM</span>
                         </button>
                     </div>
                 </div>
@@ -1352,6 +1726,7 @@ function getHTML() {
                                 <select id="filter-reseller" onchange="loadSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All Resellers</option>
                                 </select>
+                                <input id="sims-search" type="text" placeholder="Search..." oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-40">
                                 <span id="sims-count" class="text-sm text-gray-500"></span>
                             </div>
                         </div>
@@ -1360,15 +1735,15 @@ function getHTML() {
                         <table class="w-full">
                             <thead>
                                 <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
-                                    <th class="px-4 py-3 font-medium">ID</th>
-                                    <th class="px-4 py-3 font-medium">Gateway</th>
-                                    <th class="px-4 py-3 font-medium">ICCID</th>
-                                    <th class="px-4 py-3 font-medium">Phone</th>
-                                    <th class="px-4 py-3 font-medium">Status</th>
-                                    <th class="px-4 py-3 font-medium">Sub ID</th>
-                                    <th class="px-4 py-3 font-medium">Reseller</th>
-                                    <th class="px-4 py-3 font-medium">SMS</th>
-                                    <th class="px-4 py-3 font-medium">Last SMS</th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','id')">ID <span class="sort-arrow" data-table="sims" data-col="id"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','gateway_code')">Gateway <span class="sort-arrow" data-table="sims" data-col="gateway_code"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','iccid')">ICCID <span class="sort-arrow" data-table="sims" data-col="iccid"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','phone_number')">Phone <span class="sort-arrow" data-table="sims" data-col="phone_number"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','status')">Status <span class="sort-arrow" data-table="sims" data-col="status"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','mobility_subscription_id')">Sub ID <span class="sort-arrow" data-table="sims" data-col="mobility_subscription_id"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
                             </thead>
@@ -1385,17 +1760,20 @@ function getHTML() {
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
                         <h2 class="text-lg font-semibold text-white">SMS Messages</h2>
-                        <button onclick="loadMessages()" class="text-xs text-accent hover:text-green-400 transition">Refresh</button>
+                        <div class="flex items-center gap-3">
+                            <input id="messages-search" type="text" placeholder="Search..." oninput="renderMessages()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-40">
+                            <button onclick="loadMessages()" class="text-xs text-accent hover:text-green-400 transition">Refresh</button>
+                        </div>
                     </div>
                     <div class="overflow-x-auto">
                         <table class="w-full">
                             <thead>
                                 <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
-                                    <th class="px-5 py-3 font-medium">Time</th>
-                                    <th class="px-5 py-3 font-medium">To</th>
-                                    <th class="px-5 py-3 font-medium">From</th>
-                                    <th class="px-5 py-3 font-medium">Message</th>
-                                    <th class="px-5 py-3 font-medium">ICCID</th>
+                                    <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','received_at')">Time <span class="sort-arrow" data-table="messages" data-col="received_at"></span></th>
+                                    <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','to_number')">To <span class="sort-arrow" data-table="messages" data-col="to_number"></span></th>
+                                    <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','from_number')">From <span class="sort-arrow" data-table="messages" data-col="from_number"></span></th>
+                                    <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','body')">Message <span class="sort-arrow" data-table="messages" data-col="body"></span></th>
+                                    <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','iccid')">ICCID <span class="sort-arrow" data-table="messages" data-col="iccid"></span></th>
                                 </tr>
                             </thead>
                             <tbody id="messages-table" class="text-sm">
@@ -1504,7 +1882,7 @@ function getHTML() {
                     <div class="px-5 py-4 border-b border-dark-600">
                         <h2 class="text-lg font-semibold text-white">Gateway Actions</h2>
                     </div>
-                    <div class="p-5 grid grid-cols-2 md:grid-cols-5 gap-3">
+                    <div class="p-5 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
                         <button onclick="showGwSwitchSimModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
                             <div class="w-10 h-10 rounded-lg bg-purple-500/20 flex items-center justify-center group-hover:bg-purple-500/30 transition">
                                 <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
@@ -1535,6 +1913,70 @@ function getHTML() {
                             </div>
                             <span class="text-xs text-gray-300">Unlock</span>
                         </button>
+                        <button onclick="importGatewayImeis()" id="gw-import-imei-btn" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-cyan-500/20 flex items-center justify-center group-hover:bg-cyan-500/30 transition">
+                                <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Import IMEIs</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- IMEI Pool Tab -->
+            <div id="tab-imei-pool" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">IMEI Pool</h2>
+                    <div class="flex items-center gap-3">
+                        <input id="imei-search" type="text" placeholder="Search IMEI..." oninput="renderImeiPool()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-40">
+                        <select id="imei-status-filter" onchange="renderImeiPool()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                            <option value="">All Statuses</option>
+                            <option value="in_use">In Use</option>
+                            <option value="available">Available</option>
+                            <option value="retired">Retired</option>
+                        </select>
+                        <button onclick="showAddImeiModal()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add IMEIs</button>
+                    </div>
+                </div>
+
+                <!-- Stats Row -->
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                    <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
+                        <span class="text-sm text-gray-400">Total</span>
+                        <p class="text-2xl font-bold text-white" id="imei-total">-</p>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
+                        <span class="text-sm text-gray-400">Available</span>
+                        <p class="text-2xl font-bold text-accent" id="imei-available">-</p>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
+                        <span class="text-sm text-gray-400">In Use</span>
+                        <p class="text-2xl font-bold text-blue-400" id="imei-in-use">-</p>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
+                        <span class="text-sm text-gray-400">Retired</span>
+                        <p class="text-2xl font-bold text-gray-500" id="imei-retired">-</p>
+                    </div>
+                </div>
+
+                <!-- Pool Table -->
+                <div class="bg-dark-800 rounded-xl border border-dark-600">
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','id')">ID <span class="sort-arrow" data-table="imei" data-col="id"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','imei')">IMEI <span class="sort-arrow" data-table="imei" data-col="imei"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','status')">Status <span class="sort-arrow" data-table="imei" data-col="status"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','sim_id')">Assigned SIM <span class="sort-arrow" data-table="imei" data-col="sim_id"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','assigned_at')">Assigned At <span class="sort-arrow" data-table="imei" data-col="assigned_at"></span></th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="imei-pool-table" class="text-sm">
+                                <tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
@@ -1544,6 +1986,46 @@ function getHTML() {
     <!-- Toast -->
     <div id="toast" class="hidden fixed bottom-4 right-4 px-6 py-4 rounded-lg shadow-lg max-w-md z-50">
         <p id="toast-message" class="text-sm"></p>
+    </div>
+
+    <!-- Fix SIM Modal -->
+    <div id="fix-sim-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Fix SIM (IMEI + OTA + Cancel/Resume)</h3>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3">Enter SIM IDs to fix (one per line):</p>
+                <textarea id="fix-sim-input" rows="8" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="1"></textarea>
+                <p class="text-xs text-gray-500 mt-2">Changes IMEI from pool, runs OTA Refresh, Cancel, Resume On Cancel</p>
+                <div id="fix-sim-result" class="mt-4 hidden">
+                    <h4 class="text-sm font-medium text-gray-400 mb-2">Results:</h4>
+                    <pre id="fix-sim-output" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-60 overflow-y-auto text-gray-300 border border-dark-600"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideFixSimModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
+                <button onclick="fixSims()" id="fix-sim-btn" class="px-4 py-2 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg transition">Fix SIMs</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add IMEIs Modal -->
+    <div id="add-imei-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
+            <div class="px-5 py-4 border-b border-dark-600">
+                <h3 class="text-lg font-semibold text-white">Add IMEIs to Pool</h3>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3">Enter IMEIs to add (one per line, 15 digits each):</p>
+                <textarea id="add-imei-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="123456789012345"></textarea>
+                <p class="text-xs text-gray-500 mt-2">Duplicates will be ignored automatically</p>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                <button onclick="hideAddImeiModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                <button onclick="addImeis()" id="add-imei-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Add IMEIs</button>
+            </div>
+        </div>
     </div>
 
     <!-- Cancel Modal -->
@@ -1606,9 +2088,10 @@ function getHTML() {
                 <h3 class="text-lg font-semibold text-white">Activate SIMs</h3>
             </div>
             <div class="p-5">
-                <p class="text-sm text-gray-400 mb-3">Enter SIM data (CSV: iccid,imei,reseller_id):</p>
-                <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631,123456789012345,1"></textarea>
-                <p class="text-xs text-gray-500 mt-2">Format: ICCID (20 digits), IMEI (15 digits), Reseller ID</p>
+                <p class="text-sm text-gray-400 mb-3">Paste from spreadsheet or enter one SIM per line:</p>
+                <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631&#9;123456789012345&#9;1
+89014103271467425632&#9;123456789012346&#9;1"></textarea>
+                <p class="text-xs text-gray-500 mt-2">3 columns: ICCID (20 digits), IMEI (15 digits), Reseller ID — tab or comma separated</p>
             </div>
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
                 <button onclick="hideActivateModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
@@ -1770,19 +2253,121 @@ function getHTML() {
         </div>
     </div>
 
+    <!-- Port Detail Modal -->
+    <div id="port-detail-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-3xl max-h-[90vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                <h3 id="port-detail-title" class="text-lg font-semibold text-white">Port Details</h3>
+                <button onclick="hideGwModal('port-detail-modal')" class="text-gray-400 hover:text-white transition text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 overflow-y-auto" id="port-detail-content">
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
+                <button onclick="hideGwModal('port-detail-modal')" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const API_BASE = '/api';
 
-        function switchTab(tabName) {
+        
+        const TAB_ROUTES = {
+            'dashboard': '/',
+            'sims': '/sims',
+            'messages': '/messages',
+            'workers': '/workers',
+            'gateway': '/gateway',
+            'imei-pool': '/imei-pool',
+        };
+        const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
+
+        function switchTab(tabName, push = true) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
             document.querySelectorAll('.sidebar-btn').forEach(el => {
                 el.classList.remove('bg-dark-600', 'text-white');
                 el.classList.add('text-gray-400');
             });
-            document.getElementById(\`tab-\${tabName}\`).classList.remove('hidden');
-            event.currentTarget.classList.add('bg-dark-600', 'text-white');
-            event.currentTarget.classList.remove('text-gray-400');
+            const tabEl = document.getElementById(\`tab-\${tabName}\`);
+            if (!tabEl) return;
+            tabEl.classList.remove('hidden');
+            // Highlight the correct sidebar button
+            const btns = document.querySelectorAll('.sidebar-btn');
+            const tabNames = Object.keys(TAB_ROUTES);
+            tabNames.forEach((name, i) => {
+                if (name === tabName && btns[i]) {
+                    btns[i].classList.add('bg-dark-600', 'text-white');
+                    btns[i].classList.remove('text-gray-400');
+                }
+            });
+            if (push && TAB_ROUTES[tabName]) {
+                history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
+            }
+            if (tabName === 'imei-pool') loadImeiPool();
+            if (tabName === 'gateway') loadPortStatus();
         }
+
+        // Handle browser back/forward
+        window.addEventListener('popstate', (e) => {
+            const tab = e.state?.tab || ROUTE_TO_TAB[location.pathname] || 'dashboard';
+            switchTab(tab, false);
+        });
+
+        // Init tab from URL on page load
+
+        // ===== Sort & Filter Engine =====
+        const tableState = {
+            sims: { data: [], sortKey: 'id', sortDir: 'asc' },
+            messages: { data: [], sortKey: 'received_at', sortDir: 'desc' },
+            imei: { data: [], sortKey: 'id', sortDir: 'desc' },
+        };
+
+        function sortTable(table, key) {
+            const state = tableState[table];
+            if (state.sortKey === key) {
+                state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+            } else {
+                state.sortKey = key;
+                state.sortDir = 'asc';
+            }
+            // Update arrows
+            document.querySelectorAll(\`[data-table="\${table}"]\`).forEach(el => el.textContent = '');
+            const arrow = document.querySelector(\`[data-table="\${table}"][data-col="\${key}"]\`);
+            if (arrow) arrow.textContent = state.sortDir === 'asc' ? ' \u25B2' : ' \u25BC';
+            // Re-render
+            if (table === 'sims') renderSims();
+            else if (table === 'messages') renderMessages();
+            else if (table === 'imei') renderImeiPool();
+        }
+
+        function genericSort(arr, key, dir) {
+            return [...arr].sort((a, b) => {
+                let va = a[key], vb = b[key];
+                if (va == null) va = '';
+                if (vb == null) vb = '';
+                if (typeof va === 'number' && typeof vb === 'number') {
+                    return dir === 'asc' ? va - vb : vb - va;
+                }
+                va = String(va).toLowerCase();
+                vb = String(vb).toLowerCase();
+                if (va < vb) return dir === 'asc' ? -1 : 1;
+                if (va > vb) return dir === 'asc' ? 1 : -1;
+                return 0;
+            });
+        }
+
+        function matchesSearch(obj, query) {
+            if (!query) return true;
+            const q = query.toLowerCase();
+            return Object.values(obj).some(v => v != null && String(v).toLowerCase().includes(q));
+        }
+
+
+        function initTabFromUrl() {
+            const tab = ROUTE_TO_TAB[location.pathname] || 'dashboard';
+            switchTab(tab, false);
+        }
+
 
         function showToast(message, type = 'info') {
             const toast = document.getElementById('toast');
@@ -1858,50 +2443,62 @@ function getHTML() {
                 const url = \`\${API_BASE}/sims?\${params.toString()}\`;
                 const response = await fetch(url);
                 const sims = await response.json();
-                const tbody = document.getElementById('sims-table');
-                const countEl = document.getElementById('sims-count');
-                countEl.textContent = \`\${sims.length} SIM(s)\`;
-
-                if (sims.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = sims.map(sim => {
-                    const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
-                    const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
-                    const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-accent" title="Verified">&#10003;</span>' : '';
-                    const gatewayDisplay = sim.gateway_code ? \`<span class="font-medium text-gray-200">\${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">\${sim.port || ''}</span>\` : (sim.port || '-');
-                    const statusClass = {
-                        'active': 'bg-accent/20 text-accent',
-                        'provisioning': 'bg-yellow-500/20 text-yellow-400',
-                        'suspended': 'bg-orange-500/20 text-orange-400',
-                        'canceled': 'bg-red-500/20 text-red-400',
-                        'error': 'bg-red-500/20 text-red-400',
-                    }[sim.status] || 'bg-gray-500/20 text-gray-400';
-                    return \`
-                    <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
-                        <td class="px-4 py-3 text-gray-300">\${sim.id}</td>
-                        <td class="px-4 py-3 text-gray-400" title="\${sim.gateway_name || ''}">\${gatewayDisplay}</td>
-                        <td class="px-4 py-3 text-gray-400 font-mono text-xs">\${sim.iccid}</td>
-                        <td class="px-4 py-3 text-gray-200">\${sim.phone_number || '-'}\${verifiedBadge}</td>
-                        <td class="px-4 py-3">
-                            <span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${sim.status}</span>
-                        </td>
-                        <td class="px-4 py-3 font-mono text-xs">\${sim.mobility_subscription_id ? \`<button onclick="queryHelixSubId('\${sim.mobility_subscription_id}')" class="text-indigo-400 hover:text-indigo-300 hover:underline">\${sim.mobility_subscription_id}</button>\` : '-'}</td>
-                        <td class="px-4 py-3 text-gray-400">\${sim.reseller_name || '-'}</td>
-                        <td class="px-4 py-3 text-gray-300">\${sim.sms_count || 0}</td>
-                        <td class="px-4 py-3 text-gray-500 text-xs">\${lastSms}</td>
-                        <td class="px-4 py-3">
-                            \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Online</button>\` : '-'}
-                        </td>
-                    </tr>
-                \`;
-                }).join('');
+                tableState.sims.data = sims;
+                renderSims();
             } catch (error) {
                 showToast('Error loading SIMs', 'error');
                 console.error(error);
             }
         }
+
+        function renderSims() {
+            const state = tableState.sims;
+            const search = (document.getElementById('sims-search')?.value || '').trim();
+            let data = state.data;
+            if (search) data = data.filter(s => matchesSearch(s, search));
+            data = genericSort(data, state.sortKey, state.sortDir);
+
+            const tbody = document.getElementById('sims-table');
+            const countEl = document.getElementById('sims-count');
+            countEl.textContent = \`\${data.length} of \${state.data.length} SIM(s)\`;
+
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
+                return;
+            }
+            tbody.innerHTML = data.map(sim => {
+                const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
+                const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
+                const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-accent" title="Verified">&#10003;</span>' : '';
+                const gatewayDisplay = sim.gateway_code ? \`<span class="font-medium text-gray-200">\${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">\${sim.port || ''}</span>\` : (sim.port || '-');
+                const statusClass = {
+                    'active': 'bg-accent/20 text-accent',
+                    'provisioning': 'bg-yellow-500/20 text-yellow-400',
+                    'suspended': 'bg-orange-500/20 text-orange-400',
+                    'canceled': 'bg-red-500/20 text-red-400',
+                    'error': 'bg-red-500/20 text-red-400',
+                }[sim.status] || 'bg-gray-500/20 text-gray-400';
+                return \`
+                <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                    <td class="px-4 py-3 text-gray-300">\${sim.id}</td>
+                    <td class="px-4 py-3 text-gray-400" title="\${sim.gateway_name || ''}">\${gatewayDisplay}</td>
+                    <td class="px-4 py-3 text-gray-400 font-mono text-xs">\${sim.iccid}</td>
+                    <td class="px-4 py-3 text-gray-200">\${sim.phone_number || '-'}\${verifiedBadge}</td>
+                    <td class="px-4 py-3">
+                        <span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${sim.status}</span>
+                    </td>
+                    <td class="px-4 py-3 font-mono text-xs">\${sim.mobility_subscription_id ? \`<button onclick="queryHelixSubId('\${sim.mobility_subscription_id}')" class="text-indigo-400 hover:text-indigo-300 hover:underline">\${sim.mobility_subscription_id}</button>\` : '-'}</td>
+                    <td class="px-4 py-3 text-gray-400">\${sim.reseller_name || '-'}</td>
+                    <td class="px-4 py-3 text-gray-300">\${sim.sms_count || 0}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${lastSms}</td>
+                    <td class="px-4 py-3">
+                        \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Online</button>\` : '-'}
+                    </td>
+                </tr>
+                \`;
+            }).join('');
+        }
+
 
         async function sendSimOnline(simId, phoneNumber) {
             if (!confirm(\`Send number.online webhook for \${phoneNumber}?\`)) {
@@ -1932,25 +2529,8 @@ function getHTML() {
                 const messages = await response.json();
 
                 // Update main messages table
-                const tbody = document.getElementById('messages-table');
-                if (messages.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="px-5 py-4 text-center text-gray-500">No messages found</td></tr>';
-                } else {
-                    tbody.innerHTML = messages.map(msg => {
-                        const date = new Date(msg.received_at);
-                        const timeStr = date.toLocaleString();
-                        return \`
-                            <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
-                                <td class="px-5 py-3 text-gray-400 text-xs">\${timeStr}</td>
-                                <td class="px-5 py-3 text-gray-200">\${msg.to_number || '-'}</td>
-                                <td class="px-5 py-3 text-gray-200">\${msg.from_number}</td>
-                                <td class="px-5 py-3 text-gray-300 max-w-md truncate">\${msg.body}</td>
-                                <td class="px-5 py-3 text-gray-500 font-mono text-xs">\${msg.iccid || '-'}</td>
-                            </tr>
-                        \`;
-                    }).join('');
-                }
-
+                tableState.messages.data = messages;
+                renderMessages();
                 // Update preview table (first 5)
                 const preview = document.getElementById('messages-preview');
                 const previewMsgs = messages.slice(0, 5);
@@ -1975,6 +2555,33 @@ function getHTML() {
                 console.error(error);
             }
         }
+
+        function renderMessages() {
+            const state = tableState.messages;
+            const search = (document.getElementById('messages-search')?.value || '').trim();
+            let data = state.data;
+            if (search) data = data.filter(m => matchesSearch(m, search));
+            data = genericSort(data, state.sortKey, state.sortDir);
+
+            const tbody = document.getElementById('messages-table');
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="px-5 py-4 text-center text-gray-500">No messages found</td></tr>';
+                return;
+            }
+            tbody.innerHTML = data.map(msg => {
+                const timeStr = new Date(msg.received_at).toLocaleString();
+                return \`
+                    <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                        <td class="px-5 py-3 text-gray-400 text-xs">\${timeStr}</td>
+                        <td class="px-5 py-3 text-gray-200">\${msg.to_number || '-'}</td>
+                        <td class="px-5 py-3 text-gray-200">\${msg.from_number}</td>
+                        <td class="px-5 py-3 text-gray-300 max-w-md truncate">\${msg.body}</td>
+                        <td class="px-5 py-3 text-gray-500 font-mono text-xs">\${msg.iccid || '-'}</td>
+                    </tr>
+                \`;
+            }).join('');
+        }
+
 
         function showRotateSimModal() {
             document.getElementById('rotate-sim-modal').classList.remove('hidden');
@@ -2095,13 +2702,14 @@ function getHTML() {
                 return;
             }
 
-            // Parse CSV data
+            // Parse pasted data (tab-separated from spreadsheet, or comma-separated)
             const lines = input.split('\\n').map(line => line.trim()).filter(line => line.length > 0);
             const sims = [];
             const errors = [];
 
             for (let i = 0; i < lines.length; i++) {
-                const parts = lines[i].split(',').map(p => p.trim());
+                const delimiter = lines[i].includes('\\t') ? '\\t' : ',';
+                const parts = lines[i].split(delimiter).map(p => p.trim());
                 if (parts.length !== 3) {
                     errors.push(\`Line \${i + 1}: Invalid format (expected 3 columns)\`);
                     continue;
@@ -2561,6 +3169,7 @@ function getHTML() {
                 }
 
                 label.textContent = \`\${ports.length} port(s) - Updated \${new Date().toLocaleTimeString()}\`;
+                window.portData = ports;
 
                 grid.innerHTML = ports.map(p => {
                     const portLabel = p.port || '?';
@@ -2598,8 +3207,75 @@ function getHTML() {
             }
         }
 
-        function selectPort(port) {
-            showToast(\`Port \${port} selected\`, 'info');
+        const SLOT_TO_LETTER = { '01':'A', '02':'B', '03':'C', '04':'D', '05':'E', '06':'F', '07':'G', '08':'H' };
+
+        function selectPort(portLabel) {
+            if (!window.portData) return;
+            // Port format from gateway: "1.01", "1.02", "2.01" etc. (port.slot)
+            const match = portLabel.match(/^(\\d+)\\.(\\d+)$/);
+            if (!match) return;
+            const portNum = match[1];
+            const slotNum = match[2];
+            const slotLetter = SLOT_TO_LETTER[slotNum] || slotNum;
+
+            // Find all slots on this physical port
+            const siblings = window.portData.filter(p => {
+                const m = (p.port || '').match(/^(\\d+)\\./);
+                return m && m[1] === portNum;
+            }).sort((a, b) => (a.port || '').localeCompare(b.port || ''));
+
+            document.getElementById('port-detail-title').textContent = \`Port \${portNum} \u2014 \${portLabel} / \${portNum}\${slotLetter}\`;
+
+            const content = document.getElementById('port-detail-content');
+            content.innerHTML = \`
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-gray-400 border-b border-dark-600">
+                            <th class="pb-2 pr-3">Slot</th>
+                            <th class="pb-2 pr-3">Status</th>
+                            <th class="pb-2 pr-3">Number</th>
+                            <th class="pb-2 pr-3">ICCID</th>
+                            <th class="pb-2 pr-3">IMEI</th>
+                            <th class="pb-2 pr-3">Signal</th>
+                            <th class="pb-2">Operator</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        \${siblings.map(p => {
+                            const pm = (p.port || '').match(/^(\\d+)\\.(\\d+)$/);
+                            const sn = pm ? pm[2] : '?';
+                            const sl = SLOT_TO_LETTER[sn] || sn;
+                            const st = p.st ?? -1;
+                            const info = PORT_STATUS_COLORS[st] || { bg: 'bg-gray-600', label: 'Unknown' };
+                            const isCurrent = p.port === portLabel;
+                            const rowBg = isCurrent ? 'bg-dark-600' : '';
+                            const number = p.number ? p.number.replace('+1', '') : '';
+                            return \`
+                                <tr class="\${rowBg} border-b border-dark-700">
+                                    <td class="py-2 pr-3 font-mono text-gray-200">
+                                        <span class="font-bold">\${p.port}</span>
+                                        <span class="text-gray-500 ml-1">\${portNum}\${sl}</span>
+                                    </td>
+                                    <td class="py-2 pr-3">
+                                        <span class="inline-flex items-center gap-1.5">
+                                            <span class="w-2.5 h-2.5 rounded-full \${info.bg} inline-block"></span>
+                                            <span class="text-gray-300">\${info.label}</span>
+                                        </span>
+                                    </td>
+                                    <td class="py-2 pr-3 font-mono \${number ? 'text-accent' : 'text-gray-600'}">\${number || '---'}</td>
+                                    <td class="py-2 pr-3 font-mono text-gray-400 text-xs">\${p.iccid || '---'}</td>
+                                    <td class="py-2 pr-3 font-mono text-gray-400 text-xs">\${p.imei || '---'}</td>
+                                    <td class="py-2 pr-3 text-gray-300">\${p.signal != null ? p.signal : '-'}</td>
+                                    <td class="py-2 text-gray-300">\${p.operator || '---'}</td>
+                                </tr>
+                            \`;
+                        }).join('')}
+                    </tbody>
+                </table>
+                \${siblings.length === 1 ? '<p class="text-xs text-gray-500 mt-3">This port has a single SIM slot.</p>' : \`<p class="text-xs text-gray-500 mt-3">\${siblings.length} SIM slot(s) on this port. Current slot highlighted.</p>\`}
+            \`;
+
+            document.getElementById('port-detail-modal').classList.remove('hidden');
         }
 
         function getSelectedGatewayId() {
@@ -2748,10 +3424,235 @@ function getHTML() {
             }
         }
 
+        // --- Fix SIM ---
+        function showFixSimModal() {
+            document.getElementById('fix-sim-modal').classList.remove('hidden');
+            document.getElementById('fix-sim-result').classList.add('hidden');
+            document.getElementById('fix-sim-btn').disabled = false;
+            document.getElementById('fix-sim-btn').textContent = 'Fix SIMs';
+        }
+
+        function hideFixSimModal() {
+            document.getElementById('fix-sim-modal').classList.add('hidden');
+            document.getElementById('fix-sim-input').value = '';
+            document.getElementById('fix-sim-result').classList.add('hidden');
+        }
+
+        async function fixSims() {
+            const input = document.getElementById('fix-sim-input').value.trim();
+            if (!input) { showToast('Please enter at least one SIM ID', 'error'); return; }
+
+            const simIds = input.split('\\n').map(l => l.trim()).filter(Boolean).map(id => parseInt(id)).filter(id => !isNaN(id));
+            if (simIds.length === 0) { showToast('No valid SIM IDs found', 'error'); return; }
+
+            if (!confirm(\`Fix \${simIds.length} SIM(s)? This will change IMEI and run OTA/Cancel/Resume.\`)) return;
+
+            const btn = document.getElementById('fix-sim-btn');
+            btn.disabled = true;
+            btn.textContent = 'Fixing...';
+            showToast(\`Fixing \${simIds.length} SIM(s)...\`, 'info');
+
+            try {
+                const response = await fetch(\`\${API_BASE}/fix-sim\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: simIds })
+                });
+                const result = await response.json();
+
+                const resultDiv = document.getElementById('fix-sim-result');
+                const outputPre = document.getElementById('fix-sim-output');
+                resultDiv.classList.remove('hidden');
+                outputPre.textContent = JSON.stringify(result, null, 2);
+
+                if (response.ok && result.results) {
+                    const succeeded = result.results.filter(r => r.ok).length;
+                    const failed = result.results.filter(r => !r.ok).length;
+                    showToast(\`Fixed \${succeeded}, failed \${failed}\`, failed > 0 ? 'error' : 'success');
+                } else {
+                    showToast(\`Error: \${result.error || 'Unknown'}\`, 'error');
+                }
+            } catch (error) {
+                showToast('Error fixing SIMs', 'error');
+                console.error(error);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Fix SIMs';
+            }
+        }
+
+        // --- IMEI Pool ---
+        function showAddImeiModal() {
+            document.getElementById('add-imei-modal').classList.remove('hidden');
+            document.getElementById('add-imei-input').value = '';
+        }
+
+        function hideAddImeiModal() {
+            document.getElementById('add-imei-modal').classList.add('hidden');
+            document.getElementById('add-imei-input').value = '';
+        }
+
+        async function addImeis() {
+            const input = document.getElementById('add-imei-input').value.trim();
+            if (!input) { showToast('Please enter at least one IMEI', 'error'); return; }
+
+            const imeis = input.split('\\n').map(l => l.trim()).filter(Boolean);
+            if (imeis.length === 0) { showToast('No IMEIs entered', 'error'); return; }
+
+            const btn = document.getElementById('add-imei-btn');
+            btn.disabled = true;
+            btn.textContent = 'Adding...';
+
+            try {
+                const response = await fetch(\`\${API_BASE}/imei-pool\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'add', imeis })
+                });
+                const result = await response.json();
+
+                if (result.ok) {
+                    showToast(\`Added \${result.added} IMEI(s), \${result.duplicates} duplicate(s), \${result.invalid} invalid\`, 'success');
+                    hideAddImeiModal();
+                    loadImeiPool();
+                } else {
+                    showToast(\`Error: \${result.error}\`, 'error');
+                }
+            } catch (error) {
+                showToast('Error adding IMEIs', 'error');
+                console.error(error);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Add IMEIs';
+            }
+        }
+
+        async function retireImei(id) {
+            if (!confirm('Retire this IMEI? It will no longer be available for allocation.')) return;
+
+            try {
+                const response = await fetch(\`\${API_BASE}/imei-pool\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'retire', id })
+                });
+                const result = await response.json();
+
+                if (result.ok) {
+                    showToast('IMEI retired', 'success');
+                    loadImeiPool();
+                } else {
+                    showToast(\`Error: \${result.error}\`, 'error');
+                }
+            } catch (error) {
+                showToast('Error retiring IMEI', 'error');
+            }
+        }
+
+        async function importGatewayImeis() {
+            const gatewayId = document.getElementById('gw-select').value;
+            if (!gatewayId) {
+                showToast('Select a gateway first', 'error');
+                return;
+            }
+
+            const btn = document.getElementById('gw-import-imei-btn');
+            const origLabel = btn.querySelector('span').textContent;
+            btn.querySelector('span').textContent = 'Importing...';
+            btn.disabled = true;
+
+            try {
+                const res = await fetch(\`\${API_BASE}/import-gateway-imeis\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: parseInt(gatewayId) }),
+                });
+                const data = await res.json();
+
+                if (!res.ok || !data.ok) {
+                    showToast(data.error || 'Import failed', 'error');
+                    return;
+                }
+
+                const msg = \`Added \${data.added} IMEIs (\${data.duplicates} already in pool, \${data.skipped_no_imei} slots had no IMEI)\`;
+                showToast(msg, 'success');
+
+                // Refresh IMEI pool if on that tab
+                if (document.getElementById('tab-imei-pool') && !document.getElementById('tab-imei-pool').classList.contains('hidden')) {
+                    loadImeiPool();
+                }
+            } catch (err) {
+                showToast('Import error: ' + err, 'error');
+            } finally {
+                btn.querySelector('span').textContent = origLabel;
+                btn.disabled = false;
+            }
+        }
+
+        async function loadImeiPool() {
+            try {
+                const response = await fetch(\`\${API_BASE}/imei-pool\`);
+                const data = await response.json();
+
+                tableState.imei.data = data.pool || [];
+                tableState.imei.stats = data.stats || {};
+                renderImeiPool();
+            } catch (error) {
+                console.error('Error loading IMEI pool:', error);
+            }
+        }
+
+        function renderImeiPool() {
+            const state = tableState.imei;
+            const stats = state.stats || {};
+            const search = (document.getElementById('imei-search')?.value || '').trim();
+            const statusFilter = (document.getElementById('imei-status-filter')?.value || '');
+
+            document.getElementById('imei-total').textContent = stats.total || 0;
+            document.getElementById('imei-available').textContent = stats.available || 0;
+            document.getElementById('imei-in-use').textContent = stats.in_use || 0;
+            document.getElementById('imei-retired').textContent = stats.retired || 0;
+
+            let data = state.data;
+            if (statusFilter) data = data.filter(e => e.status === statusFilter);
+            if (search) data = data.filter(e => matchesSearch(e, search));
+            data = genericSort(data, state.sortKey, state.sortDir);
+
+            const tbody = document.getElementById('imei-pool-table');
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">No IMEIs match filters</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = data.map(entry => {
+                const statusClass = {
+                    'available': 'bg-accent/20 text-accent',
+                    'in_use': 'bg-blue-500/20 text-blue-400',
+                    'retired': 'bg-gray-500/20 text-gray-400',
+                }[entry.status] || 'bg-gray-500/20 text-gray-400';
+                const simInfo = entry.sims ? \`\${entry.sims.iccid || ''} (port \${entry.sims.port || '?'})\` : (entry.sim_id ? \`SIM #\${entry.sim_id}\` : '-');
+                const assignedAt = entry.assigned_at ? new Date(entry.assigned_at).toLocaleString() : '-';
+                const canRetire = entry.status === 'available';
+                return \`
+                <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                    <td class="px-4 py-3 text-gray-400">\${entry.id}</td>
+                    <td class="px-4 py-3 font-mono text-sm text-gray-200">\${entry.imei}</td>
+                    <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${entry.status}</span></td>
+                    <td class="px-4 py-3 text-gray-400 text-xs">\${entry.status === 'in_use' ? simInfo : '-'}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${entry.status === 'in_use' ? assignedAt : '-'}</td>
+                    <td class="px-4 py-3">
+                        \${canRetire ? \`<button onclick="retireImei(\${entry.id})" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-700 text-white rounded transition">Retire</button>\` : ''}
+                    </td>
+                </tr>\`;
+            }).join('');
+        }
+
+
         loadGatewayDropdown();
         loadResellers();
         loadData();
         setInterval(loadData, 30000);
+        initTabFromUrl();
     </script>
 </body>
 </html>`;

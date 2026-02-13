@@ -24,6 +24,11 @@ max_batch_size = 10
 max_retries = 3
 max_concurrency = 1
 
+# Service binding for skyline-gateway worker
+[[services]]
+binding = "SKYLINE_GATEWAY"
+service = "skyline-gateway"
+
 [observability.logs]
 enabled = true
 invocation_logs = true
@@ -51,6 +56,11 @@ queue = "mdn-rotation-queue-test"
 max_batch_size = 10
 max_retries = 3
 max_concurrency = 1
+
+# Service binding for skyline-gateway worker (TEST)
+[[env.test.services]]
+binding = "SKYLINE_GATEWAY"
+service = "skyline-gateway-test"
 
 [env.test.observability.logs]
 enabled = true
