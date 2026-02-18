@@ -41,6 +41,10 @@ service = "sim-status-changer"
 binding = "SKYLINE_GATEWAY"
 service = "skyline-gateway"
 
+# [[services]]
+# binding = "QUICKBOOKS"
+# service = "quickbooks"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "dashboard-test"
@@ -81,3 +85,7 @@ service = "sim-status-changer-test"
 [[env.test.services]]
 binding = "SKYLINE_GATEWAY"
 service = "skyline-gateway-test"
+
+# [[env.test.services]]
+# binding = "QUICKBOOKS"
+# service = "quickbooks-test"

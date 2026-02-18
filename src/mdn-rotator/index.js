@@ -84,6 +84,140 @@ export default {
       }
     }
 
+    if (url.pathname === "/sim-action" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      try {
+        const body = await request.json();
+        const { sim_id, action } = body;
+
+        if (!sim_id || !action) {
+          return new Response(JSON.stringify({ error: "sim_id and action are required" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        const validActions = ["ota_refresh", "cancel", "resume", "rotate", "fix"];
+        if (!validActions.includes(action)) {
+          return new Response(JSON.stringify({ error: `Invalid action: ${action}. Valid: ${validActions.join(", ")}` }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        // Load SIM from DB
+        const sims = await supabaseSelect(
+          env,
+          `sims?select=id,iccid,mobility_subscription_id,gateway_id,port&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`
+        );
+        if (!Array.isArray(sims) || sims.length === 0) {
+          return new Response(JSON.stringify({ ok: false, error: `SIM not found: ${sim_id}` }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        const sim = sims[0];
+        const iccid = sim.iccid;
+        const subId = sim.mobility_subscription_id;
+
+        // For rotate, delegate directly
+        if (action === "rotate") {
+          const result = await rotateSpecificSim(env, iccid);
+          return new Response(JSON.stringify({ ok: result.ok, action, sim_id, iccid, detail: result }, null, 2), {
+            status: result.ok ? 200 : 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        // For fix, delegate directly
+        if (action === "fix") {
+          const token = await getCachedToken(env);
+          const result = await fixSim(env, token, sim_id, { autoRotate: false });
+          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        // For ota_refresh, cancel, resume — need Helix token + subscriber details
+        if (!subId) {
+          return new Response(JSON.stringify({ ok: false, error: `SIM ${iccid} has no mobility_subscription_id` }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        const token = await getCachedToken(env);
+        const runId = `simaction_${iccid}_${Date.now()}`;
+
+        // Get subscriber details for mdn + attBan
+        const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
+        const d = Array.isArray(details) ? details[0] : null;
+        const subscriberNumber = d?.phoneNumber;
+        const attBan = d?.attBan || d?.ban || null;
+
+        if (!subscriberNumber) {
+          return new Response(JSON.stringify({ ok: false, error: `No phoneNumber from Helix for SIM ${iccid}` }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        const mdn = String(subscriberNumber).replace(/\D/g, "").replace(/^1/, "");
+
+        if (action === "ota_refresh") {
+          if (!attBan) {
+            return new Response(JSON.stringify({ ok: false, error: `No attBan for SIM ${iccid}, cannot OTA refresh` }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+          const result = await hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid);
+          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        if (action === "cancel") {
+          const result = await hxChangeSubscriberStatus(env, token, {
+            mobilitySubscriptionId: subId,
+            subscriberNumber: mdn,
+            reasonCode: "CAN",
+            reasonCodeId: 1,
+            subscriberState: "Cancel",
+          }, runId, iccid, "manual_cancel");
+          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        if (action === "resume") {
+          const result = await hxChangeSubscriberStatus(env, token, {
+            mobilitySubscriptionId: subId,
+            subscriberNumber: mdn,
+            reasonCode: "BBL",
+            reasonCodeId: 20,
+            subscriberState: "Resume On Cancel",
+          }, runId, iccid, "manual_resume");
+          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: String(err) }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
     if (url.pathname === "/error-summary") {
       const secret = url.searchParams.get("secret") || "";
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
@@ -114,7 +248,7 @@ export default {
   },
 
   // Queue consumer - processes SIMs in batches with cached token
-  // After 3 failures, performs cancel + restore cycle then retries once more
+  // After 3 failures, records error for manual triage via /errors dashboard
   async queue(batch, env) {
     // Get cached token once for the entire batch
     const token = await getCachedToken(env);
@@ -131,17 +265,10 @@ export default {
         console.error(`SIM ${sim.iccid} failed (attempt ${attempts + 1}): ${err}`);
 
         if (attempts >= 2) {
-          // 3rd failure — run fix-sim recovery then re-queue
-          console.log(`SIM ${sim.iccid}: 3 failures reached, starting fix-sim recovery`);
-          try {
-            await fixSim(env, token, sim.id, { autoRotate: true });
-            message.ack();
-            console.log(`SIM ${sim.iccid}: fix-sim complete, re-queued for rotation`);
-          } catch (recoveryErr) {
-            console.error(`SIM ${sim.iccid}: fix-sim failed: ${recoveryErr}`);
-            await updateSimRotationError(env, sim.id, `Fix-SIM failed: ${recoveryErr}`).catch(() => {});
-            message.ack();
-          }
+          // 3rd failure — record error for manual triage
+          console.log(`SIM ${sim.iccid}: 3 failures reached, recording error`);
+          await updateSimRotationError(env, sim.id, `Rotation failed after 3 attempts: ${err}`).catch(() => {});
+          message.ack();
         } else {
           // Still have retries left — let the queue retry
           message.retry();
@@ -223,7 +350,7 @@ async function rotateSpecificSim(env, iccid) {
 
     const token = await getCachedToken(env);
 
-    // Try rotation up to 3 times, then cancel+restore and try once more
+    // Try rotation up to 3 times, then record error for manual triage
     const maxAttempts = 3;
     let lastError = null;
 
@@ -241,22 +368,14 @@ async function rotateSpecificSim(env, iccid) {
       }
     }
 
-    // All 3 attempts failed — run fix-sim recovery then retry once
-    console.log(`SIM ${iccid}: 3 attempts failed, starting fix-sim recovery`);
-    try {
-      await fixSim(env, token, sim.id, { autoRotate: false });
-      console.log(`SIM ${iccid}: fix-sim complete, attempting final rotation`);
-      await rotateSingleSim(env, token, sim);
-      return { ok: true, iccid, message: `SIM ${iccid} rotated successfully after fix-sim recovery`, recovered: true };
-    } catch (recoveryErr) {
-      console.error(`SIM ${iccid}: recovery failed: ${recoveryErr}`);
-      await updateSimRotationError(env, sim.id, `Fix-SIM recovery failed: ${recoveryErr}`).catch(() => {});
-      return {
-        ok: false,
-        iccid,
-        error: `Rotation failed after 3 attempts and fix-sim recovery. Last rotation error: ${lastError}. Recovery error: ${recoveryErr}`,
-      };
-    }
+    // All 3 attempts failed — record error for manual triage via /errors dashboard
+    console.log(`SIM ${iccid}: 3 attempts failed, recording error`);
+    await updateSimRotationError(env, sim.id, `Rotation failed after 3 attempts: ${lastError}`).catch(() => {});
+    return {
+      ok: false,
+      iccid,
+      error: `Rotation failed after 3 attempts. Last error: ${lastError}`,
+    };
   } catch (err) {
     console.error(`Manual rotation failed for ${iccid}: ${err}`);
     return { ok: false, iccid, error: String(err) };
@@ -493,8 +612,9 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   console.log(`[FixSim] Starting for SIM ${simId} (${iccid})`);
 
   // 2) Release old IMEI pool entry if exists
-  if (sim.current_imei_pool_id) {
-    await releaseImeiPoolEntry(env, sim.current_imei_pool_id, simId);
+  const oldPoolId = sim.current_imei_pool_id;
+  if (oldPoolId) {
+    await releaseImeiPoolEntry(env, oldPoolId, simId);
   }
 
   // 3) Allocate new IMEI from pool
@@ -502,71 +622,123 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   const newImei = poolEntry.imei;
   console.log(`[FixSim] SIM ${iccid}: allocated IMEI ${newImei} (pool entry ${poolEntry.id})`);
 
-  // 4) Set IMEI on gateway via service binding
-  await callSkylineSetImei(env, sim.gateway_id, sim.port, newImei);
-  console.log(`[FixSim] SIM ${iccid}: IMEI set on gateway`);
+  // Steps 4-10 wrapped in try/catch for rollback on failure
+  try {
+    // 4) Set IMEI on gateway via service binding (with retry)
+    await retryWithBackoff(
+      () => callSkylineSetImei(env, sim.gateway_id, sim.port, newImei),
+      { attempts: 3, label: `setImei ${iccid}` }
+    );
+    console.log(`[FixSim] SIM ${iccid}: IMEI set on gateway`);
 
-  // 5) Wait for gateway to process
-  await sleep(2000);
+    // 5) Wait for gateway to process
+    await sleep(2000);
 
-  // 6) Get subscriber details (attBan, phoneNumber)
-  const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
-  const d = Array.isArray(details) ? details[0] : null;
-  const subscriberNumber = d?.phoneNumber;
-  const attBan = d?.attBan || d?.ban || null;
-  const subscriberStatus = (d?.status || '').toUpperCase();
+    // 6) Get subscriber details (with retry)
+    const details = await retryWithBackoff(
+      () => hxSubscriberDetails(env, token, subId, runId, iccid),
+      { attempts: 3, label: `subscriberDetails ${iccid}` }
+    );
+    const d = Array.isArray(details) ? details[0] : null;
+    const subscriberNumber = d?.phoneNumber;
+    const attBan = d?.attBan || d?.ban || null;
+    const subscriberStatus = (d?.status || '').toUpperCase();
 
-  if (!subscriberNumber) {
-    throw new Error(`SIM ${iccid}: no phoneNumber from Helix`);
+    if (!subscriberNumber) {
+      throw new Error(`SIM ${iccid}: no phoneNumber from Helix`);
+    }
+
+    const mdn = String(subscriberNumber).replace(/\D/g, "").replace(/^1/, "");
+
+    // 7) OTA Refresh (skip if no attBan, with retry)
+    if (attBan) {
+      console.log(`[FixSim] SIM ${iccid}: OTA Refresh (ban=${attBan})`);
+      await retryWithBackoff(
+        () => hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid),
+        { attempts: 3, label: `otaRefresh ${iccid}` }
+      );
+      await sleep(3000);
+    } else {
+      console.log(`[FixSim] SIM ${iccid}: skipping OTA Refresh (no attBan)`);
+    }
+
+    // 8) Cancel (only if subscriber is active on carrier side)
+    let cancelAttempted = false;
+    if (subscriberStatus === 'ACTIVATED' || subscriberStatus === 'ACTIVE') {
+      console.log(`[FixSim] SIM ${iccid}: canceling subscriber ${mdn} (status=${subscriberStatus})`);
+      try {
+        await retryWithBackoff(
+          () => hxChangeSubscriberStatus(env, token, {
+            mobilitySubscriptionId: subId,
+            subscriberNumber: mdn,
+            reasonCode: "CAN",
+            reasonCodeId: 1,
+            subscriberState: "Cancel",
+          }, runId, iccid, "fix_cancel"),
+          { attempts: 3, label: `cancel ${iccid}` }
+        );
+        cancelAttempted = true;
+        await sleep(3000);
+      } catch (cancelErr) {
+        const msg = String(cancelErr);
+        if (msg.includes('Must Be Active') || msg.includes('not active') || msg.includes('must be active')) {
+          console.warn(`[FixSim] SIM ${iccid}: Cancel soft-fail (already cancelled?): ${msg}`);
+          cancelAttempted = true; // still need Resume
+        } else {
+          throw cancelErr;
+        }
+      }
+    } else {
+      console.log(`[FixSim] SIM ${iccid}: skipping cancel (carrier status=${subscriberStatus})`);
+    }
+
+    // 9) Resume On Cancel — only if cancel was attempted (succeeded or soft-failed)
+    if (cancelAttempted) {
+      console.log(`[FixSim] SIM ${iccid}: resuming subscriber ${mdn}`);
+      await retryWithBackoff(
+        () => hxChangeSubscriberStatus(env, token, {
+          mobilitySubscriptionId: subId,
+          subscriberNumber: mdn,
+          reasonCode: "BBL",
+          reasonCodeId: 20,
+          subscriberState: "Resume On Cancel",
+        }, runId, iccid, "fix_resume"),
+        { attempts: 3, label: `resume ${iccid}` }
+      );
+      await sleep(3000);
+    } else {
+      console.log(`[FixSim] SIM ${iccid}: skipping resume (cancel was not attempted)`);
+    }
+
+    // 10) Update SIM record with new IMEI and pool entry
+    await supabasePatch(
+      env,
+      `sims?id=eq.${encodeURIComponent(String(simId))}`,
+      { imei: newImei, current_imei_pool_id: poolEntry.id }
+    );
+  } catch (err) {
+    // Rollback: release the newly allocated IMEI
+    console.error(`[FixSim] SIM ${iccid}: failed at steps 4-10, rolling back IMEI allocation: ${err}`);
+    try {
+      await releaseImeiPoolEntry(env, poolEntry.id, simId);
+    } catch (rollbackErr) {
+      console.error(`[FixSim] SIM ${iccid}: rollback release failed: ${rollbackErr}`);
+    }
+    // Re-assign old IMEI pool entry if one existed
+    if (oldPoolId) {
+      try {
+        await supabasePatch(
+          env,
+          `imei_pool?id=eq.${encodeURIComponent(String(oldPoolId))}`,
+          { status: "in_use", sim_id: simId, assigned_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+        );
+        console.log(`[FixSim] SIM ${iccid}: rolled back to old pool entry ${oldPoolId}`);
+      } catch (rollbackErr) {
+        console.error(`[FixSim] SIM ${iccid}: rollback re-assign failed: ${rollbackErr}`);
+      }
+    }
+    throw err;
   }
-
-  const mdn = String(subscriberNumber).replace(/\D/g, "").replace(/^1/, "");
-
-  // 7) OTA Refresh (skip if no attBan)
-  if (attBan) {
-    console.log(`[FixSim] SIM ${iccid}: OTA Refresh (ban=${attBan})`);
-    await hxOtaRefresh(env, token, {
-      ban: attBan,
-      subscriberNumber: mdn,
-      iccid,
-    }, runId, iccid);
-    await sleep(3000);
-  } else {
-    console.log(`[FixSim] SIM ${iccid}: skipping OTA Refresh (no attBan)`);
-  }
-
-  // 8) Cancel (only if subscriber is active on carrier side)
-  if (subscriberStatus === 'ACTIVATED' || subscriberStatus === 'ACTIVE') {
-    console.log(`[FixSim] SIM ${iccid}: canceling subscriber ${mdn} (status=${subscriberStatus})`);
-    await hxChangeSubscriberStatus(env, token, {
-      mobilitySubscriptionId: subId,
-      subscriberNumber: mdn,
-      reasonCode: "CAN",
-      reasonCodeId: 1,
-      subscriberState: "Cancel",
-    }, runId, iccid, "fix_cancel");
-    await sleep(3000);
-  } else {
-    console.log(`[FixSim] SIM ${iccid}: skipping cancel (carrier status=${subscriberStatus})`);
-  }
-
-  // 9) Resume On Cancel
-  console.log(`[FixSim] SIM ${iccid}: resuming subscriber ${mdn}`);
-  await hxChangeSubscriberStatus(env, token, {
-    mobilitySubscriptionId: subId,
-    subscriberNumber: mdn,
-    reasonCode: "BBL",
-    reasonCodeId: 20,
-    subscriberState: "Resume On Cancel",
-  }, runId, iccid, "fix_resume");
-  await sleep(3000);
-
-  // 10) Update SIM record with new IMEI and pool entry
-  await supabasePatch(
-    env,
-    `sims?id=eq.${encodeURIComponent(String(simId))}`,
-    { imei: newImei, current_imei_pool_id: poolEntry.id }
-  );
 
   // 11) If autoRotate, re-queue for MDN rotation
   if (autoRotate) {
@@ -621,7 +793,38 @@ async function allocateImeiFromPool(env, simId) {
 
   const updated = JSON.parse(txt);
   if (!Array.isArray(updated) || updated.length === 0) {
-    throw new Error("IMEI allocation race condition — entry already claimed");
+    // Race condition — retry once with the next available IMEI
+    console.warn(`[IMEI Pool] Race condition on entry ${entry.id}, retrying with next available`);
+    const available2 = await supabaseSelect(
+      env,
+      `imei_pool?select=id,imei&status=eq.available&order=id.asc&limit=1`
+    );
+    if (!Array.isArray(available2) || available2.length === 0) {
+      throw new Error("No available IMEIs in pool (retry after race condition)");
+    }
+    const entry2 = available2[0];
+    const res2 = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry2.id}&status=eq.available`, {
+      method: "PATCH",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify({
+        status: "in_use",
+        sim_id: simId,
+        assigned_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }),
+    });
+    const txt2 = await res2.text();
+    if (!res2.ok) throw new Error(`Failed to allocate IMEI (retry): ${res2.status} ${txt2}`);
+    const updated2 = JSON.parse(txt2);
+    if (!Array.isArray(updated2) || updated2.length === 0) {
+      throw new Error("IMEI allocation race condition — failed after retry");
+    }
+    return updated2[0];
   }
 
   return updated[0];
@@ -1111,6 +1314,23 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function retryWithBackoff(fn, { attempts = 3, initialDelayMs = 1000, label = 'operation' } = {}) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const status = err?.status || 0;
+      // Don't retry 4xx client errors
+      if (status >= 400 && status < 500) throw err;
+      console.warn(`[Retry] ${label} attempt ${i}/${attempts} failed: ${err}`);
+      if (i < attempts) await sleep(initialDelayMs * Math.pow(2, i - 1));
+    }
+  }
+  throw lastErr;
 }
 
 function nextRotationUtcISO() {

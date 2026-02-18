@@ -120,6 +120,12 @@ export default {
       } catch (e) {
         errors++;
         results.push({ iccid, ok: false, error: String(e) });
+        // Persist activation error to DB for triage
+        try {
+          await upsertSimError(env, iccid, String(e));
+        } catch (dbErr) {
+          console.error(`Failed to save activation error for ${iccid}: ${dbErr}`);
+        }
       }
 
       // HARD CARRIER SAFETY GAP BETWEEN SIMS
@@ -224,6 +230,12 @@ async function handleActivateJson(request, env) {
       } catch (e) {
         errors++;
         results.push({ iccid, ok: false, error: String(e) });
+        // Persist activation error to DB for triage
+        try {
+          await upsertSimError(env, iccid, String(e));
+        } catch (dbErr) {
+          console.error(`Failed to save activation error for ${iccid}: ${dbErr}`);
+        }
       }
 
       // HARD CARRIER SAFETY GAP BETWEEN SIMS
@@ -499,6 +511,28 @@ async function upsertSim(env, iccid, subId) {
     throw new Error("Supabase insert returned no rows. Add Prefer:return=representation.");
   }
   return inserted[0].id;
+}
+
+async function upsertSimError(env, iccid, errorMessage) {
+  const existing = await supabaseSelect(
+    env,
+    `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+  );
+
+  if (existing?.[0]?.id) {
+    await supabasePatch(env, `sims?id=eq.${existing[0].id}`, {
+      status: "error",
+      last_rotation_error: `Activation failed: ${errorMessage}`,
+      last_rotation_at: new Date().toISOString(),
+    });
+  } else {
+    await supabaseInsert(env, "sims", [{
+      iccid,
+      status: "error",
+      last_rotation_error: `Activation failed: ${errorMessage}`,
+      last_rotation_at: new Date().toISOString(),
+    }]);
+  }
 }
 
 async function assignSimToReseller(env, resellerId, simId) {
