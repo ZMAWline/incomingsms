@@ -97,6 +97,54 @@ export default {
       return handleImportGatewayImeis(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/errors') {
+      return handleErrors(env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/error-logs') {
+      return handleErrorLogs(env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/log-error' && request.method === 'POST') {
+      return handleLogError(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/resolve-error' && request.method === 'POST') {
+      return handleResolveError(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/unassign-reseller' && request.method === 'POST') {
+      return handleUnassignReseller(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/sim-action' && request.method === 'POST') {
+      return handleSimAction(request, env, corsHeaders);
+    }
+
+    if (url.pathname.startsWith('/api/qbo/')) {
+      return handleQboRoute(request, env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/qbo-mappings' && request.method === 'GET') {
+      return handleQboMappingsGet(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/qbo-mappings' && request.method === 'POST') {
+      return handleQboMappingsPost(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/qbo-mappings' && request.method === 'DELETE') {
+      return handleQboMappingsDelete(url, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/qbo-invoices') {
+      return handleQboInvoicesGet(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/qbo-invoice-preview') {
+      return handleQboInvoicePreview(url, env, corsHeaders);
+    }
+
     // Debug endpoint to test worker-to-worker connectivity via service binding
     if (url.pathname === '/api/debug-cancel') {
       try {
@@ -188,7 +236,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=100`;
+    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_activation_error,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=500`;
 
     // Apply status filter
     if (statusFilter) {
@@ -250,7 +298,9 @@ async function handleSims(env, corsHeaders, url) {
         reseller_name: resellerName,
         gateway_id: sim.gateway_id,
         gateway_code: sim.gateways?.code || null,
-        gateway_name: sim.gateways?.name || null
+        gateway_name: sim.gateways?.name || null,
+        last_mdn_rotated_at: sim.last_mdn_rotated_at || null,
+        last_activation_error: sim.last_activation_error || null,
       };
     }));
 
@@ -424,6 +474,13 @@ async function handleRunWorker(request, env, workerName, corsHeaders) {
     try {
       result = JSON.parse(responseText);
     } catch {
+      // Log error to system_errors
+      await logSystemError(env, {
+        source: 'dashboard',
+        action: `run_${workerName}`,
+        error_message: `Worker returned non-JSON response (${workerResponse.status}): ${responseText.slice(0, 200)}`,
+        error_details: { status: workerResponse.status, body: responseText.slice(0, 1000) }
+      });
       return new Response(JSON.stringify({
         error: `Worker returned non-JSON response (${workerResponse.status}): ${responseText.slice(0, 200)}`
       }), {
@@ -432,11 +489,26 @@ async function handleRunWorker(request, env, workerName, corsHeaders) {
       });
     }
 
+    // Log worker errors to system_errors
+    if (!workerResponse.ok || (result && result.error)) {
+      await logSystemError(env, {
+        source: workerName,
+        action: 'run',
+        error_message: result.error || `Worker returned status ${workerResponse.status}`,
+        error_details: result
+      });
+    }
+
     return new Response(JSON.stringify(result), {
       status: workerResponse.status,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
+    await logSystemError(env, {
+      source: 'dashboard',
+      action: `run_${workerName}`,
+      error_message: String(error),
+    });
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -869,7 +941,7 @@ async function handleSimOnline(request, env, corsHeaders) {
     let webhookBody = null;
     try {
       webhookBody = await webhookResponse.text();
-    } catch {}
+    } catch { }
 
     // Record the webhook delivery
     await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
@@ -1192,20 +1264,42 @@ async function handleFixSim(request, env, corsHeaders) {
 
 async function handleImeiPoolGet(env, corsHeaders) {
   try {
-    const response = await supabaseGet(
-      env,
-      'imei_pool?select=id,imei,status,sim_id,assigned_at,previous_sim_id,notes,created_at,sims!imei_pool_sim_id_fkey(iccid,port)&order=id.desc'
-    );
-    const pool = await response.json();
+    // Supabase enforces PGRST_MAX_ROWS=1000 server-side, so we must paginate
+    const baseUrl = `${env.SUPABASE_URL}/rest/v1/imei_pool?select=id,imei,status,sim_id,assigned_at,previous_sim_id,notes,created_at,gateway_id,port,sims!imei_pool_sim_id_fkey(iccid,port)&order=id.desc`;
+    const batchSize = 1000;
+    let allRows = [];
+    let offset = 0;
+
+    while (true) {
+      const response = await fetch(baseUrl, {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          Accept: 'application/json',
+          Range: `${offset}-${offset + batchSize - 1}`,
+        },
+      });
+      const batch = await response.json();
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      allRows = allRows.concat(batch);
+      if (batch.length < batchSize) break; // Last page
+      offset += batchSize;
+    }
+
+    // Get total gateway slots for context
+    const gwRes = await supabaseGet(env, 'gateways?select=total_ports,slots_per_port&active=eq.true');
+    const gateways = await gwRes.json();
+    const totalSlots = Array.isArray(gateways) ? gateways.reduce((sum, gw) => sum + (gw.total_ports || 0) * (gw.slots_per_port || 1), 0) : 0;
 
     const stats = {
-      total: pool.length,
-      available: pool.filter(e => e.status === 'available').length,
-      in_use: pool.filter(e => e.status === 'in_use').length,
-      retired: pool.filter(e => e.status === 'retired').length,
+      total: allRows.length,
+      available: allRows.filter(e => e.status === 'available').length,
+      in_use: allRows.filter(e => e.status === 'in_use').length,
+      retired: allRows.filter(e => e.status === 'retired').length,
+      slots: totalSlots,
     };
 
-    return new Response(JSON.stringify({ pool, stats }), {
+    return new Response(JSON.stringify({ pool: allRows, stats }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -1250,20 +1344,20 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
       }
 
       // Bulk insert, ignoring duplicates
-      const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool`, {
+      const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
         method: 'POST',
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
           Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
           'Content-Type': 'application/json',
-          Prefer: 'resolution=ignore-duplicates,return=representation',
+          Prefer: 'resolution=merge-duplicates,return=representation',
         },
         body: JSON.stringify(valid),
       });
 
       const insertText = await insertRes.text();
       let inserted = [];
-      try { inserted = JSON.parse(insertText); } catch {}
+      try { inserted = JSON.parse(insertText); } catch { }
 
       return new Response(JSON.stringify({
         ok: true,
@@ -1284,9 +1378,9 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
         });
       }
 
-      // Only retire available entries
+      // Retire available or in_use IMEIs (carrier rejected)
       const patchRes = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${id}&status=eq.available`,
+        `${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${id}&status=in.(available,in_use)`,
         {
           method: 'PATCH',
           headers: {
@@ -1295,16 +1389,16 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
             'Content-Type': 'application/json',
             Prefer: 'return=representation',
           },
-          body: JSON.stringify({ status: 'retired', updated_at: new Date().toISOString() }),
+          body: JSON.stringify({ status: 'retired', sim_id: null, assigned_at: null }),
         }
       );
 
       const patchText = await patchRes.text();
       let patched = [];
-      try { patched = JSON.parse(patchText); } catch {}
+      try { patched = JSON.parse(patchText); } catch { }
 
       if (patched.length === 0) {
-        return new Response(JSON.stringify({ error: 'IMEI not found or not available' }), {
+        return new Response(JSON.stringify({ error: 'IMEI not found or already retired' }), {
           status: 400,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
@@ -1315,7 +1409,28 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
       });
     }
 
-    return new Response(JSON.stringify({ error: 'Unknown action. Use "add" or "retire"' }), {
+    if (action === 'unretire') {
+      const id = body.id;
+      if (!id) return new Response(JSON.stringify({ error: 'id is required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      const patchRes = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${id}&status=eq.retired`,
+        {
+          method: 'PATCH',
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation',
+          },
+          body: JSON.stringify({ status: 'available' }),
+        }
+      );
+      const patched = await patchRes.json().catch(() => []);
+      if (!patched.length) return new Response(JSON.stringify({ error: 'IMEI not found or not retired' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ ok: true, unretired: patched[0] }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    return new Response(JSON.stringify({ error: 'Unknown action. Use "add", "retire", or "unretire"' }), {
       status: 400,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -1400,6 +1515,8 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
         toInsert.push({
           imei,
           status: 'in_use',
+          gateway_id: parseInt(gatewayId),
+          port: p.port || null,
           notes: `Imported from gateway ${gatewayId} port ${p.port}${p.iccid ? ' iccid=' + p.iccid : ''}`,
         });
       }
@@ -1431,10 +1548,10 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
 
     const insertText = await insertRes.text();
     let inserted = [];
-    try { inserted = JSON.parse(insertText); } catch {}
+    try { inserted = JSON.parse(insertText); } catch { }
 
-    const added = Array.isArray(inserted) ? inserted.length : 0;
-    const duplicates = toInsert.length - added;
+    const upserted = Array.isArray(inserted) ? inserted.length : 0;
+    const updated = upserted;
 
     // Backfill sims.imei for active slots that have a matched sim_id
     let backfilled = 0;
@@ -1454,7 +1571,7 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
           }
         );
         if (patchRes.ok) backfilled++;
-      } catch {}
+      } catch { }
     }
 
     // Set sim_id on imei_pool entries for active SIM slots
@@ -1475,13 +1592,13 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
           }
         );
         if (linkRes.ok) linked++;
-      } catch {}
+      } catch { }
     }
 
     return new Response(JSON.stringify({
       ok: true, total_ports: totalPorts,
       skipped_no_imei: skippedNoImei, found: toInsert.length,
-      added, duplicates, backfilled_sims: backfilled, linked_to_sims: linked,
+      added: 0, updated: upserted, backfilled_sims: backfilled, linked_to_sims: linked,
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
   } catch (error) {
@@ -1491,6 +1608,415 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
     });
   }
 }
+async function handleErrors(env, corsHeaders, url) {
+  try {
+    const statusFilter = url.searchParams.get('status') || 'open';
+
+    // Query system_errors table
+    let errQuery = `system_errors?select=id,source,action,sim_id,iccid,error_message,error_details,severity,status,resolved_at,resolved_by,resolution_notes,created_at&order=created_at.desc&limit=500`;
+    if (statusFilter !== 'all') {
+      errQuery += `&status=eq.${statusFilter}`;
+    }
+    const errResponse = await supabaseGet(env, errQuery);
+    const systemErrors = await errResponse.json();
+
+    // Also get SIMs with last_activation_error (legacy errors)
+    const simQuery = `sims?select=id,iccid,port,status,last_activation_error,gateways(code),sim_numbers(e164)&last_activation_error=not.is.null&sim_numbers.valid_to=is.null&order=id.desc&limit=200`;
+    const simResponse = await supabaseGet(env, simQuery);
+    const simErrors = await simResponse.json();
+
+    // Convert SIM errors to unified format
+    const legacyErrors = (Array.isArray(simErrors) ? simErrors : []).map(sim => ({
+      id: `sim_${sim.id}`,
+      source: 'activation',
+      action: 'activate',
+      sim_id: sim.id,
+      iccid: sim.iccid,
+      error_message: sim.last_activation_error,
+      error_details: null,
+      severity: 'error',
+      status: 'open',
+      resolved_at: null,
+      resolved_by: null,
+      resolution_notes: null,
+      created_at: null,
+      phone_number: sim.sim_numbers?.[0]?.e164 || null,
+      gateway_code: sim.gateways?.code || null,
+      sim_status: sim.status,
+      _legacy: true,
+    }));
+
+    // Merge: system_errors first, then legacy activation errors
+    const sysFormatted = (Array.isArray(systemErrors) ? systemErrors : []).map(e => ({ ...e, _legacy: false }));
+    const merged = [...sysFormatted, ...legacyErrors];
+
+    return new Response(JSON.stringify(merged), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleErrorLogs(env, corsHeaders, url) {
+  try {
+    const simId = url.searchParams.get('sim_id');
+    if (!simId) return new Response(JSON.stringify({ error: 'sim_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const query = `helix_api_logs?select=id,action,request_body,response_body,status_code,created_at&sim_id=eq.${simId}&order=created_at.desc&limit=20`;
+    const response = await supabaseGet(env, query);
+    const logs = await response.json();
+    return new Response(JSON.stringify(logs), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// Log an error from any source into system_errors
+async function handleLogError(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { source, action, sim_id, iccid, error_message, error_details, severity } = body;
+    if (!source || !error_message) {
+      return new Response(JSON.stringify({ error: 'source and error_message required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    await logSystemError(env, { source, action, sim_id, iccid, error_message, error_details, severity });
+    return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+// Mark system_errors as resolved
+async function handleResolveError(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { error_ids, resolution_notes } = body;
+    if (!error_ids || !Array.isArray(error_ids) || error_ids.length === 0) {
+      return new Response(JSON.stringify({ error: 'error_ids array required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    // Filter out legacy sim_ IDs and handle them separately
+    const systemIds = error_ids.filter(id => typeof id === 'number');
+    const legacySimIds = error_ids.filter(id => typeof id === 'string' && id.startsWith('sim_')).map(id => parseInt(id.replace('sim_', '')));
+
+    // Resolve system errors
+    if (systemIds.length > 0) {
+      const idsParam = systemIds.map(id => `id.eq.${id}`).join(',');
+      await fetch(`${env.SUPABASE_URL}/rest/v1/system_errors?or=(${idsParam})`, {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          status: 'resolved',
+          resolved_at: new Date().toISOString(),
+          resolved_by: 'admin',
+          resolution_notes: resolution_notes || null,
+        }),
+      });
+    }
+
+    // Clear last_activation_error for legacy SIM errors
+    if (legacySimIds.length > 0) {
+      for (const simId of legacySimIds) {
+        await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
+          method: 'PATCH',
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify({ last_activation_error: null }),
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({ ok: true, resolved: systemIds.length + legacySimIds.length }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+// Unassign SIMs from reseller
+async function handleUnassignReseller(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const simIds = body.sim_ids || [];
+    if (!Array.isArray(simIds) || simIds.length === 0) {
+      return new Response(JSON.stringify({ error: 'sim_ids array required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    let unassigned = 0;
+    for (const simId of simIds) {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?sim_id=eq.${simId}&active=eq.true`, {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=representation',
+        },
+        body: JSON.stringify({ active: false }),
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        if (updated.length > 0) unassigned++;
+      }
+    }
+
+    return new Response(JSON.stringify({ ok: true, unassigned }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+// Helper: insert a row into system_errors
+async function logSystemError(env, { source, action, sim_id, iccid, error_message, error_details, severity }) {
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/system_errors`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        source: source || 'unknown',
+        action: action || null,
+        sim_id: sim_id || null,
+        iccid: iccid || null,
+        error_message: error_message || 'Unknown error',
+        error_details: error_details || null,
+        severity: severity || 'error',
+        status: 'open',
+      }),
+    });
+  } catch (e) {
+    console.error('[logSystemError] Failed to log error:', e);
+  }
+}
+
+async function handleSimAction(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { sim_id, action } = body;
+    if (!sim_id || !action) return new Response(JSON.stringify({ error: 'sim_id and action required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    const workerUrl = `https://mdn-rotator/sim-action?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
+    const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sim_id, action })
+    });
+
+    const responseText = await workerResponse.text();
+    let result;
+    try { result = JSON.parse(responseText); } catch {
+      result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
+    }
+
+    // Log action errors to system_errors
+    if (!result.ok && result.error) {
+      await logSystemError(env, {
+        source: 'dashboard',
+        action: action,
+        sim_id: sim_id,
+        error_message: result.error,
+        error_details: result,
+      });
+    }
+
+    return new Response(JSON.stringify(result, null, 2), {
+      status: workerResponse.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    await logSystemError(env, {
+      source: 'dashboard',
+      action: 'sim_action',
+      error_message: String(error),
+    });
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleQboRoute(request, env, corsHeaders, url) {
+  try {
+    if (!env.QUICKBOOKS) return new Response(JSON.stringify({ error: 'QUICKBOOKS binding not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    const qboPath = url.pathname.replace('/api/qbo', '');
+    const qboUrl = new URL(`https://quickbooks${qboPath}${url.search}`);
+
+    const workerResponse = await env.QUICKBOOKS.fetch(qboUrl.toString(), {
+      method: request.method,
+      headers: request.headers,
+      body: request.method !== 'GET' ? await request.text() : undefined,
+    });
+
+    const responseText = await workerResponse.text();
+    return new Response(responseText, {
+      status: workerResponse.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleQboMappingsGet(env, corsHeaders) {
+  try {
+    const query = `qbo_customer_map?select=id,reseller_id,customer_name,qbo_customer_id,qbo_display_name,daily_rate,resellers(name)&order=id.desc`;
+    const response = await supabaseGet(env, query);
+    const data = await response.json();
+    const mapped = (Array.isArray(data) ? data : []).map(m => ({
+      ...m,
+      reseller_name: m.resellers?.name || null,
+    }));
+    return new Response(JSON.stringify(mapped), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleQboMappingsPost(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { reseller_id, qbo_customer_id, qbo_display_name, daily_rate } = body;
+    if (!qbo_customer_id) return new Response(JSON.stringify({ error: 'qbo_customer_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const insertResp = await fetch(`${env.SUPABASE_URL}/rest/v1/qbo_customer_map`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify({ reseller_id: reseller_id || null, qbo_customer_id, qbo_display_name, daily_rate: daily_rate || 0.50 }),
+    });
+    const inserted = await insertResp.json();
+    return new Response(JSON.stringify(inserted), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleQboMappingsDelete(url, env, corsHeaders) {
+  try {
+    const id = url.searchParams.get('id');
+    if (!id) return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    await fetch(`${env.SUPABASE_URL}/rest/v1/qbo_customer_map?id=eq.${id}`, {
+      method: 'DELETE',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    });
+    return new Response(JSON.stringify({ ok: true }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleQboInvoicesGet(env, corsHeaders) {
+  try {
+    const query = `qbo_invoices?select=id,week_start,week_end,sim_count,total,status,error_message,qbo_customer_map(qbo_display_name)&order=created_at.desc&limit=50`;
+    const response = await supabaseGet(env, query);
+    const data = await response.json();
+    const mapped = (Array.isArray(data) ? data : []).map(inv => ({
+      ...inv,
+      customer_name: inv.qbo_customer_map?.qbo_display_name || null,
+    }));
+    return new Response(JSON.stringify(mapped), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleQboInvoicePreview(url, env, corsHeaders) {
+  try {
+    const weekStart = url.searchParams.get('week_start');
+    if (!weekStart) return new Response(JSON.stringify({ error: 'week_start required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    // Get all mappings
+    const mapResp = await supabaseGet(env, `qbo_customer_map?select=id,reseller_id,customer_name,qbo_display_name,daily_rate`);
+    const mappings = await mapResp.json();
+
+    const invoices = [];
+    for (const m of mappings) {
+      // Count active SIMs for this reseller
+      let simCount = 0;
+      if (m.reseller_id) {
+        const simResp = await supabaseGet(env, `reseller_sims?select=sim_id,sims(status)&reseller_id=eq.${m.reseller_id}&active=eq.true&sims.status=in.(active,ACTIVATED)`);
+        const sims = await simResp.json();
+        simCount = Array.isArray(sims) ? sims.filter(s => s.sims).length : 0;
+      }
+      if (simCount > 0) {
+        invoices.push({
+          mapping_id: m.id,
+          customer_name: m.qbo_display_name,
+          sim_count: simCount,
+          daily_rate: m.daily_rate,
+          total: simCount * 7 * parseFloat(m.daily_rate),
+        });
+      }
+    }
+    return new Response(JSON.stringify({ invoices }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1553,6 +2079,13 @@ function getHTML() {
                 </button>
                 <button onclick="switchTab('imei-pool')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="IMEI Pool">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                </button>
+                <button onclick="switchTab('errors')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition relative" title="Errors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
+                    <span id="error-badge" class="hidden absolute -top-1 -right-1 w-4 h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center">0</span>
+                </button>
+                <button onclick="switchTab('billing')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Billing">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                 </button>
             </nav>
             <div class="mt-auto">
@@ -1708,12 +2241,28 @@ function getHTML() {
 
             <!-- SIMs Tab -->
             <div id="tab-sims" class="tab-content hidden">
+                <div id="sim-action-bar" class="hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
+                    <span id="sim-selected-count" class="text-sm text-gray-300">0 selected</span>
+                    <button onclick="bulkSimAction('ota_refresh')" class="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">OTA Refresh</button>
+                    <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition">Rotate MDN</button>
+                    <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Fix SIM</button>
+                    <button onclick="bulkUnassignReseller()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Unassign Reseller</button>
+                    <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
+                    <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
+                </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
                         <div class="flex flex-wrap items-center justify-between gap-4">
-                            <h2 class="text-lg font-semibold text-white">SIM Status</h2>
+                            <div class="flex items-center gap-3">
+                                <h2 class="text-lg font-semibold text-white">SIM Status</h2>
+                                <span id="sims-cache-label" class="text-xs text-gray-500"></span>
+                                <button id="sims-refresh-btn" onclick="loadSims(true); this.querySelector('svg').classList.add('animate-spin'); setTimeout(() => this.querySelector('svg').classList.remove('animate-spin'), 1000)" class="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-gray-400 hover:text-white bg-dark-700 hover:bg-dark-600 border border-dark-500 rounded-lg transition">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                                    Refresh
+                                </button>
+                            </div>
                             <div class="flex flex-wrap items-center gap-3">
-                                <select id="filter-status" onchange="loadSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                <select id="filter-status" onchange="loadSims(true)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All (except cancelled)</option>
                                     <option value="all">All (include cancelled)</option>
                                     <option value="active">Active</option>
@@ -1723,7 +2272,7 @@ function getHTML() {
                                     <option value="canceled">Cancelled</option>
                                     <option value="error">Error</option>
                                 </select>
-                                <select id="filter-reseller" onchange="loadSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                <select id="filter-reseller" onchange="loadSims(true)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All Resellers</option>
                                 </select>
                                 <input id="sims-search" type="text" placeholder="Search..." oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-40">
@@ -1735,6 +2284,7 @@ function getHTML() {
                         <table class="w-full">
                             <thead>
                                 <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium"><input type="checkbox" onchange="toggleAllSims(this)" class="accent-green-500"></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','id')">ID <span class="sort-arrow" data-table="sims" data-col="id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','gateway_code')">Gateway <span class="sort-arrow" data-table="sims" data-col="gateway_code"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','iccid')">ICCID <span class="sort-arrow" data-table="sims" data-col="iccid"></span></th>
@@ -1744,13 +2294,15 @@ function getHTML() {
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_mdn_rotated_at')">Last Rotated <span class="sort-arrow" data-table="sims" data-col="last_mdn_rotated_at"></span></th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="sims-table" class="text-sm">
-                                <tr><td colspan="10" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="12" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
+                    <div id="sims-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
                     </div>
                 </div>
             </div>
@@ -1780,6 +2332,7 @@ function getHTML() {
                                 <tr><td colspan="5" class="px-5 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
+                    <div id="messages-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
                     </div>
                 </div>
             </div>
@@ -1932,30 +2485,35 @@ function getHTML() {
                         <select id="imei-status-filter" onchange="renderImeiPool()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                             <option value="">All Statuses</option>
                             <option value="in_use">In Use</option>
-                            <option value="available">Available</option>
-                            <option value="retired">Retired</option>
+                            <option value="available">Available (Stock)</option>
+                            <option value="retired">Retired (Rejected)</option>
                         </select>
+                        <button onclick="syncAllGatewayImeis()" id="sync-gateways-btn" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Sync from Gateways</button>
                         <button onclick="showAddImeiModal()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add IMEIs</button>
                     </div>
                 </div>
 
                 <!-- Stats Row -->
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
                     <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400">Total</span>
-                        <p class="text-2xl font-bold text-white" id="imei-total">-</p>
+                        <span class="text-sm text-gray-400" title="Total number of SIM slots across all gateways">Slots</span>
+                        <p class="text-2xl font-bold text-purple-400" id="imei-slots">-</p>
                     </div>
                     <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400">Available</span>
-                        <p class="text-2xl font-bold text-accent" id="imei-available">-</p>
-                    </div>
-                    <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400">In Use</span>
+                        <span class="text-sm text-gray-400" title="IMEIs currently assigned to a gateway slot">In Use</span>
                         <p class="text-2xl font-bold text-blue-400" id="imei-in-use">-</p>
                     </div>
                     <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400">Retired</span>
+                        <span class="text-sm text-gray-400" title="Stock IMEIs ready for future assignment">Available</span>
+                        <p class="text-2xl font-bold text-accent" id="imei-available">-</p>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
+                        <span class="text-sm text-gray-400" title="IMEIs rejected by carrier, will not be reused">Retired</span>
                         <p class="text-2xl font-bold text-gray-500" id="imei-retired">-</p>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
+                        <span class="text-sm text-gray-400" title="Total IMEIs in the database">Total IMEIs</span>
+                        <p class="text-2xl font-bold text-white" id="imei-total">-</p>
                     </div>
                 </div>
 
@@ -1969,6 +2527,8 @@ function getHTML() {
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','imei')">IMEI <span class="sort-arrow" data-table="imei" data-col="imei"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','status')">Status <span class="sort-arrow" data-table="imei" data-col="status"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','sim_id')">Assigned SIM <span class="sort-arrow" data-table="imei" data-col="sim_id"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','gateway_id')">Gateway <span class="sort-arrow" data-table="imei" data-col="gateway_id"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','port')">Port <span class="sort-arrow" data-table="imei" data-col="port"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','assigned_at')">Assigned At <span class="sort-arrow" data-table="imei" data-col="assigned_at"></span></th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
@@ -1977,9 +2537,153 @@ function getHTML() {
                                 <tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
+                    <div id="imei-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
                     </div>
                 </div>
             </div>
+
+            <!-- Errors Tab -->
+            <div id="tab-errors" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">System Errors</h2>
+                    <div class="flex items-center gap-3">
+                        <select id="errors-status-filter" onchange="loadErrors()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                            <option value="open">Open</option>
+                            <option value="acknowledged">Acknowledged</option>
+                            <option value="resolved">Resolved</option>
+                            <option value="all">All</option>
+                        </select>
+                        <input id="errors-search" type="text" placeholder="Search..." oninput="renderErrors()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-40">
+                        <button onclick="loadErrors()" class="px-3 py-2 text-sm bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Refresh</button>
+                    </div>
+                </div>
+                <!-- Error Summary -->
+                <div id="error-summary" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6"></div>
+                <!-- Bulk Action Bar -->
+                <div id="error-action-bar" class="hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
+                    <span id="error-selected-count" class="text-sm text-gray-300">0 selected</span>
+                    <button onclick="bulkResolveErrors()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-600 text-white rounded transition">Mark Resolved</button>
+                    <button onclick="bulkErrorAction('ota_refresh')" class="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">OTA Refresh</button>
+                    <button onclick="bulkErrorAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
+                    <button onclick="bulkErrorAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
+                    <button onclick="bulkErrorAction('fix')" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Fix SIM</button>
+                </div>
+                <div class="bg-dark-800 rounded-xl border border-dark-600">
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium"><input type="checkbox" onchange="toggleAllErrors(this)" class="accent-green-500"></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('errors','source')">Source <span class="sort-arrow" data-table="errors" data-col="source"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('errors','iccid')">ICCID / SIM <span class="sort-arrow" data-table="errors" data-col="iccid"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('errors','error_message')">Error <span class="sort-arrow" data-table="errors" data-col="error_message"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('errors','severity')">Severity <span class="sort-arrow" data-table="errors" data-col="severity"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('errors','status')">Status <span class="sort-arrow" data-table="errors" data-col="status"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('errors','created_at')">Time <span class="sort-arrow" data-table="errors" data-col="created_at"></span></th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="errors-table" class="text-sm">
+                                <tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div id="errors-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
+                </div>
+                <!-- Error Detail Drawer -->
+                <div id="error-detail" class="hidden mt-4 bg-dark-800 rounded-xl border border-dark-600 p-5">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-semibold text-white" id="error-detail-title">Error Details</h3>
+                        <button onclick="hideErrorDetail()" class="text-gray-400 hover:text-white text-xl">&times;</button>
+                    </div>
+                    <div id="error-detail-info" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4"></div>
+                    <div class="mb-3">
+                        <h4 class="text-sm font-semibold text-gray-400 mb-2">Error Message</h4>
+                        <pre id="error-detail-content" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-60 overflow-y-auto text-red-400 border border-dark-600 whitespace-pre-wrap"></pre>
+                    </div>
+                    <div id="error-detail-extra" class="hidden mb-3">
+                        <h4 class="text-sm font-semibold text-gray-400 mb-2">Error Details (JSON)</h4>
+                        <pre id="error-detail-json" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-60 overflow-y-auto text-gray-300 border border-dark-600 whitespace-pre-wrap"></pre>
+                    </div>
+                    <div id="error-logs-section" class="hidden">
+                        <h4 class="text-sm font-semibold text-gray-400 mb-2">API Logs (most recent first)</h4>
+                        <div id="error-logs-container" class="space-y-2 max-h-96 overflow-y-auto"></div>
+                    </div>
+                </div>
+            </div>
+
+
+            <!-- Billing Tab -->
+            <div id="tab-billing" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">Billing & Invoicing</h2>
+                </div>
+
+                <!-- QBO Connection -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">QuickBooks Connection</h3>
+                    <div id="qbo-status" class="text-gray-400">Checking connection...</div>
+                    <div class="mt-3" id="qbo-actions"></div>
+                </div>
+
+                <!-- Customer Mapping -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-semibold text-white">Customer Mapping</h3>
+                        <button onclick="showAddMappingModal()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add Mapping</button>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium">Reseller</th>
+                                    <th class="px-4 py-3 font-medium">QBO Customer</th>
+                                    <th class="px-4 py-3 font-medium">Daily Rate</th>
+                                    <th class="px-4 py-3 font-medium">Active SIMs</th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mapping-table" class="text-sm">
+                                <tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Invoice Generator -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Generate Invoices</h3>
+                    <div class="flex items-center gap-3 mb-4">
+                        <label class="text-sm text-gray-400">Week Start:</label>
+                        <input type="date" id="invoice-week-start" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        <button onclick="previewInvoices()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Preview</button>
+                        <button onclick="createInvoices()" id="create-invoices-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Create in QBO</button>
+                    </div>
+                    <div id="invoice-preview" class="text-gray-400 text-sm"></div>
+                </div>
+
+                <!-- Invoice History -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                    <h3 class="text-lg font-semibold text-white mb-3">Invoice History</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium">Customer</th>
+                                    <th class="px-4 py-3 font-medium">Week</th>
+                                    <th class="px-4 py-3 font-medium">SIMs</th>
+                                    <th class="px-4 py-3 font-medium">Total</th>
+                                    <th class="px-4 py-3 font-medium">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="invoice-history-table" class="text-sm">
+                                <tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
         </main>
     </div>
 
@@ -2279,6 +2983,8 @@ function getHTML() {
             'workers': '/workers',
             'gateway': '/gateway',
             'imei-pool': '/imei-pool',
+            'errors': '/errors',
+            'billing': '/billing',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
 
@@ -2305,6 +3011,8 @@ function getHTML() {
             }
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
+            if (tabName === 'errors') loadErrors();
+            if (tabName === 'billing') loadBillingStatus();
         }
 
         // Handle browser back/forward
@@ -2317,9 +3025,10 @@ function getHTML() {
 
         // ===== Sort & Filter Engine =====
         const tableState = {
-            sims: { data: [], sortKey: 'id', sortDir: 'asc' },
-            messages: { data: [], sortKey: 'received_at', sortDir: 'desc' },
-            imei: { data: [], sortKey: 'id', sortDir: 'desc' },
+            sims: { data: [], sortKey: 'id', sortDir: 'asc', page: 1, pageSize: 50 },
+            messages: { data: [], sortKey: 'received_at', sortDir: 'desc', page: 1, pageSize: 50 },
+            imei: { data: [], sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
+            errors: { data: [], sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
         };
 
         function sortTable(table, key) {
@@ -2334,10 +3043,12 @@ function getHTML() {
             document.querySelectorAll(\`[data-table="\${table}"]\`).forEach(el => el.textContent = '');
             const arrow = document.querySelector(\`[data-table="\${table}"][data-col="\${key}"]\`);
             if (arrow) arrow.textContent = state.sortDir === 'asc' ? ' \u25B2' : ' \u25BC';
+            state.page = 1;
             // Re-render
             if (table === 'sims') renderSims();
             else if (table === 'messages') renderMessages();
             else if (table === 'imei') renderImeiPool();
+            else if (table === 'errors') renderErrors();
         }
 
         function genericSort(arr, key, dir) {
@@ -2394,7 +3105,14 @@ function getHTML() {
 
         async function loadData() {
             try {
-                const response = await fetch(\`\${API_BASE}/stats\`);
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 8000);
+                const response = await fetch(API_BASE + '/stats', { 
+                    credentials: 'include',
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                if (!response.ok) { const txt = await response.text(); throw new Error(response.status + ' ' + response.statusText + ' ' + txt.substring(0,50)); }
                 const data = await response.json();
                 document.getElementById('total-sims').textContent = data.total_sims || 0;
                 document.getElementById('active-sims').textContent = data.active_sims || 0;
@@ -2402,11 +3120,12 @@ function getHTML() {
                 document.getElementById('messages-24h').textContent = data.messages_24h || 0;
                 updateActiveRing(data.active_sims || 0, data.total_sims || 0);
                 document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
-                loadSims();
+                loadSims(true);
                 loadMessages();
             } catch (error) {
                 showToast('Error loading dashboard data', 'error');
                 console.error(error);
+                document.getElementById('total-sims').innerHTML = '<span class="text-red-500 text-xs">' + error.message + '</span>';
             }
         }
 
@@ -2424,7 +3143,19 @@ function getHTML() {
             }
         }
 
-        async function loadSims() {
+        let lastSimsFetchedAt = 0;
+        const SIM_CACHE_MS = 30 * 60 * 1000; // 30 minutes
+
+        async function loadSims(force = false) {
+            // Check cache: if data loaded < 30 min ago and not forced, skip fetch
+            const now = Date.now();
+            if (!force && lastSimsFetchedAt && (now - lastSimsFetchedAt) < SIM_CACHE_MS && tableState.sims.data.length > 0) {
+                const cacheAge = Math.round((now - lastSimsFetchedAt) / 60000);
+                const cacheLabel = document.getElementById('sims-cache-label');
+                if (cacheLabel) cacheLabel.textContent = '(cached ' + cacheAge + 'm ago)';
+                renderSims();
+                return;
+            }
             try {
                 const statusFilter = document.getElementById('filter-status').value;
                 const resellerFilter = document.getElementById('filter-reseller').value;
@@ -2439,11 +3170,15 @@ function getHTML() {
                 if (resellerFilter) {
                     params.set('reseller_id', resellerFilter);
                 }
+                if (force) params.set('force', 'true');
 
-                const url = \`\${API_BASE}/sims?\${params.toString()}\`;
+                const url = API_BASE + '/sims?' + params.toString();
                 const response = await fetch(url);
                 const sims = await response.json();
                 tableState.sims.data = sims;
+                lastSimsFetchedAt = Date.now();
+                const cacheLabel = document.getElementById('sims-cache-label');
+                if (cacheLabel) cacheLabel.textContent = '(just loaded)';
                 renderSims();
             } catch (error) {
                 showToast('Error loading SIMs', 'error');
@@ -2451,19 +3186,23 @@ function getHTML() {
             }
         }
 
-        function renderSims() {
-            const state = tableState.sims;
-            const search = (document.getElementById('sims-search')?.value || '').trim();
-            let data = state.data;
-            if (search) data = data.filter(s => matchesSearch(s, search));
-            data = genericSort(data, state.sortKey, state.sortDir);
+function renderSims() {
+  const state = tableState.sims;
+  const search = (document.getElementById('sims-search')?.value || '').trim();
+  let data = state.data;
+  if (search) data = data.filter(s => matchesSearch(s, search));
+  data = genericSort(data, state.sortKey, state.sortDir);
 
-            const tbody = document.getElementById('sims-table');
-            const countEl = document.getElementById('sims-count');
-            countEl.textContent = \`\${data.length} of \${state.data.length} SIM(s)\`;
+  const tbody = document.getElementById('sims-table');
+  const countEl = document.getElementById('sims-count');
+  countEl.textContent = \`\${data.length} of \${state.data.length} SIM(s)\`;
+
+            const totalFiltered = data.length;
+            data = paginate(data, 'sims');
+            renderPaginationControls('sims-pagination', 'sims', totalFiltered);
 
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="12" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
                 return;
             }
             tbody.innerHTML = data.map(sim => {
@@ -2480,6 +3219,7 @@ function getHTML() {
                 }[sim.status] || 'bg-gray-500/20 text-gray-400';
                 return \`
                 <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                    <td class="px-4 py-3"><input type="checkbox" class="sim-cb accent-green-500" value="\${sim.id}" onchange="updateSimActionBar()"></td>
                     <td class="px-4 py-3 text-gray-300">\${sim.id}</td>
                     <td class="px-4 py-3 text-gray-400" title="\${sim.gateway_name || ''}">\${gatewayDisplay}</td>
                     <td class="px-4 py-3 text-gray-400 font-mono text-xs">\${sim.iccid}</td>
@@ -2491,17 +3231,20 @@ function getHTML() {
                     <td class="px-4 py-3 text-gray-400">\${sim.reseller_name || '-'}</td>
                     <td class="px-4 py-3 text-gray-300">\${sim.sms_count || 0}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${lastSms}</td>
-                    <td class="px-4 py-3">
-                        \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Online</button>\` : '-'}
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).toLocaleString() : '-'}</td>
+                    <td class="px-4 py-3 whitespace-nowrap">
+                        \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
+                        \${sim.status === 'active' ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}
+                        \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : ''}
                     </td>
                 </tr>
                 \`;
-            }).join('');
+}).join('');
         }
 
 
-        async function sendSimOnline(simId, phoneNumber) {
-            if (!confirm(\`Send number.online webhook for \${phoneNumber}?\`)) {
+async function sendSimOnline(simId, phoneNumber) {
+  if (!confirm(\`Send number.online webhook for \${phoneNumber}?\`)) {
                 return;
             }
             showToast(\`Sending online webhook for \${phoneNumber}...\`, 'info');
@@ -2562,6 +3305,10 @@ function getHTML() {
             let data = state.data;
             if (search) data = data.filter(m => matchesSearch(m, search));
             data = genericSort(data, state.sortKey, state.sortDir);
+
+            const totalFiltered = data.length;
+            data = paginate(data, 'messages');
+            renderPaginationControls('messages-pagination', 'messages', totalFiltered);
 
             const tbody = document.getElementById('messages-table');
             if (data.length === 0) {
@@ -2641,6 +3388,7 @@ function getHTML() {
                         showToast(\`\${succeeded} succeeded, \${failed} failed\`, failed > 0 ? 'error' : 'success');
                     }
                     loadData();
+        loadErrors();
                 } else {
                     showToast(\`Error: \${result.error || 'Unknown error'}\`, 'error');
                 }
@@ -3152,7 +3900,7 @@ function getHTML() {
             grid.innerHTML = '<p class="text-gray-400 text-sm col-span-full text-center py-8">Loading...</p>';
 
             try {
-                const response = await fetch(\`\${API_BASE}/skyline/port-info?gateway_id=\${gatewayId}\`);
+                const response = await fetch(\`\${API_BASE}/skyline/port-info?gateway_id=\${gatewayId}&all_slots=1\`);
                 const result = await response.json();
 
                 if (!result.ok) {
@@ -3168,7 +3916,7 @@ function getHTML() {
                     return;
                 }
 
-                label.textContent = \`\${ports.length} port(s) - Updated \${new Date().toLocaleTimeString()}\`;
+                label.textContent = \`\${ports.length} slot(s) - Updated \${new Date().toLocaleTimeString()}\`;
                 window.portData = ports;
 
                 grid.innerHTML = ports.map(p => {
@@ -3602,25 +4350,30 @@ function getHTML() {
             }
         }
 
-        function renderImeiPool() {
+         function renderImeiPool() {
             const state = tableState.imei;
             const stats = state.stats || {};
             const search = (document.getElementById('imei-search')?.value || '').trim();
             const statusFilter = (document.getElementById('imei-status-filter')?.value || '');
 
-            document.getElementById('imei-total').textContent = stats.total || 0;
-            document.getElementById('imei-available').textContent = stats.available || 0;
+            document.getElementById('imei-slots').textContent = stats.slots || 0;
             document.getElementById('imei-in-use').textContent = stats.in_use || 0;
+            document.getElementById('imei-available').textContent = stats.available || 0;
             document.getElementById('imei-retired').textContent = stats.retired || 0;
+            document.getElementById('imei-total').textContent = stats.total || 0;
 
             let data = state.data;
             if (statusFilter) data = data.filter(e => e.status === statusFilter);
             if (search) data = data.filter(e => matchesSearch(e, search));
             data = genericSort(data, state.sortKey, state.sortDir);
 
+            const totalFiltered = data.length;
+            data = paginate(data, 'imei');
+            renderPaginationControls('imei-pagination', 'imei', totalFiltered);
+
             const tbody = document.getElementById('imei-pool-table');
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">No IMEIs match filters</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No IMEIs match filters</td></tr>';
                 return;
             }
 
@@ -3632,28 +4385,798 @@ function getHTML() {
                 }[entry.status] || 'bg-gray-500/20 text-gray-400';
                 const simInfo = entry.sims ? \`\${entry.sims.iccid || ''} (port \${entry.sims.port || '?'})\` : (entry.sim_id ? \`SIM #\${entry.sim_id}\` : '-');
                 const assignedAt = entry.assigned_at ? new Date(entry.assigned_at).toLocaleString() : '-';
-                const canRetire = entry.status === 'available';
+                const canRetire = entry.status === 'available' || entry.status === 'in_use';
                 return \`
                 <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
                     <td class="px-4 py-3 text-gray-400">\${entry.id}</td>
                     <td class="px-4 py-3 font-mono text-sm text-gray-200">\${entry.imei}</td>
                     <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${entry.status}</span></td>
-                    <td class="px-4 py-3 text-gray-400 text-xs">\${entry.status === 'in_use' ? simInfo : '-'}</td>
-                    <td class="px-4 py-3 text-gray-500 text-xs">\${entry.status === 'in_use' ? assignedAt : '-'}</td>
-                    <td class="px-4 py-3">
-                        \${canRetire ? \`<button onclick="retireImei(\${entry.id})" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-700 text-white rounded transition">Retire</button>\` : ''}
+                    <td class="px-4 py-3 text-gray-400 text-xs">\${simInfo}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${entry.gateway_id || '-'}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${entry.port || '-'}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${assignedAt}</td>
+                    <td class="px-4 py-3 whitespace-nowrap">
+                        \${canRetire ? \`<button onclick="retireImei(\${entry.id})" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-700 text-white rounded transition mr-1" title="Carrier rejected — retire this IMEI">Retire</button>\` : ''}
+                        \${entry.status === 'retired' ? \`<button onclick="unretireImei(\${entry.id})" class="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition" title="Restore to available stock">Restore</button>\` : ''}
                     </td>
                 </tr>\`;
             }).join('');
         }
 
 
+
+        // ===== Pagination =====
+        function paginate(data, table) {
+            const state = tableState[table];
+            const start = (state.page - 1) * state.pageSize;
+            return data.slice(start, start + state.pageSize);
+        }
+
+        function changePageSize(table, size) {
+            tableState[table].pageSize = parseInt(size);
+            tableState[table].page = 1;
+            const renderMap = { sims: renderSims, messages: renderMessages, imei: renderImeiPool, errors: renderErrors };
+            if (renderMap[table]) renderMap[table]();
+        }
+
+        function goToPage(table, page) {
+            tableState[table].page = page;
+            const renderMap = { sims: renderSims, messages: renderMessages, imei: renderImeiPool, errors: renderErrors };
+            if (renderMap[table]) renderMap[table]();
+        }
+
+        function renderPaginationControls(containerId, table, totalItems) {
+            const container = document.getElementById(containerId);
+            if (!container) return;
+            const state = tableState[table];
+            const totalPages = Math.ceil(totalItems / state.pageSize) || 1;
+            if (state.page > totalPages) state.page = totalPages;
+
+            const pageSizeOptions = [25, 50, 100, 250].map(s =>
+                \`<option value="\${s}" \${s === state.pageSize ? 'selected' : ''}>\${s}</option>\`
+            ).join('');
+
+            let pageButtons = '';
+            const maxBtns = 7;
+            let startPage = Math.max(1, state.page - Math.floor(maxBtns / 2));
+            let endPage = Math.min(totalPages, startPage + maxBtns - 1);
+            if (endPage - startPage < maxBtns - 1) startPage = Math.max(1, endPage - maxBtns + 1);
+
+            if (startPage > 1) pageButtons += \`<button onclick="goToPage('\${table}', 1)" class="px-2 py-1 text-xs rounded bg-dark-700 text-gray-300 hover:bg-dark-600">1</button>\`;
+            if (startPage > 2) pageButtons += '<span class="text-gray-500 text-xs">...</span>';
+            for (let i = startPage; i <= endPage; i++) {
+                const active = i === state.page ? 'bg-accent text-white' : 'bg-dark-700 text-gray-300 hover:bg-dark-600';
+                pageButtons += \`<button onclick="goToPage('\${table}', \${i})" class="px-2 py-1 text-xs rounded \${active}">\${i}</button>\`;
+            }
+            if (endPage < totalPages - 1) pageButtons += '<span class="text-gray-500 text-xs">...</span>';
+            if (endPage < totalPages) pageButtons += \`<button onclick="goToPage('\${table}', \${totalPages})" class="px-2 py-1 text-xs rounded bg-dark-700 text-gray-300 hover:bg-dark-600">\${totalPages}</button>\`;
+
+            container.innerHTML = \`
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-gray-500">Show</span>
+                    <select onchange="changePageSize('\${table}', this.value)" class="text-xs bg-dark-700 border border-dark-500 rounded px-2 py-1 text-gray-300">\${pageSizeOptions}</select>
+                    <span class="text-xs text-gray-500">of \${totalItems}</span>
+                </div>
+                <div class="flex items-center gap-1">\${pageButtons}</div>
+            \`;
+        }
+
+        // ===== Errors Tab =====
+        async function loadErrors() {
+            try {
+                const statusFilter = document.getElementById('errors-status-filter')?.value || 'open';
+                const response = await fetch(\`\${API_BASE}/errors?status=\${statusFilter}\`);
+                const data = await response.json();
+                tableState.errors.data = Array.isArray(data) ? data : [];
+                renderErrors();
+                // Update badge with open errors count
+                const badge = document.getElementById('error-badge');
+                if (badge) {
+                    const openCount = tableState.errors.data.filter(e => e.status === 'open').length;
+                    badge.textContent = openCount;
+                    badge.classList.toggle('hidden', openCount === 0);
+                }
+            } catch (error) {
+                showToast('Error loading errors', 'error');
+                console.error(error);
+            }
+        }
+
+        function classifyError(errorText) {
+            if (!errorText) return 'unknown';
+            const lower = errorText.toLowerCase();
+            if (lower.includes('must be active')) return 'must_be_active';
+            if (lower.includes('cancel')) return 'cancel_failed';
+            if (lower.includes('resume')) return 'resume_failed';
+            if (lower.includes('ota') || lower.includes('refresh')) return 'ota_failed';
+            if (lower.includes('imei')) return 'imei_failed';
+            if (lower.includes('timeout') || lower.includes('timed out')) return 'timeout';
+            return 'other';
+        }
+
+        function renderErrors() {
+            const state = tableState.errors;
+            const search = (document.getElementById('errors-search')?.value || '').trim();
+            let data = state.data;
+            if (search) data = data.filter(s => matchesSearch(s, search));
+            data = genericSort(data, state.sortKey, state.sortDir);
+
+            // Summary cards by source
+            const sources = {};
+            state.data.forEach(e => {
+                const src = e.source || 'unknown';
+                sources[src] = (sources[src] || 0) + 1;
+            });
+            const summaryEl = document.getElementById('error-summary');
+            summaryEl.innerHTML = Object.entries(sources).map(([src, count]) => \`
+                <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
+                    <span class="text-sm text-gray-400">\${src}</span>
+                    <p class="text-2xl font-bold text-red-400">\${count}</p>
+                </div>
+            \`).join('');
+
+            // Paginate
+            const totalFiltered = data.length;
+            const pageData = paginate(data, 'errors');
+            renderPaginationControls('errors-pagination', 'errors', totalFiltered);
+
+            const tbody = document.getElementById('errors-table');
+            if (pageData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No errors found</td></tr>';
+                return;
+            }
+            tbody.innerHTML = pageData.map(err => {
+                const sevClass = {
+                    'critical': 'bg-red-600/30 text-red-300',
+                    'error': 'bg-red-500/20 text-red-400',
+                    'warning': 'bg-yellow-500/20 text-yellow-400',
+                }[err.severity] || 'bg-gray-500/20 text-gray-400';
+                const statusClass = {
+                    'open': 'bg-red-500/20 text-red-400',
+                    'acknowledged': 'bg-yellow-500/20 text-yellow-400',
+                    'resolved': 'bg-accent/20 text-accent',
+                }[err.status] || 'bg-gray-500/20 text-gray-400';
+                const time = err.created_at ? new Date(err.created_at).toLocaleString() : '-';
+                const simLabel = err.iccid ? err.iccid : (err.sim_id ? \`SIM #\${err.sim_id}\` : '-');
+                const errorPreview = (err.error_message || '').slice(0, 80) + ((err.error_message || '').length > 80 ? '...' : '');
+                const errId = err._legacy ? err.id : err.id;
+                return \`
+                <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                    <td class="px-4 py-3"><input type="checkbox" class="error-cb accent-green-500" value="\${errId}" onchange="updateErrorActionBar()"></td>
+                    <td class="px-4 py-3 text-gray-300">
+                        <span class="px-2 py-0.5 text-xs font-medium rounded bg-dark-600 text-gray-300">\${err.source || '-'}</span>
+                        \${err.action ? \`<span class="text-xs text-gray-500 ml-1">\${err.action}</span>\` : ''}
+                    </td>
+                    <td class="px-4 py-3 font-mono text-xs text-gray-400">\${simLabel}</td>
+                    <td class="px-4 py-3 text-gray-300 text-xs max-w-xs truncate" title="\${(err.error_message || '').replace(/"/g, '&quot;')}">\${errorPreview}</td>
+                    <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${sevClass}">\${err.severity || '-'}</span></td>
+                    <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${err.status || '-'}</span></td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${time}</td>
+                    <td class="px-4 py-3 whitespace-nowrap">
+                        <button onclick="showFullError('\${errId}')" class="px-2 py-1 text-xs bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition mr-1">View</button>
+                        \${err.status !== 'resolved' ? \`<button onclick="resolveError('\${errId}')" class="px-2 py-1 text-xs bg-accent hover:bg-green-600 text-white rounded transition mr-1">Resolve</button>\` : ''}
+                        \${err.sim_id && err.status !== 'resolved' ? \`<button onclick="simAction(\${err.sim_id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">OTA</button>\` : ''}
+                    </td>
+                </tr>
+                \`;
+            }).join('');
+        }
+
+        function toggleAllErrors(checkbox) {
+            document.querySelectorAll('.error-cb').forEach(cb => cb.checked = checkbox.checked);
+            updateErrorActionBar();
+        }
+
+        function updateErrorActionBar() {
+            const checked = document.querySelectorAll('.error-cb:checked');
+            const bar = document.getElementById('error-action-bar');
+            document.getElementById('error-selected-count').textContent = checked.length + ' selected';
+            bar.classList.toggle('hidden', checked.length === 0);
+        }
+
+        function hideErrorDetail() {
+            document.getElementById('error-detail').classList.add('hidden');
+        }
+
+        async function resolveError(errorId) {
+            if (!confirm('Mark this error as resolved?')) return;
+            try {
+                const ids = typeof errorId === 'string' && errorId.startsWith('sim_') ? [errorId] : [parseInt(errorId)];
+                const resp = await fetch(\`\${API_BASE}/resolve-error\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ error_ids: ids })
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    showToast('Error resolved', 'success');
+                    loadErrors();
+                } else {
+                    showToast('Failed: ' + (result.error || JSON.stringify(result)), 'error');
+                }
+            } catch (err) {
+                showToast('Error resolving: ' + err, 'error');
+            }
+        }
+
+        async function bulkResolveErrors() {
+            const ids = [...document.querySelectorAll('.error-cb:checked')].map(cb => {
+                const val = cb.value;
+                return val.startsWith('sim_') ? val : parseInt(val);
+            });
+            if (ids.length === 0) return;
+            if (!confirm(\`Mark \${ids.length} error(s) as resolved?\`)) return;
+            try {
+                const resp = await fetch(\`\${API_BASE}/resolve-error\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ error_ids: ids })
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    showToast(\`\${result.resolved} error(s) resolved\`, 'success');
+                    loadErrors();
+                } else {
+                    showToast('Failed: ' + (result.error || JSON.stringify(result)), 'error');
+                }
+            } catch (err) {
+                showToast('Error resolving: ' + err, 'error');
+            }
+        }
+
+        async function showFullError(errorId) {
+            const err = tableState.errors.data.find(e => String(e.id) === String(errorId));
+            if (!err) return;
+
+            document.getElementById('error-detail-title').textContent = \`Error Detail - \${err.source || 'Unknown'} #\${errorId}\`;
+
+            // Show info cards
+            document.getElementById('error-detail-info').innerHTML = \`
+                <div class="bg-dark-900 rounded-lg p-3 border border-dark-600">
+                    <span class="text-xs text-gray-500">Source</span>
+                    <p class="text-sm text-gray-200">\${err.source || '-'}</p>
+                </div>
+                <div class="bg-dark-900 rounded-lg p-3 border border-dark-600">
+                    <span class="text-xs text-gray-500">Action</span>
+                    <p class="text-sm text-gray-200">\${err.action || '-'}</p>
+                </div>
+                <div class="bg-dark-900 rounded-lg p-3 border border-dark-600">
+                    <span class="text-xs text-gray-500">ICCID / SIM</span>
+                    <p class="text-sm font-mono text-gray-200">\${err.iccid || (err.sim_id ? 'SIM #' + err.sim_id : '-')}</p>
+                </div>
+                <div class="bg-dark-900 rounded-lg p-3 border border-dark-600">
+                    <span class="text-xs text-gray-500">Status</span>
+                    <p class="text-sm text-gray-200">\${err.status || '-'} \${err.resolved_at ? '(' + new Date(err.resolved_at).toLocaleString() + ')' : ''}</p>
+                </div>
+            \`;
+
+            document.getElementById('error-detail-content').textContent = err.error_message || 'No error text';
+
+            // Show JSON details if available
+            const extraSection = document.getElementById('error-detail-extra');
+            const jsonPre = document.getElementById('error-detail-json');
+            if (err.error_details) {
+                extraSection.classList.remove('hidden');
+                try {
+                    jsonPre.textContent = JSON.stringify(err.error_details, null, 2);
+                } catch {
+                    jsonPre.textContent = String(err.error_details);
+                }
+            } else {
+                extraSection.classList.add('hidden');
+            }
+
+            document.getElementById('error-detail').classList.remove('hidden');
+            document.getElementById('error-detail').scrollIntoView({ behavior: 'smooth' });
+
+            // Load API logs if we have a sim_id
+            const logsSection = document.getElementById('error-logs-section');
+            const logsContainer = document.getElementById('error-logs-container');
+            const simId = err.sim_id || (err._legacy ? parseInt(String(err.id).replace('sim_', '')) : null);
+            if (!simId) {
+                logsSection.classList.add('hidden');
+                return;
+            }
+            logsSection.classList.add('hidden');
+            logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading logs...</p>';
+            try {
+                const resp = await fetch(\`\${API_BASE}/error-logs?sim_id=\${simId}\`);
+                const logs = await resp.json();
+                if (Array.isArray(logs) && logs.length > 0) {
+                    logsSection.classList.remove('hidden');
+                    logsContainer.innerHTML = logs.map(log => {
+                        const statusColor = (log.status_code >= 200 && log.status_code < 300) ? 'text-accent' : 'text-red-400';
+                        let reqBody = log.request_body || '-';
+                        let resBody = log.response_body || '-';
+                        try { reqBody = JSON.stringify(JSON.parse(reqBody), null, 2); } catch {}
+                        try { resBody = JSON.stringify(JSON.parse(resBody), null, 2); } catch {}
+                        const time = log.created_at ? new Date(log.created_at).toLocaleString() : '-';
+                        return \`
+                        <div class="bg-dark-900 rounded-lg border border-dark-600 p-3">
+                            <div class="flex items-center justify-between mb-2">
+                                <div class="flex items-center gap-3">
+                                    <span class="text-xs font-semibold text-blue-400">\${log.action || '-'}</span>
+                                    <span class="text-xs \${statusColor} font-mono">HTTP \${log.status_code || '?'}</span>
+                                </div>
+                                <span class="text-xs text-gray-500">\${time}</span>
+                            </div>
+                            <details class="mb-1">
+                                <summary class="text-xs text-gray-400 cursor-pointer hover:text-gray-300">Request Body</summary>
+                                <pre class="mt-1 text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">\${reqBody.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+                            </details>
+                            <details open>
+                                <summary class="text-xs text-gray-400 cursor-pointer hover:text-gray-300">Response Body</summary>
+                                <pre class="mt-1 text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">\${resBody.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+                            </details>
+                        </div>\`;
+                    }).join('');
+                } else {
+                    logsSection.classList.remove('hidden');
+                    logsContainer.innerHTML = '<p class="text-gray-500 text-sm">No API logs found for this SIM.</p>';
+                }
+            } catch (err) {
+                logsSection.classList.remove('hidden');
+                logsContainer.innerHTML = '<p class="text-red-400 text-sm">Error loading logs: ' + err + '</p>';
+            }
+        }
+
+        // ===== SIM Actions =====
+        async function simAction(simId, action) {
+            if (!confirm(\`Run \${action} on SIM #\${simId}?\`)) return;
+            showToast(\`Running \${action} on SIM #\${simId}...\`, 'info');
+            try {
+                const response = await fetch(\`\${API_BASE}/sim-action\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_id: simId, action })
+                });
+                const result = await response.json();
+                if (result.ok) {
+                    showToast(\`\${action} completed on SIM #\${simId}\`, 'success');
+                    loadErrors();
+                } else {
+                    showToast(\`Error: \${result.error || JSON.stringify(result)}\`, 'error');
+                }
+            } catch (error) {
+                showToast(\`Error running \${action}\`, 'error');
+                console.error(error);
+            }
+        }
+
+        function toggleAllSims(checkbox) {
+            document.querySelectorAll('.sim-cb').forEach(cb => cb.checked = checkbox.checked);
+            updateSimActionBar();
+        }
+
+        function updateSimActionBar() {
+            const checked = document.querySelectorAll('.sim-cb:checked');
+            const bar = document.getElementById('sim-action-bar');
+            document.getElementById('sim-selected-count').textContent = checked.length + ' selected';
+            bar.classList.toggle('hidden', checked.length === 0);
+        }
+
+        async function bulkSimAction(action) {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            if (!confirm(\`Run \${action} on \${simIds.length} SIM(s)?\`)) return;
+            showToast(\`Running \${action} on \${simIds.length} SIM(s)...\`, 'info');
+            let ok = 0, fail = 0;
+            const failures = [];
+            const concurrency = 5;
+            const queue = [...simIds];
+            async function worker() {
+                while (queue.length > 0) {
+                    const id = queue.shift();
+                    try {
+                        const r = await fetch(\`\${API_BASE}/sim-action\`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ sim_id: id, action })
+                        });
+                        const res = await r.json();
+                        if (res.ok) { ok++; } else { fail++; failures.push(\`SIM #\${id}: \${res.error || JSON.stringify(res)}\`); }
+                    } catch (err) { fail++; failures.push(\`SIM #\${id}: \${err}\`); }
+                }
+            }
+            await Promise.all(Array.from({ length: Math.min(concurrency, simIds.length) }, () => worker()));
+            if (fail > 0) {
+                showToast(\`\${action}: \${ok} ok, \${fail} failed\`, 'error');
+                console.error(\`Bulk \${action} failures:\`, failures);
+                alert(\`\${action} completed: \${ok} ok, \${fail} failed\\n\\nFailures:\\n\${failures.join('\\n')}\`);
+            } else {
+                showToast(\`\${action}: \${ok} ok\`, 'success');
+            }
+            loadSims(true);
+        }
+
+        async function unassignReseller(simId) {
+            if (!confirm('Unassign this SIM from its reseller? This stops webhooks and billing for this line.')) return;
+            try {
+                const resp = await fetch(API_BASE + '/unassign-reseller', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: [simId] })
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    showToast('SIM unassigned from reseller', 'success');
+                    loadSims(true);
+                } else {
+                    showToast('Failed: ' + (result.error || JSON.stringify(result)), 'error');
+                }
+            } catch (err) {
+                showToast('Error unassigning: ' + err, 'error');
+            }
+        }
+
+        async function bulkUnassignReseller() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            if (!confirm('Unassign ' + simIds.length + ' SIM(s) from their resellers? This stops webhooks and billing.')) return;
+            try {
+                const resp = await fetch(API_BASE + '/unassign-reseller', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: simIds })
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    showToast(result.unassigned + ' SIM(s) unassigned', 'success');
+                    loadSims(true);
+                } else {
+                    showToast('Failed: ' + (result.error || JSON.stringify(result)), 'error');
+                }
+            } catch (err) {
+                showToast('Error unassigning: ' + err, 'error');
+            }
+        }
+
+async function bulkErrorAction(action) {
+  const simIds = [...document.querySelectorAll('.error-cb:checked')].map(cb => parseInt(cb.value));
+  if (simIds.length === 0) return;
+  if (!confirm(\`Run \${action} on \${simIds.length} SIM(s)?\`)) return;
+            showToast(\`Running \${action} on \${simIds.length} SIM(s)...\`, 'info');
+            let ok = 0, fail = 0;
+            const concurrency = 5;
+            const queue = [...simIds];
+            async function worker() {
+                while (queue.length > 0) {
+                    const id = queue.shift();
+                    try {
+                        const r = await fetch(\`\${API_BASE}/sim-action\`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ sim_id: id, action })
+                        });
+                        const res = await r.json();
+                        if (res.ok) ok++; else fail++;
+                    } catch { fail++; }
+                }
+            }
+            await Promise.all(Array.from({ length: Math.min(concurrency, simIds.length) }, () => worker()));
+            showToast(\`\${action}: \${ok} ok, \${fail} failed\`, fail > 0 ? 'error' : 'success');
+            loadErrors();
+        }
+
+        // ===== IMEI Sync/Block =====
+        async function syncAllGatewayImeis() {
+            const btn = document.getElementById('sync-gateways-btn');
+            btn.textContent = 'Syncing...';
+            btn.disabled = true;
+            try {
+                const gwResp = await fetch(\`\${API_BASE}/gateways\`);
+                const gateways = await gwResp.json();
+                let totalAdded = 0, totalUpdated = 0;
+                for (const gw of gateways) {
+                    try {
+                        const res = await fetch(\`\${API_BASE}/import-gateway-imeis\`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ gateway_id: gw.id })
+                        });
+                        const data = await res.json();
+                        if (data.ok) {
+                            totalAdded += data.added || 0;
+                            totalUpdated += data.updated || 0;
+                        }
+                    } catch {}
+                }
+                showToast(\`Sync complete: \${totalAdded} added, \${totalUpdated} updated\`, 'success');
+                loadImeiPool();
+            } catch (error) {
+                showToast('Sync error: ' + error, 'error');
+            } finally {
+                btn.textContent = 'Sync from Gateways';
+                btn.disabled = false;
+            }
+        }
+
+        async function unretireImei(id) {
+            if (!confirm('Restore this IMEI to available stock?')) return;
+            try {
+                const r = await fetch(\`\${API_BASE}/imei-pool\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'unretire', id })
+                });
+                const res = await r.json();
+                showToast(res.ok ? 'IMEI restored to available' : \`Error: \${res.error}\`, res.ok ? 'success' : 'error');
+                loadImeiPool();
+            } catch (error) {
+                showToast('Error restoring IMEI', 'error');
+            }
+        }
+
+
+        // ===== Billing (QBO) =====
+        let selectedQboCustomer = null;
+        let invoicePreviewData = null;
+
+        async function loadBillingStatus() {
+            try {
+                const resp = await fetch(\`\${API_BASE}/qbo/status\`);
+                const data = await resp.json();
+                const statusEl = document.getElementById("qbo-status");
+                const actionsEl = document.getElementById("qbo-actions");
+                if (data.connected) {
+                    statusEl.innerHTML = \`<span class="text-accent font-semibold">Connected</span> <span class="text-gray-500 text-sm">(Company: \${data.company_name || data.realm_id || "unknown"})</span>\`;
+                    actionsEl.innerHTML = \`<button onclick="disconnectQbo()" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Disconnect</button>\`;
+                    loadMappings();
+                    loadInvoiceHistory();
+                } else {
+                    statusEl.innerHTML = \`<span class="text-yellow-400">Not connected</span>\`;
+                    actionsEl.innerHTML = \`<button onclick="connectQbo()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Connect to QuickBooks</button>\`;
+                }
+            } catch (error) {
+                document.getElementById("qbo-status").innerHTML = \`<span class="text-red-400">Error: \${error}</span>\`;
+            }
+        }
+
+        async function connectQbo() {
+            try {
+                const resp = await fetch(\`\${API_BASE}/qbo/auth-url\`);
+                const data = await resp.json();
+                if (data.url) window.open(data.url, "_blank");
+                else showToast("Error getting auth URL: " + JSON.stringify(data), "error");
+            } catch (error) {
+                showToast("Error: " + error, "error");
+            }
+        }
+
+        async function disconnectQbo() {
+            if (!confirm("Disconnect from QuickBooks?")) return;
+            try {
+                await fetch(\`\${API_BASE}/qbo/disconnect\`, { method: "POST" });
+                showToast("Disconnected from QuickBooks", "success");
+                loadBillingStatus();
+            } catch (error) {
+                showToast("Error: " + error, "error");
+            }
+        }
+
+        async function loadMappings() {
+            try {
+                const resp = await fetch(\`\${API_BASE}/qbo-mappings\`);
+                if (!resp.ok) { document.getElementById("mapping-table").innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No mappings yet</td></tr>'; return; }
+                const mappings = await resp.json();
+                const tbody = document.getElementById("mapping-table");
+                if (!mappings.length) { tbody.innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No mappings yet</td></tr>'; return; }
+                tbody.innerHTML = mappings.map(m => \`
+                    <tr class="border-b border-dark-600">
+                        <td class="px-4 py-3 text-gray-300">\${m.reseller_name || m.customer_name || "-"}</td>
+                        <td class="px-4 py-3 text-gray-300">\${m.qbo_display_name}</td>
+                        <td class="px-4 py-3 text-gray-300">$\${Number(m.daily_rate).toFixed(2)}</td>
+                        <td class="px-4 py-3 text-gray-300">\${m.sim_count || "-"}</td>
+                        <td class="px-4 py-3"><button onclick="deleteMapping(\${m.id})" class="text-xs text-red-400 hover:text-red-300">Delete</button></td>
+                    </tr>
+                \`).join("");
+            } catch (error) {
+                console.error("Error loading mappings:", error);
+            }
+        }
+
+        function showAddMappingModal() {
+            selectedQboCustomer = null;
+            document.getElementById("mapping-qbo-search").value = "";
+            document.getElementById("qbo-search-results").classList.add("hidden");
+            document.getElementById("mapping-rate").value = "0.50";
+            // Populate reseller dropdown
+            const sel = document.getElementById("mapping-reseller");
+            sel.innerHTML = '<option value="">-- Select Reseller --</option>';
+            // Load resellers from existing data
+            fetch(\`\${API_BASE}/resellers\`).then(r => r.json()).then(resellers => {
+                resellers.forEach(r => {
+                    const opt = document.createElement("option");
+                    opt.value = r.id; opt.textContent = r.name;
+                    sel.appendChild(opt);
+                });
+            });
+            document.getElementById("add-mapping-modal").classList.remove("hidden");
+        }
+
+        function closeMappingModal() {
+            document.getElementById("add-mapping-modal").classList.add("hidden");
+        }
+
+        let qboSearchTimeout = null;
+        async function searchQboCustomers() {
+            clearTimeout(qboSearchTimeout);
+            const q = document.getElementById("mapping-qbo-search").value.trim();
+            if (q.length < 2) { document.getElementById("qbo-search-results").classList.add("hidden"); return; }
+            qboSearchTimeout = setTimeout(async () => {
+                try {
+                    const resp = await fetch(\`\${API_BASE}/qbo/customers/search?q=\${encodeURIComponent(q)}\`);
+                    const data = await resp.json();
+                    const container = document.getElementById("qbo-search-results");
+                    if (data.customers && data.customers.length > 0) {
+                        container.innerHTML = data.customers.map(c => \`
+                            <div class="px-3 py-2 text-sm text-gray-300 hover:bg-dark-600 cursor-pointer" onclick="selectQboCustomer(\${c.Id}, '\${(c.DisplayName || "").replace(/'/g, "\\'")}')">
+                                \${c.DisplayName}
+                            </div>
+                        \`).join("");
+                        container.classList.remove("hidden");
+                    } else {
+                        container.innerHTML = '<div class="px-3 py-2 text-sm text-gray-500">No customers found</div>';
+                        container.classList.remove("hidden");
+                    }
+                } catch (error) {
+                    console.error("QBO search error:", error);
+                }
+            }, 300);
+        }
+
+        function selectQboCustomer(id, name) {
+            selectedQboCustomer = { id: String(id), name };
+            document.getElementById("mapping-qbo-search").value = name;
+            document.getElementById("qbo-search-results").classList.add("hidden");
+        }
+
+        async function saveMapping() {
+            const resellerId = document.getElementById("mapping-reseller").value;
+            const rate = document.getElementById("mapping-rate").value;
+            if (!selectedQboCustomer) { showToast("Select a QBO customer first", "error"); return; }
+            try {
+                const body = {
+                    reseller_id: resellerId ? parseInt(resellerId) : null,
+                    qbo_customer_id: selectedQboCustomer.id,
+                    qbo_display_name: selectedQboCustomer.name,
+                    daily_rate: parseFloat(rate)
+                };
+                const resp = await fetch(\`\${API_BASE}/qbo-mappings\`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body)
+                });
+                if (resp.ok) {
+                    showToast("Mapping saved", "success");
+                    closeMappingModal();
+                    loadMappings();
+                } else {
+                    const err = await resp.json();
+                    showToast("Error: " + (err.error || JSON.stringify(err)), "error");
+                }
+            } catch (error) {
+                showToast("Error saving mapping: " + error, "error");
+            }
+        }
+
+        async function deleteMapping(id) {
+            if (!confirm("Delete this mapping?")) return;
+            try {
+                await fetch(\`\${API_BASE}/qbo-mappings?id=\${id}\`, { method: "DELETE" });
+                showToast("Mapping deleted", "success");
+                loadMappings();
+            } catch (error) {
+                showToast("Error: " + error, "error");
+            }
+        }
+
+        async function previewInvoices() {
+            const weekStart = document.getElementById("invoice-week-start").value;
+            if (!weekStart) { showToast("Select a week start date", "error"); return; }
+            try {
+                const resp = await fetch(\`\${API_BASE}/qbo-invoice-preview?week_start=\${weekStart}\`);
+                const data = await resp.json();
+                invoicePreviewData = data;
+                if (!data.invoices || data.invoices.length === 0) {
+                    document.getElementById("invoice-preview").innerHTML = '<p class="text-gray-500">No invoices to generate for this period.</p>';
+                    document.getElementById("create-invoices-btn").classList.add("hidden");
+                    return;
+                }
+                let html = '<table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2">Customer</th><th class="py-2">SIMs</th><th class="py-2">Days</th><th class="py-2">Rate</th><th class="py-2">Total</th></tr></thead><tbody>';
+                data.invoices.forEach(inv => {
+                    html += \`<tr class="border-b border-dark-700"><td class="py-2 text-gray-300">\${inv.customer_name}</td><td class="py-2 text-gray-300">\${inv.sim_count}</td><td class="py-2 text-gray-300">7</td><td class="py-2 text-gray-300">$\${Number(inv.daily_rate).toFixed(2)}</td><td class="py-2 text-accent font-semibold">$\${Number(inv.total).toFixed(2)}</td></tr>\`;
+                });
+                html += "</tbody></table>";
+                document.getElementById("invoice-preview").innerHTML = html;
+                document.getElementById("create-invoices-btn").classList.remove("hidden");
+            } catch (error) {
+                showToast("Error previewing: " + error, "error");
+            }
+        }
+
+        async function createInvoices() {
+            if (!invoicePreviewData || !invoicePreviewData.invoices) return;
+            const weekStart = document.getElementById("invoice-week-start").value;
+            if (!confirm(\`Create \${invoicePreviewData.invoices.length} invoice(s) in QuickBooks?\`)) return;
+            try {
+                const resp = await fetch(\`\${API_BASE}/qbo/invoice/create\`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ week_start: weekStart })
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    showToast(\`Created \${result.created} invoice(s)\`, "success");
+                    document.getElementById("create-invoices-btn").classList.add("hidden");
+                    loadInvoiceHistory();
+                } else {
+                    showToast("Error: " + (result.error || JSON.stringify(result)), "error");
+                }
+            } catch (error) {
+                showToast("Error creating invoices: " + error, "error");
+            }
+        }
+
+        async function loadInvoiceHistory() {
+            try {
+                const resp = await fetch(\`\${API_BASE}/qbo-invoices\`);
+                if (!resp.ok) return;
+                const invoices = await resp.json();
+                const tbody = document.getElementById("invoice-history-table");
+                if (!invoices.length) { tbody.innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No invoices yet</td></tr>'; return; }
+                tbody.innerHTML = invoices.map(inv => {
+                    const statusClass = {
+                        draft: "bg-gray-500/20 text-gray-400",
+                        sent: "bg-blue-500/20 text-blue-400",
+                        paid: "bg-accent/20 text-accent",
+                        error: "bg-red-500/20 text-red-400"
+                    }[inv.status] || "bg-gray-500/20 text-gray-400";
+                    return \`
+                    <tr class="border-b border-dark-600">
+                        <td class="px-4 py-3 text-gray-300">\${inv.customer_name || "-"}</td>
+                        <td class="px-4 py-3 text-gray-400 text-xs">\${inv.week_start} - \${inv.week_end}</td>
+                        <td class="px-4 py-3 text-gray-300">\${inv.sim_count}</td>
+                        <td class="px-4 py-3 text-accent">$\${Number(inv.total).toFixed(2)}</td>
+                        <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${inv.status}</span></td>
+                    </tr>\`;
+                }).join("");
+            } catch (error) {
+                console.error("Error loading invoice history:", error);
+            }
+        }
+
         loadGatewayDropdown();
         loadResellers();
         loadData();
-        setInterval(loadData, 30000);
+        setInterval(loadData, 3600000);
         initTabFromUrl();
     </script>
+        <!-- Add Mapping Modal -->
+        <div id="add-mapping-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div class="bg-dark-800 rounded-xl border border-dark-600 p-6 w-full max-w-md">
+                <h3 class="text-lg font-semibold text-white mb-4">Add Customer Mapping</h3>
+                <div class="space-y-3">
+                    <div>
+                        <label class="text-sm text-gray-400 block mb-1">Reseller</label>
+                        <select id="mapping-reseller" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300"></select>
+                    </div>
+                    <div>
+                        <label class="text-sm text-gray-400 block mb-1">QBO Customer (search)</label>
+                        <input type="text" id="mapping-qbo-search" placeholder="Type to search QBO customers..." oninput="searchQboCustomers()" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        <div id="qbo-search-results" class="mt-1 bg-dark-700 rounded-lg border border-dark-500 max-h-32 overflow-y-auto hidden"></div>
+                    </div>
+                    <div>
+                        <label class="text-sm text-gray-400 block mb-1">Daily Rate ($/SIM/day)</label>
+                        <input type="number" id="mapping-rate" step="0.01" value="0.50" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                    </div>
+                </div>
+                <div class="flex justify-end gap-3 mt-5">
+                    <button onclick="closeMappingModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
+                    <button onclick="saveMapping()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Save</button>
+                </div>
+            </div>
+        </div>
 </body>
 </html>`;
 }
