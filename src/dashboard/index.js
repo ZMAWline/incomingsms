@@ -495,7 +495,7 @@ async function handleRunWorker(request, env, workerName, corsHeaders) {
         source: workerName,
         action: 'run',
         error_message: result.error || `Worker returned status ${workerResponse.status}`,
-        error_details: result
+        error_details: { request: { url: workerUrl }, response: result, status: workerResponse.status }
       });
     }
 
@@ -1664,8 +1664,24 @@ async function handleErrors(env, corsHeaders, url) {
 async function handleErrorLogs(env, corsHeaders, url) {
   try {
     const simId = url.searchParams.get('sim_id');
-    if (!simId) return new Response(JSON.stringify({ error: 'sim_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    const query = `helix_api_logs?select=id,action,request_body,response_body,status_code,created_at&sim_id=eq.${simId}&order=created_at.desc&limit=20`;
+    const iccid = url.searchParams.get('iccid');
+
+    if (!simId && !iccid) return new Response(JSON.stringify({ error: 'sim_id or iccid required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    let lookupIccid = iccid;
+
+    // If we have sim_id but no iccid, look up the iccid from the sims table
+    if (simId && !lookupIccid) {
+      const simRes = await supabaseGet(env, `sims?select=iccid&id=eq.${simId}&limit=1`);
+      const sims = await simRes.json();
+      lookupIccid = sims?.[0]?.iccid;
+      if (!lookupIccid) {
+        return new Response(JSON.stringify([]), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // Query helix_api_logs by iccid with correct column names
+    const query = `helix_api_logs?select=id,step,iccid,imei,request_url,request_method,request_body,response_status,response_ok,response_body_json,response_body_text,error,created_at&iccid=eq.${encodeURIComponent(lookupIccid)}&order=created_at.desc&limit=20`;
     const response = await supabaseGet(env, query);
     const logs = await response.json();
     return new Response(JSON.stringify(logs), {
@@ -1842,7 +1858,7 @@ async function handleSimAction(request, env, corsHeaders) {
         action: action,
         sim_id: sim_id,
         error_message: result.error,
-        error_details: result,
+        error_details: { request: { sim_id, action }, response: result, status: workerResponse.status },
       });
     }
 
@@ -4652,15 +4668,34 @@ async function sendSimOnline(simId, phoneNumber) {
 
             document.getElementById('error-detail-content').textContent = err.error_message || 'No error text';
 
-            // Show JSON details if available
+            // Show JSON details if available — split into request/response if structured
             const extraSection = document.getElementById('error-detail-extra');
             const jsonPre = document.getElementById('error-detail-json');
             if (err.error_details) {
                 extraSection.classList.remove('hidden');
-                try {
-                    jsonPre.textContent = JSON.stringify(err.error_details, null, 2);
-                } catch {
-                    jsonPre.textContent = String(err.error_details);
+                const d = err.error_details;
+                let html = '';
+                if (d.request || d.response) {
+                    // Structured error_details with request/response
+                    if (d.request) {
+                        html += '<div class="mb-3"><details open><summary class="text-xs font-semibold text-blue-400 cursor-pointer hover:text-blue-300 mb-1">Request Body</summary>';
+                        html += '<pre class="text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">' + JSON.stringify(d.request, null, 2).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre></details></div>';
+                    }
+                    if (d.response) {
+                        html += '<div class="mb-3"><details open><summary class="text-xs font-semibold text-orange-400 cursor-pointer hover:text-orange-300 mb-1">Response Body</summary>';
+                        html += '<pre class="text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">' + JSON.stringify(d.response, null, 2).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre></details></div>';
+                    }
+                    if (d.status) {
+                        html += '<p class="text-xs text-gray-500">HTTP Status: <span class="font-mono ' + (d.status >= 200 && d.status < 300 ? 'text-accent' : 'text-red-400') + '">' + d.status + '</span></p>';
+                    }
+                    jsonPre.innerHTML = html;
+                } else {
+                    // Unstructured — show raw JSON
+                    try {
+                        jsonPre.textContent = JSON.stringify(d, null, 2);
+                    } catch {
+                        jsonPre.textContent = String(d);
+                    }
                 }
             } else {
                 extraSection.classList.add('hidden');
@@ -4669,54 +4704,64 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('error-detail').classList.remove('hidden');
             document.getElementById('error-detail').scrollIntoView({ behavior: 'smooth' });
 
-            // Load API logs if we have a sim_id
+            // Load Helix API logs if we have a sim_id or iccid
             const logsSection = document.getElementById('error-logs-section');
             const logsContainer = document.getElementById('error-logs-container');
             const simId = err.sim_id || (err._legacy ? parseInt(String(err.id).replace('sim_', '')) : null);
-            if (!simId) {
+            const iccid = err.iccid;
+            if (!simId && !iccid) {
                 logsSection.classList.add('hidden');
                 return;
             }
             logsSection.classList.add('hidden');
-            logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading logs...</p>';
+            logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading Helix API logs...</p>';
             try {
-                const resp = await fetch(\`\${API_BASE}/error-logs?sim_id=\${simId}\`);
+                const params = simId ? 'sim_id=' + simId : 'iccid=' + encodeURIComponent(iccid);
+                const resp = await fetch(\`\${API_BASE}/error-logs?\${params}\`);
                 const logs = await resp.json();
                 if (Array.isArray(logs) && logs.length > 0) {
                     logsSection.classList.remove('hidden');
                     logsContainer.innerHTML = logs.map(log => {
-                        const statusColor = (log.status_code >= 200 && log.status_code < 300) ? 'text-accent' : 'text-red-400';
-                        let reqBody = log.request_body || '-';
-                        let resBody = log.response_body || '-';
-                        try { reqBody = JSON.stringify(JSON.parse(reqBody), null, 2); } catch {}
-                        try { resBody = JSON.stringify(JSON.parse(resBody), null, 2); } catch {}
+                        const statusColor = (log.response_status >= 200 && log.response_status < 300) ? 'text-accent' : 'text-red-400';
+                        let reqBody = '-';
+                        if (log.request_body) {
+                            try { reqBody = JSON.stringify(log.request_body, null, 2); } catch { reqBody = String(log.request_body); }
+                        }
+                        let resBody = '-';
+                        if (log.response_body_json) {
+                            try { resBody = JSON.stringify(log.response_body_json, null, 2); } catch { resBody = String(log.response_body_json); }
+                        } else if (log.response_body_text) {
+                            resBody = log.response_body_text;
+                        }
                         const time = log.created_at ? new Date(log.created_at).toLocaleString() : '-';
                         return \`
                         <div class="bg-dark-900 rounded-lg border border-dark-600 p-3">
                             <div class="flex items-center justify-between mb-2">
                                 <div class="flex items-center gap-3">
-                                    <span class="text-xs font-semibold text-blue-400">\${log.action || '-'}</span>
-                                    <span class="text-xs \${statusColor} font-mono">HTTP \${log.status_code || '?'}</span>
+                                    <span class="text-xs font-semibold text-blue-400">\${log.step || '-'}</span>
+                                    <span class="text-xs \${statusColor} font-mono">HTTP \${log.response_status || '?'}</span>
+                                    <span class="text-xs text-gray-500 font-mono">\${log.request_method || 'GET'}</span>
                                 </div>
                                 <span class="text-xs text-gray-500">\${time}</span>
                             </div>
+                            <div class="text-xs text-gray-400 font-mono mb-2 truncate" title="\${(log.request_url || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}">\${log.request_url || '-'}</div>
                             <details class="mb-1">
-                                <summary class="text-xs text-gray-400 cursor-pointer hover:text-gray-300">Request Body</summary>
+                                <summary class="text-xs text-blue-400 cursor-pointer hover:text-blue-300">Request Body</summary>
                                 <pre class="mt-1 text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">\${reqBody.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
                             </details>
                             <details open>
-                                <summary class="text-xs text-gray-400 cursor-pointer hover:text-gray-300">Response Body</summary>
+                                <summary class="text-xs text-orange-400 cursor-pointer hover:text-orange-300">Response Body</summary>
                                 <pre class="mt-1 text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">\${resBody.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
                             </details>
-                        </div>\`;
+                            \${log.error ? \`<p class="text-xs text-red-400 mt-1">Error: \${log.error}</p>\` : ''}
+                        </div>
+                        \`;
                     }).join('');
                 } else {
-                    logsSection.classList.remove('hidden');
-                    logsContainer.innerHTML = '<p class="text-gray-500 text-sm">No API logs found for this SIM.</p>';
+                    logsSection.classList.add('hidden');
                 }
-            } catch (err) {
-                logsSection.classList.remove('hidden');
-                logsContainer.innerHTML = '<p class="text-red-400 text-sm">Error loading logs: ' + err + '</p>';
+            } catch (logErr) {
+                console.error('Error loading Helix logs:', logErr);
             }
         }
 

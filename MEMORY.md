@@ -96,10 +96,10 @@
 - **Error page redesign**: Queries `system_errors` table + legacy `last_activation_error`. Shows Source, ICCID, Error, Severity, Status, Time columns. Has View/Resolve/OTA buttons per row.
 - **SIM caching**: 30-minute client-side cache (`lastSimsFetchedAt`). Refresh button and filter changes force-reload via `loadSims(true)`.
 - **Unassign reseller**: `/api/unassign-reseller` endpoint. Per-row and bulk Unassign buttons in SIM table. Sets `reseller_sims.active = false`.
-- **System error logging**: Worker runs and SIM actions log failures to `system_errors` table via `logSystemError()`.
+- **System error logging**: Worker runs and SIM actions log failures to `system_errors` table via `logSystemError()`. Error details now include `request` and `response` objects for better debugging.
+- **Helix API logs**: Dashboard now looks up `helix_api_logs` via ICCID (since the table doesn't have a `sim_id` column). The error detail view renders full request/response payloads side-by-side.
 - **IMEI pool overhaul**: Paginated fetch (handles >1000 IMEIs). Stats show Slots/In Use/Available/Retired/Total. Blocked status merged into retired. Gateway/Port columns added to table. Retire works on both available and in_use. Restore button for retired IMEIs.
-- **Gateway 512-1 fix**: `slots_per_port` corrected from 1 → 8 (64 ports × 8 slots = 512).
-- **Gateway tab all_slots**: `loadPortStatus` now passes `all_slots=1` to Skyline API so the 512-1 gateway shows all 512 SIM slots instead of only 64 active ones.
+- **Gateway tab all_slots**: `loadPortStatus` now passes `all_slots=1` to Skyline API so the 512-1 gateway shows all 512 SIM slots instead of only 64 active ones. Also corrected `slots_per_port` to 8 for the 512-1 gateway.
 - **IMEI cleanup**: Retired 37 orphaned `in_use` IMEIs that had no `gateway_id` (legacy entries from before gateway import).
 
 ## Skyline Gateway Integration
