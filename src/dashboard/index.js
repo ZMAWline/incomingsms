@@ -1128,6 +1128,45 @@ async function handleSendTestSms(request, env, corsHeaders) {
     let result;
     try { result = JSON.parse(responseText); } catch { result = { raw: responseText }; }
 
+    // Intercept set-imei to update IMEI pool automatically
+    if (skylinePath === '/set-imei' && request.method === 'POST' && result.ok && requestBodyParsed) {
+      try {
+        const { gateway_id, port, imei: newImei } = requestBodyParsed;
+        if (gateway_id && port && newImei) {
+          // 1. Retire old IMEI on this gateway/port (if any)
+          await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?gateway_id=eq.${gateway_id}&port=eq.${encodeURIComponent(port)}&status=eq.in_use&imei=neq.${newImei}`, {
+            method: 'PATCH',
+            headers: {
+              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ status: 'retired', sim_id: null, assigned_at: null })
+          });
+
+          // 2. Upsert the new IMEI into the pool as in_use
+          await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
+            method: 'POST',
+            headers: {
+              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'resolution=merge-duplicates,return=minimal'
+            },
+            body: JSON.stringify({
+              imei: newImei,
+              status: 'in_use',
+              gateway_id: parseInt(gateway_id),
+              port: port,
+              notes: `Manually set via dashboard on ${new Date().toISOString().split('T')[0]}`
+            })
+          });
+        }
+      } catch (poolErr) {
+        console.error('Failed to update IMEI pool after set-imei:', poolErr);
+      }
+    }
+
     return new Response(JSON.stringify(result, null, 2), {
       status: skylineRes.status,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -1162,6 +1201,7 @@ async function handleSkylineProxy(request, env, url, corsHeaders) {
 
   try {
     let skylineResponse;
+    let requestBodyParsed = null;
     if (request.method === 'GET') {
       // Forward query params for GET requests (like port-status)
       const params = new URLSearchParams(url.searchParams);
@@ -1172,6 +1212,7 @@ async function handleSkylineProxy(request, env, url, corsHeaders) {
       );
     } else {
       const body = await request.text();
+      try { requestBodyParsed = JSON.parse(body); } catch { }
       skylineResponse = await env.SKYLINE_GATEWAY.fetch(targetUrl, {
         method: request.method,
         headers: { 'Content-Type': 'application/json' },
@@ -2841,6 +2882,37 @@ function getHTML() {
         </div>
     </div>
 
+    <!-- SIM Action Modal -->
+    <div id="sim-action-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-3xl max-h-[90vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 id="sim-action-title" class="text-lg font-semibold text-white">Action Result</h3>
+                <button onclick="hideSimActionModal()" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 overflow-y-auto flex-1">
+                <div class="mb-4">
+                    <h4 class="text-sm font-medium text-gray-400 mb-2">API Response:</h4>
+                    <pre id="sim-action-output" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto text-gray-300 border border-dark-600">Loading...</pre>
+                </div>
+                <!-- Helix API Logs section -->
+                <div id="sim-action-logs-section" class="mt-6 border-t border-dark-600 pt-4 hidden">
+                    <div class="flex items-center justify-between mb-3">
+                        <h4 class="text-sm font-medium text-gray-300">Recent Helix API Logs</h4>
+                        <button onclick="loadSimActionLogs()" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                            Refresh
+                        </button>
+                    </div>
+                    <div id="sim-action-logs-container" class="space-y-3">
+                        <p class="text-gray-500 text-sm">Loading logs...</p>
+                    </div>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
+                <button onclick="hideSimActionModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>
+            </div>
+        </div>
+    </div>
     <!-- Rotate Specific SIMs Modal -->
     <div id="rotate-sim-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
         <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
@@ -4766,9 +4838,25 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         // ===== SIM Actions =====
+        let currentSimActionId = null;
+        let currentSimActionIccid = null;
+
+        function hideSimActionModal() {
+            document.getElementById('sim-action-modal').classList.add('hidden');
+        }
+
         async function simAction(simId, action) {
             if (!confirm(\`Run \${action} on SIM #\${simId}?\`)) return;
-            showToast(\`Running \${action} on SIM #\${simId}...\`, 'info');
+
+            const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
+            currentSimActionId = simId;
+            currentSimActionIccid = sim?.iccid || null;
+
+            document.getElementById('sim-action-title').textContent = \`\${action} - SIM #\${simId}\`;
+            document.getElementById('sim-action-output').textContent = \`Running \${action}...\`;
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+
             try {
                 const response = await fetch(\`\${API_BASE}/sim-action\`, {
                     method: 'POST',
@@ -4776,18 +4864,86 @@ async function sendSimOnline(simId, phoneNumber) {
                     body: JSON.stringify({ sim_id: simId, action })
                 });
                 const result = await response.json();
+
+                document.getElementById('sim-action-output').textContent = JSON.stringify(result, null, 2);
+
                 if (result.ok) {
-                    showToast(\`\${action} completed on SIM #\${simId}\`, 'success');
+                    showToast(\`\${action} completed successfully\`, 'success');
                     loadErrors();
                 } else {
-                    showToast(\`Error: \${result.error || JSON.stringify(result)}\`, 'error');
+                    showToast(\`Error: \${result.error || 'Action failed'}\`, 'error');
                 }
             } catch (error) {
+                document.getElementById('sim-action-output').textContent = String(error);
                 showToast(\`Error running \${action}\`, 'error');
                 console.error(error);
             }
+
+            loadSimActionLogs();
         }
 
+        async function loadSimActionLogs() {
+            if (!currentSimActionId && !currentSimActionIccid) return;
+
+            const logsSection = document.getElementById('sim-action-logs-section');
+            const logsContainer = document.getElementById('sim-action-logs-container');
+
+            logsSection.classList.remove('hidden');
+            logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading Helix logs...</p>';
+
+            try {
+                const params = currentSimActionIccid
+                    ? 'iccid=' + encodeURIComponent(currentSimActionIccid)
+                    : 'sim_id=' + currentSimActionId;
+                const response = await fetch(\`\${API_BASE}/error-logs?\${params}\`);
+                const logs = await response.json();
+
+                if (!Array.isArray(logs) || logs.length === 0) {
+                    logsSection.classList.add('hidden');
+                    return;
+                }
+
+                logsContainer.innerHTML = logs.map(log => {
+                    const statusColor = (log.response_status >= 200 && log.response_status < 300) ? 'text-accent' : 'text-red-400';
+                    let reqBody = '-';
+                    if (log.request_body) {
+                        try { reqBody = JSON.stringify(log.request_body, null, 2); } catch { reqBody = String(log.request_body); }
+                    }
+                    let resBody = '-';
+                    if (log.response_body_json) {
+                        try { resBody = JSON.stringify(log.response_body_json, null, 2); } catch { resBody = String(log.response_body_json); }
+                    } else if (log.response_body_text) {
+                        resBody = log.response_body_text;
+                    }
+                    const time = log.created_at ? new Date(log.created_at).toLocaleString() : '-';
+                    return \`
+                    <div class="bg-dark-900 rounded-lg border border-dark-600 p-3">
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="flex items-center gap-3">
+                                <span class="text-xs font-semibold text-blue-400">\${log.step || '-'}</span>
+                                <span class="text-xs \${statusColor} font-mono">HTTP \${log.response_status || '?'}</span>
+                                <span class="text-xs text-gray-500 font-mono">\${log.request_method || 'GET'}</span>
+                            </div>
+                            <span class="text-xs text-gray-500">\${time}</span>
+                        </div>
+                        <div class="text-xs text-gray-400 font-mono mb-2 truncate" title="\${(log.request_url || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}">\${log.request_url || '-'}</div>
+                        <details class="mb-1">
+                            <summary class="text-xs text-blue-400 cursor-pointer hover:text-blue-300">Request Body</summary>
+                            <pre class="mt-1 text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">\${reqBody.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+                        </details>
+                        <details open>
+                            <summary class="text-xs text-orange-400 cursor-pointer hover:text-orange-300">Response Body</summary>
+                            <pre class="mt-1 text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">\${resBody.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+                        </details>
+                        \${log.error ? \`<p class="text-xs text-red-400 mt-1">Error: \${log.error}</p>\` : ''}
+                    </div>
+                    \`;
+                }).join('');
+            } catch (err) {
+                console.error('Failed to load Helix API logs:', err);
+                logsContainer.innerHTML = '<p class="text-red-400 text-sm">Failed to load API logs</p>';
+            }
+        }
         function toggleAllSims(checkbox) {
             document.querySelectorAll('.sim-cb').forEach(cb => cb.checked = checkbox.checked);
             updateSimActionBar();
