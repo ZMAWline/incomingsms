@@ -4845,8 +4845,8 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('sim-action-modal').classList.add('hidden');
         }
 
-        async function simAction(simId, action) {
-            if (!confirm(\`Run \${action} on SIM #\${simId}?\`)) return;
+        async function simAction(simId, action, skipConfirm = false) {
+            if (!skipConfirm && !confirm(\`Run \${action} on SIM #\${simId}?\`)) return;
 
             const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
             currentSimActionId = simId;
@@ -4960,32 +4960,8 @@ async function sendSimOnline(simId, phoneNumber) {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
             if (!confirm(\`Run \${action} on \${simIds.length} SIM(s)?\`)) return;
-            showToast(\`Running \${action} on \${simIds.length} SIM(s)...\`, 'info');
-            let ok = 0, fail = 0;
-            const failures = [];
-            const concurrency = 5;
-            const queue = [...simIds];
-            async function worker() {
-                while (queue.length > 0) {
-                    const id = queue.shift();
-                    try {
-                        const r = await fetch(\`\${API_BASE}/sim-action\`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ sim_id: id, action })
-                        });
-                        const res = await r.json();
-                        if (res.ok) { ok++; } else { fail++; failures.push(\`SIM #\${id}: \${res.error || JSON.stringify(res)}\`); }
-                    } catch (err) { fail++; failures.push(\`SIM #\${id}: \${err}\`); }
-                }
-            }
-            await Promise.all(Array.from({ length: Math.min(concurrency, simIds.length) }, () => worker()));
-            if (fail > 0) {
-                showToast(\`\${action}: \${ok} ok, \${fail} failed\`, 'error');
-                console.error(\`Bulk \${action} failures:\`, failures);
-                alert(\`\${action} completed: \${ok} ok, \${fail} failed\\n\\nFailures:\\n\${failures.join('\\n')}\`);
-            } else {
-                showToast(\`\${action}: \${ok} ok\`, 'success');
+            for (const id of simIds) {
+                await simAction(id, action, true);
             }
             loadSims(true);
         }
@@ -5032,30 +5008,13 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
-async function bulkErrorAction(action) {
-  const simIds = [...document.querySelectorAll('.error-cb:checked')].map(cb => parseInt(cb.value));
-  if (simIds.length === 0) return;
-  if (!confirm(\`Run \${action} on \${simIds.length} SIM(s)?\`)) return;
-            showToast(\`Running \${action} on \${simIds.length} SIM(s)...\`, 'info');
-            let ok = 0, fail = 0;
-            const concurrency = 5;
-            const queue = [...simIds];
-            async function worker() {
-                while (queue.length > 0) {
-                    const id = queue.shift();
-                    try {
-                        const r = await fetch(\`\${API_BASE}/sim-action\`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ sim_id: id, action })
-                        });
-                        const res = await r.json();
-                        if (res.ok) ok++; else fail++;
-                    } catch { fail++; }
-                }
+        async function bulkErrorAction(action) {
+            const simIds = [...document.querySelectorAll('.error-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            if (!confirm(\`Run \${action} on \${simIds.length} SIM(s)?\`)) return;
+            for (const id of simIds) {
+                await simAction(id, action, true);
             }
-            await Promise.all(Array.from({ length: Math.min(concurrency, simIds.length) }, () => worker()));
-            showToast(\`\${action}: \${ok} ok, \${fail} failed\`, fail > 0 ? 'error' : 'success');
             loadErrors();
         }
 
