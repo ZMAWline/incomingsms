@@ -244,14 +244,13 @@ async function hxCancelSubscription(env, token, subscriptionId, iccid) {
   console.log(`[Helix] Cancelling subscription ${subscriptionId} with MDN ${phoneNumber}`);
 
   // Step 2: Cancel using the correct endpoint with MDN
-  const cancelUrl = `${env.HX_API_BASE}/api/mobility-subscriber/ctn`;
-  const cancelBody = {
-    mobilitySubscriptionId: subscriptionId,
+  const cancelUrl = `${env.HX_API_BASE}/api/mobility-subscriber/status`;
+  const cancelBody = [{
     subscriberNumber: phoneNumber,
     reasonCode: "CAN",
     reasonCodeId: 1,
     subscriberState: "Cancel"
-  };
+  }];
 
   const cancelRes = await fetch(cancelUrl, {
     method: "PATCH",

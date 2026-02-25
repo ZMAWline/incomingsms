@@ -36,6 +36,7 @@ invocation_logs = true
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "mdn-rotator-test"
+main = "index.ts"
 
 [env.test.triggers]
 # No crons in test - trigger manually via dashboard

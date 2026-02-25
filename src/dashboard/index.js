@@ -275,27 +275,24 @@ async function handleSims(env, corsHeaders, url) {
       );
     }
 
-    // Get SMS stats for each SIM
-    // Batch SMS stats: paginate (PostgREST caps at 1000 rows/request)
+    // Get SMS stats via DB-side aggregation (avoids row-limit truncation)
     const simIds = filteredSims.map(s => s.id);
     const smsMap = {}; // sim_id -> { count, last_received }
     if (simIds.length > 0) {
-      const idList = simIds.join(',');
-      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      const smsUrl = env.SUPABASE_URL + '/rest/v1/inbound_sms?select=sim_id,received_at&sim_id=in.(' + idList + ')&received_at=gte.' + since + '&order=sim_id,received_at.desc&limit=1000';
+      const smsUrl = env.SUPABASE_URL + '/rest/v1/rpc/get_sms_counts_24h';
       const smsResp = await fetch(smsUrl, {
+        method: 'POST',
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
           Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+          'Content-Type': 'application/json',
           Accept: 'application/json',
-        }
+        },
+        body: JSON.stringify({ sim_ids: simIds }),
       });
       const smsRows = await smsResp.json();
       for (const row of smsRows) {
-        if (!smsMap[row.sim_id]) {
-          smsMap[row.sim_id] = { count: 0, last_received: row.received_at };
-        }
-        smsMap[row.sim_id].count++;
+        smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
       }
     }
 
@@ -2098,7 +2095,7 @@ async function handleSimAction(request, env, corsHeaders) {
     const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sim_id, action })
+      body: JSON.stringify({ sim_id, action, gateway_id: body.gateway_id ?? null, port: body.port ?? null })
     });
 
     const responseText = await workerResponse.text();
@@ -2334,31 +2331,31 @@ function getHTML() {
                 </svg>
             </div>
             <nav class="flex flex-col gap-4">
-                <button onclick="switchTab('dashboard')" class="sidebar-btn active w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Dashboard">
+                <a href="/" onclick="event.preventDefault();switchTab('dashboard')" data-tab="dashboard" class="sidebar-btn active w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Dashboard">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"></path></svg>
-                </button>
-                <button onclick="switchTab('sims')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="SIMs">
+                </a>
+                <a href="/sims" onclick="event.preventDefault();switchTab('sims')" data-tab="sims" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="SIMs">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
-                </button>
-                <button onclick="switchTab('messages')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Messages">
+                </a>
+                <a href="/messages" onclick="event.preventDefault();switchTab('messages')" data-tab="messages" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Messages">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
-                </button>
-                <button onclick="switchTab('workers')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Workers">
+                </a>
+                <a href="/workers" onclick="event.preventDefault();switchTab('workers')" data-tab="workers" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Workers">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-                </button>
-                <button onclick="switchTab('gateway')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Gateway">
+                </a>
+                <a href="/gateway" onclick="event.preventDefault();switchTab('gateway')" data-tab="gateway" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Gateway">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
-                </button>
-                <button onclick="switchTab('imei-pool')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="IMEI Pool">
+                </a>
+                <a href="/imei-pool" onclick="event.preventDefault();switchTab('imei-pool')" data-tab="imei-pool" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="IMEI Pool">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-                </button>
-                <button onclick="switchTab('errors')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition relative" title="Errors">
+                </a>
+                <a href="/errors" onclick="event.preventDefault();switchTab('errors')" data-tab="errors" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition relative" title="Errors">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
                     <span id="error-badge" class="hidden absolute -top-1 -right-1 w-4 h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center">0</span>
-                </button>
-                <button onclick="switchTab('billing')" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Billing">
+                </a>
+                <a href="/billing" onclick="event.preventDefault();switchTab('billing')" data-tab="billing" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Billing">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                </button>
+                </a>
             </nav>
             <div class="mt-auto">
                 <button onclick="loadData()" class="w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-accent hover:bg-dark-600 transition" title="Refresh">
@@ -3130,6 +3127,36 @@ function getHTML() {
             </div>
         </div>
     </div>
+    <!-- Slot Picker Modal -->
+    <div id="slot-picker-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl max-h-[80vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 class="text-lg font-semibold text-white">Select Gateway Slot</h3>
+                <button onclick="hideSlotPickerModal()" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 overflow-y-auto flex-1">
+                <p class="text-sm text-gray-400 mb-4">The SIM card was not found on any gateway. Select a slot to try, or enter slot details manually.</p>
+                <div id="slot-picker-candidates" class="mb-4"></div>
+                <div class="border-t border-dark-600 pt-4">
+                    <h4 class="text-sm font-medium text-gray-300 mb-3">Manual Entry</h4>
+                    <div class="flex gap-3 items-end">
+                        <div>
+                            <label class="block text-xs text-gray-500 mb-1">Gateway ID</label>
+                            <input id="slot-picker-manual-gw" type="text" class="px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent w-28" placeholder="1"/>
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-500 mb-1">Port</label>
+                            <input id="slot-picker-manual-port" type="text" class="px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent w-24" placeholder="01.01"/>
+                        </div>
+                        <button onclick="useManualSlot()" class="px-4 py-2 text-sm bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg transition">Use Slot</button>
+                    </div>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
+                <button onclick="hideSlotPickerModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Cancel</button>
+            </div>
+        </div>
+    </div>
     <!-- Rotate Specific SIMs Modal -->
     <div id="rotate-sim-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
         <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md">
@@ -3317,6 +3344,8 @@ function getHTML() {
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', billing: 'Billing' };
+            document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
             if (tabName === 'errors') loadErrors();
@@ -3386,6 +3415,7 @@ function getHTML() {
             const tab = ROUTE_TO_TAB[location.pathname] || 'dashboard';
             switchTab(tab, false);
         }
+
 
 
         function showToast(message, type = 'info') {
@@ -3546,6 +3576,7 @@ function renderSims() {
                     <td class="px-4 py-3 whitespace-nowrap">
                         \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
                         \${sim.status === 'active' ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}
+                        \${sim.status === 'error' ? \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\` : ''}
                         \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : ''}
                     </td>
                 </tr>
@@ -5129,6 +5160,103 @@ async function sendSimOnline(simId, phoneNumber) {
             }
 
             loadSimActionLogs();
+        }
+
+        async function retryActivation(simId, gatewayId, port) {
+            const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
+            currentSimActionId = simId;
+            currentSimActionIccid = sim?.iccid || null;
+
+            document.getElementById('sim-action-title').textContent = 'Retry Activation - SIM #' + simId;
+            document.getElementById('sim-action-output').textContent = 'Scanning gateways for SIM...';
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+
+            try {
+                const reqBody = { sim_id: simId, action: 'retry_activation' };
+                if (gatewayId) reqBody.gateway_id = gatewayId;
+                if (port) reqBody.port = port;
+
+                const response = await fetch(API_BASE + '/sim-action', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(reqBody)
+                });
+                const result = await response.json();
+
+                if (result.slot_not_found) {
+                    hideSimActionModal();
+                    showSlotPickerModal(simId, result.candidates || []);
+                    return;
+                }
+
+                document.getElementById('sim-action-output').textContent = JSON.stringify(result, null, 2);
+                if (result.ok) {
+                    showToast('Retry activation submitted — SIM moving to provisioning', 'success');
+                    loadSims(true);
+                    loadErrors();
+                } else {
+                    showToast('Retry failed: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                document.getElementById('sim-action-output').textContent = String(error);
+                showToast('Error running retry activation', 'error');
+                console.error(error);
+            }
+
+            loadSimActionLogs();
+        }
+
+        let _slotPickerSimId = null;
+
+        function showSlotPickerModal(simId, candidates) {
+            _slotPickerSimId = simId;
+            const container = document.getElementById('slot-picker-candidates');
+            container.innerHTML = '';
+            if (!candidates || candidates.length === 0) {
+                container.innerHTML = '<p class="text-sm text-gray-500">No unoccupied slots found on any gateway.</p>';
+            } else {
+                const table = document.createElement('table');
+                table.className = 'w-full text-sm text-gray-300';
+                table.innerHTML = '<thead><tr class="text-xs text-gray-500 border-b border-dark-600">' +
+                    '<th class="py-2 text-left">Gateway</th><th class="py-2 text-left">Port</th>' +
+                    '<th class="py-2 text-left">ICCID in Slot</th><th class="py-2 text-left">IMEI</th>' +
+                    '<th class="py-2"></th></tr></thead><tbody id="slot-picker-tbody"></tbody>';
+                container.appendChild(table);
+                const tbody = document.getElementById('slot-picker-tbody');
+                candidates.forEach(function(c) {
+                    const tr = document.createElement('tr');
+                    tr.className = 'border-b border-dark-700';
+                    tr.innerHTML = '<td class="py-2 pr-4">' + (c.gateway_code || c.gateway_id) + '</td>' +
+                        '<td class="py-2 pr-4 font-mono">' + (c.port || '-') + '</td>' +
+                        '<td class="py-2 pr-4 font-mono text-xs">' + (c.iccid || '-') + '</td>' +
+                        '<td class="py-2 pr-4 font-mono text-xs">' + (c.current_imei || '-') + '</td>' +
+                        '<td class="py-2"></td>';
+                    const btn = document.createElement('button');
+                    btn.className = 'px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition';
+                    btn.textContent = 'Use Slot';
+                    btn.addEventListener('click', (function(gid, p) {
+                        return function() { retryActivation(simId, gid, p); };
+                    })(c.gateway_id, c.port));
+                    tr.lastElementChild.appendChild(btn);
+                    tbody.appendChild(tr);
+                });
+            }
+            document.getElementById('slot-picker-modal').classList.remove('hidden');
+        }
+
+        function hideSlotPickerModal() {
+            document.getElementById('slot-picker-modal').classList.add('hidden');
+            _slotPickerSimId = null;
+        }
+
+        function useManualSlot() {
+            const gwId = document.getElementById('slot-picker-manual-gw').value.trim();
+            const port = document.getElementById('slot-picker-manual-port').value.trim();
+            if (!gwId || !port) { showToast('Enter gateway ID and port', 'error'); return; }
+            const simId = _slotPickerSimId;
+            hideSlotPickerModal();
+            retryActivation(simId, gwId, port);
         }
 
         async function loadSimActionLogs() {

@@ -101,7 +101,7 @@ export default {
           });
         }
 
-        const validActions = ["ota_refresh", "cancel", "resume", "rotate", "fix"];
+        const validActions = ["ota_refresh", "cancel", "resume", "rotate", "fix", "retry_activation"];
         if (!validActions.includes(action)) {
           return new Response(JSON.stringify({ error: `Invalid action: ${action}. Valid: ${validActions.join(", ")}` }), {
             status: 400,
@@ -139,6 +139,15 @@ export default {
           const result = await fixSim(env, token, sim_id, { autoRotate: false });
           return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
             status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        // For retry_activation — handles its own SIM loading
+        if (action === "retry_activation") {
+          const result = await retryActivation(env, sim_id, body.gateway_id ?? null, body.port ?? null);
+          return new Response(JSON.stringify(result, null, 2), {
+            status: result.ok === false && !result.slot_not_found ? 500 : 200,
             headers: { "Content-Type": "application/json" }
           });
         }
@@ -611,10 +620,10 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
 
   console.log(`[FixSim] Starting for SIM ${simId} (${iccid})`);
 
-  // 2) Release old IMEI pool entry if exists
+  // 2) Retire old IMEI pool entry — IMEIs removed from a slot are never reused
   const oldPoolId = sim.current_imei_pool_id;
   if (oldPoolId) {
-    await releaseImeiPoolEntry(env, oldPoolId, simId);
+    await retireImeiPoolEntry(env, oldPoolId, simId);
   }
 
   // 3) Allocate new IMEI from pool
@@ -717,26 +726,15 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
       { imei: newImei, current_imei_pool_id: poolEntry.id }
     );
   } catch (err) {
-    // Rollback: release the newly allocated IMEI
+    // Rollback: release the newly allocated IMEI back to available (it was never used)
     console.error(`[FixSim] SIM ${iccid}: failed at steps 4-10, rolling back IMEI allocation: ${err}`);
     try {
       await releaseImeiPoolEntry(env, poolEntry.id, simId);
     } catch (rollbackErr) {
       console.error(`[FixSim] SIM ${iccid}: rollback release failed: ${rollbackErr}`);
     }
-    // Re-assign old IMEI pool entry if one existed
-    if (oldPoolId) {
-      try {
-        await supabasePatch(
-          env,
-          `imei_pool?id=eq.${encodeURIComponent(String(oldPoolId))}`,
-          { status: "in_use", sim_id: simId, assigned_at: new Date().toISOString(), updated_at: new Date().toISOString() }
-        );
-        console.log(`[FixSim] SIM ${iccid}: rolled back to old pool entry ${oldPoolId}`);
-      } catch (rollbackErr) {
-        console.error(`[FixSim] SIM ${iccid}: rollback re-assign failed: ${rollbackErr}`);
-      }
-    }
+    // NOTE: old IMEI (${oldPoolId}) is already retired and cannot be reassigned.
+    // SIM will have no current_imei_pool_id until fix is retried.
     throw err;
   }
 
@@ -845,6 +843,21 @@ async function releaseImeiPoolEntry(env, poolEntryId, simId) {
   );
 }
 
+async function retireImeiPoolEntry(env, poolEntryId, simId) {
+  console.log(`[IMEI Pool] Retiring entry ${poolEntryId} from SIM ${simId} (will not be reused)`);
+  await supabasePatch(
+    env,
+    `imei_pool?id=eq.${encodeURIComponent(String(poolEntryId))}`,
+    {
+      status: "retired",
+      sim_id: null,
+      assigned_at: null,
+      previous_sim_id: simId,
+      updated_at: new Date().toISOString(),
+    }
+  );
+}
+
 // ===========================
 // Skyline Gateway - Set IMEI via service binding
 // ===========================
@@ -916,9 +929,14 @@ async function hxOtaRefresh(env, token, payload, runId, iccid) {
 }
 
 async function hxChangeSubscriberStatus(env, token, statusPayload, runId, iccid, stepName) {
-  const url = `${env.HX_API_BASE}/api/mobility-subscriber/ctn`;
+  const url = `${env.HX_API_BASE}/api/mobility-subscriber/status`;
   const method = "PATCH";
-  const requestBody = statusPayload;
+  // Wrap in array if not already, and remove mobilitySubscriptionId
+  const cleanPayload = Array.isArray(statusPayload) ? statusPayload : [statusPayload];
+  const requestBody = cleanPayload.map(item => {
+    const { mobilitySubscriptionId, ...rest } = item;
+    return rest;
+  });
 
   const res = await fetch(url, {
     method,
@@ -960,6 +978,192 @@ function normalizeUS(phone) {
   if (digits.length === 10) return `+1${digits}`;
   if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
   return phone;
+}
+
+// ===========================
+// Retry Activation for error-status SIMs
+// ===========================
+
+async function hxActivate(env, token, iccid, imei) {
+  const url = env.HX_API_BASE + '/api/mobility-activation/activate';
+  const method = "POST";
+  const runId = 'retry_activate_' + iccid + '_' + Date.now();
+  const requestBody = {
+    clientId: Number(env.HX_ACTIVATION_CLIENT_ID),
+    plan: { id: Number(env.HX_PLAN_ID) },
+    BAN: String(env.HX_BAN),
+    FAN: String(env.HX_FAN),
+    activationType: "new_activation",
+    subscriber: { firstName: "SUB", lastName: "NINE" },
+    address: {
+      address1: env.HX_ADDRESS1,
+      city: env.HX_CITY,
+      state: env.HX_STATE,
+      zipCode: env.HX_ZIP,
+    },
+    service: { iccid, imei },
+  };
+  const res = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json", Authorization: 'Bearer ' + token },
+    body: JSON.stringify(requestBody),
+  });
+  const responseText = await res.text();
+  let json = {};
+  try { json = JSON.parse(responseText); } catch {}
+  await logHelixApiCall(env, {
+    run_id: runId, step: "retry_activation", iccid, imei,
+    request_url: url, request_method: method, request_body: requestBody,
+    response_status: res.status, response_ok: res.ok,
+    response_body_text: responseText, response_body_json: json,
+    error: res.ok ? null : 'Activate failed: ' + res.status,
+  });
+  if (!res.ok) throw new Error('Activate failed ' + res.status + ': ' + responseText.slice(0, 300));
+  if (json && json.mobilitySubscriptionId) return json;
+  const match = responseText.match(/"mobilitySubscriptionId"\s*:\s*"?(\d+)"?/);
+  if (match) return { mobilitySubscriptionId: match[1], _raw: responseText };
+  throw new Error('Activate returned ' + res.status + ' but no mobilitySubscriptionId. Raw: ' + responseText.slice(0, 200));
+}
+
+// Convert port-info dot-notation ("06.01") to gateway letter format ("6A")
+function dotPortToLetter(dotPort) {
+  const parts = String(dotPort).split('.');
+  if (parts.length !== 2) return dotPort;
+  const portNum = parseInt(parts[0], 10);
+  const slotNum = parseInt(parts[1], 10);
+  if (isNaN(portNum) || isNaN(slotNum) || slotNum < 1) return dotPort;
+  return portNum + String.fromCharCode(64 + slotNum);
+}
+
+async function scanGatewaysForIccid(env, iccid) {
+  if (!env.SKYLINE_GATEWAY) throw new Error("SKYLINE_GATEWAY service binding not configured");
+  if (!env.SKYLINE_SECRET) throw new Error("SKYLINE_SECRET not configured");
+  const gateways = await supabaseSelect(env, 'gateways?select=id,code&order=id.asc');
+  if (!Array.isArray(gateways) || gateways.length === 0) return null;
+  for (const gw of gateways) {
+    try {
+      const skUrl = 'https://skyline-gateway/port-info?gateway_id=' + encodeURIComponent(String(gw.id)) +
+        '&secret=' + encodeURIComponent(env.SKYLINE_SECRET) + '&all_slots=1';
+      const res = await env.SKYLINE_GATEWAY.fetch(skUrl);
+      const txt = await res.text();
+      let data = {};
+      try { data = JSON.parse(txt); } catch {}
+      if (!data.ok || !Array.isArray(data.ports)) continue;
+      const found = data.ports.find(p => p.iccid === iccid);
+      if (found) return { gateway_id: gw.id, gateway_code: gw.code, port: dotPortToLetter(found.port), current_imei: found.imei || null };
+    } catch (err) {
+      console.warn('[scanGateways] Gateway ' + gw.id + ' error: ' + err);
+    }
+  }
+  return null;
+}
+
+async function getUnoccupiedCandidates(env) {
+  if (!env.SKYLINE_GATEWAY) throw new Error("SKYLINE_GATEWAY service binding not configured");
+  if (!env.SKYLINE_SECRET) throw new Error("SKYLINE_SECRET not configured");
+  const activeSims = await supabaseSelect(env, 'sims?select=iccid&status=in.(active,provisioning)&limit=5000');
+  const occupied = new Set(Array.isArray(activeSims) ? activeSims.map(s => s.iccid).filter(Boolean) : []);
+  const gateways = await supabaseSelect(env, 'gateways?select=id,code&order=id.asc');
+  if (!Array.isArray(gateways) || gateways.length === 0) return [];
+  const candidates = [];
+  for (const gw of gateways) {
+    try {
+      const skUrl = 'https://skyline-gateway/port-info?gateway_id=' + encodeURIComponent(String(gw.id)) +
+        '&secret=' + encodeURIComponent(env.SKYLINE_SECRET) + '&all_slots=1';
+      const res = await env.SKYLINE_GATEWAY.fetch(skUrl);
+      const txt = await res.text();
+      let data = {};
+      try { data = JSON.parse(txt); } catch {}
+      if (!data.ok || !Array.isArray(data.ports)) continue;
+      for (const p of data.ports) {
+        if (p.iccid && !occupied.has(p.iccid)) {
+          candidates.push({ gateway_id: gw.id, gateway_code: gw.code, port: dotPortToLetter(p.port), iccid: p.iccid, current_imei: p.imei || null });
+        }
+      }
+    } catch (err) {
+      console.warn('[getUnoccupied] Gateway ' + gw.id + ' error: ' + err);
+    }
+  }
+  return candidates;
+}
+
+async function retryActivation(env, simId, manualGatewayId = null, manualPort = null) {
+  const sims = await supabaseSelect(
+    env,
+    'sims?select=id,iccid,status,current_imei_pool_id&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
+  );
+  if (!Array.isArray(sims) || sims.length === 0) throw new Error('SIM not found: ' + simId);
+  const sim = sims[0];
+  if (sim.status !== 'error') throw new Error('SIM ' + sim.iccid + ' is not in error state (status: ' + sim.status + ')');
+  console.log('[RetryActivation] Starting for SIM ' + simId + ' (' + sim.iccid + ')');
+
+  let gatewayId, port;
+  if (manualGatewayId && manualPort) {
+    gatewayId = manualGatewayId;
+    port = manualPort;
+    console.log('[RetryActivation] Using manual slot: gateway=' + gatewayId + ' port=' + port);
+  } else {
+    const found = await scanGatewaysForIccid(env, sim.iccid);
+    if (!found) {
+      console.log('[RetryActivation] SIM ' + sim.iccid + ' not found on any gateway, returning candidates');
+      const candidates = await getUnoccupiedCandidates(env);
+      return { ok: false, slot_not_found: true, candidates };
+    }
+    gatewayId = found.gateway_id;
+    port = found.port;
+    console.log('[RetryActivation] Found SIM ' + sim.iccid + ' at gateway=' + gatewayId + ' port=' + port);
+  }
+
+  await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), { gateway_id: gatewayId, port });
+
+  if (sim.current_imei_pool_id) await retireImeiPoolEntry(env, sim.current_imei_pool_id, simId);
+
+  const poolEntry = await allocateImeiFromPool(env, simId);
+  console.log('[RetryActivation] SIM ' + sim.iccid + ': allocated IMEI ' + poolEntry.imei + ' (pool entry ' + poolEntry.id + ')');
+
+  // Step 6a: Set IMEI on gateway
+  try {
+    await callSkylineSetImei(env, gatewayId, port, poolEntry.imei);
+    console.log('[RetryActivation] SIM ' + sim.iccid + ': IMEI set on gateway');
+  } catch (err) {
+    console.error('[RetryActivation] SIM ' + sim.iccid + ': gateway set-IMEI failed: ' + err);
+    await releaseImeiPoolEntry(env, poolEntry.id, simId).catch(() => {});
+    await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
+      { last_activation_error: 'Gateway error: ' + err.message });
+    throw err;
+  }
+
+  // Step 6b: Helix activation
+  let activateResult;
+  try {
+    const token = await getCachedToken(env);
+    activateResult = await hxActivate(env, token, sim.iccid, poolEntry.imei);
+    console.log('[RetryActivation] SIM ' + sim.iccid + ': activation submitted, subId=' + activateResult.mobilitySubscriptionId);
+  } catch (err) {
+    console.error('[RetryActivation] SIM ' + sim.iccid + ': Helix activation failed: ' + err);
+    await retireImeiPoolEntry(env, poolEntry.id, simId).catch(() => {});
+    await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
+      { last_activation_error: String(err), imei: poolEntry.imei, current_imei_pool_id: poolEntry.id });
+    throw err;
+  }
+
+  // Step 6c: Set SIM to provisioning
+  await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), {
+    status: 'provisioning',
+    last_activation_error: null,
+    imei: poolEntry.imei,
+    current_imei_pool_id: poolEntry.id,
+    mobility_subscription_id: activateResult.mobilitySubscriptionId,
+  });
+  console.log('[RetryActivation] SIM ' + sim.iccid + ': set to provisioning');
+
+  return {
+    ok: true,
+    imei: poolEntry.imei,
+    gateway_id: gatewayId,
+    port,
+    message: 'Activation submitted — finalizer will complete within 5 min',
+  };
 }
 
 // ===========================

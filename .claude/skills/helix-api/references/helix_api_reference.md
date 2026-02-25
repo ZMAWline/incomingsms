@@ -1,10 +1,10 @@
 # Helix HX-AX API Reference
 
-**Last Updated:** 02/09/2026
+**Last Updated:** 02/24/2026
 
 ## Overview
 
-The Helix HX-AX API manages cellular SIM card activation and management for T-Mobile data plans. All API endpoints require bearer token authentication.
+The Helix HX-AX API manages cellular SIM card activation and management for AT&T data plans. All API endpoints require bearer token authentication.
 
 ## Seven Core Operations
 
@@ -260,7 +260,9 @@ Change the phone number assigned to a SIM.
 
 Use this endpoint to change the current status of a subscriber. Supports three lifecycle actions.
 
-**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/ctn`
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/status`
+
+**Important:** Request body must be an array of status change objects. Do not include `mobilitySubscriptionId` in the request.
 
 **Headers:**
 - `Content-Type: application/json`
@@ -399,6 +401,10 @@ Reactivate a previously canceled subscriber.
 Trigger an OTA refresh/reset for a subscriber. Useful when the device/SIM needs a network profile refresh.
 
 **Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/reset-ota`
+
+**Method:** PATCH (not POST)
+
+**Important:** Request body must be an array of OTA refresh objects.
 
 **Headers:**
 - `Content-Type: application/json`

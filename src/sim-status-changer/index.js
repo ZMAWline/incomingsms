@@ -223,7 +223,7 @@ async function hxGetBearerToken(env) {
 async function hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reasonCodeId, iccid) {
   const runId = `status_${Date.now().toString(36)}`;
 
-  const statusUrl = `${env.HX_API_BASE}/api/mobility-subscriber/ctn`;
+  const statusUrl = `${env.HX_API_BASE}/api/mobility-subscriber/status`;
   const statusBody = [{
     subscriberNumber: mdn,
     reasonCode,
