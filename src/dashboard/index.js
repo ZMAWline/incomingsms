@@ -236,7 +236,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_activation_error,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=500`;
+    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=500`;
 
     // Apply status filter
     if (statusFilter) {
@@ -2352,11 +2352,12 @@ function getHTML() {
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_mdn_rotated_at')">Last Rotated <span class="sort-arrow" data-table="sims" data-col="last_mdn_rotated_at"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','activated_at')">Activated <span class="sort-arrow" data-table="sims" data-col="activated_at"></span></th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="sims-table" class="text-sm">
-                                <tr><td colspan="12" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="13" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     <div id="sims-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
@@ -3320,6 +3321,7 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-300">\${sim.sms_count || 0}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${lastSms}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).toLocaleString() : '-'}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${sim.activated_at ? new Date(sim.activated_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 whitespace-nowrap">
                         \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
                         \${sim.status === 'active' ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}

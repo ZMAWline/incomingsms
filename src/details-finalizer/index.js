@@ -82,7 +82,7 @@ async function runFinalizer(env, limit) {
     await supabasePatch(
       env,
       `sims?id=eq.${encodeURIComponent(String(simId))}`,
-      { status: "active", status_reason: null }
+      { status: "active", status_reason: null, activated_at: new Date().toISOString() }
     );
 
     activated++;
@@ -99,26 +99,14 @@ async function runFinalizer(env, limit) {
         verificationSent++;
         console.log(`SIM ${sim.iccid}: verification SMS sent from ${senderSim.e164} to ${e164}`);
       } else {
-        // SMS failed, skip verification and send webhook
-        console.log(`SIM ${sim.iccid}: verification SMS failed, sending webhook directly`);
+        // SMS failed, skip verification
+        console.log(`SIM ${sim.iccid}: verification SMS failed, skipping`);
         await updateVerificationStatus(env, simId, 'skipped');
-        await sendNumberOnlineWebhook(env, simId, {
-          number: e164,
-          iccid: sim.iccid,
-          mobilitySubscriptionId: subId,
-          verified: false,
-        });
       }
     } else {
       // No sender SIM, skip verification
-      console.log(`SIM ${sim.iccid}: no sender SIM available, sending webhook directly`);
+      console.log(`SIM ${sim.iccid}: no sender SIM available, skipping`);
       await updateVerificationStatus(env, simId, 'skipped');
-      await sendNumberOnlineWebhook(env, simId, {
-        number: e164,
-        iccid: sim.iccid,
-        mobilitySubscriptionId: subId,
-        verified: false,
-      });
     }
   }
 
