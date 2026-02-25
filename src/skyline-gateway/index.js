@@ -154,12 +154,14 @@ async function handleGetImei(request, env) {
   const { gateway, error } = await loadAndHandshake(env, gateway_id);
   if (error) return error;
 
-  // IMEI is available from the port status endpoint — just fetch and extract
+  // IMEI is available from the port status endpoint — just fetch and extract.
+  // Use all_slots=1 so multi-slot gateways return every slot (not just the active one).
   const params = new URLSearchParams({
     version: "1.1",
     username: gateway.username,
     password: gateway.password,
     ports: "all",
+    all_slots: "1",
   });
   const statusUrl = `http://${gateway.host}:${gateway.api_port || 80}/goip_get_status.html?${params}`;
   const result = await bridgeFetch(env, statusUrl, "GET");
@@ -182,7 +184,7 @@ async function handleGetImei(request, env) {
 
   // Find the matching port in status data
   const normalizedPort = normalizePortSlot(port);
-  const portEntry = (result.data?.status || []).find(p => p.port === normalizedPort);
+  const portEntry = (result.data?.status || []).find(p => normalizePortSlot(p.port) === normalizedPort);
 
   if (!portEntry) {
     return json({ ok: false, error: `Port ${port} (${normalizedPort}) not found in device status` }, 404);
@@ -540,13 +542,18 @@ async function skylineFetch(env, gateway, endpoint, method, payload) {
 
 const LETTER_TO_SLOT_NUM = { A: 1, B: 2, C: 3, D: 4, E: 5, F: 6, G: 7, H: 8 };
 
-/** Normalize port input to dot notation: "22A" → "22.01", "22.01" → "22.01", "22" → "22" */
+/** Normalize port input to dot notation: "22A" → "22.01", "22.01" → "22.01", "22.1" → "22.01", "22" → "22" */
 function normalizePortSlot(port) {
-  if (/^\d+\.\d+$/.test(port)) return port;
-  const match = port.match(/^(\d+)([A-Ha-h])$/);
-  if (match) {
-    const slotNum = LETTER_TO_SLOT_NUM[match[2].toUpperCase()] || 1;
-    return `${match[1]}.${String(slotNum).padStart(2, "0")}`;
+  // Dot notation — normalize slot to 2-digit padding: "22.3" → "22.03"
+  const dotMatch = port.match(/^(\d+)\.(\d+)$/);
+  if (dotMatch) {
+    return `${dotMatch[1]}.${String(parseInt(dotMatch[2])).padStart(2, "0")}`;
+  }
+  // Letter notation: "22A" → "22.01"
+  const letterMatch = port.match(/^(\d+)([A-Ha-h])$/);
+  if (letterMatch) {
+    const slotNum = LETTER_TO_SLOT_NUM[letterMatch[2].toUpperCase()] || 1;
+    return `${letterMatch[1]}.${String(slotNum).padStart(2, "0")}`;
   }
   return port;
 }
