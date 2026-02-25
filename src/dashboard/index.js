@@ -2043,14 +2043,14 @@ async function handleAssignReseller(request, env, corsHeaders) {
       },
       body: JSON.stringify({ active: false }),
     });
-    // Insert new assignment
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims`, {
+    // Upsert new assignment (handles existing inactive row from prior assignment)
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?on_conflict=reseller_id,sim_id`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
         'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
+        Prefer: 'resolution=merge-duplicates,return=minimal',
       },
       body: JSON.stringify({ sim_id, reseller_id, active: true }),
     });
