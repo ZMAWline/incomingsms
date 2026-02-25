@@ -276,26 +276,31 @@ async function handleSims(env, corsHeaders, url) {
     }
 
     // Get SMS stats for each SIM
-    const formatted = await Promise.all(filteredSims.map(async sim => {
-      // Get SMS count and last received timestamp
-      const smsQuery = `inbound_sms?select=id,received_at&sim_id=eq.${sim.id}&order=received_at.desc&limit=1`;
-      const smsResponse = await supabaseGet(env, smsQuery);
-      const smsData = await smsResponse.json();
-
-      // Get total count
-      const countQuery = `inbound_sms?select=id&sim_id=eq.${sim.id}`;
-      const countResponse = await fetch(`${env.SUPABASE_URL}/rest/v1/${countQuery}`, {
+    // Batch SMS stats: paginate (PostgREST caps at 1000 rows/request)
+    const simIds = filteredSims.map(s => s.id);
+    const smsMap = {}; // sim_id -> { count, last_received }
+    if (simIds.length > 0) {
+      const idList = simIds.join(',');
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const smsUrl = env.SUPABASE_URL + '/rest/v1/inbound_sms?select=sim_id,received_at&sim_id=in.(' + idList + ')&received_at=gte.' + since + '&order=sim_id,received_at.desc&limit=1000';
+      const smsResp = await fetch(smsUrl, {
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
           Accept: 'application/json',
-          Prefer: 'count=exact'
         }
       });
+      const smsRows = await smsResp.json();
+      for (const row of smsRows) {
+        if (!smsMap[row.sim_id]) {
+          smsMap[row.sim_id] = { count: 0, last_received: row.received_at };
+        }
+        smsMap[row.sim_id].count++;
+      }
+    }
 
-      const countHeader = countResponse.headers.get('content-range');
-      const smsCount = countHeader ? parseInt(countHeader.split('/')[1]) : 0;
-      const lastReceived = smsData.length > 0 ? smsData[0].received_at : null;
+    const formatted = filteredSims.map(sim => {
+      const smsStat = smsMap[sim.id] || { count: 0, last_received: null };
 
       // Extract reseller info
       const resellerSim = sim.reseller_sims?.[0];
@@ -310,17 +315,18 @@ async function handleSims(env, corsHeaders, url) {
         mobility_subscription_id: sim.mobility_subscription_id,
         phone_number: sim.sim_numbers?.[0]?.e164 || null,
         verification_status: sim.sim_numbers?.[0]?.verification_status || null,
-        sms_count: smsCount,
-        last_sms_received: lastReceived,
+        sms_count: smsStat.count,
+        last_sms_received: smsStat.last_received,
         reseller_id: resellerId,
         reseller_name: resellerName,
         gateway_id: sim.gateway_id,
         gateway_code: sim.gateways?.code || null,
         gateway_name: sim.gateways?.name || null,
         last_mdn_rotated_at: sim.last_mdn_rotated_at || null,
+        activated_at: sim.activated_at || null,
         last_activation_error: sim.last_activation_error || null,
       };
-    }));
+    });
 
     return new Response(JSON.stringify(formatted), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -2515,6 +2521,7 @@ function getHTML() {
                     <button onclick="bulkUnassignReseller()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Unassign Reseller</button>
                     <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
                     <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
+                    <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Send Online</button>
                 </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
@@ -3480,6 +3487,8 @@ function getHTML() {
                 lastSimsFetchedAt = Date.now();
                 const cacheLabel = document.getElementById('sims-cache-label');
                 if (cacheLabel) cacheLabel.textContent = '(just loaded)';
+                const lastUpdated = document.getElementById('last-updated');
+                if (lastUpdated) lastUpdated.textContent = 'Updated ' + new Date().toLocaleTimeString();
                 renderSims();
             } catch (error) {
                 showToast('Error loading SIMs', 'error');
@@ -5204,6 +5213,31 @@ async function sendSimOnline(simId, phoneNumber) {
                 await simAction(id, action, true);
             }
             loadSims(true);
+        }
+
+        async function bulkSendOnline() {
+            const selectedIds = new Set([...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value)));
+            const eligible = tableState.sims.data.filter(s =>
+                selectedIds.has(s.id) && s.phone_number && s.reseller_id && s.status === 'active'
+            );
+            if (eligible.length === 0) {
+                showToast('No eligible SIMs selected (must be active with phone and reseller)', 'error');
+                return;
+            }
+            if (!confirm('Send number.online webhook for ' + eligible.length + ' SIM(s)?')) return;
+            let ok = 0, fail = 0;
+            for (const sim of eligible) {
+                try {
+                    const resp = await fetch(API_BASE + '/sim-online', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sim_id: sim.id })
+                    });
+                    const result = await resp.json();
+                    if (resp.ok && result.ok) { ok++; } else { fail++; }
+                } catch { fail++; }
+            }
+            showToast(ok + ' sent' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'error' : 'success');
         }
 
         async function unassignReseller(simId) {
