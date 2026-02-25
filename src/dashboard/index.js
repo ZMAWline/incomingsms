@@ -135,6 +135,10 @@ export default {
       return handleUnassignReseller(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/assign-reseller' && request.method === 'POST') {
+      return handleAssignReseller(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/sim-action' && request.method === 'POST') {
       return handleSimAction(request, env, corsHeaders);
     }
@@ -2020,6 +2024,46 @@ async function handleResolveError(request, env, corsHeaders) {
   }
 }
 
+// Assign SIM to reseller
+async function handleAssignReseller(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { sim_id, reseller_id } = body;
+    if (!sim_id || !reseller_id) {
+      return new Response(JSON.stringify({ error: 'sim_id and reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    // Deactivate any existing active assignment
+    await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?sim_id=eq.${sim_id}&active=eq.true`, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ active: false }),
+    });
+    // Insert new assignment
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ sim_id, reseller_id, active: true }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      return new Response(JSON.stringify({ error: err }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
 // Unassign SIMs from reseller
 async function handleUnassignReseller(request, env, corsHeaders) {
   try {
@@ -2515,6 +2559,7 @@ function getHTML() {
                     <button onclick="bulkSimAction('ota_refresh')" class="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">OTA Refresh</button>
                     <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition">Rotate MDN</button>
                     <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Fix SIM</button>
+                    <button onclick="bulkAssignReseller()" class="px-3 py-1.5 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition">Assign Reseller</button>
                     <button onclick="bulkUnassignReseller()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Unassign Reseller</button>
                     <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
                     <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
@@ -3473,7 +3518,7 @@ function getHTML() {
                 const resellers = await response.json();
                 const select = document.getElementById('filter-reseller');
                 const currentValue = select.value;
-                select.innerHTML = '<option value="">All Resellers</option>' +
+                select.innerHTML = '<option value="">All Resellers</option><option value="none">No Reseller</option>' +
                     resellers.map(r => \`<option value="\${r.id}">\${r.name}</option>\`).join('');
                 select.value = currentValue;
             } catch (error) {
@@ -3505,7 +3550,7 @@ function getHTML() {
                     params.set('status', statusFilter);
                     params.set('hide_cancelled', 'false');
                 }
-                if (resellerFilter) {
+                if (resellerFilter && resellerFilter !== 'none') {
                     params.set('reseller_id', resellerFilter);
                 }
                 if (force) params.set('force', 'true');
@@ -3531,6 +3576,8 @@ function renderSims() {
   const search = (document.getElementById('sims-search')?.value || '').trim();
   let data = state.data;
   if (search) data = data.filter(s => matchesSearch(s, search));
+  const resellerFilterVal = document.getElementById('filter-reseller')?.value;
+  if (resellerFilterVal === 'none') data = data.filter(s => !s.reseller_id);
   data = genericSort(data, state.sortKey, state.sortDir);
 
   const tbody = document.getElementById('sims-table');
@@ -3577,7 +3624,7 @@ function renderSims() {
                         \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
                         \${sim.status === 'active' ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}
                         \${sim.status === 'error' ? \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\` : ''}
-                        \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : ''}
+                        \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : \`<button onclick="assignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition" title="Assign to reseller">Assign</button>\`}
                     </td>
                 </tr>
                 \`;
@@ -5386,6 +5433,141 @@ async function sendSimOnline(simId, phoneNumber) {
             } catch (err) {
                 showToast('Error unassigning: ' + err, 'error');
             }
+        }
+
+        async function assignReseller(simId) {
+            const sel = document.getElementById('filter-reseller');
+            const opts = [...sel.options].filter(o => o.value);
+            if (opts.length === 0) {
+                showToast('No resellers available', 'error');
+                return;
+            }
+            const existing = document.getElementById('assign-reseller-modal');
+            if (existing) existing.remove();
+
+            const modal = document.createElement('div');
+            modal.id = 'assign-reseller-modal';
+            modal.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            const box = document.createElement('div');
+            box.className = 'bg-gray-800 rounded-xl shadow-xl w-80 p-6';
+            const titleEl = document.createElement('h3');
+            titleEl.className = 'text-lg font-semibold text-white mb-4';
+            titleEl.textContent = 'Assign to Reseller';
+            const select = document.createElement('select');
+            select.className = 'w-full text-sm bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-gray-300 mb-4';
+            opts.forEach(function(o) {
+                const opt = document.createElement('option');
+                opt.value = o.value;
+                opt.textContent = o.text;
+                select.appendChild(opt);
+            });
+            const btnRow = document.createElement('div');
+            btnRow.className = 'flex gap-2 justify-end mt-4';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'px-3 py-1.5 text-sm bg-gray-600 hover:bg-gray-700 text-gray-300 rounded transition';
+            cancelBtn.textContent = 'Cancel';
+            cancelBtn.onclick = function() { modal.remove(); };
+            const assignBtn = document.createElement('button');
+            assignBtn.className = 'px-3 py-1.5 text-sm bg-green-700 hover:bg-green-800 text-white rounded transition';
+            assignBtn.textContent = 'Assign';
+            assignBtn.onclick = async function() {
+                const resellerId = parseInt(select.value);
+                modal.remove();
+                try {
+                    const resp = await fetch(API_BASE + '/assign-reseller', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sim_id: simId, reseller_id: resellerId })
+                    });
+                    const result = await resp.json();
+                    if (result.ok) {
+                        showToast('SIM assigned to reseller', 'success');
+                        loadSims(true);
+                    } else {
+                        showToast('Failed: ' + (result.error || JSON.stringify(result)), 'error');
+                    }
+                } catch (err) {
+                    showToast('Error assigning: ' + err, 'error');
+                }
+            };
+            btnRow.appendChild(cancelBtn);
+            btnRow.appendChild(assignBtn);
+            box.appendChild(titleEl);
+            box.appendChild(select);
+            box.appendChild(btnRow);
+            modal.appendChild(box);
+            document.body.appendChild(modal);
+        }
+
+        async function bulkAssignReseller() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            const sel = document.getElementById('filter-reseller');
+            const opts = [...sel.options].filter(o => o.value);
+            if (opts.length === 0) {
+                showToast('No resellers available', 'error');
+                return;
+            }
+            const existing = document.getElementById('assign-reseller-modal');
+            if (existing) existing.remove();
+
+            const modal = document.createElement('div');
+            modal.id = 'assign-reseller-modal';
+            modal.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            const box = document.createElement('div');
+            box.className = 'bg-gray-800 rounded-xl shadow-xl w-80 p-6';
+            const titleEl = document.createElement('h3');
+            titleEl.className = 'text-lg font-semibold text-white mb-1';
+            titleEl.textContent = 'Assign to Reseller';
+            const subtitle = document.createElement('p');
+            subtitle.className = 'text-xs text-gray-400 mb-4';
+            subtitle.textContent = simIds.length + ' SIM(s) selected';
+            const select = document.createElement('select');
+            select.className = 'w-full text-sm bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-gray-300';
+            opts.forEach(function(o) {
+                const opt = document.createElement('option');
+                opt.value = o.value;
+                opt.textContent = o.text;
+                select.appendChild(opt);
+            });
+            const btnRow = document.createElement('div');
+            btnRow.className = 'flex gap-2 justify-end mt-4';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'px-3 py-1.5 text-sm bg-gray-600 hover:bg-gray-700 text-gray-300 rounded transition';
+            cancelBtn.textContent = 'Cancel';
+            cancelBtn.onclick = function() { modal.remove(); };
+            const assignBtn = document.createElement('button');
+            assignBtn.className = 'px-3 py-1.5 text-sm bg-green-700 hover:bg-green-800 text-white rounded transition';
+            assignBtn.textContent = 'Assign';
+            assignBtn.onclick = async function() {
+                const resellerId = parseInt(select.value);
+                modal.remove();
+                let assigned = 0, failed = 0;
+                for (const simId of simIds) {
+                    try {
+                        const resp = await fetch(API_BASE + '/assign-reseller', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ sim_id: simId, reseller_id: resellerId })
+                        });
+                        const result = await resp.json();
+                        if (result.ok) assigned++; else failed++;
+                    } catch (err) {
+                        failed++;
+                    }
+                }
+                if (failed) showToast(assigned + ' assigned, ' + failed + ' failed', 'error');
+                else showToast(assigned + ' SIM(s) assigned to reseller', 'success');
+                loadSims(true);
+            };
+            btnRow.appendChild(cancelBtn);
+            btnRow.appendChild(assignBtn);
+            box.appendChild(titleEl);
+            box.appendChild(subtitle);
+            box.appendChild(select);
+            box.appendChild(btnRow);
+            modal.appendChild(box);
+            document.body.appendChild(modal);
         }
 
         async function bulkUnassignReseller() {
