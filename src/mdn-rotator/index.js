@@ -620,11 +620,9 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
 
   console.log(`[FixSim] Starting for SIM ${simId} (${iccid})`);
 
-  // 2) Retire old IMEI pool entry — IMEIs removed from a slot are never reused
-  const oldPoolId = sim.current_imei_pool_id;
-  if (oldPoolId) {
-    await retireImeiPoolEntry(env, oldPoolId, simId);
-  }
+  // 2) Retire old IMEI pool entry — also sweeps orphaned entries where
+  //    current_imei_pool_id was never set (gateway-synced SIMs).
+  await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
 
   // 3) Allocate new IMEI from pool
   const poolEntry = await allocateImeiFromPool(env, simId);
@@ -757,6 +755,53 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
 // ===========================
 // IMEI Pool helpers
 // ===========================
+function parseImeiPoolConflict(status, bodyText) {
+  if (status !== 409 && status !== 422) return null;
+  let parsed;
+  try { parsed = JSON.parse(bodyText); } catch { return null; }
+  if (parsed.code !== '23505') return null;
+  const msg = parsed.message || '';
+  const det = parsed.details || '';
+  if (msg.includes('imei_pool_unique_in_use_sim')) {
+    const m = det.match(/sim_id\)=\((\d+)\)/);
+    const simPart = m ? ' (SIM #' + m[1] + ')' : '';
+    return 'IMEI pool conflict: SIM' + simPart + ' already has an active (in_use) IMEI entry. ' +
+           'The old entry must be retired before assigning a new one. Check the IMEI Pool tab.';
+  }
+  if (msg.includes('imei_pool_unique_in_use_slot')) {
+    const m = det.match(/gateway_id, port\)=\(([^)]+)\)/);
+    const slotPart = m ? ' (gateway/port ' + m[1] + ')' : '';
+    return 'IMEI pool conflict: gateway slot' + slotPart + ' already has an active (in_use) IMEI entry. ' +
+           'The existing slot entry must be retired first. Check the IMEI Pool tab.';
+  }
+  return 'IMEI pool unique conflict: ' + (parsed.message || bodyText.slice(0, 200));
+}
+
+async function logImeiPoolConflict(env, message, details) {
+  console.error('[IMEI Pool Conflict]', message, details);
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/system_errors`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        source: 'imei-pool',
+        action: 'duplicate_imei_assignment',
+        error_message: message,
+        error_details: details || null,
+        severity: 'error',
+        status: 'open',
+      }),
+    });
+  } catch (e) {
+    console.error('[IMEI Pool] Failed to log conflict to system_errors:', e);
+  }
+}
+
 async function allocateImeiFromPool(env, simId) {
   // Find first available IMEI
   const available = await supabaseSelect(
@@ -787,7 +832,14 @@ async function allocateImeiFromPool(env, simId) {
   });
 
   const txt = await res.text();
-  if (!res.ok) throw new Error(`Failed to allocate IMEI: ${res.status} ${txt}`);
+  if (!res.ok) {
+    const conflict = parseImeiPoolConflict(res.status, txt);
+    if (conflict) {
+      await logImeiPoolConflict(env, conflict, { sim_id: simId, pool_entry_id: entry.id, imei: entry.imei });
+      throw new Error(conflict);
+    }
+    throw new Error(`Failed to allocate IMEI: ${res.status} ${txt}`);
+  }
 
   const updated = JSON.parse(txt);
   if (!Array.isArray(updated) || updated.length === 0) {
@@ -817,7 +869,14 @@ async function allocateImeiFromPool(env, simId) {
       }),
     });
     const txt2 = await res2.text();
-    if (!res2.ok) throw new Error(`Failed to allocate IMEI (retry): ${res2.status} ${txt2}`);
+    if (!res2.ok) {
+      const conflict2 = parseImeiPoolConflict(res2.status, txt2);
+      if (conflict2) {
+        await logImeiPoolConflict(env, conflict2, { sim_id: simId, pool_entry_id: entry2.id, imei: entry2.imei });
+        throw new Error(conflict2);
+      }
+      throw new Error(`Failed to allocate IMEI (retry): ${res2.status} ${txt2}`);
+    }
     const updated2 = JSON.parse(txt2);
     if (!Array.isArray(updated2) || updated2.length === 0) {
       throw new Error("IMEI allocation race condition — failed after retry");
@@ -841,6 +900,23 @@ async function releaseImeiPoolEntry(env, poolEntryId, simId) {
       updated_at: new Date().toISOString(),
     }
   );
+}
+
+async function retireAllPoolEntriesForSim(env, simId, knownPoolId) {
+  // Retire the known current entry first (by current_imei_pool_id)
+  if (knownPoolId) {
+    await retireImeiPoolEntry(env, knownPoolId, simId);
+  }
+  // Also retire any orphaned in_use entries where imei_pool.sim_id = simId but
+  // sims.current_imei_pool_id was never set (happens with gateway-synced SIMs).
+  const query = 'imei_pool?select=id&status=eq.in_use&sim_id=eq.' +
+    encodeURIComponent(String(simId)) +
+    (knownPoolId ? '&id=neq.' + encodeURIComponent(String(knownPoolId)) : '');
+  const orphans = await supabaseSelect(env, query);
+  for (const entry of (orphans || [])) {
+    console.log('[IMEI Pool] Retiring orphaned pool entry ' + entry.id + ' for SIM ' + simId);
+    await retireImeiPoolEntry(env, entry.id, simId).catch(console.error);
+  }
 }
 
 async function retireImeiPoolEntry(env, poolEntryId, simId) {
@@ -1116,7 +1192,8 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 
   await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), { gateway_id: gatewayId, port });
 
-  if (sim.current_imei_pool_id) await retireImeiPoolEntry(env, sim.current_imei_pool_id, simId);
+  // Retire old entry + sweep orphaned in_use entries
+  await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
 
   const poolEntry = await allocateImeiFromPool(env, simId);
   console.log('[RetryActivation] SIM ' + sim.iccid + ': allocated IMEI ' + poolEntry.imei + ' (pool entry ' + poolEntry.id + ')');

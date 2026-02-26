@@ -1228,7 +1228,7 @@ async function handleSkylineProxy(request, env, url, corsHeaders) {
             body: JSON.stringify({ status: 'retired', sim_id: null, assigned_at: null }),
           });
           // 2. Upsert new IMEI as in_use
-          await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
+          const upsertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
             method: 'POST',
             headers: {
               apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1244,6 +1244,21 @@ async function handleSkylineProxy(request, env, url, corsHeaders) {
               notes: `Manually set via dashboard on ${new Date().toISOString().split('T')[0]}`,
             }),
           });
+          if (!upsertRes.ok) {
+            const upsertTxt = await upsertRes.text();
+            const conflict = parseImeiPoolConflict(upsertRes.status, upsertTxt);
+            if (conflict) {
+              await logSystemError(env, {
+                source: 'imei-pool',
+                action: 'set_imei_intercept',
+                error_message: conflict,
+                error_details: { gateway_id, port: normPort, imei: newImei },
+                severity: 'error',
+              });
+              throw new Error(conflict);
+            }
+            throw new Error(`IMEI pool upsert failed: ${upsertRes.status} ${upsertTxt}`);
+          }
         }
       } catch (poolErr) {
         console.error('Failed to update IMEI pool after set-imei:', poolErr);
@@ -1706,7 +1721,21 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
       const insertText = await insertRes.text();
       let insertedArr = [];
       try { insertedArr = JSON.parse(insertText); } catch { }
-      inserted = Array.isArray(insertedArr) ? insertedArr.length : 0;
+      if (!insertRes.ok) {
+        const conflict = parseImeiPoolConflict(insertRes.status, insertText);
+        const errMsg = conflict || `IMEI pool bulk insert failed: ${insertRes.status} ${insertText.slice(0, 300)}`;
+        await logSystemError(env, {
+          source: 'imei-pool',
+          action: 'gateway_sync_insert',
+          error_message: errMsg,
+          error_details: { gateway_id: gatewayId, attempted: toInsert.length },
+          severity: 'error',
+        });
+        // Surface in response but don't throw — partial success is still useful
+        discrepancies.push({ type: 'insert_conflict', message: errMsg });
+      } else {
+        inserted = Array.isArray(insertedArr) ? insertedArr.length : 0;
+      }
     }
 
     // Backfill sims.imei for active slots that have a matched sim_id
@@ -1730,8 +1759,10 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
       } catch { }
     }
 
-    // Link sim_id on imei_pool entries for active SIM slots
+    // Link sim_id on imei_pool entries for active SIM slots,
+    // and backfill sims.current_imei_pool_id where not set.
     let linked = 0;
+    let backfilledCurrentPool = 0;
     for (const entry of simImeiMap) {
       try {
         const linkRes = await fetch(
@@ -1742,12 +1773,35 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
               apikey: env.SUPABASE_SERVICE_ROLE_KEY,
               Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
               'Content-Type': 'application/json',
-              Prefer: 'return=minimal',
+              Prefer: 'return=representation',
             },
             body: JSON.stringify({ sim_id: entry.sim_id }),
           }
         );
-        if (linkRes.ok) linked++;
+        if (linkRes.ok) {
+          linked++;
+          // Backfill sims.current_imei_pool_id if not set
+          try {
+            const poolRows = await linkRes.json();
+            const poolId = Array.isArray(poolRows) && poolRows[0]?.id;
+            if (poolId) {
+              const simPatch = await fetch(
+                `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${encodeURIComponent(String(entry.sim_id))}&current_imei_pool_id=is.null`,
+                {
+                  method: 'PATCH',
+                  headers: {
+                    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                    'Content-Type': 'application/json',
+                    Prefer: 'return=minimal',
+                  },
+                  body: JSON.stringify({ current_imei_pool_id: poolId }),
+                }
+              );
+              if (simPatch.ok) backfilledCurrentPool++;
+            }
+          } catch { }
+        }
       } catch { }
     }
 
@@ -1760,6 +1814,7 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
       discrepancies,
       backfilled_sims: backfilled,
       linked_to_sims: linked,
+      backfilled_current_pool: backfilledCurrentPool,
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
   } catch (error) {
@@ -1882,6 +1937,11 @@ async function handleErrors(env, corsHeaders, url) {
     const simResponse = await supabaseGet(env, simQuery);
     const simErrors = await simResponse.json();
 
+    // Also get SIMs with last_rotation_error
+    const rotQuery = `sims?select=id,iccid,port,status,last_rotation_error,last_rotation_at,gateways(code),sim_numbers(e164)&last_rotation_error=not.is.null&sim_numbers.valid_to=is.null&order=last_rotation_at.desc.nullslast&limit=200`;
+    const rotResponse = await supabaseGet(env, rotQuery);
+    const rotErrors = await rotResponse.json();
+
     // Convert SIM errors to unified format
     const legacyErrors = (Array.isArray(simErrors) ? simErrors : []).map(sim => ({
       id: `sim_${sim.id}`,
@@ -1903,9 +1963,30 @@ async function handleErrors(env, corsHeaders, url) {
       _legacy: true,
     }));
 
-    // Merge: system_errors first, then legacy activation errors
+    // Convert rotation errors to unified format
+    const rotationErrors = (Array.isArray(rotErrors) ? rotErrors : []).map(sim => ({
+      id: `rot_${sim.id}`,
+      source: 'rotation',
+      action: 'rotate_mdn',
+      sim_id: sim.id,
+      iccid: sim.iccid,
+      error_message: sim.last_rotation_error,
+      error_details: null,
+      severity: 'error',
+      status: 'open',
+      resolved_at: null,
+      resolved_by: null,
+      resolution_notes: null,
+      created_at: sim.last_rotation_at || null,
+      phone_number: sim.sim_numbers?.[0]?.e164 || null,
+      gateway_code: sim.gateways?.code || null,
+      sim_status: sim.status,
+      _legacy: true,
+    }));
+
+    // Merge: system_errors first, then legacy activation errors, then rotation errors
     const sysFormatted = (Array.isArray(systemErrors) ? systemErrors : []).map(e => ({ ...e, _legacy: false }));
-    const merged = [...sysFormatted, ...legacyErrors];
+    const merged = [...sysFormatted, ...legacyErrors, ...rotationErrors];
 
     return new Response(JSON.stringify(merged), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -1976,9 +2057,10 @@ async function handleResolveError(request, env, corsHeaders) {
       return new Response(JSON.stringify({ error: 'error_ids array required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Filter out legacy sim_ IDs and handle them separately
+    // Filter out legacy sim_ IDs and rotation rot_ IDs and handle them separately
     const systemIds = error_ids.filter(id => typeof id === 'number');
     const legacySimIds = error_ids.filter(id => typeof id === 'string' && id.startsWith('sim_')).map(id => parseInt(id.replace('sim_', '')));
+    const rotationSimIds = error_ids.filter(id => typeof id === 'string' && id.startsWith('rot_')).map(id => parseInt(id.replace('rot_', '')));
 
     // Resolve system errors
     if (systemIds.length > 0) {
@@ -2016,7 +2098,23 @@ async function handleResolveError(request, env, corsHeaders) {
       }
     }
 
-    return new Response(JSON.stringify({ ok: true, resolved: systemIds.length + legacySimIds.length }), {
+    // Clear last_rotation_error for rotation SIM errors
+    if (rotationSimIds.length > 0) {
+      for (const simId of rotationSimIds) {
+        await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
+          method: 'PATCH',
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify({ last_rotation_error: null }),
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({ ok: true, resolved: systemIds.length + legacySimIds.length + rotationSimIds.length }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -2100,6 +2198,28 @@ async function handleUnassignReseller(request, env, corsHeaders) {
 }
 
 // Helper: insert a row into system_errors
+function parseImeiPoolConflict(status, bodyText) {
+  if (status !== 409 && status !== 422) return null;
+  let parsed;
+  try { parsed = JSON.parse(bodyText); } catch { return null; }
+  if (parsed.code !== '23505') return null;
+  const msg = parsed.message || '';
+  const det = parsed.details || '';
+  if (msg.includes('imei_pool_unique_in_use_sim')) {
+    const m = det.match(/sim_id\)=\((\d+)\)/);
+    const simPart = m ? ' (SIM #' + m[1] + ')' : '';
+    return 'IMEI pool conflict: SIM' + simPart + ' already has an active (in_use) IMEI entry. ' +
+           'The old entry must be retired before assigning a new one. Check the IMEI Pool tab.';
+  }
+  if (msg.includes('imei_pool_unique_in_use_slot')) {
+    const m = det.match(/gateway_id, port\)=\(([^)]+)\)/);
+    const slotPart = m ? ' (gateway/port ' + m[1] + ')' : '';
+    return 'IMEI pool conflict: gateway slot' + slotPart + ' already has an active (in_use) IMEI entry. ' +
+           'The existing slot entry must be retired first. Check the IMEI Pool tab.';
+  }
+  return 'IMEI pool unique conflict: ' + (parsed.message || bodyText.slice(0, 200));
+}
+
 async function logSystemError(env, { source, action, sim_id, iccid, error_message, error_details, severity }) {
   try {
     await fetch(`${env.SUPABASE_URL}/rest/v1/system_errors`, {
