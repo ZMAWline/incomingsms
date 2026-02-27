@@ -5,143 +5,127 @@ description: Expert knowledge of the Helix HX-AX API for managing T-Mobile SIM c
 
 # Helix API Expert Skill
 
-This skill makes you an expert in the Helix HX-AX API for managing cellular SIM cards and T-Mobile data plans.
+Expert in the Helix SOLO Mobility API (v1.4) for AT&T SIM card activation and subscriber management.
 
 ## What This Skill Covers
 
-The Helix API handles seven core operations:
+16 endpoint groups across two major sections:
 
-1. **Token Authentication** - Get bearer tokens for API access (24-hour validity)
-2. **SIM Activation** - Activate new SIM cards with IMEI, ICCID, subscriber info
-3. **Query Subscriber** - Look up SIM and subscriber details by mobilitySubscriptionId
-4. **ZIP Code Updates** - Change service address/ZIP (required before MDN change for new area codes)
-5. **MDN Changes** - Change phone numbers assigned to SIMs
-6. **Subscriber Status** - Suspend, Restore (Unsuspend), Cancel, or Resume (from Cancel)
-7. **OTA Refresh** - Trigger an OTA refresh/reset for a subscriber's network profile
+**Section 4 — AT&T Mobility Endpoints:**
+1. **Check IMEI Eligibility** (4.1) — Validate IMEI for a plan/carrier before activating
+2. **Single Unit Activation** (4.2) — Activate one SIM with IMEI, ICCID, subscriber info
+3. **Retry/Update Activation** (4.3) — Retry a failed activation, change IMEI/ICCID/plan
+4. **Update Subscriber Details** (4.4) — Change name and/or address
+5. **Get Reason Codes** (4.5) — Retrieve all status change reason codes
+6. **Change Subscriber Status** (4.6) — Suspend, Unsuspend, Cancel, Resume On Cancel
+7. **Get Subscriber Details** (4.7) — Look up full subscriber info by phone or subscription ID
+8. **Change IMEI** (4.8) — Update the device IMEI on a subscription
+9. **Change ICCID** (4.9) — Swap the physical SIM card
+10. **Change Plan** (4.10) — Switch to a different rate plan (checks IMEI compatibility)
+11. **Send OTA Update** (4.11) — Trigger over-the-air refresh of network profile
+12. **Reset Voicemail Password** (4.12) — Change the voicemail PIN
+13. **Bulk Activation** (4.13) — Activate multiple SIMs in one call
+14. **Bulk BAN Pin Change** (4.14) — Update PINs for multiple billing accounts
+15. **Add Note** (4.15) — Attach a note to a subscriber record
+16. **Update CTN/MDN** (4.16) — Change the phone number on a subscription
 
-## When to Use This Skill
-
-Use this skill when you need to:
-
-- **Understand an API endpoint** - How to format requests, what fields are required, expected responses
-- **Write activation scripts** - Build Python, Bash, or other code to activate SIMs automatically
-- **Debug API errors** - Understand response codes, troubleshoot failed requests
-- **Execute multi-step workflows** - Like changing ZIP code before changing MDN (order matters!)
-- **Explain the API** - Break down how authentication works, what each endpoint does
-- **Build automation** - Create batches of SIM activations or management scripts
+**Section 5 — Get Mobility Subscribers:**
+- Paginated list of all subscribers with status filtering and cancellation date filter
 
 ## Quick Reference
 
 **Base URLs:**
-- Authentication: `https://auth.helixsolo.app/oauth/token`
+- Auth: `https://auth.helixsolo.app/oauth/token`
 - API: `https://api.helixsolo.app/api/`
 
-**Authentication:** All requests need `Authorization: Bearer YOUR_TOKEN` header after getting a token.
+**Authorization:** `Authorization: Bearer YOUR_TOKEN` (24-hour tokens)
 
-**Common Fields:**
-- `mobilitySubscriptionId` - The unique ID for a SIM subscription (returned from activation)
-- `MDN` / `subscriberNumber` - The phone number assigned to the SIM
-- `ICCID` - The SIM card's integrated circuit card identifier
-- `IMEI` - The device's international mobile equipment identity
+**Common identifiers:**
+- `mobilitySubscriptionId` — SOLO unique ID for a subscription (returned from activation; called "Customer ID" in UI)
+- `subscriberNumber` — The 10-digit phone number (MDN/CTN)
+- `iccid` — SIM card identifier
+- `imei` — Device identifier
+- `attBan` — AT&T Billing Account Number (from 4.7 response; needed for OTA refresh)
 
-## Detailed API Reference
+For complete endpoint documentation, request/response formats, and examples, see [helix_api_reference.md](references/helix_api_reference.md).
 
-For complete endpoint documentation, request/response formats, and field descriptions, see [helix_api_reference.md](references/helix_api_reference.md).
+## Key Workflows
 
-### Key Workflows
+### Basic SIM Activation
+1. Get token
+2. (Optional) Check IMEI eligibility via 4.1
+3. POST to 4.2 with IMEI, ICCID, subscriber info, address
+4. Save returned `mobilitySubscriptionId`
 
-#### Basic SIM Activation Flow
-1. Get a token (valid 24 hours)
-2. Call Activation endpoint with IMEI, ICCID, subscriber info, and address
-3. Save the `mobilitySubscriptionId` returned
-4. Use that ID to query, update, or cancel the subscription later
+### Retry Failed Activation
+1. Subscription must be in `ACTIVATION_FAILED` status
+2. PATCH to 4.3 with `mobilitySubscriptionId` in URL + corrected fields in body
 
-#### Changing Phone Number with New Area Code
-⚠️ **Important order:**
-1. Update ZIP code first (Section 4)
-2. Then change MDN/phone number (Section 5)
+### MDN Change (Phone Number Rotation)
+⚠️ **Order matters if changing area codes:**
+1. Update address/ZIP via 4.4 first
+2. Then call 4.16 with `mobilitySubscriptionId`
 
-If you skip this order, the phone number assignment may fail.
+### OTA Refresh
+1. Get subscriber details via 4.7 → note `attBan`, `phoneNumber`, `iccid`
+2. PATCH 4.11 with `{ ban, subscriberNumber, iccid }`
 
-#### Finding Subscription Details
-1. Use Query Sub ID endpoint
-2. Provide the `mobilitySubscriptionId`
-3. Response includes all subscriber data, current phone number, status, etc.
+### Swap Physical SIM
+- PATCH 4.9 with `subscriberNumber` + new `iccid`
 
-#### OTA Refresh Flow
-1. Query Sub ID to get the `attBan`, current MDN, and ICCID
-2. Call OTA Refresh endpoint with `ban`, `subscriberNumber`, and `iccid`
-3. Useful when device/SIM needs a network profile refresh
+### Change Plan
+1. Verify compatibility: GET 4.1 with IMEI
+2. PATCH 4.10 with `mobilitySubscriptionId`, IMEI, `plan.id`
 
-## Example: Simple Activation Request
+## Subscriber Status Quick Reference
+
+| Action | subscriberState | reasonCode | reasonCodeId |
+|--------|-----------------|------------|--------------|
+| Suspend | `Suspend` | `CR` | `22` |
+| Restore | `Unsuspend` | `CR` | `35` |
+| Cancel | `Cancel` | `CAN` | `1` |
+| Resume (From Cancel) | `Resume On Cancel` | `BBL` | `20` |
+
+## Example: Activation
 
 ```bash
 # 1. Get token
 curl -X POST https://auth.helixsolo.app/oauth/token \
   -H "Content-Type: application/json" \
-  -d '{
-    "grant_type": "password",
-    "client_id": "YOUR_CLIENT_ID",
-    "audience": "https://dev-z8ucfxd1iqdj7bzm.us.auth0.com/api/v2/",
-    "username": "YOUR_USERNAME",
-    "password": "YOUR_PASSWORD"
-  }'
+  -d '{"grant_type":"password","client_id":"YOUR_CLIENT_ID","audience":"https://dev-z8ucfxd1iqdj7bzm.us.auth0.com/api/v2/","username":"YOUR_USERNAME","password":"YOUR_PASSWORD"}'
 
-# 2. Activate SIM (use token from step 1)
+# 2. Activate SIM
 curl -X POST https://api.helixsolo.app/api/mobility-activation/activate \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -d '{
-    "clientId": 230,
+    "resellerId": 230,
     "plan": {"id": 985},
-    "BAN": "287355952378",
     "FAN": "63654144",
     "activationType": "new_activation",
-    "subscriber": {
-      "firstName": "John",
-      "lastName": "Doe"
-    },
-    "address": {
-      "address1": "123 Main St",
-      "city": "Dallas",
-      "state": "TX",
-      "zipCode": "75001"
-    },
-    "service": {
-      "imei": "123456789012345",
-      "iccid": "89148000006998837205"
-    }
+    "subscriber": {"firstName": "John", "lastName": "Doe"},
+    "address": {"address1": "123 Main St", "city": "Dallas", "state": "TX", "zipCode": "75001"},
+    "service": {"imei": "123456789012345", "iccid": "89148000006998837205"}
   }'
 ```
 
 ## Common Troubleshooting
 
-**"Invalid token"** → Token expired (24 hour limit). Get a new one.
-
-**"IMEI not found"** → Check format is correct, SIM may already be activated.
-
-**"Address required"** → All fields (address1, city, state, zipCode) must be included.
-
-**"MDN change failed"** → Did you update the ZIP code first if changing area codes?
-
-**Status change failed** → Use correct reasonCodeId: Suspend=22, Restore=35, Cancel=1, Resume=20
-
-**OTA Refresh failed** → Ensure you have the correct `attBan` from Query Sub ID response, plus current MDN and ICCID.
-
-## Subscriber Status Changes
-
-| Action | subscriberState | reasonCodeId |
-|--------|-----------------|--------------|
-| Suspend | `Suspend` | `22` |
-| Restore | `Unsuspend` | `35` |
-| Cancel | `Cancel` | `1` |
-| Resume (From Cancel) | `Resume On Cancel` | `20` |
+| Error | Fix |
+|-------|-----|
+| Token expired | Re-authenticate (24h limit) |
+| IMEI not found (406) | Check format; verify with 4.1 |
+| ICCID already active | Query 4.7 first to confirm state |
+| Activation retry failed | Status must be `ACTIVATION_FAILED` |
+| OTA rejected | Get correct `attBan` from 4.7 |
+| MDN change failed | Update ZIP via 4.4 first if new area code |
+| Status change rejected | Use 4.5 to get valid reason codes |
+| Voicemail reset 400 | BAN must be exactly 12 characters |
 
 ## How I Can Help
 
-Tell me what you're trying to do with Helix, and I can:
-- Explain how a specific endpoint works
-- Write code/scripts to activate or manage SIMs
+- Explain any endpoint and write properly formatted request payloads
 - Debug API errors and responses
-- Guide you through complex workflows
-- Build batch activation scripts
+- Write activation/management scripts in any language
+- Guide through complex multi-step workflows
+- Build batch processing logic for bulk operations

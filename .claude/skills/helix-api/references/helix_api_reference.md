@@ -1,40 +1,28 @@
-# Helix HX-AX API Reference
+# Helix SOLO API Mobility Reference
 
-**Last Updated:** 02/24/2026
+**Last Updated:** 2026-02-27 (from SOLO API Mobility Docs v1.4)
 
 ## Overview
 
-The Helix HX-AX API manages cellular SIM card activation and management for AT&T data plans. All API endpoints require bearer token authentication.
+The Helix SOLO Mobility API manages AT&T SIM card activation and subscriber management. All endpoints require a bearer token in the `Authorization` header.
 
-## Seven Core Operations
-
-| Step | Action | Purpose |
-|------|--------|---------|
-| 1 | Token Authentication | Retrieve bearer token using credentials |
-| 2 | Activation | Activate a SIM using IMEI + plan |
-| 3 | Query Sub ID | Get SIM and subscriber info |
-| 4 | Service ZIP Change | Update the service ZIP code |
-| 5 | MDN Change | Change MDN associated with ICCID |
-| 6 | Change Subscriber Status | Suspend / Restore / Cancel service |
-| 7 | OTA Refresh | Trigger an OTA refresh/reset for a subscriber |
+**Base URL:** `https://api.helixsolo.app`
+**Auth URL:** `https://auth.helixsolo.app/oauth/token`
 
 ---
 
-## 1. Token Authentication
+## Authentication
 
 **Endpoint:** `POST https://auth.helixsolo.app/oauth/token`
-
-**Headers:**
-- `Content-Type: application/json`
 
 **Request:**
 ```json
 {
   "grant_type": "password",
-  "client_id": "4cor0JEQHxfwTdlAkGdCfUWiX8Q2sXzk",
+  "client_id": "YOUR_CLIENT_ID",
   "audience": "https://dev-z8ucfxd1iqdj7bzm.us.auth0.com/api/v2/",
-  "username": "svc-api9",
-  "password": "Wing1212@!"
+  "username": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD"
 }
 ```
 
@@ -42,350 +30,221 @@ The Helix HX-AX API manages cellular SIM card activation and management for AT&T
 ```json
 {
   "access_token": "eyJhbGciOiJSUzI1NiIs...",
-  "scope": "read:current_user update:current_user_metadata ...",
   "expires_in": 86400,
   "token_type": "Bearer"
 }
 ```
 
-**Important:** Use the token in all subsequent requests via `Authorization: Bearer YOUR_TOKEN` header. Tokens expire in 24 hours.
+Token expires in 86400 seconds (24 hours). All API calls need `Authorization: Bearer YOUR_TOKEN`.
 
 ---
 
-## 2. Activation
+## 4.1 Check IMEI Eligibility
 
-Activate a new SIM card with subscriber information and address.
+Validate whether an IMEI can be activated on a given plan/carrier.
+
+**Endpoint:** `GET https://api.helixsolo.app/api/plans-by-imei/{imei}?skuId={skuId}&resellerId={resellerId}`
+
+- `skuId=3` for AT&T
+- `skuId=11` for Verizon
+
+**Example:** `GET /api/plans-by-imei/356415593499551?skuId=3&resellerId=91`
+
+**Response (200):**
+```json
+{
+  "imei_type_id": "63",
+  "imei_type": "S7",
+  "sim_type": "DSDS (4FF/eSIM)",
+  "manufacturer": "Sample Manufacturer",
+  "model": "Sample Model 2023",
+  "network_type": "5G",
+  "isImeiValid": true,
+  "plans": [
+    { "plan_id": 123, "name": "Sample Plan", "soloPlanCode": "MESP1T" }
+  ]
+}
+```
+
+**Response (406):** IMEI not found.
+
+---
+
+## 4.2 Single Unit Activation
+
+Activate a single SIM card.
 
 **Endpoint:** `POST https://api.helixsolo.app/api/mobility-activation/activate`
 
-**Headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer YOUR_TOKEN`
-
 **Request:**
 ```json
 {
-  "clientId": 230,
-  "plan": {
-    "id": 985
-  },
-  "FAN": "63654144",
+  "resellerId": 101,
+  "plan": { "id": 123 },
+  "FAN": "98765432",
+  "BAN": "987654321000",
   "activationType": "new_activation",
   "subscriber": {
-    "firstName": "FIRST_NAME",
-    "lastName": "LAST_NAME"
+    "firstName": "Jane",
+    "lastName": "Smith"
   },
   "address": {
-    "address1": "ADDRESS_LINE_1",
-    "city": "CITY",
-    "state": "STATE_CODE",
-    "zipCode": "ZIP_CODE"
+    "address1": "456 Elm Street",
+    "city": "Springfield",
+    "state": "IL",
+    "zipCode": "62701"
   },
   "service": {
-    "imei": "YOUR_IMEI",
-    "iccid": "YOUR_ICCID"
-  }
+    "imei": "358765098765432",
+    "iccid": "89014104334567890123",
+    "subscriberNumber": "5551234567"
+  },
+  "partnerTransactionId": "TR1234"
 }
 ```
 
-**Response:**
+**Field notes:**
+- `resellerId` / `clientId` — interchangeable
+- `plan.id` — required; no `type` field (removed in v1.2)
+- `BAN` — optional; auto-generated if omitted
+- `service.subscriberNumber` — optional; include to reserve a specific CTN
+- `partnerTransactionId` — optional; must have a value for webhooks to fire
+
+**Response (201):**
 ```json
-{
-  "mobilitySubscriptionId": 38106
-}
+{ "mobilitySubscriptionId": 4000 }
 ```
 
-**Fields to Update:**
-- `address1`, `city`, `state`, `zipCode` - Service address
-- `imei` - Device IMEI number (15 digits)
-- `iccid` - SIM card ICCID (19-20 digits)
-- `firstName`, `lastName` - Subscriber name
+**Response (400):** ICCID already has an active subscription.
 
 ---
 
-## 3. Query Sub ID
+## 4.3 Retry/Update Activation
 
-Fetch subscriber and SIM card details by subscription ID.
+Retry a failed activation, optionally changing IMEI, ICCID, plan, or subscriber details.
 
-**Endpoint:** `POST https://api.helixsolo.app/api/mobility-subscriber/details`
-
-**Headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer YOUR_TOKEN`
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-activation/activate/retry/:mobilitySubscriptionId`
 
 **Request:**
 ```json
 {
-  "mobilitySubscriptionId": SUBID
+  "firstName": "Test",
+  "lastName": "User",
+  "address": {
+    "address1": "123 Example St",
+    "city": "Sample City",
+    "state": "XY",
+    "zipCode": "12345"
+  },
+  "iccid": "12345678901234567890",
+  "imei": "123456789012345",
+  "plan": { "id": 999 },
+  "esim": false
 }
 ```
 
-**Response (Example):**
-```json
-[
-  {
-    "mobilitySubscriptionId": "40033",
-    "mobilitySubscriptionDetailsId": "40033",
-    "skuId": "11",
-    "phoneNumber": "4695042393",
-    "oldPhoneNumber": "6468474546",
-    "firstName": "SUB",
-    "lastName": "NINE",
-    "addressLine1": "5600 Tennyson Pkwy",
-    "addressLine2": null,
-    "streetName": "TENNYSON",
-    "streetType": "Pkwy",
-    "streetDirection": "",
-    "streetNumber": "5600",
-    "zip": "75024",
-    "city": "Plano",
-    "state": "TX",
-    "iccid": "89148000006998837205",
-    "eid": null,
-    "billingImei": "355826084427185",
-    "esimActivationCode": null,
-    "syncDate": null,
-    "fan": "V26496855",
-    "attBan": null,
-    "attBanPasscode": null,
-    "planId": "739",
-    "planName": "Wing - Tiered",
-    "operationType": "new_activation",
-    "activatedAt": "2025-07-17T15:56:40.101Z",
-    "status": "ACTIVE",
-    "statusReason": "SUCCESSFULLY PROCESSED THE REQUEST",
-    "resellerId": null,
-    "clientId": "189",
-    "networkType": "LTE",
-    "businessEntityName": "SUB1",
-    "scheduledStatus": null,
-    "scheduledDate": null,
-    "startBillingDate": "2025-07-05T00:00:00.000Z",
-    "endBillingDate": "2025-08-05T00:00:00.000Z",
-    "suspendedAt": null,
-    "canceledAt": null
-  }
-]
-```
+**Field notes:**
+- All fields are optional except `firstName`, `lastName`, and address fields
+- `esim: true` required for eSIM activations
+- Only works when subscription status is `ACTIVATION_FAILED`
 
-**Key Response Fields:**
-- `status` - Current status: `ACTIVE`, `SUSPENDED`, `CANCELED`
-- `statusReason` - Detailed status message
-- `phoneNumber` - Current MDN
-- `oldPhoneNumber` - Previous MDN (if changed)
+**Response (200):** Full subscriber object with `mobility_subscription_id`, address fields, `iccid`, `billing_imei`, `activationId`.
+
+**Response (400):** `"Subscription operation status should be ACTIVATION_FAILED."`
 
 ---
 
-## 4. Service ZIP Code Change
+## 4.4 Update Mobility Subscriber Details
 
-Update the ZIP code (and address) associated with an active SIM.
+Update subscriber name and/or address.
 
 **Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/details`
 
-**Headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer YOUR_TOKEN`
-
-**Request:**
+**Request (array):**
 ```json
 [
   {
-    "subscriberNumber": "MDN",
+    "subscriberNumber": "1234567890",
+    "firstName": "John",
+    "lastName": "Smith",
     "address": {
-      "address1": "ADDRESS_LINE_1",
-      "city": "CITY",
-      "state": "STATE_CODE",
-      "zipCode": "ZIP_CODE"
-    }
+      "address1": "123 Maple Ave",
+      "address2": "Apt 4B",
+      "city": "Springfield",
+      "state": "IL",
+      "zipCode": "62704"
+    },
+    "streetName": "Maple",
+    "streetType": "Ave",
+    "streetNumber": "123"
   }
 ]
 ```
 
-**Response:**
-```json
-[
-  {
-    "status": "fulfilled",
-    "value": {
-      "mobility_subscription_id": "38105",
-      "subscriberNumber": "9726546901",
-      "address_line_1": "5600 Tennyson Pkwy",
-      "address_line_2": null,
-      "street_number": "5600",
-      "street_name": "TENNYSON",
-      "street_type": "Pkwy",
-      "street_direction": "",
-      "zip": "75024",
-      "city": "Plano",
-      "state": "TX"
-    }
-  }
-]
-```
+**Response (200):** Array with `status: "fulfilled"` and updated subscriber details.
 
 ---
 
-## 5. MDN Change
+## 4.5 Get Status Change Reason Codes
 
-Change the phone number assigned to a SIM.
+Get all reason codes for status changes.
 
-**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/ctn`
+**Endpoint:** `GET https://api.helixsolo.app/api/mobility-subscriber/reason-codes`
 
-**Headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer YOUR_TOKEN`
+**Response (200):** Array of reason code objects. Key codes:
 
-**Request:**
-```json
-{
-  "mobilitySubscriptionId": SUBID
-}
-```
-
-**Response:**
-```json
-{
-  "subscriberNumber": "6462309413",
-  "newSubscriberNumber": "9726546901",
-  "changeStatus": "SUCCESS",
-  "mobilitySubscriptionId": 38105
-}
-```
-
-**CRITICAL NOTE:** If assigning a new area code tied to a different ZIP code, complete the ZIP code change (Section 4) **BEFORE** initiating the MDN change.
+| reasonCodeId | reason | reasonCode | subscriberState |
+|---|---|---|---|
+| 1 | Cancel No Reason | CAN | Cancel |
+| 3 | Lost Stolen | LOS | Cancel |
+| 18 | Customer Request | CR | Resume On Cancel |
+| 19 | Procedural | PR | Resume On Cancel |
+| 20 | Bring Back Live | BBL | Resume On Cancel |
+| 22 | Customer Request | CR | Suspend |
+| 23 | High Use Suspend | NPG | Suspend |
+| 25 | Stolen | STLN | Suspend |
+| 35 | Customer Request | CR | Unsuspend |
+| 36 | Procedural | PR | Unsuspend |
 
 ---
 
-## 6. Change Subscriber Status (Suspend / Restore / Cancel)
+## 4.6 Change Subscriber Status
 
-Use this endpoint to change the current status of a subscriber. Supports three lifecycle actions.
+Change subscriber status (suspend, unsuspend, cancel, resume).
 
 **Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/status`
 
-**Important:** Request body must be an array of status change objects. Do not include `mobilitySubscriptionId` in the request.
-
-**Headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer YOUR_TOKEN`
+Request body is an **array** of status change objects.
 
 ### Suspend
-
-Temporarily suspend service.
-
-**Request:**
 ```json
-[
-  {
-    "subscriberNumber": "CURRENT_MDN",
-    "reasonCode": "CR",
-    "reasonCodeId": 22,
-    "subscriberState": "Suspend"
-  }
-]
+[{ "subscriberNumber": "4693186358", "reasonCodeId": 22, "subscriberState": "Suspend", "reasonCode": "CR" }]
 ```
 
-### Restore (Unsuspend)
-
-Reactivate a previously suspended subscriber.
-
-**Request:**
+### Unsuspend (Restore)
 ```json
-[
-  {
-    "subscriberNumber": "CURRENT_MDN",
-    "reasonCode": "CR",
-    "reasonCodeId": 35,
-    "subscriberState": "Unsuspend"
-  }
-]
+[{ "subscriberNumber": "4693186358", "reasonCodeId": 35, "subscriberState": "Unsuspend", "reasonCode": "CR" }]
 ```
 
 ### Cancel
-
-Permanently disconnect service.
-
-**Request:**
 ```json
-[
-  {
-    "subscriberNumber": "CURRENT_MDN",
-    "reasonCode": "CAN",
-    "reasonCodeId": 1,
-    "subscriberState": "Cancel"
-  }
-]
+[{ "subscriberNumber": "4693186358", "reasonCodeId": 1, "subscriberState": "Cancel", "reasonCode": "CAN" }]
 ```
 
-**Response (Cancel Example):**
+### Resume On Cancel
+```json
+[{ "subscriberNumber": "4693186358", "reasonCodeId": 20, "subscriberState": "Resume On Cancel", "reasonCode": "BBL" }]
+```
+
+**Response (200):**
 ```json
 {
-  "fulfilled": [
-    {
-      "?xml": {
-        "@_version": "1.0",
-        "@_encoding": "UTF-8"
-      },
-      "resellerOrderResponse": {
-        "messageHeader": {
-          "vendorId": "HELIX",
-          "requestType": "ORDER",
-          "orderType": "MNTMLND",
-          "referenceNumber": "ChangeState_1752773879360",
-          "returnURL": "http://vz-api.helixsolo.app/api/mobility-verizon/returnURL"
-        },
-        "orderResponse": {
-          "returnCode": "00",
-          "returnMessage": "SUCCESSFULLY PROCESSED THE REQUEST"
-        }
-      },
-      "reasonCodeId": 1,
-      "subscriberState": "Cancel",
-      "subscriberNumber": "4697997136"
-    }
-  ],
+  "fulfilled": [{ "status": "Active", "subscriberNumber": "1234567890", "reasonCodeId": 1, "subscriberState": "Cancel" }],
   "rejected": []
 }
 ```
 
-### Resume (From Cancel)
-
-Reactivate a previously canceled subscriber.
-
-**Request:**
-```json
-[
-  {
-    "subscriberNumber": "CURRENT_MDN",
-    "reasonCode": "BBL",
-    "reasonCodeId": 20,
-    "subscriberState": "Resume On Cancel"
-  }
-]
-```
-
-**Response:**
-```json
-{
-  "fulfilled": [
-    {
-      "category": {
-        "id": "12",
-        "name": "Mobility Services"
-      },
-      "effectiveDate": "immediately",
-      "href": "/mobility/service/6468842752",
-      "name": "",
-      "status": "Active",
-      "subscriberNumber": "6468842752",
-      "reasonCodeId": 20,
-      "subscriberState": "Resume On Cancel"
-    }
-  ],
-  "rejected": []
-}
-```
-
-### Status Change Reference
+**Status Change Quick Reference:**
 
 | Action | subscriberState | reasonCode | reasonCodeId |
 |--------|-----------------|------------|--------------|
@@ -396,80 +255,335 @@ Reactivate a previously canceled subscriber.
 
 ---
 
-## 7. OTA Refresh (Reset OTA)
+## 4.7 Get Mobility Subscriber Details
 
-Trigger an OTA refresh/reset for a subscriber. Useful when the device/SIM needs a network profile refresh.
+Get detailed subscriber information.
+
+**Endpoint:** `POST https://api.helixsolo.app/api/mobility-subscriber/details`
+
+**Request:** Either `subscriberNumber` or `mobilitySubscriptionId` (or both):
+```json
+[{ "subscriberNumber": "1234567890", "mobilitySubscriptionId": 1001 }]
+```
+
+**Bulk request:** Array with multiple entries.
+
+**Response (201):** Array of subscriber objects:
+```json
+[{
+  "mobilitySubscriptionId": "1001",
+  "phoneNumber": "1234567890",
+  "oldPhoneNumber": null,
+  "firstName": "John",
+  "lastName": "Smith",
+  "addressLine1": "123 Maple Ave",
+  "addressLine2": "Apt 4B",
+  "zip": "62704",
+  "city": "Springfield",
+  "state": "IL",
+  "iccid": "89014103219876543210",
+  "billingImei": "356415123456789",
+  "fan": "98765432",
+  "attBan": "123456789012",
+  "attBanPasscode": "123456",
+  "planId": "101",
+  "planName": "5GB Data Plan",
+  "operationType": "new_activation",
+  "activatedAt": "2024-11-14T20:11:30.000Z",
+  "status": "ACTIVATED",
+  "statusReason": "",
+  "startBillingDate": "2024-10-24T00:00:00.000Z",
+  "endBillingDate": "2024-11-24T00:00:00.000Z",
+  "suspendedAt": null,
+  "canceledAt": null
+}]
+```
+
+**Key response fields:**
+- `status` — `ACTIVATED`, `SUSPENDED`, `CANCELED` (also seen as `ACTIVE` in real responses)
+- `attBan` — BAN needed for OTA Refresh
+- `mobilitySubscriptionId` — the SOLO unique identifier (Customer ID in UI)
+
+---
+
+## 4.8 Change Subscriber's IMEI
+
+Update the IMEI on a subscription.
+
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-sub-ops/imei-plan`
+
+**Request (array):**
+```json
+[{ "mobilitySubscriptionId": 1001, "imei": "356415123456789" }]
+```
+
+**Response (200):**
+```json
+{
+  "successful": [{ "mobilitySubscriptionId": "1001", "billingImei": "356415123456789", "planId": "101", "planType": "custom" }],
+  "failed": []
+}
+```
+
+---
+
+## 4.9 Change Subscriber's ICCID
+
+Swap the SIM card (change ICCID) on a subscription.
+
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/iccid`
+
+**Request (array):**
+```json
+[{ "subscriberNumber": "1234567890", "iccid": "89014103219876543210" }]
+```
+
+**Response (200):**
+```json
+{
+  "successful": [{ "message": "Line with phone number 1234567890 was updated with ICCID 89014103219876543210", "mobilitySubscriptionId": "1001", "phoneNumber": "1234567890" }],
+  "failed": []
+}
+```
+
+---
+
+## 4.10 Change Subscriber's Plan
+
+Change the plan (and optionally IMEI) on a subscription. Verify plan+IMEI compatibility first using 4.1.
+
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-sub-ops/imei-plan`
+
+**Request (array):**
+```json
+[{ "mobilitySubscriptionId": 5000, "imei": "356789123456789", "plan": { "id": 68 } }]
+```
+
+To change plan only (keep same IMEI), still include the current IMEI.
+
+**Response (200):**
+```json
+{
+  "successful": [{ "mobilitySubscriptionId": "5000", "billingImei": "356789123456789", "planId": "68" }],
+  "failed": []
+}
+```
+
+**Note:** Same endpoint as 4.8 (IMEI change) — include `plan` to also change plan, or omit to only change IMEI.
+
+---
+
+## 4.11 Send OTA Update (Reset OTA)
+
+Trigger OTA refresh for a subscriber's network profile.
 
 **Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/reset-ota`
 
-**Method:** PATCH (not POST)
-
-**Important:** Request body must be an array of OTA refresh objects.
-
-**Headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer YOUR_TOKEN`
-
-**Request:**
+**Request (array):**
 ```json
-[
-  {
-    "ban": "BAN_NUMBER",
-    "subscriberNumber": "CURRENT_MDN",
-    "iccid": "ICCID"
-  }
-]
+[{ "ban": "123456789012", "subscriberNumber": "1234567890", "iccid": "89014103219876543210" }]
 ```
 
-**Fields to Update:**
-- `ban` - The BAN (billing account number). Obtain from Query Sub ID response under `attBan`.
-- `subscriberNumber` - Current MDN of the subscriber
-- `iccid` - SIM card ICCID
+- `ban` — get from 4.7 response field `attBan`
 
-**Response:**
+**Response (200):**
 ```json
 {
-  "fulfilled": [
-    {
-      "category": {
-        "id": "12",
-        "name": "Mobility Services"
-      },
-      "href": "/mobility/service/6468842752",
-      "name": "",
-      "serviceCharacteristic": [
-        { "name": "subscriberStatus", "value": "S" },
-        { "name": "statusEffectiveDate", "value": "2026-01-19Z" },
-        { "name": "statusReasonCode", "value": "DLC" },
-        { "name": "subscriberActivationDate", "value": "2026-01-16Z" }
-      ],
-      "serviceSpecification": {
-        "href": "/catalogManagement/serviceSpecification/apexMobilityPlan",
-        "id": "apexMobilityPlan"
-      },
-      "status": "Suspended",
-      "subscriberNumber": "6468842752"
-    }
-  ],
+  "fulfilled": [{
+    "status": "Active",
+    "subscriberNumber": "1234567890",
+    "serviceCharacteristic": [
+      { "name": "subscriberStatus", "value": "Active" },
+      { "name": "BLIMEI", "value": "356415123456789" },
+      { "name": "sim", "value": "89014103219876543210" }
+    ]
+  }],
   "rejected": []
 }
 ```
 
-**NOTE:** The `ban` (BAN) required for this call can be obtained from the **Query Sub ID** response — use the value returned under `attBan`.
+---
+
+## 4.12 Reset Subscriber's Voicemail Password
+
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/reset-voicemail`
+
+**Request (array):**
+```json
+[{ "ban": "123456789012", "subscriberNumber": "1234567890", "newPin": "5678" }]
+```
+
+- `newPin` — 4–12 digit number
+- `ban` — must be exactly 12 characters
+
+**Response (200):** Same structure as OTA refresh (fulfilled/rejected).
+
+---
+
+## 4.13 Bulk Activation
+
+Activate multiple SIMs in one call.
+
+**Endpoint:** `POST https://api.helixsolo.app/api/mobility-sub-ops/subscription`
+
+**Request (array):** Each element is a standard activation object (same fields as 4.2).
+
+**Response (201):**
+```json
+{ "successful": [{ "data": { ...activation_data... } }], "failed": [] }
+```
+
+---
+
+## 4.14 Bulk BAN Pin Change
+
+Change PIN codes for multiple BANs.
+
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-account/ban/pin/bulk`
+
+**Request:**
+```json
+{ "banIds": ["123456789012", "987654321098"] }
+```
+
+**Response (200):** Array of `{ "ban": "...", "passcode": "..." }` objects.
+
+---
+
+## 4.15 Add Note to Subscriber
+
+**Endpoint:** `POST https://api.helixsolo.app/api/notes/add`
+
+**Request:**
+```json
+{ "message": "Note text here", "internalOnly": true, "mobilitySubscriptionId": 1001 }
+```
+
+- `internalOnly: true` — only visible to your org
+- `internalOnly: false` — visible to clients/resellers below you
+
+**Response (200):**
+```json
+{ "status": "Note successfully added.", "details": { "id": 101, "message": "...", "internalOnly": true, "date": "..." } }
+```
+
+---
+
+## 4.16 Update Subscriber's CTN (MDN Change)
+
+Change the phone number (CTN) assigned to a subscription.
+
+**Endpoint:** `PATCH https://api.helixsolo.app/api/mobility-subscriber/ctn`
+
+**Request:**
+```json
+{ "mobilitySubscriptionId": 1001 }
+```
+
+**Response (200):**
+```json
+{
+  "subscriberNumber": "9876543210",
+  "newSubscriberNumber": "1234567890",
+  "changeStatus": "SUCCESS",
+  "mobilitySubscriptionId": 1001
+}
+```
+
+**CRITICAL:** If changing to a number with a different area code ZIP, update the ZIP/address first using 4.4, then call this endpoint.
+
+---
+
+## 5. Get Mobility Subscribers (Paginated List)
+
+Get a paginated list of all subscribers.
+
+**Endpoint:** `POST https://api.helixsolo.app/api/mobility-subscriber/subscribers/search`
+
+**Request:**
+```json
+{
+  "pageNumber": 0,
+  "pageSize": 25,
+  "statuses": ["ACTIVATED", "CANCELED", "SUSPENDED"],
+  "canceledAfter": "2025-08-01"
+}
+```
+
+**Field notes:**
+- All fields optional
+- `pageNumber` — 0-indexed, default 0
+- `pageSize` — default 25
+- `statuses` — filter by status; default includes all three
+- `canceledAfter` — ISO date; defaults to 45 days ago; max 6 months ago
+
+**Response (200):**
+```json
+{
+  "items": [
+    {
+      "mobilitySubscriptionId": "4056",
+      "subscriber": {
+        "number": "7327998621",
+        "status": "ACTIVATED",
+        "billingImei": "350765878789449",
+        "iccid": "89014102334595823365",
+        "eid": null,
+        "planId": "1113",
+        "org": { "id": "489", "type": "reseller" }
+      }
+    }
+  ],
+  "pagination": { "page": 1, "size": 25, "lastPage": true }
+}
+```
+
+When `lastPage: true`, there are no more pages.
+
+---
+
+## Common Workflows
+
+### Basic SIM Activation
+1. Get token
+2. (Optional) Check IMEI eligibility via 4.1
+3. POST to 4.2 with IMEI, ICCID, subscriber info, address
+4. Save returned `mobilitySubscriptionId`
+
+### Fix Failed Activation
+1. Get current subscription state via 4.7
+2. If status is `ACTIVATION_FAILED`, use 4.3 to retry with corrected IMEI/ICCID/plan
+
+### MDN Rotation (phone number change)
+1. Get subscriber details via 4.7 to confirm current state
+2. If new number has different area code: update address/ZIP via 4.4 first
+3. Call 4.16 with `mobilitySubscriptionId` to assign new number
+
+### OTA Refresh
+1. Get subscriber details via 4.7 to get `attBan`, `phoneNumber`, `iccid`
+2. Call 4.11 with `ban`, `subscriberNumber`, `iccid`
+
+### Swap SIM Card (new physical SIM, same number)
+1. Call 4.9 with `subscriberNumber` and new `iccid`
+
+### Change Plan
+1. Verify new plan is compatible with IMEI via 4.1
+2. Call 4.10 with `mobilitySubscriptionId`, current IMEI, and new `plan.id`
 
 ---
 
 ## Common Issues & Solutions
 
-**Token Expired:** Tokens expire in 86400 seconds (24 hours). Re-authenticate when needed.
-
-**Invalid IMEI/ICCID:** Verify format and that SIM hasn't been activated already.
-
-**ZIP Code and MDN:** Always update ZIP first if changing area codes to different regions.
-
-**Address Fields Required:** All address fields (address1, city, state, zipCode) must be provided.
-
-**Status Change Failed:** Ensure `subscriberNumber` is the current MDN and use the correct `reasonCodeId` for the action.
+| Error | Cause | Fix |
+|-------|-------|-----|
+| Token expired | 24-hour limit hit | Re-authenticate |
+| IMEI not found (406) | Invalid IMEI or wrong skuId | Check format; verify with 4.1 |
+| ICCID already active | Duplicate activation attempt | Query 4.7 first |
+| Activation retry failed | Status is not ACTIVATION_FAILED | Can only retry failed activations |
+| Status change rejected | Wrong reasonCodeId | Use 4.5 to get valid codes |
+| OTA rejected | Wrong BAN | Get `attBan` from 4.7 response |
+| MDN change failed | ZIP mismatch for new area code | Update address via 4.4 first |
+| Voicemail reset 400 | BAN must be exactly 12 chars | Pad or verify BAN length |
 
 ---
 
