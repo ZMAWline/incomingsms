@@ -115,6 +115,18 @@ export default {
       return handleImeiPoolFixSlot(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/check-imei' && request.method === 'GET') {
+      return handleCheckImei(request, env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/check-imeis' && request.method === 'POST') {
+      return handleCheckImeis(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/imei-pool/fix-incompatible' && request.method === 'POST') {
+      return handleFixIncompatibleImei(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/errors') {
       return handleErrors(env, corsHeaders, url);
     }
@@ -1484,8 +1496,33 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
         });
       }
 
+      // Eligibility gate: check each IMEI before adding
+      const rejectedIneligible = [];
+      const eligible = [];
+      if (env.MDN_ROTATOR && env.ADMIN_RUN_SECRET) {
+        for (const candidate of toAdd) {
+          try {
+            const checkUrl = 'https://mdn-rotator/check-imei?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET) + '&imei=' + encodeURIComponent(candidate.imei);
+            const checkRes = await env.MDN_ROTATOR.fetch(checkUrl, { method: 'GET' });
+            const checkData = checkRes.ok ? await checkRes.json().catch(() => ({})) : {};
+            if (checkData.eligible === true) {
+              eligible.push(candidate);
+            } else {
+              rejectedIneligible.push({ imei: candidate.imei, reason: checkData.result ? JSON.stringify(checkData.result).slice(0, 200) : 'Not eligible for carrier/plan' });
+            }
+          } catch (eligErr) {
+            // On check error, allow the IMEI (do not block on Helix errors)
+            console.error('[IMEI Add] Eligibility check error for ' + candidate.imei + ': ' + eligErr);
+            eligible.push(candidate);
+          }
+        }
+      } else {
+        // No MDN_ROTATOR binding — skip eligibility check
+        eligible.push(...toAdd);
+      }
+
       let added = 0;
-      if (toAdd.length > 0) {
+      if (eligible.length > 0) {
         const addInsertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
           method: 'POST',
           headers: {
@@ -1494,7 +1531,7 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
             'Content-Type': 'application/json',
             Prefer: 'resolution=ignore-duplicates,return=representation',
           },
-          body: JSON.stringify(toAdd),
+          body: JSON.stringify(eligible),
         });
         const addInsertText = await addInsertRes.text();
         let addInserted = [];
@@ -1508,6 +1545,7 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
         duplicates: dupCount,
         invalid: invalid.length,
         rejected_retired: rejectedRetired,
+        rejected_ineligible: rejectedIneligible || [],
       }), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
@@ -2259,7 +2297,7 @@ async function handleSimAction(request, env, corsHeaders) {
     const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sim_id, action, gateway_id: body.gateway_id ?? null, port: body.port ?? null })
+      body: JSON.stringify({ sim_id, action, gateway_id: body.gateway_id ?? null, port: body.port ?? null, new_imei: body.new_imei ?? null, auto_imei: body.auto_imei ?? false })
     });
 
     const responseText = await workerResponse.text();
@@ -2293,6 +2331,63 @@ async function handleSimAction(request, env, corsHeaders) {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
+  }
+}
+
+async function handleCheckImei(request, env, corsHeaders, url) {
+  try {
+    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    const imei = url.searchParams.get('imei') || '';
+    if (!/^\d{15}$/.test(imei)) {
+      return new Response(JSON.stringify({ error: 'imei must be 15 digits' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    const checkUrl = 'https://mdn-rotator/check-imei?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET) + '&imei=' + encodeURIComponent(imei);
+    const workerRes = await env.MDN_ROTATOR.fetch(checkUrl, { method: 'GET' });
+    const responseText = await workerRes.text();
+    return new Response(responseText, { status: workerRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+async function handleCheckImeis(request, env, corsHeaders) {
+  try {
+    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    const body = await request.json().catch(() => ({}));
+    const checkUrl = 'https://mdn-rotator/check-imeis?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET);
+    const workerRes = await env.MDN_ROTATOR.fetch(checkUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const responseText = await workerRes.text();
+    return new Response(responseText, { status: workerRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+async function handleFixIncompatibleImei(request, env, corsHeaders) {
+  try {
+    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    const body = await request.json().catch(() => ({}));
+    const fixUrl = 'https://mdn-rotator/fix-incompatible-imei?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET);
+    const workerRes = await env.MDN_ROTATOR.fetch(fixUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const responseText = await workerRes.text();
+    return new Response(responseText, { status: workerRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
 
@@ -2926,6 +3021,7 @@ function getHTML() {
                         </select>
                         <button onclick="syncAllGatewayImeis()" id="sync-gateways-btn" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Sync from Gateways</button>
                         <button onclick="showAddImeiModal()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add IMEIs</button>
+                        <button onclick="showCheckImeisModal()" class="px-4 py-2 text-sm bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition">Check IMEIs</button>
                     </div>
                 </div>
 
@@ -3472,6 +3568,90 @@ function getHTML() {
         </div>
     </div>
 
+    <!-- IMEI Eligibility Modal -->
+    <div id="imei-eligibility-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl max-h-[85vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 id="imei-eligibility-title" class="text-lg font-semibold text-white">IMEI Eligibility Check</h3>
+                <button onclick="document.getElementById('imei-eligibility-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 overflow-y-auto flex-1">
+                <div id="imei-eligibility-content" class="text-sm text-gray-300">Checking...</div>
+                <div id="imei-eligibility-fix-btn" class="mt-4 hidden">
+                    <button onclick="fixIncompatibleImei()" class="px-4 py-2 text-sm bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg transition">Fix (Replace with Pool IMEI)</button>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
+                <button onclick="document.getElementById('imei-eligibility-modal').classList.add('hidden')" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Check IMEIs Bulk Modal -->
+    <div id="check-imeis-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl max-h-[85vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 class="text-lg font-semibold text-white">Bulk IMEI Eligibility Check</h3>
+                <button onclick="document.getElementById('check-imeis-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 overflow-y-auto flex-1">
+                <p class="text-sm text-gray-400 mb-3">Paste IMEIs to check eligibility (one per line, max 100):</p>
+                <textarea id="check-imeis-input" rows="6" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono mb-3" placeholder="351756051523999"></textarea>
+                <button onclick="runBulkImeiCheck()" id="check-imeis-run-btn" class="px-4 py-2 text-sm bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition">Run Check</button>
+                <div id="check-imeis-result" class="mt-4 hidden">
+                    <h4 class="text-sm font-medium text-gray-400 mb-2">Results:</h4>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600">
+                                <th class="py-2 pr-4">IMEI</th>
+                                <th class="py-2 pr-4">Eligible</th>
+                                <th class="py-2 pr-4">Device</th>
+                                <th class="py-2">Plans</th>
+                            </tr></thead>
+                            <tbody id="check-imeis-tbody" class="text-gray-300"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
+                <button onclick="document.getElementById('check-imeis-modal').classList.add('hidden')" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Change IMEI Modal -->
+    <div id="change-imei-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-lg max-h-[85vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 id="change-imei-title" class="text-lg font-semibold text-white">Change IMEI</h3>
+                <button onclick="document.getElementById('change-imei-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 overflow-y-auto flex-1">
+                <p id="change-imei-sim-info" class="text-sm text-gray-400 mb-4"></p>
+                <div class="flex gap-3 mb-4">
+                    <button id="change-imei-auto-btn" onclick="confirmChangeImei(true)" class="flex-1 px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Auto (Pick from Pool)</button>
+                </div>
+                <div class="border-t border-dark-600 pt-4">
+                    <label class="block text-xs text-gray-500 mb-1">Manual IMEI (15 digits)</label>
+                    <div class="flex gap-2">
+                        <input id="change-imei-input" type="text" maxlength="15" class="flex-1 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="351756051523999">
+                        <button onclick="checkManualImeiEligibility()" class="px-3 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition whitespace-nowrap">Check</button>
+                    </div>
+                    <div id="change-imei-eligibility-result" class="mt-2 text-xs"></div>
+                </div>
+                <div class="mt-4">
+                    <button id="change-imei-confirm-btn" onclick="confirmChangeImei(false)" class="w-full px-4 py-2 text-sm bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Confirm Change IMEI</button>
+                </div>
+                <div id="change-imei-result-section" class="mt-4 hidden">
+                    <pre id="change-imei-output" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto text-gray-300 border border-dark-600"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
+                <button onclick="document.getElementById('change-imei-modal').classList.add('hidden')" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const API_BASE = '/api';
 
@@ -3745,6 +3925,7 @@ function renderSims() {
                         \${sim.status === 'active' ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}
                         \${sim.status === 'error' ? \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\` : ''}
                         \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : \`<button onclick="assignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition" title="Assign to reseller">Assign</button>\`}
+                        \${(sim.mobility_subscription_id && sim.gateway_id && sim.port) ? \`<button onclick="showChangeImeiModal(\${sim.id}, '\${sim.iccid}', \${sim.gateway_id}, '\${sim.port}')" class="px-2 py-1 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition ml-1" title="Change IMEI">IMEI</button>\` : ''}
                     </td>
                 </tr>
                 \`;
@@ -4933,6 +5114,8 @@ async function sendSimOnline(simId, phoneNumber) {
                     <td class="px-4 py-3 whitespace-nowrap">
                         \${canRetire ? \`<button onclick="retireImei(\${entry.id})" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-700 text-white rounded transition mr-1" title="Carrier rejected — retire this IMEI">Retire</button>\` : ''}
                         \${entry.status === 'retired' ? \`<button onclick="unretireImei(\${entry.id})" class="px-2 py-1 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition" title="Restore to available stock">Restore</button>\` : ''}
+                    
+                        <button onclick="checkImeiEligibility('\${entry.imei}', '\${entry.gateway_id || ''}', '\${entry.port || ''}', '\${entry.status}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition ml-1" title="Check carrier eligibility">Check</button>
                     </td>
                 </tr>\`;
             }).join('');
@@ -5126,6 +5309,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (result.ok) {
                     showToast('Error resolved', 'success');
                     loadErrors();
+                    if (action === "ota_refresh") loadSims(true);
                 } else {
                     showToast('Failed: ' + (result.error || JSON.stringify(result)), 'error');
                 }
@@ -5795,6 +5979,190 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
             }
             loadImeiPool();
+        }
+
+        // ===== IMEI Eligibility =====
+        window._imeiEligibilityContext = null;
+
+        async function checkImeiEligibility(imei, gatewayId, port, status) {
+            window._imeiEligibilityContext = { imei, gatewayId, port, status };
+            const modal = document.getElementById('imei-eligibility-modal');
+            document.getElementById('imei-eligibility-title').textContent = 'IMEI Check: ' + imei;
+            document.getElementById('imei-eligibility-content').innerHTML = '<p class="text-gray-400">Checking eligibility...</p>';
+            document.getElementById('imei-eligibility-fix-btn').classList.add('hidden');
+            modal.classList.remove('hidden');
+
+            try {
+                const res = await fetch(API_BASE + '/check-imei?imei=' + encodeURIComponent(imei));
+                const data = await res.json();
+                const el = document.getElementById('imei-eligibility-content');
+                if (data.eligible) {
+                    const deviceInfo = (data.result && (data.result.brand || data.result.deviceType)) || '';
+                    const plans = Array.isArray(data.result && data.result.plans) ? data.result.plans.map(function(p) { return p.name || p.planName || JSON.stringify(p); }).join(', ') : '';
+                    el.innerHTML = '<div class="space-y-3">' +
+                        '<p><span class="inline-block px-2 py-0.5 text-xs rounded-full bg-accent/20 text-accent font-medium">&#10003; Eligible</span></p>' +
+                        (deviceInfo ? '<p class="text-gray-400">Device: <span class="text-gray-200">' + deviceInfo + '</span></p>' : '') +
+                        (plans ? '<p class="text-gray-400">Plans: <span class="text-gray-200">' + plans + '</span></p>' : '') +
+                        '<details class="mt-2"><summary class="text-xs text-gray-500 cursor-pointer">Raw response</summary><pre class="mt-1 text-xs font-mono text-gray-400 overflow-x-auto bg-dark-900 p-2 rounded">' + JSON.stringify(data.result, null, 2) + '</pre></details>' +
+                        '</div>';
+                } else {
+                    el.innerHTML = '<div class="space-y-3">' +
+                        '<p><span class="inline-block px-2 py-0.5 text-xs rounded-full bg-red-500/20 text-red-400 font-medium">&#10007; Not Eligible</span></p>' +
+                        (data.error ? '<p class="text-red-400 text-xs">' + data.error + '</p>' : '') +
+                        '<details class="mt-2"><summary class="text-xs text-gray-500 cursor-pointer">Raw response</summary><pre class="mt-1 text-xs font-mono text-gray-400 overflow-x-auto bg-dark-900 p-2 rounded">' + JSON.stringify(data.result || {}, null, 2) + '</pre></details>' +
+                        '</div>';
+                    if (status === 'in_use' && gatewayId && port) {
+                        document.getElementById('imei-eligibility-fix-btn').classList.remove('hidden');
+                    }
+                }
+            } catch (err) {
+                document.getElementById('imei-eligibility-content').innerHTML = '<p class="text-red-400">Error: ' + err + '</p>';
+            }
+        }
+
+        async function fixIncompatibleImei() {
+            const ctx = window._imeiEligibilityContext;
+            if (!ctx || !ctx.imei || !ctx.gatewayId || !ctx.port) { alert('Missing context for fix'); return; }
+            const fixBtn = document.querySelector('#imei-eligibility-fix-btn button');
+            if (fixBtn) { fixBtn.disabled = true; fixBtn.textContent = 'Fixing...'; }
+            try {
+                const res = await fetch(API_BASE + '/imei-pool/fix-incompatible', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ imei: ctx.imei, gateway_id: ctx.gatewayId, port: ctx.port }),
+                });
+                const data = await res.json();
+                const el = document.getElementById('imei-eligibility-content');
+                if (data.ok) {
+                    el.innerHTML += '<div class="mt-4 p-3 bg-accent/10 border border-accent/30 rounded-lg"><p class="text-accent font-medium text-sm">&#10003; Fixed!</p><p class="text-gray-300 text-xs mt-1">New IMEI: <span class="font-mono">' + data.new_imei + '</span></p></div>';
+                    document.getElementById('imei-eligibility-fix-btn').classList.add('hidden');
+                    loadImeiPool();
+                } else {
+                    el.innerHTML += '<div class="mt-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg"><p class="text-red-400 text-sm">Fix failed: ' + (data.error || 'Unknown error') + '</p></div>';
+                }
+            } catch (err) {
+                alert('Fix error: ' + err);
+            } finally {
+                if (fixBtn) { fixBtn.disabled = false; fixBtn.textContent = 'Fix (Replace with Pool IMEI)'; }
+            }
+        }
+
+        // ===== Bulk IMEI Check Tool =====
+        function showCheckImeisModal() {
+            document.getElementById('check-imeis-input').value = '';
+            document.getElementById('check-imeis-result').classList.add('hidden');
+            document.getElementById('check-imeis-modal').classList.remove('hidden');
+        }
+
+        async function runBulkImeiCheck() {
+            const raw = document.getElementById('check-imeis-input').value.trim();
+            const imeis = raw.split(/\\n/).map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+            if (imeis.length === 0) { alert('Enter at least one IMEI'); return; }
+            const btn = document.getElementById('check-imeis-run-btn');
+            btn.disabled = true; btn.textContent = 'Checking...';
+            try {
+                const res = await fetch(API_BASE + '/check-imeis', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ imeis: imeis }),
+                });
+                const data = await res.json();
+                const tbody = document.getElementById('check-imeis-tbody');
+                if (Array.isArray(data.results)) {
+                    tbody.innerHTML = data.results.map(function(r) {
+                        const eligClass = r.eligible ? 'text-accent' : 'text-red-400';
+                        const eligText = r.eligible ? '&#10003; Yes' : '&#10007; No';
+                        const device = (r.result && (r.result.brand || r.result.deviceType)) || '-';
+                        const plans = Array.isArray(r.result && r.result.plans) ? r.result.plans.length + ' plan(s)' : '-';
+                        return '<tr class="border-b border-dark-600"><td class="py-2 pr-4 font-mono text-xs">' + r.imei + '</td><td class="py-2 pr-4 ' + eligClass + ' text-sm">' + eligText + '</td><td class="py-2 pr-4 text-gray-400 text-xs">' + device + '</td><td class="py-2 text-gray-400 text-xs">' + plans + '</td></tr>';
+                    }).join('');
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="4" class="py-3 text-red-400">' + (data.error || 'Unknown error') + '</td></tr>';
+                }
+                document.getElementById('check-imeis-result').classList.remove('hidden');
+            } catch (err) {
+                alert('Check error: ' + err);
+            } finally {
+                btn.disabled = false; btn.textContent = 'Run Check';
+            }
+        }
+
+        // ===== Change IMEI =====
+        window._changeImeiContext = null;
+
+        function showChangeImeiModal(simId, iccid, gatewayId, port) {
+            window._changeImeiContext = { simId: simId, iccid: iccid, gatewayId: gatewayId, port: port };
+            document.getElementById('change-imei-title').textContent = 'Change IMEI — SIM ' + simId;
+            document.getElementById('change-imei-sim-info').textContent = 'ICCID: ' + iccid + ' | Gateway: ' + gatewayId + ' | Port: ' + port;
+            document.getElementById('change-imei-input').value = '';
+            document.getElementById('change-imei-eligibility-result').textContent = '';
+            document.getElementById('change-imei-result-section').classList.add('hidden');
+            document.getElementById('change-imei-modal').classList.remove('hidden');
+        }
+
+        async function checkManualImeiEligibility() {
+            const imei = document.getElementById('change-imei-input').value.trim();
+            if (!/^\d{15}$/.test(imei)) {
+                document.getElementById('change-imei-eligibility-result').innerHTML = '<span class="text-yellow-400">Enter a valid 15-digit IMEI first</span>';
+                return;
+            }
+            document.getElementById('change-imei-eligibility-result').innerHTML = '<span class="text-gray-400">Checking...</span>';
+            try {
+                const res = await fetch(API_BASE + '/check-imei?imei=' + encodeURIComponent(imei));
+                const data = await res.json();
+                if (data.eligible) {
+                    document.getElementById('change-imei-eligibility-result').innerHTML = '<span class="text-accent">&#10003; Eligible</span>';
+                } else {
+                    document.getElementById('change-imei-eligibility-result').innerHTML = '<span class="text-red-400">&#10007; Not eligible for this carrier/plan</span>';
+                }
+            } catch (err) {
+                document.getElementById('change-imei-eligibility-result').innerHTML = '<span class="text-red-400">Check failed: ' + err + '</span>';
+            }
+        }
+
+        async function confirmChangeImei(autoImei) {
+            const ctx = window._changeImeiContext;
+            if (!ctx) { alert('No SIM context'); return; }
+            let newImei = null;
+            if (!autoImei) {
+                newImei = document.getElementById('change-imei-input').value.trim();
+                if (!/^\d{15}$/.test(newImei)) { alert('Enter a valid 15-digit IMEI or use Auto'); return; }
+                if (!confirm('Change IMEI for SIM ' + ctx.simId + ' to ' + newImei + '?')) return;
+            } else {
+                if (!confirm('Auto-pick an available IMEI from pool and apply to SIM ' + ctx.simId + '?')) return;
+            }
+            const autoBtn = document.getElementById('change-imei-auto-btn');
+            const confirmBtn = document.getElementById('change-imei-confirm-btn');
+            if (autoImei && autoBtn) { autoBtn.disabled = true; autoBtn.textContent = 'Working...'; }
+            if (!autoImei && confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = 'Working...'; }
+            try {
+                const body = { sim_id: ctx.simId, action: 'change_imei', auto_imei: autoImei };
+                if (!autoImei) body.new_imei = newImei;
+                const res = await fetch(API_BASE + '/sim-action', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await res.json();
+                document.getElementById('change-imei-output').textContent = JSON.stringify(data, null, 2);
+                document.getElementById('change-imei-result-section').classList.remove('hidden');
+                if (data.ok) {
+                    document.getElementById('sim-action-title').textContent = 'Change IMEI — ' + ctx.iccid;
+                    document.getElementById('sim-action-output').textContent = JSON.stringify(data, null, 2);
+                    document.getElementById('sim-action-logs-section').classList.remove('hidden');
+                    window._simActionIccid = ctx.iccid;
+                    document.getElementById('change-imei-modal').classList.add('hidden');
+                    document.getElementById('sim-action-modal').classList.remove('hidden');
+                    loadSimActionLogs();
+                    loadImeiPool();
+                    loadSims(true);
+                }
+            } catch (err) {
+                alert('Change IMEI error: ' + err);
+            } finally {
+                if (autoBtn) { autoBtn.disabled = false; autoBtn.textContent = 'Auto (Pick from Pool)'; }
+                if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = 'Confirm Change IMEI'; }
+            }
         }
 
         function showDiscrepancyModal(discrepancies) {
