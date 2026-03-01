@@ -7,7 +7,7 @@
 
 export default {
   // HTTP endpoint for manual triggering
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/run") {
@@ -133,11 +133,21 @@ export default {
           });
         }
 
-        // For fix, delegate directly
+        // For fix, run in background via ctx.waitUntil to avoid the ~40s
+        // service-binding timeout. Returns immediately; results appear in Helix API Logs.
         if (action === "fix") {
           const token = await getCachedToken(env);
-          const result = await fixSim(env, token, sim_id, { autoRotate: false });
-          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
+          ctx.waitUntil(
+            fixSim(env, token, sim_id, { autoRotate: false }).catch(err => {
+              console.error("[SimAction/fix] background error:", err);
+            })
+          );
+          return new Response(JSON.stringify({
+            ok: true,
+            running: true,
+            message: "Fix started — this takes ~40 seconds. Check the Helix API Logs below to confirm each step completed.",
+            action, sim_id, iccid
+          }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
           });
@@ -944,7 +954,7 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
       }, runId, iccid, "fix_resume"),
       { attempts: 3, label: `resume ${iccid}` }
     );
-    await sleep(3000);
+    await sleep(8000); // wait for Helix to restore subscriber to Active before Change IMEI
 
     // 10) Notify Helix of the IMEI change
     console.log(`[FixSim] SIM ${iccid}: notifying Helix of IMEI change (${newImei})`);
