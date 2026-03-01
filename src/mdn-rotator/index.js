@@ -169,6 +169,14 @@ export default {
           let allocatedEntry = null;
           let targetImei = newImeiRaw;
 
+          // Retire old in_use IMEI for this slot first — must happen before allocating
+          // a new one, otherwise the DB unique-per-sim_id constraint blocks the allocation.
+          await supabasePatch(
+            env,
+            `imei_pool?gateway_id=eq.${encodeURIComponent(String(sim.gateway_id))}&port=eq.${encodeURIComponent(sim.port)}&status=eq.in_use`,
+            { status: 'retired', sim_id: null, assigned_at: null, updated_at: new Date().toISOString() }
+          );
+
           try {
             if (autoImei) {
               // Allocate from pool — temporarily attach to sim_id
@@ -195,13 +203,6 @@ export default {
               if (allocatedEntry) await releaseImeiPoolEntry(env, allocatedEntry.id, sim_id).catch(() => {});
               throw gwErr;
             }
-
-            // Retire old in_use IMEI for this slot in the pool
-            await supabasePatch(
-              env,
-              `imei_pool?gateway_id=eq.${encodeURIComponent(String(sim.gateway_id))}&port=eq.${encodeURIComponent(sim.port)}&status=eq.in_use`,
-              { status: 'retired', sim_id: null, assigned_at: null, updated_at: new Date().toISOString() }
-            );
 
             // Upsert new IMEI in pool as in_use for this slot
             if (!allocatedEntry) {
