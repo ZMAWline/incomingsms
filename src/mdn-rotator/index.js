@@ -112,7 +112,7 @@ export default {
         // Load SIM from DB
         const sims = await supabaseSelect(
           env,
-          `sims?select=id,iccid,mobility_subscription_id,gateway_id,port&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`
+          `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,status&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`
         );
         if (!Array.isArray(sims) || sims.length === 0) {
           return new Response(JSON.stringify({ ok: false, error: `SIM not found: ${sim_id}` }), {
@@ -312,8 +312,17 @@ export default {
               headers: { "Content-Type": "application/json" }
             });
           }
+          // Sync status if Helix differs from DB
+          const helixStatusMap = { Active: "active", ACTIVE: "active", ACTIVATED: "active", Suspended: "suspended", SUSPENDED: "suspended", Canceled: "canceled", CANCELED: "canceled" };
+          const helixStatus = helixStatusMap[d?.status] || null;
+          let statusUpdated = null;
+          if (helixStatus && helixStatus !== sim.status) {
+            console.log(`[OTA] SIM ${iccid}: status mismatch DB=${sim.status} Helix=${helixStatus} — updating`);
+            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: helixStatus });
+            statusUpdated = { from: sim.status, to: helixStatus };
+          }
           const result = await hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid);
-          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
+          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, status_updated: statusUpdated, detail: result }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
           });
