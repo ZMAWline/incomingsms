@@ -915,55 +915,42 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
       console.log(`[FixSim] SIM ${iccid}: skipping OTA Refresh (no attBan)`);
     }
 
-    // 8) Cancel (only if subscriber is active on carrier side)
-    let cancelAttempted = false;
-    if (subscriberStatus === 'ACTIVATED' || subscriberStatus === 'ACTIVE') {
-      console.log(`[FixSim] SIM ${iccid}: canceling subscriber ${mdn} (status=${subscriberStatus})`);
-      try {
-        await retryWithBackoff(
-          () => hxChangeSubscriberStatus(env, token, {
-            mobilitySubscriptionId: subId,
-            subscriberNumber: mdn,
-            reasonCode: "CAN",
-            reasonCodeId: 1,
-            subscriberState: "Cancel",
-          }, runId, iccid, "fix_cancel"),
-          { attempts: 3, label: `cancel ${iccid}` }
-        );
-        cancelAttempted = true;
-        await sleep(3000);
-      } catch (cancelErr) {
-        const msg = String(cancelErr);
-        if (msg.includes('Must Be Active') || msg.includes('not active') || msg.includes('must be active')) {
-          console.warn(`[FixSim] SIM ${iccid}: Cancel soft-fail (already cancelled?): ${msg}`);
-          cancelAttempted = true; // still need Resume
-        } else {
-          throw cancelErr;
-        }
-      }
-    } else {
-      console.log(`[FixSim] SIM ${iccid}: skipping cancel (carrier status=${subscriberStatus})`);
-    }
+    // 8) Cancel
+    console.log(`[FixSim] SIM ${iccid}: canceling subscriber ${mdn}`);
+    await retryWithBackoff(
+      () => hxChangeSubscriberStatus(env, token, {
+        mobilitySubscriptionId: subId,
+        subscriberNumber: mdn,
+        reasonCode: "CAN",
+        reasonCodeId: 1,
+        subscriberState: "Cancel",
+      }, runId, iccid, "fix_cancel"),
+      { attempts: 3, label: `cancel ${iccid}` }
+    );
+    await sleep(3000);
 
-    // 9) Resume On Cancel — only if cancel was attempted (succeeded or soft-failed)
-    if (cancelAttempted) {
-      console.log(`[FixSim] SIM ${iccid}: resuming subscriber ${mdn}`);
-      await retryWithBackoff(
-        () => hxChangeSubscriberStatus(env, token, {
-          mobilitySubscriptionId: subId,
-          subscriberNumber: mdn,
-          reasonCode: "BBL",
-          reasonCodeId: 20,
-          subscriberState: "Resume On Cancel",
-        }, runId, iccid, "fix_resume"),
-        { attempts: 3, label: `resume ${iccid}` }
-      );
-      await sleep(3000);
-    } else {
-      console.log(`[FixSim] SIM ${iccid}: skipping resume (cancel was not attempted)`);
-    }
+    // 9) Resume On Cancel
+    console.log(`[FixSim] SIM ${iccid}: resuming subscriber ${mdn}`);
+    await retryWithBackoff(
+      () => hxChangeSubscriberStatus(env, token, {
+        mobilitySubscriptionId: subId,
+        subscriberNumber: mdn,
+        reasonCode: "BBL",
+        reasonCodeId: 20,
+        subscriberState: "Resume On Cancel",
+      }, runId, iccid, "fix_resume"),
+      { attempts: 3, label: `resume ${iccid}` }
+    );
+    await sleep(3000);
 
-    // 10) Update SIM record with new IMEI and pool entry
+    // 10) Notify Helix of the IMEI change
+    console.log(`[FixSim] SIM ${iccid}: notifying Helix of IMEI change (${newImei})`);
+    await retryWithBackoff(
+      () => hxChangeImei(env, token, subId, newImei, runId, iccid),
+      { attempts: 3, label: `changeImei ${iccid}` }
+    );
+
+    // 11) Update SIM record with new IMEI and pool entry
     await supabasePatch(
       env,
       `sims?id=eq.${encodeURIComponent(String(simId))}`,
