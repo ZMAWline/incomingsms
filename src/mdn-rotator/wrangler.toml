@@ -24,6 +24,17 @@ max_batch_size = 10
 max_retries = 3
 max_concurrency = 1
 
+# Queue for fix-sim jobs (runs outside 30s service-binding limit)
+[[queues.producers]]
+queue = "fix-sim-queue"
+binding = "FIX_SIM_QUEUE"
+
+[[queues.consumers]]
+queue = "fix-sim-queue"
+max_batch_size = 1
+max_retries = 2
+max_concurrency = 1
+
 # Service binding for skyline-gateway worker
 [[services]]
 binding = "SKYLINE_GATEWAY"

@@ -4044,7 +4044,7 @@ function renderSims() {
                 return \`
                 <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
                     <td class="px-4 py-3"><input type="checkbox" class="sim-cb accent-green-500" value="\${sim.id}" onchange="updateSimActionBar()"></td>
-                    <td class="px-4 py-3 text-gray-300">\${sim.id}</td>
+                    <td class="px-4 py-3"><button onclick="showSimLogs(\${sim.id})" class="text-indigo-400 hover:text-indigo-200 hover:underline font-mono transition" title="View Helix logs">\${sim.id}</button></td>
                     <td class="px-4 py-3 text-gray-400" title="\${sim.gateway_name || ''}">\${gatewayDisplay}</td>
                     <td class="px-4 py-3 text-gray-400 font-mono text-xs">\${sim.iccid}</td>
                     <td class="px-4 py-3 text-gray-200">\${sim.phone_number || '-'}\${verifiedBadge}</td>
@@ -4115,7 +4115,7 @@ async function sendSimOnline(simId, phoneNumber) {
                                 <td class="px-5 py-3 text-gray-400 text-xs">\${timeStr}</td>
                                 <td class="px-5 py-3 text-gray-200">\${msg.to_number || '-'}</td>
                                 <td class="px-5 py-3 text-gray-200">\${msg.from_number}</td>
-                                <td class="px-5 py-3 text-gray-300 truncate max-w-xs">\${msg.body}</td>
+                                <td class="px-5 py-3 text-gray-300 truncate max-w-xs cursor-pointer hover:text-white" onclick="showMsgBody(this.dataset.body)" data-body="\${(msg.body||'')}">\${msg.body}</td>
                             </tr>
                         \`;
                     }).join('');
@@ -4126,6 +4126,13 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
+        function showMsgBody(text) {
+            document.getElementById('msg-body-text').textContent = text;
+            document.getElementById('msg-body-modal').classList.remove('hidden');
+        }
+        function hideMsgBodyModal() {
+            document.getElementById('msg-body-modal').classList.add('hidden');
+        }
         function renderMessages() {
             const state = tableState.messages;
             const search = (document.getElementById('messages-search')?.value || '').trim();
@@ -4149,7 +4156,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         <td class="px-5 py-3 text-gray-400 text-xs">\${timeStr}</td>
                         <td class="px-5 py-3 text-gray-200">\${msg.to_number || '-'}</td>
                         <td class="px-5 py-3 text-gray-200">\${msg.from_number}</td>
-                        <td class="px-5 py-3 text-gray-300 max-w-md truncate">\${msg.body}</td>
+                        <td class="px-5 py-3 text-gray-300 max-w-md truncate cursor-pointer hover:text-white" onclick="showMsgBody(this.dataset.body)" data-body="\${(msg.body||'')}">\${msg.body}</td>
                         <td class="px-5 py-3 text-gray-500 font-mono text-xs">\${msg.iccid || '-'}</td>
                     </tr>
                 \`;
@@ -5611,6 +5618,19 @@ async function sendSimOnline(simId, phoneNumber) {
 
         function hideSimActionModal() {
             document.getElementById('sim-action-modal').classList.add('hidden');
+            document.getElementById('sim-action-output').classList.remove('hidden');
+        }
+
+        function showSimLogs(simId) {
+            const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
+            currentSimActionId = simId;
+            currentSimActionIccid = sim?.iccid || null;
+            document.getElementById('sim-action-title').textContent = 'Helix Logs — SIM #' + simId;
+            document.getElementById('sim-action-output').textContent = '';
+            document.getElementById('sim-action-output').classList.add('hidden');
+            document.getElementById('sim-action-logs-section').classList.remove('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+            loadSimActionLogs();
         }
 
         async function simAction(simId, action, skipConfirm = false) {
@@ -5632,6 +5652,12 @@ async function sendSimOnline(simId, phoneNumber) {
                     body: JSON.stringify({ sim_id: simId, action })
                 });
                 const result = await response.json();
+
+                if (result.slot_not_found) {
+                    hideSimActionModal();
+                    showSlotPickerModal(simId, [], 'fix');
+                    return;
+                }
 
                 document.getElementById('sim-action-output').textContent = JSON.stringify(result, null, 2);
 
@@ -5696,8 +5722,10 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         let _slotPickerSimId = null;
+        let _slotPickerMode = 'retry';
 
-        function showSlotPickerModal(simId, candidates) {
+        function showSlotPickerModal(simId, candidates, mode) {
+            _slotPickerMode = mode || 'retry';
             _slotPickerSimId = simId;
             const container = document.getElementById('slot-picker-candidates');
             container.innerHTML = '';
@@ -5744,7 +5772,39 @@ async function sendSimOnline(simId, phoneNumber) {
             if (!gwId || !port) { showToast('Enter gateway ID and port', 'error'); return; }
             const simId = _slotPickerSimId;
             hideSlotPickerModal();
-            retryActivation(simId, gwId, port);
+            if (_slotPickerMode === 'fix') {
+                fixSimWithSlot(simId, gwId, port);
+            } else {
+                retryActivation(simId, gwId, port);
+            }
+        }
+
+        async function fixSimWithSlot(simId, gatewayId, port) {
+            const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
+            currentSimActionId = simId;
+            currentSimActionIccid = sim?.iccid || null;
+            document.getElementById('sim-action-title').textContent = \`fix - SIM #\${simId}\`;
+            document.getElementById('sim-action-output').textContent = 'Queuing fix...';
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+            try {
+                const response = await fetch(\`\${API_BASE}/sim-action\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_id: simId, action: 'fix', gateway_id: gatewayId, port })
+                });
+                const result = await response.json();
+                document.getElementById('sim-action-output').textContent = JSON.stringify(result, null, 2);
+                if (result.ok) {
+                    showToast('Fix queued successfully', 'success');
+                } else {
+                    showToast('Fix failed: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                document.getElementById('sim-action-output').textContent = String(error);
+                showToast('Error queuing fix', 'error');
+            }
+            loadSimActionLogs();
         }
 
         async function loadSimActionLogs() {
@@ -6749,7 +6809,21 @@ async function sendSimOnline(simId, phoneNumber) {
             </div>
         </div>
         <!-- Bulk Send SMS Modal -->
-        <div id="bulk-send-sms-modal" class="fixed inset-0 bg-black/70 z-50 hidden flex items-center justify-center p-4">
+        
+    <!-- Message Body Modal -->
+    <div id="msg-body-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onclick="hideMsgBodyModal()">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-lg" onclick="event.stopPropagation()">
+            <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                <h3 class="text-base font-semibold text-white">Message</h3>
+                <button onclick="hideMsgBodyModal()" class="text-gray-500 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5">
+                <p id="msg-body-text" class="text-sm text-gray-200 whitespace-pre-wrap break-words"></p>
+            </div>
+        </div>
+    </div>
+
+    <div id="bulk-send-sms-modal" class="fixed inset-0 bg-black/70 z-50 hidden flex items-center justify-center p-4">
             <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-lg">
                 <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
                     <h3 class="text-white font-semibold">Send Test SMS</h3>
