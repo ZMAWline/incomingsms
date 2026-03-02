@@ -90,6 +90,10 @@ export default {
       return handleSendTestSms(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/bulk-send-test-sms' && request.method === 'POST') {
+      return handleBulkSendTestSms(request, env, corsHeaders);
+    }
+
     if (url.pathname.startsWith('/api/skyline/')) {
       return handleSkylineProxy(request, env, url, corsHeaders);
     }
@@ -1175,6 +1179,138 @@ async function handleSendTestSms(request, env, corsHeaders) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleBulkSendTestSms(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { target_sim_ids, message } = body;
+
+    if (!Array.isArray(target_sim_ids) || target_sim_ids.length === 0) {
+      return new Response(JSON.stringify({ error: 'target_sim_ids must be a non-empty array' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      return new Response(JSON.stringify({ error: 'message is required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    if (message.length > 160) {
+      return new Response(JSON.stringify({ error: 'message must be 160 chars or fewer' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const sbUrl = env.SUPABASE_URL;
+    const sbKey = env.SUPABASE_SERVICE_ROLE_KEY;
+    const idList = target_sim_ids.join(',');
+
+    // Fetch target SIMs with their current MDNs
+    const targetsRes = await fetch(
+      sbUrl + '/rest/v1/sims?select=id,gateway_id,port,sim_numbers(e164)&id=in.(' + idList + ')&sim_numbers.valid_to=is.null',
+      { headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey } }
+    );
+    if (!targetsRes.ok) {
+      const errText = await targetsRes.text();
+      return new Response(JSON.stringify({ error: 'DB error fetching targets: ' + errText }), {
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const targets = await targetsRes.json();
+
+    // Fetch sender pool: active SIMs with gateway+port+MDN, not in target list
+    const sendersRes = await fetch(
+      sbUrl + '/rest/v1/sims?select=id,gateway_id,port,sim_numbers(e164)&status=eq.active&gateway_id=not.is.null&port=not.is.null&sim_numbers.valid_to=is.null&limit=200',
+      { headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey } }
+    );
+    if (!sendersRes.ok) {
+      const errText = await sendersRes.text();
+      return new Response(JSON.stringify({ error: 'DB error fetching senders: ' + errText }), {
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const allSenders = await sendersRes.json();
+
+    // Filter out targets from sender pool and senders with no MDN
+    const targetSet = new Set(target_sim_ids.map(Number));
+    const senders = allSenders.filter(s =>
+      !targetSet.has(s.id) &&
+      Array.isArray(s.sim_numbers) && s.sim_numbers.length > 0 && s.sim_numbers[0].e164
+    );
+
+    if (senders.length === 0) {
+      return new Response(JSON.stringify({ ok: false, error: 'No eligible sender SIMs available' }), {
+        status: 422, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Fisher-Yates shuffle
+    for (let i = senders.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [senders[i], senders[j]] = [senders[j], senders[i]];
+    }
+
+    const results = [];
+    const skipped = [];
+    let sentCount = 0;
+    let errorCount = 0;
+    let senderIdx = 0;
+
+    for (const target of targets) {
+      const targetMdn = Array.isArray(target.sim_numbers) && target.sim_numbers.length > 0
+        ? target.sim_numbers[0].e164
+        : null;
+
+      if (!targetMdn) {
+        skipped.push({ target_sim_id: target.id, reason: 'no_mdn' });
+        continue;
+      }
+
+      const sender = senders[senderIdx % senders.length];
+      senderIdx++;
+
+      try {
+        const skylineRes = await env.SKYLINE_GATEWAY.fetch(
+          'https://skyline-gateway/send-sms?secret=' + encodeURIComponent(env.SKYLINE_SECRET),
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              gateway_id: sender.gateway_id,
+              port: sender.port,
+              to: targetMdn,
+              message
+            })
+          }
+        );
+        const resText = await skylineRes.text();
+        let resJson;
+        try { resJson = JSON.parse(resText); } catch { resJson = { raw: resText }; }
+
+        if (skylineRes.ok) {
+          sentCount++;
+          results.push({ target_sim_id: target.id, target_mdn: targetMdn, sender_sim_id: sender.id, sender_port: sender.port, ok: true });
+        } else {
+          errorCount++;
+          const errMsg = resJson.error || resJson.raw || ('HTTP ' + skylineRes.status);
+          results.push({ target_sim_id: target.id, target_mdn: targetMdn, sender_sim_id: sender.id, sender_port: sender.port, ok: false, error: errMsg });
+        }
+      } catch (e) {
+        errorCount++;
+        results.push({ target_sim_id: target.id, target_mdn: targetMdn, sender_sim_id: sender.id, sender_port: sender.port, ok: false, error: String(e) });
+      }
+    }
+
+    return new Response(JSON.stringify({ ok: true, sent: sentCount, skipped: skipped.length, errors: errorCount, results, skipped_list: skipped }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
 }
@@ -2779,6 +2915,7 @@ function getHTML() {
                     <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
                     <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
                     <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Send Online</button>
+                    <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
                 </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
@@ -5694,6 +5831,79 @@ async function sendSimOnline(simId, phoneNumber) {
             loadSims(true);
         }
 
+        function showBulkSendSmsModal() {
+            const selectedIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (selectedIds.length === 0) {
+                alert('Select at least one SIM first');
+                return;
+            }
+            document.getElementById('bulk-sms-count').textContent = selectedIds.length;
+            document.getElementById('bulk-sms-results').classList.add('hidden');
+            document.getElementById('bulk-sms-result-body').innerHTML = '';
+            const sendBtn = document.getElementById('bulk-sms-send-btn');
+            sendBtn.disabled = false;
+            sendBtn.textContent = 'Send';
+            document.getElementById('bulk-send-sms-modal').classList.remove('hidden');
+        }
+
+        async function runBulkSendSms() {
+            const selectedIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (selectedIds.length === 0) { alert('No SIMs selected'); return; }
+            const message = document.getElementById('bulk-sms-message').value.trim();
+            if (!message) { alert('Please enter a message'); return; }
+            const sendBtn = document.getElementById('bulk-sms-send-btn');
+            sendBtn.disabled = true;
+            sendBtn.textContent = 'Sending...';
+            try {
+                const resp = await fetch(API_BASE + '/bulk-send-test-sms', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ target_sim_ids: selectedIds, message })
+                });
+                const data = await resp.json();
+                const tbody = document.getElementById('bulk-sms-result-body');
+                tbody.innerHTML = '';
+                if (data.results) {
+                    for (const r of data.results) {
+                        const tr = document.createElement('tr');
+                        tr.className = 'border-b border-dark-700';
+                        tr.innerHTML = '<td class="py-1 pr-3">' + r.target_sim_id + '</td>' +
+                            '<td class="py-1 pr-3 font-mono">' + (r.target_mdn || '-') + '</td>' +
+                            '<td class="py-1 pr-3">' + (r.sender_port || '-') + '</td>' +
+                            '<td class="py-1">' + (r.ok ? '<span class="text-green-400">\u2713</span>' : '<span class="text-red-400">\u2717 ' + (r.error || '') + '</span>') + '</td>';
+                        tbody.appendChild(tr);
+                    }
+                }
+                if (data.skipped_list) {
+                    for (const sk of data.skipped_list) {
+                        const tr = document.createElement('tr');
+                        tr.className = 'border-b border-dark-700 opacity-50';
+                        tr.innerHTML = '<td class="py-1 pr-3">' + sk.target_sim_id + '</td>' +
+                            '<td class="py-1 pr-3">-</td>' +
+                            '<td class="py-1 pr-3">-</td>' +
+                            '<td class="py-1 text-gray-400">skipped: ' + sk.reason + '</td>';
+                        tbody.appendChild(tr);
+                    }
+                }
+                if (data.error && !data.results) {
+                    document.getElementById('bulk-sms-summary').textContent = 'Error: ' + data.error;
+                } else {
+                    const parts = [];
+                    if (data.sent != null) parts.push(data.sent + ' sent');
+                    if (data.skipped) parts.push(data.skipped + ' skipped (no MDN)');
+                    if (data.errors) parts.push(data.errors + ' error(s)');
+                    document.getElementById('bulk-sms-summary').textContent = parts.join(', ');
+                }
+                document.getElementById('bulk-sms-results').classList.remove('hidden');
+            } catch (e) {
+                document.getElementById('bulk-sms-summary').textContent = 'Request failed: ' + e;
+                document.getElementById('bulk-sms-results').classList.remove('hidden');
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Send';
+            }
+        }
+
         async function bulkSendOnline() {
             const selectedIds = new Set([...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value)));
             const eligible = tableState.sims.data.filter(s =>
@@ -6535,6 +6745,43 @@ async function sendSimOnline(simId, phoneNumber) {
                 <div class="flex justify-end gap-3 mt-5">
                     <button onclick="closeMappingModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
                     <button onclick="saveMapping()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Save</button>
+                </div>
+            </div>
+        </div>
+        <!-- Bulk Send SMS Modal -->
+        <div id="bulk-send-sms-modal" class="fixed inset-0 bg-black/70 z-50 hidden flex items-center justify-center p-4">
+            <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-lg">
+                <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                    <h3 class="text-white font-semibold">Send Test SMS</h3>
+                    <button onclick="document.getElementById('bulk-send-sms-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+                </div>
+                <div class="p-5 space-y-4">
+                    <p class="text-sm text-gray-400">Sending to <span id="bulk-sms-count" class="text-white font-semibold">0</span> selected SIM(s).</p>
+                    <div>
+                        <label class="text-sm text-gray-400 block mb-1">Message <span class="text-xs">(max 160 chars)</span></label>
+                        <textarea id="bulk-sms-message" maxlength="160" rows="3" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 resize-none">Test SMS â can you receive this message?</textarea>
+                    </div>
+                    <p class="text-xs text-gray-500">Sender picked randomly from active SIMs, rotated to avoid spam.</p>
+                    <div id="bulk-sms-results" class="hidden">
+                        <p id="bulk-sms-summary" class="text-sm text-gray-300 mb-2"></p>
+                        <div class="overflow-auto max-h-64">
+                            <table class="w-full text-xs">
+                                <thead>
+                                    <tr class="text-gray-400 border-b border-dark-600">
+                                        <th class="text-left py-1 pr-3">SIM</th>
+                                        <th class="text-left py-1 pr-3">MDN</th>
+                                        <th class="text-left py-1 pr-3">Sender Port</th>
+                                        <th class="text-left py-1">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="bulk-sms-result-body" class="text-gray-300"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
+                    <button onclick="document.getElementById('bulk-send-sms-modal').classList.add('hidden')" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
+                    <button id="bulk-sms-send-btn" onclick="runBulkSendSms()" class="px-4 py-2 text-sm bg-teal-600 hover:bg-teal-700 text-white rounded-lg transition">Send</button>
                 </div>
             </div>
         </div>
