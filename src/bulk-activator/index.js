@@ -307,7 +307,6 @@ function buildActivationObject(env, iccid, imei) {
     BAN: String(env.HX_BAN),
     FAN: String(env.HX_FAN),
     activationType: "new_activation",
-    partnerTransactionId: iccid,
     subscriber: { firstName: "SUB", lastName: "NINE" },
     address: {
       address1: env.HX_ADDRESS1,
@@ -315,7 +314,8 @@ function buildActivationObject(env, iccid, imei) {
       state: env.HX_STATE,
       zipCode: env.HX_ZIP,
     },
-    service: { iccid, imei },
+    iccid,
+    imei,
   };
 }
 

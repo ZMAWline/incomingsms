@@ -47,9 +47,18 @@ async function findSimIdByCurrentNumber(env: Env, e164: string): Promise<string 
     return Array.isArray(data) && data[0]?.sim_id ? data[0].sim_id : null;
 }
 
+function dotPortToLetter(dotPort: string): string {
+    const parts = String(dotPort).split('.');
+    if (parts.length !== 2) return dotPort;
+    const portNum = parseInt(parts[0], 10);
+    const slotNum = parseInt(parts[1], 10);
+    if (isNaN(portNum) || isNaN(slotNum) || slotNum < 1) return dotPort;
+    return portNum + String.fromCharCode(64 + slotNum);
+}
+
 async function updateSimPort(env: Env, simId: string, port: string) {
     if (!simId || !port) return;
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(simId)}`, { port });
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(simId)}`, { port: dotPortToLetter(port) });
 }
 
 async function findSimIdByIccid(env: Env, iccid: string): Promise<string | null> {
@@ -71,7 +80,7 @@ async function findCurrentNumberBySimId(env: Env, simId: string): Promise<string
 async function updateSimPortAndGateway(env: Env, simId: string, port: string, mac: string) {
     if (!simId) return;
     const updates: any = {};
-    if (port) updates.port = port;
+    if (port) updates.port = dotPortToLetter(port);
 
     if (mac) {
         const gatewayId = await findGatewayIdByMac(env, mac);

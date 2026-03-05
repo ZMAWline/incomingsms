@@ -299,13 +299,22 @@ async function findSimIdByIccid(env, iccid) {
   return Array.isArray(data) && data[0]?.id ? data[0].id : null;
 }
 
+function dotPortToLetter(dotPort) {
+  const parts = String(dotPort).split('.');
+  if (parts.length !== 2) return dotPort;
+  const portNum = parseInt(parts[0], 10);
+  const slotNum = parseInt(parts[1], 10);
+  if (isNaN(portNum) || isNaN(slotNum) || slotNum < 1) return dotPort;
+  return portNum + String.fromCharCode(64 + slotNum);
+}
+
 // Update SIM's port and gateway in the sims table
 // Links SIM to gateway based on MAC address
 async function updateSimPortAndGateway(env, simId, port, mac) {
   if (!simId) return;
 
   const updates = {};
-  if (port) updates.port = port;
+  if (port) updates.port = dotPortToLetter(port);
 
   // Look up gateway by MAC address
   if (mac) {

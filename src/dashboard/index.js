@@ -2780,6 +2780,9 @@ function getHTML() {
                 <a href="/billing" onclick="event.preventDefault();switchTab('billing')" data-tab="billing" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Billing">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                 </a>
+                <a href="/guide" onclick="event.preventDefault();switchTab('guide')" data-tab="guide" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Guide">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
+                </a>
             </nav>
             <div class="mt-auto">
                 <button onclick="loadData()" class="w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-accent hover:bg-dark-600 transition" title="Refresh">
@@ -3390,6 +3393,641 @@ function getHTML() {
                 </div>
             </div>
 
+            <!-- Guide Tab -->
+            <div id="tab-guide" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">System Guide &mdash; Standard Operating Procedures</h2>
+                </div>
+
+                <!-- Table of Contents -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Contents</h3>
+                    <div class="grid grid-cols-2 md:grid-cols-3 gap-2 text-sm">
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-architecture').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">System Architecture</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-sims').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">SIMs Page</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-fix-sim').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Fix SIM</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-mdn-rotation').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">MDN Rotation</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-ota-refresh').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">OTA Refresh</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-cancel-resume').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Cancel / Resume</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-change-imei').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Change IMEI</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-retry-activation').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Retry Activation</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-bulk-activate').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Bulk Activation</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-send-sms').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Send SMS</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-sms-ingest').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Incoming SMS</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-workers').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Workers Page</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-gateway').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Gateway Page</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-imei-pool').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">IMEI Pool</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-errors').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Errors Page</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-billing').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Billing Page</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-reseller-webhooks').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Reseller Webhooks</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-statuses').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">SIM Status Reference</a>
+                    </div>
+                </div>
+
+                <!-- Architecture Overview -->
+                <div id="guide-architecture" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">System Architecture</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>The system runs on <span class="text-white font-medium">Cloudflare Workers</span> with <span class="text-white font-medium">Supabase</span> (PostgreSQL) as the database. It integrates with two external APIs:</p>
+                        <ul class="list-disc list-inside space-y-1 ml-2">
+                            <li><span class="text-white font-medium">Helix API</span> &mdash; AT&amp;T carrier operations (activate, cancel, resume, OTA refresh, IMEI change, MDN rotation, subscriber details)</li>
+                            <li><span class="text-white font-medium">SkyLine API</span> &mdash; Physical SMS gateway hardware control (send SMS, read/write IMEI, switch SIM, port status, reboot)</li>
+                        </ul>
+                        <p class="mt-2">Workers communicate via <span class="text-white font-medium">Cloudflare Service Bindings</span> (worker-to-worker calls). The dashboard is the main hub that proxies actions to specialized workers.</p>
+                        <div class="bg-dark-900 rounded-lg p-4 mt-3 font-mono text-xs text-gray-400 border border-dark-600">
+                            <pre>Dashboard (hub)
+  |-- bulk-activator      Bulk SIM activation via Helix
+  |-- details-finalizer   Finalize provisioning SIMs (get phone numbers)
+  |-- mdn-rotator         MDN rotation, Fix SIM, IMEI operations, sim-action dispatcher
+  |     |-- FIX_SIM_QUEUE   (Cloudflare Queue, batch=1, concurrency=1)
+  |     |-- MDN_QUEUE        (Cloudflare Queue, batch=10, concurrency=1)
+  |     |-- skyline-gateway  (service binding for hardware control)
+  |-- sim-canceller       Cancel SIMs via Helix
+  |-- sim-status-changer  Suspend / Restore SIMs via Helix
+  |-- phone-number-sync   Sync phone numbers from Helix to DB
+  |-- reseller-sync       Webhook notifications to resellers (number.online)
+  |-- skyline-gateway     Gateway hardware proxy (via Supabase Edge Function bridge)
+  |-- quickbooks          QBO OAuth + invoice API
+  |-- ota-status-sync     Cron: sync SIM statuses from Helix (every 12h)
+  |-- sms-ingest          Receives incoming SMS from physical gateways</pre>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SIMs Page -->
+                <div id="guide-sims" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">SIMs Page</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>The SIMs page displays all SIM cards in the system with filtering, sorting, and bulk actions.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Filters</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">Status</span> &mdash; Filter by SIM status (active, provisioning, error, canceled, suspended)</li>
+                                <li><span class="text-white">Reseller</span> &mdash; Filter by assigned reseller</li>
+                                <li><span class="text-white">Search</span> &mdash; Free text search across ICCID, phone number, subscription ID</li>
+                                <li><span class="text-white">Hide Cancelled</span> &mdash; Toggle to exclude canceled SIMs from the table</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Caching</h4>
+                            <p>SIM data is cached client-side for <span class="text-white">30 minutes</span>. The Refresh button or changing filters force-reloads from the server. The cache timestamp is shown in the header.</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Per-Row Actions (dropdown menu on each SIM)</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">OTA Refresh</span> &mdash; Send over-the-air network profile refresh</li>
+                                <li><span class="text-white">Rotate MDN</span> &mdash; Change the phone number on the SIM</li>
+                                <li><span class="text-white">Fix SIM</span> &mdash; Full repair cycle (IMEI swap + Cancel/Resume + OTA)</li>
+                                <li><span class="text-white">Cancel</span> &mdash; Cancel the SIM subscription</li>
+                                <li><span class="text-white">Resume</span> &mdash; Resume a canceled SIM</li>
+                                <li><span class="text-white">Send SMS</span> &mdash; Send a test SMS from this SIM's gateway port</li>
+                                <li><span class="text-white">Change IMEI</span> &mdash; Swap to a new IMEI (from pool or manual)</li>
+                                <li><span class="text-white">Retry Activation</span> &mdash; Retry a failed activation on Helix</li>
+                                <li><span class="text-white">Assign Reseller</span> &mdash; Link SIM to a reseller</li>
+                                <li><span class="text-white">Unassign Reseller</span> &mdash; Remove reseller assignment</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Bulk Actions (select via checkboxes)</h4>
+                            <p>Select multiple SIMs using checkboxes, then use the bulk action buttons. Supported: OTA Refresh, Rotate MDN, Fix SIM, Cancel, Resume, Unassign Reseller, Send SMS.</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">SIM ID Click</h4>
+                            <p>Clicking a SIM's ID opens a modal showing all Helix API log entries for that SIM (looked up by ICCID). Useful for debugging API call history.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fix SIM -->
+                <div id="guide-fix-sim" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Fix SIM &mdash; Full Repair Cycle</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Fix SIM is the most complex operation. It performs a full repair cycle on a problematic SIM by swapping the IMEI, cycling the carrier status, and refreshing the network profile.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">How it works</h4>
+                            <ol class="list-decimal list-inside space-y-2 ml-2">
+                                <li>Dashboard sends <code class="bg-dark-900 px-1 rounded text-accent">POST /api/sim-action</code> with <code class="bg-dark-900 px-1 rounded text-accent">action: "fix"</code> to the mdn-rotator worker</li>
+                                <li>mdn-rotator resolves the SIM's gateway and port (auto-scans all gateways if not set)</li>
+                                <li>Job is queued to <span class="text-white font-medium">FIX_SIM_QUEUE</span> (Cloudflare Queue) to avoid the 30-second service-binding timeout</li>
+                                <li>Queue consumer processes the job:
+                                    <ol class="list-[lower-alpha] list-inside ml-4 mt-1 space-y-1">
+                                        <li>Gets subscriber details from Helix (MDN + BAN)</li>
+                                        <li><span class="text-amber-400 font-medium">Step 1: Cancel</span> &mdash; Cancels the subscriber on Helix (reason: CAN, code 1). Retries up to 3 times with <code class="bg-dark-900 px-1 rounded text-accent">retryUntilFulfilled</code></li>
+                                        <li>Waits 10 seconds</li>
+                                        <li><span class="text-green-400 font-medium">Step 2: Resume On Cancel</span> &mdash; Resumes the subscriber (reason: BBL, code 20). Retries up to 3 times</li>
+                                        <li>Waits 5 seconds</li>
+                                        <li><span class="text-blue-400 font-medium">Step 3: IMEI Swap</span> &mdash; Retires the old IMEI pool entry, allocates a new IMEI from the pool, checks eligibility with Helix, changes IMEI on Helix, sets IMEI on the physical gateway via SkyLine</li>
+                                        <li><span class="text-purple-400 font-medium">Step 4: OTA Refresh</span> &mdash; Sends over-the-air refresh via Helix to re-provision the network profile</li>
+                                    </ol>
+                                </li>
+                            </ol>
+                        </div>
+                        <div class="mt-3">
+                            <h4 class="text-white font-medium mb-1">If it fails</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li>Each Helix call uses <code class="bg-dark-900 px-1 rounded text-accent">retryUntilFulfilled</code> which polls the response until the status shows "fulfilled" (up to 3 attempts with delays)</li>
+                                <li>If any step fails, the error is logged to <span class="text-white">system_errors</span> table and the SIM status is set to <span class="text-red-400">error</span></li>
+                                <li>The queue has max 2 retries &mdash; if it fails twice, the message is dead-lettered</li>
+                                <li>Check the Errors page for details. Click the SIM ID to view the full Helix API request/response log</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- MDN Rotation -->
+                <div id="guide-mdn-rotation" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">MDN Rotation (Phone Number Change)</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>MDN rotation changes the phone number (MDN/CTN) on a SIM. This runs automatically every night and can also be triggered manually.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Nightly Cron (automatic)</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Cron fires at <span class="text-white font-medium">05:00 UTC</span> on the mdn-rotator worker</li>
+                                <li>All SIMs with status <code class="bg-dark-900 px-1 rounded text-accent">active</code> are queued to <span class="text-white font-medium">MDN_QUEUE</span></li>
+                                <li>Queue processes batches of 10, concurrency 1 (sequential batches)</li>
+                                <li>For each SIM:
+                                    <ol class="list-[lower-alpha] list-inside ml-4 mt-1 space-y-1">
+                                        <li>Calls Helix MDN change endpoint (<code class="bg-dark-900 px-1 rounded text-accent">PATCH /api/mobility-subscriber/ctn</code>) with the subscription ID</li>
+                                        <li>Polls subscriber details until a new phone number appears</li>
+                                        <li>Closes old phone number in DB (sets <code class="bg-dark-900 px-1 rounded text-accent">valid_to</code> timestamp)</li>
+                                        <li>Inserts new phone number in <code class="bg-dark-900 px-1 rounded text-accent">sim_numbers</code></li>
+                                        <li>Updates <code class="bg-dark-900 px-1 rounded text-accent">last_mdn_rotated_at</code> on the SIM record</li>
+                                        <li>Sends <code class="bg-dark-900 px-1 rounded text-accent">number.online</code> webhook to the assigned reseller</li>
+                                    </ol>
+                                </li>
+                            </ol>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Manual rotation</h4>
+                            <p>Click <span class="text-white">Rotate MDN</span> on a SIM row, or use the bulk action. The same flow runs but only for the selected SIM(s).</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">If it fails</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li>Queue has max 3 retries per message</li>
+                                <li>After all retries fail, error is logged to <span class="text-white">system_errors</span></li>
+                                <li>At <span class="text-white font-medium">07:00 UTC</span>, a separate cron sends an error summary to Slack listing all failed SIMs</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- OTA Refresh -->
+                <div id="guide-ota-refresh" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">OTA Refresh</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>OTA (Over-The-Air) refresh sends a network profile update to the SIM via the carrier. This is useful when a SIM has connectivity issues after an IMEI change or MDN rotation.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Steps</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Dashboard sends <code class="bg-dark-900 px-1 rounded text-accent">action: "ota_refresh"</code> to mdn-rotator</li>
+                                <li>Worker gets subscriber details from Helix to obtain the <span class="text-white">attBan</span>, <span class="text-white">subscriberNumber</span> (MDN), and <span class="text-white">iccid</span></li>
+                                <li>Calls Helix OTA endpoint (<code class="bg-dark-900 px-1 rounded text-accent">PATCH /api/mobility-subscriber/ota</code>) with those three fields</li>
+                                <li>Helix pushes the updated profile to the SIM over the air</li>
+                            </ol>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">When to use</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li>SIM not connecting to network after IMEI change</li>
+                                <li>SIM not receiving SMS after MDN rotation</li>
+                                <li>General connectivity troubleshooting</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Cancel / Resume -->
+                <div id="guide-cancel-resume" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Cancel / Resume</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <div>
+                            <h4 class="text-white font-medium mb-1">Cancel</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Dashboard sends ICCIDs to the <span class="text-white font-medium">sim-canceller</span> worker</li>
+                                <li>For each SIM: gets subscriber details (MDN) from Helix</li>
+                                <li>Calls Helix status change: <code class="bg-dark-900 px-1 rounded text-accent">subscriberState: "Cancel"</code>, reason code <code class="bg-dark-900 px-1 rounded text-accent">CAN</code> (ID 1)</li>
+                                <li>Updates SIM status to <span class="text-red-400">canceled</span> in DB</li>
+                                <li>Expires current phone number (sets <code class="bg-dark-900 px-1 rounded text-accent">valid_to</code>)</li>
+                                <li>Sends <code class="bg-dark-900 px-1 rounded text-accent">sim.cancelled</code> webhook to the assigned reseller</li>
+                            </ol>
+                        </div>
+                        <div class="mt-3">
+                            <h4 class="text-white font-medium mb-1">Resume</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Dashboard sends the action to the <span class="text-white font-medium">mdn-rotator</span> worker (<code class="bg-dark-900 px-1 rounded text-accent">action: "resume"</code>)</li>
+                                <li>Gets subscriber details from Helix</li>
+                                <li>Calls Helix status change: <code class="bg-dark-900 px-1 rounded text-accent">subscriberState: "Resume On Cancel"</code>, reason code <code class="bg-dark-900 px-1 rounded text-accent">BBL</code> (ID 20)</li>
+                                <li>Updates SIM status to <span class="text-green-400">active</span> in DB</li>
+                                <li>Re-fetches subscriber details and inserts new phone number into <code class="bg-dark-900 px-1 rounded text-accent">sim_numbers</code></li>
+                            </ol>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Change IMEI -->
+                <div id="guide-change-imei" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Change IMEI</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Swaps the IMEI associated with a SIM, both on the carrier side (Helix) and the physical gateway (SkyLine).</p>
+                        <ol class="list-decimal list-inside space-y-1 ml-2">
+                            <li>Dashboard sends <code class="bg-dark-900 px-1 rounded text-accent">action: "change_imei"</code> to mdn-rotator with optional <code class="bg-dark-900 px-1 rounded text-accent">imei</code> (manual) or <code class="bg-dark-900 px-1 rounded text-accent">auto_imei: true</code> (from pool)</li>
+                            <li>Retires all existing <code class="bg-dark-900 px-1 rounded text-accent">in_use</code> IMEI pool entries for this SIM</li>
+                            <li>If auto: allocates next available IMEI from pool. If manual: uses the provided IMEI</li>
+                            <li>Checks IMEI eligibility with Helix (<code class="bg-dark-900 px-1 rounded text-accent">GET /api/mobility-eligibility/imei</code>)</li>
+                            <li>Sets IMEI on the physical gateway port via SkyLine API</li>
+                            <li>Updates/upserts the IMEI pool entry (gateway, port, sim_id, status=in_use)</li>
+                            <li>Changes IMEI on Helix (<code class="bg-dark-900 px-1 rounded text-accent">PATCH /api/mobility-sub-ops/imei-plan</code>) using <code class="bg-dark-900 px-1 rounded text-accent">retryUntilFulfilled</code></li>
+                            <li>Updates the SIM record with the new IMEI and pool entry ID</li>
+                        </ol>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">If eligibility fails</h4>
+                            <p>The IMEI is marked as <span class="text-red-400">retired</span> in the pool and a new one is tried (when using auto). The error is logged.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Retry Activation -->
+                <div id="guide-retry-activation" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Retry Activation</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Retries a failed activation on Helix. The SIM must have a <code class="bg-dark-900 px-1 rounded text-accent">mobility_subscription_id</code> and the subscription must be in <span class="text-red-400">ACTIVATION_FAILED</span> status on the Helix side.</p>
+                        <ol class="list-decimal list-inside space-y-1 ml-2">
+                            <li>Dashboard sends <code class="bg-dark-900 px-1 rounded text-accent">action: "retry_activation"</code> to mdn-rotator</li>
+                            <li>Worker calls Helix retry endpoint (<code class="bg-dark-900 px-1 rounded text-accent">PATCH /api/mobility-activation/activate/{subscriptionId}</code>) with corrected ICCID/IMEI</li>
+                            <li>On success, SIM status is set back to <span class="text-yellow-400">provisioning</span></li>
+                            <li>The details-finalizer will later pick it up and finalize (get phone number, set to active)</li>
+                        </ol>
+                    </div>
+                </div>
+
+                <!-- Bulk Activation -->
+                <div id="guide-bulk-activate" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Bulk Activation</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Activates multiple new SIM cards at once via the Helix bulk activation API.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Two input modes</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">CSV mode</span> (<code class="bg-dark-900 px-1 rounded text-accent">GET /run</code>) &mdash; Fetches a Google Sheet CSV with columns: iccid, imei, reseller_id, status. Only rows with status "pending" are processed.</li>
+                                <li><span class="text-white">JSON mode</span> (<code class="bg-dark-900 px-1 rounded text-accent">POST /activate</code>) &mdash; Receives <code class="bg-dark-900 px-1 rounded text-accent">{sims: [{iccid, imei, reseller_id}]}</code> directly.</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Steps</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Validates all input rows (must have valid iccid, imei, reseller_id)</li>
+                                <li>Skips ICCIDs that already have a <code class="bg-dark-900 px-1 rounded text-accent">mobility_subscription_id</code> (already activated)</li>
+                                <li>Gets Helix bearer token</li>
+                                <li>Sends all SIMs in one call to Helix bulk endpoint (<code class="bg-dark-900 px-1 rounded text-accent">POST /api/mobility-sub-ops/subscription</code>)</li>
+                                <li>For each successful activation: upserts SIM record with status <span class="text-yellow-400">provisioning</span>, assigns to reseller</li>
+                                <li>For failed items: logs error to <span class="text-white">system_errors</span> and sets SIM status to <span class="text-red-400">error</span></li>
+                            </ol>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">After activation</h4>
+                            <p>New SIMs start in <span class="text-yellow-400">provisioning</span> status. The <span class="text-white font-medium">details-finalizer</span> worker runs on a cron schedule to poll Helix for the assigned phone number and move the SIM to <span class="text-green-400">active</span>.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Send SMS -->
+                <div id="guide-send-sms" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Send SMS</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Sends an outbound SMS from the physical gateway port associated with a SIM.</p>
+                        <ol class="list-decimal list-inside space-y-1 ml-2">
+                            <li>Dashboard resolves the SIM's <code class="bg-dark-900 px-1 rounded text-accent">gateway_id</code> and <code class="bg-dark-900 px-1 rounded text-accent">port</code> from the database</li>
+                            <li>Sends the request to <span class="text-white font-medium">skyline-gateway</span> worker at <code class="bg-dark-900 px-1 rounded text-accent">/send-sms</code></li>
+                            <li>Skyline-gateway loads gateway credentials from DB, authenticates with the device</li>
+                            <li>Sends the SMS via the Supabase Edge Function bridge (skyline-bridge) to the physical device</li>
+                            <li>The gateway transmits the SMS from the specified port's SIM card</li>
+                        </ol>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Bulk Send SMS</h4>
+                            <p>Select multiple SIMs and use the bulk Send SMS action. Sends a test SMS from each selected SIM sequentially.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Incoming SMS -->
+                <div id="guide-sms-ingest" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Incoming SMS (sms-ingest)</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>The sms-ingest worker receives incoming SMS messages from the physical gateways and routes them to the correct reseller.</p>
+                        <ol class="list-decimal list-inside space-y-1 ml-2">
+                            <li>Gateway pushes incoming SMS to sms-ingest via HTTP (two formats supported: JSON <code class="bg-dark-900 px-1 rounded text-accent">recv-sms</code> or raw octet-stream)</li>
+                            <li>Worker authenticates the request via header/query/path secret</li>
+                            <li>Parses the SMS body (base64 decodes if JSON format)</li>
+                            <li>Resolves the SIM by ICCID or phone number lookup</li>
+                            <li>Auto-links the SIM to the gateway port (updates <code class="bg-dark-900 px-1 rounded text-accent">port</code> and <code class="bg-dark-900 px-1 rounded text-accent">gateway_id</code> on the SIM via MAC address matching)</li>
+                            <li>Generates a deduplication message ID (SHA-256 hash of from+to+body+timestamp)</li>
+                            <li>Inserts the message into <code class="bg-dark-900 px-1 rounded text-accent">inbound_sms</code> table</li>
+                            <li>Sends webhook to the SIM's assigned reseller (up to 5 retries with exponential backoff)</li>
+                            <li>Records delivery result in <code class="bg-dark-900 px-1 rounded text-accent">webhook_deliveries</code> table</li>
+                        </ol>
+                    </div>
+                </div>
+
+                <!-- Workers Page -->
+                <div id="guide-workers" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Workers Page</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Manual trigger buttons for running workers on demand (normally they run on cron schedules).</p>
+                        <ul class="list-disc list-inside space-y-1 ml-2">
+                            <li><span class="text-white">Activate SIMs (Bulk)</span> &mdash; Triggers the bulk-activator to process pending rows from the CSV</li>
+                            <li><span class="text-white">Finalize Details</span> &mdash; Runs details-finalizer to fetch phone numbers for provisioning SIMs</li>
+                            <li><span class="text-white">Rotate Numbers</span> &mdash; Manually triggers nightly MDN rotation for all active SIMs</li>
+                            <li><span class="text-white">Sync Phone Numbers</span> &mdash; Runs phone-number-sync to reconcile phone numbers from Helix to the DB</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Gateway Page -->
+                <div id="guide-gateway" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Gateway Page</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Displays real-time status of physical SMS gateway hardware. Shows each port's SIM status, signal strength, ICCID, IMEI, operator, and phone number.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Gateway types</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">Gateway 64-1</span> &mdash; 64 ports x 1 SIM slot = 64 SIM slots</li>
+                                <li><span class="text-white">Gateway 512-1</span> &mdash; 64 ports x 8 SIM slots = 512 SIM slots (8 SIMs rotate per port, only 1 active at a time per cellular module)</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Per-port actions</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">Lock</span> &mdash; Locks the port to prevent SIM switching</li>
+                                <li><span class="text-white">Unlock</span> &mdash; Unlocks the port for SIM switching</li>
+                                <li><span class="text-white">Reboot</span> &mdash; Reboots the port's cellular module</li>
+                                <li><span class="text-white">Reset</span> &mdash; Factory resets the port configuration</li>
+                                <li><span class="text-white">Switch SIM</span> &mdash; Triggers SIM rotation on multi-slot ports</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">How gateway communication works</h4>
+                            <p>The <span class="text-white">skyline-gateway</span> worker cannot reach the physical gateway directly (Cloudflare Workers can't access local IPs). It uses a <span class="text-white">Supabase Edge Function bridge</span> (<code class="bg-dark-900 px-1 rounded text-accent">skyline-bridge</code>) to proxy requests from the cloud to the gateway's local network.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- IMEI Pool -->
+                <div id="guide-imei-pool" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">IMEI Pool</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Manages the inventory of IMEI numbers used across all SIM slots. Each gateway port/slot needs a unique IMEI registered with the carrier.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">IMEI statuses</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-green-400 font-medium">available</span> &mdash; Stock IMEI ready for assignment. Gets picked when Fix SIM or Change IMEI runs.</li>
+                                <li><span class="text-blue-400 font-medium">in_use</span> &mdash; Currently assigned to a gateway port/slot and linked to a SIM.</li>
+                                <li><span class="text-red-400 font-medium">retired</span> &mdash; Carrier rejected or permanently removed. Will never be reused.</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Stats</h4>
+                            <p><span class="text-white">Slots</span> = total gateway slots (576). <span class="text-white">In Use</span> should match Slots. <span class="text-white">Available</span> = spare stock. <span class="text-white">Retired</span> = burned IMEIs.</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Actions</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">Retire</span> &mdash; Moves an available or in_use IMEI to retired status</li>
+                                <li><span class="text-white">Restore</span> &mdash; Moves a retired IMEI back to available</li>
+                                <li><span class="text-white">Check IMEI</span> &mdash; Verifies eligibility with the carrier (Helix) for a specific plan</li>
+                                <li><span class="text-white">Fix Incompatible IMEI</span> &mdash; Retires an incompatible IMEI and assigns a new one from the pool</li>
+                                <li><span class="text-white">Fix Slot</span> &mdash; Reconciles a slot's IMEI between the pool, gateway, and carrier</li>
+                                <li><span class="text-white">Import Gateway IMEIs</span> &mdash; Reads all IMEIs from a physical gateway and imports them into the pool</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Errors Page -->
+                <div id="guide-errors" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Errors Page</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Centralized error tracking from all workers and SIM operations.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Error sources</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">system_errors table</span> &mdash; Errors logged by workers (mdn-rotator, bulk-activator, etc.) with full request/response details</li>
+                                <li><span class="text-white">SIM last_activation_error</span> &mdash; Legacy activation errors stored directly on the SIM record</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Columns</h4>
+                            <p>Source (which worker), ICCID, Error message, Severity, Status (open/resolved), Time.</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Actions</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">View</span> &mdash; Opens detail modal with full error context, Helix API request/response payloads</li>
+                                <li><span class="text-white">Resolve</span> &mdash; Marks error as resolved (updates status in DB)</li>
+                                <li><span class="text-white">OTA Refresh</span> &mdash; Quick-action to send OTA refresh for the affected SIM</li>
+                                <li><span class="text-white">Bulk Resolve</span> &mdash; Select multiple errors and resolve them at once</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Slack notifications</h4>
+                            <p>At <span class="text-white font-medium">07:00 UTC</span> daily, the mdn-rotator sends an error summary to Slack listing all unresolved errors from the last rotation run.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Billing Page -->
+                <div id="guide-billing" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Billing Page</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Integrates with QuickBooks Online for reseller invoicing.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Setup</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Click <span class="text-white">Connect to QuickBooks</span> to start OAuth flow</li>
+                                <li>Authorize the app in QBO</li>
+                                <li>Tokens are stored in Cloudflare KV (auto-refreshed)</li>
+                            </ol>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Customer Mapping</h4>
+                            <p>Maps each reseller to a QBO customer with a daily rate per SIM. Use <span class="text-white">+ Add Mapping</span> to create new mappings. Each mapping specifies: reseller, QBO customer, and daily rate.</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Invoice Generation</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Select a week start date</li>
+                                <li>Click <span class="text-white">Preview</span> to calculate: active SIMs per reseller x daily rate x 7 days</li>
+                                <li>Review the preview, then click <span class="text-white">Create in QBO</span> to generate invoices</li>
+                                <li>Invoices appear in the Invoice History table with links to QBO</li>
+                            </ol>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Reseller Webhooks -->
+                <div id="guide-reseller-webhooks" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Reseller Webhooks</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>The system sends webhook notifications to resellers for key events.</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Webhook events</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white font-medium">number.online</span> &mdash; Sent after MDN rotation when a new phone number is verified and ready. Includes the phone number, ICCID, and <code class="bg-dark-900 px-1 rounded text-accent">online_until</code> timestamp (next 05:00 UTC rotation). Also sent by reseller-sync cron.</li>
+                                <li><span class="text-white font-medium">sms.received</span> &mdash; Sent when an incoming SMS is received for a SIM assigned to the reseller. Includes from/to numbers, message body, and dedup message_id.</li>
+                                <li><span class="text-white font-medium">sim.cancelled</span> &mdash; Sent when a SIM is canceled.</li>
+                                <li><span class="text-white font-medium">sim.suspended</span> &mdash; Sent when a SIM is suspended.</li>
+                                <li><span class="text-white font-medium">sim.restored</span> &mdash; Sent when a suspended SIM is restored.</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Delivery</h4>
+                            <p>Webhooks include a <code class="bg-dark-900 px-1 rounded text-accent">message_id</code> for deduplication. Failed deliveries retry up to 5 times with exponential backoff. All deliveries are recorded in <code class="bg-dark-900 px-1 rounded text-accent">webhook_deliveries</code> table.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SIM Status Reference -->
+                <div id="guide-statuses" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">SIM Status Reference</h3>
+                    <div class="text-sm text-gray-300">
+                        <div class="overflow-x-auto">
+                            <table class="w-full">
+                                <thead>
+                                    <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                        <th class="px-4 py-3 font-medium">Status</th>
+                                        <th class="px-4 py-3 font-medium">Meaning</th>
+                                        <th class="px-4 py-3 font-medium">Transitions To</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="text-sm">
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3"><span class="text-yellow-400 font-medium">provisioning</span></td>
+                                        <td class="px-4 py-3">SIM activated on Helix, waiting for phone number assignment</td>
+                                        <td class="px-4 py-3">active, error</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3"><span class="text-green-400 font-medium">active</span></td>
+                                        <td class="px-4 py-3">Fully operational with assigned phone number</td>
+                                        <td class="px-4 py-3">canceled, suspended, error</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3"><span class="text-red-400 font-medium">canceled</span></td>
+                                        <td class="px-4 py-3">Subscription cancelled on carrier</td>
+                                        <td class="px-4 py-3">active (via Resume)</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3"><span class="text-orange-400 font-medium">suspended</span></td>
+                                        <td class="px-4 py-3">Temporarily suspended (billing or manual)</td>
+                                        <td class="px-4 py-3">active (via Restore)</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3"><span class="text-red-400 font-medium">error</span></td>
+                                        <td class="px-4 py-3">Operation failed, needs manual intervention</td>
+                                        <td class="px-4 py-3">active (via Fix SIM or manual fix)</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Helix Status Codes -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Helix Status Change Codes</h3>
+                    <div class="text-sm text-gray-300">
+                        <div class="overflow-x-auto">
+                            <table class="w-full">
+                                <thead>
+                                    <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                        <th class="px-4 py-3 font-medium">Action</th>
+                                        <th class="px-4 py-3 font-medium">subscriberState</th>
+                                        <th class="px-4 py-3 font-medium">reasonCode</th>
+                                        <th class="px-4 py-3 font-medium">reasonCodeId</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="text-sm">
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3">Suspend</td>
+                                        <td class="px-4 py-3"><code class="bg-dark-900 px-1 rounded text-accent">Suspend</code></td>
+                                        <td class="px-4 py-3">CR</td>
+                                        <td class="px-4 py-3">22</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3">Restore (unsuspend)</td>
+                                        <td class="px-4 py-3"><code class="bg-dark-900 px-1 rounded text-accent">Unsuspend</code></td>
+                                        <td class="px-4 py-3">CR</td>
+                                        <td class="px-4 py-3">35</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3">Cancel</td>
+                                        <td class="px-4 py-3"><code class="bg-dark-900 px-1 rounded text-accent">Cancel</code></td>
+                                        <td class="px-4 py-3">CAN</td>
+                                        <td class="px-4 py-3">1</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3">Resume (from cancel)</td>
+                                        <td class="px-4 py-3"><code class="bg-dark-900 px-1 rounded text-accent">Resume On Cancel</code></td>
+                                        <td class="px-4 py-3">BBL</td>
+                                        <td class="px-4 py-3">20</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Cron Schedules -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                    <h3 class="text-lg font-semibold text-white mb-3">Cron Schedules</h3>
+                    <div class="text-sm text-gray-300">
+                        <div class="overflow-x-auto">
+                            <table class="w-full">
+                                <thead>
+                                    <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                        <th class="px-4 py-3 font-medium">Time (UTC)</th>
+                                        <th class="px-4 py-3 font-medium">Worker</th>
+                                        <th class="px-4 py-3 font-medium">Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="text-sm">
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3 font-mono">00:00</td>
+                                        <td class="px-4 py-3">ota-status-sync</td>
+                                        <td class="px-4 py-3">Sync SIM statuses from Helix + OTA refresh all active SIMs</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3 font-mono">05:00</td>
+                                        <td class="px-4 py-3">mdn-rotator</td>
+                                        <td class="px-4 py-3">Nightly MDN rotation for all active SIMs</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3 font-mono">07:00</td>
+                                        <td class="px-4 py-3">mdn-rotator</td>
+                                        <td class="px-4 py-3">Send error summary to Slack</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3 font-mono">12:00</td>
+                                        <td class="px-4 py-3">ota-status-sync</td>
+                                        <td class="px-4 py-3">Second daily status sync from Helix</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3 font-mono">Periodic</td>
+                                        <td class="px-4 py-3">details-finalizer</td>
+                                        <td class="px-4 py-3">Finalize provisioning SIMs (get phone numbers from Helix)</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="px-4 py-3 font-mono">Periodic</td>
+                                        <td class="px-4 py-3">reseller-sync</td>
+                                        <td class="px-4 py-3">Send number.online webhooks to resellers for verified numbers</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
         </main>
     </div>
 
@@ -3839,6 +4477,7 @@ function getHTML() {
             'imei-pool': '/imei-pool',
             'errors': '/errors',
             'billing': '/billing',
+            'guide': '/guide',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
 
@@ -3863,7 +4502,7 @@ function getHTML() {
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', billing: 'Billing' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', billing: 'Billing', guide: 'Guide' };
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();

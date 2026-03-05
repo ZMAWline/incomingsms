@@ -54,6 +54,10 @@
 6. **IMEI Pool** — IMEI inventory (stats: Slots, In Use, Available, Retired, Total). Retire/Restore actions.
 7. **Errors** — System error tracking with resolution workflow (View, Resolve, bulk resolve)
 8. **Billing** — QuickBooks invoicing and customer mappings
+9. **Guide** — System Guide / SOP reference page. Documents every action, flow, and process in the system.
+
+## MANDATORY: Keep the Guide Page Updated
+**When making ANY changes to system behavior, worker logic, action flows, new features, or UI actions, you MUST also update the Guide tab (`tab-guide` section in `src/dashboard/index.js`) to reflect the current state.** The Guide page is the single source of truth for SOPs. It must always describe the CURRENT behavior, not historical changes. If you add a new action, worker, or modify an existing flow, update the corresponding Guide section immediately.
 
 ## What Works (DO NOT BREAK)
 - SIM table with filtering by status, reseller, search
