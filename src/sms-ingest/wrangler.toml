@@ -16,3 +16,12 @@ main = "index.ts"
 [env.test.observability.logs]
 enabled = true
 invocation_logs = true
+
+# ============ SERVICE BINDINGS ============
+[[services]]
+binding = "MDN_ROTATOR"
+service = "mdn-rotator"
+
+[[env.test.services]]
+binding = "MDN_ROTATOR"
+service = "mdn-rotator"

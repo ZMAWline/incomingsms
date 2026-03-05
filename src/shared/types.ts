@@ -22,6 +22,7 @@ export interface Env {
     TOKEN_CACHE?: KVNamespace;
     MDN_QUEUE?: Queue<any>;
     SKYLINE_GATEWAY?: Fetcher;
+    MDN_ROTATOR?: Fetcher;
 }
 
 export interface WebhookDelivery {

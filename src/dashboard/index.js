@@ -3421,6 +3421,7 @@ function getHTML() {
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-billing').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Billing Page</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-reseller-webhooks').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Reseller Webhooks</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-statuses').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">SIM Status Reference</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-auto-imei-att').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Auto IMEI Change (AT&amp;T)</a>
                     </div>
                 </div>
 
@@ -4023,6 +4024,33 @@ function getHTML() {
                                 </tbody>
                             </table>
                         </div>
+                    </div>
+                </div>
+
+                <!-- Auto IMEI Change (AT&T) -->
+                <div id="guide-auto-imei-att" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Auto IMEI Change (AT&amp;T Unsupported Device)</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>When AT&amp;T flags a device IMEI as unsupported, it sends an SMS to the SIM&rsquo;s number. The <span class="text-white font-medium">sms-ingest</span> worker automatically detects this message and triggers a Change IMEI action.</p>
+                        <p class="text-white font-medium">Detection</p>
+                        <p>The SMS body is matched if it contains <em>both</em> of these phrases:</p>
+                        <ul class="list-disc list-inside space-y-1 ml-2">
+                            <li><code class="text-accent">no longer supported</code></li>
+                            <li><code class="text-accent">Upgrade your device</code></li>
+                        </ul>
+                        <p class="text-white font-medium">What Happens</p>
+                        <ol class="list-decimal list-inside space-y-1 ml-2">
+                            <li>sms-ingest receives and stores the SMS as normal (both JSON and gateway paths).</li>
+                            <li>If the SMS matches the AT&amp;T pattern and has a <code class="text-accent">sim_id</code>, a fire-and-forget <code class="text-accent">POST /sim-action</code> is sent to the <span class="text-white font-medium">mdn-rotator</span> worker via service binding.</li>
+                            <li>mdn-rotator picks an available IMEI from the pool and writes it to the gateway via Skyline, then updates Helix.</li>
+                        </ol>
+                        <p class="text-white font-medium">Requirements</p>
+                        <ul class="list-disc list-inside space-y-1 ml-2">
+                            <li><code class="text-accent">MDN_ROTATOR</code> service binding configured in sms-ingest&rsquo;s wrangler.toml</li>
+                            <li><code class="text-accent">ADMIN_RUN_SECRET</code> environment variable set for sms-ingest</li>
+                        </ul>
+                        <p class="text-white font-medium">Logs</p>
+                        <p>Look for <code class="text-accent">[SMS] Auto IMEI change triggered for SIM &lt;id&gt;</code> in sms-ingest logs to confirm the trigger fired.</p>
                     </div>
                 </div>
 

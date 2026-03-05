@@ -106,6 +106,13 @@
 - **Gateway tab all_slots**: `loadPortStatus` now passes `all_slots=1` to Skyline API so the 512-1 gateway shows all 512 SIM slots instead of only 64 active ones. Also corrected `slots_per_port` to 8 for the 512-1 gateway.
 - **IMEI cleanup**: Retired 37 orphaned `in_use` IMEIs that had no `gateway_id` (legacy entries from before gateway import).
 
+## Auto IMEI Change (AT&T Unsupported Device)
+- sms-ingest detects AT&T "unsupported device" SMS (body contains "no longer supported" AND "Upgrade your device")
+- Fires a `POST /sim-action` to mdn-rotator via `MDN_ROTATOR` service binding with `{ action: "change_imei", auto_imei: true }`
+- Fire-and-forget — doesn't block the SMS response
+- Requires `MDN_ROTATOR` service binding + `ADMIN_RUN_SECRET` env var on sms-ingest
+- Logic exists in both `index.js` and `index.ts`
+
 ## Skyline Gateway Integration
 - The dashboard proxies to the `skyline-gateway` worker via `handleSkylineProxy` (routes under `/api/skyline/*`).
 - The proxy automatically injects `SKYLINE_SECRET` into requests.

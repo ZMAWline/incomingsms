@@ -211,6 +211,31 @@ async function sendWebhookWithDeduplication(env: Env, webhookUrl: string, payloa
 }
 
 
+// ====================
+// AT&T Unsupported Device Auto-IMEI Change
+// ====================
+
+function isAttUnsupportedDeviceMsg(body: string): boolean {
+    return typeof body === 'string'
+        && body.includes('no longer supported')
+        && body.includes('Upgrade your device');
+}
+
+async function triggerAutoImeiChange(env: Env, simId: string): Promise<void> {
+    if (!env.MDN_ROTATOR || !env.ADMIN_RUN_SECRET) return;
+    try {
+        const url = `https://mdn-rotator/sim-action?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
+        const res = await env.MDN_ROTATOR.fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sim_id: simId, action: 'change_imei', auto_imei: true }),
+        });
+        console.log(`[SMS] Auto IMEI change triggered for SIM ${simId}: ${res.status}`);
+    } catch (err) {
+        console.log(`[SMS] Failed to trigger auto IMEI change for SIM ${simId}: ${err}`);
+    }
+}
+
 export default {
     async fetch(request: Request, env: Env): Promise<Response> {
         if (request.method !== "POST") {
@@ -297,6 +322,13 @@ export default {
             if (inserts.length > 0) {
                 const ins = await supabaseInsert(env, "inbound_sms", inserts);
                 if (!ins.ok) return new Response(await ins.text(), { status: 500 });
+
+                // Auto IMEI change for AT&T unsupported device messages
+                for (const row of inserts) {
+                    if (row.sim_id && isAttUnsupportedDeviceMsg(row.body)) {
+                        triggerAutoImeiChange(env, row.sim_id);
+                    }
+                }
             }
 
             return new Response("OK", { status: 200 });
@@ -351,6 +383,11 @@ export default {
         }]);
 
         if (!ins.ok) return new Response(await ins.text(), { status: 500 });
+
+        // Auto IMEI change for AT&T unsupported device messages
+        if (simId && isAttUnsupportedDeviceMsg(body)) {
+            triggerAutoImeiChange(env, simId);
+        }
 
         // Webhook
         if (simId) {
