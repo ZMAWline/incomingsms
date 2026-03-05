@@ -6,7 +6,7 @@ workers_dev = true
 
 [triggers]
 # Rotation: every hour 12am-6am EST (5am-11am UTC); error summary runs at 7am UTC (inside this window)
-crons = ["0 5-11 * * *"]
+crons = ["0,30 5-11 * * *"]
 
 # KV namespace for token caching
 [[kv_namespaces]]
