@@ -39,7 +39,7 @@ async function runResellerSync(env, limit) {
   // Only sync verified numbers (or skipped verification)
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,sim_numbers!inner(e164,verification_status),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks!inner(url)))&status=eq.active&sim_numbers.valid_to=is.null&sim_numbers.verification_status=in.(verified,skipped)&reseller_sims.active=eq.true&reseller_webhooks.enabled=eq.true&order=id.asc&limit=${limit}`
+    `sims?select=id,iccid,status,sim_numbers!inner(e164,verification_status),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&sim_numbers.valid_to=is.null&sim_numbers.verification_status=in.(verified,skipped)&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
   );
 
   let attempted = sims.length;
@@ -55,7 +55,8 @@ async function runResellerSync(env, limit) {
       const currentNumber = sim.sim_numbers?.[0]?.e164;
       const verificationStatus = sim.sim_numbers?.[0]?.verification_status;
       const resellerId = sim.reseller_sims?.[0]?.reseller_id;
-      const webhookUrl = sim.reseller_sims?.[0]?.resellers?.reseller_webhooks?.[0]?.url;
+      const webhook = sim.reseller_sims?.[0]?.resellers?.reseller_webhooks?.find(w => w.enabled);
+      const webhookUrl = webhook?.url;
 
       if (!currentNumber) {
         skipped++;

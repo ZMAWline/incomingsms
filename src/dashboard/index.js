@@ -3052,7 +3052,7 @@ function getHTML() {
                         <h2 class="text-lg font-semibold text-white">Worker Controls</h2>
                     </div>
                     <div class="p-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        <button onclick="runWorker('bulk-activator', 10)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                        <button onclick="runWorker('bulk-activator')" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
                             <div class="w-12 h-12 rounded-lg bg-blue-500/20 flex items-center justify-center flex-shrink-0">
                                 <svg class="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
                             </div>
@@ -3061,7 +3061,7 @@ function getHTML() {
                                 <p class="text-xs text-gray-400">Activate pending SIMs</p>
                             </div>
                         </button>
-                        <button onclick="runWorker('details-finalizer', 10)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                        <button onclick="runWorker('details-finalizer')" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
                             <div class="w-12 h-12 rounded-lg bg-green-500/20 flex items-center justify-center flex-shrink-0">
                                 <svg class="w-6 h-6 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                             </div>
@@ -3088,7 +3088,7 @@ function getHTML() {
                                 <p class="text-xs text-gray-400">Rotate by ICCID</p>
                             </div>
                         </button>
-                        <button onclick="runWorker('phone-number-sync', null)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                        <button onclick="runWorker('phone-number-sync')" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
                             <div class="w-12 h-12 rounded-lg bg-purple-500/20 flex items-center justify-center flex-shrink-0">
                                 <svg class="w-6 h-6 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
                             </div>
@@ -3097,7 +3097,7 @@ function getHTML() {
                                 <p class="text-xs text-gray-400">Sync numbers from Helix</p>
                             </div>
                         </button>
-                        <button onclick="runWorker('reseller-sync', 50)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                        <button onclick="runWorker('reseller-sync')" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
                             <div class="w-12 h-12 rounded-lg bg-teal-500/20 flex items-center justify-center flex-shrink-0">
                                 <svg class="w-6 h-6 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
                             </div>
@@ -4962,8 +4962,8 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
-        async function runWorker(workerName, limit) {
-            if (!confirm(\`Run \${workerName}\${limit ? \` (limit: \${limit})\` : ''}?\`)) {
+        async function runWorker(workerName) {
+            if (!confirm(\`Run \${workerName}?\`)) {
                 return;
             }
             showToast(\`Running \${workerName}...\`, 'info');
@@ -4971,7 +4971,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const response = await fetch(\`\${API_BASE}/run/\${workerName}\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ limit })
+                    body: JSON.stringify({})
                 });
                 const result = await response.json();
                 if (response.ok) {
