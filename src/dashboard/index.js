@@ -2158,9 +2158,38 @@ async function handleErrors(env, corsHeaders, url) {
       _legacy: true,
     }));
 
-    // Merge: system_errors first, then legacy activation errors, then rotation errors
+    // Format system_errors
     const sysFormatted = (Array.isArray(systemErrors) ? systemErrors : []).map(e => ({ ...e, _legacy: false }));
-    const merged = [...sysFormatted, ...legacyErrors, ...rotationErrors];
+
+    // Deduplicate system_errors by (sim_id, source): keep most recent, auto-resolve older ones
+    const seenKey = new Map();
+    for (const e of sysFormatted) {
+      if (!e.sim_id) continue;
+      const k = e.sim_id + ':' + e.source;
+      const existing = seenKey.get(k);
+      if (!existing || new Date(e.created_at) > new Date(existing.created_at)) {
+        seenKey.set(k, e);
+      }
+    }
+    const keepIds = new Set([...seenKey.values()].map(e => e.id));
+    const toAutoResolve = sysFormatted.filter(e => e.sim_id && !keepIds.has(e.id)).map(e => e.id);
+    if (toAutoResolve.length > 0) {
+      const inClause = toAutoResolve.join(',');
+      fetch(`${env.SUPABASE_URL}/rest/v1/system_errors?id=in.(${inClause})`, {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ status: 'resolved', resolved_at: new Date().toISOString(), resolved_by: 'auto-dedup' }),
+      }).catch(() => {});
+    }
+    const dedupedSys = sysFormatted.filter(e => !e.sim_id || keepIds.has(e.id));
+
+    // Merge: deduplicated system_errors first, then legacy activation errors, then rotation errors
+    const merged = [...dedupedSys, ...legacyErrors, ...rotationErrors];
 
     return new Response(JSON.stringify(merged), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -2942,7 +2971,15 @@ function getHTML() {
                                 <select id="filter-reseller" onchange="loadSims(true)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All Resellers</option>
                                 </select>
-                                <input id="sims-search" type="text" placeholder="Search..." oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-40">
+                                <select id="filter-gateway" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                    <option value="">All Gateways</option>
+                                </select>
+                                <label class="text-xs text-gray-500 flex items-center gap-1">Activated
+                                  <input id="filter-activated-from" type="date" oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent" title="Activated from">
+                                  <span class="text-gray-600">&#8211;</span>
+                                  <input id="filter-activated-to" type="date" oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent" title="Activated to">
+                                </label>
+                                <input id="sims-search" type="text" placeholder="Search all fields..." oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-48">
                                 <span id="sims-count" class="text-sm text-gray-500"></span>
                             </div>
                         </div>
@@ -3030,7 +3067,7 @@ function getHTML() {
                                 <p class="text-xs text-gray-400">Finalize provisioning SIMs</p>
                             </div>
                         </button>
-                        <button onclick="runWorker('mdn-rotator', 5)" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                        <button onclick="runWorker('mdn-rotator')" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
                             <div class="w-12 h-12 rounded-lg bg-orange-500/20 flex items-center justify-center flex-shrink-0">
                                 <svg class="w-6 h-6 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                             </div>
@@ -3889,7 +3926,17 @@ function getHTML() {
         function matchesSearch(obj, query) {
             if (!query) return true;
             const q = query.toLowerCase();
-            return Object.values(obj).some(v => v != null && String(v).toLowerCase().includes(q));
+            const DATE_FIELDS = ['activated_at','last_sms_received','last_mdn_rotated_at','created_at','updated_at'];
+            const strings = Object.entries(obj).flatMap(([k, v]) => {
+              if (v == null) return [];
+              const base = String(v);
+              if (DATE_FIELDS.includes(k) && v) {
+                const d = new Date(v);
+                if (!isNaN(d)) return [base, d.toLocaleDateString(), d.toLocaleString(), d.toISOString().slice(0,10)];
+              }
+              return [base];
+            });
+            return strings.some(s => s.toLowerCase().includes(q));
         }
 
 
@@ -3997,6 +4044,13 @@ function getHTML() {
                 const sims = await response.json();
                 tableState.sims.data = sims;
                 lastSimsFetchedAt = Date.now();
+                // Populate gateway dropdown
+                const gwSel = document.getElementById('filter-gateway');
+                if (gwSel) {
+                  const current = gwSel.value;
+                  const gateways = [...new Set(sims.map(s => s.gateway_code).filter(Boolean))].sort();
+                  gwSel.innerHTML = '<option value="">All Gateways</option>' + gateways.map(g => \`<option value="\${g}"\${current===g?' selected':''}>\${g}</option>\`).join('');
+                }
                 const cacheLabel = document.getElementById('sims-cache-label');
                 if (cacheLabel) cacheLabel.textContent = '(just loaded)';
                 const lastUpdated = document.getElementById('last-updated');
@@ -4015,6 +4069,12 @@ function renderSims() {
   if (search) data = data.filter(s => matchesSearch(s, search));
   const resellerFilterVal = document.getElementById('filter-reseller')?.value;
   if (resellerFilterVal === 'none') data = data.filter(s => !s.reseller_id);
+  const gatewayFilterVal = document.getElementById('filter-gateway')?.value;
+  if (gatewayFilterVal) data = data.filter(s => s.gateway_code === gatewayFilterVal);
+  const activatedFrom = document.getElementById('filter-activated-from')?.value;
+  const activatedTo = document.getElementById('filter-activated-to')?.value;
+  if (activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= activatedFrom);
+  if (activatedTo) data = data.filter(s => s.activated_at && s.activated_at <= activatedTo + 'T23:59:59');
   data = genericSort(data, state.sortKey, state.sortDir);
 
   const tbody = document.getElementById('sims-table');

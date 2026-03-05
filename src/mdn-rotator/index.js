@@ -540,14 +540,16 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
   },
 
   // Cron handler
-  // - 05:00 UTC: rotation
-  // - 07:00 UTC: error summary to Slack
+  // - Every hour 5am-11am UTC (12am-6am EST): rotation (skips SIMs already rotated today)
+  // - 7am UTC (2am EST): error summary to Slack
   async scheduled(event, env, ctx) {
     const hour = new Date(event.scheduledTime).getUTCHours();
-
-    if (hour === 5) {
+    // Rotation: every hour from 12am-6am EST (5am-11am UTC)
+    if (hour >= 5 && hour <= 11) {
       ctx.waitUntil(queueSimsForRotation(env));
-    } else if (hour === 7) {
+    }
+    // Error summary at 7am UTC (2am EST)
+    if (hour === 7) {
       ctx.waitUntil(sendErrorSummaryToSlack(env));
     }
   },
@@ -584,29 +586,27 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
     }
 
     // Default: mdn-rotation-queue
-    const token = await getCachedToken(env);
+    let token;
+    try {
+      token = await getCachedToken(env);
+    } catch (err) {
+      console.error(`[Queue] Token fetch failed, messages will retry: ${err}`);
+      return; // Don't ack - messages will be retried (max_retries=2 in wrangler.toml)
+    }
 
     for (const message of batch.messages) {
       const sim = message.body;
-      const attempts = message.attempts || 0;
 
       try {
         await rotateSingleSim(env, token, sim);
         message.ack();
         console.log(`SIM ${sim.iccid}: rotation complete`);
       } catch (err) {
-        console.error(`SIM ${sim.iccid} failed (attempt ${attempts + 1}): ${err}`);
-
-        if (attempts >= 2) {
-          // 3rd failure — record error for manual triage
-          console.log(`SIM ${sim.iccid}: 3 failures reached, recording error`);
-          await updateSimRotationError(env, sim.id, `Rotation failed after 3 attempts: ${err}`).catch(() => {});
-          message.ack();
-        } else {
-          // Still have retries left — let the queue retry
-          message.retry();
-        }
+        console.error(`SIM ${sim.iccid} failed: ${err}`);
+        await updateSimRotationError(env, sim.id, `Rotation failed: ${err}`).catch(() => {});
+        message.ack();
       }
+
     }
   },
 };
@@ -620,16 +620,16 @@ async function queueSimsForRotation(env, options = {}) {
 
   // Build query - manual runs prioritize SIMs that were rotated longest ago
   // NULLS FIRST ensures SIMs that have never been rotated get processed first
-  let query = `sims?select=id,iccid,mobility_subscription_id,status&mobility_subscription_id=not.is.null&status=eq.active`;
+  let query = `sims?select=id,iccid,mobility_subscription_id,status,last_mdn_rotated_at&mobility_subscription_id=not.is.null&status=eq.active`;
 
   if (isManualRun) {
     // Manual run: order by oldest rotation first (nulls first = never rotated)
     query += `&order=last_mdn_rotated_at.asc.nullsfirst&limit=${queryLimit}`;
     console.log(`[Manual Run] Fetching ${queryLimit} SIMs ordered by oldest rotation first`);
   } else {
-    // Automatic run: process all active SIMs
+    // Scheduled run: fetch all active SIMs (filter by today EST in JS below)
     query += `&order=id.asc&limit=${queryLimit}`;
-    console.log(`[Scheduled Run] Fetching all active SIMs`);
+    console.log(`[Scheduled Run] Fetching all active SIMs for EST-today filter`);
   }
 
   const sims = await supabaseSelect(env, query);
@@ -639,10 +639,26 @@ async function queueSimsForRotation(env, options = {}) {
     return { ok: true, queued: 0, message: "No SIMs to rotate" };
   }
 
-  console.log(`Queuing ${sims.length} SIMs for rotation...`);
+  // For scheduled runs: filter out SIMs already rotated today (EST = UTC-5)
+  let simsToQueue = sims;
+  if (!isManualRun) {
+    const estOffsetMs = -5 * 60 * 60 * 1000;
+    const estNow = new Date(Date.now() + estOffsetMs);
+    const todayEst = new Date(Date.UTC(estNow.getUTCFullYear(), estNow.getUTCMonth(), estNow.getUTCDate(), 5, 0, 0));
+    const todayEstISO = todayEst.toISOString();
+    simsToQueue = sims.filter(s => !s.last_mdn_rotated_at || s.last_mdn_rotated_at < todayEstISO);
+    console.log(`[Scheduled Run] ${sims.length} active SIMs, ${simsToQueue.length} not yet rotated since ${todayEstISO} (midnight EST), ${sims.length - simsToQueue.length} skipped`);
+  }
+
+  if (simsToQueue.length === 0) {
+    console.log("All active SIMs already rotated today.");
+    return { ok: true, queued: 0, message: "All SIMs already rotated today" };
+  }
+
+  console.log(`Queuing ${simsToQueue.length} SIMs for rotation...`);
 
   // Queue each SIM (queue operations don't count toward subrequest limit)
-  const messages = sims.map(sim => ({ body: sim }));
+  const messages = simsToQueue.map(sim => ({ body: sim }));
 
   // Send in batches of 100 (queue API limit)
   let queued = 0;
@@ -683,32 +699,15 @@ async function rotateSpecificSim(env, iccid) {
 
     const token = await getCachedToken(env);
 
-    // Try rotation up to 3 times, then record error for manual triage
-    const maxAttempts = 3;
-    let lastError = null;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        console.log(`SIM ${iccid}: rotation attempt ${attempt}/${maxAttempts}`);
-        await rotateSingleSim(env, token, sim);
-        return { ok: true, iccid, message: `SIM ${iccid} rotated successfully`, attempts: attempt };
-      } catch (err) {
-        lastError = err;
-        console.error(`SIM ${iccid}: attempt ${attempt} failed: ${err}`);
-        if (attempt < maxAttempts) {
-          await sleep(2000);
-        }
-      }
+    try {
+      console.log(`SIM ${iccid}: starting rotation`);
+      await rotateSingleSim(env, token, sim);
+      return { ok: true, iccid, message: `SIM ${iccid} rotated successfully` };
+    } catch (err) {
+      console.error(`SIM ${iccid}: rotation failed: ${err}`);
+      await updateSimRotationError(env, sim.id, `Rotation failed: ${err}`).catch(() => {});
+      return { ok: false, iccid, error: String(err) };
     }
-
-    // All 3 attempts failed — record error for manual triage via /errors dashboard
-    console.log(`SIM ${iccid}: 3 attempts failed, recording error`);
-    await updateSimRotationError(env, sim.id, `Rotation failed after 3 attempts: ${lastError}`).catch(() => {});
-    return {
-      ok: false,
-      iccid,
-      error: `Rotation failed after 3 attempts. Last error: ${lastError}`,
-    };
   } catch (err) {
     console.error(`Manual rotation failed for ${iccid}: ${err}`);
     return { ok: false, iccid, error: String(err) };
