@@ -41,11 +41,17 @@ async function runFinalizer(env, limit) {
 
   let processed = 0;
   let activated = 0;
+  let corrected = 0;
+
+  // ── Pass 1: call Helix for every SIM, detect ICCID mismatches ──────────
+  // corrections: rows where Helix's ICCID differs from what we have in DB.
+  // Each entry records the wrong DB row (wrongSimId) and the sub_id that
+  // belongs to a different ICCID (helixIccid).
+  const corrections = []; // { wrongSimId, subId, helixIccid }
+  const detailsCache = {}; // subId -> Helix details object (for activation pass)
 
   for (const sim of sims) {
     processed++;
-
-    const simId = sim.id;
     const subId = sim.mobility_subscription_id;
     if (!subId) continue;
 
@@ -58,6 +64,54 @@ async function runFinalizer(env, limit) {
     }
 
     const d = Array.isArray(details) ? details[0] : null;
+    detailsCache[subId] = d;
+
+    const helixIccid = d?.iccid ? String(d.iccid).trim() : null;
+    if (helixIccid && helixIccid !== sim.iccid) {
+      console.log(`[Finalizer] ICCID mismatch sub ${subId}: DB=${sim.iccid} Helix=${helixIccid}`);
+      corrections.push({ wrongSimId: sim.id, subId, helixIccid });
+    }
+  }
+
+  // ── Pass 2: fix mismatched sub_id ↔ ICCID assignments ──────────────────
+  // Step 2a: null out sub_id on every wrong row first (avoids unique conflicts).
+  for (const { wrongSimId } of corrections) {
+    await supabasePatch(
+      env,
+      `sims?id=eq.${encodeURIComponent(String(wrongSimId))}`,
+      { mobility_subscription_id: null }
+    );
+  }
+  // Step 2b: assign sub_id to the DB row that actually has Helix's ICCID.
+  for (const { helixIccid, subId } of corrections) {
+    const rows = await supabaseSelect(
+      env,
+      `sims?iccid=eq.${encodeURIComponent(helixIccid)}&select=id&limit=1`
+    );
+    const correctSim = rows[0];
+    if (!correctSim) {
+      console.error(`[Finalizer] No DB row for Helix ICCID ${helixIccid} (sub ${subId}) — cannot correct`);
+      continue;
+    }
+    await supabasePatch(
+      env,
+      `sims?id=eq.${encodeURIComponent(String(correctSim.id))}`,
+      { mobility_subscription_id: Number(subId) }
+    );
+    corrected++;
+    console.log(`[Finalizer] Corrected: sub ${subId} → SIM ${correctSim.id} (iccid=${helixIccid})`);
+  }
+
+  // ── Pass 3: activate — re-query so we have the corrected sub_id mapping ─
+  const freshSims = corrected > 0
+    ? await supabaseSelect(env, `sims?select=id,iccid,mobility_subscription_id,status&status=eq.provisioning&limit=${limit}`)
+    : sims;
+
+  for (const sim of freshSims) {
+    const subId = sim.mobility_subscription_id;
+    if (!subId) continue;
+
+    const d = detailsCache[subId];
     const phoneNumber = d?.phoneNumber;
 
     if (!phoneNumber) {
@@ -67,11 +121,11 @@ async function runFinalizer(env, limit) {
 
     const e164 = normalizeUS(phoneNumber);
 
-    await closeCurrentNumber(env, simId);
-    await insertNewNumber(env, simId, e164);
+    await closeCurrentNumber(env, sim.id);
+    await insertNewNumber(env, sim.id, e164);
     await supabasePatch(
       env,
-      `sims?id=eq.${encodeURIComponent(String(simId))}`,
+      `sims?id=eq.${encodeURIComponent(String(sim.id))}`,
       { status: "active", status_reason: null, activated_at: new Date().toISOString() }
     );
 
@@ -79,7 +133,7 @@ async function runFinalizer(env, limit) {
     console.log(`SIM ${sim.iccid}: activated with number ${e164}`);
   }
 
-  return { ok: true, processed, activated };
+  return { ok: true, processed, activated, corrected };
 }
 
 /* ---------------- helpers  ---------------- */
