@@ -155,6 +155,10 @@ export default {
       return handleAssignReseller(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/reset-to-provisioning' && request.method === 'POST') {
+      return handleResetToProvisioning(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/sim-action' && request.method === 'POST') {
       return handleSimAction(request, env, corsHeaders);
     }
@@ -2333,6 +2337,41 @@ async function handleResolveError(request, env, corsHeaders) {
   }
 }
 
+// Reset SIMs back to provisioning so details-finalizer re-processes them
+async function handleResetToProvisioning(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { sim_ids } = body;
+    if (!Array.isArray(sim_ids) || sim_ids.length === 0) {
+      return new Response(JSON.stringify({ error: 'sim_ids array required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const idList = sim_ids.map(Number).filter(n => Number.isFinite(n) && n > 0);
+    if (idList.length === 0) {
+      return new Response(JSON.stringify({ error: 'No valid sim_ids' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const patchUrl = `${env.SUPABASE_URL}/rest/v1/sims?id=in.(${idList.join(',')})`;
+    const res = await fetch(patchUrl, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify({ status: 'provisioning', activated_at: null }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      return new Response(JSON.stringify({ error: `Supabase error: ${errText}` }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const updated = await res.json();
+    const count = Array.isArray(updated) ? updated.length : idList.length;
+    return new Response(JSON.stringify({ ok: true, reset: count }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
 // Assign SIM to reseller
 async function handleAssignReseller(request, env, corsHeaders) {
   try {
@@ -3089,6 +3128,7 @@ function getHTML() {
                     <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
                     <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Send Online</button>
                     <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
+                    <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
                 </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
@@ -6876,6 +6916,28 @@ async function sendSimOnline(simId, phoneNumber) {
                 await simAction(id, action, true);
             }
             loadSims(true);
+        }
+
+        async function bulkResetToProvisioning() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            if (!confirm(\`Reset \${simIds.length} SIM(s) to provisioning? The details-finalizer cron will re-process and correct ICCID mappings.\`)) return;
+            try {
+                const resp = await fetch(API_BASE + '/reset-to-provisioning', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: simIds })
+                });
+                const data = await resp.json();
+                if (data.ok) {
+                    alert(\`Reset \${data.reset} SIM(s) to provisioning. The details-finalizer cron will re-process them shortly.\`);
+                    loadSims(true);
+                } else {
+                    alert('Error: ' + (data.error || 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
         }
 
         function showBulkSendSmsModal() {
