@@ -339,6 +339,32 @@ async function updateSimPortAndGateway(env, simId, port, mac) {
   if (Object.keys(updates).length === 0) return;
 
   try {
+    // If we know both gateway and port, evict any other SIM currently claiming
+    // this slot — the gateway's ICCID report is the physical source of truth.
+    if (updates.gateway_id && updates.port) {
+      const evictRes = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/sims?gateway_id=eq.${updates.gateway_id}&port=eq.${encodeURIComponent(updates.port)}&id=neq.${simId}`,
+        {
+          method: "PATCH",
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            "Content-Type": "application/json",
+            Prefer: "return=representation",
+          },
+          body: JSON.stringify({ port: null, gateway_id: null }),
+        }
+      );
+      if (evictRes.ok) {
+        const evicted = await evictRes.json();
+        if (Array.isArray(evicted) && evicted.length > 0) {
+          console.log(`[SMS] Evicted SIM ${evicted[0].id} from slot ${updates.gateway_id}/${updates.port} — replaced by SIM ${simId}`);
+        }
+      } else {
+        console.error(`[SMS] Evict failed for slot ${updates.gateway_id}/${updates.port}: ${evictRes.status} ${await evictRes.text()}`);
+      }
+    }
+
     const res = await fetch(
       `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${encodeURIComponent(String(simId))}`,
       {
@@ -355,8 +381,10 @@ async function updateSimPortAndGateway(env, simId, port, mac) {
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
-        console.log(`[SMS] Updated SIM ${simId}: port=${port}, gateway=${updates.gateway_id || 'unchanged'}`);
+        console.log(`[SMS] Updated SIM ${simId}: port=${updates.port}, gateway=${updates.gateway_id || 'unchanged'}`);
       }
+    } else {
+      console.error(`[SMS] Port update failed for SIM ${simId}: ${res.status} ${await res.text()}`);
     }
   } catch (err) {
     console.log(`[SMS] Failed to update SIM: ${err}`);

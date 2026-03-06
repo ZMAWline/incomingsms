@@ -183,6 +183,14 @@ export default {
       return handleQboInvoicePreview(url, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/billing/preview') {
+      return handleBillingPreview(url, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/billing/create-invoice' && request.method === 'POST') {
+      return handleBillingCreateInvoice(request, env, corsHeaders);
+    }
+
     // Debug endpoint to test worker-to-worker connectivity via service binding
     if (url.pathname === '/api/debug-cancel') {
       try {
@@ -2672,41 +2680,174 @@ async function handleQboInvoicesGet(env, corsHeaders) {
 }
 
 async function handleQboInvoicePreview(url, env, corsHeaders) {
+  // Legacy stub – replaced by /api/billing/preview
+  return new Response(JSON.stringify({ error: 'Use /api/billing/preview' }), { status: 410, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
+async function handleBillingPreview(url, env, corsHeaders) {
   try {
-    const weekStart = url.searchParams.get('week_start');
-    if (!weekStart) return new Response(JSON.stringify({ error: 'week_start required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const resellerId = url.searchParams.get('reseller_id');
+    const start = url.searchParams.get('start');
+    const end = url.searchParams.get('end');
+    if (!resellerId || !start || !end) {
+      return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
 
-    // Get all mappings
-    const mapResp = await supabaseGet(env, `qbo_customer_map?select=id,reseller_id,customer_name,qbo_display_name,daily_rate`);
-    const mappings = await mapResp.json();
+    // Get reseller name + QBO mapping
+    const [resellerResp, mappingResp] = await Promise.all([
+      supabaseGet(env, 'resellers?select=id,name&id=eq.' + encodeURIComponent(resellerId) + '&limit=1'),
+      supabaseGet(env, 'qbo_customer_map?select=id,qbo_customer_id,qbo_display_name,daily_rate&reseller_id=eq.' + encodeURIComponent(resellerId) + '&limit=1'),
+    ]);
+    const resellerData = await resellerResp.json();
+    const mappingData = await mappingResp.json();
+    const reseller = Array.isArray(resellerData) && resellerData[0] ? resellerData[0] : null;
+    const mapping = Array.isArray(mappingData) && mappingData[0] ? mappingData[0] : null;
 
-    const invoices = [];
-    for (const m of mappings) {
-      // Count active SIMs for this reseller
-      let simCount = 0;
-      if (m.reseller_id) {
-        const simResp = await supabaseGet(env, `reseller_sims?select=sim_id,sims(status)&reseller_id=eq.${m.reseller_id}&active=eq.true&sims.status=in.(active,ACTIVATED)`);
-        const sims = await simResp.json();
-        simCount = Array.isArray(sims) ? sims.filter(s => s.sims).length : 0;
-      }
-      if (simCount > 0) {
-        invoices.push({
-          mapping_id: m.id,
-          customer_name: m.qbo_display_name,
-          sim_count: simCount,
-          daily_rate: m.daily_rate,
-          total: simCount * 7 * parseFloat(m.daily_rate),
-        });
+    // Get SIM-days with SMS for this reseller in the date range
+    // Join: reseller_sims → sims → sim_sms_daily
+    const smsResp = await supabaseGet(env,
+      'reseller_sims?select=sim_id,sims(sim_sms_daily(est_date,sms_count))' +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+      '&active=eq.true'
+    );
+    const rsSims = await smsResp.json();
+
+    // Aggregate: for each EST calendar day in range, count distinct SIMs with sms_count > 0
+    const dailyCounts = {}; // est_date → Set of sim_ids
+    if (Array.isArray(rsSims)) {
+      for (const rs of rsSims) {
+        const daily = rs.sims?.sim_sms_daily;
+        if (!Array.isArray(daily)) continue;
+        for (const row of daily) {
+          if (!row.est_date || row.sms_count <= 0) continue;
+          if (row.est_date < start || row.est_date > end) continue;
+          if (!dailyCounts[row.est_date]) dailyCounts[row.est_date] = new Set();
+          dailyCounts[row.est_date].add(rs.sim_id);
+        }
       }
     }
-    return new Response(JSON.stringify({ invoices }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+
+    const dailyRate = mapping ? parseFloat(mapping.daily_rate) : 0;
+    const days = Object.keys(dailyCounts).sort().map(date => ({
+      date,
+      sim_count: dailyCounts[date].size,
+      amount: dailyCounts[date].size * dailyRate,
+    }));
+    const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
+    const totalAmount = totalSimDays * dailyRate;
+
+    return new Response(JSON.stringify({
+      reseller_id: resellerId,
+      reseller_name: reseller?.name || resellerId,
+      mapping,
+      daily_rate: dailyRate,
+      days,
+      total_sim_days: totalSimDays,
+      total_amount: totalAmount,
+    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+async function handleBillingCreateInvoice(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { reseller_id, start, end } = body;
+    if (!reseller_id || !start || !end) {
+      return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    // Get QBO mapping
+    const mappingResp = await supabaseGet(env, 'qbo_customer_map?select=id,qbo_customer_id,qbo_display_name,daily_rate&reseller_id=eq.' + encodeURIComponent(reseller_id) + '&limit=1');
+    const mappingData = await mappingResp.json();
+    const mapping = Array.isArray(mappingData) && mappingData[0] ? mappingData[0] : null;
+    if (!mapping) {
+      return new Response(JSON.stringify({ error: 'No QBO mapping for this reseller' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    // Get billable SIM-days (same logic as preview)
+    const smsResp = await supabaseGet(env,
+      'reseller_sims?select=sim_id,sims(sim_sms_daily(est_date,sms_count))' +
+      '&reseller_id=eq.' + encodeURIComponent(reseller_id) +
+      '&active=eq.true'
+    );
+    const rsSims = await smsResp.json();
+
+    const dailyCounts = {};
+    if (Array.isArray(rsSims)) {
+      for (const rs of rsSims) {
+        const daily = rs.sims?.sim_sms_daily;
+        if (!Array.isArray(daily)) continue;
+        for (const row of daily) {
+          if (!row.est_date || row.sms_count <= 0) continue;
+          if (row.est_date < start || row.est_date > end) continue;
+          if (!dailyCounts[row.est_date]) dailyCounts[row.est_date] = new Set();
+          dailyCounts[row.est_date].add(rs.sim_id);
+        }
+      }
+    }
+
+    const dailyRate = parseFloat(mapping.daily_rate);
+    const days = Object.keys(dailyCounts).sort().map(date => ({
+      date,
+      sim_count: dailyCounts[date].size,
+      amount: dailyCounts[date].size * dailyRate,
+    }));
+    const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
+    const totalAmount = +(totalSimDays * dailyRate).toFixed(2);
+
+    if (totalSimDays === 0) {
+      return new Response(JSON.stringify({ error: 'No billable SIM-days in this range' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    // Build QBO line items — one per calendar day
+    const lineItems = days.map(d => ({
+      description: 'SMS Routing - ' + d.date + ' (' + d.sim_count + ' SIM' + (d.sim_count !== 1 ? 's' : '') + ')',
+      quantity: d.sim_count,
+      rate: dailyRate,
+      amount: +d.amount.toFixed(2),
+    }));
+
+    // Call QBO via service binding
+    const qboUrl = 'https://quickbooks/invoice/create';
+    const qboResp = await env.QUICKBOOKS.fetch(qboUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: mapping.qbo_customer_id,
+        lineItems,
+      }),
     });
+    if (!qboResp.ok) {
+      const errText = await qboResp.text();
+      return new Response(JSON.stringify({ error: 'QBO error: ' + errText }), { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const qboResult = await qboResp.json();
+
+    // Record in qbo_invoices
+    await fetch(env.SUPABASE_URL + '/rest/v1/qbo_invoices', {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        qbo_customer_map_id: mapping.id,
+        qbo_invoice_id: qboResult.id || null,
+        week_start: start,
+        week_end: end,
+        sim_count: totalSimDays,
+        total: totalAmount,
+        status: 'draft',
+      }),
+    });
+
+    return new Response(JSON.stringify({ ok: true, invoice_id: qboResult.id, doc_number: qboResult.docNumber, total: totalAmount }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
 
@@ -3361,10 +3502,22 @@ function getHTML() {
 
                 <!-- Invoice Generator -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
-                    <h3 class="text-lg font-semibold text-white mb-3">Generate Invoices</h3>
-                    <div class="flex items-center gap-3 mb-4">
-                        <label class="text-sm text-gray-400">Week Start:</label>
-                        <input type="date" id="invoice-week-start" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                    <h3 class="text-lg font-semibold text-white mb-3">Generate Invoice</h3>
+                    <div class="flex flex-wrap items-end gap-3 mb-4">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">Reseller</label>
+                            <select id="invoice-reseller" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 min-w-40">
+                                <option value="">-- Select Reseller --</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">From</label>
+                            <input type="date" id="invoice-start" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">To</label>
+                            <input type="date" id="invoice-end" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        </div>
                         <button onclick="previewInvoices()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Preview</button>
                         <button onclick="createInvoices()" id="create-invoices-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Create in QBO</button>
                     </div>
@@ -3473,6 +3626,77 @@ function getHTML() {
                             <h4 class="text-white font-medium mb-1">Caching</h4>
                             <p>SIM data is cached client-side for <span class="text-white">30 minutes</span>. The Refresh button or changing filters force-reloads from the server. The cache timestamp is shown in the header.</p>
                         </div>
+                        <div class="mt-4">
+                            <h4 class="text-white font-medium mb-2">Column Data Sources</h4>
+                            <p class="mb-2">Each column in the SIMs table is populated from a specific source. Understanding this helps diagnose stale or missing data.</p>
+                            <table class="w-full text-xs border-collapse">
+                                <thead>
+                                    <tr class="border-b border-dark-500">
+                                        <th class="text-left py-1.5 pr-4 text-gray-400 font-medium w-28">Column</th>
+                                        <th class="text-left py-1.5 pr-4 text-gray-400 font-medium w-40">Source</th>
+                                        <th class="text-left py-1.5 text-gray-400 font-medium">Written by / When</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-dark-700">
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">ID</td>
+                                        <td class="py-1.5 pr-4 text-accent">sims.id</td>
+                                        <td class="py-1.5 text-gray-300">Auto-incremented primary key. Set when the SIM row is first inserted (bulk-activator or manual).</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">Gateway</td>
+                                        <td class="py-1.5 pr-4 text-accent">sims.gateway_id &rarr; gateways.code</td>
+                                        <td class="py-1.5 text-gray-300"><strong class="text-white">sms-ingest</strong>: updated every time an inbound SMS arrives from a port &mdash; the MAC address in the webhook is resolved to a gateway. Also updated by fix-sim / retry-activation when scanning gateways for the ICCID.</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">ICCID</td>
+                                        <td class="py-1.5 pr-4 text-accent">sims.iccid</td>
+                                        <td class="py-1.5 text-gray-300"><strong class="text-white">bulk-activator</strong>: written at activation time from the CSV upload. Never changed after that (changing ICCID requires a separate Helix API call).</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">Phone (MDN)</td>
+                                        <td class="py-1.5 pr-4 text-accent">sim_numbers.e164<br/>(valid_to IS NULL)</td>
+                                        <td class="py-1.5 text-gray-300"><strong class="text-white">mdn-rotator</strong>: inserts a new row in <code class="bg-dark-900 px-1 rounded">sim_numbers</code> after each rotation; sets <code class="bg-dark-900 px-1 rounded">valid_to</code> on the old row. The current MDN is always the row with <code class="bg-dark-900 px-1 rounded">valid_to = null</code>. Initially set by bulk-activator from Helix subscriber details post-activation.</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">Status</td>
+                                        <td class="py-1.5 pr-4 text-accent">sims.status</td>
+                                        <td class="py-1.5 text-gray-300">Written by multiple workers: <strong class="text-white">bulk-activator</strong> &rarr; <code class="bg-dark-900 px-1 rounded">provisioning</code>; <strong class="text-white">details-finalizer</strong> &rarr; <code class="bg-dark-900 px-1 rounded">active</code> when Helix confirms; <strong class="text-white">ota-status-sync</strong> &rarr; syncs every 12 h from Helix; <strong class="text-white">mdn-rotator</strong> / <strong class="text-white">dashboard</strong> actions update on cancel/resume/OTA outcomes.</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">Sub ID</td>
+                                        <td class="py-1.5 pr-4 text-accent">sims.mobility_subscription_id</td>
+                                        <td class="py-1.5 text-gray-300"><strong class="text-white">bulk-activator</strong>: after Helix activation, calls <code class="bg-dark-900 px-1 rounded">subscriber/details</code> for each returned sub ID to confirm the matching ICCID, then writes here. Clicking the Sub ID queries Helix live via the dashboard proxy.</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">Port</td>
+                                        <td class="py-1.5 pr-4 text-accent">sims.port</td>
+                                        <td class="py-1.5 text-gray-300"><strong class="text-white">sms-ingest</strong>: updated on every inbound SMS from the port field in the Skyline webhook payload (converted from dot-notation to letter format, e.g. <code class="bg-dark-900 px-1 rounded">06.01</code> &rarr; <code class="bg-dark-900 px-1 rounded">6A</code>). Also set during fix-sim / retry-activation / manual slot picker.</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">Reseller</td>
+                                        <td class="py-1.5 pr-4 text-accent">reseller_sims.reseller_id<br/>(active = true)</td>
+                                        <td class="py-1.5 text-gray-300">Written by the <strong class="text-white">dashboard</strong> Assign Reseller action (per-row or bulk). A SIM can have multiple historical rows in <code class="bg-dark-900 px-1 rounded">reseller_sims</code>; only the row with <code class="bg-dark-900 px-1 rounded">active=true</code> is shown.</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">SMS (24 h)</td>
+                                        <td class="py-1.5 pr-4 text-accent">get_sms_counts_24h() RPC</td>
+                                        <td class="py-1.5 text-gray-300">Aggregated live from the <code class="bg-dark-900 px-1 rounded">sms_messages</code> table by a Supabase RPC on every page load. Count and last-received timestamp for the last 24 hours. Written by <strong class="text-white">sms-ingest</strong> when messages arrive.</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">Last Rotated</td>
+                                        <td class="py-1.5 pr-4 text-accent">sims.last_mdn_rotated_at</td>
+                                        <td class="py-1.5 text-gray-300"><strong class="text-white">mdn-rotator</strong>: written after each successful MDN rotation (both cron and manual). Used by the rotator itself to skip SIMs already rotated today.</td>
+                                    </tr>
+                                    <tr>
+                                        <td class="py-1.5 pr-4 text-white font-mono">Activated</td>
+                                        <td class="py-1.5 pr-4 text-accent">sims.activated_at</td>
+                                        <td class="py-1.5 text-gray-300"><strong class="text-white">details-finalizer</strong>: set once when the SIM transitions to <code class="bg-dark-900 px-1 rounded">active</code> status. Never overwritten after that.</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">Per-Row Actions (dropdown menu on each SIM)</h4>
                             <ul class="list-disc list-inside space-y-1 ml-2">
@@ -3595,6 +3819,14 @@ function getHTML() {
                                 <li>General connectivity troubleshooting</li>
                             </ul>
                         </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Failure: data_mismatch</h4>
+                            <p>If Helix rejects the OTA request with <span class="text-red-400">"The sim number does not match our records"</span>, the SIM status is automatically set to <code class="bg-dark-900 px-1 rounded text-yellow-400">data_mismatch</code>. This means the subscriber number (MDN) stored in Helix no longer matches what is on record &mdash; typically caused by an out-of-band MDN change. To recover: verify the correct MDN via Helix subscriber details, update the DB record, then retry OTA.</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Failure: helix_timeout</h4>
+                            <p>If Helix rejects the OTA request with <span class="text-red-400">"The requested subscription does not belong to the user."</span>, the SIM status is automatically set to <code class="bg-dark-900 px-1 rounded text-orange-400">helix_timeout</code>. This means Helix cannot locate the subscription under the current account &mdash; typically caused by a subscription being transferred, cancelled on the carrier side, or a credentials mismatch. Investigate the subscription in Helix directly.</p>
+                        </div>
                     </div>
                 </div>
 
@@ -3681,9 +3913,14 @@ function getHTML() {
                                 <li>Skips ICCIDs that already have a <code class="bg-dark-900 px-1 rounded text-accent">mobility_subscription_id</code> (already activated)</li>
                                 <li>Gets Helix bearer token</li>
                                 <li>Sends all SIMs in one call to Helix bulk endpoint (<code class="bg-dark-900 px-1 rounded text-accent">POST /api/mobility-sub-ops/subscription</code>)</li>
+                                <li><span class="text-yellow-300 font-medium">ICCID resolution</span>: the bulk response returns only <code class="bg-dark-900 px-1 rounded text-accent">mobilitySubscriptionId</code>s &mdash; no ICCIDs, and Helix does not guarantee response order matches request order. The worker immediately calls <code class="bg-dark-900 px-1 rounded text-accent">POST /api/mobility-subscriber/details</code> for all successful sub IDs to get the authoritative ICCID for each from Helix, then writes to DB using those ICCIDs.</li>
                                 <li>For each successful activation: upserts SIM record with status <span class="text-yellow-400">provisioning</span>, assigns to reseller</li>
-                                <li>For failed items: logs error to <span class="text-white">system_errors</span> and sets SIM status to <span class="text-red-400">error</span></li>
+                                <li>For failed items: logs error and sets SIM status to <span class="text-red-400">error</span> (failed items do include ICCID in the response)</li>
                             </ol>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Why ICCID resolution matters</h4>
+                            <p>Positional matching (pairing the Nth sub ID to the Nth ICCID we sent) caused SIMs 417&ndash;424 to have their ICCIDs shifted by one position after a bulk run. The fix: always confirm ICCID ownership via <code class="bg-dark-900 px-1 rounded text-accent">subscriber_details</code> before writing to DB. Logged as step <code class="bg-dark-900 px-1 rounded text-accent">post_activation_details</code> in Helix API Logs.</p>
                         </div>
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">After activation</h4>
@@ -3721,12 +3958,21 @@ function getHTML() {
                             <li>Worker authenticates the request via header/query/path secret</li>
                             <li>Parses the SMS body (base64 decodes if JSON format)</li>
                             <li>Resolves the SIM by ICCID or phone number lookup</li>
-                            <li>Auto-links the SIM to the gateway port (updates <code class="bg-dark-900 px-1 rounded text-accent">port</code> and <code class="bg-dark-900 px-1 rounded text-accent">gateway_id</code> on the SIM via MAC address matching)</li>
+                            <li>Auto-links the SIM to the gateway port &mdash; updates <code class="bg-dark-900 px-1 rounded text-accent">port</code> and <code class="bg-dark-900 px-1 rounded text-accent">gateway_id</code> on the SIM using the MAC address in the webhook</li>
                             <li>Generates a deduplication message ID (SHA-256 hash of from+to+body+timestamp)</li>
                             <li>Inserts the message into <code class="bg-dark-900 px-1 rounded text-accent">inbound_sms</code> table</li>
                             <li>Sends webhook to the SIM's assigned reseller (up to 5 retries with exponential backoff)</li>
                             <li>Records delivery result in <code class="bg-dark-900 px-1 rounded text-accent">webhook_deliveries</code> table</li>
                         </ol>
+                        <div class="mt-3 p-3 bg-dark-900 rounded-lg border border-dark-500">
+                            <h4 class="text-white font-medium mb-1">Port Conflict Resolution</h4>
+                            <p>The gateway is the physical source of truth for which SIM occupies a slot. If the incoming SMS reports an ICCID on a port that the DB already attributes to a <em>different</em> SIM, sms-ingest will:</p>
+                            <ol class="list-decimal list-inside space-y-1 ml-2 mt-1">
+                                <li>Clear <code class="bg-dark-900 px-1 rounded text-accent">port</code> and <code class="bg-dark-900 px-1 rounded text-accent">gateway_id</code> on the old SIM (logged as <span class="text-yellow-400">Evicted SIM X from slot Y/Z</span>)</li>
+                                <li>Assign the slot to the SIM whose ICCID just sent the SMS</li>
+                            </ol>
+                            <p class="mt-1">This handles cases where a physical SIM card is replaced in a hardware slot without a corresponding DB update (e.g. after a <span class="text-orange-400">helix_timeout</span> SIM is swapped out).</p>
+                        </div>
                     </div>
                 </div>
 
@@ -3925,6 +4171,16 @@ function getHTML() {
                                         <td class="px-4 py-3"><span class="text-red-400 font-medium">error</span></td>
                                         <td class="px-4 py-3">Operation failed, needs manual intervention</td>
                                         <td class="px-4 py-3">active (via Fix SIM or manual fix)</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3"><span class="text-yellow-300 font-medium">data_mismatch</span></td>
+                                        <td class="px-4 py-3">OTA refresh rejected by Helix &mdash; subscriber number does not match carrier records. MDN in DB may be stale.</td>
+                                        <td class="px-4 py-3">active (after correcting MDN + retrying OTA)</td>
+                                    </tr>
+                                    <tr class="border-b border-dark-700">
+                                        <td class="px-4 py-3"><span class="text-orange-400 font-medium">helix_timeout</span></td>
+                                        <td class="px-4 py-3">OTA refresh rejected &mdash; subscription does not belong to user. Helix cannot locate the subscription under the current account.</td>
+                                        <td class="px-4 py-3">Investigate in Helix; no automatic recovery</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -6394,6 +6650,10 @@ async function sendSimOnline(simId, phoneNumber) {
                 } else {
                     showToast(\`Error: \${result.error || 'Action failed'}\`, 'error');
                 }
+                // Reload SIM table if the action changed the SIM's status
+                if (result.status_updated) {
+                    loadSims(true);
+                }
             } catch (error) {
                 document.getElementById('sim-action-output').textContent = String(error);
                 showToast(\`Error running \${action}\`, 'error');
@@ -7270,6 +7530,22 @@ async function sendSimOnline(simId, phoneNumber) {
         let selectedQboCustomer = null;
         let invoicePreviewData = null;
 
+        async function loadBillingResellers() {
+            try {
+                const resp = await fetch(\`\${API_BASE}/qbo-mappings\`);
+                if (!resp.ok) return;
+                const mappings = await resp.json();
+                const sel = document.getElementById("invoice-reseller");
+                sel.innerHTML = '<option value="">-- Select Reseller --</option>';
+                mappings.forEach(m => {
+                    const opt = document.createElement("option");
+                    opt.value = m.reseller_id || "";
+                    opt.textContent = (m.reseller_name || m.customer_name || m.qbo_display_name) + " — " + m.qbo_display_name;
+                    sel.appendChild(opt);
+                });
+            } catch (e) { console.error("loadBillingResellers:", e); }
+        }
+
         async function loadBillingStatus() {
             try {
                 const resp = await fetch(\`\${API_BASE}/qbo/status\`);
@@ -7281,6 +7557,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     actionsEl.innerHTML = \`<button onclick="disconnectQbo()" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Disconnect</button>\`;
                     loadMappings();
                     loadInvoiceHistory();
+                    loadBillingResellers();
                 } else {
                     statusEl.innerHTML = \`<span class="text-yellow-400">Not connected</span>\`;
                     actionsEl.innerHTML = \`<button onclick="connectQbo()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Connect to QuickBooks</button>\`;
@@ -7430,22 +7707,32 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function previewInvoices() {
-            const weekStart = document.getElementById("invoice-week-start").value;
-            if (!weekStart) { showToast("Select a week start date", "error"); return; }
+            const resellerId = document.getElementById("invoice-reseller").value;
+            const start = document.getElementById("invoice-start").value;
+            const end = document.getElementById("invoice-end").value;
+            if (!resellerId || !start || !end) { showToast("Select reseller and date range", "error"); return; }
             try {
-                const resp = await fetch(\`\${API_BASE}/qbo-invoice-preview?week_start=\${weekStart}\`);
+                const resp = await fetch(\`\${API_BASE}/billing/preview?reseller_id=\${encodeURIComponent(resellerId)}&start=\${start}&end=\${end}\`);
                 const data = await resp.json();
+                if (data.error) { showToast(data.error, "error"); return; }
                 invoicePreviewData = data;
-                if (!data.invoices || data.invoices.length === 0) {
-                    document.getElementById("invoice-preview").innerHTML = '<p class="text-gray-500">No invoices to generate for this period.</p>';
+                if (!data.days || data.days.length === 0) {
+                    document.getElementById("invoice-preview").innerHTML = '<p class="text-gray-500">No billable SIM-days in this range.</p>';
                     document.getElementById("create-invoices-btn").classList.add("hidden");
                     return;
                 }
-                let html = '<table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2">Customer</th><th class="py-2">SIMs</th><th class="py-2">Days</th><th class="py-2">Rate</th><th class="py-2">Total</th></tr></thead><tbody>';
-                data.invoices.forEach(inv => {
-                    html += \`<tr class="border-b border-dark-700"><td class="py-2 text-gray-300">\${inv.customer_name}</td><td class="py-2 text-gray-300">\${inv.sim_count}</td><td class="py-2 text-gray-300">7</td><td class="py-2 text-gray-300">$\${Number(inv.daily_rate).toFixed(2)}</td><td class="py-2 text-accent font-semibold">$\${Number(inv.total).toFixed(2)}</td></tr>\`;
+                if (!data.mapping) {
+                    document.getElementById("invoice-preview").innerHTML = '<p class="text-yellow-400">No QBO mapping for this reseller. Add one in Customer Mapping above.</p>';
+                    document.getElementById("create-invoices-btn").classList.add("hidden");
+                    return;
+                }
+                let html = '<div class="mb-3 text-sm text-gray-400">QBO Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Daily Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span></div>';
+                html += '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2 pr-4">Date (EST)</th><th class="py-2 pr-4">SIMs w/ SMS</th><th class="py-2">Amount</th></tr></thead><tbody>';
+                data.days.forEach(d => {
+                    html += \`<tr class="border-b border-dark-700"><td class="py-2 pr-4 text-gray-300">\${d.date}</td><td class="py-2 pr-4 text-gray-300">\${d.sim_count}</td><td class="py-2 text-gray-300">$\${Number(d.amount).toFixed(2)}</td></tr>\`;
                 });
-                html += "</tbody></table>";
+                html += \`<tr class="border-t border-dark-500"><td class="py-2 pr-4 text-white font-semibold">Total</td><td class="py-2 pr-4 text-white font-semibold">\${data.total_sim_days} SIM-days</td><td class="py-2 text-accent font-bold">$\${Number(data.total_amount).toFixed(2)}</td></tr>\`;
+                html += "</tbody></table></div>";
                 document.getElementById("invoice-preview").innerHTML = html;
                 document.getElementById("create-invoices-btn").classList.remove("hidden");
             } catch (error) {
@@ -7454,29 +7741,33 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function createInvoices() {
-            if (!invoicePreviewData || !invoicePreviewData.invoices) return;
-            const weekStart = document.getElementById("invoice-week-start").value;
-            if (!confirm(\`Create \${invoicePreviewData.invoices.length} invoice(s) in QuickBooks?\`)) return;
+            if (!invoicePreviewData || !invoicePreviewData.days || invoicePreviewData.days.length === 0) return;
+            const resellerId = document.getElementById("invoice-reseller").value;
+            const start = document.getElementById("invoice-start").value;
+            const end = document.getElementById("invoice-end").value;
+            const total = invoicePreviewData.total_amount;
+            if (!confirm(\`Create invoice for $\${Number(total).toFixed(2)} in QuickBooks? (\${invoicePreviewData.total_sim_days} SIM-days)\`)) return;
             try {
-                const resp = await fetch(\`\${API_BASE}/qbo/invoice/create\`, {
+                const resp = await fetch(\`\${API_BASE}/billing/create-invoice\`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ week_start: weekStart })
+                    body: JSON.stringify({ reseller_id: resellerId, start, end }),
                 });
                 const result = await resp.json();
                 if (result.ok) {
-                    showToast(\`Created \${result.created} invoice(s)\`, "success");
+                    showToast(\`Invoice created in QBO — $\${Number(result.total).toFixed(2)}\`, "success");
                     document.getElementById("create-invoices-btn").classList.add("hidden");
+                    document.getElementById("invoice-preview").innerHTML = '';
                     loadInvoiceHistory();
                 } else {
                     showToast("Error: " + (result.error || JSON.stringify(result)), "error");
                 }
             } catch (error) {
-                showToast("Error creating invoices: " + error, "error");
+                showToast("Error creating invoice: " + error, "error");
             }
         }
 
-        async function loadInvoiceHistory() {
+                async function loadInvoiceHistory() {
             try {
                 const resp = await fetch(\`\${API_BASE}/qbo-invoices\`);
                 if (!resp.ok) return;

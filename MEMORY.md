@@ -72,6 +72,13 @@
 - IMEI pool with paginated fetch (all 1576+ IMEIs), retire/restore actions
 - SIM data 30-minute client-side cache with force-reload
 
+## Bulk Activator — ICCID Resolution
+- After bulk activation, Helix returns only sub IDs (no ICCIDs) in the `successful` array. Order is not guaranteed.
+- **Never use positional matching** to pair sub IDs back to ICCIDs.
+- Instead, call `POST /api/mobility-subscriber/details` for all successful sub IDs immediately after activation. Build a `subId → iccid` map from the response. Use Helix's ICCID as the key written to DB.
+- Both `/run` (CSV) and `/activate` (JSON) handlers share `processActivationResults()` which implements this correctly.
+- Failed items in the bulk response DO include `data.iccid` — match those by ICCID directly.
+
 ## Common Pitfalls
 1. **Template literals in `getHTML()`**: The entire frontend is inside a JS template literal (backtick string). Inner template literals must use `\`...\`` and variables use `\${...}`. Do NOT use unescaped backticks or `${...}` inside `getHTML()`. For dynamically built strings, use string concatenation (`+`) instead.
 2. **Supabase 1000-row limit**: `PGRST_MAX_ROWS` defaults to 1000 server-side. `limit=` URL params and `Range` headers **cannot override this**. To fetch >1000 rows, you MUST paginate in batches using Range header offsets (`0-999`, `1000-1999`, ...). See `handleImeiPoolGet` for the pattern.
@@ -92,9 +99,14 @@
 - `SKYLINE_SECRET` — Secret for Skyline gateway API
 - `QBO_*` — QuickBooks credentials
 
+## SIM Statuses
+Allowed values (DB constraint): `pending`, `provisioning`, `active`, `suspended`, `canceled`, `error`, `data_mismatch`
+- **data_mismatch**: Set automatically when OTA refresh is rejected by Helix with "sim number does not match our records". Indicates the MDN stored in DB/Helix is stale. Recover by correcting MDN then retrying OTA.
+
 ## Migrations Applied
 - **006_system_errors**: `system_errors` table for centralized error tracking with resolution workflow
 - **007_imei_pool_cleanup**: Removed `blocked` status from `imei_pool` check constraint
+- **add_data_mismatch_sim_status**: Added `data_mismatch` to `sims.status` CHECK constraint (2026-03-05)
 
 ## Recent Changes (Feb 2026)
 - **Error page redesign**: Queries `system_errors` table + legacy `last_activation_error`. Shows Source, ICCID, Error, Severity, Status, Time columns. Has View/Resolve/OTA buttons per row.
