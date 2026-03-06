@@ -349,8 +349,29 @@ export default {
             await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: helixStatus });
             statusUpdated = { from: sim.status, to: helixStatus };
           }
-          const result = await hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid);
-          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, status_updated: statusUpdated, detail: result }, null, 2), {
+          let otaResult, otaError = null;
+          try {
+            otaResult = await hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid);
+          } catch (otaErr) {
+            if (otaErr.isSimMismatch) {
+              console.log(`[OTA] SIM ${iccid}: sim number mismatch — setting status to data_mismatch`);
+              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: "data_mismatch" });
+              return new Response(JSON.stringify({ ok: false, action, sim_id, iccid, status_updated: { from: sim.status, to: "data_mismatch" }, error: otaErr.message }, null, 2), {
+                status: 200,
+                headers: { "Content-Type": "application/json" }
+              });
+            }
+            if (otaErr.isHelixTimeout) {
+              console.log(`[OTA] SIM ${iccid}: subscription not found — setting status to helix_timeout`);
+              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: "helix_timeout" });
+              return new Response(JSON.stringify({ ok: false, action, sim_id, iccid, status_updated: { from: sim.status, to: "helix_timeout" }, error: otaErr.message }, null, 2), {
+                status: 200,
+                headers: { "Content-Type": "application/json" }
+              });
+            }
+            throw otaErr;
+          }
+          return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, status_updated: statusUpdated, detail: otaResult }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
           });
@@ -1457,9 +1478,44 @@ async function hxOtaRefresh(env, token, payload, runId, iccid) {
     error: res.ok ? null : `OTA Refresh failed: ${res.status}`,
   });
 
+  // Helper: check any error text (body or rejected[].message) for known patterns
+  const allErrorText = [
+    responseText,
+    ...(Array.isArray(json.rejected) ? json.rejected.map(r => r.message || "") : []),
+    json.errorMessage || "",
+    json.message || "",
+  ].join(" ").toLowerCase();
+
   if (!res.ok) {
+    if (allErrorText.includes("does not belong to the user")) {
+      const err = new Error(`OTA Refresh rejected: ${json.errorMessage || responseText}`);
+      err.isHelixTimeout = true;
+      throw err;
+    }
+    if (allErrorText.includes("sim number does not match")) {
+      const err = new Error(`OTA Refresh rejected: ${json.errorMessage || responseText}`);
+      err.isSimMismatch = true;
+      throw err;
+    }
     throw new Error(`OTA Refresh failed: ${res.status} ${JSON.stringify(json)}`);
   }
+
+  // Helix sometimes returns 200 with a rejected array instead of a non-2xx status
+  const rejected = Array.isArray(json.rejected) ? json.rejected : [];
+  const simMismatch = rejected.find(r => r.message && r.message.toLowerCase().includes("sim number does not match"));
+  if (simMismatch) {
+    const err = new Error(`OTA Refresh rejected: ${simMismatch.message}`);
+    err.isSimMismatch = true;
+    throw err;
+  }
+
+  const subNotFound = rejected.find(r => r.message && r.message.toLowerCase().includes("does not belong to the user"));
+  if (subNotFound) {
+    const err = new Error(`OTA Refresh rejected: ${subNotFound.message}`);
+    err.isHelixTimeout = true;
+    throw err;
+  }
+
   return json;
 }
 

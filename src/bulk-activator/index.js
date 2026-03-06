@@ -105,45 +105,9 @@ export default {
         const successfulItems = Array.isArray(bulkResult.successful) ? bulkResult.successful : [];
         const failedItems = Array.isArray(bulkResult.failed) ? bulkResult.failed : [];
 
-        // Process successful: try to match by iccid in response, fall back to index
-        for (let i = 0; i < successfulItems.length; i++) {
-          const item = successfulItems[i];
-          const subId = item?.data?.mobilitySubscriptionId || item?.mobilitySubscriptionId;
-          const responseIccid = item?.data?.service?.iccid || item?.data?.iccid;
-          const meta = responseIccid
-            ? toActivateMeta.find(m => m.iccid === responseIccid) || toActivateMeta[i]
-            : toActivateMeta[i];
-
-          if (!meta || !subId) {
-            errors++;
-            results.push({ ok: false, error: `Bulk success item ${i} missing subId or meta`, raw: item });
-            continue;
-          }
-          try {
-            const simId = await upsertSim(env, meta.iccid, subId);
-            await assignSimToReseller(env, meta.resellerId, simId);
-            processed++;
-            results.push({ iccid: meta.iccid, ok: true, mobilitySubscriptionId: subId, status: "provisioning" });
-          } catch (e) {
-            errors++;
-            results.push({ iccid: meta.iccid, ok: false, error: String(e) });
-            try { await upsertSimError(env, meta.iccid, String(e)); } catch {}
-          }
-        }
-
-        // Process failed
-        for (let i = 0; i < failedItems.length; i++) {
-          const item = failedItems[i];
-          const responseIccid = item?.data?.service?.iccid || item?.data?.iccid;
-          const meta = responseIccid
-            ? toActivateMeta.find(m => m.iccid === responseIccid) || toActivateMeta[successfulItems.length + i]
-            : toActivateMeta[successfulItems.length + i];
-          const errorMsg = item?.error || item?.message || JSON.stringify(item);
-          const iccid = meta?.iccid || responseIccid || `unknown_${i}`;
-          errors++;
-          results.push({ iccid, ok: false, error: errorMsg });
-          try { await upsertSimError(env, iccid, errorMsg); } catch {}
-        }
+        const counts = await processActivationResults(env, token, runId, toActivateMeta, bulkResult, results);
+        processed += counts.processed;
+        errors += counts.errors;
       } catch (e) {
         // Bulk call itself failed — record error for all pending
         errors += toActivateMeta.length;
@@ -236,45 +200,9 @@ async function handleActivateJson(request, env) {
         const successfulItems = Array.isArray(bulkResult.successful) ? bulkResult.successful : [];
         const failedItems = Array.isArray(bulkResult.failed) ? bulkResult.failed : [];
 
-        // Process successful items
-        for (let i = 0; i < successfulItems.length; i++) {
-          const item = successfulItems[i];
-          const subId = item?.data?.mobilitySubscriptionId || item?.mobilitySubscriptionId;
-          const responseIccid = item?.data?.service?.iccid || item?.data?.iccid;
-          const meta = responseIccid
-            ? toActivateMeta.find(m => m.iccid === responseIccid) || toActivateMeta[i]
-            : toActivateMeta[i];
-
-          if (!meta || !subId) {
-            errors++;
-            results.push({ ok: false, error: `Bulk success item ${i} missing subId or meta`, raw: item });
-            continue;
-          }
-          try {
-            const simId = await upsertSim(env, meta.iccid, subId);
-            await assignSimToReseller(env, meta.resellerId, simId);
-            processed++;
-            results.push({ iccid: meta.iccid, ok: true, mobilitySubscriptionId: subId, status: "provisioning" });
-          } catch (e) {
-            errors++;
-            results.push({ iccid: meta.iccid, ok: false, error: String(e) });
-            try { await upsertSimError(env, meta.iccid, String(e)); } catch {}
-          }
-        }
-
-        // Process failed items
-        for (let i = 0; i < failedItems.length; i++) {
-          const item = failedItems[i];
-          const responseIccid = item?.data?.service?.iccid || item?.data?.iccid;
-          const meta = responseIccid
-            ? toActivateMeta.find(m => m.iccid === responseIccid) || toActivateMeta[successfulItems.length + i]
-            : toActivateMeta[successfulItems.length + i];
-          const errorMsg = item?.error || item?.message || JSON.stringify(item);
-          const iccid = meta?.iccid || responseIccid || `unknown_${i}`;
-          errors++;
-          results.push({ iccid, ok: false, error: errorMsg });
-          try { await upsertSimError(env, iccid, errorMsg); } catch {}
-        }
+        const counts = await processActivationResults(env, token, runId, toActivateMeta, bulkResult, results);
+        processed += counts.processed;
+        errors += counts.errors;
       } catch (e) {
         errors += toActivateMeta.length;
         for (const meta of toActivateMeta) {
@@ -434,6 +362,121 @@ async function hxBulkActivateSub(env, token, activationObjects, runId) {
   }
 
   return responseJson;
+}
+
+/* ================= POST-ACTIVATION ICCID RESOLUTION ================= */
+
+// After bulk activation, Helix returns only mobilitySubscriptionIds — no ICCIDs.
+// Positional matching is unreliable because Helix does not guarantee response order.
+// This function calls subscriber_details for each successful sub ID to get the
+// authoritative ICCID from Helix, then writes to DB using that ICCID.
+async function processActivationResults(env, token, runId, toActivateMeta, bulkResult, results) {
+  let processed = 0;
+  let errors = 0;
+  const successfulItems = Array.isArray(bulkResult.successful) ? bulkResult.successful : [];
+  const failedItems = Array.isArray(bulkResult.failed) ? bulkResult.failed : [];
+
+  // Step 1: collect all sub IDs from successful responses
+  const successfulSubIds = successfulItems
+    .map(item => item?.data?.mobilitySubscriptionId || item?.mobilitySubscriptionId)
+    .filter(Boolean)
+    .map(String);
+
+  // Step 2: fetch authoritative ICCID for each sub ID from Helix
+  const subIdToIccid = successfulSubIds.length > 0
+    ? await hxBuildSubIdToIccidMap(env, token, successfulSubIds, runId)
+    : {};
+
+  // Step 3: write to DB using Helix's ICCID (not positional index)
+  for (const item of successfulItems) {
+    const subId = String(item?.data?.mobilitySubscriptionId || item?.mobilitySubscriptionId || "");
+    const helixIccid = subIdToIccid[subId];
+
+    if (!subId || !helixIccid) {
+      errors++;
+      results.push({ ok: false, error: `SubId ${subId || "?"} — no ICCID returned by Helix subscriber_details` });
+      continue;
+    }
+
+    // Match reseller from the ICCID we originally sent for this sub
+    const meta = toActivateMeta.find(m => m.iccid === helixIccid);
+    if (!meta) {
+      // Helix returned an ICCID we didn't send — unexpected but handle gracefully
+      console.warn(`[bulk] subId ${subId}: Helix ICCID ${helixIccid} was not in our batch`);
+    }
+
+    try {
+      const simId = await upsertSim(env, helixIccid, subId);
+      if (meta?.resellerId) await assignSimToReseller(env, meta.resellerId, simId);
+      processed++;
+      results.push({ iccid: helixIccid, ok: true, mobilitySubscriptionId: subId, status: "provisioning" });
+    } catch (e) {
+      errors++;
+      results.push({ iccid: helixIccid, ok: false, error: String(e) });
+      try { await upsertSimError(env, helixIccid, String(e)); } catch {}
+    }
+  }
+
+  // Failed items DO include the ICCID in data — match by that
+  for (let i = 0; i < failedItems.length; i++) {
+    const item = failedItems[i];
+    const responseIccid = item?.data?.service?.iccid || item?.data?.iccid;
+    const meta = responseIccid ? toActivateMeta.find(m => m.iccid === responseIccid) : null;
+    const errorMsg = item?.error || item?.message || JSON.stringify(item);
+    const iccid = responseIccid || meta?.iccid || `unknown_${i}`;
+    errors++;
+    results.push({ iccid, ok: false, error: errorMsg });
+    try { await upsertSimError(env, iccid, errorMsg); } catch {}
+  }
+
+  return { processed, errors };
+}
+
+// Batch-calls Helix subscriber_details for a list of sub IDs.
+// Returns a map of { subId (string) -> iccid (string) }.
+async function hxBuildSubIdToIccidMap(env, token, subIds, runId) {
+  const url = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
+  const body = subIds.map(id => ({ mobilitySubscriptionId: String(id) }));
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const responseText = await res.text();
+  let json = [];
+  try { json = JSON.parse(responseText); } catch {}
+
+  logHelixApiCall(env, {
+    run_id: runId,
+    step: "post_activation_details",
+    request_url: url,
+    request_method: "POST",
+    request_body: body,
+    response_status: res.status,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: json,
+    error: res.ok ? null : `post-activation subscriber_details failed: ${res.status}`,
+  }).catch(e => console.error(`[Helix Log] Failed: ${e}`));
+
+  if (!res.ok) {
+    throw new Error(`post-activation subscriber_details failed ${res.status}: ${responseText.slice(0, 300)}`);
+  }
+
+  const map = {};
+  if (Array.isArray(json)) {
+    for (const entry of json) {
+      const subId = String(entry.mobilitySubscriptionId || "");
+      const iccid = entry.iccid || "";
+      if (subId && iccid) map[subId] = iccid;
+    }
+  }
+  return map;
 }
 
 /* ================= SUPABASE (SAFE) ================= */
