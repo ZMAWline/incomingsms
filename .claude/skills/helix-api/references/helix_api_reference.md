@@ -1,6 +1,6 @@
 # Helix SOLO API Mobility Reference
 
-**Last Updated:** 2026-02-27 (from SOLO API Mobility Docs v1.4)
+**Last Updated:** 2026-03-06 (from SOLO API Mobility Docs v1.4)
 
 ## Overview
 
@@ -301,8 +301,21 @@ Get detailed subscriber information.
 
 **Key response fields:**
 - `status` — `ACTIVATED`, `SUSPENDED`, `CANCELED` (also seen as `ACTIVE` in real responses)
-- `attBan` — BAN needed for OTA Refresh
+- `attBan` — BAN needed for OTA Refresh (4.11)
 - `mobilitySubscriptionId` — the SOLO unique identifier (Customer ID in UI)
+- `phoneNumber` — current MDN (10-digit, no country code)
+- `iccid` — SIM card ICCID as known by Helix — **authoritative for ICCID verification**
+- `billingImei` — IMEI on file with AT&T — may differ from gateway IMEI if change_imei flow partially failed
+- `activatedAt` — ISO timestamp of activation — used to backfill `sims.activated_at` if DB is null
+
+**DB sync rules (via `syncSimFromHelixDetails` in `src/shared/subscriber-sync.js`):**
+| Field | DB column | Sync action |
+|---|---|---|
+| `iccid` | `sims.iccid` | Verify match; log error if mismatch, do NOT auto-fix |
+| `phoneNumber` | `sim_numbers.e164` | Sync only during finalization (provisioning→active); log mismatch for active SIMs |
+| `billingImei` | `sims.imei` | Log warning if mismatch, do NOT auto-fix |
+| `activatedAt` | `sims.activated_at` | Backfill if DB is null |
+| `status` | (skip) | Status is governed by OTA refresh (4.11) only |
 
 ---
 
@@ -432,6 +445,8 @@ Activate multiple SIMs in one call.
 ```json
 { "successful": [{ "data": { ...activation_data... } }], "failed": [] }
 ```
+
+> ⚠️ **DO NOT USE for our system.** The bulk response returns sub IDs in non-deterministic order with no ICCIDs — positional matching to the request array is unreliable. Use individual activation (4.2) via queue instead. See "Project-Specific Workflows" at the bottom of this document.
 
 ---
 
@@ -584,6 +599,56 @@ When `lastPage: true`, there are no more pages.
 | OTA rejected | Wrong BAN | Get `attBan` from 4.7 response |
 | MDN change failed | ZIP mismatch for new area code | Update address via 4.4 first |
 | Voicemail reset 400 | BAN must be exactly 12 chars | Pad or verify BAN length |
+
+---
+
+---
+
+## Project-Specific Workflows
+
+### Activation (Queue-Based Individual Activation)
+
+We use individual activation (4.2) via a Cloudflare Queue — **never the bulk endpoint (4.13)**.
+
+**Why:** Bulk response returns sub IDs with no ICCIDs, in non-deterministic order — impossible to reliably match back to the ICCID that was sent.
+
+**Flow:**
+1. `/run` (CSV) or `POST /activate` (JSON) to `bulk-activator` worker — validates input, enqueues each SIM
+2. `sim-activation-queue` consumer picks up one SIM at a time
+3. Calls `POST /api/mobility-activation/activate` with `service: { iccid, imei }` — response immediately contains the `mobilitySubscriptionId` for that exact ICCID
+4. Upserts `sims` row: `mobility_subscription_id`, `status = 'provisioning'`
+5. `details-finalizer` cron (every 5 min) picks up provisioning SIMs → calls 4.7 → runs `syncSimFromHelixDetails` → sets `status = 'active'` when MDN is assigned
+
+**Request body for individual activation:**
+```json
+{
+  "clientId": 230,
+  "plan": { "id": 985 },
+  "BAN": "123456789012",
+  "FAN": "63654144",
+  "activationType": "new_activation",
+  "subscriber": { "firstName": "SUB", "lastName": "NINE" },
+  "address": { "address1": "...", "city": "...", "state": "TX", "zipCode": "75001" },
+  "service": { "iccid": "89014104334567890123", "imei": "356415123456789" }
+}
+```
+
+---
+
+### Subscriber Details Sync
+
+Any time 4.7 is called in our system, `syncSimFromHelixDetails` from `src/shared/subscriber-sync.js` is also called to keep the DB in sync with Helix. Called from:
+- `details-finalizer` (finalization: provisioning → active)
+- `mdn-rotator` (before OTA refresh, cancel, resume, fix-sim)
+- `ota-status-sync` (every 12h status sync)
+
+The `simRow` passed to it must include: `id, iccid, status, imei, activated_at, mobility_subscription_id`.
+
+**Conflict resolution rules:**
+- **ICCID mismatch**: log error, skip MDN sync entirely, do NOT auto-fix. With individual activation this should never occur.
+- **IMEI mismatch**: log warning only. `sims.imei` reflects what's on the physical gateway; `billingImei` is what AT&T has. Divergence means a change_imei flow partially failed — fix the root cause, don't paper over it.
+- **MDN mismatch** (active SIMs): log warning only. `mdn-rotator` manages MDN changes with its own sim_numbers logic; auto-fixing here would create race conditions.
+- **`activated_at` missing in DB**: backfill from `activatedAt` in response — safe to always trust Helix here.
 
 ---
 

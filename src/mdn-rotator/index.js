@@ -1,3 +1,5 @@
+import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
+
 // =========================================================
 // MDN ROTATOR WORKER
 // Daily phone number rotation at 5:00 AM UTC
@@ -112,7 +114,7 @@ export default {
         // Load SIM from DB
         const sims = await supabaseSelect(
           env,
-          `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,status&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`
+          `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,status,imei,activated_at&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`
         );
         if (!Array.isArray(sims) || sims.length === 0) {
           return new Response(JSON.stringify({ ok: false, error: `SIM not found: ${sim_id}` }), {
@@ -324,6 +326,9 @@ export default {
         const subscriberNumber = d?.phoneNumber;
         const attBan = d?.attBan || d?.ban || null;
 
+        // Sync DB with Helix details (activated_at backfill, ICCID/IMEI mismatch logging)
+        syncSimFromHelixDetails(env, sim, d).catch(e => console.warn(`[SyncDetails] sim_id=${sim.id}: ${e}`));
+
         if (!subscriberNumber) {
           return new Response(JSON.stringify({ ok: false, error: `No phoneNumber from Helix for SIM ${iccid}` }), {
             status: 500,
@@ -371,6 +376,19 @@ export default {
             }
             throw otaErr;
           }
+          // Update DB based on fulfilled[0].status from OTA response
+          const fulfilledStatus = otaResult && otaResult.fulfilled && otaResult.fulfilled[0] && otaResult.fulfilled[0].status;
+          if (fulfilledStatus) {
+            const otaStatusMap = { Active: "active", ACTIVE: "active", ACTIVATED: "active", Suspended: "suspended", SUSPENDED: "suspended", Canceled: "canceled", CANCELED: "canceled" };
+            const otaDbStatus = otaStatusMap[fulfilledStatus] || null;
+            const currentDbStatus = statusUpdated ? statusUpdated.to : sim.status;
+            if (otaDbStatus && otaDbStatus !== currentDbStatus) {
+              console.log(`[OTA] SIM ${iccid}: fulfilled=${fulfilledStatus} → updating DB ${currentDbStatus} → ${otaDbStatus}`);
+              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: otaDbStatus });
+              statusUpdated = { from: currentDbStatus, to: otaDbStatus };
+            }
+          }
+
           return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, status_updated: statusUpdated, detail: otaResult }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
@@ -385,6 +403,7 @@ export default {
             reasonCodeId: 1,
             subscriberState: "Cancel",
           }, runId, iccid, "manual_cancel");
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: 'canceled' });
           return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
@@ -399,6 +418,7 @@ export default {
             reasonCodeId: 20,
             subscriberState: "Resume On Cancel",
           }, runId, iccid, "manual_resume");
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: 'active' });
           return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
@@ -748,6 +768,21 @@ async function rotateSingleSim(env, token, sim) {
     return;
   }
 
+  // Dedup check: skip if already rotated today (catches duplicate queue messages from multi-cron)
+  const estOffsetMs = -5 * 60 * 60 * 1000;
+  const estNow = new Date(Date.now() + estOffsetMs);
+  const todayMidnightEst = new Date(Date.UTC(estNow.getUTCFullYear(), estNow.getUTCMonth(), estNow.getUTCDate(), 5, 0, 0)).toISOString();
+  if (sim.last_mdn_rotated_at && sim.last_mdn_rotated_at >= todayMidnightEst) {
+    console.log(`SIM ${iccid}: already rotated today (${sim.last_mdn_rotated_at}), skipping duplicate queue message`);
+    return;
+  }
+  // Re-check current DB value (queue message may be stale from an earlier cron run)
+  const freshSim = await supabaseSelectOne(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}&select=last_mdn_rotated_at`);
+  if (freshSim && freshSim.last_mdn_rotated_at && freshSim.last_mdn_rotated_at >= todayMidnightEst) {
+    console.log(`SIM ${iccid}: DB confirms already rotated today (${freshSim.last_mdn_rotated_at}), skipping`);
+    return;
+  }
+
   // Generate unique run_id for this rotation operation
   const runId = `rotate_${iccid}_${Date.now()}`;
 
@@ -759,6 +794,14 @@ async function rotateSingleSim(env, token, sim) {
   const d = Array.isArray(details) ? details[0] : null;
   const phoneNumber = d?.phoneNumber;
   const detailsIccid = d?.iccid || iccid;
+
+  // Skip rotation if Helix subscriber is already canceled
+  const rotateHelixStatus = d?.status ? String(d.status).toLowerCase() : null;
+  if (rotateHelixStatus === 'canceled' || rotateHelixStatus === 'cancelled') {
+    console.log(`SIM ${iccid}: subscriber is CANCELED in Helix — updating DB and skipping rotation`);
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { status: 'canceled' });
+    return;
+  }
 
   if (!phoneNumber) {
     throw new Error(`No phoneNumber returned for SUBID ${subId}`);
@@ -978,7 +1021,7 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   // Load SIM details from DB
   const sims = await supabaseSelect(
     env,
-    `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,slot,current_imei_pool_id&id=eq.${encodeURIComponent(String(simId))}&limit=1`
+    `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,slot,current_imei_pool_id,status,imei,activated_at&id=eq.${encodeURIComponent(String(simId))}&limit=1`
   );
   if (!Array.isArray(sims) || sims.length === 0) {
     throw new Error(`SIM not found: ${simId}`);
@@ -1015,6 +1058,9 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   const d = Array.isArray(details) ? details[0] : null;
   const subscriberNumber = d?.phoneNumber;
   const attBan = d?.attBan || d?.ban || null;
+
+  // Sync DB with Helix details (activated_at backfill, ICCID/IMEI mismatch logging)
+  syncSimFromHelixDetails(env, sim, d).catch(e => console.warn(`[SyncDetails] sim_id=${sim.id}: ${e}`));
 
   if (!subscriberNumber) {
     throw new Error(`SIM ${iccid}: no phoneNumber from Helix`);
@@ -1772,6 +1818,11 @@ async function supabaseSelect(env, path) {
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Supabase SELECT failed: ${res.status} ${JSON.stringify(json)}`);
   return json;
+}
+
+async function supabaseSelectOne(env, path) {
+  const rows = await supabaseSelect(env, path + '&limit=1');
+  return Array.isArray(rows) ? rows[0] || null : null;
 }
 
 async function supabasePatch(env, path, bodyObj) {

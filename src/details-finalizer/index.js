@@ -1,246 +1,159 @@
 // =========================================================
 // DETAILS FINALIZER WORKER
-// Finalizes SIM provisioning by getting phone numbers from Helix
+// Cron: every 5 minutes.
+// For each provisioning SIM with a sub_id, calls Helix subscriber_details,
+// syncs DB via syncSimFromHelixDetails, then sets status=active once MDN is assigned.
 // =========================================================
+
+import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
-    if (url.pathname !== "/run") {
-      return new Response("details-finalizer ok. Use /run?secret=...", { status: 200 });
+    if (url.pathname !== '/run') {
+      return new Response('details-finalizer ok. Use /run?secret=...', { status: 200 });
     }
-
-    const secret = url.searchParams.get("secret") || "";
+    const secret = url.searchParams.get('secret') || '';
     if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
-      return new Response("Unauthorized", { status: 401 });
+      return new Response('Unauthorized', { status: 401 });
     }
-
-    const limitParam = url.searchParams.get("limit");
+    const limitParam = url.searchParams.get('limit');
     const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 1, 1) : 1000;
-
     const result = await runFinalizer(env, limit);
     return json(result);
   },
 
   async scheduled(event, env, ctx) {
-    const limit = 25;
-    ctx.waitUntil(runFinalizer(env, limit));
-  }
+    ctx.waitUntil(runFinalizer(env, 25));
+  },
 };
 
-/* ---------------- core runner ---------------- */
+/* ── Core runner ──────────────────────────────────────────────────────────── */
 
 async function runFinalizer(env, limit) {
   const token = await hxGetBearerToken(env);
 
   const sims = await supabaseSelect(
     env,
-    `sims?select=id,iccid,mobility_subscription_id,status&status=eq.provisioning&limit=${limit}`
+    `sims?select=id,iccid,mobility_subscription_id,status,imei,activated_at&status=eq.provisioning&limit=${limit}`
   );
 
   let processed = 0;
   let activated = 0;
-  let corrected = 0;
-
-  // ── Pass 1: call Helix for every SIM, detect ICCID mismatches ──────────
-  // corrections: rows where Helix's ICCID differs from what we have in DB.
-  // Each entry records the wrong DB row (wrongSimId) and the sub_id that
-  // belongs to a different ICCID (helixIccid).
-  const corrections = []; // { wrongSimId, subId, helixIccid }
-  const detailsCache = {}; // subId -> Helix details object (for activation pass)
+  let errors = 0;
 
   for (const sim of sims) {
     processed++;
     const subId = sim.mobility_subscription_id;
     if (!subId) continue;
 
-    let details;
+    let d;
     try {
-      details = await hxSubscriberDetails(env, token, subId);
+      const details = await hxSubscriberDetails(env, token, subId);
+      d = Array.isArray(details) ? details[0] : details;
     } catch (e) {
-      console.log(`SUBID ${subId}: details error`, String(e));
+      console.error(`[Finalizer] subId=${subId} iccid=${sim.iccid}: subscriber_details failed: ${e}`);
+      errors++;
       continue;
     }
 
-    const d = Array.isArray(details) ? details[0] : null;
-    detailsCache[subId] = d;
-
-    const helixIccid = d?.iccid ? String(d.iccid).trim() : null;
-    if (helixIccid && helixIccid !== sim.iccid) {
-      console.log(`[Finalizer] ICCID mismatch sub ${subId}: DB=${sim.iccid} Helix=${helixIccid}`);
-      corrections.push({ wrongSimId: sim.id, subId, helixIccid });
-    }
-  }
-
-  // ── Pass 2: fix mismatched sub_id ↔ ICCID assignments ──────────────────
-  // Step 2a: null out sub_id on every wrong row first (avoids unique conflicts).
-  for (const { wrongSimId } of corrections) {
-    await supabasePatch(
-      env,
-      `sims?id=eq.${encodeURIComponent(String(wrongSimId))}`,
-      { mobility_subscription_id: null }
-    );
-  }
-  // Step 2b: assign sub_id to the DB row that actually has Helix's ICCID.
-  for (const { helixIccid, subId } of corrections) {
-    const rows = await supabaseSelect(
-      env,
-      `sims?iccid=eq.${encodeURIComponent(helixIccid)}&select=id&limit=1`
-    );
-    const correctSim = rows[0];
-    if (!correctSim) {
-      console.error(`[Finalizer] No DB row for Helix ICCID ${helixIccid} (sub ${subId}) — cannot correct`);
-      continue;
-    }
-    await supabasePatch(
-      env,
-      `sims?id=eq.${encodeURIComponent(String(correctSim.id))}`,
-      { mobility_subscription_id: Number(subId) }
-    );
-    corrected++;
-    console.log(`[Finalizer] Corrected: sub ${subId} → SIM ${correctSim.id} (iccid=${helixIccid})`);
-  }
-
-  // ── Pass 3: activate — re-query so we have the corrected sub_id mapping ─
-  const freshSims = corrected > 0
-    ? await supabaseSelect(env, `sims?select=id,iccid,mobility_subscription_id,status&status=eq.provisioning&limit=${limit}`)
-    : sims;
-
-  for (const sim of freshSims) {
-    const subId = sim.mobility_subscription_id;
-    if (!subId) continue;
-
-    const d = detailsCache[subId];
-    const phoneNumber = d?.phoneNumber;
-
-    if (!phoneNumber) {
-      console.log(`SUBID ${subId}: phoneNumber still null, skipping`);
+    let synced;
+    try {
+      synced = await syncSimFromHelixDetails(env, sim, d, { isFinalization: true });
+    } catch (e) {
+      console.error(`[Finalizer] sim_id=${sim.id}: sync failed: ${e}`);
+      errors++;
       continue;
     }
 
-    const e164 = normalizeUS(phoneNumber);
+    if (synced.iccidMismatch) {
+      // Logged by syncSimFromHelixDetails — skip until manually resolved
+      errors++;
+      continue;
+    }
 
-    await closeCurrentNumber(env, sim.id);
-    await insertNewNumber(env, sim.id, e164);
+    if (synced.statusUpdated) {
+      // Helix returned suspended/canceled/helix_timeout — DB already updated, do not activate
+      console.log(`[Finalizer] sim_id=${sim.id}: Helix status → ${synced.statusUpdated}, skipping activation`);
+      continue;
+    }
+
+    if (!synced.phoneNumber) {
+      // Helix hasn't assigned an MDN yet — will retry on next cron run
+      console.log(`[Finalizer] sim_id=${sim.id} iccid=${sim.iccid}: no MDN yet, will retry`);
+      continue;
+    }
+
+    // MDN is set — activate the SIM
+    const activatedAt = synced.activatedAt || sim.activated_at || new Date().toISOString();
     await supabasePatch(
       env,
       `sims?id=eq.${encodeURIComponent(String(sim.id))}`,
-      { status: "active", status_reason: null, activated_at: new Date().toISOString() }
+      { status: 'active', status_reason: null, activated_at: activatedAt }
     );
-
     activated++;
-    console.log(`SIM ${sim.iccid}: activated with number ${e164}`);
+    console.log(`[Finalizer] SIM ${sim.iccid} (id=${sim.id}): activated with MDN ${synced.phoneNumber}`);
   }
 
-  return { ok: true, processed, activated, corrected };
+  return { ok: true, processed, activated, errors };
 }
 
-/* ---------------- helpers  ---------------- */
-
-function json(obj) {
-  return new Response(JSON.stringify(obj, null, 2), {
-    headers: { "Content-Type": "application/json" }
-  });
-}
-
-function normalizeUS(phone) {
-  const d = String(phone).replace(/\D/g, "");
-  if (d.length === 10) return `+1${d}`;
-  if (d.length === 11 && d.startsWith("1")) return `+${d}`;
-  return phone;
-}
-
-/* ---------------- Helix ---------------- */
+/* ── Helix ────────────────────────────────────────────────────────────────── */
 
 async function hxGetBearerToken(env) {
   const res = await fetch(env.HX_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      grant_type: "password",
+      grant_type: 'password',
       client_id: env.HX_CLIENT_ID,
       audience: env.HX_AUDIENCE,
       username: env.HX_GRANT_USERNAME,
-      password: env.HX_GRANT_PASSWORD
-    })
+      password: env.HX_GRANT_PASSWORD,
+    }),
   });
-
   const data = await res.json();
-  if (!res.ok || !data.access_token) {
-    throw new Error("Failed to get Helix token");
-  }
+  if (!res.ok || !data.access_token) throw new Error('Failed to get Helix token');
   return data.access_token;
 }
 
 async function hxSubscriberDetails(env, token, mobilitySubscriptionId) {
   const res = await fetch(`${env.HX_API_BASE}/api/mobility-subscriber/details`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`
-    },
-    body: JSON.stringify({ mobilitySubscriptionId })
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ mobilitySubscriptionId }),
   });
-
   const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`Details failed ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`subscriber_details failed ${res.status}`);
   return data;
 }
 
-/* ---------------- Supabase ---------------- */
+/* ── Supabase ─────────────────────────────────────────────────────────────── */
 
 async function supabaseSelect(env, path) {
   const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`
-    }
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
   });
-  return await res.json();
+  if (!res.ok) throw new Error(`Supabase SELECT ${res.status}: ${await res.text().catch(() => '')}`);
+  return res.json();
 }
 
 async function supabasePatch(env, path, body) {
   const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "PATCH",
+    method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json"
+      'Content-Type': 'application/json',
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error("Supabase patch failed");
+  if (!res.ok) throw new Error(`Supabase PATCH ${res.status}: ${await res.text().catch(() => '')}`);
 }
 
-async function supabaseInsert(env, table, rows) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: "POST",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(rows)
-  });
-  if (!res.ok) throw new Error("Supabase insert failed");
-}
-
-async function closeCurrentNumber(env, simId) {
-  await supabasePatch(
-    env,
-    `sim_numbers?sim_id=eq.${simId}&valid_to=is.null`,
-    { valid_to: new Date().toISOString() }
-  );
-}
-
-async function insertNewNumber(env, simId, e164) {
-  await supabaseInsert(env, "sim_numbers", [{
-    sim_id: simId,
-    e164,
-    valid_from: new Date().toISOString(),
-    verification_status: "verified",
-  }]);
+function json(obj) {
+  return new Response(JSON.stringify(obj, null, 2), { headers: { 'Content-Type': 'application/json' } });
 }

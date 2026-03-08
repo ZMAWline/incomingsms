@@ -24,10 +24,6 @@ export default {
     return json(result, 200);
   },
 
-  async scheduled(event, env, ctx) {
-    const limit = clampInt(env.CRON_BATCH, 1, 1000, 100);
-    ctx.waitUntil(runResellerSync(env, limit));
-  },
 };
 
 /* ---------------- Core ---------------- */

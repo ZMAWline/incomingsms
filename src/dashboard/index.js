@@ -286,7 +286,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=500`;
+    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=5000`;
 
     // Apply status filter
     if (statusFilter) {
@@ -3163,7 +3163,7 @@ function getHTML() {
                                   <span class="text-gray-600">&#8211;</span>
                                   <input id="filter-activated-to" type="date" oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent" title="Activated to">
                                 </label>
-                                <input id="sims-search" type="text" placeholder="Search all fields..." oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-48">
+                                <input id="sims-search" type="text" placeholder="Search... (comma-separated for multiple)" oninput="renderSims()" onpaste="normalizePastedSearch(this,event,renderSims)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-48">
                                 <span id="sims-count" class="text-sm text-gray-500"></span>
                             </div>
                         </div>
@@ -3807,7 +3807,7 @@ function getHTML() {
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">Nightly Cron (automatic)</h4>
                             <ol class="list-decimal list-inside space-y-1 ml-2">
-                                <li>Cron fires at <span class="text-white font-medium">05:00 UTC</span> on the mdn-rotator worker</li>
+                                <li>Cron fires every 20 min from <span class="text-white font-medium">midnight to noon EST</span> (05:00&ndash;17:00 UTC) on the mdn-rotator worker</li>
                                 <li>All SIMs with status <code class="bg-dark-900 px-1 rounded text-accent">active</code> are queued to <span class="text-white font-medium">MDN_QUEUE</span></li>
                                 <li>Queue processes batches of 10, concurrency 1 (sequential batches)</li>
                                 <li>For each SIM:
@@ -3850,6 +3850,10 @@ function getHTML() {
                                 <li>Calls Helix OTA endpoint (<code class="bg-dark-900 px-1 rounded text-accent">PATCH /api/mobility-subscriber/ota</code>) with those three fields</li>
                                 <li>Helix pushes the updated profile to the SIM over the air</li>
                             </ol>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Status update</h4>
+                            <p>The OTA response includes the current subscriber status. If the status is <span class="text-yellow-400">Suspended</span> or <span class="text-red-400">Canceled</span>, the SIM status in DB is automatically updated to match. This means running OTA on a suspended SIM will correctly reflect <code class="bg-dark-900 px-1 rounded text-accent">suspended</code> in the dashboard.</p>
                         </div>
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">When to use</h4>
@@ -4159,7 +4163,7 @@ function getHTML() {
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">Webhook events</h4>
                             <ul class="list-disc list-inside space-y-1 ml-2">
-                                <li><span class="text-white font-medium">number.online</span> &mdash; Sent after MDN rotation when a new phone number is verified and ready. Includes the phone number, ICCID, and <code class="bg-dark-900 px-1 rounded text-accent">online_until</code> timestamp (next 05:00 UTC rotation). Also sent by reseller-sync cron.</li>
+                                <li><span class="text-white font-medium">number.online</span> &mdash; Sent after MDN rotation when a new phone number is verified and ready. Includes the phone number, ICCID, and <code class="bg-dark-900 px-1 rounded text-accent">online_until</code> timestamp (next 05:00 UTC rotation).</li>
                                 <li><span class="text-white font-medium">sms.received</span> &mdash; Sent when an incoming SMS is received for a SIM assigned to the reseller. Includes from/to numbers, message body, and dedup message_id.</li>
                                 <li><span class="text-white font-medium">sim.cancelled</span> &mdash; Sent when a SIM is canceled.</li>
                                 <li><span class="text-white font-medium">sim.suspended</span> &mdash; Sent when a SIM is suspended.</li>
@@ -4886,9 +4890,22 @@ function getHTML() {
             });
         }
 
+        function normalizePastedSearch(el, e, cb) {
+            var NL = String.fromCharCode(10);
+            var CR = String.fromCharCode(13);
+            var text = (e.clipboardData||window.clipboardData).getData('text');
+            if (text.indexOf(NL) === -1 && text.indexOf(CR) === -1) return;
+            e.preventDefault();
+            var normalized = text.split(new RegExp('[' + CR + NL + ']+')).map(function(s){return s.trim();}).filter(Boolean).join(',');
+            var s = el.selectionStart, end = el.selectionEnd;
+            el.value = el.value.slice(0, s) + normalized + el.value.slice(end);
+            cb();
+        }
+
         function matchesSearch(obj, query) {
             if (!query) return true;
-            const q = query.toLowerCase();
+            const terms = query.split(/[,;\\n\\r]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+            if (!terms.length) return true;
             const DATE_FIELDS = ['activated_at','last_sms_received','last_mdn_rotated_at','created_at','updated_at'];
             const strings = Object.entries(obj).flatMap(([k, v]) => {
               if (v == null) return [];
@@ -4899,7 +4916,8 @@ function getHTML() {
               }
               return [base];
             });
-            return strings.some(s => s.toLowerCase().includes(q));
+            const lowerStrings = strings.map(s => s.toLowerCase());
+            return terms.some(term => lowerStrings.some(s => s.includes(term)));
         }
 
 

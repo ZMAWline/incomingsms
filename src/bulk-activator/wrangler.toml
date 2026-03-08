@@ -8,6 +8,17 @@ workers_dev = true
 enabled = true
 invocation_logs = true
 
+# Queue: one SIM at a time, max 5 per batch, retry up to 2x on crash
+[[queues.producers]]
+queue = "sim-activation-queue"
+binding = "ACTIVATION_QUEUE"
+
+[[queues.consumers]]
+queue = "sim-activation-queue"
+max_batch_size = 5
+max_retries = 2
+max_concurrency = 1
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "bulk-activator-test"
@@ -15,3 +26,13 @@ name = "bulk-activator-test"
 [env.test.observability.logs]
 enabled = true
 invocation_logs = true
+
+[[env.test.queues.producers]]
+queue = "sim-activation-queue-test"
+binding = "ACTIVATION_QUEUE"
+
+[[env.test.queues.consumers]]
+queue = "sim-activation-queue-test"
+max_batch_size = 5
+max_retries = 2
+max_concurrency = 1

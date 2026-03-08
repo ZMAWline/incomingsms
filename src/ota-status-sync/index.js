@@ -5,6 +5,8 @@
 //   2. Run OTA refresh via Helix
 //   3. Extract the status from the response and update sims.status in DB
 
+import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -35,7 +37,7 @@ export default {
 async function runOtaStatusSync(env) {
   const sims = await supabaseSelect(
     env,
-    "sims?select=id,iccid,mobility_subscription_id&mobility_subscription_id=not.is.null&status=in.(active,suspended)&order=id.asc&limit=10000"
+    "sims?select=id,iccid,mobility_subscription_id,status,imei,activated_at&mobility_subscription_id=not.is.null&status=in.(active,suspended)&order=id.asc&limit=10000"
   );
 
   if (!Array.isArray(sims) || sims.length === 0) {
@@ -74,6 +76,9 @@ async function syncSimStatus(env, token, sim) {
   const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
   const d = Array.isArray(details) ? details[0] : null;
   const phoneNumber = d && d.phoneNumber;
+
+  // Sync DB with Helix details (activated_at backfill, ICCID/IMEI mismatch logging)
+  syncSimFromHelixDetails(env, sim, d).catch(e => console.warn(`[SyncDetails] sim_id=${sim.id}: ${e}`));
   const attBan = (d && d.attBan) || (d && d.ban) || null;
 
   if (!phoneNumber || !attBan) {
@@ -84,10 +89,25 @@ async function syncSimStatus(env, token, sim) {
   const mdn = String(phoneNumber).replace(/\D/g, "").replace(/^1/, "");
 
   // Run OTA refresh — response contains the current subscriber status
-  const result = await hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid);
+  let otaResult;
+  try {
+    otaResult = await hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid);
+  } catch (otaErr) {
+    if (otaErr.isHelixTimeout) {
+      await supabasePatch(env, `sims?id=eq.${id}`, { status: 'helix_timeout' });
+      console.log(`[OTA Sync] SIM ${iccid}: sub not found → helix_timeout`);
+      return;
+    }
+    if (otaErr.isSimMismatch) {
+      await supabasePatch(env, `sims?id=eq.${id}`, { status: 'data_mismatch' });
+      console.log(`[OTA Sync] SIM ${iccid}: sim mismatch → data_mismatch`);
+      return;
+    }
+    throw otaErr;
+  }
 
   // Extract status from fulfilled[0].status and update DB
-  const fulfilled = result && result.fulfilled;
+  const fulfilled = otaResult && otaResult.fulfilled;
   if (!Array.isArray(fulfilled) || fulfilled.length === 0) return;
 
   const helixStatus = fulfilled[0] && fulfilled[0].status;
@@ -213,7 +233,41 @@ async function hxOtaRefresh(env, token, data, runId, iccid) {
     error: res.ok ? null : `OTA Refresh failed: ${res.status}`,
   });
 
-  if (!res.ok) throw new Error(`OTA Refresh failed: ${res.status} ${JSON.stringify(json)}`);
+  const allErrorText = [
+    responseText,
+    ...(Array.isArray(json.rejected) ? json.rejected.map(r => r.message || '') : []),
+    json.errorMessage || '',
+    json.message || '',
+  ].join(' ').toLowerCase();
+
+  if (!res.ok) {
+    if (allErrorText.includes('does not belong to the user')) {
+      const err = new Error(`OTA Refresh rejected: ${json.errorMessage || responseText}`);
+      err.isHelixTimeout = true;
+      throw err;
+    }
+    if (allErrorText.includes('sim number does not match')) {
+      const err = new Error(`OTA Refresh rejected: ${json.errorMessage || responseText}`);
+      err.isSimMismatch = true;
+      throw err;
+    }
+    throw new Error(`OTA Refresh failed: ${res.status} ${JSON.stringify(json)}`);
+  }
+
+  const rejected = Array.isArray(json.rejected) ? json.rejected : [];
+  const subNotFound = rejected.find(r => r.message && r.message.toLowerCase().includes('does not belong to the user'));
+  if (subNotFound) {
+    const err = new Error(`OTA Refresh rejected: ${subNotFound.message}`);
+    err.isHelixTimeout = true;
+    throw err;
+  }
+  const simMismatch = rejected.find(r => r.message && r.message.toLowerCase().includes('sim number does not match'));
+  if (simMismatch) {
+    const err = new Error(`OTA Refresh rejected: ${simMismatch.message}`);
+    err.isSimMismatch = true;
+    throw err;
+  }
+
   return json;
 }
 
