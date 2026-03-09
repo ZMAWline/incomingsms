@@ -3123,12 +3123,14 @@ function getHTML() {
                     <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition">Rotate MDN</button>
                     <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Fix SIM</button>
                     <button onclick="bulkAssignReseller()" class="px-3 py-1.5 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition">Assign Reseller</button>
+                    <button onclick="bulkAssignResellerAndNotify()" class="px-3 py-1.5 text-xs bg-green-600 hover:bg-green-700 text-white rounded transition">Assign + Notify</button>
                     <button onclick="bulkUnassignReseller()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Unassign Reseller</button>
                     <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
                     <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
                     <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Send Online</button>
                     <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
                     <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
+                    <button onclick="bulkModifyImei()" class="px-3 py-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded transition">Modify IMEI</button>
                 </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
@@ -7210,6 +7212,180 @@ async function sendSimOnline(simId, phoneNumber) {
             modal.appendChild(box);
             document.body.appendChild(modal);
         }
+
+        async function bulkAssignResellerAndNotify() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            const sel = document.getElementById('filter-reseller');
+            const opts = [...sel.options].filter(o => o.value);
+            if (opts.length === 0) { showToast('No resellers available', 'error'); return; }
+            const existing = document.getElementById('assign-reseller-modal');
+            if (existing) existing.remove();
+            const modal = document.createElement('div');
+            modal.id = 'assign-reseller-modal';
+            modal.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            const box = document.createElement('div');
+            box.className = 'bg-gray-800 rounded-xl shadow-xl w-80 p-6';
+            const titleEl = document.createElement('h3');
+            titleEl.className = 'text-lg font-semibold text-white mb-1';
+            titleEl.textContent = 'Assign + Notify';
+            const subtitle = document.createElement('p');
+            subtitle.className = 'text-xs text-gray-400 mb-4';
+            subtitle.textContent = simIds.length + ' SIM(s) — assigns reseller then sends number.online for active SIMs';
+            const select = document.createElement('select');
+            select.className = 'w-full text-sm bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-gray-300';
+            opts.forEach(function(o) {
+                const opt = document.createElement('option');
+                opt.value = o.value;
+                opt.textContent = o.text;
+                select.appendChild(opt);
+            });
+            const btnRow = document.createElement('div');
+            btnRow.className = 'flex gap-2 justify-end mt-4';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'px-3 py-1.5 text-sm bg-gray-600 hover:bg-gray-700 text-gray-300 rounded transition';
+            cancelBtn.textContent = 'Cancel';
+            cancelBtn.onclick = function() { modal.remove(); };
+            const assignBtn = document.createElement('button');
+            assignBtn.className = 'px-3 py-1.5 text-sm bg-green-600 hover:bg-green-700 text-white rounded transition';
+            assignBtn.textContent = 'Assign & Notify';
+            assignBtn.onclick = async function() {
+                const resellerId = parseInt(select.value);
+                modal.remove();
+                let assigned = 0, notified = 0, failed = 0;
+                for (const simId of simIds) {
+                    try {
+                        const resp = await fetch(API_BASE + '/assign-reseller', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ sim_id: simId, reseller_id: resellerId })
+                        });
+                        const result = await resp.json();
+                        if (result.ok) {
+                            assigned++;
+                            const simData = tableState.sims.data.find(s => s.id === simId);
+                            if (simData && simData.status === 'active' && simData.phone_number) {
+                                try {
+                                    const onlineResp = await fetch(API_BASE + '/sim-online', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ sim_id: simId })
+                                    });
+                                    const onlineResult = await onlineResp.json();
+                                    if (onlineResp.ok && onlineResult.ok) notified++;
+                                } catch (e) {}
+                            }
+                        } else { failed++; }
+                    } catch (e) { failed++; }
+                }
+                const msg = assigned + ' assigned, ' + notified + ' notified' + (failed ? ', ' + failed + ' failed' : '');
+                showToast(msg, failed ? 'error' : 'success');
+                loadSims(true);
+            };
+            btnRow.appendChild(cancelBtn);
+            btnRow.appendChild(assignBtn);
+            box.appendChild(titleEl);
+            box.appendChild(subtitle);
+            box.appendChild(select);
+            box.appendChild(btnRow);
+            modal.appendChild(box);
+            document.body.appendChild(modal);
+        }
+
+        async function bulkModifyImei() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            const singleMode = simIds.length === 1;
+            const existing = document.getElementById('bulk-imei-modal');
+            if (existing) existing.remove();
+            const modal = document.createElement('div');
+            modal.id = 'bulk-imei-modal';
+            modal.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            const box = document.createElement('div');
+            box.className = 'bg-gray-800 rounded-xl shadow-xl w-96 p-6';
+            const titleEl = document.createElement('h3');
+            titleEl.className = 'text-lg font-semibold text-white mb-1';
+            titleEl.textContent = 'Modify IMEI';
+            const subtitle = document.createElement('p');
+            subtitle.className = 'text-xs text-gray-400 mb-4';
+            subtitle.textContent = simIds.length + ' SIM(s) selected — SIMs must have gateway_id and port set';
+            const modeDiv = document.createElement('div');
+            modeDiv.className = 'mb-4';
+            const autoLabel = document.createElement('label');
+            autoLabel.className = 'flex items-center gap-2 text-sm text-gray-300 cursor-pointer mb-2';
+            const autoRadio = document.createElement('input');
+            autoRadio.type = 'radio';
+            autoRadio.name = 'imei-mode';
+            autoRadio.value = 'auto';
+            autoRadio.checked = true;
+            autoLabel.appendChild(autoRadio);
+            autoLabel.appendChild(document.createTextNode('Auto (pick from pool)'));
+            modeDiv.appendChild(autoLabel);
+            const manualLabel = document.createElement('label');
+            manualLabel.className = 'flex items-center gap-2 text-sm text-gray-300 cursor-pointer mb-2';
+            const manualRadio = document.createElement('input');
+            manualRadio.type = 'radio';
+            manualRadio.name = 'imei-mode';
+            manualRadio.value = 'manual';
+            if (!singleMode) manualRadio.disabled = true;
+            manualLabel.appendChild(manualRadio);
+            manualLabel.appendChild(document.createTextNode('Manual IMEI' + (singleMode ? '' : ' (single SIM only)')));
+            const imeiInput = document.createElement('input');
+            imeiInput.type = 'text';
+            imeiInput.placeholder = '15-digit IMEI';
+            imeiInput.maxLength = 15;
+            imeiInput.disabled = true;
+            imeiInput.className = 'w-full text-sm bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-gray-300 font-mono mt-1';
+            modeDiv.appendChild(manualLabel);
+            modeDiv.appendChild(imeiInput);
+            autoRadio.onchange = function() { imeiInput.disabled = true; };
+            manualRadio.onchange = function() { imeiInput.disabled = false; imeiInput.focus(); };
+            const btnRow = document.createElement('div');
+            btnRow.className = 'flex gap-2 justify-end mt-4';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'px-3 py-1.5 text-sm bg-gray-600 hover:bg-gray-700 text-gray-300 rounded transition';
+            cancelBtn.textContent = 'Cancel';
+            cancelBtn.onclick = function() { modal.remove(); };
+            const confirmBtn = document.createElement('button');
+            confirmBtn.className = 'px-3 py-1.5 text-sm bg-violet-600 hover:bg-violet-700 text-white rounded transition';
+            confirmBtn.textContent = 'Apply';
+            confirmBtn.onclick = async function() {
+                const isAuto = autoRadio.checked;
+                let manualImei = null;
+                if (!isAuto) {
+                    manualImei = imeiInput.value.trim();
+                    if (!/^\d{15}$/.test(manualImei)) { alert('Enter a valid 15-digit IMEI'); return; }
+                }
+                if (!confirm((isAuto ? 'Auto-assign new IMEI from pool' : 'Change IMEI to ' + manualImei) + ' for ' + simIds.length + ' SIM(s)?')) return;
+                modal.remove();
+                let ok = 0, fail = 0;
+                for (const simId of simIds) {
+                    try {
+                        const bodyObj = { sim_id: simId, action: 'change_imei', auto_imei: isAuto };
+                        if (!isAuto) bodyObj.new_imei = manualImei;
+                        const resp = await fetch(API_BASE + '/sim-action', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(bodyObj)
+                        });
+                        const result = await resp.json();
+                        if (result.ok) { ok++; } else { fail++; }
+                    } catch (e) { fail++; }
+                }
+                showToast(ok + ' IMEI(s) changed' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'error' : 'success');
+                loadSims(true);
+                loadImeiPool();
+            };
+            btnRow.appendChild(cancelBtn);
+            btnRow.appendChild(confirmBtn);
+            box.appendChild(titleEl);
+            box.appendChild(subtitle);
+            box.appendChild(modeDiv);
+            box.appendChild(btnRow);
+            modal.appendChild(box);
+            document.body.appendChild(modal);
+        }
+
 
         async function bulkUnassignReseller() {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
