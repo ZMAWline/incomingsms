@@ -1138,10 +1138,20 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
     await sleep(2000);
     if (attBan) {
       console.log(`[FixSim] SIM ${iccid}: OTA Refresh (ban=${attBan})`);
-      await retryWithBackoff(
+      const otaResult = await retryWithBackoff(
         () => hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid),
         { attempts: 3, label: `otaRefresh ${iccid}` }
       );
+      // Update DB status from OTA fulfilled response
+      const fulfilledStatus = otaResult && otaResult.fulfilled && otaResult.fulfilled[0] && otaResult.fulfilled[0].status;
+      if (fulfilledStatus) {
+        const otaStatusMap = { Active: 'active', ACTIVE: 'active', ACTIVATED: 'active', Suspended: 'suspended', SUSPENDED: 'suspended', Canceled: 'canceled', CANCELED: 'canceled' };
+        const otaDbStatus = otaStatusMap[fulfilledStatus] || null;
+        if (otaDbStatus) {
+          console.log(`[FixSim] SIM ${iccid}: OTA fulfilled=${fulfilledStatus} → updating DB status to ${otaDbStatus}`);
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { status: otaDbStatus });
+        }
+      }
       await sleep(3000);
     } else {
       console.log(`[FixSim] SIM ${iccid}: skipping OTA Refresh (no attBan)`);
