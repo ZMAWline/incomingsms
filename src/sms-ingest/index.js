@@ -5,7 +5,7 @@
 // =========================================================
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method !== "POST") {
       return new Response("Method Not Allowed", { status: 405 });
     }
@@ -120,7 +120,7 @@ export default {
       // Auto IMEI change for AT&T unsupported device messages
       for (const row of inserts) {
         if (row.sim_id && isAttUnsupportedDeviceMsg(row.body)) {
-          triggerAutoImeiChange(env, row.sim_id);
+          ctx.waitUntil(triggerAutoImeiChange(env, row.sim_id));
         }
       }
 
@@ -196,7 +196,7 @@ export default {
 
     // Auto IMEI change for AT&T unsupported device messages
     if (simId && isAttUnsupportedDeviceMsg(body)) {
-      triggerAutoImeiChange(env, simId);
+      ctx.waitUntil(triggerAutoImeiChange(env, simId));
     }
 
     // =========================================================

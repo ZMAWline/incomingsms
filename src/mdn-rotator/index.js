@@ -680,15 +680,12 @@ async function queueSimsForRotation(env, options = {}) {
     return { ok: true, queued: 0, message: "No SIMs to rotate" };
   }
 
-  // For scheduled runs: filter out SIMs already rotated today (EST = UTC-5)
+  // For scheduled runs: filter out SIMs already rotated today (NY timezone, DST-aware)
   let simsToQueue = sims;
   if (!isManualRun) {
-    const estOffsetMs = -5 * 60 * 60 * 1000;
-    const estNow = new Date(Date.now() + estOffsetMs);
-    const todayEst = new Date(Date.UTC(estNow.getUTCFullYear(), estNow.getUTCMonth(), estNow.getUTCDate(), 5, 0, 0));
-    const todayEstISO = todayEst.toISOString();
+    const todayEstISO = getNYMidnightISO();
     simsToQueue = sims.filter(s => !s.last_mdn_rotated_at || s.last_mdn_rotated_at < todayEstISO);
-    console.log(`[Scheduled Run] ${sims.length} active SIMs, ${simsToQueue.length} not yet rotated since ${todayEstISO} (midnight EST), ${sims.length - simsToQueue.length} skipped`);
+    console.log(`[Scheduled Run] ${sims.length} active SIMs, ${simsToQueue.length} not yet rotated since ${todayEstISO} (midnight NY), ${sims.length - simsToQueue.length} skipped`);
   }
 
   if (simsToQueue.length === 0) {
@@ -769,9 +766,7 @@ async function rotateSingleSim(env, token, sim) {
   }
 
   // Dedup check: skip if already rotated today (catches duplicate queue messages from multi-cron)
-  const estOffsetMs = -5 * 60 * 60 * 1000;
-  const estNow = new Date(Date.now() + estOffsetMs);
-  const todayMidnightEst = new Date(Date.UTC(estNow.getUTCFullYear(), estNow.getUTCMonth(), estNow.getUTCDate(), 5, 0, 0)).toISOString();
+  const todayMidnightEst = getNYMidnightISO();
   if (sim.last_mdn_rotated_at && sim.last_mdn_rotated_at >= todayMidnightEst) {
     console.log(`SIM ${iccid}: already rotated today (${sim.last_mdn_rotated_at}), skipping duplicate queue message`);
     return;
@@ -1807,6 +1802,17 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 // ===========================
 // Supabase helpers
 // ===========================
+// Returns ISO string for midnight in New York timezone (DST-aware)
+function getNYMidnightISO() {
+  const now = new Date();
+  const nyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
+  const tzPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', timeZoneName: 'shortOffset'
+  }).formatToParts(now).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-5';
+  const offsetHours = -parseInt(tzPart.replace('GMT', '') || '-5');
+  return new Date(`${nyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
+}
+
 async function supabaseSelect(env, path) {
   const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "GET",
