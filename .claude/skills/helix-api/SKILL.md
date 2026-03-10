@@ -92,7 +92,7 @@ For complete endpoint documentation, request/response formats, and examples, see
 # 1. Get token
 curl -X POST https://auth.helixsolo.app/oauth/token \
   -H "Content-Type: application/json" \
-  -d '{"grant_type":"password","client_id":"YOUR_CLIENT_ID","audience":"https://dev-z8ucfxd1iqdj7bzm.us.auth0.com/api/v2/","username":"YOUR_USERNAME","password":"YOUR_PASSWORD"}'
+  -d '{"grant_type":"password","client_id":"YOUR_CLIENT_ID","audience":"https://helixsolo-prod.us.auth0.com/api/v2/","username":"YOUR_USERNAME","password":"YOUR_PASSWORD"}'
 
 # 2. Activate SIM
 curl -X POST https://api.helixsolo.app/api/mobility-activation/activate \

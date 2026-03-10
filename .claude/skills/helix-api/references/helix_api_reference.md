@@ -20,7 +20,7 @@ The Helix SOLO Mobility API manages AT&T SIM card activation and subscriber mana
 {
   "grant_type": "password",
   "client_id": "YOUR_CLIENT_ID",
-  "audience": "https://dev-z8ucfxd1iqdj7bzm.us.auth0.com/api/v2/",
+  "audience": "https://helixsolo-prod.us.auth0.com/api/v2/",
   "username": "YOUR_USERNAME",
   "password": "YOUR_PASSWORD"
 }
