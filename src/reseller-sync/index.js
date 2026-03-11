@@ -25,7 +25,7 @@ export default {
     return json(result, 200);
   },
 
-  // Daily backstop cron: 20:00 UTC (4 PM EST / after all rotations complete)
+  // Daily backstop cron: 15:00 UTC (10 AM EST / after all rotations complete)
   // Catches any SIMs whose number.online failed during the mdn-rotator rotation run.
   // Uses force=false so dedup skips already-delivered SIMs and only re-sends misses.
   async scheduled(event, env, ctx) {
@@ -347,15 +347,19 @@ function sleep(ms) {
 }
 
 function nextRotationUtcISO() {
+  // DST-aware: midnight NY = 05:00 UTC (EST) or 04:00 UTC (EDT).
+  // Probe 5 AM UTC of tomorrow's calendar date — always within 1h of NY midnight,
+  // which correctly reflects the offset in effect at that midnight.
   const now = new Date();
-  const next = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    5, 0, 0
-  ));
-  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-  return next.toISOString();
+  const nyDateToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
+  const [y, m, d] = nyDateToday.split('-').map(Number);
+  const probe = new Date(Date.UTC(y, m - 1, d + 1, 5, 0, 0));
+  const probeNyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(probe);
+  const tzPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', timeZoneName: 'shortOffset'
+  }).formatToParts(probe).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-5';
+  const offsetHours = -parseInt(tzPart.replace('GMT', '') || '-5');
+  return new Date(`${probeNyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
 }
 
 /* ---------------- Misc ---------------- */
