@@ -93,6 +93,19 @@ async function runResellerSync(env, limit) {
         resellerId,
       });
 
+      if (result.ok) {
+        await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
+          method: 'PATCH',
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify({ last_notified_at: new Date().toISOString() }),
+        });
+      }
+
       if (result.skipped) {
         skipped++;
         details.push({

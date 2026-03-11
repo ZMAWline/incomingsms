@@ -290,7 +290,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=5000`;
+    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=5000`;
 
     // Apply status filter
     if (statusFilter) {
@@ -358,6 +358,7 @@ async function handleSims(env, corsHeaders, url) {
         last_mdn_rotated_at: sim.last_mdn_rotated_at || null,
         activated_at: sim.activated_at || null,
         last_activation_error: sim.last_activation_error || null,
+        last_notified_at: sim.last_notified_at || null,
       };
     });
 
@@ -1022,6 +1023,20 @@ async function handleSimOnline(request, env, corsHeaders) {
       }),
     });
 
+    // Update last_notified_at on the SIM
+    if (webhookOk) {
+      await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + simId, {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ last_notified_at: new Date().toISOString() }),
+      });
+    }
+
     if (webhookOk) {
       return new Response(JSON.stringify({
         ok: true,
@@ -1239,7 +1254,7 @@ async function handleBulkSendTestSms(request, env, corsHeaders) {
 
     // Fetch sender pool: active SIMs with gateway+port+MDN, not in target list
     const sendersRes = await fetch(
-      sbUrl + '/rest/v1/sims?select=id,gateway_id,port,sim_numbers(e164)&status=eq.active&gateway_id=not.is.null&port=not.is.null&sim_numbers.valid_to=is.null&limit=200',
+      sbUrl + '/rest/v1/sims?select=id,gateway_id,port,sim_numbers(e164)&status=eq.active&gateway_id=eq.1&port=not.is.null&sim_numbers.valid_to=is.null&limit=200',
       { headers: { apikey: sbKey, Authorization: 'Bearer ' + sbKey } }
     );
     if (!sendersRes.ok) {
@@ -3220,6 +3235,7 @@ function getHTML() {
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_mdn_rotated_at')">Last Rotated <span class="sort-arrow" data-table="sims" data-col="last_mdn_rotated_at"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','activated_at')">Activated <span class="sort-arrow" data-table="sims" data-col="activated_at"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_notified_at')">Last Notified <span class="sort-arrow" data-table="sims" data-col="last_notified_at"></span></th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
                             </thead>
@@ -4968,7 +4984,7 @@ function getHTML() {
             if (!query) return true;
             const terms = query.split(/[,;\\n\\r]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
             if (!terms.length) return true;
-            const DATE_FIELDS = ['activated_at','last_sms_received','last_mdn_rotated_at','created_at','updated_at'];
+            const DATE_FIELDS = ['activated_at','last_sms_received','last_mdn_rotated_at','last_notified_at','created_at','updated_at'];
             const strings = Object.entries(obj).flatMap(([k, v]) => {
               if (v == null) return [];
               const base = String(v);
@@ -5160,6 +5176,7 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-500 text-xs">\${lastSms}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.activated_at ? new Date(sim.activated_at).toLocaleString() : '-'}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_notified_at ? new Date(sim.last_notified_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 whitespace-nowrap">
                         \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
                         \${sim.status === 'active' ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}

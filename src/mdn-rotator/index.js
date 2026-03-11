@@ -838,7 +838,7 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
 
   if (!webhookUrl) return;
 
-  await sendWebhookWithDeduplication(env, webhookUrl, {
+  const result = await sendWebhookWithDeduplication(env, webhookUrl, {
     event_type: "number.online",
     created_at: new Date().toISOString(),
     data: {
@@ -857,6 +857,19 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
     },
     resellerId,
   });
+
+  if (result.ok) {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ last_notified_at: new Date().toISOString() }),
+    });
+  }
 }
 
 // ===========================
