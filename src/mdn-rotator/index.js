@@ -114,7 +114,7 @@ export default {
         // Load SIM from DB
         const sims = await supabaseSelect(
           env,
-          `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,status,imei,activated_at&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`
+          `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,status,imei,activated_at,att_ban,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
         );
         if (!Array.isArray(sims) || sims.length === 0) {
           return new Response(JSON.stringify({ ok: false, error: `SIM not found: ${sim_id}` }), {
@@ -309,7 +309,7 @@ export default {
           });
         }
 
-        // For ota_refresh, cancel, resume — need Helix token + subscriber details
+        // For ota_refresh, cancel, resume — need Helix token + mdn/ban
         if (!subId) {
           return new Response(JSON.stringify({ ok: false, error: `SIM ${iccid} has no mobility_subscription_id` }), {
             status: 400,
@@ -320,23 +320,33 @@ export default {
         const token = await getCachedToken(env);
         const runId = `simaction_${iccid}_${Date.now()}`;
 
-        // Get subscriber details for mdn + attBan
-        const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
-        const d = Array.isArray(details) ? details[0] : null;
-        const subscriberNumber = d?.phoneNumber;
-        const attBan = d?.attBan || d?.ban || null;
-
-        // Sync DB with Helix details (activated_at backfill, ICCID/IMEI mismatch logging)
-        syncSimFromHelixDetails(env, sim, d).catch(e => console.warn(`[SyncDetails] sim_id=${sim.id}: ${e}`));
-
-        if (!subscriberNumber) {
-          return new Response(JSON.stringify({ ok: false, error: `No phoneNumber from Helix for SIM ${iccid}` }), {
-            status: 500,
-            headers: { "Content-Type": "application/json" }
-          });
+        // Use cached BAN + MDN from DB if available; fall back to subscriber_details
+        // DB MDN is always preferred over Helix MDN (DB reflects post-rotation state)
+        const dbMdn = sim.sim_numbers?.[0]?.e164;
+        let mdn, attBan, d = null;
+        if (dbMdn && sim.att_ban) {
+          // Full cache hit — skip subscriber_details entirely
+          mdn = String(dbMdn).replace(/\D/g, "").replace(/^1/, "");
+          attBan = sim.att_ban;
+          console.log(`[SimAction] SIM ${iccid}: full cache hit BAN=${attBan} MDN=${mdn}`);
+        } else {
+          // Need subscriber_details (att_ban not cached yet)
+          const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
+          d = Array.isArray(details) ? details[0] : null;
+          attBan = d?.attBan || d?.ban || null;
+          // Sync DB with Helix details (stores att_ban, activated_at backfill, etc.)
+          syncSimFromHelixDetails(env, sim, d).catch(e => console.warn(`[SyncDetails] sim_id=${sim.id}: ${e}`));
+          // Prefer DB MDN (post-rotation) over Helix MDN (may be stale after rotation)
+          const mdnSource = dbMdn || d?.phoneNumber;
+          if (!mdnSource) {
+            return new Response(JSON.stringify({ ok: false, error: `No phoneNumber for SIM ${iccid}` }), {
+              status: 500,
+              headers: { "Content-Type": "application/json" }
+            });
+          }
+          mdn = String(mdnSource).replace(/\D/g, "").replace(/^1/, "");
+          console.log(`[SimAction] SIM ${iccid}: using ${dbMdn ? "DB" : "Helix"} MDN=${mdn}`);
         }
-
-        const mdn = String(subscriberNumber).replace(/\D/g, "").replace(/^1/, "");
 
         if (action === "ota_refresh") {
           if (!attBan) {
@@ -581,15 +591,15 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
   },
 
   // Cron handler
-  // - Every hour 5am-11am UTC (12am-6am EST): rotation (skips SIMs already rotated today)
-  // - 7am UTC (2am EST): error summary to Slack
+  // - Every 20 min 04:00-16:00 UTC (midnight-noon EDT / 1am-1pm EST): rotation
+  // - 7am UTC: error summary to Slack
   async scheduled(event, env, ctx) {
     const hour = new Date(event.scheduledTime).getUTCHours();
-    // Rotation: every hour from 12am-6am EST (5am-11am UTC)
-    if (hour >= 5 && hour <= 11) {
+    // Rotation: cron fires 04:00-16:00 UTC (covers both EDT and EST midnight windows)
+    if (hour >= 4 && hour <= 16) {
       ctx.waitUntil(queueSimsForRotation(env));
     }
-    // Error summary at 7am UTC (2am EST)
+    // Error summary at 7am UTC
     if (hour === 7) {
       ctx.waitUntil(sendErrorSummaryToSlack(env));
     }

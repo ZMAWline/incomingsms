@@ -63,6 +63,13 @@ export async function syncSimFromHelixDetails(env, simRow, d, { isFinalization =
     console.log(`[SyncDetails] sim_id=${simRow.id}: backfilled activated_at=${ts}`);
   }
 
+  // 4b. att_ban — store/update from Helix if present
+  const helixBan = d?.attBan || d?.ban || null;
+  if (helixBan) {
+    await _patch(env, `sims?id=eq.${encodeURIComponent(String(simRow.id))}`, { att_ban: helixBan });
+    console.log(`[SyncDetails] sim_id=${simRow.id}: stored att_ban=${helixBan}`);
+  }
+
   // 5. IMEI check — log only, do not auto-fix
   const helixImei = d.billingImei ? String(d.billingImei).trim() : null;
   if (helixImei && simRow.imei && helixImei !== simRow.imei) {

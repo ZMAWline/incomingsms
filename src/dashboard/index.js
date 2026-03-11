@@ -155,6 +155,10 @@ export default {
       return handleAssignReseller(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/set-sim-status' && request.method === 'POST') {
+      return handleSetSimStatus(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/reset-to-provisioning' && request.method === 'POST') {
       return handleResetToProvisioning(request, env, corsHeaders);
     }
@@ -2338,6 +2342,36 @@ async function handleResolveError(request, env, corsHeaders) {
 }
 
 // Reset SIMs back to provisioning so details-finalizer re-processes them
+async function handleSetSimStatus(request, env, corsHeaders) {
+  const body = await request.json();
+  const { sim_id, status } = body;
+  const validStatuses = ['provisioning', 'active', 'suspended', 'canceled', 'error', 'pending', 'helix_timeout', 'data_mismatch'];
+  if (!sim_id || !status) {
+    return new Response(JSON.stringify({ error: 'sim_id and status required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+  if (!validStatuses.includes(status)) {
+    return new Response(JSON.stringify({ error: 'Invalid status. Valid: ' + validStatuses.join(', ') }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+  const res = await fetch(
+    env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(String(sim_id)),
+    {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ status }),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    return new Response(JSON.stringify({ error: 'DB error: ' + text }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+  return new Response(JSON.stringify({ ok: true, sim_id, status }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
 async function handleResetToProvisioning(request, env, corsHeaders) {
   try {
     const body = await request.json();
@@ -4499,6 +4533,32 @@ function getHTML() {
         </div>
     </div>
 
+    <!-- Set Status Modal -->
+    <div id="set-status-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-sm">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 id="set-status-title" class="text-lg font-semibold text-white">Set Status</h3>
+                <button onclick="document.getElementById('set-status-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5">
+                <select id="set-status-select" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent mb-4">
+                    <option value="provisioning">provisioning</option>
+                    <option value="active">active</option>
+                    <option value="suspended">suspended</option>
+                    <option value="canceled">canceled</option>
+                    <option value="error">error</option>
+                    <option value="pending">pending</option>
+                    <option value="helix_timeout">helix_timeout</option>
+                    <option value="data_mismatch">data_mismatch</option>
+                </select>
+                <div class="flex gap-2 justify-end">
+                    <button onclick="document.getElementById('set-status-modal').classList.add('hidden')" class="px-4 py-2 text-sm bg-dark-700 hover:bg-dark-600 text-gray-300 rounded-lg transition">Cancel</button>
+                    <button onclick="runSetStatus()" class="px-4 py-2 text-sm bg-accent hover:bg-accent/80 text-white rounded-lg transition">Apply</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- SIM Action Modal -->
     <div id="sim-action-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
         <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-3xl max-h-[90vh] flex flex-col">
@@ -5106,6 +5166,7 @@ function renderSims() {
                         \${sim.status === 'error' ? \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\` : ''}
                         \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : \`<button onclick="assignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition" title="Assign to reseller">Assign</button>\`}
                         \${(sim.mobility_subscription_id && sim.gateway_id && sim.port) ? \`<button onclick="showChangeImeiModal(\${sim.id}, '\${sim.iccid}', \${sim.gateway_id}, '\${sim.port}')" class="px-2 py-1 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition ml-1" title="Change IMEI">IMEI</button>\` : ''}
+                        \${\`<button onclick="showSetStatusModal(\${sim.id}, '\${sim.status}')" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition ml-1">Status</button>\`}
                     </td>
                 </tr>
                 \`;
@@ -6674,6 +6735,36 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('sim-action-logs-section').classList.remove('hidden');
             document.getElementById('sim-action-modal').classList.remove('hidden');
             loadSimActionLogs();
+        }
+
+        let _setStatusSimId = null;
+        function showSetStatusModal(simId, currentStatus) {
+            _setStatusSimId = simId;
+            document.getElementById('set-status-title').textContent = 'Set Status - SIM #' + simId;
+            document.getElementById('set-status-select').value = currentStatus;
+            document.getElementById('set-status-modal').classList.remove('hidden');
+        }
+
+        async function runSetStatus() {
+            const status = document.getElementById('set-status-select').value;
+            document.getElementById('set-status-modal').classList.add('hidden');
+            try {
+                const res = await fetch(API_BASE + '/set-sim-status', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_id: _setStatusSimId, status })
+                });
+                const result = await res.json();
+                if (result.ok) {
+                    showToast('SIM #' + _setStatusSimId + ' status set to ' + status, 'success');
+                    loadSims(true);
+                } else {
+                    showToast('Error: ' + (result.error || 'Failed'), 'error');
+                }
+            } catch (e) {
+                showToast('Error setting status', 'error');
+                console.error(e);
+            }
         }
 
         async function simAction(simId, action, skipConfirm = false) {
