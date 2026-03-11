@@ -9,7 +9,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname !== "/run") {
-      return new Response("reseller-sync ok. Use /run?secret=...&limit=100", { status: 200 });
+      return new Response("reseller-sync ok. Use /run?secret=...&limit=2000&force=false", { status: 200 });
     }
 
     const secret = url.searchParams.get("secret") || "";
@@ -18,24 +18,32 @@ export default {
     }
 
     const limitParam = url.searchParams.get("limit");
-    const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 100, 1) : 100;
+    const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 2000, 1) : 2000;
+    const force = url.searchParams.get("force") === "true";
 
-    const result = await runResellerSync(env, limit);
+    const result = await runResellerSync(env, limit, force);
     return json(result, 200);
   },
 
+  // Daily backstop cron: 20:00 UTC (4 PM EST / after all rotations complete)
+  // Catches any SIMs whose number.online failed during the mdn-rotator rotation run.
+  // Uses force=false so dedup skips already-delivered SIMs and only re-sends misses.
+  async scheduled(event, env, ctx) {
+    console.log('[Cron] reseller-sync daily backstop starting');
+    const result = await runResellerSync(env, 2000, false);
+    console.log(`[Cron] reseller-sync done: ${result.synced} sent, ${result.skipped} skipped, ${result.errors} errors`);
+  },
 };
 
 /* ---------------- Core ---------------- */
 
-async function runResellerSync(env, limit) {
+async function runResellerSync(env, limit, force = false) {
   const startedAt = new Date().toISOString();
 
   // Fetch active SIMs with current numbers, reseller info, and webhook URLs in ONE query
-  // Only sync verified numbers (or skipped verification)
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,sim_numbers!inner(e164,verification_status),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&sim_numbers.valid_to=is.null&sim_numbers.verification_status=in.(verified,skipped)&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
+    `sims?select=id,iccid,status,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
   );
 
   let attempted = sims.length;
@@ -49,7 +57,6 @@ async function runResellerSync(env, limit) {
 
     try {
       const currentNumber = sim.sim_numbers?.[0]?.e164;
-      const verificationStatus = sim.sim_numbers?.[0]?.verification_status;
       const resellerId = sim.reseller_sims?.[0]?.reseller_id;
       const webhook = sim.reseller_sims?.[0]?.resellers?.reseller_webhooks?.find(w => w.enabled);
       const webhookUrl = webhook?.url;
@@ -82,7 +89,7 @@ async function runResellerSync(env, limit) {
           status: sim.status,
           online: true,
           online_until: nextRotationUtcISO(),
-          verified: verificationStatus === 'verified',
+          verified: true,
         },
       }, {
         idComponents: {
@@ -91,9 +98,10 @@ async function runResellerSync(env, limit) {
           number: currentNumber,
         },
         resellerId,
+        force,
       });
 
-      if (result.ok) {
+      if (result.ok && !result.skipped) {
         await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
           method: 'PATCH',
           headers: {
@@ -173,11 +181,18 @@ async function sbGetArray(env, path) {
 async function generateMessageIdAsync(components) {
   const { eventType, simId, iccid, number, from, body, timestamp } = components;
 
-  const roundedTs = timestamp
-    ? new Date(Math.floor(new Date(timestamp).getTime() / 60000) * 60000).toISOString()
-    : new Date(Math.floor(Date.now() / 60000) * 60000).toISOString();
+  // number.online: deduplicate per day so mdn-rotator and reseller-sync share the same key.
+  // Other events: deduplicate per minute.
+  let dedupeTs;
+  if (eventType === 'number.online') {
+    dedupeTs = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  } else {
+    dedupeTs = timestamp
+      ? new Date(Math.floor(new Date(timestamp).getTime() / 60000) * 60000).toISOString()
+      : new Date(Math.floor(Date.now() / 60000) * 60000).toISOString();
+  }
 
-  const str = [eventType, simId, iccid, number, from, (body || '').slice(0, 100), roundedTs].join('|');
+  const str = [eventType, simId, iccid, number, from, (body || '').slice(0, 100), dedupeTs].join('|');
 
   const encoder = new TextEncoder();
   const data = encoder.encode(str);
@@ -298,10 +313,12 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
 
   payload.message_id = messageId;
 
-  const alreadySent = await wasWebhookDelivered(env, messageId);
-  if (alreadySent) {
-    console.log(`[Webhook] Skipping duplicate ${messageId}`);
-    return { ok: true, status: 200, attempts: 0, skipped: true };
+  if (!options.force) {
+    const alreadySent = await wasWebhookDelivered(env, messageId);
+    if (alreadySent) {
+      console.log(`[Webhook] Skipping duplicate ${messageId}`);
+      return { ok: true, status: 200, attempts: 0, skipped: true };
+    }
   }
 
   const result = await postWebhookWithRetry(webhookUrl, payload, { messageId });

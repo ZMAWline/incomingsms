@@ -834,9 +834,16 @@ async function rotateSingleSim(env, token, sim) {
 // ===========================
 async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscriptionId) {
   const resellerId = await findResellerIdBySimId(env, simId);
-  const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
+  if (!resellerId) {
+    console.log(`[Webhook] SIM ${simId}: no active reseller, skipping number.online`);
+    return;
+  }
 
-  if (!webhookUrl) return;
+  const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
+  if (!webhookUrl) {
+    console.log(`[Webhook] SIM ${simId}: reseller ${resellerId} has no enabled webhook, skipping number.online`);
+    return;
+  }
 
   const result = await sendWebhookWithDeduplication(env, webhookUrl, {
     event_type: "number.online",
@@ -848,6 +855,7 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
       online_until: nextRotationUtcISO(),
       iccid,
       mobilitySubscriptionId,
+      verified: true,
     }
   }, {
     idComponents: {
@@ -858,17 +866,25 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
     resellerId,
   });
 
+  if (!result.ok) {
+    console.error(`[Webhook] SIM ${simId}: number.online FAILED after ${result.attempts} attempts — will be caught by daily reseller-sync cron`);
+  }
+
   if (result.ok) {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
-      method: 'PATCH',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
-      },
-      body: JSON.stringify({ last_notified_at: new Date().toISOString() }),
-    });
+    try {
+      await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ last_notified_at: new Date().toISOString() }),
+      });
+    } catch (err) {
+      console.error(`[Webhook] SIM ${simId}: last_notified_at PATCH failed (non-critical): ${err}`);
+    }
   }
 }
 
@@ -1976,6 +1992,7 @@ async function insertNewNumber(env, simId, e164) {
       sim_id: simId,
       e164,
       valid_from: new Date().toISOString(),
+      verification_status: 'verified',
     },
   ]);
   console.log(`[DB] Inserted new number ${e164} for sim_id=${simId}`);
@@ -2048,11 +2065,18 @@ async function findWebhookUrlByResellerId(env, resellerId) {
 async function generateMessageIdAsync(components) {
   const { eventType, simId, iccid, number, from, body, timestamp } = components;
 
-  const roundedTs = timestamp
-    ? new Date(Math.floor(new Date(timestamp).getTime() / 60000) * 60000).toISOString()
-    : new Date(Math.floor(Date.now() / 60000) * 60000).toISOString();
+  // number.online: deduplicate per day (one send per SIM per number per UTC day).
+  // Other events: deduplicate per minute (prevents double-send on retry within the same minute).
+  let dedupeTs;
+  if (eventType === 'number.online') {
+    dedupeTs = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  } else {
+    dedupeTs = timestamp
+      ? new Date(Math.floor(new Date(timestamp).getTime() / 60000) * 60000).toISOString()
+      : new Date(Math.floor(Date.now() / 60000) * 60000).toISOString();
+  }
 
-  const str = [eventType, simId, iccid, number, from, (body || '').slice(0, 100), roundedTs].join('|');
+  const str = [eventType, simId, iccid, number, from, (body || '').slice(0, 100), dedupeTs].join('|');
 
   const encoder = new TextEncoder();
   const data = encoder.encode(str);

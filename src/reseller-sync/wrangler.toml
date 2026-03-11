@@ -5,7 +5,7 @@ account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
 [triggers]
-crons = []
+crons = ["0 20 * * *"]
 
 [observability.logs]
 enabled = true
