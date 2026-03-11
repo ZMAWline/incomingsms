@@ -241,6 +241,7 @@ async function recordWebhookDelivery(env, delivery) {
       attempts,
       last_attempt_at: new Date().toISOString(),
       delivered_at: status === 'delivered' ? new Date().toISOString() : null,
+      response_body: delivery.responseBody ? String(delivery.responseBody).slice(0, 2000) : null,
     }),
   });
 }
@@ -263,19 +264,19 @@ async function postWebhookWithRetry(url, payload, options = {}) {
 
       lastStatus = res.status;
 
+      const responseBody = await res.text().catch(() => '');
+
       if (res.ok) {
         console.log(`[Webhook] Success ${res.status} for ${messageId} after ${attempt} attempt(s)`);
-        return { ok: true, status: res.status, attempts: attempt };
+        return { ok: true, status: res.status, attempts: attempt, responseBody };
       }
 
       if (res.status >= 400 && res.status < 500) {
-        const txt = await res.text().catch(() => '');
-        console.log(`[Webhook] Client error ${res.status} for ${messageId}: ${txt.slice(0, 200)}`);
-        return { ok: false, status: res.status, attempts: attempt, error: `Client error: ${res.status}` };
+        console.log(`[Webhook] Client error ${res.status} for ${messageId}: ${responseBody.slice(0, 200)}`);
+        return { ok: false, status: res.status, attempts: attempt, error: `Client error: ${res.status}`, responseBody };
       }
 
-      const txt = await res.text().catch(() => '');
-      lastError = `Server error ${res.status}: ${txt.slice(0, 200)}`;
+      lastError = `Server error ${res.status}: ${responseBody.slice(0, 200)}`;
       console.log(`[Webhook] ${lastError} for ${messageId}`);
 
     } catch (err) {
@@ -292,7 +293,7 @@ async function postWebhookWithRetry(url, payload, options = {}) {
   }
 
   console.log(`[Webhook] Failed ${messageId} after ${maxRetries + 1} attempts: ${lastError}`);
-  return { ok: false, status: lastStatus, attempts: maxRetries + 1, error: lastError };
+  return { ok: false, status: lastStatus, attempts: maxRetries + 1, error: lastError, responseBody: lastError };
 }
 
 async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = {}) {
@@ -332,6 +333,7 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
       payload,
       status: result.ok ? 'delivered' : 'failed',
       attempts: result.attempts,
+      responseBody: result.responseBody || null,
     });
   } catch (err) {
     console.log(`[Webhook] Failed to record delivery: ${err}`);
