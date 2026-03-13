@@ -2858,20 +2858,14 @@ function buildCSV(customerName, start, end, days, dailyRate) {
     return m + '/' + d + '/' + y;
   };
 
-  for (let i = 0; i < days.length; i++) {
-    const d = days[i];
-    // Only put invoice header fields on first line
-    const invoiceNo = i === 0 ? 'INV-' + start.replace(/-/g, '') + '-' + end.replace(/-/g, '') : '';
-    const customer  = i === 0 ? customerName : '';
-    const invDate   = i === 0 ? fmtDate(invoiceDate) : '';
-    const dueDate   = i === 0 ? fmtDate(invoiceDate) : '';
-    const terms     = i === 0 ? 'Due on receipt' : '';
+  const invoiceNo = 'INV-' + start.replace(/-/g, '') + '-' + end.replace(/-/g, '');
+  for (const d of days) {
     rows.push([
       invoiceNo,
-      customer,
-      invDate,
-      dueDate,
-      terms,
+      customerName,
+      fmtDate(invoiceDate),
+      fmtDate(invoiceDate),
+      'Due on receipt',
       'US Business phone Rental',
       '',
       d.sim_count,
