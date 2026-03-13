@@ -245,7 +245,26 @@ async function handleSetImei(request, env) {
     return json({ ok: false, error: result.error || result.data?.reason || "Skyline API error", skyline_response: result.data, debug: { n, textBody } }, 502);
   }
 
-  return json({ ok: true, message: `IMEI set on ${gateway.code} port ${portNum} slot ${slotNum} (index ${n})`, skyline_response: result.data, debug: { n, textBody } });
+  // Persist the IMEI change to flash so it survives reboots (op=save)
+  const saveParams = new URLSearchParams({ username: gateway.username, password: gateway.password });
+  const saveUrl = `http://${gateway.host}:${apiPort}/goip_send_cmd.html?${saveParams}`;
+  const saveResult = await bridgeFetch(env, saveUrl, "POST", { "Content-Type": "application/json;charset=utf-8" }, JSON.stringify({ type: "command", op: "save" }));
+
+  await logSkylineApiCall(env, {
+    action: "save_config",
+    gateway_id,
+    port: `${portNum}.${String(slotNum).padStart(2, "0")} (n=${n})`,
+    requestUrl: saveUrl.replace(gateway.password, "***"),
+    requestBody: '{"type":"command","op":"save"}',
+    responseStatus: saveResult.status,
+    responseOk: saveResult.ok,
+    responseBody: saveResult.data,
+    error: saveResult.error,
+  });
+
+  const saveOk = saveResult.ok || saveResult.data?.code === 200;
+
+  return json({ ok: true, message: `IMEI set on ${gateway.code} port ${portNum} slot ${slotNum} (index ${n})`, save_ok: saveOk, skyline_response: result.data, save_response: saveResult.data, debug: { n, textBody } });
 }
 
 async function handlePortStatus(url, env) {
