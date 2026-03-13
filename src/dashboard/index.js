@@ -2843,15 +2843,13 @@ async function handleBillingCreateInvoice(request, env, corsHeaders) {
 
 function buildCSV(customerName, start, end, days, dailyRate) {
   // QuickBooks Online invoice import CSV format
-  // Required columns: InvoiceNo, Customer, InvoiceDate, DueDate, Terms, ProductService, Description, Qty, Rate, Amount
   const csvField = v => '"' + String(v).replace(/"/g, '""') + '"';
   const rows = [];
   rows.push([
     'InvoiceNo', 'Customer', 'InvoiceDate', 'DueDate', 'Terms',
-    'ProductService', 'Description', 'Qty', 'Rate', 'Amount'
+    'ServiceDate', 'ProductService', 'Description', 'Qty', 'Rate', 'Amount'
   ].map(csvField).join(','));
 
-  const invoiceDate = end;
   // Format date as MM/DD/YYYY for QBO
   const fmtDate = iso => {
     const [y, m, d] = iso.split('-');
@@ -2863,9 +2861,10 @@ function buildCSV(customerName, start, end, days, dailyRate) {
     rows.push([
       invoiceNo,
       customerName,
-      fmtDate(invoiceDate),
-      fmtDate(invoiceDate),
+      fmtDate(end),
+      fmtDate(end),
       'Due on receipt',
+      d.date ? fmtDate(d.date) : fmtDate(end),
       'US Business phone Rental',
       '',
       d.sim_count,
