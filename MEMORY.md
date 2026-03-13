@@ -22,7 +22,7 @@
 | `sms-ingest` | Main worker for receiving/processing incoming SMS |
 | `skyline-gateway` | Gateway for skyline device operations (IMEI changes) |
 | `phone-number-sync` | Syncs phone numbers from Helix |
-| `quickbooks` | QuickBooks Online integration for billing/invoicing |
+| `quickbooks` | Legacy QuickBooks worker (no longer used by dashboard — billing now uses CSV export) |
 
 ## Key Database Tables
 - `sims` — SIM card records (iccid, status, port, gateway_id, mobility_subscription_id, last_activation_error, last_mdn_rotated_at)
@@ -53,7 +53,7 @@
 5. **Gateway** — Gateway device management
 6. **IMEI Pool** — IMEI inventory (stats: Slots, In Use, Available, Retired, Total). Retire/Restore actions.
 7. **Errors** — System error tracking with resolution workflow (View, Resolve, bulk resolve)
-8. **Billing** — QuickBooks invoicing and customer mappings
+8. **Billing** — Invoice CSV export for QuickBooks Online import. Customer rates per reseller. No OAuth required.
 9. **Guide** — System Guide / SOP reference page. Documents every action, flow, and process in the system.
 
 ## MANDATORY: Keep the Guide Page Updated
@@ -68,7 +68,7 @@
 - Error page with resolution tracking (View, Resolve, bulk resolve)
 - Pagination system across all tables
 - Sorting system across all tables
-- QuickBooks invoice generation and customer mappings
+- Billing CSV export (QBO import format) with invoice history and re-download
 - IMEI pool with paginated fetch (all 1576+ IMEIs), retire/restore actions
 - SIM data 30-minute client-side cache with force-reload
 
@@ -97,7 +97,7 @@
 - `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD` — Dashboard basic auth
 - `SLACK_WEBHOOK_URL` — Error notifications to Slack
 - `SKYLINE_SECRET` — Secret for Skyline gateway API
-- `QBO_*` — QuickBooks credentials
+- `QBO_*` — QuickBooks credentials (legacy, no longer used by dashboard billing)
 
 ## SIM Statuses
 Allowed values (DB constraint): `pending`, `provisioning`, `active`, `suspended`, `canceled`, `error`, `data_mismatch`
@@ -107,6 +107,10 @@ Allowed values (DB constraint): `pending`, `provisioning`, `active`, `suspended`
 - **006_system_errors**: `system_errors` table for centralized error tracking with resolution workflow
 - **007_imei_pool_cleanup**: Removed `blocked` status from `imei_pool` check constraint
 - **add_data_mismatch_sim_status**: Added `data_mismatch` to `sims.status` CHECK constraint (2026-03-05)
+
+## Recent Changes (Mar 2026)
+- **Billing page overhaul**: Removed QuickBooks OAuth integration entirely. Billing now generates a QBO-compatible CSV file (one row per billing day) that you import via QuickBooks Online > Invoices > Import. Customer rates stored in `qbo_customer_map` table (customer name must match QBO exactly). Service item = "US Business phone Rental". Invoice history has per-row re-download. Invoices recorded in `qbo_invoices` table with status `draft`.
+- **Reseller Sync force option**: Workers tab Reseller Sync button now opens a modal with a "Skip dedup (force re-send)" checkbox. When checked passes `force=true` to reseller-sync worker to bypass the already-notified-today guard.
 
 ## Recent Changes (Feb 2026)
 - **Error page redesign**: Queries `system_errors` table + legacy `last_activation_error`. Shows Source, ICCID, Error, Severity, Status, Time columns. Has View/Resolve/OTA buttons per row.

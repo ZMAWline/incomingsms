@@ -4243,27 +4243,32 @@ function getHTML() {
                 <div id="guide-billing" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <h3 class="text-lg font-semibold text-white mb-3">Billing Page</h3>
                     <div class="text-sm text-gray-300 space-y-3">
-                        <p>Integrates with QuickBooks Online for reseller invoicing.</p>
+                        <p>Generates invoices as a CSV file you can import directly into QuickBooks Online. No OAuth connection required.</p>
                         <div class="mt-2">
-                            <h4 class="text-white font-medium mb-1">Setup</h4>
+                            <h4 class="text-white font-medium mb-1">Setup — Customer Rates</h4>
                             <ol class="list-decimal list-inside space-y-1 ml-2">
-                                <li>Click <span class="text-white">Connect to QuickBooks</span> to start OAuth flow</li>
-                                <li>Authorize the app in QBO</li>
-                                <li>Tokens are stored in Cloudflare KV (auto-refreshed)</li>
+                                <li>Click <span class="text-white">+ Add</span> in the Customer Rates section</li>
+                                <li>Select the reseller, enter the customer name <span class="text-gray-400">(must match exactly how it appears in QuickBooks)</span>, and set the daily rate per SIM</li>
+                                <li>Save — repeat for each reseller you bill</li>
                             </ol>
                         </div>
                         <div class="mt-2">
-                            <h4 class="text-white font-medium mb-1">Customer Mapping</h4>
-                            <p>Maps each reseller to a QBO customer with a daily rate per SIM. Use <span class="text-white">+ Add Mapping</span> to create new mappings. Each mapping specifies: reseller, QBO customer, and daily rate.</p>
+                            <h4 class="text-white font-medium mb-1">Generating an Invoice</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Select a reseller and date range (From / To)</li>
+                                <li>Click <span class="text-white">Preview</span> — shows a breakdown of billable SIM-days (SIMs with SMS activity per EST calendar day)</li>
+                                <li>Click <span class="text-white">Download for QuickBooks</span> to get a <code class="bg-dark-900 px-1 rounded text-accent">.csv</code> file</li>
+                                <li>In QuickBooks Online: go to <span class="text-white">Invoices &rarr; Import</span> and upload the CSV</li>
+                                <li>The invoice is recorded in Invoice History with a re-download link</li>
+                            </ol>
                         </div>
                         <div class="mt-2">
-                            <h4 class="text-white font-medium mb-1">Invoice Generation</h4>
-                            <ol class="list-decimal list-inside space-y-1 ml-2">
-                                <li>Select a week start date</li>
-                                <li>Click <span class="text-white">Preview</span> to calculate: active SIMs per reseller x daily rate x 7 days</li>
-                                <li>Review the preview, then click <span class="text-white">Create in QBO</span> to generate invoices</li>
-                                <li>Invoices appear in the Invoice History table with links to QBO</li>
-                            </ol>
+                            <h4 class="text-white font-medium mb-1">CSV Format</h4>
+                            <p>Each row is one billing day. Columns: <code class="bg-dark-900 px-1 rounded text-accent">InvoiceNo, Customer, InvoiceDate, DueDate, Terms, ServiceDate, ProductService, Description, Qty, Rate, Amount</code>. Service item is <span class="text-white">US Business phone Rental</span>. Invoice date = end of period. Terms = Due on receipt. InvoiceNo is repeated on every row.</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Billing Logic</h4>
+                            <p>A SIM is billable on a given EST date if it had at least 1 incoming SMS that day (<code class="bg-dark-900 px-1 rounded text-accent">sim_sms_daily.sms_count &gt; 0</code>). Each billable SIM counts as 1 unit at the configured daily rate.</p>
                         </div>
                     </div>
                 </div>
