@@ -2841,28 +2841,46 @@ async function handleBillingCreateInvoice(request, env, corsHeaders) {
   return new Response(JSON.stringify({ error: 'Use /api/billing/download-invoice' }), { status: 410, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
-function buildIIF(customerName, start, end, days, dailyRate, totalAmount) {
-  // QuickBooks IIF invoice format
-  const lines = [];
-  lines.push('!TRNS\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM\tMEMO');
-  lines.push('!SPL\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tQNTY\tPRICE\tINVITEM\tMEMO');
-  lines.push('!ENDTRNS');
+function buildCSV(customerName, start, end, days, dailyRate) {
+  // QuickBooks Online invoice import CSV format
+  // Required columns: InvoiceNo, Customer, InvoiceDate, DueDate, Terms, ProductService, Description, Qty, Rate, Amount
+  const csvField = v => '"' + String(v).replace(/"/g, '""') + '"';
+  const rows = [];
+  rows.push([
+    'InvoiceNo', 'Customer', 'InvoiceDate', 'DueDate', 'Terms',
+    'ProductService', 'Description', 'Qty', 'Rate', 'Amount'
+  ].map(csvField).join(','));
 
-  const invoiceDate = end; // use end of period as invoice date
-  const docNum = 'INV-' + start.replace(/-/g, '') + '-' + end.replace(/-/g, '');
-  const memo = 'SMS Routing ' + start + ' to ' + end;
+  const invoiceDate = end;
+  // Format date as MM/DD/YYYY for QBO
+  const fmtDate = iso => {
+    const [y, m, d] = iso.split('-');
+    return m + '/' + d + '/' + y;
+  };
 
-  // Header line
-  lines.push(['TRNS', 'INVOICE', invoiceDate, 'Accounts Receivable', customerName, totalAmount.toFixed(2), docNum, memo].join('\t'));
-
-  // One SPL line per day
-  for (const d of days) {
-    const itemMemo = 'SMS Routing - ' + d.date + ' (' + d.sim_count + ' SIM' + (d.sim_count !== 1 ? 's' : '') + ')';
-    lines.push(['SPL', 'INVOICE', invoiceDate, 'SMS Routing Services', customerName, (-d.amount).toFixed(2), d.sim_count, dailyRate.toFixed(4), 'SMS Routing', itemMemo].join('\t'));
+  for (let i = 0; i < days.length; i++) {
+    const d = days[i];
+    // Only put invoice header fields on first line
+    const invoiceNo = i === 0 ? 'INV-' + start.replace(/-/g, '') + '-' + end.replace(/-/g, '') : '';
+    const customer  = i === 0 ? customerName : '';
+    const invDate   = i === 0 ? fmtDate(invoiceDate) : '';
+    const dueDate   = i === 0 ? fmtDate(invoiceDate) : '';
+    const terms     = i === 0 ? 'Due on receipt' : '';
+    rows.push([
+      invoiceNo,
+      customer,
+      invDate,
+      dueDate,
+      terms,
+      'US Business phone Rental',
+      '',
+      d.sim_count,
+      dailyRate.toFixed(2),
+      d.amount.toFixed(2),
+    ].map(csvField).join(','));
   }
 
-  lines.push('ENDTRNS');
-  return lines.join('\r\n') + '\r\n';
+  return rows.join('\r\n') + '\r\n';
 }
 
 async function handleBillingDownloadInvoice(url, env, corsHeaders) {
@@ -2883,13 +2901,13 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       const dailyRate = parseFloat(inv.qbo_customer_map?.daily_rate || 0);
       const totalAmount = parseFloat(inv.total);
       // For re-download we don't have day-by-day breakdown, use a single summary line
-      const days = [{ date: inv.week_start + ' – ' + inv.week_end, sim_count: inv.sim_count, amount: totalAmount }];
-      const iif = buildIIF(customerName, inv.week_start, inv.week_end, days, dailyRate, totalAmount);
-      const filename = 'invoice_' + customerName.replace(/[^a-z0-9]/gi, '_') + '_' + inv.week_start + '_' + inv.week_end + '.iif';
-      return new Response(iif, {
+      const days = [{ sim_count: inv.sim_count, amount: totalAmount }];
+      const csv = buildCSV(customerName, inv.week_start, inv.week_end, days, dailyRate);
+      const filename = 'invoice_' + customerName.replace(/[^a-z0-9]/gi, '_') + '_' + inv.week_start + '_' + inv.week_end + '.csv';
+      return new Response(csv, {
         headers: {
           ...corsHeaders,
-          'Content-Type': 'application/octet-stream',
+          'Content-Type': 'text/csv',
           'Content-Disposition': 'attachment; filename="' + filename + '"',
         },
       });
@@ -2964,12 +2982,12 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       }),
     });
 
-    const iif = buildIIF(mapping.qbo_display_name, start, end, days, dailyRate, totalAmount);
-    const filename = 'invoice_' + mapping.qbo_display_name.replace(/[^a-z0-9]/gi, '_') + '_' + start + '_' + end + '.iif';
-    return new Response(iif, {
+    const csv = buildCSV(mapping.qbo_display_name, start, end, days, dailyRate);
+    const filename = 'invoice_' + mapping.qbo_display_name.replace(/[^a-z0-9]/gi, '_') + '_' + start + '_' + end + '.csv';
+    return new Response(csv, {
       headers: {
         ...corsHeaders,
-        'Content-Type': 'application/octet-stream',
+        'Content-Type': 'text/csv',
         'Content-Disposition': 'attachment; filename="' + filename + '"',
       },
     });
@@ -8125,10 +8143,10 @@ async function sendSimOnline(simId, phoneNumber) {
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");
-                const filename = \`invoice_\${invoicePreviewData.mapping?.qbo_display_name?.replace(/[^a-z0-9]/gi, "_") || resellerId}_\${start}_\${end}.iif\`;
+                const filename = \`invoice_\${invoicePreviewData.mapping?.qbo_display_name?.replace(/[^a-z0-9]/gi, "_") || resellerId}_\${start}_\${end}.csv\`;
                 a.href = url; a.download = filename; a.click();
                 URL.revokeObjectURL(url);
-                showToast("Downloaded IIF file — import it into QuickBooks", "success");
+                showToast("Downloaded CSV — import via QuickBooks > Invoices > Import", "success");
                 loadInvoiceHistory();
             } catch (error) {
                 showToast("Error downloading: " + error, "error");
@@ -8146,7 +8164,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");
-                a.href = url; a.download = \`invoice_\${invoiceId}.iif\`; a.click();
+                a.href = url; a.download = \`invoice_\${invoiceId}.csv\`; a.click();
                 URL.revokeObjectURL(url);
             } catch (error) {
                 showToast("Error: " + error, "error");
@@ -8166,7 +8184,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         <td class="px-4 py-3 text-gray-400 text-xs">\${inv.week_start} – \${inv.week_end}</td>
                         <td class="px-4 py-3 text-gray-300">\${inv.sim_count}</td>
                         <td class="px-4 py-3 text-accent">$\${Number(inv.total).toFixed(2)}</td>
-                        <td class="px-4 py-3"><button onclick="downloadHistoryIIF(\${inv.id})" class="text-xs text-blue-400 hover:text-blue-300">Download IIF</button></td>
+                        <td class="px-4 py-3"><button onclick="downloadHistoryIIF(\${inv.id})" class="text-xs text-blue-400 hover:text-blue-300">Download CSV</button></td>
                     </tr>\`
                 ).join("");
             } catch (error) {
