@@ -468,6 +468,7 @@ async function handleRunWorker(request, env, workerName, corsHeaders) {
   try {
     const body = await request.json();
     const limit = body.limit || null;
+    const force = body.force || false;
 
     // Worker configs with service bindings
     const workerConfigs = {
@@ -515,9 +516,10 @@ async function handleRunWorker(request, env, workerName, corsHeaders) {
       });
     }
 
-    const workerUrl = limit
-      ? `https://worker/run?secret=${encodeURIComponent(config.secret)}&limit=${limit}`
-      : `https://worker/run?secret=${encodeURIComponent(config.secret)}`;
+    let workerUrl = limit
+      ? 'https://worker/run?secret=' + encodeURIComponent(config.secret) + '&limit=' + limit
+      : 'https://worker/run?secret=' + encodeURIComponent(config.secret);
+    if (force) workerUrl += '&force=true';
 
     // Use service binding for worker-to-worker communication
     const workerResponse = await config.binding.fetch(workerUrl);
@@ -3367,7 +3369,7 @@ function getHTML() {
                                 <p class="text-xs text-gray-400">Sync numbers from Helix</p>
                             </div>
                         </button>
-                        <button onclick="runWorker('reseller-sync')" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                        <button onclick="showResellerSyncModal()" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
                             <div class="w-12 h-12 rounded-lg bg-teal-500/20 flex items-center justify-center flex-shrink-0">
                                 <svg class="w-6 h-6 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
                             </div>
@@ -3376,6 +3378,24 @@ function getHTML() {
                                 <p class="text-xs text-gray-400">Send webhooks to resellers</p>
                             </div>
                         </button>
+                    <!-- Reseller Sync Modal -->
+                    <div id="reseller-sync-modal" class="hidden fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+                        <div class="bg-dark-800 border border-dark-600 rounded-xl p-6 w-full max-w-sm shadow-2xl">
+                            <h3 class="text-lg font-semibold text-white mb-4">Reseller Sync</h3>
+                            <p class="text-sm text-gray-400 mb-4">Send <code class="bg-dark-900 px-1 rounded text-accent">number.online</code> webhooks to resellers for all active SIMs with verified numbers.</p>
+                            <label class="flex items-center gap-3 cursor-pointer mb-6">
+                                <input type="checkbox" id="reseller-sync-force" class="w-4 h-4 rounded accent-amber-500">
+                                <div>
+                                    <span class="text-sm font-medium text-white">Skip dedup (force re-send)</span>
+                                    <p class="text-xs text-gray-500">Re-send even if already notified today</p>
+                                </div>
+                            </label>
+                            <div class="flex gap-3">
+                                <button onclick="hideResellerSyncModal()" class="flex-1 px-4 py-2 bg-dark-600 hover:bg-dark-500 text-white rounded-lg text-sm transition">Cancel</button>
+                                <button onclick="doResellerSync()" class="flex-1 px-4 py-2 bg-teal-600 hover:bg-teal-500 text-white rounded-lg text-sm font-medium transition">Run Sync</button>
+                            </div>
+                        </div>
+                    </div>
                     </div>
                 </div>
             </div>
@@ -5383,6 +5403,40 @@ async function sendSimOnline(simId, phoneNumber) {
             } finally {
                 btn.disabled = false;
                 btn.textContent = 'Rotate SIMs';
+            }
+        }
+
+        
+        function showResellerSyncModal() {
+            document.getElementById('reseller-sync-force').checked = false;
+            document.getElementById('reseller-sync-modal').classList.remove('hidden');
+        }
+
+        function hideResellerSyncModal() {
+            document.getElementById('reseller-sync-modal').classList.add('hidden');
+        }
+
+        async function doResellerSync() {
+            const force = document.getElementById('reseller-sync-force').checked;
+            hideResellerSyncModal();
+            showToast('Running reseller-sync' + (force ? ' (force)' : '') + '...', 'info');
+            try {
+                const response = await fetch(API_BASE + '/run/reseller-sync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ force })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    const msg = 'Reseller sync done: ' + (result.synced || 0) + ' sent, ' + (result.skipped || 0) + ' skipped, ' + (result.errors || 0) + ' errors';
+                    showToast(msg, 'success');
+                    loadData();
+                } else {
+                    showToast('Error: ' + (result.error || 'unknown'), 'error');
+                }
+            } catch (e) {
+                showToast('Error running reseller-sync', 'error');
+                console.error(e);
             }
         }
 
