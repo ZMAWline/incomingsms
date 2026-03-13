@@ -167,10 +167,6 @@ export default {
       return handleSimAction(request, env, corsHeaders);
     }
 
-    if (url.pathname.startsWith('/api/qbo/')) {
-      return handleQboRoute(request, env, corsHeaders, url);
-    }
-
     if (url.pathname === '/api/qbo-mappings' && request.method === 'GET') {
       return handleQboMappingsGet(env, corsHeaders);
     }
@@ -187,12 +183,12 @@ export default {
       return handleQboInvoicesGet(env, corsHeaders);
     }
 
-    if (url.pathname === '/api/qbo-invoice-preview') {
-      return handleQboInvoicePreview(url, env, corsHeaders);
-    }
-
     if (url.pathname === '/api/billing/preview') {
       return handleBillingPreview(url, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/billing/download-invoice') {
+      return handleBillingDownloadInvoice(url, env, corsHeaders);
     }
 
     if (url.pathname === '/api/billing/create-invoice' && request.method === 'POST') {
@@ -2839,25 +2835,82 @@ async function handleBillingPreview(url, env, corsHeaders) {
 }
 
 async function handleBillingCreateInvoice(request, env, corsHeaders) {
+  // Kept for backward compatibility but no longer called by the UI.
+  return new Response(JSON.stringify({ error: 'Use /api/billing/download-invoice' }), { status: 410, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
+function buildIIF(customerName, start, end, days, dailyRate, totalAmount) {
+  // QuickBooks IIF invoice format
+  const lines = [];
+  lines.push('!TRNS\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM\tMEMO');
+  lines.push('!SPL\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tQNTY\tPRICE\tINVITEM\tMEMO');
+  lines.push('!ENDTRNS');
+
+  const invoiceDate = end; // use end of period as invoice date
+  const docNum = 'INV-' + start.replace(/-/g, '') + '-' + end.replace(/-/g, '');
+  const memo = 'SMS Routing ' + start + ' to ' + end;
+
+  // Header line
+  lines.push(['TRNS', 'INVOICE', invoiceDate, 'Accounts Receivable', customerName, totalAmount.toFixed(2), docNum, memo].join('\t'));
+
+  // One SPL line per day
+  for (const d of days) {
+    const itemMemo = 'SMS Routing - ' + d.date + ' (' + d.sim_count + ' SIM' + (d.sim_count !== 1 ? 's' : '') + ')';
+    lines.push(['SPL', 'INVOICE', invoiceDate, 'SMS Routing Services', customerName, (-d.amount).toFixed(2), d.sim_count, dailyRate.toFixed(4), 'SMS Routing', itemMemo].join('\t'));
+  }
+
+  lines.push('ENDTRNS');
+  return lines.join('\r\n') + '\r\n';
+}
+
+async function handleBillingDownloadInvoice(url, env, corsHeaders) {
   try {
-    const body = await request.json();
-    const { reseller_id, start, end } = body;
-    if (!reseller_id || !start || !end) {
+    const invoiceId = url.searchParams.get('invoice_id');
+
+    if (invoiceId) {
+      // Re-download an existing invoice from history (single summary line item)
+      const invResp = await supabaseGet(env,
+        'qbo_invoices?select=id,week_start,week_end,sim_count,total,qbo_customer_map(qbo_display_name,daily_rate)&id=eq.' + encodeURIComponent(invoiceId) + '&limit=1'
+      );
+      const invData = await invResp.json();
+      const inv = Array.isArray(invData) && invData[0] ? invData[0] : null;
+      if (!inv) {
+        return new Response(JSON.stringify({ error: 'Invoice not found' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      const customerName = inv.qbo_customer_map?.qbo_display_name || 'Customer';
+      const dailyRate = parseFloat(inv.qbo_customer_map?.daily_rate || 0);
+      const totalAmount = parseFloat(inv.total);
+      // For re-download we don't have day-by-day breakdown, use a single summary line
+      const days = [{ date: inv.week_start + ' – ' + inv.week_end, sim_count: inv.sim_count, amount: totalAmount }];
+      const iif = buildIIF(customerName, inv.week_start, inv.week_end, days, dailyRate, totalAmount);
+      const filename = 'invoice_' + customerName.replace(/[^a-z0-9]/gi, '_') + '_' + inv.week_start + '_' + inv.week_end + '.iif';
+      return new Response(iif, {
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/octet-stream',
+          'Content-Disposition': 'attachment; filename="' + filename + '"',
+        },
+      });
+    }
+
+    // New invoice: reseller_id + start + end
+    const resellerId = url.searchParams.get('reseller_id');
+    const start = url.searchParams.get('start');
+    const end = url.searchParams.get('end');
+    if (!resellerId || !start || !end) {
       return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Get QBO mapping
-    const mappingResp = await supabaseGet(env, 'qbo_customer_map?select=id,qbo_customer_id,qbo_display_name,daily_rate&reseller_id=eq.' + encodeURIComponent(reseller_id) + '&limit=1');
+    const mappingResp = await supabaseGet(env, 'qbo_customer_map?select=id,qbo_display_name,daily_rate&reseller_id=eq.' + encodeURIComponent(resellerId) + '&limit=1');
     const mappingData = await mappingResp.json();
     const mapping = Array.isArray(mappingData) && mappingData[0] ? mappingData[0] : null;
     if (!mapping) {
-      return new Response(JSON.stringify({ error: 'No QBO mapping for this reseller' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ error: 'No customer rate configured for this reseller' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Get billable SIM-days (same logic as preview)
     const smsResp = await supabaseGet(env,
       'reseller_sims?select=sim_id,sims(sim_sms_daily(est_date,sms_count))' +
-      '&reseller_id=eq.' + encodeURIComponent(reseller_id) +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
       '&active=eq.true'
     );
     const rsSims = await smsResp.json();
@@ -2889,30 +2942,6 @@ async function handleBillingCreateInvoice(request, env, corsHeaders) {
       return new Response(JSON.stringify({ error: 'No billable SIM-days in this range' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // Build QBO line items — one per calendar day
-    const lineItems = days.map(d => ({
-      description: 'SMS Routing - ' + d.date + ' (' + d.sim_count + ' SIM' + (d.sim_count !== 1 ? 's' : '') + ')',
-      quantity: d.sim_count,
-      rate: dailyRate,
-      amount: +d.amount.toFixed(2),
-    }));
-
-    // Call QBO via service binding
-    const qboUrl = 'https://quickbooks/invoice/create';
-    const qboResp = await env.QUICKBOOKS.fetch(qboUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        customerId: mapping.qbo_customer_id,
-        lineItems,
-      }),
-    });
-    if (!qboResp.ok) {
-      const errText = await qboResp.text();
-      return new Response(JSON.stringify({ error: 'QBO error: ' + errText }), { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-    const qboResult = await qboResp.json();
-
     // Record in qbo_invoices
     await fetch(env.SUPABASE_URL + '/rest/v1/qbo_invoices', {
       method: 'POST',
@@ -2924,7 +2953,7 @@ async function handleBillingCreateInvoice(request, env, corsHeaders) {
       },
       body: JSON.stringify({
         qbo_customer_map_id: mapping.id,
-        qbo_invoice_id: qboResult.id || null,
+        qbo_invoice_id: null,
         week_start: start,
         week_end: end,
         sim_count: totalSimDays,
@@ -2933,7 +2962,15 @@ async function handleBillingCreateInvoice(request, env, corsHeaders) {
       }),
     });
 
-    return new Response(JSON.stringify({ ok: true, invoice_id: qboResult.id, doc_number: qboResult.docNumber, total: totalAmount }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const iif = buildIIF(mapping.qbo_display_name, start, end, days, dailyRate, totalAmount);
+    const filename = 'invoice_' + mapping.qbo_display_name.replace(/[^a-z0-9]/gi, '_') + '_' + start + '_' + end + '.iif';
+    return new Response(iif, {
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': 'attachment; filename="' + filename + '"',
+      },
+    });
   } catch (error) {
     return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
@@ -3561,25 +3598,18 @@ function getHTML() {
                     <h2 class="text-xl font-bold text-white">Billing & Invoicing</h2>
                 </div>
 
-                <!-- QBO Connection -->
-                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
-                    <h3 class="text-lg font-semibold text-white mb-3">QuickBooks Connection</h3>
-                    <div id="qbo-status" class="text-gray-400">Checking connection...</div>
-                    <div class="mt-3" id="qbo-actions"></div>
-                </div>
-
                 <!-- Customer Mapping -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-semibold text-white">Customer Mapping</h3>
-                        <button onclick="showAddMappingModal()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add Mapping</button>
+                        <h3 class="text-lg font-semibold text-white">Customer Rates</h3>
+                        <button onclick="showAddMappingModal()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add</button>
                     </div>
                     <div class="overflow-x-auto">
                         <table class="w-full">
                             <thead>
                                 <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
                                     <th class="px-4 py-3 font-medium">Reseller</th>
-                                    <th class="px-4 py-3 font-medium">QBO Customer</th>
+                                    <th class="px-4 py-3 font-medium">Customer Name</th>
                                     <th class="px-4 py-3 font-medium">Daily Rate</th>
                                     <th class="px-4 py-3 font-medium">Active SIMs</th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
@@ -3611,7 +3641,7 @@ function getHTML() {
                             <input type="date" id="invoice-end" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
                         </div>
                         <button onclick="previewInvoices()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Preview</button>
-                        <button onclick="createInvoices()" id="create-invoices-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Create in QBO</button>
+                        <button onclick="downloadInvoiceIIF()" id="download-invoice-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Download for QuickBooks</button>
                     </div>
                     <div id="invoice-preview" class="text-gray-400 text-sm"></div>
                 </div>
@@ -3624,10 +3654,10 @@ function getHTML() {
                             <thead>
                                 <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
                                     <th class="px-4 py-3 font-medium">Customer</th>
-                                    <th class="px-4 py-3 font-medium">Week</th>
-                                    <th class="px-4 py-3 font-medium">SIMs</th>
+                                    <th class="px-4 py-3 font-medium">Period</th>
+                                    <th class="px-4 py-3 font-medium">SIM-days</th>
                                     <th class="px-4 py-3 font-medium">Total</th>
-                                    <th class="px-4 py-3 font-medium">Status</th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="invoice-history-table" class="text-sm">
@@ -4913,7 +4943,7 @@ function getHTML() {
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'billing') loadBillingStatus();
+            if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); }
         }
 
         // Handle browser back/forward
@@ -7890,8 +7920,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
 
-        // ===== Billing (QBO) =====
-        let selectedQboCustomer = null;
+        // ===== Billing =====
         let invoicePreviewData = null;
 
         async function loadBillingResellers() {
@@ -7904,66 +7933,23 @@ async function sendSimOnline(simId, phoneNumber) {
                 mappings.forEach(m => {
                     const opt = document.createElement("option");
                     opt.value = m.reseller_id || "";
-                    opt.textContent = (m.reseller_name || m.customer_name || m.qbo_display_name) + " — " + m.qbo_display_name;
+                    opt.textContent = m.reseller_name || m.qbo_display_name || String(m.reseller_id);
                     sel.appendChild(opt);
                 });
             } catch (e) { console.error("loadBillingResellers:", e); }
         }
 
-        async function loadBillingStatus() {
-            try {
-                const resp = await fetch(\`\${API_BASE}/qbo/status\`);
-                const data = await resp.json();
-                const statusEl = document.getElementById("qbo-status");
-                const actionsEl = document.getElementById("qbo-actions");
-                if (data.connected) {
-                    statusEl.innerHTML = \`<span class="text-accent font-semibold">Connected</span> <span class="text-gray-500 text-sm">(Company: \${data.company_name || data.realm_id || "unknown"})</span>\`;
-                    actionsEl.innerHTML = \`<button onclick="disconnectQbo()" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Disconnect</button>\`;
-                    loadMappings();
-                    loadInvoiceHistory();
-                    loadBillingResellers();
-                } else {
-                    statusEl.innerHTML = \`<span class="text-yellow-400">Not connected</span>\`;
-                    actionsEl.innerHTML = \`<button onclick="connectQbo()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Connect to QuickBooks</button>\`;
-                }
-            } catch (error) {
-                document.getElementById("qbo-status").innerHTML = \`<span class="text-red-400">Error: \${error}</span>\`;
-            }
-        }
-
-        async function connectQbo() {
-            try {
-                const resp = await fetch(\`\${API_BASE}/qbo/auth-url\`);
-                const data = await resp.json();
-                if (data.url) window.open(data.url, "_blank");
-                else showToast("Error getting auth URL: " + JSON.stringify(data), "error");
-            } catch (error) {
-                showToast("Error: " + error, "error");
-            }
-        }
-
-        async function disconnectQbo() {
-            if (!confirm("Disconnect from QuickBooks?")) return;
-            try {
-                await fetch(\`\${API_BASE}/qbo/disconnect\`, { method: "POST" });
-                showToast("Disconnected from QuickBooks", "success");
-                loadBillingStatus();
-            } catch (error) {
-                showToast("Error: " + error, "error");
-            }
-        }
-
         async function loadMappings() {
             try {
                 const resp = await fetch(\`\${API_BASE}/qbo-mappings\`);
-                if (!resp.ok) { document.getElementById("mapping-table").innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No mappings yet</td></tr>'; return; }
+                if (!resp.ok) { document.getElementById("mapping-table").innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No entries yet</td></tr>'; return; }
                 const mappings = await resp.json();
                 const tbody = document.getElementById("mapping-table");
-                if (!mappings.length) { tbody.innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No mappings yet</td></tr>'; return; }
+                if (!mappings.length) { tbody.innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No entries yet</td></tr>'; return; }
                 tbody.innerHTML = mappings.map(m => \`
                     <tr class="border-b border-dark-600">
-                        <td class="px-4 py-3 text-gray-300">\${m.reseller_name || m.customer_name || "-"}</td>
-                        <td class="px-4 py-3 text-gray-300">\${m.qbo_display_name}</td>
+                        <td class="px-4 py-3 text-gray-300">\${m.reseller_name || "-"}</td>
+                        <td class="px-4 py-3 text-gray-300">\${m.qbo_display_name || "-"}</td>
                         <td class="px-4 py-3 text-gray-300">$\${Number(m.daily_rate).toFixed(2)}</td>
                         <td class="px-4 py-3 text-gray-300">\${m.sim_count || "-"}</td>
                         <td class="px-4 py-3"><button onclick="deleteMapping(\${m.id})" class="text-xs text-red-400 hover:text-red-300">Delete</button></td>
@@ -7975,14 +7961,10 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         function showAddMappingModal() {
-            selectedQboCustomer = null;
-            document.getElementById("mapping-qbo-search").value = "";
-            document.getElementById("qbo-search-results").classList.add("hidden");
+            document.getElementById("mapping-customer-name").value = "";
             document.getElementById("mapping-rate").value = "0.50";
-            // Populate reseller dropdown
             const sel = document.getElementById("mapping-reseller");
             sel.innerHTML = '<option value="">-- Select Reseller --</option>';
-            // Load resellers from existing data
             fetch(\`\${API_BASE}/resellers\`).then(r => r.json()).then(resellers => {
                 resellers.forEach(r => {
                     const opt = document.createElement("option");
@@ -7997,48 +7979,16 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById("add-mapping-modal").classList.add("hidden");
         }
 
-        let qboSearchTimeout = null;
-        async function searchQboCustomers() {
-            clearTimeout(qboSearchTimeout);
-            const q = document.getElementById("mapping-qbo-search").value.trim();
-            if (q.length < 2) { document.getElementById("qbo-search-results").classList.add("hidden"); return; }
-            qboSearchTimeout = setTimeout(async () => {
-                try {
-                    const resp = await fetch(\`\${API_BASE}/qbo/customers/search?q=\${encodeURIComponent(q)}\`);
-                    const data = await resp.json();
-                    const container = document.getElementById("qbo-search-results");
-                    if (data.customers && data.customers.length > 0) {
-                        container.innerHTML = data.customers.map(c => \`
-                            <div class="px-3 py-2 text-sm text-gray-300 hover:bg-dark-600 cursor-pointer" onclick="selectQboCustomer(\${c.Id}, '\${(c.DisplayName || "").replace(/'/g, "\\'")}')">
-                                \${c.DisplayName}
-                            </div>
-                        \`).join("");
-                        container.classList.remove("hidden");
-                    } else {
-                        container.innerHTML = '<div class="px-3 py-2 text-sm text-gray-500">No customers found</div>';
-                        container.classList.remove("hidden");
-                    }
-                } catch (error) {
-                    console.error("QBO search error:", error);
-                }
-            }, 300);
-        }
-
-        function selectQboCustomer(id, name) {
-            selectedQboCustomer = { id: String(id), name };
-            document.getElementById("mapping-qbo-search").value = name;
-            document.getElementById("qbo-search-results").classList.add("hidden");
-        }
-
         async function saveMapping() {
             const resellerId = document.getElementById("mapping-reseller").value;
+            const customerName = document.getElementById("mapping-customer-name").value.trim();
             const rate = document.getElementById("mapping-rate").value;
-            if (!selectedQboCustomer) { showToast("Select a QBO customer first", "error"); return; }
+            if (!customerName) { showToast("Enter a customer name", "error"); return; }
             try {
                 const body = {
                     reseller_id: resellerId ? parseInt(resellerId) : null,
-                    qbo_customer_id: selectedQboCustomer.id,
-                    qbo_display_name: selectedQboCustomer.name,
+                    qbo_customer_id: customerName,
+                    qbo_display_name: customerName,
                     daily_rate: parseFloat(rate)
                 };
                 const resp = await fetch(\`\${API_BASE}/qbo-mappings\`, {
@@ -8047,24 +7997,26 @@ async function sendSimOnline(simId, phoneNumber) {
                     body: JSON.stringify(body)
                 });
                 if (resp.ok) {
-                    showToast("Mapping saved", "success");
+                    showToast("Saved", "success");
                     closeMappingModal();
                     loadMappings();
+                    loadBillingResellers();
                 } else {
                     const err = await resp.json();
                     showToast("Error: " + (err.error || JSON.stringify(err)), "error");
                 }
             } catch (error) {
-                showToast("Error saving mapping: " + error, "error");
+                showToast("Error saving: " + error, "error");
             }
         }
 
         async function deleteMapping(id) {
-            if (!confirm("Delete this mapping?")) return;
+            if (!confirm("Delete this entry?")) return;
             try {
                 await fetch(\`\${API_BASE}/qbo-mappings?id=\${id}\`, { method: "DELETE" });
-                showToast("Mapping deleted", "success");
+                showToast("Deleted", "success");
                 loadMappings();
+                loadBillingResellers();
             } catch (error) {
                 showToast("Error: " + error, "error");
             }
@@ -8082,15 +8034,15 @@ async function sendSimOnline(simId, phoneNumber) {
                 invoicePreviewData = data;
                 if (!data.days || data.days.length === 0) {
                     document.getElementById("invoice-preview").innerHTML = '<p class="text-gray-500">No billable SIM-days in this range.</p>';
-                    document.getElementById("create-invoices-btn").classList.add("hidden");
+                    document.getElementById("download-invoice-btn").classList.add("hidden");
                     return;
                 }
                 if (!data.mapping) {
-                    document.getElementById("invoice-preview").innerHTML = '<p class="text-yellow-400">No QBO mapping for this reseller. Add one in Customer Mapping above.</p>';
-                    document.getElementById("create-invoices-btn").classList.add("hidden");
+                    document.getElementById("invoice-preview").innerHTML = '<p class="text-yellow-400">No customer rate configured for this reseller. Add one in Customer Rates above.</p>';
+                    document.getElementById("download-invoice-btn").classList.add("hidden");
                     return;
                 }
-                let html = '<div class="mb-3 text-sm text-gray-400">QBO Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Daily Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span></div>';
+                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Daily Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span></div>';
                 html += '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2 pr-4">Date (EST)</th><th class="py-2 pr-4">SIMs w/ SMS</th><th class="py-2">Amount</th></tr></thead><tbody>';
                 data.days.forEach(d => {
                     html += \`<tr class="border-b border-dark-700"><td class="py-2 pr-4 text-gray-300">\${d.date}</td><td class="py-2 pr-4 text-gray-300">\${d.sim_count}</td><td class="py-2 text-gray-300">$\${Number(d.amount).toFixed(2)}</td></tr>\`;
@@ -8098,62 +8050,71 @@ async function sendSimOnline(simId, phoneNumber) {
                 html += \`<tr class="border-t border-dark-500"><td class="py-2 pr-4 text-white font-semibold">Total</td><td class="py-2 pr-4 text-white font-semibold">\${data.total_sim_days} SIM-days</td><td class="py-2 text-accent font-bold">$\${Number(data.total_amount).toFixed(2)}</td></tr>\`;
                 html += "</tbody></table></div>";
                 document.getElementById("invoice-preview").innerHTML = html;
-                document.getElementById("create-invoices-btn").classList.remove("hidden");
+                document.getElementById("download-invoice-btn").classList.remove("hidden");
             } catch (error) {
                 showToast("Error previewing: " + error, "error");
             }
         }
 
-        async function createInvoices() {
+        async function downloadInvoiceIIF() {
             if (!invoicePreviewData || !invoicePreviewData.days || invoicePreviewData.days.length === 0) return;
             const resellerId = document.getElementById("invoice-reseller").value;
             const start = document.getElementById("invoice-start").value;
             const end = document.getElementById("invoice-end").value;
-            const total = invoicePreviewData.total_amount;
-            if (!confirm(\`Create invoice for $\${Number(total).toFixed(2)} in QuickBooks? (\${invoicePreviewData.total_sim_days} SIM-days)\`)) return;
             try {
-                const resp = await fetch(\`\${API_BASE}/billing/create-invoice\`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ reseller_id: resellerId, start, end }),
-                });
-                const result = await resp.json();
-                if (result.ok) {
-                    showToast(\`Invoice created in QBO — $\${Number(result.total).toFixed(2)}\`, "success");
-                    document.getElementById("create-invoices-btn").classList.add("hidden");
-                    document.getElementById("invoice-preview").innerHTML = '';
-                    loadInvoiceHistory();
-                } else {
-                    showToast("Error: " + (result.error || JSON.stringify(result)), "error");
+                const resp = await fetch(\`\${API_BASE}/billing/download-invoice?reseller_id=\${encodeURIComponent(resellerId)}&start=\${start}&end=\${end}\`);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    showToast("Error: " + (err.error || resp.statusText), "error");
+                    return;
                 }
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                const filename = \`invoice_\${invoicePreviewData.mapping?.qbo_display_name?.replace(/[^a-z0-9]/gi, "_") || resellerId}_\${start}_\${end}.iif\`;
+                a.href = url; a.download = filename; a.click();
+                URL.revokeObjectURL(url);
+                showToast("Downloaded IIF file — import it into QuickBooks", "success");
+                loadInvoiceHistory();
             } catch (error) {
-                showToast("Error creating invoice: " + error, "error");
+                showToast("Error downloading: " + error, "error");
             }
         }
 
-                async function loadInvoiceHistory() {
+        async function downloadHistoryIIF(invoiceId) {
+            try {
+                const resp = await fetch(\`\${API_BASE}/billing/download-invoice?invoice_id=\${invoiceId}\`);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    showToast("Error: " + (err.error || resp.statusText), "error");
+                    return;
+                }
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url; a.download = \`invoice_\${invoiceId}.iif\`; a.click();
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                showToast("Error: " + error, "error");
+            }
+        }
+
+        async function loadInvoiceHistory() {
             try {
                 const resp = await fetch(\`\${API_BASE}/qbo-invoices\`);
                 if (!resp.ok) return;
                 const invoices = await resp.json();
                 const tbody = document.getElementById("invoice-history-table");
                 if (!invoices.length) { tbody.innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No invoices yet</td></tr>'; return; }
-                tbody.innerHTML = invoices.map(inv => {
-                    const statusClass = {
-                        draft: "bg-gray-500/20 text-gray-400",
-                        sent: "bg-blue-500/20 text-blue-400",
-                        paid: "bg-accent/20 text-accent",
-                        error: "bg-red-500/20 text-red-400"
-                    }[inv.status] || "bg-gray-500/20 text-gray-400";
-                    return \`
+                tbody.innerHTML = invoices.map(inv => \`
                     <tr class="border-b border-dark-600">
                         <td class="px-4 py-3 text-gray-300">\${inv.customer_name || "-"}</td>
-                        <td class="px-4 py-3 text-gray-400 text-xs">\${inv.week_start} - \${inv.week_end}</td>
+                        <td class="px-4 py-3 text-gray-400 text-xs">\${inv.week_start} – \${inv.week_end}</td>
                         <td class="px-4 py-3 text-gray-300">\${inv.sim_count}</td>
                         <td class="px-4 py-3 text-accent">$\${Number(inv.total).toFixed(2)}</td>
-                        <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${inv.status}</span></td>
-                    </tr>\`;
-                }).join("");
+                        <td class="px-4 py-3"><button onclick="downloadHistoryIIF(\${inv.id})" class="text-xs text-blue-400 hover:text-blue-300">Download IIF</button></td>
+                    </tr>\`
+                ).join("");
             } catch (error) {
                 console.error("Error loading invoice history:", error);
             }
@@ -8168,16 +8129,15 @@ async function sendSimOnline(simId, phoneNumber) {
         <!-- Add Mapping Modal -->
         <div id="add-mapping-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50">
             <div class="bg-dark-800 rounded-xl border border-dark-600 p-6 w-full max-w-md">
-                <h3 class="text-lg font-semibold text-white mb-4">Add Customer Mapping</h3>
+                <h3 class="text-lg font-semibold text-white mb-4">Add Customer Rate</h3>
                 <div class="space-y-3">
                     <div>
                         <label class="text-sm text-gray-400 block mb-1">Reseller</label>
                         <select id="mapping-reseller" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300"></select>
                     </div>
                     <div>
-                        <label class="text-sm text-gray-400 block mb-1">QBO Customer (search)</label>
-                        <input type="text" id="mapping-qbo-search" placeholder="Type to search QBO customers..." oninput="searchQboCustomers()" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
-                        <div id="qbo-search-results" class="mt-1 bg-dark-700 rounded-lg border border-dark-500 max-h-32 overflow-y-auto hidden"></div>
+                        <label class="text-sm text-gray-400 block mb-1">Customer Name (as it appears in QuickBooks)</label>
+                        <input type="text" id="mapping-customer-name" placeholder="e.g. Acme Corp" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
                     </div>
                     <div>
                         <label class="text-sm text-gray-400 block mb-1">Daily Rate ($/SIM/day)</label>
