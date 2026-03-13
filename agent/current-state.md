@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-03-13
+> Last updated: 2026-03-13 (session 2)
 
 ---
 
@@ -45,6 +45,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-03-13 | Agent OS built: `agent/` directory with 7 docs + 3 skills (patch-dashboard, sim-triage, session-close) + user SOP | — |
 | 2026-03-13 | `op=save` added after IMEI set — persists IMEI changes across gateway reboots | skyline-gateway |
 | 2026-03-11 | Reseller sync: remove verification_status filter; backfill all sim_numbers to verified | reseller-sync |
 | 2026-03-11 | Dashboard: Force re-send option in Reseller Sync | dashboard |
