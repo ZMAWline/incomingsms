@@ -86,6 +86,152 @@ export default {
       }
     }
 
+    if (url.pathname === "/imei-sweep" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      try {
+        if (!env.FIX_SIM_QUEUE) {
+          return new Response(JSON.stringify({ error: "FIX_SIM_QUEUE not configured" }), {
+            status: 500, headers: { "Content-Type": "application/json" }
+          });
+        }
+        const suspended = await supabaseSelect(
+          env,
+          `sims?select=id,iccid&status=eq.suspended&gateway_id=not.is.null&port=not.is.null&mobility_subscription_id=not.is.null&limit=200`
+        );
+        if (!Array.isArray(suspended) || suspended.length === 0) {
+          return new Response(JSON.stringify({ ok: true, queued: 0, message: "No suspended SIMs found" }), {
+            status: 200, headers: { "Content-Type": "application/json" }
+          });
+        }
+        let queued = 0;
+        for (const sim of suspended) {
+          await env.FIX_SIM_QUEUE.send({ sim_id: sim.id, iccid: sim.iccid });
+          queued++;
+        }
+        return new Response(JSON.stringify({ ok: true, queued, sim_ids: suspended.map(s => s.id) }, null, 2), {
+          status: 200, headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    if (url.pathname === "/imei-gateway-sync" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      try {
+        const body = await request.json();
+        const simList = Array.isArray(body.sims) ? body.sims : [];
+        if (simList.length === 0) {
+          return new Response(JSON.stringify({ error: "sims array is required" }), {
+            status: 400, headers: { "Content-Type": "application/json" }
+          });
+        }
+        if (simList.length > 20) {
+          return new Response(JSON.stringify({ error: "max 20 SIMs per call" }), {
+            status: 400, headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        const token = await getCachedToken(env);
+        const runId = `imei-sync-${Date.now()}`;
+        const results = [];
+
+        for (const item of simList) {
+          const { id: simId, needs_ota, target_imei } = item;
+          try {
+            const rows = await supabaseSelect(
+              env,
+              `sims?select=id,iccid,gateway_id,port,att_ban,imei,mobility_subscription_id,sim_numbers(e164)&id=eq.${encodeURIComponent(String(simId))}&limit=1&sim_numbers.valid_to=is.null`
+            );
+            if (!Array.isArray(rows) || rows.length === 0) {
+              results.push({ sim_id: simId, ok: false, error: "SIM not found" });
+              continue;
+            }
+            const sim = rows[0];
+            const { iccid, gateway_id, port } = sim;
+
+            if (!gateway_id || !port) {
+              results.push({ sim_id: simId, iccid, ok: false, error: "No gateway/port assigned" });
+              continue;
+            }
+
+            let blimei;
+            if (!needs_ota) {
+              blimei = target_imei;
+            } else {
+              const attBan = sim.att_ban;
+              const mdnRaw = Array.isArray(sim.sim_numbers) && sim.sim_numbers.length > 0
+                ? sim.sim_numbers[0].e164
+                : null;
+              const mdn = mdnRaw ? String(mdnRaw).replace(/\D/g, "").replace(/^1/, "") : null;
+
+              if (!attBan && sim.mobility_subscription_id) {
+                // No att_ban: use subscriber details to get billingImei + backfill att_ban
+                console.log(`[ImeiGatewaySync] SIM ${iccid}: no att_ban — fetching subscriber details`);
+                const details = await hxSubscriberDetails(env, token, sim.mobility_subscription_id, runId, iccid);
+                const d = Array.isArray(details) ? details[0] : details;
+                if (d?.billingImei) {
+                  blimei = d.billingImei;
+                  const newBan = d.attBan || d.billingAccountNumber || null;
+                  if (newBan) {
+                    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { att_ban: newBan });
+                    console.log(`[ImeiGatewaySync] SIM ${iccid}: backfilled att_ban=${newBan}`);
+                  }
+                } else {
+                  results.push({ sim_id: simId, iccid, ok: false, error: "No billingImei in subscriber details" });
+                  continue;
+                }
+              } else if (!attBan) {
+                results.push({ sim_id: simId, iccid, ok: false, error: "Missing att_ban and no mobility_subscription_id" });
+                continue;
+              } else if (!mdn) {
+                results.push({ sim_id: simId, iccid, ok: false, error: "Missing phone number (mdn)" });
+                continue;
+              } else {
+                const otaResult = await hxOtaRefresh(
+                  env, token,
+                  { ban: attBan, subscriberNumber: mdn, iccid },
+                  runId, iccid
+                );
+                blimei = extractBlimeiFromOta(otaResult);
+                if (!blimei) {
+                  results.push({ sim_id: simId, iccid, ok: false, error: "Could not extract BLIMEI from OTA response" });
+                  continue;
+                }
+              }
+            }
+
+            const dbImei = sim.imei;
+            await callSkylineSetImei(env, gateway_id, port, blimei);
+            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { imei: blimei });
+            await markGatewayImeiSynced(env, simId);
+
+            results.push({ sim_id: simId, iccid, ok: true, blimei, db_imei_was: dbImei, needs_ota });
+          } catch (err) {
+            results.push({ sim_id: simId, ok: false, error: String(err) });
+          }
+        }
+
+        const ok_count = results.filter(r => r.ok).length;
+        const fail_count = results.filter(r => !r.ok).length;
+        return new Response(JSON.stringify({ ok: true, ok_count, fail_count, results }, null, 2), {
+          status: 200, headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
     if (url.pathname === "/sim-action" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
@@ -597,6 +743,8 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
     const hour = new Date(event.scheduledTime).getUTCHours();
     // Rotation: runs every 20 min all day until all client-assigned SIMs are rotated
     ctx.waitUntil(queueSimsForRotation(env));
+    // IMEI heartbeat: re-sync stale gateway IMEIs every cron cycle
+    ctx.waitUntil(queueImeiHeartbeats(env));
     // Error summary at 7am UTC
     if (hour === 7) {
       ctx.waitUntil(sendErrorSummaryToSlack(env));
@@ -645,6 +793,29 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
 
     for (const message of batch.messages) {
       const sim = message.body;
+
+      // Handle IMEI heartbeat jobs: just re-sync gateway IMEI, no rotation
+      if (sim.type === "imei_heartbeat") {
+        try {
+          await callSkylineSetImei(env, sim.gateway_id, sim.port, sim.imei);
+          // Increment consecutive success count (capped at 3 = graduated)
+          const newCount = Math.min((sim.sync_count || 0) + 1, 3);
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.sim_id))}`, {
+            gateway_imei_synced_at: new Date().toISOString(),
+            gateway_imei_sync_count: newCount,
+          });
+          const status = newCount >= 3 ? "graduated — skipping future heartbeats" : `${newCount}/3`;
+          console.log(`[ImeiHeartbeat] SIM ${sim.iccid}: IMEI synced (${status})`);
+        } catch (err) {
+          // Reset consecutive count — streak broken. Cron will re-enqueue next cycle.
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.sim_id))}`, {
+            gateway_imei_sync_count: 0,
+          }).catch(() => {});
+          console.warn(`[ImeiHeartbeat] SIM ${sim.iccid}: failed, streak reset (will retry next cron): ${err.message}`);
+        }
+        message.ack();
+        continue;
+      }
 
       try {
         await rotateSingleSim(env, token, sim);
@@ -717,6 +888,44 @@ async function queueSimsForRotation(env, options = {}) {
 
   console.log(`Queued ${queued} SIMs for rotation.`);
   return { ok: true, queued, total: sims.length, manual: isManualRun };
+}
+
+// ===========================
+// IMEI Heartbeat — re-queue SIMs whose IMEI hasn't been confirmed on gateway recently
+// Runs every cron cycle; capped at 100/run to avoid queue flooding
+// ===========================
+async function queueImeiHeartbeats(env) {
+  if (!env.MDN_QUEUE) return;
+
+  // Only queue SIMs that haven't graduated (< 3 consecutive successes).
+  // Graduated SIMs (count >= 3) are skipped until suspended/canceled resets their count.
+  const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const stale = await supabaseSelect(
+    env,
+    `sims?select=id,iccid,gateway_id,port,imei,gateway_imei_sync_count&status=eq.active&gateway_id=not.is.null&port=not.is.null&imei=not.is.null&gateway_imei_sync_count=lt.3&or=(gateway_imei_synced_at.is.null,gateway_imei_synced_at.lt.${threeHoursAgo})&limit=100`
+  ).catch(err => {
+    console.warn(`[ImeiHeartbeat] Query failed: ${err}`);
+    return [];
+  });
+
+  if (!Array.isArray(stale) || stale.length === 0) {
+    console.log("[ImeiHeartbeat] All SIMs graduated or in sync");
+    return;
+  }
+
+  const messages = stale.map(s => ({
+    body: {
+      type: "imei_heartbeat",
+      sim_id: s.id,
+      iccid: s.iccid,
+      gateway_id: s.gateway_id,
+      port: s.port,
+      imei: s.imei,
+      sync_count: s.gateway_imei_sync_count || 0,
+    }
+  }));
+  await env.MDN_QUEUE.sendBatch(messages);
+  console.log(`[ImeiHeartbeat] Queued ${messages.length} SIMs (non-graduated) for IMEI re-sync`);
 }
 
 // ===========================
@@ -846,6 +1055,15 @@ async function rotateSingleSim(env, token, sim) {
 
   // 6) Send number.online webhook immediately
   await sendNumberOnlineWebhook(env, sim.id, e164, detailsIccid, subId);
+
+  // 7) Re-sync gateway IMEI (guard rail against DLC suspension)
+  // Gateway can lose IMEI after reset/sleep; re-setting daily keeps NWIMEI = BLIMEI.
+  // Fire-and-forget — never fail the rotation if gateway is temporarily unreachable.
+  if (sim.gateway_id && sim.port && sim.imei) {
+    callSkylineSetImei(env, sim.gateway_id, sim.port, sim.imei)
+      .then(() => markGatewayImeiSynced(env, sim.id))
+      .catch(err => console.warn(`[Rotation] SIM ${iccid}: IMEI re-sync failed (non-fatal): ${err.message}`));
+  }
 
   console.log(`SIM ${iccid}: rotated to ${e164}`);
 }
@@ -1059,6 +1277,12 @@ async function retryUntilFulfilled(fn, { attempts = 3, delayMs = 5000, label = '
         console.warn(`[retryUntilFulfilled] ${label} attempt ${i}/${attempts} rejected: ${msg}`);
       // Check for application-level failure (change-IMEI responses)
       } else if (result?.failed?.length > 0) {
+        // "not needed / already assigned" means IMEI is already set — treat as success
+        const alreadySet = result.failed.every(f => /not needed|already assigned billing/i.test(f.reason || ""));
+        if (alreadySet) {
+          console.log(`[retryUntilFulfilled] ${label}: IMEI already assigned — treating as success`);
+          return result;
+        }
         const msg = result.failed[0]?.reason || JSON.stringify(result.failed);
         lastErr = new Error(`${label} failed: ${msg}`);
         console.warn(`[retryUntilFulfilled] ${label} attempt ${i}/${attempts} failed: ${msg}`);
@@ -1156,23 +1380,37 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   );
   await sleep(5000); // wait for Helix to restore subscriber
 
-  // Step 3: Retire old IMEI pool entry + allocate new one
-  await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
+  // Step 3: Determine IMEI to use.
+  // Try to reuse the existing DB IMEI first — avoids unnecessary pool churn and BLIMEI changes.
+  // Only allocate a new pool entry if the existing IMEI is missing or no longer eligible.
+  let poolEntry = null;
+  let newImei = sim.imei || null;
 
-  const poolEntry = await allocateImeiFromPool(env, simId);
-  const newImei = poolEntry.imei;
-  console.log(`[FixSim] SIM ${iccid}: allocated IMEI ${newImei} (pool entry ${poolEntry.id})`);
+  if (newImei) {
+    console.log(`[FixSim] SIM ${iccid}: checking eligibility for existing IMEI ${newImei}`);
+    const existingEligibility = await hxCheckImeiEligibility(env, token, newImei).catch(() => null);
+    if (existingEligibility?.isImeiValid === true) {
+      console.log(`[FixSim] SIM ${iccid}: existing IMEI ${newImei} is eligible — reusing`);
+    } else {
+      console.log(`[FixSim] SIM ${iccid}: existing IMEI ${newImei} not eligible, allocating from pool`);
+      newImei = null;
+    }
+  }
 
-  try {
-    // Check IMEI eligibility with Helix
-    console.log(`[FixSim] SIM ${iccid}: checking eligibility for IMEI ${newImei}`);
+  if (!newImei) {
+    await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
+    poolEntry = await allocateImeiFromPool(env, simId);
+    newImei = poolEntry.imei;
+    console.log(`[FixSim] SIM ${iccid}: allocated IMEI ${newImei} (pool entry ${poolEntry.id})`);
     const eligibility = await hxCheckImeiEligibility(env, token, newImei);
     if (eligibility.isImeiValid !== true) {
       throw new Error(`IMEI ${newImei} is not eligible for this carrier/plan`);
     }
+  }
 
-    // Change IMEI on Helix
-    console.log(`[FixSim] SIM ${iccid}: changing IMEI on Helix to ${newImei}`);
+  try {
+    // Change IMEI on Helix (re-anchors BLIMEI even when reusing the same IMEI)
+    console.log(`[FixSim] SIM ${iccid}: setting IMEI on Helix to ${newImei}`);
     await retryUntilFulfilled(
       () => hxChangeImei(env, token, subId, newImei, runId, iccid),
       { attempts: 3, delayMs: 5000, label: `changeImei ${iccid}` }
@@ -1184,20 +1422,22 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
       { attempts: 3, label: `setImei ${iccid}` }
     );
     console.log(`[FixSim] SIM ${iccid}: IMEI set on gateway`);
+    markGatewayImeiSynced(env, simId).catch(() => {});
 
-    // Update IMEI pool entry with gateway/port
-    await supabasePatch(
-      env,
-      `imei_pool?id=eq.${encodeURIComponent(String(poolEntry.id))}`,
-      { gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString() }
-    );
-
-    // Update SIM record with new IMEI
-    await supabasePatch(
-      env,
-      `sims?id=eq.${encodeURIComponent(String(simId))}`,
-      { imei: newImei, current_imei_pool_id: poolEntry.id }
-    );
+    if (poolEntry) {
+      // New pool entry: update with gateway/port and update SIM record
+      await supabasePatch(
+        env,
+        `imei_pool?id=eq.${encodeURIComponent(String(poolEntry.id))}`,
+        { gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString() }
+      );
+      await supabasePatch(
+        env,
+        `sims?id=eq.${encodeURIComponent(String(simId))}`,
+        { imei: newImei, current_imei_pool_id: poolEntry.id }
+      );
+    }
+    // If reusing existing IMEI, sims.imei is already correct — no DB update needed.
 
     // Step 4: OTA Refresh
     await sleep(2000);
@@ -1222,14 +1462,17 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
       console.log(`[FixSim] SIM ${iccid}: skipping OTA Refresh (no attBan)`);
     }
 
-
   } catch (err) {
-    // Rollback: release the newly allocated IMEI (cancel/resume already happened, can't undo those)
-    console.error(`[FixSim] SIM ${iccid}: failed in IMEI/OTA phase, rolling back IMEI allocation: ${err}`);
-    try {
-      await releaseImeiPoolEntry(env, poolEntry.id, simId);
-    } catch (rollbackErr) {
-      console.error(`[FixSim] SIM ${iccid}: rollback release failed: ${rollbackErr}`);
+    if (poolEntry) {
+      // Rollback: release newly allocated pool entry (cancel/resume already happened, can't undo those)
+      console.error(`[FixSim] SIM ${iccid}: failed in IMEI/OTA phase, rolling back pool allocation: ${err}`);
+      try {
+        await releaseImeiPoolEntry(env, poolEntry.id, simId);
+      } catch (rollbackErr) {
+        console.error(`[FixSim] SIM ${iccid}: rollback release failed: ${rollbackErr}`);
+      }
+    } else {
+      console.error(`[FixSim] SIM ${iccid}: failed in IMEI/OTA phase: ${err}`);
     }
     throw err;
   }
@@ -1507,9 +1750,17 @@ async function hxChangeImei(env, token, mobilitySubscriptionId, newImei, runId, 
     throw new Error(`Change IMEI failed ${res.status}: ${responseText.slice(0, 300)}`);
   }
 
-  // Check that successful array is non-empty
+  // Check that successful array is non-empty.
+  // Exception: Helix returns failed["not needed / already assigned"] when the IMEI is already set —
+  // treat that as a success since the billing IMEI is already correct.
   if (Array.isArray(json.successful) && json.successful.length === 0) {
-    throw new Error(`Change IMEI: no successful items. Failed: ${JSON.stringify(json.failed)}`);
+    const alreadyAssigned = Array.isArray(json.failed) && json.failed.some(f =>
+      /not needed|already assigned billing/i.test(f.reason || "")
+    );
+    if (!alreadyAssigned) {
+      throw new Error(`Change IMEI: no successful items. Failed: ${JSON.stringify(json.failed)}`);
+    }
+    console.log(`[ChangeImei] ${iccid}: IMEI ${newImei} already set as billing IMEI — treating as success`);
   }
 
   return json;
@@ -1542,21 +1793,67 @@ async function callSkylineSetImei(env, gatewayId, port, imei) {
   }
 
   const skUrl = `https://skyline-gateway/set-imei?secret=${encodeURIComponent(env.SKYLINE_SECRET)}`;
-  const res = await env.SKYLINE_GATEWAY.fetch(skUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ gateway_id: gatewayId, port, imei }),
-  });
 
-  const txt = await res.text();
-  let json = {};
-  try { json = JSON.parse(txt); } catch {}
+  // Retry up to 3× for transient gateway errors (502, handshake fail, connection closed on reboot)
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await env.SKYLINE_GATEWAY.fetch(skUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gateway_id: gatewayId, port, imei }),
+      });
 
-  if (!res.ok || !json.ok) {
-    throw new Error(`Set IMEI failed: ${res.status} ${txt}`);
+      const txt = await res.text();
+      let json = {};
+      try { json = JSON.parse(txt); } catch {}
+
+      if (!res.ok || !json.ok) {
+        const isTransient = res.status === 502 || /handshake failed|connection closed|connection reset/i.test(txt);
+        if (isTransient && attempt < 3) {
+          lastErr = new Error(`Set IMEI failed: ${res.status} ${txt}`);
+          console.warn(`[SetImei] gateway_id=${gatewayId} port=${port}: transient error attempt ${attempt}/3, retrying in 5s`);
+          await sleep(5000);
+          continue;
+        }
+        throw new Error(`Set IMEI failed: ${res.status} ${txt}`);
+      }
+
+      return json;
+    } catch (err) {
+      const isTransient = /handshake failed|connection closed|connection reset|502/i.test(err.message);
+      if (isTransient && attempt < 3) {
+        lastErr = err;
+        console.warn(`[SetImei] gateway_id=${gatewayId} port=${port}: transient error attempt ${attempt}/3, retrying in 5s`);
+        await sleep(5000);
+        continue;
+      }
+      throw err;
+    }
   }
+  throw lastErr;
+}
 
-  return json;
+// Mark IMEI as confirmed on gateway hardware for a given SIM
+async function markGatewayImeiSynced(env, simId) {
+  await supabasePatch(
+    env,
+    `sims?id=eq.${encodeURIComponent(String(simId))}`,
+    { gateway_imei_synced_at: new Date().toISOString() }
+  ).catch(err => console.warn(`[markGatewayImeiSynced] sim_id=${simId}: ${err}`));
+}
+
+// ===========================
+// Extract BLIMEI from OTA refresh response
+// ===========================
+function extractBlimeiFromOta(otaResult) {
+  const fulfilled = Array.isArray(otaResult?.fulfilled) ? otaResult.fulfilled : [];
+  for (const item of fulfilled) {
+    const chars = Array.isArray(item.serviceCharacteristic) ? item.serviceCharacteristic : [];
+    const entry = chars.find(c => c.name === "BLIMEI");
+    if (entry?.value) return entry.value;
+  }
+  return null;
 }
 
 // ===========================

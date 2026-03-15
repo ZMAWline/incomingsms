@@ -167,6 +167,14 @@ export default {
       return handleSimAction(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/imei-sweep' && request.method === 'POST') {
+      return handleImeiSweep(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/imei-gateway-sync' && request.method === 'POST') {
+      return handleImeiGatewaySync(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/qbo-mappings' && request.method === 'GET') {
       return handleQboMappingsGet(env, corsHeaders);
     }
@@ -2541,6 +2549,49 @@ async function logSystemError(env, { source, action, sim_id, iccid, error_messag
   } catch (e) {
     console.error('[logSystemError] Failed to log error:', e);
   }
+}
+
+async function handleImeiGatewaySync(request, env, corsHeaders) {
+  if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+  let body;
+  try { body = await request.json(); } catch {
+    return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+
+  const workerUrl = `https://mdn-rotator/imei-gateway-sync?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
+  const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const responseText = await workerResponse.text();
+  let result;
+  try { result = JSON.parse(responseText); } catch {
+    result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
+  }
+  return new Response(JSON.stringify(result, null, 2), {
+    status: workerResponse.ok ? 200 : 500,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
+}
+
+async function handleImeiSweep(env, corsHeaders) {
+  if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+  const workerUrl = `https://mdn-rotator/imei-sweep?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
+  const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, { method: 'POST' });
+  const responseText = await workerResponse.text();
+  let result;
+  try { result = JSON.parse(responseText); } catch {
+    result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
+  }
+  return new Response(JSON.stringify(result, null, 2), {
+    status: workerResponse.ok ? 200 : 500,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
 }
 
 async function handleSimAction(request, env, corsHeaders) {

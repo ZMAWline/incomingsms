@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-03-14 (session 3)
+> Last updated: 2026-03-15 (session 4)
 
 ---
 
@@ -45,6 +45,11 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-03-15 | IMEI heartbeat system: `gateway_imei_synced_at`, `gateway_imei_sync_count`, DB trigger on suspend/cancel, periodic re-sync, 3-consecutive graduation | mdn-rotator, DB |
+| 2026-03-15 | System-wide IMEI gateway sweep: `/imei-gateway-sync` endpoint, 295/295 active SIMs synced (BLIMEI = gateway IMEI) | mdn-rotator, dashboard |
+| 2026-03-15 | fix-sim: reuse existing eligible IMEI before allocating new; retryUntilFulfilled treats "not needed/already assigned" as success | mdn-rotator |
+| 2026-03-15 | Rotation guard rail: daily IMEI re-sync on every rotation to break DLC suspension cycle | mdn-rotator |
+| 2026-03-15 | Suspended SIM sweep: all 7 suspended SIMs restored (fix-sim via `/imei-sweep`) | mdn-rotator |
 | 2026-03-14 | MDN rotator: all-day cron, client-only filter, 5xx skip, subscriber-must-be-active → fix-sim | mdn-rotator |
 | 2026-03-13 | Agent OS built: `agent/` directory with 7 docs + 3 skills (patch-dashboard, sim-triage, session-close) + user SOP | — |
 | 2026-03-13 | `op=save` added after IMEI set — persists IMEI changes across gateway reboots | skyline-gateway |
@@ -64,6 +69,8 @@ These items were verified to be working correctly as of their last check:
 - MDN rotation cron (all-day, every 20 min): ✅
 - Dedup guard in `rotateSingleSim` (re-reads DB before rotating): ✅
 - `op=save` after IMEI set: ✅ (added 2026-03-13)
+- IMEI heartbeat re-sync (every 20 min, graduated after 3×, reset on suspend/cancel): ✅ (added 2026-03-15)
+- BLIMEI = gateway IMEI for all 295 active SIMs: ✅ (swept 2026-03-15)
 - sms-ingest AT&T upgrade message → auto IMEI change: ✅
 - Reseller webhook dedup (date-based, failed doesn't block): ✅
 - OTA error handling (both errorMessage + rejected[].message): ✅
