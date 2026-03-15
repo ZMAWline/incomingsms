@@ -595,10 +595,8 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
   // - 7am UTC: error summary to Slack
   async scheduled(event, env, ctx) {
     const hour = new Date(event.scheduledTime).getUTCHours();
-    // Rotation: cron fires 04:00-16:00 UTC (covers both EDT and EST midnight windows)
-    if (hour >= 4 && hour <= 16) {
-      ctx.waitUntil(queueSimsForRotation(env));
-    }
+    // Rotation: runs every 20 min all day until all client-assigned SIMs are rotated
+    ctx.waitUntil(queueSimsForRotation(env));
     // Error summary at 7am UTC
     if (hour === 7) {
       ctx.waitUntil(sendErrorSummaryToSlack(env));
@@ -671,7 +669,8 @@ async function queueSimsForRotation(env, options = {}) {
 
   // Build query - manual runs prioritize SIMs that were rotated longest ago
   // NULLS FIRST ensures SIMs that have never been rotated get processed first
-  let query = `sims?select=id,iccid,mobility_subscription_id,status,last_mdn_rotated_at&mobility_subscription_id=not.is.null&status=eq.active`;
+  // !inner join on reseller_sims ensures only SIMs assigned to an active client are rotated
+  let query = `sims?select=id,iccid,mobility_subscription_id,status,last_mdn_rotated_at,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&mobility_subscription_id=not.is.null&status=eq.active`;
 
   if (isManualRun) {
     // Manual run: order by oldest rotation first (nulls first = never rotated)
@@ -792,7 +791,29 @@ async function rotateSingleSim(env, token, sim) {
   const runId = `rotate_${iccid}_${Date.now()}`;
 
   // 1) MDN change - request new number from carrier
-  const mdnChange = await hxMdnChange(env, token, subId, runId, iccid);
+  let mdnChange;
+  try {
+    mdnChange = await hxMdnChange(env, token, subId, runId, iccid);
+  } catch (err) {
+    const msg = String(err);
+    // Helix 5xx = transient error; skip silently — next cron run will retry
+    // (last_mdn_rotated_at is not updated, so this SIM stays in the rotation queue)
+    if (/MDN change failed: 5\d\d/.test(msg)) {
+      console.log(`SIM ${iccid}: Helix 5xx (transient), skipping — next cron run will retry`);
+      return;
+    }
+    // "Subscriber must be active" — queue fix-sim, skip rotation this run
+    if (/subscriber.*must.*be.*active/i.test(msg)) {
+      console.log(`SIM ${iccid}: subscriber-must-be-active — queuing fix-sim, will retry rotation next cron run`);
+      if (env.FIX_SIM_QUEUE) {
+        await env.FIX_SIM_QUEUE.send({ sim_id: sim.id, iccid }).catch(e =>
+          console.error(`SIM ${iccid}: failed to enqueue fix-sim: ${e}`)
+        );
+      }
+      return;
+    }
+    throw err;
+  }
 
   // 2) Get the new phone number
   const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
@@ -973,6 +994,11 @@ async function hxMdnChange(env, token, mobilitySubscriptionId, runId, iccid) {
 
   if (!res.ok) {
     throw new Error(`MDN change failed: ${res.status} ${JSON.stringify(json)}`);
+  }
+  // Check for application-level rejection (HTTP 200 with rejected[] body)
+  if (json?.rejected?.length > 0) {
+    const msg = json.rejected[0]?.message || JSON.stringify(json.rejected);
+    throw new Error(`MDN change rejected: ${msg}`);
   }
   return json;
 }

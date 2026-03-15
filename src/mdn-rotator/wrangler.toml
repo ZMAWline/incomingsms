@@ -5,10 +5,9 @@ account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
 [triggers]
-# Rotation: every 20 min midnight-noon NY time (DST-aware)
-# EDT (summer): midnight=04:00 UTC, noon=16:00 UTC → "0,20,40 4-15" + "0 16"
-# EST (winter): midnight=05:00 UTC, noon=17:00 UTC → starts 1hr early at 04:00, acceptable
-crons = ["0,20,40 4-15 * * *", "0 16 * * *"]
+# Rotation: every 20 min all day — runs until all client-assigned SIMs are rotated
+# (queueSimsForRotation skips SIMs already rotated today, so it's a no-op once done)
+crons = ["0,20,40 * * * *"]
 
 # KV namespace for token caching
 [[kv_namespaces]]
