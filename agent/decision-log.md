@@ -84,13 +84,13 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
-## ~2025-12 — MDN rotation cron schedule is DST-aware
+## 2026-03-14 — MDN rotation cron runs all day
 
-**Decision:** Crons are `"0,20,40 4-15 * * *"` + `"0 16 * * *"` (UTC) not a simple midnight-to-noon NY schedule.
+**Decision:** Cron changed from `"0,20,40 4-15 * * *"` + `"0 16 * * *"` to `"0,20,40 * * * *"` (every 20 min, all 24 hours). Hour gate removed from `scheduled()` handler.
 
-**Why:** Cloudflare cron expressions run in UTC. NY midnight is UTC 05:00 in EDT and UTC 06:00 in EST. The `getNYMidnightISO()` helper uses `Intl.DateTimeFormat('America/New_York')` to compute the correct DST-aware boundary at runtime. The cron range is deliberately over-wide (4–16 UTC) to cover both DST states; the runtime check filters correctly.
+**Why:** Some SIMs get Helix 5xx errors and are skipped each run. With a limited window (4–16 UTC) there was no guarantee all SIMs would get rotated by noon. Running all day means every skipped SIM gets another attempt 20 minutes later until it succeeds.
 
-**Consequence:** Do not "simplify" the cron to a single NY-midnight expression — it will break for half the year.
+**Consequence:** `queueSimsForRotation` already filters by `last_mdn_rotated_at >= NY midnight`, so runs after all SIMs are done are fast no-ops. Safe to run 24/7. The `getNYMidnightISO()` dedup guard handles the DST boundary correctly at runtime — the cron itself no longer needs to be DST-aware.
 
 ---
 

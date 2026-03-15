@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-03-13 (session 2)
+> Last updated: 2026-03-14 (session 3)
 
 ---
 
@@ -45,6 +45,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-03-14 | MDN rotator: all-day cron, client-only filter, 5xx skip, subscriber-must-be-active → fix-sim | mdn-rotator |
 | 2026-03-13 | Agent OS built: `agent/` directory with 7 docs + 3 skills (patch-dashboard, sim-triage, session-close) + user SOP | — |
 | 2026-03-13 | `op=save` added after IMEI set — persists IMEI changes across gateway reboots | skyline-gateway |
 | 2026-03-11 | Reseller sync: remove verification_status filter; backfill all sim_numbers to verified | reseller-sync |
@@ -60,7 +61,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 These items were verified to be working correctly as of their last check:
 
-- MDN rotation cron (DST-aware schedule): ✅
+- MDN rotation cron (all-day, every 20 min): ✅
 - Dedup guard in `rotateSingleSim` (re-reads DB before rotating): ✅
 - `op=save` after IMEI set: ✅ (added 2026-03-13)
 - sms-ingest AT&T upgrade message → auto IMEI change: ✅
