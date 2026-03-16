@@ -121,6 +121,23 @@ export default {
       }
     }
 
+    if (url.pathname === "/trigger-blimei-sweep" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      try {
+        const result = await queueBlimeiUpdates(env);
+        return new Response(JSON.stringify({ ok: true, ...result }), {
+          status: 200, headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
     if (url.pathname === "/imei-gateway-sync" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
@@ -210,8 +227,11 @@ export default {
             }
 
             const dbImei = sim.imei;
+            // Always update sims.imei to live BLIMEI first — heartbeat uses this for retries
+            if (blimei !== dbImei) {
+              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { imei: blimei });
+            }
             await callSkylineSetImei(env, gateway_id, port, blimei);
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { imei: blimei });
             await markGatewayImeiSynced(env, simId);
 
             results.push({ sim_id: simId, iccid, ok: true, blimei, db_imei_was: dbImei, needs_ota });
@@ -817,6 +837,59 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
         continue;
       }
 
+      // Handle BLIMEI update jobs: OTA refresh → update sims.imei → set on gateway
+      if (sim.type === "blimei_update") {
+        try {
+          const rows = await supabaseSelect(
+            env,
+            `sims?select=id,iccid,gateway_id,port,att_ban,imei,mobility_subscription_id,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim.sim_id))}&limit=1&sim_numbers.valid_to=is.null`
+          );
+          if (!Array.isArray(rows) || rows.length === 0) {
+            console.warn(`[BlimeiUpdate] SIM ${sim.iccid}: not found`);
+            message.ack(); continue;
+          }
+          const s = rows[0];
+          if (!s.gateway_id || !s.port) {
+            console.warn(`[BlimeiUpdate] SIM ${s.iccid}: no gateway/port`);
+            message.ack(); continue;
+          }
+          let blimei = null;
+          if (!s.att_ban && s.mobility_subscription_id) {
+            const details = await hxSubscriberDetails(env, token, s.mobility_subscription_id, `blimei-sweep`, s.iccid);
+            const d = Array.isArray(details) ? details[0] : details;
+            if (d?.billingImei) {
+              blimei = d.billingImei;
+              const newBan = d.attBan || d.billingAccountNumber || null;
+              if (newBan) await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(s.id))}`, { att_ban: newBan }).catch(() => {});
+            }
+          } else if (s.att_ban) {
+            const mdnRaw = Array.isArray(s.sim_numbers) && s.sim_numbers.length > 0 ? s.sim_numbers[0].e164 : null;
+            const mdn = mdnRaw ? String(mdnRaw).replace(/\D/g, "").replace(/^1/, "") : null;
+            if (mdn) {
+              const otaResult = await hxOtaRefresh(env, token, { ban: s.att_ban, subscriberNumber: mdn, iccid: s.iccid }, `blimei-sweep`, s.iccid);
+              blimei = extractBlimeiFromOta(otaResult);
+            }
+          }
+          if (!blimei) {
+            console.warn(`[BlimeiUpdate] SIM ${s.iccid}: could not get BLIMEI`);
+            message.ack(); continue;
+          }
+          // Always update DB first so heartbeat uses correct BLIMEI even if gateway is down
+          if (blimei !== s.imei) {
+            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(s.id))}`, { imei: blimei });
+            console.log(`[BlimeiUpdate] SIM ${s.iccid}: DB imei updated ${s.imei} → ${blimei}`);
+          }
+          await callSkylineSetImei(env, s.gateway_id, s.port, blimei);
+          await markGatewayImeiSynced(env, s.id);
+          console.log(`[BlimeiUpdate] SIM ${s.iccid}: gateway IMEI set to ${blimei} ✓`);
+        } catch (err) {
+          console.warn(`[BlimeiUpdate] SIM ${sim.iccid}: ${err.message}`);
+          // Don't reset heartbeat count — gateway may just be temporarily down
+        }
+        message.ack();
+        continue;
+      }
+
       try {
         await rotateSingleSim(env, token, sim);
         message.ack();
@@ -929,6 +1002,29 @@ async function queueImeiHeartbeats(env) {
 }
 
 // ===========================
+// Queue all active SIMs for OTA BLIMEI update sweep
+// ===========================
+async function queueBlimeiUpdates(env) {
+  if (!env.MDN_QUEUE) return { queued: 0, error: "MDN_QUEUE not configured" };
+  const sims = await supabaseSelect(
+    env,
+    `sims?select=id,iccid&status=eq.active&gateway_id=not.is.null&limit=5000`
+  ).catch(err => { console.warn(`[BlimeiSweep] Query failed: ${err}`); return []; });
+  if (!Array.isArray(sims) || sims.length === 0) return { queued: 0 };
+  // Send in batches of 100 (CF queue sendBatch limit)
+  let queued = 0;
+  for (let i = 0; i < sims.length; i += 100) {
+    const batch = sims.slice(i, i + 100);
+    await env.MDN_QUEUE.sendBatch(batch.map(s => ({
+      body: { type: "blimei_update", sim_id: s.id, iccid: s.iccid }
+    })));
+    queued += batch.length;
+  }
+  console.log(`[BlimeiSweep] Queued ${queued} SIMs for BLIMEI update`);
+  return { queued };
+}
+
+// ===========================
 // Rotate a specific SIM by ICCID (manual trigger)
 // ===========================
 async function rotateSpecificSim(env, iccid) {
@@ -1005,13 +1101,8 @@ async function rotateSingleSim(env, token, sim) {
     mdnChange = await hxMdnChange(env, token, subId, runId, iccid);
   } catch (err) {
     const msg = String(err);
-    // Helix 5xx = transient error; skip silently — next cron run will retry
-    // (last_mdn_rotated_at is not updated, so this SIM stays in the rotation queue)
-    if (/MDN change failed: 5\d\d/.test(msg)) {
-      console.log(`SIM ${iccid}: Helix 5xx (transient), skipping — next cron run will retry`);
-      return;
-    }
-    // "Subscriber must be active" — queue fix-sim, skip rotation this run
+    // "Subscriber must be active" — comes back as 500 but is NOT transient; queue fix-sim
+    // Must be checked BEFORE the generic 5xx handler or it gets silently swallowed
     if (/subscriber.*must.*be.*active/i.test(msg)) {
       console.log(`SIM ${iccid}: subscriber-must-be-active — queuing fix-sim, will retry rotation next cron run`);
       if (env.FIX_SIM_QUEUE) {
@@ -1019,6 +1110,12 @@ async function rotateSingleSim(env, token, sim) {
           console.error(`SIM ${iccid}: failed to enqueue fix-sim: ${e}`)
         );
       }
+      return;
+    }
+    // Helix 5xx = transient error; skip silently — next cron run will retry
+    // (last_mdn_rotated_at is not updated, so this SIM stays in the rotation queue)
+    if (/MDN change failed: 5\d\d/.test(msg)) {
+      console.log(`SIM ${iccid}: Helix 5xx (transient), skipping — next cron run will retry`);
       return;
     }
     throw err;
@@ -1272,6 +1369,12 @@ async function retryUntilFulfilled(fn, { attempts = 3, delayMs = 5000, label = '
       const result = await fn();
       // Check for application-level rejection (status-change responses)
       if (result?.rejected?.length > 0) {
+        // "already Cancelled" — subscriber is already in the desired cancel state, treat as success
+        const alreadyCancelled = result.rejected.every(r => /already cancell/i.test(r.message || ""));
+        if (alreadyCancelled) {
+          console.log(`[retryUntilFulfilled] ${label}: subscriber already cancelled — treating as success`);
+          return result;
+        }
         const msg = result.rejected[0]?.message || JSON.stringify(result.rejected);
         lastErr = new Error(`${label} rejected: ${msg}`);
         console.warn(`[retryUntilFulfilled] ${label} attempt ${i}/${attempts} rejected: ${msg}`);
@@ -1411,10 +1514,29 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   try {
     // Change IMEI on Helix (re-anchors BLIMEI even when reusing the same IMEI)
     console.log(`[FixSim] SIM ${iccid}: setting IMEI on Helix to ${newImei}`);
-    await retryUntilFulfilled(
+    let changeImeiResult = await retryUntilFulfilled(
       () => hxChangeImei(env, token, subId, newImei, runId, iccid),
       { attempts: 3, delayMs: 5000, label: `changeImei ${iccid}` }
     );
+
+    // If Helix says "already assigned" its cache is stale vs AT&T live BLIMEI.
+    // Force a fresh pool IMEI to bypass the cache and actually update AT&T.
+    if (changeImeiResult?._alreadyAssigned) {
+      console.log(`[FixSim] SIM ${iccid}: Helix cache stale — forcing new pool IMEI to bypass`);
+      if (poolEntry) await releaseImeiPoolEntry(env, poolEntry.id, simId).catch(() => {});
+      await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
+      poolEntry = await allocateImeiFromPool(env, simId);
+      newImei = poolEntry.imei;
+      console.log(`[FixSim] SIM ${iccid}: allocated fresh IMEI ${newImei} (pool entry ${poolEntry.id})`);
+      const eligibility = await hxCheckImeiEligibility(env, token, newImei);
+      if (eligibility.isImeiValid !== true) {
+        throw new Error(`IMEI ${newImei} is not eligible for this carrier/plan`);
+      }
+      changeImeiResult = await retryUntilFulfilled(
+        () => hxChangeImei(env, token, subId, newImei, runId, iccid),
+        { attempts: 3, delayMs: 5000, label: `changeImei-forced ${iccid}` }
+      );
+    }
 
     // Set IMEI on gateway
     await retryWithBackoff(
@@ -1447,15 +1569,27 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
         () => hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid),
         { attempts: 3, label: `otaRefresh ${iccid}` }
       );
-      // Update DB status from OTA fulfilled response
+      // Update DB: status from OTA fulfilled response + sims.imei from OTA BLIMEI (source of truth)
+      const otaBlimei = extractBlimeiFromOta(otaResult);
+      if (otaBlimei && otaBlimei !== newImei) {
+        console.log(`[FixSim] SIM ${iccid}: OTA BLIMEI=${otaBlimei} differs from Helix IMEI=${newImei} — updating DB to OTA BLIMEI`);
+        newImei = otaBlimei;
+      }
+      const otaStatusPatch = {};
       const fulfilledStatus = otaResult && otaResult.fulfilled && otaResult.fulfilled[0] && otaResult.fulfilled[0].status;
       if (fulfilledStatus) {
         const otaStatusMap = { Active: 'active', ACTIVE: 'active', ACTIVATED: 'active', Suspended: 'suspended', SUSPENDED: 'suspended', Canceled: 'canceled', CANCELED: 'canceled' };
         const otaDbStatus = otaStatusMap[fulfilledStatus] || null;
         if (otaDbStatus) {
           console.log(`[FixSim] SIM ${iccid}: OTA fulfilled=${fulfilledStatus} → updating DB status to ${otaDbStatus}`);
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { status: otaDbStatus });
+          otaStatusPatch.status = otaDbStatus;
         }
+      }
+      if (otaBlimei) {
+        otaStatusPatch.imei = otaBlimei;
+      }
+      if (Object.keys(otaStatusPatch).length > 0) {
+        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, otaStatusPatch);
       }
       await sleep(3000);
     } else {
@@ -1760,7 +1894,8 @@ async function hxChangeImei(env, token, mobilitySubscriptionId, newImei, runId, 
     if (!alreadyAssigned) {
       throw new Error(`Change IMEI: no successful items. Failed: ${JSON.stringify(json.failed)}`);
     }
-    console.log(`[ChangeImei] ${iccid}: IMEI ${newImei} already set as billing IMEI — treating as success`);
+    console.log(`[ChangeImei] ${iccid}: IMEI ${newImei} already set as billing IMEI (Helix cache) — flagging _alreadyAssigned`);
+    return { ...json, _alreadyAssigned: true };
   }
 
   return json;

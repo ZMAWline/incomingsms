@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-03-15 (session 4)
+> Last updated: 2026-03-16 (session 5)
 
 ---
 
@@ -12,6 +12,13 @@ _None currently tracked. Add here when something breaks in production._
 ---
 
 ## In Progress / Pending Work
+
+### BLIMEI Sweep — Queue Running
+- 535 SIMs queued via `blimei_update` job type in `mdn-rotation-queue`
+- Each job: OTA refresh → update `sims.imei` to live AT&T BLIMEI → set on gateway
+- Processing at ~4-5 SIMs/min; will complete automatically in background
+- Gateway `54.254.97.139` came back online during this session; heartbeat will finish syncing slots
+- **No action needed** — sweep + heartbeat handle everything automatically
 
 ### QuickBooks Integration — Needs Secrets
 - Worker deployed: ✅
@@ -45,6 +52,9 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-03-16 | OTA BLIMEI source-of-truth strategy: `hxChangeImei` flags `_alreadyAssigned`; fixSim forces new pool IMEI on stale Helix cache; fixSim OTA step updates `sims.imei` from live BLIMEI | mdn-rotator |
+| 2026-03-16 | `blimei_update` queue job: OTA refresh → DB imei update → gateway set, 1 per message; `/trigger-blimei-sweep` endpoint queues all 535 active SIMs | mdn-rotator, dashboard |
+| 2026-03-16 | `/imei-gateway-sync` fix: `sims.imei` updated from OTA BLIMEI before gateway set attempt, so heartbeat retries use correct IMEI even if gateway is down | mdn-rotator |
 | 2026-03-15 | IMEI heartbeat system: `gateway_imei_synced_at`, `gateway_imei_sync_count`, DB trigger on suspend/cancel, periodic re-sync, 3-consecutive graduation | mdn-rotator, DB |
 | 2026-03-15 | System-wide IMEI gateway sweep: `/imei-gateway-sync` endpoint, 295/295 active SIMs synced (BLIMEI = gateway IMEI) | mdn-rotator, dashboard |
 | 2026-03-15 | fix-sim: reuse existing eligible IMEI before allocating new; retryUntilFulfilled treats "not needed/already assigned" as success | mdn-rotator |
@@ -70,7 +80,8 @@ These items were verified to be working correctly as of their last check:
 - Dedup guard in `rotateSingleSim` (re-reads DB before rotating): ✅
 - `op=save` after IMEI set: ✅ (added 2026-03-13)
 - IMEI heartbeat re-sync (every 20 min, graduated after 3×, reset on suspend/cancel): ✅ (added 2026-03-15)
-- BLIMEI = gateway IMEI for all 295 active SIMs: ✅ (swept 2026-03-15)
+- OTA BLIMEI = `sims.imei` = gateway IMEI strategy: ✅ (sweep in progress 2026-03-16)
+- `hxChangeImei` `_alreadyAssigned` flag + fixSim force-new-pool-IMEI: ✅ (deployed 2026-03-16)
 - sms-ingest AT&T upgrade message → auto IMEI change: ✅
 - Reseller webhook dedup (date-based, failed doesn't block): ✅
 - OTA error handling (both errorMessage + rejected[].message): ✅

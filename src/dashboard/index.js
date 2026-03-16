@@ -171,6 +171,10 @@ export default {
       return handleImeiSweep(env, corsHeaders);
     }
 
+    if (url.pathname === '/api/trigger-blimei-sweep' && request.method === 'POST') {
+      return handleTriggerBlimeiSweep(env, corsHeaders);
+    }
+
     if (url.pathname === '/api/imei-gateway-sync' && request.method === 'POST') {
       return handleImeiGatewaySync(request, env, corsHeaders);
     }
@@ -2582,6 +2586,22 @@ async function handleImeiSweep(env, corsHeaders) {
   if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
   const workerUrl = `https://mdn-rotator/imei-sweep?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
+  const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, { method: 'POST' });
+  const responseText = await workerResponse.text();
+  let result;
+  try { result = JSON.parse(responseText); } catch {
+    result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
+  }
+  return new Response(JSON.stringify(result, null, 2), {
+    status: workerResponse.ok ? 200 : 500,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
+}
+
+async function handleTriggerBlimeiSweep(env, corsHeaders) {
+  if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  const workerUrl = `https://mdn-rotator/trigger-blimei-sweep?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
   const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, { method: 'POST' });
   const responseText = await workerResponse.text();
   let result;
