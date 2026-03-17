@@ -753,6 +753,53 @@ export default {
       }
     }
 
+    if (url.pathname === "/sync-gateway-slots" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      try {
+        const gateway_id = Number(url.searchParams.get("gateway_id"));
+        if (!gateway_id) {
+          return new Response(JSON.stringify({ error: "gateway_id is required" }), {
+            status: 400, headers: { "Content-Type": "application/json" }
+          });
+        }
+        if (!env.SKYLINE_GATEWAY) {
+          return new Response(JSON.stringify({ error: "SKYLINE_GATEWAY service binding not configured" }), {
+            status: 500, headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        const skUrl = `https://skyline-gateway/port-info?gateway_id=${encodeURIComponent(String(gateway_id))}&all_slots=1&secret=${encodeURIComponent(env.SKYLINE_SECRET)}`;
+        const skRes = await env.SKYLINE_GATEWAY.fetch(skUrl);
+        if (!skRes.ok) {
+          const errTxt = await skRes.text();
+          return new Response(JSON.stringify({ error: `Skyline error ${skRes.status}: ${errTxt}` }), {
+            status: 502, headers: { "Content-Type": "application/json" }
+          });
+        }
+        const data = await skRes.json();
+
+        let synced = 0, not_found = 0;
+        for (const p of (data.ports || [])) {
+          if (!p.iccid) continue;
+          const sims = await supabaseSelect(env, `sims?select=id&iccid=eq.${encodeURIComponent(p.iccid)}&limit=1`);
+          if (!Array.isArray(sims) || sims.length === 0) { not_found++; continue; }
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sims[0].id))}`, { gateway_id, port: p.port });
+          synced++;
+        }
+
+        return new Response(JSON.stringify({ ok: true, gateway_id, synced, not_found }, null, 2), {
+          status: 200, headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: String(err) }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
 return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?secret=...&iccid=..., or /error-summary?secret=...", { status: 200 });
   },
 
@@ -763,8 +810,8 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
     const hour = new Date(event.scheduledTime).getUTCHours();
     // Rotation: runs every 20 min all day until all client-assigned SIMs are rotated
     ctx.waitUntil(queueSimsForRotation(env));
-    // IMEI heartbeat: re-sync stale gateway IMEIs every cron cycle
-    ctx.waitUntil(queueImeiHeartbeats(env));
+    // IMEI heartbeat: DISABLED — investigating gateway instability
+    // ctx.waitUntil(queueImeiHeartbeats(env));
     // Error summary at 7am UTC
     if (hour === 7) {
       ctx.waitUntil(sendErrorSummaryToSlack(env));
@@ -814,8 +861,10 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
     for (const message of batch.messages) {
       const sim = message.body;
 
-      // Handle IMEI heartbeat jobs: just re-sync gateway IMEI, no rotation
+      // Handle IMEI heartbeat jobs: DISABLED — investigating gateway instability
       if (sim.type === "imei_heartbeat") {
+        console.log(`[ImeiHeartbeat] DISABLED — skipping SIM ${sim.iccid}`);
+        message.ack(); continue;
         try {
           await callSkylineSetImei(env, sim.gateway_id, sim.port, sim.imei);
           // Increment consecutive success count (capped at 3 = graduated)
@@ -837,8 +886,13 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
         continue;
       }
 
-      // Handle BLIMEI update jobs: OTA refresh → update sims.imei → set on gateway
+      // Handle BLIMEI update jobs: DISABLED — investigating gateway instability
       if (sim.type === "blimei_update") {
+        console.log(`[BlimeiUpdate] DISABLED — skipping SIM ${sim.iccid}`);
+        message.ack(); continue;
+      }
+      // blimei_update (dead code while disabled):
+      if (sim.type === "blimei_update_disabled") {
         try {
           const rows = await supabaseSelect(
             env,
@@ -1153,14 +1207,13 @@ async function rotateSingleSim(env, token, sim) {
   // 6) Send number.online webhook immediately
   await sendNumberOnlineWebhook(env, sim.id, e164, detailsIccid, subId);
 
-  // 7) Re-sync gateway IMEI (guard rail against DLC suspension)
-  // Gateway can lose IMEI after reset/sleep; re-setting daily keeps NWIMEI = BLIMEI.
-  // Fire-and-forget — never fail the rotation if gateway is temporarily unreachable.
-  if (sim.gateway_id && sim.port && sim.imei) {
-    callSkylineSetImei(env, sim.gateway_id, sim.port, sim.imei)
-      .then(() => markGatewayImeiSynced(env, sim.id))
-      .catch(err => console.warn(`[Rotation] SIM ${iccid}: IMEI re-sync failed (non-fatal): ${err.message}`));
-  }
+  // 7) Re-sync gateway IMEI (guard rail against DLC suspension) — DISABLED
+  // Investigating gateway instability; re-enable once root cause confirmed.
+  // if (sim.gateway_id && sim.port && sim.imei) {
+  //   callSkylineSetImei(env, sim.gateway_id, sim.port, sim.imei)
+  //     .then(() => markGatewayImeiSynced(env, sim.id))
+  //     .catch(err => console.warn(`[Rotation] SIM ${iccid}: IMEI re-sync failed (non-fatal): ${err.message}`));
+  // }
 
   console.log(`SIM ${iccid}: rotated to ${e164}`);
 }
@@ -1484,12 +1537,15 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   await sleep(5000); // wait for Helix to restore subscriber
 
   // Step 3: Determine IMEI to use.
-  // Try to reuse the existing DB IMEI first — avoids unnecessary pool churn and BLIMEI changes.
-  // Only allocate a new pool entry if the existing IMEI is missing or no longer eligible.
+  // Suspended SIMs always get a fresh IMEI — the one that got them suspended is retired regardless
+  // of what Helix eligibility says. For other statuses, try to reuse the existing IMEI if eligible.
   let poolEntry = null;
   let newImei = sim.imei || null;
 
-  if (newImei) {
+  if (sim.status === 'suspended') {
+    console.log(`[FixSim] SIM ${iccid}: status=suspended — retiring current IMEI and allocating fresh from pool`);
+    newImei = null;
+  } else if (newImei) {
     console.log(`[FixSim] SIM ${iccid}: checking eligibility for existing IMEI ${newImei}`);
     const existingEligibility = await hxCheckImeiEligibility(env, token, newImei).catch(() => null);
     if (existingEligibility?.isImeiValid === true) {
@@ -1624,7 +1680,7 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   }
 
   console.log(`[FixSim] SIM ${iccid}: fix complete (IMEI=${newImei})`);
-  return { imei: newImei, pool_entry_id: poolEntry.id };
+  return { imei: newImei, pool_entry_id: poolEntry?.id ?? null };
 }
 
 // ===========================

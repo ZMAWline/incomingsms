@@ -22,6 +22,10 @@ export default {
     const secretFromPath =
       pathParts[0] === "s" && pathParts[1] ? String(pathParts[1]) : "";
 
+    // Optional /gw/<id> path segment for gateways that can't send MAC (e.g. 512-2)
+    const gatewayIdFromPath = (pathParts[2] === "gw" && pathParts[3])
+      ? parseInt(pathParts[3]) : null;
+
     const gotSecret =
       request.headers.get("x-gateway-secret") ||
       url.searchParams.get("secret") ||
@@ -145,12 +149,21 @@ export default {
     const body = extractSmsBody(rawText);
 
     // Best mapping for rotating numbers: ICCID -> sim_id -> current phone number
-    const simId = iccid ? await findSimIdByIccid(env, iccid) : null;
+    // Fallback: gateway_id (from path) + port when ICCID is absent
+    let simId = iccid ? await findSimIdByIccid(env, iccid) : null;
+    if (!simId && gatewayIdFromPath && port) {
+      const portLetter = dotPortToLetter(port);
+      simId = await findSimIdByGatewayPort(env, gatewayIdFromPath, portLetter);
+      if (!simId) {
+        console.log(`[SMS] Port ${portLetter} on gateway ${gatewayIdFromPath} not found — triggering slot sync`);
+        ctx.waitUntil(triggerGatewaySlotSync(env, gatewayIdFromPath));
+      }
+    }
     const toNumber = simId ? await findCurrentNumberBySimId(env, simId) : "";
 
     // Update the SIM's port and gateway for Skyline SMS sending
     if (simId) {
-      await updateSimPortAndGateway(env, simId, port, mac);
+      await updateSimPortAndGateway(env, simId, port, mac, gatewayIdFromPath);
     }
 
     const receivedAt = new Date().toISOString();
@@ -321,8 +334,8 @@ function dotPortToLetter(dotPort) {
 }
 
 // Update SIM's port and gateway in the sims table
-// Links SIM to gateway based on MAC address
-async function updateSimPortAndGateway(env, simId, port, mac) {
+// Links SIM to gateway based on MAC address, or gatewayIdHint if MAC is absent
+async function updateSimPortAndGateway(env, simId, port, mac, gatewayIdHint = null) {
   if (!simId) return;
 
   const updates = {};
@@ -334,6 +347,8 @@ async function updateSimPortAndGateway(env, simId, port, mac) {
     if (gatewayId) {
       updates.gateway_id = gatewayId;
     }
+  } else if (gatewayIdHint) {
+    updates.gateway_id = gatewayIdHint;
   }
 
   if (Object.keys(updates).length === 0) return;
@@ -388,6 +403,27 @@ async function updateSimPortAndGateway(env, simId, port, mac) {
     }
   } catch (err) {
     console.log(`[SMS] Failed to update SIM: ${err}`);
+  }
+}
+
+// Find sim_id by gateway_id + port (fallback when ICCID is absent)
+async function findSimIdByGatewayPort(env, gatewayId, port) {
+  const q = `sims?select=id&gateway_id=eq.${gatewayId}&port=eq.${encodeURIComponent(port)}&status=neq.canceled&limit=1`;
+  const res = await supabaseGet(env, q);
+  if (!res.ok) return null;
+  const data = await res.json();
+  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+}
+
+// Trigger a background slot sync on mdn-rotator so the next SMS routes correctly
+async function triggerGatewaySlotSync(env, gatewayId) {
+  if (!env.MDN_ROTATOR || !env.ADMIN_RUN_SECRET) return;
+  try {
+    const url = `https://mdn-rotator/sync-gateway-slots?gateway_id=${gatewayId}&secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
+    const res = await env.MDN_ROTATOR.fetch(url, { method: 'POST' });
+    console.log(`[SMS] Slot sync for gateway ${gatewayId}: ${res.status}`);
+  } catch (err) {
+    console.warn(`[SMS] Slot sync trigger failed: ${err}`);
   }
 }
 

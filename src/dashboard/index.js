@@ -175,6 +175,10 @@ export default {
       return handleTriggerBlimeiSweep(env, corsHeaders);
     }
 
+    if (url.pathname === '/api/sync-gateway-slots' && request.method === 'POST') {
+      return handleSyncGatewaySlots(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/imei-gateway-sync' && request.method === 'POST') {
       return handleImeiGatewaySync(request, env, corsHeaders);
     }
@@ -2614,6 +2618,26 @@ async function handleTriggerBlimeiSweep(env, corsHeaders) {
   });
 }
 
+async function handleSyncGatewaySlots(request, env, corsHeaders) {
+  if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  let body;
+  try { body = await request.json(); } catch { body = {}; }
+  const gateway_id = body.gateway_id ? parseInt(body.gateway_id) : null;
+  if (!gateway_id) return new Response(JSON.stringify({ error: 'gateway_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  const workerUrl = `https://mdn-rotator/sync-gateway-slots?gateway_id=${gateway_id}&secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
+  const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, { method: 'POST' });
+  const responseText = await workerResponse.text();
+  let result;
+  try { result = JSON.parse(responseText); } catch {
+    result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
+  }
+  return new Response(JSON.stringify(result, null, 2), {
+    status: workerResponse.ok ? 200 : 500,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
+}
+
 async function handleSimAction(request, env, corsHeaders) {
   try {
     const body = await request.json();
@@ -3323,6 +3347,8 @@ function getHTML() {
                                     <option value="suspended">Suspended</option>
                                     <option value="canceled">Cancelled</option>
                                     <option value="error">Error</option>
+                                    <option value="helix_timeout">Helix Timeout</option>
+                                    <option value="data_mismatch">Data Mismatch</option>
                                 </select>
                                 <select id="filter-reseller" onchange="loadSims(true)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All Resellers</option>
@@ -3551,6 +3577,12 @@ function getHTML() {
                                 <svg class="w-5 h-5 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
                             </div>
                             <span class="text-xs text-gray-300">Import IMEIs</span>
+                        </button>
+                        <button onclick="syncGatewaySlots()" id="gw-sync-slots-btn" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-indigo-500/20 flex items-center justify-center group-hover:bg-indigo-500/30 transition">
+                                <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582 4 8 4s8 1.79 8 4"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Sync Slots</span>
                         </button>
                     </div>
                 </div>
@@ -6439,6 +6471,37 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
             } catch (error) {
                 showToast('Error retiring IMEI', 'error');
+            }
+        }
+
+        async function syncGatewaySlots() {
+            const gatewayId = document.getElementById('gw-select').value;
+            if (!gatewayId) {
+                showToast('Select a gateway first', 'error');
+                return;
+            }
+            const btn = document.getElementById('gw-sync-slots-btn');
+            const origLabel = btn.querySelector('span').textContent;
+            btn.querySelector('span').textContent = 'Syncing...';
+            btn.disabled = true;
+            try {
+                const res = await fetch(\`\${API_BASE}/sync-gateway-slots\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: parseInt(gatewayId) }),
+                });
+                const data = await res.json();
+                if (!res.ok || !data.ok) {
+                    showToast(data.error || 'Sync failed', 'error');
+                    return;
+                }
+                showToast(\`Synced \${data.synced} slots (\${data.not_found} SIMs not in DB)\`, 'success');
+                loadPortStatus();
+            } catch (err) {
+                showToast('Sync error: ' + err, 'error');
+            } finally {
+                btn.querySelector('span').textContent = origLabel;
+                btn.disabled = false;
             }
         }
 
