@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-03-16 (session 5)
+> Last updated: 2026-03-17 (session 6)
 
 ---
 
@@ -12,6 +12,15 @@ _None currently tracked. Add here when something breaks in production._
 ---
 
 ## In Progress / Pending Work
+
+### 512-2 Gateway (id=4) — Push URL Change Needed
+- Code deployed: ✅ (sms-ingest path encoding, mdn-rotator /sync-gateway-slots, dashboard Sync Slots button)
+- **Remaining:** Change push URL on the physical 512-2 device:
+  - From: `https://sms-ingest.zalmen-531.workers.dev/s/<secret>`
+  - To: `https://sms-ingest.zalmen-531.workers.dev/s/<secret>/gw/4`
+- Then use dashboard → Gateway tab → select 512-2 → Sync Slots to populate `sims.port` + `sims.gateway_id`
+- Verify with test SMS: check `inbound_sms` row has `sim_id`, `to_number`, `gateway_id` all populated
+
 
 ### BLIMEI Sweep — Queue Running
 - 535 SIMs queued via `blimei_update` job type in `mdn-rotation-queue`
@@ -52,6 +61,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-03-17 | Gateway-ID path encoding + port-based SIM lookup for 512-2: /gw/<id> path segment, findSimIdByGatewayPort fallback, /sync-gateway-slots endpoint, Sync Slots dashboard button | sms-ingest, mdn-rotator, dashboard |
 | 2026-03-16 | OTA BLIMEI source-of-truth strategy: `hxChangeImei` flags `_alreadyAssigned`; fixSim forces new pool IMEI on stale Helix cache; fixSim OTA step updates `sims.imei` from live BLIMEI | mdn-rotator |
 | 2026-03-16 | `blimei_update` queue job: OTA refresh → DB imei update → gateway set, 1 per message; `/trigger-blimei-sweep` endpoint queues all 535 active SIMs | mdn-rotator, dashboard |
 | 2026-03-16 | `/imei-gateway-sync` fix: `sims.imei` updated from OTA BLIMEI before gateway set attempt, so heartbeat retries use correct IMEI even if gateway is down | mdn-rotator |
