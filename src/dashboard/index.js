@@ -211,6 +211,22 @@ export default {
       return handleBillingCreateInvoice(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/wing-bill/upload' && request.method === 'POST') {
+      return handleWingBillUpload(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/wing-bill/results') {
+      return handleWingBillResults(env, corsHeaders, url);
+    }
+    if (url.pathname === '/api/wing-bill/uploads') {
+      return handleWingBillUploads(env, corsHeaders);
+    }
+    if (url.pathname === '/api/wing-bill/export') {
+      return handleWingBillExport(env, corsHeaders, url);
+    }
+    if (url.pathname === '/api/wing-bill/backfill-cancel-dates' && request.method === 'POST') {
+      return handleBackfillCancelDates(env, corsHeaders);
+    }
+
     // Debug endpoint to test worker-to-worker connectivity via service binding
     if (url.pathname === '/api/debug-cancel') {
       try {
@@ -387,7 +403,7 @@ async function handleSims(env, corsHeaders, url) {
 
 async function handleMessages(env, corsHeaders) {
   try {
-    const query = `inbound_sms?select=id,to_number,from_number,body,received_at,sim_id,sims(iccid)&order=received_at.desc&limit=50`;
+    const query = `inbound_sms?select=id,to_number,from_number,body,received_at,sim_id,sims(iccid)&order=received_at.desc&limit=500`;
     const response = await supabaseGet(env, query);
     const messages = await response.json();
 
@@ -3084,6 +3100,530 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
   }
 }
 
+// ── Wing Bill Verification ────────────────────────────────────────────────────
+
+function parseWingCSV(text) {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) throw new Error('CSV has no data rows');
+    const headers = lines[0].split(',').map(h => h.trim());
+    return lines.slice(1).map(line => {
+        const values = splitCSVLine(line);
+        const row = {};
+        headers.forEach((h, i) => { row[h] = (values[i] || '').trim(); });
+        return row;
+    });
+}
+
+function splitCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') { inQuotes = !inQuotes; }
+        else if (ch === ',' && !inQuotes) { result.push(current); current = ''; }
+        else { current += ch; }
+    }
+    result.push(current);
+    return result;
+}
+
+async function sbGet(env, path) {
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+        headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        }
+    });
+    return resp.json();
+}
+
+async function sbPost(env, table, data) {
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+        method: 'POST',
+        headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            'Prefer': 'return=representation',
+        },
+        body: JSON.stringify(data),
+    });
+    return resp.json();
+}
+
+async function sbPatch(env, path, data) {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+        method: 'PATCH',
+        headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            'Prefer': 'return=minimal',
+        },
+        body: JSON.stringify(data),
+    });
+}
+
+const BILLABLE_STATUSES = new Set(['active', 'suspended']);
+
+function calculateBillableDays(statusHistory, simCurrentStatus, fromDate, toDate) {
+    const totalMs = toDate.getTime() - fromDate.getTime();
+    const totalDays = Math.max(1, Math.round(totalMs / (1000 * 60 * 60 * 24)));
+
+    // If no history records, use current status for the whole period
+    if (!statusHistory || statusHistory.length === 0) {
+        const billable = BILLABLE_STATUSES.has(simCurrentStatus);
+        return { billable_days: billable ? totalDays : 0, total_days: totalDays };
+    }
+
+    // Sort history by changed_at
+    const sorted = [...statusHistory].sort((a, b) => new Date(a.changed_at) - new Date(b.changed_at));
+
+    // Determine status at start of period by walking backwards from earliest history
+    // The old_status of the first transition tells us what it was before
+    let currentStatus = sorted[0].old_status || simCurrentStatus;
+    let billableDays = 0;
+    let cursor = fromDate.getTime();
+
+    for (const entry of sorted) {
+        const changeTime = new Date(entry.changed_at).getTime();
+        if (changeTime > toDate.getTime()) break; // past end of period
+
+        const segmentEnd = Math.min(changeTime, toDate.getTime());
+        const segmentStart = Math.max(cursor, fromDate.getTime());
+
+        if (segmentEnd > segmentStart && BILLABLE_STATUSES.has(currentStatus)) {
+            billableDays += (segmentEnd - segmentStart) / (1000 * 60 * 60 * 24);
+        }
+
+        currentStatus = entry.new_status;
+        cursor = changeTime;
+    }
+
+    // Account for remaining time after last transition
+    if (cursor < toDate.getTime()) {
+        const segmentStart = Math.max(cursor, fromDate.getTime());
+        if (BILLABLE_STATUSES.has(currentStatus)) {
+            billableDays += (toDate.getTime() - segmentStart) / (1000 * 60 * 60 * 24);
+        }
+    }
+
+    return { billable_days: Math.round(billableDays), total_days: totalDays };
+}
+
+async function handleWingBillUpload(request, env, corsHeaders) {
+    try {
+        // 1. Extract CSV
+        const formData = await request.formData();
+        const file = formData.get('file');
+        if (!file) return new Response(JSON.stringify({ error: 'No file uploaded' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const csvText = await file.text();
+        const filename = file.name || 'wing_bill.csv';
+
+        // 2. Parse CSV
+        const rows = parseWingCSV(csvText);
+        if (!rows.length) return new Response(JSON.stringify({ error: 'CSV has no data rows' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+        // 3. Create upload record
+        const [upload] = await sbPost(env, 'wing_bill_uploads', { filename, total_rows: rows.length, status: 'processing' });
+        const uploadId = upload.id;
+
+        // 4. Fetch all SIMs
+        const allSims = await sbGet(env, 'sims?select=id,iccid,status&limit=10000');
+        const simsByIccid = {};
+        (allSims || []).forEach(s => { simsByIccid[s.iccid] = s; });
+
+        // 5. Get expected rate
+        const expectedRate = parseFloat(env.WING_EXPECTED_RATE || '5.00');
+
+        // 6. Collect unique SIM IDs for batch history fetch
+        const simIds = new Set();
+        const parsedRows = rows.map(row => {
+            const iccid = row['Subscription Iccid'] || '';
+            const sim = simsByIccid[iccid];
+            if (sim) simIds.add(sim.id);
+            return { row, iccid, sim };
+        });
+
+        // 7. Batch fetch status history for all relevant SIMs
+        let allHistory = [];
+        if (simIds.size > 0) {
+            const idList = [...simIds].join(',');
+            allHistory = await sbGet(env, `sim_status_history?sim_id=in.(${idList})&order=changed_at.asc&limit=50000`) || [];
+        }
+        // Group history by sim_id
+        const historyBySimId = {};
+        allHistory.forEach(h => {
+            if (!historyBySimId[h.sim_id]) historyBySimId[h.sim_id] = [];
+            historyBySimId[h.sim_id].push(h);
+        });
+
+        // 8. Process each row
+        const billedIccids = new Set();
+        const lineRecords = [];
+
+        for (const { row, iccid, sim } of parsedRows) {
+            const price = parseFloat(row['Price'] || '0');
+            const fromDate = row['From Date'] ? new Date(row['From Date']) : null;
+            const toDate = row['To Date'] ? new Date(row['To Date']) : null;
+
+            let discrepancyType = null;
+            let discrepancyDetail = null;
+            let expectedPrice = price;
+            let billableDays = null;
+            let totalDays = null;
+
+            if (!sim) {
+                discrepancyType = 'unknown_iccid';
+                discrepancyDetail = `ICCID ${iccid} not found in our system`;
+                expectedPrice = 0;
+            } else if (fromDate && toDate) {
+                const history = historyBySimId[sim.id] || [];
+                // Filter history to relevant period (include some buffer before for context)
+                const relevantHistory = history.filter(h => {
+                    const t = new Date(h.changed_at).getTime();
+                    return t >= fromDate.getTime() && t <= toDate.getTime();
+                });
+
+                const calc = calculateBillableDays(relevantHistory, sim.status, fromDate, toDate);
+                billableDays = calc.billable_days;
+                totalDays = calc.total_days;
+
+                if (billableDays === 0) {
+                    discrepancyType = 'not_billable';
+                    discrepancyDetail = `SIM status is '${sim.status}' — not billable for this period (0/${totalDays} days)`;
+                    expectedPrice = 0;
+                } else if (billableDays < totalDays) {
+                    expectedPrice = Math.round((price / totalDays) * billableDays * 100) / 100;
+                    if (price > expectedPrice + 0.01) {
+                        discrepancyType = 'overcharge';
+                        discrepancyDetail = `Active ${billableDays}/${totalDays} days — expected $${expectedPrice.toFixed(2)}, charged $${price.toFixed(2)}`;
+                    }
+                } else {
+                    // Fully active — check rate
+                    if (Math.abs(price - expectedRate) > 0.01) {
+                        discrepancyType = 'rate_mismatch';
+                        discrepancyDetail = `Expected $${expectedRate.toFixed(2)} but charged $${price.toFixed(2)}`;
+                    }
+                    expectedPrice = expectedRate;
+                }
+            } else {
+                // No dates — can only check rate
+                if (!BILLABLE_STATUSES.has(sim.status)) {
+                    discrepancyType = 'not_billable';
+                    discrepancyDetail = `SIM status is '${sim.status}' — should not be billed`;
+                    expectedPrice = 0;
+                } else if (Math.abs(price - expectedRate) > 0.01) {
+                    discrepancyType = 'rate_mismatch';
+                    discrepancyDetail = `Expected $${expectedRate.toFixed(2)} but charged $${price.toFixed(2)}`;
+                }
+            }
+
+            billedIccids.add(iccid);
+            lineRecords.push({
+                upload_id: uploadId,
+                wing_id: row['Id'] || null,
+                item_type: row['Item Type'] || null,
+                description: row['Description'] || null,
+                from_date: fromDate?.toISOString() || null,
+                to_date: toDate?.toISOString() || null,
+                subscription_name: row['Subscription Name'] || null,
+                subscription_iccid: iccid || null,
+                subscription_identifier: row['Subscription Identifier'] || null,
+                carrier: row['Carrier'] || null,
+                price,
+                sim_id: sim?.id || null,
+                sim_status: sim?.status || null,
+                expected_price: expectedPrice,
+                billable_days: billableDays,
+                total_days: totalDays,
+                discrepancy_type: discrepancyType,
+                discrepancy_detail: discrepancyDetail,
+            });
+        }
+
+        // 9. Duplicate charge detection
+        const byIccid = {};
+        lineRecords.forEach(r => {
+            if (!byIccid[r.subscription_iccid]) byIccid[r.subscription_iccid] = [];
+            byIccid[r.subscription_iccid].push(r);
+        });
+        for (const entries of Object.values(byIccid)) {
+            if (entries.length < 2) continue;
+            for (let i = 0; i < entries.length; i++) {
+                for (let j = i + 1; j < entries.length; j++) {
+                    const a = entries[i], b = entries[j];
+                    if (a.from_date && b.from_date && a.to_date && b.to_date) {
+                        const aFrom = new Date(a.from_date), aTo = new Date(a.to_date);
+                        const bFrom = new Date(b.from_date), bTo = new Date(b.to_date);
+                        if (aFrom < bTo && bFrom < aTo && !b.discrepancy_type) {
+                            b.discrepancy_type = 'duplicate_charge';
+                            b.discrepancy_detail = `Overlapping period with Wing ID ${a.wing_id}`;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 10. Missing from bill (active SIMs not in CSV)
+        const activeSims = (allSims || []).filter(s => BILLABLE_STATUSES.has(s.status));
+        const missingFromBill = activeSims.filter(s => !billedIccids.has(s.iccid));
+
+        // 11. Batch insert line records
+        for (let i = 0; i < lineRecords.length; i += 500) {
+            const batch = lineRecords.slice(i, i + 500);
+            await fetch(`${env.SUPABASE_URL}/rest/v1/wing_bill_lines`, {
+                method: 'POST',
+                headers: {
+                    'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                    'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=minimal',
+                },
+                body: JSON.stringify(batch),
+            });
+        }
+
+        // 12. Update upload record
+        const discrepancyCount = lineRecords.filter(r => r.discrepancy_type).length;
+        const totalAmount = lineRecords.reduce((sum, r) => sum + (r.price || 0), 0);
+        const totalExpected = lineRecords.reduce((sum, r) => sum + (r.expected_price || 0), 0);
+        const overchargeAmount = Math.max(0, Math.round((totalAmount - totalExpected) * 100) / 100);
+        const dates = lineRecords.map(r => r.from_date).filter(Boolean).sort();
+        const endDates = lineRecords.map(r => r.to_date).filter(Boolean).sort();
+
+        await sbPatch(env, `wing_bill_uploads?id=eq.${uploadId}`, {
+            status: 'complete',
+            total_amount: totalAmount,
+            total_expected: totalExpected,
+            overcharge_amount: overchargeAmount,
+            discrepancy_count: discrepancyCount,
+            billing_period_start: dates[0] ? dates[0].split('T')[0] : null,
+            billing_period_end: endDates.length ? endDates[endDates.length - 1].split('T')[0] : null,
+        });
+
+        // 13. Return results
+        return new Response(JSON.stringify({
+            upload_id: uploadId,
+            total_rows: lineRecords.length,
+            total_amount: totalAmount,
+            total_expected: totalExpected,
+            overcharge_amount: overchargeAmount,
+            discrepancy_count: discrepancyCount,
+            discrepancies: lineRecords.filter(r => r.discrepancy_type),
+            missing_from_bill: missingFromBill.map(s => ({ sim_id: s.id, iccid: s.iccid, status: s.status })),
+            missing_count: missingFromBill.length,
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    } catch (e) {
+        console.error('Wing bill upload error:', e);
+        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+}
+
+async function handleWingBillResults(env, corsHeaders, url) {
+    const uploadId = url.searchParams.get('upload_id');
+    if (!uploadId) return new Response(JSON.stringify({ error: 'upload_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    const [uploads, lines] = await Promise.all([
+        sbGet(env, `wing_bill_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
+        sbGet(env, `wing_bill_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
+    ]);
+
+    const upload = Array.isArray(uploads) ? uploads[0] : null;
+    if (!upload) return new Response(JSON.stringify({ error: 'Upload not found' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    return new Response(JSON.stringify({
+        upload,
+        lines: lines || [],
+        discrepancies: (lines || []).filter(l => l.discrepancy_type),
+    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
+async function handleWingBillUploads(env, corsHeaders) {
+    const data = await sbGet(env, 'wing_bill_uploads?select=id,filename,billing_period_start,billing_period_end,total_rows,total_amount,total_expected,overcharge_amount,discrepancy_count,status,created_at&order=created_at.desc&limit=50');
+    return new Response(JSON.stringify(data || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
+async function handleWingBillExport(env, corsHeaders, url) {
+    const uploadId = url.searchParams.get('upload_id');
+    if (!uploadId) return new Response('upload_id required', { status: 400 });
+
+    const [uploads, lines] = await Promise.all([
+        sbGet(env, `wing_bill_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
+        sbGet(env, `wing_bill_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
+    ]);
+
+    const upload = Array.isArray(uploads) ? uploads[0] : null;
+    if (!upload) return new Response('Upload not found', { status: 404 });
+
+    const auditLabels = {
+        'not_billable': 'NOT BILLABLE',
+        'overcharge': 'OVERCHARGE',
+        'unknown_iccid': 'UNKNOWN ICCID',
+        'rate_mismatch': 'RATE MISMATCH',
+        'duplicate_charge': 'DUPLICATE',
+    };
+
+    // Build CSV
+    const csvHeaders = 'Wing ID,ICCID,Description,Carrier,From Date,To Date,Billed Amount,Expected Amount,Overcharge,Billable Days,Total Days,SIM Status,Audit Result,Detail';
+    const csvRows = (lines || []).map(l => {
+        const overcharge = Math.max(0, (l.price || 0) - (l.expected_price || 0));
+        const auditResult = l.discrepancy_type ? auditLabels[l.discrepancy_type] || l.discrepancy_type : 'OK';
+        return [
+            l.wing_id || '',
+            l.subscription_iccid || '',
+            `"${(l.description || '').replace(/"/g, '""')}"`,
+            l.carrier || '',
+            l.from_date ? new Date(l.from_date).toLocaleDateString('en-US') : '',
+            l.to_date ? new Date(l.to_date).toLocaleDateString('en-US') : '',
+            (l.price || 0).toFixed(2),
+            (l.expected_price || 0).toFixed(2),
+            overcharge.toFixed(2),
+            l.billable_days ?? '',
+            l.total_days ?? '',
+            l.sim_status || 'N/A',
+            auditResult,
+            `"${(l.discrepancy_detail || '').replace(/"/g, '""')}"`,
+        ].join(',');
+    });
+
+    // Summary row
+    const totalBilled = (lines || []).reduce((s, l) => s + (l.price || 0), 0);
+    const totalExpected = (lines || []).reduce((s, l) => s + (l.expected_price || 0), 0);
+    const totalOvercharge = Math.max(0, totalBilled - totalExpected);
+    csvRows.push('');
+    csvRows.push(`,,,,,,${totalBilled.toFixed(2)},${totalExpected.toFixed(2)},${totalOvercharge.toFixed(2)},,,,"TOTALS",`);
+
+    const csv = csvHeaders + '\n' + csvRows.join('\n');
+
+    // Derive invoice number from original filename (e.g. "purchase_8147715.csv" → "purchase_8147715")
+    const invoiceName = (upload.filename || '').replace(/\.[^.]+$/, '') || `upload-${uploadId}`;
+    const exportFilename = `${invoiceName} - Audit.csv`;
+
+    return new Response(csv, {
+        headers: {
+            ...corsHeaders,
+            'Content-Type': 'text/csv',
+            'Content-Disposition': `attachment; filename="${exportFilename}"`,
+        },
+    });
+}
+
+// ── One-time backfill: populate sim_status_history cancel dates from Helix ──
+async function handleBackfillCancelDates(env, corsHeaders) {
+    try {
+        // 1. Get all canceled SIMs that have a mobility_subscription_id
+        const canceledSims = await sbGet(env, 'sims?select=id,iccid,mobility_subscription_id,status&status=eq.canceled&mobility_subscription_id=not.is.null&limit=5000');
+        if (!canceledSims || !canceledSims.length) {
+            return new Response(JSON.stringify({ ok: true, message: 'No canceled SIMs found', total: 0 }), {
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 2. Get existing cancel history records so we skip SIMs that already have one
+        const simIds = canceledSims.map(s => s.id);
+        const existingHistory = await sbGet(env, `sim_status_history?select=sim_id&new_status=eq.canceled&sim_id=in.(${simIds.join(',')})&limit=10000`);
+        const alreadyHasHistory = new Set((existingHistory || []).map(h => h.sim_id));
+
+        const needsBackfill = canceledSims.filter(s => !alreadyHasHistory.has(s.id));
+        if (!needsBackfill.length) {
+            return new Response(JSON.stringify({
+                ok: true,
+                message: 'All canceled SIMs already have history records',
+                total_canceled: canceledSims.length,
+                already_have_history: alreadyHasHistory.size,
+                needs_backfill: 0
+            }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+
+        // 3. Get Helix token
+        const tokenRes = await fetch(env.HX_TOKEN_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                grant_type: 'password',
+                client_id: env.HX_CLIENT_ID,
+                audience: env.HX_AUDIENCE,
+                username: env.HX_GRANT_USERNAME,
+                password: env.HX_GRANT_PASSWORD,
+            }),
+        });
+        const tokenData = await tokenRes.json();
+        if (!tokenRes.ok || !tokenData.access_token) {
+            return new Response(JSON.stringify({ error: 'Failed to get Helix token', details: tokenData }), {
+                status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+        const token = tokenData.access_token;
+
+        // 4. Query each SIM's subscriber_details and extract canceledAt
+        const results = { backfilled: 0, no_date: 0, api_errors: 0, skipped: 0, details: [] };
+
+        for (const sim of needsBackfill) {
+            try {
+                const detailsRes = await fetch(`${env.HX_API_BASE}/api/mobility-subscriber/details`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${token}`,
+                    },
+                    body: JSON.stringify({ mobilitySubscriptionId: parseInt(sim.mobility_subscription_id) }),
+                });
+
+                if (!detailsRes.ok) {
+                    results.api_errors++;
+                    results.details.push({ iccid: sim.iccid, error: `Helix ${detailsRes.status}` });
+                    continue;
+                }
+
+                const detailsData = await detailsRes.json();
+                const d = Array.isArray(detailsData) ? detailsData[0] : detailsData;
+                const canceledAt = d?.canceledAt || d?.cancelledAt || null;
+
+                if (!canceledAt) {
+                    results.no_date++;
+                    results.details.push({ iccid: sim.iccid, sub_id: sim.mobility_subscription_id, error: 'No canceledAt in Helix response', helix_status: d?.status });
+                    continue;
+                }
+
+                // 5. Insert backfill record into sim_status_history
+                const ts = new Date(canceledAt).toISOString();
+                await sbPost(env, 'sim_status_history', {
+                    sim_id: sim.id,
+                    old_status: 'active', // best guess — was active before cancel
+                    new_status: 'canceled',
+                    changed_at: ts,
+                });
+
+                results.backfilled++;
+                results.details.push({ iccid: sim.iccid, canceled_at: ts });
+
+            } catch (err) {
+                results.api_errors++;
+                results.details.push({ iccid: sim.iccid, error: String(err) });
+            }
+
+            // Rate limit: small delay between Helix calls
+            await new Promise(r => setTimeout(r, 200));
+        }
+
+        return new Response(JSON.stringify({
+            ok: true,
+            total_canceled: canceledSims.length,
+            already_have_history: alreadyHasHistory.size,
+            needs_backfill: needsBackfill.length,
+            ...results,
+        }, null, 2), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        return new Response(JSON.stringify({ error: String(error) }), {
+            status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -3341,7 +3881,7 @@ function getHTML() {
                                 <select id="filter-status" onchange="loadSims(true)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All (except cancelled)</option>
                                     <option value="all">All (include cancelled)</option>
-                                    <option value="active">Active</option>
+                                    <option value="active" selected>Active</option>
                                     <option value="provisioning">Provisioning</option>
                                     <option value="pending">Pending</option>
                                     <option value="suspended">Suspended</option>
@@ -3355,6 +3895,11 @@ function getHTML() {
                                 </select>
                                 <select id="filter-gateway" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All Gateways</option>
+                                </select>
+                                <select id="filter-special" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                    <option value="">No Quick Filter</option>
+                                    <option value="not_rotated_today">Not rotated today</option>
+                                    <option value="no_sms_12h">No SMS in 12h</option>
                                 </select>
                                 <label class="text-xs text-gray-500 flex items-center gap-1">Activated
                                   <input id="filter-activated-from" type="date" oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent" title="Activated from">
@@ -3796,6 +4341,118 @@ function getHTML() {
                             </thead>
                             <tbody id="invoice-history-table" class="text-sm">
                                 <tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Wing Bill Verification -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6 mt-8">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-semibold text-white">Wing Bill Verification</h3>
+                    </div>
+                    <p class="text-sm text-gray-400 mb-4">Upload the Wing/Helix itemized CSV to cross-reference against SIM records and detect billing discrepancies.</p>
+
+                    <div class="flex flex-wrap items-end gap-3 mb-4">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">CSV File</label>
+                            <input type="file" id="wing-csv-file" accept=".csv" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        </div>
+                        <button onclick="uploadWingBill()" id="wing-upload-btn" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">
+                            Verify Bill
+                        </button>
+                    </div>
+
+                    <div id="wing-summary" class="hidden mb-4">
+                        <div class="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
+                            <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
+                                <p class="text-xs text-gray-500 uppercase">Total Lines</p>
+                                <p class="text-xl font-bold text-white" id="wing-total-rows">0</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
+                                <p class="text-xs text-gray-500 uppercase">Total Billed</p>
+                                <p class="text-xl font-bold text-white" id="wing-total-amount">$0.00</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
+                                <p class="text-xs text-gray-500 uppercase">Expected</p>
+                                <p class="text-xl font-bold text-accent" id="wing-total-expected">$0.00</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
+                                <p class="text-xs text-gray-500 uppercase">Overcharge</p>
+                                <p class="text-xl font-bold text-red-400" id="wing-overcharge">$0.00</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
+                                <p class="text-xs text-gray-500 uppercase">Discrepancies</p>
+                                <p class="text-xl font-bold" id="wing-discrepancy-count">0</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
+                                <p class="text-xs text-gray-500 uppercase">Missing from Bill</p>
+                                <p class="text-xl font-bold text-yellow-400" id="wing-missing-count">0</p>
+                            </div>
+                        </div>
+                        <button onclick="exportWingAudit(window._wingUploadId)" id="wing-export-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition mb-4">
+                            Export Audit Report (CSV)
+                        </button>
+                    </div>
+
+                    <div id="wing-discrepancies" class="hidden mb-4">
+                        <h4 class="text-sm font-semibold text-red-400 uppercase mb-2">Discrepancies Found</h4>
+                        <div class="overflow-x-auto max-h-96 overflow-y-auto">
+                            <table class="w-full text-sm">
+                                <thead class="sticky top-0 bg-dark-800">
+                                    <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                        <th class="px-3 py-2 font-medium">Type</th>
+                                        <th class="px-3 py-2 font-medium">ICCID</th>
+                                        <th class="px-3 py-2 font-medium">Description</th>
+                                        <th class="px-3 py-2 font-medium">Period</th>
+                                        <th class="px-3 py-2 font-medium">Billed</th>
+                                        <th class="px-3 py-2 font-medium">Expected</th>
+                                        <th class="px-3 py-2 font-medium">Days</th>
+                                        <th class="px-3 py-2 font-medium">Status</th>
+                                        <th class="px-3 py-2 font-medium">Detail</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="wing-discrepancy-table"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div id="wing-missing" class="hidden mb-4">
+                        <h4 class="text-sm font-semibold text-yellow-400 uppercase mb-2">Active SIMs Missing from Bill</h4>
+                        <div class="overflow-x-auto max-h-48 overflow-y-auto">
+                            <table class="w-full text-sm">
+                                <thead class="sticky top-0 bg-dark-800">
+                                    <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                        <th class="px-3 py-2 font-medium">SIM ID</th>
+                                        <th class="px-3 py-2 font-medium">ICCID</th>
+                                        <th class="px-3 py-2 font-medium">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="wing-missing-table"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Wing Verification History -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                    <h3 class="text-lg font-semibold text-white mb-3">Verification History</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium">Date</th>
+                                    <th class="px-4 py-3 font-medium">File</th>
+                                    <th class="px-4 py-3 font-medium">Period</th>
+                                    <th class="px-4 py-3 font-medium">Lines</th>
+                                    <th class="px-4 py-3 font-medium">Billed</th>
+                                    <th class="px-4 py-3 font-medium">Overcharge</th>
+                                    <th class="px-4 py-3 font-medium">Issues</th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="wing-history-table" class="text-sm">
+                                <tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No verifications yet</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -5082,7 +5739,7 @@ function getHTML() {
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); }
+            if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadWingHistory(); }
         }
 
         // Handle browser back/forward
@@ -5303,6 +5960,14 @@ function renderSims() {
   const activatedTo = document.getElementById('filter-activated-to')?.value;
   if (activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= activatedFrom);
   if (activatedTo) data = data.filter(s => s.activated_at && s.activated_at <= activatedTo + 'T23:59:59');
+  const specialFilter = document.getElementById('filter-special') && document.getElementById('filter-special').value;
+  if (specialFilter === 'not_rotated_today') {
+    const todayUTC = new Date().toISOString().slice(0, 10);
+    data = data.filter(function(s) { return !s.last_mdn_rotated_at || s.last_mdn_rotated_at.slice(0, 10) < todayUTC; });
+  } else if (specialFilter === 'no_sms_12h') {
+    const cutoff12h = Date.now() - 12 * 60 * 60 * 1000;
+    data = data.filter(function(s) { return !s.last_sms_received || new Date(s.last_sms_received).getTime() < cutoff12h; });
+  }
   data = genericSort(data, state.sortKey, state.sortDir);
 
   const tbody = document.getElementById('sims-table');
@@ -6144,6 +6809,7 @@ async function sendSimOnline(simId, phoneNumber) {
                             <th class="pb-2 pr-3">IMEI</th>
                             <th class="pb-2 pr-3">Signal</th>
                             <th class="pb-2">Operator</th>
+                            <th class="pb-2 pl-3">Actions</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -6173,6 +6839,11 @@ async function sendSimOnline(simId, phoneNumber) {
                                     <td class="py-2 pr-3 font-mono text-gray-400 text-xs">\${p.imei || '---'}</td>
                                     <td class="py-2 pr-3 text-gray-300">\${p.signal != null ? p.signal : '-'}</td>
                                     <td class="py-2 text-gray-300">\${p.operator || '---'}</td>
+                                    <td class="py-2 pl-3 whitespace-nowrap">
+                                        <button onclick="gwSlotAction('lock','\${p.port}')" class="px-2 py-1 text-xs bg-orange-700 hover:bg-orange-600 text-white rounded transition mr-1" title="Lock SIM slot">Lock</button>
+                                        <button onclick="gwSlotAction('unlock','\${p.port}')" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-600 text-white rounded transition mr-1" title="Unlock SIM slot">Unlock</button>
+                                        <button onclick="gwSlotAction('switch','\${p.port}')" class="px-2 py-1 text-xs bg-purple-700 hover:bg-purple-600 text-white rounded transition" title="Switch to this SIM slot">Switch</button>
+                                    </td>
                                 </tr>
                             \`;
                         }).join('')}
@@ -6190,6 +6861,28 @@ async function sendSimOnline(simId, phoneNumber) {
 
         function hideGwModal(modalId) {
             document.getElementById(modalId).classList.add('hidden');
+        }
+
+        // Direct slot actions from port-detail modal (lock / unlock / switch-sim)
+        async function gwSlotAction(action, port) {
+            const gatewayId = getSelectedGatewayId();
+            if (!gatewayId) { showToast('No gateway selected', 'error'); return; }
+            const label = action === 'switch' ? 'Switch SIM on' : (action.charAt(0).toUpperCase() + action.slice(1));
+            if (!confirm(label + ' slot ' + port + '?')) return;
+            showToast(label + ' ' + port + '...', 'info');
+            try {
+                const endpoint = action === 'switch' ? 'switch-sim' : action;
+                const resp = await fetch(API_BASE + '/skyline/' + endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: gatewayId, port })
+                });
+                const result = await resp.json();
+                showToast(result.ok ? (result.message || label + ' OK') : ('Error: ' + result.error), result.ok ? 'success' : 'error');
+                if (result.ok) setTimeout(loadPortStatus, 2000);
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
         }
 
         // --- Switch SIM ---
@@ -7250,6 +7943,7 @@ async function sendSimOnline(simId, phoneNumber) {
                             <pre class="mt-1 text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">\${resBody.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
                         </details>
                         \${log.error ? \`<p class="text-xs text-red-400 mt-1">Error: \${log.error}</p>\` : ''}
+                        \${(!log.response_ok || log.error) ? \`<div class="mt-2"><button onclick="retryLogStep('\${log.step}')" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">&#8635; Retry</button></div>\` : ''}
                     </div>
                     \`;
                 }).join('');
@@ -7258,6 +7952,18 @@ async function sendSimOnline(simId, phoneNumber) {
                 logsContainer.innerHTML = '<p class="text-red-400 text-sm">Failed to load API logs</p>';
             }
         }
+        // Retry a failed Helix API log step for the currently-viewed SIM
+        function retryLogStep(step) {
+            if (!currentSimActionId) { showToast('No SIM selected', 'error'); return; }
+            var actionMap = {
+                'mdn_change': 'rotate',
+                'ota_refresh': 'ota_refresh',
+                'retry_activation': 'retry_activation'
+            };
+            var action = actionMap[step] || 'fix';
+            simAction(currentSimActionId, action);
+        }
+
         function toggleAllSims(checkbox) {
             document.querySelectorAll('.sim-cb').forEach(cb => cb.checked = checkbox.checked);
             updateSimActionBar();
@@ -8323,6 +9029,167 @@ async function sendSimOnline(simId, phoneNumber) {
                 console.error("Error loading invoice history:", error);
             }
         }
+
+        // ===== Wing Bill Verification =====
+
+        async function uploadWingBill() {
+            const fileInput = document.getElementById('wing-csv-file');
+            if (!fileInput.files.length) { showToast('Select a CSV file first', 'error'); return; }
+            const file = fileInput.files[0];
+            const btn = document.getElementById('wing-upload-btn');
+            btn.disabled = true; btn.textContent = 'Verifying...';
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                const resp = await fetch(API_BASE + '/wing-bill/upload', {
+                    method: 'POST',
+                    credentials: 'include',
+                    body: formData,
+                });
+                const data = await resp.json();
+                if (data.error) { showToast(data.error, 'error'); return; }
+                window._wingUploadId = data.upload_id;
+                renderWingResults(data);
+                loadWingHistory();
+                showToast('Verification complete: ' + data.discrepancy_count + ' discrepancies, $' + Number(data.overcharge_amount).toFixed(2) + ' overcharge',
+                    data.discrepancy_count > 0 ? 'error' : 'success');
+            } catch (e) {
+                showToast('Upload failed: ' + e, 'error');
+            } finally {
+                btn.disabled = false; btn.textContent = 'Verify Bill';
+            }
+        }
+
+        function renderWingResults(data) {
+            document.getElementById('wing-summary').classList.remove('hidden');
+            document.getElementById('wing-total-rows').textContent = data.total_rows;
+            document.getElementById('wing-total-amount').textContent = '$' + Number(data.total_amount).toFixed(2);
+            document.getElementById('wing-total-expected').textContent = '$' + Number(data.total_expected).toFixed(2);
+            document.getElementById('wing-overcharge').textContent = '$' + Number(data.overcharge_amount).toFixed(2);
+            const discEl = document.getElementById('wing-discrepancy-count');
+            discEl.textContent = data.discrepancy_count;
+            discEl.className = 'text-xl font-bold ' + (data.discrepancy_count > 0 ? 'text-red-400' : 'text-accent');
+            document.getElementById('wing-missing-count').textContent = data.missing_count || 0;
+
+            const typeColors = {
+                'not_billable': 'text-red-400',
+                'overcharge': 'text-orange-400',
+                'unknown_iccid': 'text-purple-400',
+                'rate_mismatch': 'text-yellow-400',
+                'duplicate_charge': 'text-pink-400',
+            };
+            const typeLabels = {
+                'not_billable': 'Not Billable',
+                'overcharge': 'Overcharge',
+                'unknown_iccid': 'Unknown ICCID',
+                'rate_mismatch': 'Rate Mismatch',
+                'duplicate_charge': 'Duplicate',
+            };
+
+            const discSection = document.getElementById('wing-discrepancies');
+            const discTable = document.getElementById('wing-discrepancy-table');
+            if (data.discrepancies && data.discrepancies.length > 0) {
+                discSection.classList.remove('hidden');
+                discTable.innerHTML = data.discrepancies.map(d => '<tr class="border-b border-dark-700">' +
+                    '<td class="px-3 py-2 ' + (typeColors[d.discrepancy_type] || 'text-gray-300') + ' font-medium text-xs">' + (typeLabels[d.discrepancy_type] || d.discrepancy_type) + '</td>' +
+                    '<td class="px-3 py-2 text-gray-300 font-mono text-xs">' + (d.subscription_iccid || '-') + '</td>' +
+                    '<td class="px-3 py-2 text-gray-400">' + (d.description || '-') + '</td>' +
+                    '<td class="px-3 py-2 text-gray-400 text-xs">' + formatWingDate(d.from_date) + ' - ' + formatWingDate(d.to_date) + '</td>' +
+                    '<td class="px-3 py-2 text-gray-300">$' + Number(d.price).toFixed(2) + '</td>' +
+                    '<td class="px-3 py-2 text-accent">$' + Number(d.expected_price || 0).toFixed(2) + '</td>' +
+                    '<td class="px-3 py-2 text-gray-400">' + (d.billable_days != null ? d.billable_days + '/' + d.total_days : '-') + '</td>' +
+                    '<td class="px-3 py-2 text-gray-400">' + (d.sim_status || 'N/A') + '</td>' +
+                    '<td class="px-3 py-2 text-gray-400 text-xs">' + (d.discrepancy_detail || '') + '</td>' +
+                    '</tr>').join('');
+            } else {
+                discSection.classList.add('hidden');
+            }
+
+            const missingSection = document.getElementById('wing-missing');
+            const missingTable = document.getElementById('wing-missing-table');
+            if (data.missing_from_bill && data.missing_from_bill.length > 0) {
+                missingSection.classList.remove('hidden');
+                missingTable.innerHTML = data.missing_from_bill.map(s => '<tr class="border-b border-dark-700">' +
+                    '<td class="px-3 py-2 text-gray-300">' + s.sim_id + '</td>' +
+                    '<td class="px-3 py-2 text-gray-300 font-mono text-xs">' + s.iccid + '</td>' +
+                    '<td class="px-3 py-2 text-gray-400">' + s.status + '</td>' +
+                    '</tr>').join('');
+            } else {
+                missingSection.classList.add('hidden');
+            }
+        }
+
+        function formatWingDate(isoStr) {
+            if (!isoStr) return '-';
+            const d = new Date(isoStr);
+            return (d.getMonth()+1) + '/' + d.getDate() + '/' + d.getFullYear();
+        }
+
+        async function loadWingHistory() {
+            try {
+                const resp = await fetch(API_BASE + '/wing-bill/uploads', {
+                    credentials: 'include',
+                });
+                if (!resp.ok) return;
+                const uploads = await resp.json();
+                const tbody = document.getElementById('wing-history-table');
+                if (!uploads || !uploads.length) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No verifications yet</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = uploads.map(u => '<tr class="border-b border-dark-600">' +
+                    '<td class="px-4 py-3 text-gray-400 text-xs">' + new Date(u.created_at).toLocaleString() + '</td>' +
+                    '<td class="px-4 py-3 text-gray-300">' + (u.filename || '-') + '</td>' +
+                    '<td class="px-4 py-3 text-gray-400 text-xs">' + (u.billing_period_start || '?') + ' - ' + (u.billing_period_end || '?') + '</td>' +
+                    '<td class="px-4 py-3 text-gray-300">' + u.total_rows + '</td>' +
+                    '<td class="px-4 py-3 text-gray-300">$' + Number(u.total_amount).toFixed(2) + '</td>' +
+                    '<td class="px-4 py-3 ' + (u.overcharge_amount > 0 ? 'text-red-400 font-semibold' : 'text-accent') + '">$' + Number(u.overcharge_amount || 0).toFixed(2) + '</td>' +
+                    '<td class="px-4 py-3 ' + (u.discrepancy_count > 0 ? 'text-red-400 font-semibold' : 'text-accent') + '">' + u.discrepancy_count + '</td>' +
+                    '<td class="px-4 py-3"><button onclick="viewWingResults(' + u.id + ')" class="text-xs text-blue-400 hover:text-blue-300 mr-2">View</button>' +
+                    '<button onclick="exportWingAudit(' + u.id + ')" class="text-xs text-accent hover:text-green-300">Export</button></td>' +
+                    '</tr>').join('');
+            } catch (e) { console.error('loadWingHistory:', e); }
+        }
+
+        async function viewWingResults(uploadId) {
+            try {
+                const resp = await fetch(API_BASE + '/wing-bill/results?upload_id=' + uploadId, {
+                    credentials: 'include',
+                });
+                const data = await resp.json();
+                if (data.error) { showToast(data.error, 'error'); return; }
+                window._wingUploadId = uploadId;
+                renderWingResults({
+                    total_rows: data.upload.total_rows,
+                    total_amount: data.upload.total_amount,
+                    total_expected: data.upload.total_expected,
+                    overcharge_amount: data.upload.overcharge_amount,
+                    discrepancy_count: data.upload.discrepancy_count,
+                    discrepancies: data.discrepancies,
+                    missing_from_bill: [],
+                    missing_count: 0,
+                });
+            } catch (e) { showToast('Error: ' + e, 'error'); }
+        }
+
+        function exportWingAudit(uploadId) {
+            if (!uploadId) { showToast('No verification to export', 'error'); return; }
+            window.open(API_BASE + '/wing-bill/export?upload_id=' + uploadId, '_blank');
+        }
+
+        // Close any visible modal on Escape key or backdrop click
+        document.addEventListener('keydown', function(e) {
+            if (e.key !== 'Escape') return;
+            document.querySelectorAll('[id$="-modal"]:not(.hidden)').forEach(function(m) {
+                m.classList.add('hidden');
+            });
+        });
+        document.addEventListener('click', function(e) {
+            var t = e.target;
+            if (t.id && t.id.endsWith('-modal') && !t.classList.contains('hidden')) {
+                t.classList.add('hidden');
+            }
+        });
 
         loadGatewayDropdown();
         loadResellers();
