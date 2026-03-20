@@ -13,27 +13,11 @@ _None currently tracked. Add here when something breaks in production._
 
 ## In Progress / Pending Work
 
-### 512-2 Gateway (id=4) — Push URL Change Needed
-- Code deployed: ✅ (sms-ingest path encoding, mdn-rotator /sync-gateway-slots, dashboard Sync Slots button)
-- **Remaining:** Change push URL on the physical 512-2 device:
-  - From: `https://sms-ingest.zalmen-531.workers.dev/s/<secret>`
-  - To: `https://sms-ingest.zalmen-531.workers.dev/s/<secret>/gw/4`
-- Then use dashboard → Gateway tab → select 512-2 → Sync Slots to populate `sims.port` + `sims.gateway_id`
-- Verify with test SMS: check `inbound_sms` row has `sim_id`, `to_number`, `gateway_id` all populated
-
-
-### BLIMEI Sweep — Queue Running
-- 535 SIMs queued via `blimei_update` job type in `mdn-rotation-queue`
-- Each job: OTA refresh → update `sims.imei` to live AT&T BLIMEI → set on gateway
-- Processing at ~4-5 SIMs/min; will complete automatically in background
-- Gateway `54.254.97.139` came back online during this session; heartbeat will finish syncing slots
-- **No action needed** — sweep + heartbeat handle everything automatically
-
-### QuickBooks Integration — Needs Secrets
-- Worker deployed: ✅
-- Tables created: ✅ (`qbo_customer_map`, `qbo_invoices`)
-- Dashboard billing tab: ✅
-- **Remaining:** Set secrets `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET` in the quickbooks worker to enable OAuth flow. Redirect URI already configured: `https://dashboard.zalmen-531.workers.dev/api/qbo/callback`.
+### BLIMEI / IMEI Heartbeat — Both Disabled
+- Both `imei_heartbeat` and `blimei_update` queue handlers in mdn-rotator are disabled (short-circuit added during gateway instability investigation)
+- 0 of 538 active SIMs have graduated; 397 have never been synced; 141 partial (1–2 syncs)
+- Cron still enqueues jobs but they are silently acked without action
+- **Skipped by user** — re-enable when/if needed by removing the two `message.ack(); continue;` short-circuits in mdn-rotator queue handler
 
 ---
 
