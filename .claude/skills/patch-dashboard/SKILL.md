@@ -14,8 +14,9 @@ The dashboard file (`src/dashboard/index.js`) uses **CRLF line endings** and emb
 3. **Patch scripts must use `require()`, not ESM `import`** (they run as CommonJS with `node _fix.js`).
 4. **Inner template literals inside `getHTML()`** must use `\`` and `\${...}`. Never unescaped `` ` `` or `${`.
 5. **Build replacement strings with concatenation (`+`)** when they contain backticks or `${`. Do not use template literals to build those strings.
-6. **Always syntax-check after patching:** `node --input-type=module --check < src/dashboard/index.js`
-7. **Dynamic row buttons** must be wrapped in `\${...}`. A bare `` \`...\` `` not inside `\${...}` closes the outer template.
+6. **CRITICAL escaping rule for backtick/`${` in replacement strings:** In your patch script, to write `\`` (escaped backtick for inside getHTML template) into the file, use `'\\' + '`'` — NOT `'\`'`. The expression `'\`'` is just a plain backtick in JS. Always test: `console.log('\\' + '\`')` should show `\``.
+7. **Always syntax-check after patching — TWO checks required:** (a) outer Worker JS; (b) frontend JS. See Step 4.
+8. **Dynamic row buttons** must be wrapped in `\${...}`. A bare `` \`...\` `` not inside `\${...}` closes the outer template.
 
 ## Your Workflow (follow every step)
 
@@ -67,24 +68,76 @@ content = content.slice(0, start) + newFunctionCode + content.slice(end);
 - Any JS expression: `\${expr}`
 - String variable reference: `\${varName}`
 
+**Correct way to build escaped backtick/`${` in a patch script replacement string:**
+```js
+// To produce \` in the file (escaped backtick for inside getHTML template):
+const BT = '\\' + '`';    // '\\' = one backslash, '`' = backtick → \`
+// To produce \${ in the file (escaped template expression):
+const DS = '\\' + '${';   // \${
+// Then use:
+'fetch(' + BT + DS + 'API_BASE}/endpoint' + BT + ', {'
+// Writes:  fetch(\`\${API_BASE}/endpoint\`, {   ← correct in file
+```
+**WRONG:** `const Q = '\`'` — `'\`'` is just a plain backtick `` ` `` in JavaScript, NOT `\``. This was the root cause of the recurring data-not-loading bug.
+
 ### Step 3 — Run the patch
 ```bash
 node _fix_<feature>.js
 ```
 
-### Step 4 — Syntax check
+### Step 4 — Syntax check (TWO checks — both required)
+
+**Check 1: outer Worker module syntax**
 ```bash
 node --input-type=module --check < src/dashboard/index.js
 ```
-If this fails, the patch broke something. Read the error line number, fix the script, and re-run from Step 2.
 
-### Step 5 — Deploy
+**Check 2: frontend JS inside `<script>` tags**
 ```bash
-cd src/dashboard && npx wrangler deploy
+node _check_frontend_js.js
+```
+(`_check_frontend_js.js` lives at the repo root. If it's missing, create it — see template below.)
+
+**Why two checks?** Check 1 only validates the outer Worker module. Escaping bugs in the frontend JS (e.g. an unescaped `${` or a missing `\`` on a `fetch()` URL) appear as a *string* to Node — the outer module passes but the browser gets broken JS, and `loadData()` never runs. This is the root cause of the recurring "data not loading" bug.
+
+**`_check_frontend_js.js` template (create if missing):**
+```js
+const fs = require('fs');
+const cp = require('child_process');
+const src = fs.readFileSync('src/dashboard/index.js', 'utf8');
+const scriptStart = src.lastIndexOf('<script>');
+const scriptEnd = src.lastIndexOf('</script>');
+if (scriptStart === -1 || scriptEnd === -1) { console.error('script tags not found'); process.exit(1); }
+const browserJs = src.slice(scriptStart + 8, scriptEnd).replace(/\\`/g, '`').replace(/\\\${/g, '${');
+fs.writeFileSync('_frontend_check_tmp.js', browserJs, 'utf8');
+try {
+  cp.execSync('node --input-type=module --check < _frontend_check_tmp.js', { stdio: ['inherit','inherit','inherit'], shell: true });
+  console.log('Frontend JS OK');
+} catch(e) { console.error('Frontend JS has syntax errors!'); process.exit(1); }
+finally { fs.unlinkSync('_frontend_check_tmp.js'); }
 ```
 
+If either check fails, the patch broke something. Read the error line number, fix the script, and re-run from Step 2.
+
+### Step 5 — Deploy
+
+**STOP. Ask yourself before running any deploy command:**
+- Does `agent/current-state.md` say the dashboard redesign or any other change is "test only, not in production"?
+- Are there changes in `src/dashboard/index.js` that were committed or noted as test-only?
+- If YES to either: you MUST use `--env test` or you will deploy test-only changes to prod.
+
+**This project has two dashboard environments:**
+| Command | Deploys to | URL |
+|---|---|---|
+| `cd src/dashboard && npx wrangler deploy --env=""` | **prod** (`dashboard`) | `dashboard.zalmen-531.workers.dev` |
+| `cd src/dashboard && npx wrangler deploy --env test` | **test** (`dashboard-test`) | `dashboard-test.zalmen-531.workers.dev` |
+
+**Rule:** Never run `npx wrangler deploy` without an explicit `--env` flag. Always use `--env=""` for prod or `--env test` for test. The bare `npx wrangler deploy` command (no flag) also hits prod but triggers a confusing multi-env warning — avoid it.
+
+**When in doubt, ask the user which environment before deploying.**
+
 ### Step 6 — Confirm
-After deploy, verify the feature works via dashboard URL: `https://dashboard.zalmen-531.workers.dev`
+After deploy, verify the feature works via the correct dashboard URL.
 
 ### Step 7 — Commit
 ```bash

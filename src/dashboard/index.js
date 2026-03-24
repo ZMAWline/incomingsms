@@ -6867,7 +6867,7 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('helix-bulk-result').classList.add('hidden');
 
             try {
-                const response = await fetch(, {
+                const response = await fetch(\`\${API_BASE}/helix-query\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ mobility_subscription_id: subId })
@@ -6946,7 +6946,7 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('helix-bulk-more').classList.add('hidden');
 
             try {
-                const response = await fetch(, {
+                const response = await fetch(\`\${API_BASE}/helix-query-bulk\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ limit: 100, offset: offset || 0 })
