@@ -86,6 +86,10 @@ export default {
       return handleHelixQuery(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/helix-query-bulk' && request.method === 'POST') {
+      return handleHelixQueryBulk(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/send-test-sms') {
       return handleSendTestSms(request, env, corsHeaders);
     }
@@ -1115,7 +1119,6 @@ async function handleHelixQuery(request, env, corsHeaders) {
       });
     }
 
-    // Get Helix bearer token
     const tokenRes = await fetch(env.HX_TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1137,15 +1140,10 @@ async function handleHelixQuery(request, env, corsHeaders) {
     }
 
     const token = tokenData.access_token;
-
-    // Query subscriber details
-    const detailsUrl = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
+    const detailsUrl = env.HX_API_BASE + '/api/mobility-subscriber/details';
     const detailsRes = await fetch(detailsUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
       body: JSON.stringify({ mobilitySubscriptionId: parseInt(subId) }),
     });
 
@@ -1154,32 +1152,162 @@ async function handleHelixQuery(request, env, corsHeaders) {
     try {
       detailsData = JSON.parse(detailsText);
     } catch {
-      return new Response(JSON.stringify({
-        error: 'Invalid JSON response from Helix',
-        raw: detailsText.slice(0, 500)
-      }), {
+      return new Response(JSON.stringify({ error: 'Invalid JSON from Helix', raw: detailsText.slice(0, 500) }), {
         status: 502,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
     if (!detailsRes.ok) {
-      return new Response(JSON.stringify({
-        error: 'Helix API error',
-        status: detailsRes.status,
-        details: detailsData
-      }), {
+      return new Response(JSON.stringify({ error: 'Helix API error', status: detailsRes.status, details: detailsData }), {
         status: 502,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
-    // Return the full response
-    return new Response(JSON.stringify({
+    const data = Array.isArray(detailsData) ? detailsData[0] : detailsData;
+    let db_update = null;
+    if (data && (data.status === 'CANCELLED' || data.status === 'CANCELED')) {
+      db_update = await syncCancelledSim(env, String(subId), data);
+    }
+
+    return new Response(JSON.stringify({ ok: true, mobility_subscription_id: subId, helix_response: detailsData, db_update }, null, 2), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function syncCancelledSim(env, subId, helixData) {
+  try {
+    const sims = await sbGet(env, 'sims?mobility_subscription_id=eq.' + encodeURIComponent(subId) + '&select=id,iccid,status&limit=1');
+    const sim = Array.isArray(sims) ? sims[0] : null;
+    if (!sim) return { found: false };
+
+    const result = { found: true, iccid: sim.iccid, sim_id: sim.id };
+
+    if (sim.status !== 'canceled') {
+      await sbPatch(env, 'sims?id=eq.' + sim.id, { status: 'canceled' });
+      result.status_updated = true;
+      result.previous_status = sim.status;
+    } else {
+      result.status_already_canceled = true;
+    }
+
+    const hist = await sbGet(env, 'sim_status_history?sim_id=eq.' + sim.id + '&new_status=eq.canceled&limit=1');
+    if (!Array.isArray(hist) || hist.length === 0) {
+      const canceledAt = helixData.canceledAt || helixData.cancelledAt;
+      if (canceledAt) {
+        await sbPost(env, 'sim_status_history', {
+          sim_id: sim.id,
+          old_status: sim.status,
+          new_status: 'canceled',
+          changed_at: new Date(canceledAt).toISOString(),
+        });
+        result.history_inserted = true;
+        result.canceled_at = new Date(canceledAt).toISOString();
+      } else {
+        result.no_cancel_date = true;
+      }
+    } else {
+      result.history_exists = true;
+      result.canceled_at = hist[0].changed_at;
+    }
+
+    return result;
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+async function handleHelixQueryBulk(request, env, corsHeaders) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405 });
+  }
+  try {
+    const body = await request.json().catch(() => ({}));
+    const limit = Math.min(parseInt(body.limit) || 100, 200);
+    const offset = parseInt(body.offset) || 0;
+
+    const simsData = await sbGet(env, 'sims?mobility_subscription_id=not.is.null&status=not.eq.canceled&select=id,iccid,status,mobility_subscription_id&limit=5000');
+    const allSims = Array.isArray(simsData) ? simsData : [];
+    const batch = allSims.slice(offset, offset + limit);
+
+    if (batch.length === 0) {
+      return new Response(JSON.stringify({ ok: true, total_eligible: allSims.length, processed: 0, message: 'No SIMs in this batch' }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const tokenRes = await fetch(env.HX_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'password',
+        client_id: env.HX_CLIENT_ID,
+        audience: env.HX_AUDIENCE,
+        username: env.HX_GRANT_USERNAME,
+        password: env.HX_GRANT_PASSWORD,
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok || !tokenData.access_token) {
+      return new Response(JSON.stringify({ error: 'Failed to get Helix token', details: tokenData }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const token = tokenData.access_token;
+
+    const results = {
       ok: true,
-      mobility_subscription_id: subId,
-      helix_response: detailsData
-    }, null, 2), {
+      total_eligible: allSims.length,
+      processed: batch.length,
+      offset,
+      has_more: offset + batch.length < allSims.length,
+      next_offset: offset + batch.length,
+      cancelled_found: 0,
+      db_updated: 0,
+      already_synced: 0,
+      errors: 0,
+      changed: [],
+    };
+
+    for (const sim of batch) {
+      try {
+        const detailsRes = await fetch(env.HX_API_BASE + '/api/mobility-subscriber/details', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+          body: JSON.stringify({ mobilitySubscriptionId: parseInt(sim.mobility_subscription_id) }),
+        });
+
+        if (!detailsRes.ok) {
+          results.errors++;
+          results.changed.push({ iccid: sim.iccid, error: 'Helix ' + detailsRes.status });
+          continue;
+        }
+
+        const d = await detailsRes.json();
+        const data = Array.isArray(d) ? d[0] : d;
+
+        if (data && (data.status === 'CANCELLED' || data.status === 'CANCELED')) {
+          results.cancelled_found++;
+          const upd = await syncCancelledSim(env, String(sim.mobility_subscription_id), data);
+          if (upd.status_updated) results.db_updated++;
+          else if (upd.status_already_canceled) results.already_synced++;
+          results.changed.push({ iccid: sim.iccid, sub_id: sim.mobility_subscription_id, helix_status: data.status, ...upd });
+        }
+      } catch (e) {
+        results.errors++;
+        results.changed.push({ iccid: sim.iccid, error: String(e) });
+      }
+    }
+
+    return new Response(JSON.stringify(results), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
 
@@ -3631,90 +3759,246 @@ function getHTML() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SMS Gateway Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
+
+        let sidebarOpen = false;
+        function toggleSidebar(open) {
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            if (!sidebar || !overlay) return;
+            if (open) {
+                sidebar.classList.add('sidebar-open');
+                overlay.classList.remove('hidden');
+                setTimeout(() => overlay.classList.add('opacity-100'), 10);
+                document.body.classList.add('overflow-hidden');
+            } else {
+                sidebar.classList.remove('sidebar-open');
+                overlay.classList.remove('opacity-100');
+                setTimeout(() => {
+                    overlay.classList.add('hidden');
+                    document.body.classList.remove('overflow-hidden');
+                }, 300);
+            }
+        }
+
+        let confirmPromiseResolver = null;
+        function showConfirm(title, message) {
+            const modal = document.getElementById('confirm-modal');
+            if (!modal) return Promise.resolve(confirm(message));
+            document.getElementById('confirm-title').textContent = title;
+            document.getElementById('confirm-message').textContent = message;
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            return new Promise((resolve) => {
+                confirmPromiseResolver = resolve;
+            });
+        }
+        function handleConfirm(confirmed) {
+            const modal = document.getElementById('confirm-modal');
+            if (modal) {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            }
+            if (confirmPromiseResolver) {
+                confirmPromiseResolver(confirmed);
+                confirmPromiseResolver = null;
+            }
+        }
+
+        function toggleLightMode() {
+            const isLight = document.documentElement.classList.toggle('light');
+            localStorage.setItem('theme', isLight ? 'light' : 'dark');
+            const sun = document.getElementById('theme-icon-sun');
+            const moon = document.getElementById('theme-icon-moon');
+            if (sun) sun.classList.toggle('hidden', isLight);
+            if (moon) moon.classList.toggle('hidden', !isLight);
+        }
+        (function() {
+            if (localStorage.getItem('theme') === 'light') {
+                document.documentElement.classList.add('light');
+            }
+        })();
+
         tailwind.config = {
             theme: {
                 extend: {
                     colors: {
                         dark: {
-                            900: '#0d1117',
-                            800: '#161b22',
-                            700: '#1c2128',
-                            600: '#252c35',
-                            500: '#2d333b',
+                            950: 'rgb(var(--dark-950) / <alpha-value>)',
+                            900: 'rgb(var(--dark-900) / <alpha-value>)',
+                            800: 'rgb(var(--dark-800) / <alpha-value>)',
+                            700: 'rgb(var(--dark-700) / <alpha-value>)',
+                            600: 'rgb(var(--dark-600) / <alpha-value>)',
+                            500: 'rgb(var(--dark-500) / <alpha-value>)',
+                            400: 'rgb(var(--dark-400) / <alpha-value>)',
+                            300: 'rgb(var(--dark-300) / <alpha-value>)',
+                            200: 'rgb(var(--dark-200) / <alpha-value>)',
+                            100: 'rgb(var(--dark-100) / <alpha-value>)',
                         },
-                        accent: '#22c55e',
+                        accent: {
+                            DEFAULT: '#3b82f6',
+                            hover: '#2563eb',
+                            glow: 'rgba(59, 130, 246, 0.5)'
+                        },
+                        surface: {
+                            DEFAULT: 'rgb(var(--dark-800) / <alpha-value>)',
+                            hover: 'rgb(var(--dark-700) / <alpha-value>)',
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Fira Sans', 'system-ui', 'sans-serif'],
+                        mono: ['Fira Code', 'monospace'],
                     }
                 }
             }
         }
     </script>
     <style>
+        :root {
+            --dark-950: 5 5 7;
+            --dark-900: 9 9 11;
+            --dark-800: 24 24 27;
+            --dark-700: 39 39 42;
+            --dark-600: 63 63 70;
+            --dark-500: 82 82 91;
+            --dark-400: 161 161 170;
+            --dark-300: 212 212 216;
+            --dark-200: 228 228 231;
+            --dark-100: 244 244 245;
+        }
+        html.light {
+            --dark-950: 255 255 255;
+            --dark-900: 248 250 252;
+            --dark-800: 241 245 249;
+            --dark-700: 226 232 240;
+            --dark-600: 203 213 225;
+            --dark-500: 100 116 139;
+            --dark-400: 71 85 105;
+            --dark-300: 51 65 85;
+            --dark-200: 30 41 59;
+            --dark-100: 15 23 42;
+        }
+        html.light .text-white { color: rgb(var(--dark-100)) !important; }
+        html.light .sidebar-btn.text-white { color: #3b82f6 !important; background-color: rgba(59,130,246,0.1) !important; border-left-color: #3b82f6 !important; }
+        html.light ::-webkit-scrollbar-track { background: rgb(var(--dark-800)); }
+        html.light ::-webkit-scrollbar-thumb { background: rgb(var(--dark-600)); border-radius: 3px; }
+        /* text-gray-* classes are Tailwind built-ins that don't adapt — override for light mode */
+        html.light .text-gray-200 { color: rgb(30 41 59) !important; }
+        html.light .text-gray-300 { color: rgb(51 65 85) !important; }
+        html.light .text-gray-400 { color: rgb(71 85 105) !important; }
+        html.light .text-gray-500 { color: rgb(100 116 139) !important; }
+        html.light .text-gray-600 { color: rgb(71 85 105) !important; }
+        * { font-family: 'Inter', system-ui, sans-serif; }
         .progress-ring { transform: rotate(-90deg); }
         .progress-ring__circle { transition: stroke-dashoffset 0.5s ease; }
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: #161b22; }
-        ::-webkit-scrollbar-thumb { background: #2d333b; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #3d444d; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #111118; }
+        ::-webkit-scrollbar-thumb { background: #2a2a35; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #3a3a48; }
+        .sidebar-btn { transition: color 0.15s, background-color 0.15s; }
+        .sidebar-btn.text-white { color: #3b82f6 !important; background-color: rgba(59,130,246,0.1) !important; border-left-color: #3b82f6 !important; }
+        .sidebar-btn:focus-visible { outline: 2px solid #3b82f6; outline-offset: 2px; }
+        @media (max-width: 1024px) {
+            .sidebar-open { transform: translateX(0) !important; }
+            .sidebar-overlay-active { display: block !important; }
+        }
     </style>
 </head>
-<body class="bg-dark-900 text-gray-100">
-    <div class="flex min-h-screen">
+<body class="bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-dark-800 via-dark-900 to-dark-900 text-dark-100 min-h-screen selection:bg-accent/30 tracking-wide overflow-x-hidden">
+    <!-- Mobile Sidebar Overlay -->
+    <div id="sidebar-overlay" onclick="toggleSidebar(false)" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 hidden transition-opacity duration-300"></div>
+
+    <div class="flex min-h-screen relative">
         <!-- Sidebar -->
-        <aside class="w-16 bg-dark-800 flex flex-col items-center py-4 border-r border-dark-600">
-            <div class="w-10 h-10 bg-accent rounded-lg flex items-center justify-center mb-8">
-                <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path>
-                </svg>
+        <aside id="sidebar" class="fixed inset-y-0 left-0 w-72 bg-dark-950/80 flex flex-col py-6 border-r border-white/5 z-50 backdrop-blur-2xl transition-transform duration-300 -translate-x-full lg:translate-x-0 lg:static lg:w-64">
+            <div class="flex items-center gap-3 px-6 mb-10">
+                <div class="w-9 h-9 bg-accent rounded-lg flex items-center justify-center flex-shrink-0">
+                    <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                </div>
+                <div>
+                    <p class="text-sm font-semibold text-white leading-tight">SMS</p>
+                    <p class="text-xs text-dark-500 leading-tight">Gateway</p>
+                </div>
             </div>
-            <nav class="flex flex-col gap-4">
-                <a href="/" onclick="event.preventDefault();switchTab('dashboard')" data-tab="dashboard" class="sidebar-btn active w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Dashboard">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"></path></svg>
+            <nav class="flex flex-col gap-1 px-2">
+                <a href="/" onclick="event.preventDefault();switchTab('dashboard')" data-tab="dashboard" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Dashboard">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"></path></svg>
+                    <span class="text-sm">Dashboard</span>
                 </a>
-                <a href="/sims" onclick="event.preventDefault();switchTab('sims')" data-tab="sims" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="SIMs">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
+                <a href="/sims" onclick="event.preventDefault();switchTab('sims')" data-tab="sims" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="SIMs">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
+                    <span class="text-sm">SIMs</span>
                 </a>
-                <a href="/messages" onclick="event.preventDefault();switchTab('messages')" data-tab="messages" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Messages">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                <a href="/messages" onclick="event.preventDefault();switchTab('messages')" data-tab="messages" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Messages">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                    <span class="text-sm">Messages</span>
                 </a>
-                <a href="/workers" onclick="event.preventDefault();switchTab('workers')" data-tab="workers" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Workers">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                <a href="/workers" onclick="event.preventDefault();switchTab('workers')" data-tab="workers" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Workers">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                    <span class="text-sm">Workers</span>
                 </a>
-                <a href="/gateway" onclick="event.preventDefault();switchTab('gateway')" data-tab="gateway" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Gateway">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                <a href="/gateway" onclick="event.preventDefault();switchTab('gateway')" data-tab="gateway" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Gateway">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                    <span class="text-sm">Gateway</span>
                 </a>
-                <a href="/imei-pool" onclick="event.preventDefault();switchTab('imei-pool')" data-tab="imei-pool" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="IMEI Pool">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                <a href="/imei-pool" onclick="event.preventDefault();switchTab('imei-pool')" data-tab="imei-pool" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="IMEI Pool">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                    <span class="text-sm">IMEI Pool</span>
                 </a>
-                <a href="/errors" onclick="event.preventDefault();switchTab('errors')" data-tab="errors" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition relative" title="Errors">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
-                    <span id="error-badge" class="hidden absolute -top-1 -right-1 w-4 h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center">0</span>
+                <a href="/errors" onclick="event.preventDefault();switchTab('errors')" data-tab="errors" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Errors">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
+                    <span class="text-sm">Errors</span>
+                    <span id="error-badge" class="hidden ml-auto min-w-[16px] h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center px-1">0</span>
                 </a>
-                <a href="/billing" onclick="event.preventDefault();switchTab('billing')" data-tab="billing" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Billing">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                <a href="/billing" onclick="event.preventDefault();switchTab('billing')" data-tab="billing" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Billing">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    <span class="text-sm">Billing</span>
                 </a>
-                <a href="/guide" onclick="event.preventDefault();switchTab('guide')" data-tab="guide" class="sidebar-btn w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-dark-600 transition" title="Guide">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
+                <a href="/guide" onclick="event.preventDefault();switchTab('guide')" data-tab="guide" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Guide">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
+                    <span class="text-sm">Guide</span>
                 </a>
             </nav>
-            <div class="mt-auto">
-                <button onclick="loadData()" class="w-10 h-10 rounded-lg flex items-center justify-center text-gray-400 hover:text-accent hover:bg-dark-600 transition" title="Refresh">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+            <div class="mt-auto px-2">
+                <button onclick="loadData()" class="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-dark-400 hover:text-accent hover:bg-dark-600 transition" title="Refresh">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                    <span class="text-sm">Refresh</span>
                 </button>
             </div>
         </aside>
 
         <!-- Main Content -->
-        <main class="flex-1 p-6 overflow-auto">
+        <main class="flex-1 w-full min-w-0 overflow-auto">
+            <!-- Mobile Top Header -->
+            <div class="lg:hidden flex items-center justify-between p-4 bg-dark-950/50 border-b border-white/5 backdrop-blur-md sticky top-0 z-30">
+                <div class="flex items-center gap-3">
+                    <div class="w-8 h-8 bg-accent rounded flex items-center justify-center">
+                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                    </div>
+                    <span class="font-bold text-white tracking-tight">SMS Gateway</span>
+                </div>
+                <button onclick="toggleSidebar(true)" class="p-2 text-dark-400 hover:text-white transition">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+                </button>
+            </div>
+
+            <div class="p-4 lg:p-8">
             <!-- Header -->
-            <header class="flex items-center justify-between mb-6">
+            <header class="flex flex-col md:flex-row md:items-center justify-between mb-8 pb-4 border-b border-white/5 gap-4">
                 <div>
-                    <h1 class="text-2xl font-bold text-white">SMS Gateway</h1>
-                    <p class="text-sm text-gray-400">Monitor SIMs, messages, and system status</p>
+                    <h1 class="text-3xl font-bold text-white tracking-tight">SMS Gateway</h1>
+                    <p class="text-sm text-dark-400 mt-1 font-medium">Monitor SIMs, messages, and system status</p>
                 </div>
                 <div class="flex items-center gap-4">
-                    <span id="last-updated" class="text-xs text-gray-500"></span>
+                    <button id="theme-toggle" onclick="toggleLightMode()" class="p-1.5 rounded-lg text-dark-400 hover:text-dark-100 hover:bg-dark-700/50 transition" title="Toggle light mode">
+                        <svg id="theme-icon-sun" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707M17.657 17.657l-.707-.707M6.343 6.343l-.707-.707M12 8a4 4 0 100 8 4 4 0 000-8z"/></svg>
+                        <svg id="theme-icon-moon" class="w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
+                    </button>
+                    <span id="last-updated" class="text-xs text-dark-500"></span>
                     <div class="w-2 h-2 bg-accent rounded-full animate-pulse" title="Connected"></div>
                 </div>
             </header>
@@ -5234,6 +5518,7 @@ function getHTML() {
 
             </div>
 
+            </div>
         </main>
     </div>
 
@@ -5357,20 +5642,38 @@ function getHTML() {
     <!-- Helix Query Modal -->
     <div id="helix-query-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
         <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl">
-            <div class="px-5 py-4 border-b border-dark-600">
+            <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
                 <h3 class="text-lg font-semibold text-white">Query Helix Subscriber</h3>
+                <button onclick="hideHelixQueryModal()" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
             </div>
             <div class="p-5">
                 <p class="text-sm text-gray-400 mb-3">Enter a Mobility Subscription ID:</p>
                 <input type="text" id="helix-subid-input" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="e.g. 40033"/>
                 <div id="helix-query-result" class="mt-4 hidden">
+                    <div id="helix-db-update-banner" class="hidden mb-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+                        <p class="text-xs font-semibold text-yellow-400 mb-1">&#x26A0; DB Auto-Synced — Line marked Cancelled</p>
+                        <pre id="helix-db-update-output" class="text-xs font-mono text-yellow-300 whitespace-pre-wrap"></pre>
+                    </div>
                     <h4 class="text-sm font-medium text-gray-400 mb-2">Result:</h4>
                     <pre id="helix-query-output" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-80 overflow-y-auto text-gray-300 border border-dark-600"></pre>
                 </div>
+                <div id="helix-bulk-result" class="mt-4 hidden">
+                    <div id="helix-bulk-summary" class="grid grid-cols-4 gap-2 mb-3"></div>
+                    <div id="helix-bulk-changed" class="hidden">
+                        <h4 class="text-sm font-medium text-gray-400 mb-2">Cancelled / Errors:</h4>
+                        <pre id="helix-bulk-changed-output" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto max-h-64 overflow-y-auto text-gray-300 border border-dark-600"></pre>
+                    </div>
+                    <div id="helix-bulk-more" class="hidden mt-3 flex justify-end">
+                        <button id="helix-bulk-next-btn" onclick="queryHelixBulkNext()" class="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Run Next Batch</button>
+                    </div>
+                </div>
             </div>
-            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
-                <button onclick="hideHelixQueryModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
-                <button onclick="queryHelix()" id="helix-query-btn" class="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Query</button>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-between items-center">
+                <button onclick="queryHelixBulk()" id="helix-bulk-btn" class="px-4 py-2 text-sm bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Bulk Query All SIMs</button>
+                <div class="flex gap-3">
+                    <button onclick="hideHelixQueryModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Close</button>
+                    <button onclick="queryHelix()" id="helix-query-btn" class="px-4 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Query</button>
+                </div>
             </div>
         </div>
     </div>
@@ -5714,21 +6017,20 @@ function getHTML() {
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
 
         function switchTab(tabName, push = true) {
+            toggleSidebar(false);
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
             document.querySelectorAll('.sidebar-btn').forEach(el => {
-                el.classList.remove('bg-dark-600', 'text-white');
-                el.classList.add('text-gray-400');
+                el.classList.remove('text-white');
+                el.classList.add('text-dark-400');
             });
             const tabEl = document.getElementById(\`tab-\${tabName}\`);
             if (!tabEl) return;
             tabEl.classList.remove('hidden');
             // Highlight the correct sidebar button
-            const btns = document.querySelectorAll('.sidebar-btn');
-            const tabNames = Object.keys(TAB_ROUTES);
-            tabNames.forEach((name, i) => {
-                if (name === tabName && btns[i]) {
-                    btns[i].classList.add('bg-dark-600', 'text-white');
-                    btns[i].classList.remove('text-gray-400');
+            document.querySelectorAll('.sidebar-btn').forEach(b => {
+                if (b.getAttribute('data-tab') === tabName) {
+                    b.classList.add('text-white');
+                    b.classList.remove('text-dark-400');
                 }
             });
             if (push && TAB_ROUTES[tabName]) {
@@ -6026,7 +6328,7 @@ function renderSims() {
 
 
 async function sendSimOnline(simId, phoneNumber) {
-  if (!confirm(\`Send number.online webhook for \${phoneNumber}?\`)) {
+  if (!(await showConfirm('Send Webhook', \`Send number.online webhook for \${phoneNumber}?\`))) {
                 return;
             }
             showToast(\`Sending online webhook for \${phoneNumber}...\`, 'info');
@@ -6145,7 +6447,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
 
-            if (!confirm(\`Rotate \${iccids.length} SIM(s)? This will assign new phone numbers immediately.\`)) {
+            if (!(await showConfirm('Rotate SIMs', \`Rotate \${iccids.length} SIM(s)? This will assign new phone numbers immediately.\`))) {
                 return;
             }
 
@@ -6225,7 +6527,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function runWorker(workerName) {
-            if (!confirm(\`Run \${workerName}?\`)) {
+            if (!(await showConfirm('Run Worker', \`Run \${workerName}?\`))) {
                 return;
             }
             showToast(\`Running \${workerName}...\`, 'info');
@@ -6317,7 +6619,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
 
-            if (!confirm(\`Are you sure you want to activate \${sims.length} SIM(s)? This will call the Helix API.\`)) {
+            if (!(await showConfirm('Activate SIMs', \`Are you sure you want to activate \${sims.length} SIM(s)? This will call the Helix API.\`))) {
                 return;
             }
 
@@ -6362,7 +6664,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
 
-            if (!confirm(\`Are you sure you want to cancel \${iccids.length} SIM(s)? This action cannot be undone.\`)) {
+            if (!(await showConfirm('Cancel SIMs', \`Are you sure you want to cancel \${iccids.length} SIM(s)? This action cannot be undone.\`))) {
                 return;
             }
 
@@ -6428,7 +6730,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
 
-            if (!confirm(\`Are you sure you want to suspend \${simIds.length} SIM(s)?\`)) {
+            if (!(await showConfirm('Suspend SIMs', \`Are you sure you want to suspend \${simIds.length} SIM(s)?\`))) {
                 return;
             }
 
@@ -6493,7 +6795,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
 
-            if (!confirm(\`Are you sure you want to restore \${simIds.length} SIM(s)?\`)) {
+            if (!(await showConfirm('Restore SIMs', \`Are you sure you want to restore \${simIds.length} SIM(s)?\`))) {
                 return;
             }
 
@@ -6532,6 +6834,7 @@ async function sendSimOnline(simId, phoneNumber) {
         function showHelixQueryModal() {
             document.getElementById('helix-query-modal').classList.remove('hidden');
             document.getElementById('helix-query-result').classList.add('hidden');
+            document.getElementById('helix-bulk-result').classList.add('hidden');
             document.getElementById('helix-subid-input').value = '';
             document.getElementById('helix-subid-input').focus();
         }
@@ -6539,6 +6842,7 @@ async function sendSimOnline(simId, phoneNumber) {
         function queryHelixSubId(subId) {
             document.getElementById('helix-query-modal').classList.remove('hidden');
             document.getElementById('helix-query-result').classList.add('hidden');
+            document.getElementById('helix-bulk-result').classList.add('hidden');
             document.getElementById('helix-subid-input').value = subId;
             queryHelix();
         }
@@ -6547,6 +6851,7 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('helix-query-modal').classList.add('hidden');
             document.getElementById('helix-subid-input').value = '';
             document.getElementById('helix-query-result').classList.add('hidden');
+            document.getElementById('helix-bulk-result').classList.add('hidden');
         }
 
         async function queryHelix() {
@@ -6559,9 +6864,10 @@ async function sendSimOnline(simId, phoneNumber) {
             const btn = document.getElementById('helix-query-btn');
             btn.disabled = true;
             btn.textContent = 'Querying...';
+            document.getElementById('helix-bulk-result').classList.add('hidden');
 
             try {
-                const response = await fetch(\`\${API_BASE}/helix-query\`, {
+                const response = await fetch(, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ mobility_subscription_id: subId })
@@ -6570,21 +6876,47 @@ async function sendSimOnline(simId, phoneNumber) {
                 const result = await response.json();
                 const outputEl = document.getElementById('helix-query-output');
                 const resultDiv = document.getElementById('helix-query-result');
+                const dbBanner = document.getElementById('helix-db-update-banner');
+                const dbOutput = document.getElementById('helix-db-update-output');
+
+                dbBanner.classList.add('hidden');
 
                 if (response.ok && result.ok) {
                     const data = Array.isArray(result.helix_response) ? result.helix_response[0] : result.helix_response;
                     let formatted = '';
                     if (data) {
-                        formatted = \`<span class="text-blue-400 font-bold">status:</span> <span class="\${data.status === 'ACTIVE' ? 'text-accent' : 'text-red-400'} font-bold">\${data.status || 'N/A'}</span>\\n\`;
+                        const isCancelled = data.status === 'CANCELLED' || data.status === 'CANCELED';
+                        formatted = \`<span class="text-blue-400 font-bold">status:</span> <span class="\${data.status === 'ACTIVE' ? 'text-accent' : isCancelled ? 'text-red-400' : 'text-orange-400'} font-bold">\${data.status || 'N/A'}</span>\n\`;
                         if (data.statusReason) {
-                            formatted += \`<span class="text-blue-400 font-bold">statusReason:</span> <span class="text-orange-400 font-bold">\${data.statusReason}</span>\\n\`;
+                            formatted += \`<span class="text-blue-400 font-bold">statusReason:</span> <span class="text-orange-400 font-bold">\${data.statusReason}</span>\n\`;
                         }
-                        formatted += \`\\n<span class="text-gray-500">--- Full Response ---</span>\\n\`;
+                        if (data.canceledAt || data.cancelledAt) {
+                            formatted += \`<span class="text-blue-400 font-bold">canceledAt:</span> <span class="text-red-300">\${data.canceledAt || data.cancelledAt}</span>\n\`;
+                        }
+                        formatted += \`\n<span class="text-gray-500">--- Full Response ---</span>\n\`;
                         formatted += JSON.stringify(data, null, 2);
                     } else {
                         formatted = JSON.stringify(result.helix_response, null, 2);
                     }
                     outputEl.innerHTML = formatted;
+
+                    if (result.db_update) {
+                        const u = result.db_update;
+                        const dbLines = [];
+                        if (!u.found) dbLines.push('SIM not found in DB for this sub ID');
+                        else {
+                            dbLines.push(\`ICCID: \${u.iccid}\`);
+                            if (u.status_updated) dbLines.push(\`Status: \${u.previous_status} → canceled\`);
+                            else if (u.status_already_canceled) dbLines.push('Status: already canceled in DB');
+                            if (u.history_inserted) dbLines.push(\`Cancel date recorded: \${u.canceled_at}\`);
+                            else if (u.history_exists) dbLines.push(\`Cancel date already in history: \${u.canceled_at}\`);
+                            else if (u.no_cancel_date) dbLines.push('No canceledAt in Helix response — history not inserted');
+                            if (u.error) dbLines.push(\`Error: \${u.error}\`);
+                        }
+                        dbOutput.textContent = dbLines.join('\n');
+                        dbBanner.classList.remove('hidden');
+                    }
+
                     resultDiv.classList.remove('hidden');
                 } else {
                     outputEl.innerHTML = \`<span class="text-red-400">Error:</span> \${JSON.stringify(result, null, 2)}\`;
@@ -6599,6 +6931,78 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
+        let _bulkNextOffset = 0;
+
+        async function queryHelixBulk(offset) {
+            const btn = document.getElementById('helix-bulk-btn');
+            const nextBtn = document.getElementById('helix-bulk-next-btn');
+            btn.disabled = true;
+            btn.textContent = 'Running...';
+            if (nextBtn) nextBtn.disabled = true;
+            document.getElementById('helix-query-result').classList.add('hidden');
+            document.getElementById('helix-bulk-result').classList.remove('hidden');
+            document.getElementById('helix-bulk-summary').innerHTML = '<div class="col-span-4 text-sm text-gray-400 py-2">Querying Helix… this may take up to 30 seconds.</div>';
+            document.getElementById('helix-bulk-changed').classList.add('hidden');
+            document.getElementById('helix-bulk-more').classList.add('hidden');
+
+            try {
+                const response = await fetch(, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ limit: 100, offset: offset || 0 })
+                });
+                const result = await response.json();
+
+                if (!response.ok || result.error) {
+                    document.getElementById('helix-bulk-summary').innerHTML =
+                        \`<div class="col-span-4 text-sm text-red-400">Error: \${result.error || 'Unknown error'}</div>\`;
+                    return;
+                }
+
+                _bulkNextOffset = result.next_offset || 0;
+
+                const stats = [
+                    { label: 'Queried', value: result.processed, color: 'text-white' },
+                    { label: 'Cancelled Found', value: result.cancelled_found, color: result.cancelled_found > 0 ? 'text-red-400' : 'text-gray-400' },
+                    { label: 'DB Updated', value: result.db_updated, color: result.db_updated > 0 ? 'text-yellow-400' : 'text-gray-400' },
+                    { label: 'Errors', value: result.errors, color: result.errors > 0 ? 'text-orange-400' : 'text-gray-400' },
+                ];
+                document.getElementById('helix-bulk-summary').innerHTML = stats.map(s =>
+                    \`<div class="bg-dark-900 rounded-lg p-3 text-center border border-dark-600"><div class="text-xl font-bold \${s.color}">\${s.value}</div><div class="text-xs text-gray-500 mt-1">\${s.label}</div></div>\`
+                ).join('');
+
+                if (result.changed && result.changed.length > 0) {
+                    document.getElementById('helix-bulk-changed-output').textContent = JSON.stringify(result.changed, null, 2);
+                    document.getElementById('helix-bulk-changed').classList.remove('hidden');
+                }
+
+                if (result.has_more) {
+                    const moreEl = document.getElementById('helix-bulk-more');
+                    moreEl.classList.remove('hidden');
+                    moreEl.querySelector('button').textContent =
+                        \`Run Next Batch (\${result.next_offset}–\${Math.min(result.next_offset + 100, result.total_eligible)} of \${result.total_eligible})\`;
+                }
+
+                if (result.cancelled_found > 0) {
+                    showToast(\`\${result.cancelled_found} cancelled line\${result.cancelled_found > 1 ? 's' : ''} found — \${result.db_updated} DB updated\`, 'warning');
+                } else {
+                    showToast(\`Bulk query done — \${result.processed} SIMs checked, none cancelled\`, 'success');
+                }
+
+            } catch (error) {
+                document.getElementById('helix-bulk-summary').innerHTML =
+                    \`<div class="col-span-4 text-sm text-red-400">Error: \${error.message}</div>\`;
+                console.error(error);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Bulk Query All SIMs';
+                if (nextBtn) nextBtn.disabled = false;
+            }
+        }
+
+        function queryHelixBulkNext() {
+            queryHelixBulk(_bulkNextOffset);
+        }
         async function showTestSmsModal() {
             document.getElementById('test-sms-modal').classList.remove('hidden');
             document.getElementById('test-sms-result').classList.add('hidden');
@@ -6868,7 +7272,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const gatewayId = getSelectedGatewayId();
             if (!gatewayId) { showToast('No gateway selected', 'error'); return; }
             const label = action === 'switch' ? 'Switch SIM on' : (action.charAt(0).toUpperCase() + action.slice(1));
-            if (!confirm(label + ' slot ' + port + '?')) return;
+            if (!(await showConfirm('Gateway Action', label + ' slot ' + port + '?'))) return;
             showToast(label + ' ' + port + '...', 'info');
             try {
                 const endpoint = action === 'switch' ? 'switch-sim' : action;
@@ -6980,7 +7384,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const imei = document.getElementById('gw-imei-value').value.trim();
             if (!port || !imei) { showToast('Enter port and IMEI', 'error'); return; }
             if (imei.length !== 15) { showToast('IMEI must be 15 digits', 'error'); return; }
-            if (!confirm(\`Set IMEI \${imei} on port \${port}?\`)) return;
+            if (!(await showConfirm('Set IMEI', \`Set IMEI \${imei} on port \${port}?\`))) return;
 
             const btn = document.getElementById('gw-set-imei-btn');
             btn.disabled = true; btn.textContent = 'Setting...';
@@ -7018,7 +7422,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const gatewayId = getSelectedGatewayId();
             const port = document.getElementById('gw-command-port').value.trim();
             if (!port) { showToast('Enter a port', 'error'); return; }
-            if (!confirm(\`\${gwCurrentCommand} port \${port}?\`)) return;
+            if (!(await showConfirm('Port Command', \`\${gwCurrentCommand} port \${port}?\`))) return;
 
             const btn = document.getElementById('gw-command-btn');
             btn.disabled = true; btn.textContent = 'Running...';
@@ -7063,7 +7467,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const simIds = input.split('\\n').map(l => l.trim()).filter(Boolean).map(id => parseInt(id)).filter(id => !isNaN(id));
             if (simIds.length === 0) { showToast('No valid SIM IDs found', 'error'); return; }
 
-            if (!confirm(\`Fix \${simIds.length} SIM(s)? This will change IMEI and run OTA/Cancel/Resume.\`)) return;
+            if (!(await showConfirm('Fix SIMs', \`Fix \${simIds.length} SIM(s)? This will change IMEI and run OTA/Cancel/Resume.\`))) return;
 
             const btn = document.getElementById('fix-sim-btn');
             btn.disabled = true;
@@ -7146,7 +7550,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function retireImei(id) {
-            if (!confirm('Retire this IMEI? It will no longer be available for allocation.')) return;
+            if (!(await showConfirm('Retire IMEI', 'Retire this IMEI? It will no longer be available for allocation.'))) return;
 
             try {
                 const response = await fetch(\`\${API_BASE}/imei-pool\`, {
@@ -7489,7 +7893,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function resolveError(errorId) {
-            if (!confirm('Mark this error as resolved?')) return;
+            if (!(await showConfirm('Resolve Error', 'Mark this error as resolved?'))) return;
             try {
                 const ids = typeof errorId === 'string' && errorId.startsWith('sim_') ? [errorId] : [parseInt(errorId)];
                 const resp = await fetch(\`\${API_BASE}/resolve-error\`, {
@@ -7516,7 +7920,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 return val.startsWith('sim_') ? val : parseInt(val);
             });
             if (ids.length === 0) return;
-            if (!confirm(\`Mark \${ids.length} error(s) as resolved?\`)) return;
+            if (!(await showConfirm('Resolve Errors', \`Mark \${ids.length} error(s) as resolved?\`))) return;
             try {
                 const resp = await fetch(\`\${API_BASE}/resolve-error\`, {
                     method: 'POST',
@@ -7712,7 +8116,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function simAction(simId, action, skipConfirm = false) {
-            if (!skipConfirm && !confirm(\`Run \${action} on SIM #\${simId}?\`)) return;
+            if (!skipConfirm && !(await showConfirm('Run Action', \`Run \${action} on SIM #\${simId}?\`))) return;
 
             const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
             currentSimActionId = simId;
@@ -7979,7 +8383,7 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkSimAction(action) {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            if (!confirm(\`Run \${action} on \${simIds.length} SIM(s)?\`)) return;
+            if (!(await showConfirm('Run Action', \`Run \${action} on \${simIds.length} SIM(s)?\`))) return;
             for (const id of simIds) {
                 await simAction(id, action, true);
             }
@@ -7989,7 +8393,7 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkResetToProvisioning() {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            if (!confirm(\`Reset \${simIds.length} SIM(s) to provisioning? The details-finalizer cron will re-process and correct ICCID mappings.\`)) return;
+            if (!(await showConfirm('Reset SIMs', \`Reset \${simIds.length} SIM(s) to provisioning? The details-finalizer cron will re-process and correct ICCID mappings.\`))) return;
             try {
                 const resp = await fetch(API_BASE + '/reset-to-provisioning', {
                     method: 'POST',
@@ -7998,20 +8402,20 @@ async function sendSimOnline(simId, phoneNumber) {
                 });
                 const data = await resp.json();
                 if (data.ok) {
-                    alert(\`Reset \${data.reset} SIM(s) to provisioning. The details-finalizer cron will re-process them shortly.\`);
+                    showToast(\`Reset \${data.reset} SIM(s) to provisioning. Cron will re-process shortly.\`, 'success');
                     loadSims(true);
                 } else {
-                    alert('Error: ' + (data.error || 'Unknown error'));
+                    showToast('Error: ' + (data.error || 'Unknown error'), 'error');
                 }
             } catch (e) {
-                alert('Error: ' + e.message);
+                showToast('Error: ' + e.message, 'error');
             }
         }
 
         function showBulkSendSmsModal() {
             const selectedIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (selectedIds.length === 0) {
-                alert('Select at least one SIM first');
+                showToast('Select at least one SIM first', 'error');
                 return;
             }
             document.getElementById('bulk-sms-count').textContent = selectedIds.length;
@@ -8025,9 +8429,9 @@ async function sendSimOnline(simId, phoneNumber) {
 
         async function runBulkSendSms() {
             const selectedIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
-            if (selectedIds.length === 0) { alert('No SIMs selected'); return; }
+            if (selectedIds.length === 0) { showToast('No SIMs selected', 'error'); return; }
             const message = document.getElementById('bulk-sms-message').value.trim();
-            if (!message) { alert('Please enter a message'); return; }
+            if (!message) { showToast('Please enter a message', 'error'); return; }
             const sendBtn = document.getElementById('bulk-sms-send-btn');
             sendBtn.disabled = true;
             sendBtn.textContent = 'Sending...';
@@ -8090,7 +8494,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 showToast('No eligible SIMs selected (must be active with phone and reseller)', 'error');
                 return;
             }
-            if (!confirm('Send number.online webhook for ' + eligible.length + ' SIM(s)?')) return;
+            if (!(await showConfirm('Send Webhooks', 'Send number.online webhook for ' + eligible.length + ' SIM(s)?'))) return;
             let ok = 0, fail = 0;
             for (const sim of eligible) {
                 try {
@@ -8107,7 +8511,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function unassignReseller(simId) {
-            if (!confirm('Unassign this SIM from its reseller? This stops webhooks and billing for this line.')) return;
+            if (!(await showConfirm('Unassign SIM', 'Unassign this SIM from its reseller? This stops webhooks and billing for this line.'))) return;
             try {
                 const resp = await fetch(API_BASE + '/unassign-reseller', {
                     method: 'POST',
@@ -8402,9 +8806,9 @@ async function sendSimOnline(simId, phoneNumber) {
                 let manualImei = null;
                 if (!isAuto) {
                     manualImei = imeiInput.value.trim();
-                    if (!/^\d{15}$/.test(manualImei)) { alert('Enter a valid 15-digit IMEI'); return; }
+                    if (!/^\d{15}$/.test(manualImei)) { showToast('Enter a valid 15-digit IMEI', 'error'); return; }
                 }
-                if (!confirm((isAuto ? 'Auto-assign new IMEI from pool' : 'Change IMEI to ' + manualImei) + ' for ' + simIds.length + ' SIM(s)?')) return;
+                if (!(await showConfirm('Change IMEI', (isAuto ? 'Auto-assign new IMEI from pool' : 'Change IMEI to ' + manualImei) + ' for ' + simIds.length + ' SIM(s)?'))) return;
                 modal.remove();
                 let ok = 0, fail = 0;
                 for (const simId of simIds) {
@@ -8438,7 +8842,7 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkUnassignReseller() {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            if (!confirm('Unassign ' + simIds.length + ' SIM(s) from their resellers? This stops webhooks and billing.')) return;
+            if (!(await showConfirm('Unassign SIMs', 'Unassign ' + simIds.length + ' SIM(s) from their resellers? This stops webhooks and billing.'))) return;
             try {
                 const resp = await fetch(API_BASE + '/unassign-reseller', {
                     method: 'POST',
@@ -8460,7 +8864,7 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkErrorAction(action) {
             const simIds = [...document.querySelectorAll('.error-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            if (!confirm(\`Run \${action} on \${simIds.length} SIM(s)?\`)) return;
+            if (!(await showConfirm('Run Action', \`Run \${action} on \${simIds.length} SIM(s)?\`))) return;
             for (const id of simIds) {
                 await simAction(id, action, true);
             }
@@ -8583,7 +8987,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
         async function fixIncompatibleImei() {
             const ctx = window._imeiEligibilityContext;
-            if (!ctx || !ctx.imei || !ctx.gatewayId || !ctx.port) { alert('Missing context for fix'); return; }
+            if (!ctx || !ctx.imei || !ctx.gatewayId || !ctx.port) { showToast('Missing context for fix', 'error'); return; }
             const fixBtn = document.querySelector('#imei-eligibility-fix-btn button');
             if (fixBtn) { fixBtn.disabled = true; fixBtn.textContent = 'Fixing...'; }
             try {
@@ -8602,7 +9006,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     el.innerHTML += '<div class="mt-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg"><p class="text-red-400 text-sm">Fix failed: ' + (data.error || 'Unknown error') + '</p></div>';
                 }
             } catch (err) {
-                alert('Fix error: ' + err);
+                showToast('Fix error: ' + err, 'error');
             } finally {
                 if (fixBtn) { fixBtn.disabled = false; fixBtn.textContent = 'Fix (Replace with Pool IMEI)'; }
             }
@@ -8618,7 +9022,7 @@ async function sendSimOnline(simId, phoneNumber) {
         async function runBulkImeiCheck() {
             const raw = document.getElementById('check-imeis-input').value.trim();
             const imeis = raw.split(/\\n/).map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
-            if (imeis.length === 0) { alert('Enter at least one IMEI'); return; }
+            if (imeis.length === 0) { showToast('Enter at least one IMEI', 'error'); return; }
             const btn = document.getElementById('check-imeis-run-btn');
             btn.disabled = true; btn.textContent = 'Checking...';
             try {
@@ -8642,7 +9046,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
                 document.getElementById('check-imeis-result').classList.remove('hidden');
             } catch (err) {
-                alert('Check error: ' + err);
+                showToast('Check error: ' + err, 'error');
             } finally {
                 btn.disabled = false; btn.textContent = 'Run Check';
             }
@@ -8683,14 +9087,14 @@ async function sendSimOnline(simId, phoneNumber) {
 
         async function confirmChangeImei(autoImei) {
             const ctx = window._changeImeiContext;
-            if (!ctx) { alert('No SIM context'); return; }
+            if (!ctx) { showToast('No SIM context', 'error'); return; }
             let newImei = null;
             if (!autoImei) {
                 newImei = document.getElementById('change-imei-input').value.trim();
-                if (!/^\d{15}$/.test(newImei)) { alert('Enter a valid 15-digit IMEI or use Auto'); return; }
-                if (!confirm('Change IMEI for SIM ' + ctx.simId + ' to ' + newImei + '?')) return;
+                if (!/^\d{15}$/.test(newImei)) { showToast('Enter a valid 15-digit IMEI or use Auto', 'error'); return; }
+                if (!(await showConfirm('Change IMEI', 'Change IMEI for SIM ' + ctx.simId + ' to ' + newImei + '?'))) return;
             } else {
-                if (!confirm('Auto-pick an available IMEI from pool and apply to SIM ' + ctx.simId + '?')) return;
+                if (!(await showConfirm('Change IMEI', 'Auto-pick an available IMEI from pool and apply to SIM ' + ctx.simId + '?'))) return;
             }
             const autoBtn = document.getElementById('change-imei-auto-btn');
             const confirmBtn = document.getElementById('change-imei-confirm-btn');
@@ -8719,7 +9123,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     loadSims(true);
                 }
             } catch (err) {
-                alert('Change IMEI error: ' + err);
+                showToast('Change IMEI error: ' + err, 'error');
             } finally {
                 if (autoBtn) { autoBtn.disabled = false; autoBtn.textContent = 'Auto (Pick from Pool)'; }
                 if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = 'Confirm Change IMEI'; }
@@ -8814,7 +9218,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function unretireImei(id) {
-            if (!confirm('Restore this IMEI to available stock?')) return;
+            if (!(await showConfirm('Restore IMEI', 'Restore this IMEI to available stock?'))) return;
             try {
                 const r = await fetch(\`\${API_BASE}/imei-pool\`, {
                     method: 'POST',
@@ -8921,7 +9325,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function deleteMapping(id) {
-            if (!confirm("Delete this entry?")) return;
+            if (!(await showConfirm('Delete Entry', "Delete this entry?"))) return;
             try {
                 await fetch(\`\${API_BASE}/qbo-mappings?id=\${id}\`, { method: "DELETE" });
                 showToast("Deleted", "success");
@@ -9272,6 +9676,23 @@ async function sendSimOnline(simId, phoneNumber) {
                 </div>
             </div>
         </div>
+    <!-- Custom Confirm Modal -->
+    <div id="confirm-modal" class="fixed inset-0 z-[100] hidden items-center justify-center p-4">
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="handleConfirm(false)"></div>
+        <div class="relative bg-dark-900 border border-white/10 rounded-2xl w-full max-w-md p-6 shadow-2xl">
+            <div class="flex items-center gap-4 mb-4">
+                <div class="w-12 h-12 rounded-full bg-blue-500/20 flex items-center justify-center flex-shrink-0">
+                    <svg class="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
+                </div>
+                <h3 id="confirm-title" class="text-xl font-bold text-white tracking-tight">Confirmation Required</h3>
+            </div>
+            <p id="confirm-message" class="text-dark-300 mb-6 leading-relaxed">Are you sure you want to proceed with this action?</p>
+            <div class="flex items-center justify-end gap-3">
+                <button onclick="handleConfirm(false)" class="px-5 py-2.5 text-sm font-medium text-dark-400 hover:text-white hover:bg-white/5 rounded-xl transition-all border border-transparent hover:border-white/10">Cancel</button>
+                <button id="confirm-yes-btn" onclick="handleConfirm(true)" class="px-6 py-2.5 text-sm font-bold bg-accent hover:bg-blue-600 text-white rounded-xl transition-all shadow-lg shadow-accent/20 hover:shadow-accent/40 hover:-translate-y-0.5 active:translate-y-0">Confirm Action</button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>`;
 }
