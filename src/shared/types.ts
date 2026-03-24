@@ -18,6 +18,10 @@ export interface Env {
     HX_TOKEN_URL?: string;
     SLACK_WEBHOOK_URL?: string;
 
+    // IP Relay
+    RELAY_URL?: string;
+    RELAY_KEY?: string;
+
     // Bindings
     TOKEN_CACHE?: KVNamespace;
     MDN_QUEUE?: Queue<any>;

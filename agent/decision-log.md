@@ -4,6 +4,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-03-24 — All Helix API calls routed through static-IP VPS relay
+
+**Decision:** A Node.js HTTP relay service runs on VPS 74.208.37.8 (`relay.zmawsolutions.com`, HTTPS/TLS). All 5 Helix API call sites in `src/shared/helix.ts` use `relayFetch(env, url, init)` instead of `fetch(url, init)`. When `env.RELAY_URL` + `env.RELAY_KEY` are set, requests are rewritten to `https://relay.zmawsolutions.com/<original-url>` with an `x-relay-key` header; the relay strips the key and forwards to AT&T. If either var is unset, falls back to direct fetch.
+
+**Why:** Helix/AT&T API may require IP whitelisting. Cloudflare Workers egress from a large pool of shared IPs (no static IP). The VPS provides a single stable IP (74.208.37.8) that can be whitelisted with AT&T.
+
+**Consequence:** Relay is a single point of failure for all Helix operations if VPS goes down. PM2 auto-restarts on crash; systemd auto-starts PM2 on reboot. Relay key stored in Cloudflare secrets per worker. VPS credentials: root@74.208.37.8, relay key in `/opt/relay/.env`. TLS cert auto-renews via certbot systemd timer (expires 2026-06-22). Do not remove the `relayFetch` fallback logic — it allows the relay to be bypassed by deleting the secrets if needed.
+
+---
+
+## 2026-03-23 — CSS custom property pattern for dashboard light/dark theme
+
+**Decision:** Dashboard theme colors use `rgb(var(--dark-NNN) / <alpha-value>)` CSS variable pattern in the Tailwind config rather than hardcoded hex values. `:root` defines dark defaults (dark-950 = `5 5 7`, dark-100 = `244 244 245`). `html.light` overrides flip the scale (dark-950 = white, dark-100 = near-black). Toggle persisted in `localStorage`. `html.light .text-gray-*` overrides are required because Tailwind built-in `text-gray-200/300/400/500` classes (used 435 times in the dashboard) are hardcoded to near-white values and must be explicitly remapped.
+
+**Why:** The dashboard uses ~170 `text-gray-300` and ~125 `text-gray-400` classes (from older pre-Gemini code) alongside the custom `dark-*` color tokens. Without the `text-gray-*` overrides, those classes are invisible on light backgrounds. The CSS var pattern allows opacity utilities (`bg-dark-800/50`) to continue working.
+
+**Consequence:** Any future dashboard text elements must use `text-dark-*` classes (not `text-gray-*`) so they automatically adapt to both themes. If `text-gray-*` classes are added, a corresponding `html.light .text-gray-*` override must be added to the `<style>` block. Do not remove the `html.light` overrides or replace the CSS var values in Tailwind config with hex.
+
+---
+
 ## 2026-03-18 — Gateway identity encoded in push URL path for MAC-less gateways
 
 **Decision:** For gateways that cannot be configured to include `mac` or `iccid` in their SMS push params (specifically 512-2, gateway id=4), the gateway ID is encoded in the push URL path as `/s/<secret>/gw/<id>`. sms-ingest extracts it from `pathParts[3]` when `pathParts[2] === "gw"`. SIM lookup falls back to `gateway_id + port` DB query when ICCID is absent. A background slot sync fires when the port lookup misses.

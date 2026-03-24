@@ -3,6 +3,19 @@ import { Env } from './types';
 import { supabaseInsert } from './supabase';
 
 const TOKEN_CACHE_KEY = "helix_token";
+
+function relayFetch(env: Env, url: string, init?: RequestInit): Promise<Response> {
+    if (env.RELAY_URL && env.RELAY_KEY) {
+        return fetch(`${env.RELAY_URL}/${url}`, {
+            ...init,
+            headers: {
+                ...(init?.headers as Record<string, string> || {}),
+                'x-relay-key': env.RELAY_KEY,
+            },
+        });
+    }
+    return fetch(url, init);
+}
 const TOKEN_TTL_SECONDS = 1800; // 30 minutes
 
 export async function getCachedToken(env: Env): Promise<string> {
@@ -30,7 +43,7 @@ export async function getCachedToken(env: Env): Promise<string> {
 export async function hxGetBearerToken(env: Env): Promise<string> {
     if (!env.HX_TOKEN_URL) throw new Error("HX_TOKEN_URL not configured");
 
-    const res = await fetch(env.HX_TOKEN_URL, {
+    const res = await relayFetch(env, env.HX_TOKEN_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -54,7 +67,7 @@ export async function hxMdnChange(env: Env, token: string, mobilitySubscriptionI
     const method = "PATCH";
     const requestBody = { mobilitySubscriptionId };
 
-    const res = await fetch(url, {
+    const res = await relayFetch(env, url, {
         method,
         headers: {
             "Content-Type": "application/json",
@@ -95,7 +108,7 @@ export async function hxSubscriberDetails(env: Env, token: string, mobilitySubsc
     const method = "POST";
     const requestBody = { mobilitySubscriptionId };
 
-    const res = await fetch(url, {
+    const res = await relayFetch(env, url, {
         method,
         headers: {
             "Content-Type": "application/json",
@@ -141,7 +154,7 @@ export async function hxOtaRefresh(env: Env, token: string, data: { ban: string;
         }
     ];
 
-    const res = await fetch(url, {
+    const res = await relayFetch(env, url, {
         method,
         headers: {
             "Content-Type": "application/json",
@@ -186,7 +199,7 @@ export async function hxChangeSubscriberStatus(env: Env, token: string, data: an
         return rest;
     });
 
-    const res = await fetch(url, {
+    const res = await relayFetch(env, url, {
         method,
         headers: {
             "Content-Type": "application/json",
