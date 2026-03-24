@@ -6913,7 +6913,7 @@ async function sendSimOnline(simId, phoneNumber) {
                             else if (u.no_cancel_date) dbLines.push('No canceledAt in Helix response — history not inserted');
                             if (u.error) dbLines.push(\`Error: \${u.error}\`);
                         }
-                        dbOutput.textContent = dbLines.join('\n');
+                        dbOutput.textContent = dbLines.join('\\n');
                         dbBanner.classList.remove('hidden');
                     }
 

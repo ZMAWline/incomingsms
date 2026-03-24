@@ -101,20 +101,34 @@ node _check_frontend_js.js
 **Why two checks?** Check 1 only validates the outer Worker module. Escaping bugs in the frontend JS (e.g. an unescaped `${` or a missing `\`` on a `fetch()` URL) appear as a *string* to Node — the outer module passes but the browser gets broken JS, and `loadData()` never runs. This is the root cause of the recurring "data not loading" bug.
 
 **`_check_frontend_js.js` template (create if missing):**
+
+**IMPORTANT:** Do NOT use simple regex replacement (`replace(/\\`/g, '\`')`) to simulate the template literal — it misses `\n` → newline and other escape evaluations, causing false "OK" results. Use Node `vm` to actually execute `getHTML()`:
+
 ```js
-const fs = require('fs');
-const cp = require('child_process');
+const fs = require('fs'), cp = require('child_process'), vm = require('vm');
 const src = fs.readFileSync('src/dashboard/index.js', 'utf8');
-const scriptStart = src.lastIndexOf('<script>');
-const scriptEnd = src.lastIndexOf('</script>');
-if (scriptStart === -1 || scriptEnd === -1) { console.error('script tags not found'); process.exit(1); }
-const browserJs = src.slice(scriptStart + 8, scriptEnd).replace(/\\`/g, '`').replace(/\\\${/g, '${');
+const start = src.indexOf('function getHTML() {');
+if (start === -1) { console.error('getHTML not found'); process.exit(1); }
+// Find the end of getHTML by brace counting
+let depth = 0, i = start, bodyStarted = false;
+while (i < src.length) {
+  const c = src[i];
+  if (c === '{') { depth++; bodyStarted = true; }
+  if (c === '}') { if (--depth === 0 && bodyStarted) break; }
+  i++;
+}
+const fn = vm.runInContext('(' + src.slice(start, i+1) + ')', vm.createContext({}));
+const html = fn();
+const scriptStart = html.lastIndexOf('<script>');
+const scriptEnd = html.lastIndexOf('</script>');
+if (scriptStart === -1) { console.error('script tag not found'); process.exit(1); }
+const browserJs = html.slice(scriptStart + 8, scriptEnd);
 fs.writeFileSync('_frontend_check_tmp.js', browserJs, 'utf8');
 try {
-  cp.execSync('node --input-type=module --check < _frontend_check_tmp.js', { stdio: ['inherit','inherit','inherit'], shell: true });
-  console.log('Frontend JS OK');
+  cp.execSync('node --check < _frontend_check_tmp.js', { stdio: ['inherit','inherit','inherit'], shell: true });
+  console.log('Frontend JS syntax OK');
 } catch(e) { console.error('Frontend JS has syntax errors!'); process.exit(1); }
-finally { fs.unlinkSync('_frontend_check_tmp.js'); }
+finally { try { fs.unlinkSync('_frontend_check_tmp.js'); } catch(e) {} }
 ```
 
 If either check fails, the patch broke something. Read the error line number, fix the script, and re-run from Step 2.
