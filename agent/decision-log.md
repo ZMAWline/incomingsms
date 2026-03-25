@@ -4,6 +4,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-03-25 — Teltik 48h rotation guard stamped before polling completes
+
+**Decision:** In `rotateTeltikSims`, `sims.last_mdn_rotated_at` is written to DB immediately after the `change-number` API call succeeds (before the polling loop), not after polling confirms the new MDN.
+
+**Why:** Contractual obligation — Teltik SIMs may not be rotated more than once per 48 hours. The first real rotation showed Teltik changed the number successfully but our polling loop timed out (unrecognized status strings), so `last_mdn_rotated_at` stayed null. The next cron would have re-rotated within minutes of the first rotation.
+
+**Consequence:** If `change-number` is called but rotation ultimately fails (Teltik error), the 48h clock is already ticking — the SIM won't retry until the next interval. This is intentional: a failed rotation is safer than a double-rotation. Do not move the stamp back to after polling.
+
+---
+
+## 2026-03-25 — Teltik webhook push format differs from polling API format
+
+**Decision:** `handleTeltikSmsWebhook` reads `body.destination || body.to || body.mdn` for the recipient MDN and `body.origin || body.from` for the sender. It also handles array payloads (Teltik may batch-push).
+
+**Why:** Teltik's `/v1/forward-url` push format is `{ destination, origin, message, timestamp, port, gateway_id, nickname }`. The `/v1/all-sms` polling format is `{ to, from, message, time_stamp }`. These are different. The original handler only read `to`/`from`/`time_stamp`, so all real pushes silently returned 200 OK without inserting anything. Confirmed by capturing a live push in `wrangler tail`.
+
+**Consequence:** Keep both field-name fallbacks in the handler — the polling format appears in backfill scenarios. Do not simplify to just `destination`.
+
+---
+
 ## 2026-03-24 — Frontend JS check must execute getHTML() via vm, not regex substitution
 
 **Decision:** `_check_frontend_js.js` uses Node `vm.runInContext` to actually execute the `getHTML()` function and extract the resulting HTML string, rather than regex-replacing `\`` → `` ` `` and `\${` → `${` on the raw file text.

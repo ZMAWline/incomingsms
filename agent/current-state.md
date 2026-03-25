@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-03-24 (session 10)
+> Last updated: 2026-03-25 (session 11)
 
 ---
 
@@ -48,6 +48,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-03-25 | Teltik webhook: 48h guard stamped on change-number initiation (before polling); fallback to get-phone-number if polling fails; online_until = midnightNYAfterInterval(last_mdn_rotated_at, interval_hours) in all 3 code paths; carrier field (T-Mobile/att) added to all number.online payloads; webhook handler fixed for Teltik push format (destination/origin/message/timestamp) + array payload support | teltik-worker, reseller-sync, dashboard |
 | 2026-03-25 | Teltik vendor integration: new `teltik-worker` (import/webhook/rotate/setup-webhook), DB migration adds vendor/carrier/rotation_interval_hours to sims, mdn-rotator filters to helix-only + vendor guard in rotateSpecificSim, reseller-sync vendor-aware online_until + interval-based backstop skip, dashboard vendor column/filter/Import button | teltik-worker (new), mdn-rotator, reseller-sync, dashboard, DB migration |
 | 2026-03-24 | Dashboard: fixed two prod bugs from prior session — missing fetch URLs in queryHelix/queryHelixBulk (bare backtick issue) and \n→newline in dbLines.join (template literal escape bug); rewrote _check_frontend_js.js to use Node vm.runInContext to accurately simulate template evaluation | dashboard |
 | 2026-03-24 | patch-dashboard skill updated: added frontend JS check step (vm-based), documented correct BT='\\\\'+'\`' escaping pattern, added explicit --env flag warning | — |
@@ -76,6 +77,15 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 | 2026-02-25 | SMS verification removed; verified: true hardcoded in all number.online senders | mdn-rotator, reseller-sync, dashboard |
 | 2026-02-19 | QBO tables created; quickbooks worker deployed | quickbooks, DB migration |
 | 2026-02-19 | Billing: switch to QBO CSV export format with service date | quickbooks |
+
+---
+
+## Teltik Production Notes
+
+- **Push webhook format**: `{ destination, origin, message, timestamp, port, gateway_id, nickname }` — NOT `{ to, from, message, time_stamp }` (that's the all-sms polling format). Handler accepts both.
+- **First rotation (2026-03-25)**: cron fired at 21:10 UTC, numbers changed in Teltik but DB not updated due to polling format mismatch. DB manually patched: SIM 629 → +17754018206, SIM 630 → +19187209741, last_mdn_rotated_at set to ~21:57 UTC.
+- **Next Teltik rotation due**: ~2026-03-27 21:57 UTC (48h after manual patch). Cron will handle automatically.
+- **48h guard**: `last_mdn_rotated_at` is now stamped immediately on `change-number` API success, before polling completes — prevents double-rotation even if polling fails.
 
 ---
 

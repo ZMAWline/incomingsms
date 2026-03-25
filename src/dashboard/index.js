@@ -951,7 +951,7 @@ async function handleSimOnline(request, env, corsHeaders) {
     }
 
     // Step 1: Get the SIM basic info
-    const simResponse = await supabaseGet(env, `sims?select=id,iccid,status&id=eq.${simId}`);
+    const simResponse = await supabaseGet(env, `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_mdn_rotated_at&id=eq.${simId}`);
     const sims = await simResponse.json();
 
     if (!sims || sims.length === 0) {
@@ -1004,16 +1004,19 @@ async function handleSimOnline(request, env, corsHeaders) {
       });
     }
 
-    // Calculate next rotation time (5 AM UTC next day)
-    const now = new Date();
-    const next = new Date(Date.UTC(
-      now.getUTCFullYear(),
-      now.getUTCMonth(),
-      now.getUTCDate(),
-      5, 0, 0
-    ));
-    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-    const onlineUntil = next.toISOString();
+    // Calculate online_until — midnight NY of the rotation-due date
+    const _baseTs = sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at) : new Date();
+    const _intervalHours = sim.rotation_interval_hours || (sim.vendor === 'teltik' ? 48 : 24);
+    const _intervalDays = Math.ceil(_intervalHours / 24);
+    const _nyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(_baseTs);
+    const [_y, _m, _d] = _nyDate.split('-').map(Number);
+    const _probe = new Date(Date.UTC(_y, _m - 1, _d + _intervalDays, 5, 0, 0));
+    const _probeNyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(_probe);
+    const _tzPart = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', timeZoneName: 'shortOffset'
+    }).formatToParts(_probe).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-4';
+    const _offsetHours = -parseInt(_tzPart.replace('GMT', '') || '-4');
+    const onlineUntil = new Date(`${_probeNyDate}T${String(_offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
 
     // Build the webhook payload
     const payload = {
@@ -1027,6 +1030,7 @@ async function handleSimOnline(request, env, corsHeaders) {
         status: sim.status,
         online: true,
         online_until: onlineUntil,
+        carrier: sim.vendor === 'teltik' ? 'T-Mobile' : 'att',
         verified: verificationStatus === 'verified',
       },
     };

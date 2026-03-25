@@ -43,7 +43,7 @@ async function runResellerSync(env, limit, force = false) {
   // Fetch active SIMs with current numbers, reseller info, and webhook URLs in ONE query
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
+    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
   );
 
   let attempted = sims.length;
@@ -96,7 +96,8 @@ async function runResellerSync(env, limit, force = false) {
           number: currentNumber,
           status: sim.status,
           online: true,
-          online_until: sim.vendor === 'teltik' ? new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString() : nextRotationUtcISO(),
+          online_until: sim.vendor === 'teltik' ? midnightNYAfterInterval(sim.last_mdn_rotated_at, sim.rotation_interval_hours || 48) : nextRotationUtcISO(),
+          carrier: sim.vendor === 'teltik' ? 'T-Mobile' : 'att',
           verified: true,
         },
       }, {
@@ -352,6 +353,22 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function midnightNYAfterInterval(lastRotatedAt, intervalHours) {
+  // Returns midnight NY time of the day that is intervalDays after lastRotatedAt's NY date.
+  // e.g. rotated March 25, intervalHours=48 → returns March 27 00:00 ET
+  const baseDt = new Date(lastRotatedAt || Date.now());
+  const nyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(baseDt);
+  const [y, m, d] = nyDate.split('-').map(Number);
+  const intervalDays = Math.ceil((intervalHours || 24) / 24);
+  const probe = new Date(Date.UTC(y, m - 1, d + intervalDays, 5, 0, 0));
+  const probeNyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(probe);
+  const tzPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', timeZoneName: 'shortOffset'
+  }).formatToParts(probe).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-4';
+  const offsetHours = -parseInt(tzPart.replace('GMT', '') || '-4');
+  return new Date(`${probeNyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
 }
 
 function nextRotationUtcISO() {

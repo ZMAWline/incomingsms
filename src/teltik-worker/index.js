@@ -202,11 +202,29 @@ async function handleTeltikSmsWebhook(request, env) {
     return new Response('Invalid JSON', { status: 400 });
   }
 
-  const mdn = normalizeToE164(body.mdn || '');
-  const smsBody = body.sms || '';
-  const receivedAt = body.timestamp
-    ? new Date(body.timestamp).toISOString()
-    : new Date().toISOString();
+  // Log raw payload to diagnose format issues
+  console.log('[Webhook] raw payload:', JSON.stringify(body).slice(0, 500));
+
+  // Teltik may push an array of messages or a single object
+  if (Array.isArray(body)) {
+    console.log(`[Webhook] Array payload with ${body.length} items, processing each`);
+    for (const item of body) {
+      await processTeltikSmsItem(item, env);
+    }
+    return new Response('OK', { status: 200 });
+  }
+
+  return processTeltikSmsItem(body, env);
+}
+
+async function processTeltikSmsItem(body, env) {
+  // Teltik push format: { destination, origin, message, timestamp, port, gateway_id, nickname }
+  // all-sms polling format: { to, from, message, time_stamp }
+  const mdn = normalizeToE164(body.destination || body.to || body.mdn || '');
+  const smsBody = body.message || body.sms || '';
+  const fromNumber = body.origin || body.from || '';
+  // Teltik timestamps have no timezone info (likely ET not UTC) — use delivery time instead
+  const receivedAt = new Date().toISOString();
 
   if (!mdn) {
     console.log('[Webhook] No MDN in payload, ignoring');
@@ -244,7 +262,7 @@ async function handleTeltikSmsWebhook(request, env) {
   const insRes = await supabaseInsert(env, 'inbound_sms', [{
     sim_id: simId,
     to_number: mdn,
-    from_number: '',   // Teltik push has no sender field
+    from_number: fromNumber,
     body: smsBody,
     received_at: receivedAt,
     port: null,        // no physical port for Teltik
@@ -273,7 +291,7 @@ async function handleTeltikSmsWebhook(request, env) {
         data: {
           sim_id: simId,
           number: mdn,
-          from: '',
+          from: fromNumber,
           message: smsBody,
           received_at: receivedAt,
           iccid: null,
@@ -340,10 +358,15 @@ async function rotateTeltikSims(env) {
         throw new Error(`change-number failed ${changeRes.status}: ${errText}`);
       }
       const changeData = await changeRes.json();
+      console.log(`[Rotate] SIM ${sim.iccid}: change-number response: ${JSON.stringify(changeData)}`);
       const requestId = changeData.requestId || changeData.request_id;
       if (!requestId) {
         throw new Error(`No requestId in change-number response: ${JSON.stringify(changeData)}`);
       }
+
+      // SAFETY: stamp last_mdn_rotated_at immediately — prevents re-rotation even if polling fails
+      await supabasePatch(env, `sims?id=eq.${sim.id}`, { last_mdn_rotated_at: new Date().toISOString() });
+      console.log(`[Rotate] SIM ${sim.iccid}: 48h guard stamped, requestId=${requestId}`);
 
       // 3. Poll for completion — max 6 attempts with exponential backoff
       const delays = [2000, 4000, 8000, 16000, 16000, 16000];
@@ -365,6 +388,7 @@ async function rotateTeltikSims(env) {
           continue;
         }
         const pollData = await pollRes.json();
+        console.log(`[Rotate] SIM ${sim.iccid}: poll attempt ${attempt + 1}: ${JSON.stringify(pollData)}`);
         const status = (pollData.status || '').toLowerCase();
 
         if (status === 'completed' || status === 'success' || status === 'msg_received') {
@@ -376,12 +400,25 @@ async function rotateTeltikSims(env) {
         if (status === 'failed' || status === 'error' || status === 'timeout') {
           throw new Error(`Rotation failed: ${JSON.stringify(pollData)}`);
         }
-        // Still pending — continue polling
-        console.log(`[Rotate] SIM ${sim.iccid}: attempt ${attempt + 1} status=${pollData.status || 'unknown'}, continuing`);
+        console.log(`[Rotate] SIM ${sim.iccid}: attempt ${attempt + 1} pending, status=${pollData.status || 'unknown'}`);
+      }
+
+      // 3b. Fallback: if polling didn't return new MDN, fetch current number directly
+      if (!newMdn) {
+        console.log(`[Rotate] SIM ${sim.iccid}: polling exhausted, falling back to get-phone-number`);
+        const phoneRes = await fetch(
+          `${TELTIK_BASE}/v1/get-phone-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
+        );
+        if (phoneRes.ok) {
+          const phoneData = await phoneRes.json();
+          console.log(`[Rotate] SIM ${sim.iccid}: get-phone-number: ${JSON.stringify(phoneData)}`);
+          const msisdn = phoneData.msisdn || phoneData.mdn || phoneData.phone_number || phoneData.number || '';
+          if (msisdn) newMdn = normalizeToE164(msisdn);
+        }
       }
 
       if (!newMdn) {
-        throw new Error(`Rotation timed out for ICCID ${sim.iccid} after 6 attempts`);
+        throw new Error(`Could not determine new MDN for ICCID ${sim.iccid} after polling + fallback`);
       }
 
       // 4. Close old sim_numbers row and insert new
@@ -417,7 +454,8 @@ async function rotateTeltikSims(env) {
               sim_id: sim.id,
               number: newMdn,
               online: true,
-              online_until: teltikOnlineUntil(),
+              online_until: midnightNYAfterInterval(rotatedAt, 48),
+              carrier: 'T-Mobile',
               iccid: sim.iccid,
               mobilitySubscriptionId: null,
               verified: true,
@@ -476,8 +514,18 @@ async function setupTeltikForwardUrl(env) {
 // Helpers
 // =========================================================
 
-function teltikOnlineUntil() {
-  return new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+function midnightNYAfterInterval(lastRotatedAt, intervalHours) {
+  const baseDt = new Date(lastRotatedAt || Date.now());
+  const nyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(baseDt);
+  const [y, m, d] = nyDate.split('-').map(Number);
+  const intervalDays = Math.ceil((intervalHours || 48) / 24);
+  const probe = new Date(Date.UTC(y, m - 1, d + intervalDays, 5, 0, 0));
+  const probeNyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(probe);
+  const tzPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', timeZoneName: 'shortOffset'
+  }).formatToParts(probe).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-4';
+  const offsetHours = -parseInt(tzPart.replace('GMT', '') || '-4');
+  return new Date(`${probeNyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
 }
 
 function normalizeToE164(to) {
