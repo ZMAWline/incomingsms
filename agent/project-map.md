@@ -16,8 +16,9 @@
 | `sim-status-changer` | Suspend / restore a SIM via Helix | HTTP (service binding) | — |
 | `phone-number-sync` | Sync phone numbers (utility worker) | HTTP | — |
 | `quickbooks` | QBO OAuth 2.0, customer mapping, invoice generation | HTTP | QBO_TOKENS KV |
+| `teltik-worker` | T-Mobile SIM management via Teltik API: import lines, receive SMS webhooks, rotate MDNs every 48h | Cron `10,40 * * * *` + HTTP `/import` `/webhook` `/rotate` `/setup-webhook` | — |
 
-## Dashboard Service Bindings (all 9)
+## Dashboard Service Bindings (all 10)
 
 ```
 SIM_CANCELLER      → sim-canceller
@@ -29,6 +30,7 @@ RESELLER_SYNC      → reseller-sync
 SIM_STATUS_CHANGER → sim-status-changer
 SKYLINE_GATEWAY    → skyline-gateway
 QUICKBOOKS         → quickbooks
+TELTIK_WORKER      → teltik-worker
 ```
 
 ## Queue Inventory

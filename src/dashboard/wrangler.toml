@@ -48,9 +48,16 @@ service = "skyline-gateway"
 binding = "QUICKBOOKS"
 service = "quickbooks"
 
+[[services]]
+binding = "TELTIK_WORKER"
+service = "teltik-worker"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "dashboard-test"
+
+[env.test.vars]
+WING_EXPECTED_RATE = "5.00"
 
 [env.test.observability.logs]
 enabled = true
@@ -92,3 +99,7 @@ service = "skyline-gateway-test"
 [[env.test.services]]
 binding = "QUICKBOOKS"
 service = "quickbooks-test"
+
+[[env.test.services]]
+binding = "TELTIK_WORKER"
+service = "teltik-worker-test"

@@ -43,7 +43,7 @@ async function runResellerSync(env, limit, force = false) {
   // Fetch active SIMs with current numbers, reseller info, and webhook URLs in ONE query
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
+    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
   );
 
   let attempted = sims.length;
@@ -79,6 +79,14 @@ async function runResellerSync(env, limit, force = false) {
         continue;
       }
 
+      const intervalMs = (sim.rotation_interval_hours || 24) * 60 * 60 * 1000;
+      const cutoff = new Date(Date.now() - intervalMs).toISOString();
+      if (sim.last_notified_at && sim.last_notified_at > cutoff) {
+        skipped++;
+        details.push({ sim_id: simId, ok: true, skipped: true, reason: "Notified within rotation interval" });
+        continue;
+      }
+
       const result = await sendWebhookWithDeduplication(env, webhookUrl, {
         event_type: "number.online",
         created_at: new Date().toISOString(),
@@ -88,7 +96,7 @@ async function runResellerSync(env, limit, force = false) {
           number: currentNumber,
           status: sim.status,
           online: true,
-          online_until: nextRotationUtcISO(),
+          online_until: sim.vendor === 'teltik' ? new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString() : nextRotationUtcISO(),
           verified: true,
         },
       }, {

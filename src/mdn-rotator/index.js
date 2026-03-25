@@ -968,7 +968,7 @@ async function queueSimsForRotation(env, options = {}) {
   // Build query - manual runs prioritize SIMs that were rotated longest ago
   // NULLS FIRST ensures SIMs that have never been rotated get processed first
   // !inner join on reseller_sims ensures only SIMs assigned to an active client are rotated
-  let query = `sims?select=id,iccid,mobility_subscription_id,status,last_mdn_rotated_at,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&mobility_subscription_id=not.is.null&status=eq.active`;
+  let query = `sims?select=id,iccid,mobility_subscription_id,status,last_mdn_rotated_at,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&mobility_subscription_id=not.is.null&status=eq.active&vendor=eq.helix`;
 
   if (isManualRun) {
     // Manual run: order by oldest rotation first (nulls first = never rotated)
@@ -1086,7 +1086,7 @@ async function rotateSpecificSim(env, iccid) {
     // Look up the SIM by ICCID
     const sims = await supabaseSelect(
       env,
-      `sims?select=id,iccid,mobility_subscription_id,status&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+      `sims?select=id,iccid,mobility_subscription_id,status,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
     );
 
     if (!Array.isArray(sims) || sims.length === 0) {
@@ -1094,6 +1094,10 @@ async function rotateSpecificSim(env, iccid) {
     }
 
     const sim = sims[0];
+
+    if (sim.vendor === 'teltik') {
+      return { ok: false, error: 'Use teltik-worker for Teltik SIM rotation' };
+    }
 
     if (!sim.mobility_subscription_id) {
       return { ok: false, error: `SIM ${iccid} has no mobility_subscription_id` };

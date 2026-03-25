@@ -179,6 +179,14 @@ export default {
       return handleTriggerBlimeiSweep(env, corsHeaders);
     }
 
+    if (url.pathname === '/api/import-teltik' && request.method === 'POST') {
+      const res = await env.TELTIK_WORKER.fetch(
+        new Request('https://teltik-worker/import?secret=' + env.ADMIN_RUN_SECRET, { method: 'POST' })
+      );
+      return new Response(await res.text(), { status: res.status,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
     if (url.pathname === '/api/sync-gateway-slots' && request.method === 'POST') {
       return handleSyncGatewaySlots(request, env, corsHeaders);
     }
@@ -322,7 +330,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=5000`;
+    let query = `sims?select=id,iccid,port,status,vendor,carrier,rotation_interval_hours,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=5000`;
 
     // Apply status filter
     if (statusFilter) {
@@ -4149,6 +4157,7 @@ function getHTML() {
                     <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
                     <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
                     <button onclick="bulkModifyImei()" class="px-3 py-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded transition">Modify IMEI</button>
+                    <button onclick="importTeltik()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Import Teltik</button>
                 </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
@@ -4180,6 +4189,11 @@ function getHTML() {
                                 <select id="filter-gateway" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All Gateways</option>
                                 </select>
+                                <select id="filter-vendor" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                    <option value="">All Vendors</option>
+                                    <option value="helix">Helix</option>
+                                    <option value="teltik">Teltik</option>
+                                </select>
                                 <select id="filter-special" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">No Quick Filter</option>
                                     <option value="not_rotated_today">Not rotated today</option>
@@ -4205,6 +4219,7 @@ function getHTML() {
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','iccid')">ICCID <span class="sort-arrow" data-table="sims" data-col="iccid"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','phone_number')">Phone <span class="sort-arrow" data-table="sims" data-col="phone_number"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','status')">Status <span class="sort-arrow" data-table="sims" data-col="status"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','vendor')">Vendor <span class="sort-arrow" data-table="sims" data-col="vendor"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','mobility_subscription_id')">Sub ID <span class="sort-arrow" data-table="sims" data-col="mobility_subscription_id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
@@ -6258,6 +6273,8 @@ function renderSims() {
   if (resellerFilterVal === 'none') data = data.filter(s => !s.reseller_id);
   const gatewayFilterVal = document.getElementById('filter-gateway')?.value;
   if (gatewayFilterVal) data = data.filter(s => s.gateway_code === gatewayFilterVal);
+  const vendorFilterVal = document.getElementById('filter-vendor')?.value;
+  if (vendorFilterVal) data = data.filter(s => s.vendor === vendorFilterVal);
   const activatedFrom = document.getElementById('filter-activated-from')?.value;
   const activatedTo = document.getElementById('filter-activated-to')?.value;
   if (activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= activatedFrom);
@@ -6288,7 +6305,7 @@ function renderSims() {
                 const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
                 const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
                 const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-accent" title="Verified">&#10003;</span>' : '';
-                const gatewayDisplay = sim.gateway_code ? \`<span class="font-medium text-gray-200">\${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">\${sim.port || ''}</span>\` : (sim.port || '-');
+                const gatewayDisplay = sim.gateway_code ? \`<span class="font-medium text-gray-200">\${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">\${sim.port || ''}</span>\` : (sim.vendor === 'teltik' ? '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-pink-500/20 text-pink-300">T-Mobile</span>' : (sim.port || '-'));
                 const statusClass = {
                     'active': 'bg-accent/20 text-accent',
                     'provisioning': 'bg-yellow-500/20 text-yellow-400',
@@ -6296,6 +6313,7 @@ function renderSims() {
                     'canceled': 'bg-red-500/20 text-red-400',
                     'error': 'bg-red-500/20 text-red-400',
                 }[sim.status] || 'bg-gray-500/20 text-gray-400';
+                const vendorBadge = sim.vendor === 'teltik' ? '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>' : '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>';
                 return \`
                 <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
                     <td class="px-4 py-3"><input type="checkbox" class="sim-cb accent-green-500" value="\${sim.id}" onchange="updateSimActionBar()"></td>
@@ -6306,6 +6324,7 @@ function renderSims() {
                     <td class="px-4 py-3">
                         <span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${sim.status}</span>
                     </td>
+                    <td class="px-4 py-3">\${vendorBadge}</td>
                     <td class="px-4 py-3 font-mono text-xs">\${sim.mobility_subscription_id ? \`<button onclick="queryHelixSubId('\${sim.mobility_subscription_id}')" class="text-indigo-400 hover:text-indigo-300 hover:underline">\${sim.mobility_subscription_id}</button>\` : '-'}</td>
                     <td class="px-4 py-3 text-gray-400">\${sim.reseller_name || '-'}</td>
                     <td class="px-4 py-3 text-gray-300">\${sim.sms_count || 0}</td>
@@ -6315,8 +6334,8 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_notified_at ? new Date(sim.last_notified_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 whitespace-nowrap">
                         \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
-                        \${sim.status === 'active' ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}
-                        \${sim.status === 'error' ? \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\` : ''}
+                        \${(sim.vendor !== 'teltik' && sim.status === 'active') ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}
+                        \${(sim.vendor !== 'teltik' && sim.status === 'error') ? \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\` : ''}
                         \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : \`<button onclick="assignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition" title="Assign to reseller">Assign</button>\`}
                         \${(sim.mobility_subscription_id && sim.gateway_id && sim.port) ? \`<button onclick="showChangeImeiModal(\${sim.id}, '\${sim.iccid}', \${sim.gateway_id}, '\${sim.port}')" class="px-2 py-1 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition ml-1" title="Change IMEI">IMEI</button>\` : ''}
                         \${\`<button onclick="showSetStatusModal(\${sim.id}, '\${sim.status}')" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition ml-1">Status</button>\`}
@@ -6347,6 +6366,19 @@ async function sendSimOnline(simId, phoneNumber) {
             } catch (error) {
                 showToast('Error sending online webhook', 'error');
                 console.error(error);
+            }
+        }
+
+        async function importTeltik() {
+            if (!(await showConfirm('Import Teltik', 'Fetch all Teltik lines and upsert into DB?'))) return;
+            showToast('Importing Teltik lines...', 'info');
+            const res = await fetch(\`\${API_BASE}/import-teltik\`, { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) {
+                showToast('Imported: ' + data.imported + ' new, ' + data.updated + ' updated', 'success');
+                loadSims();
+            } else {
+                showToast('Error: ' + data.error, 'error');
             }
         }
 
