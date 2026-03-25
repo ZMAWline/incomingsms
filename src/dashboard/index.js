@@ -399,6 +399,9 @@ async function handleSims(env, corsHeaders, url) {
         activated_at: sim.activated_at || null,
         last_activation_error: sim.last_activation_error || null,
         last_notified_at: sim.last_notified_at || null,
+        vendor: sim.vendor || 'helix',
+        carrier: sim.carrier || null,
+        rotation_interval_hours: sim.rotation_interval_hours || 24,
       };
     });
 
