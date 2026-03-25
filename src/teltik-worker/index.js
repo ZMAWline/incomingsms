@@ -461,7 +461,7 @@ async function setupTeltikForwardUrl(env) {
   const res = await fetch(`${TELTIK_BASE}/v1/forward-url?apikey=${apiKey}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ primary_url: workerUrl }),
+    body: JSON.stringify({ forward_url: workerUrl }),
   });
 
   const text = await res.text();
