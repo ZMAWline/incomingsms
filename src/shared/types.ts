@@ -18,6 +18,17 @@ export interface Env {
     HX_TOKEN_URL?: string;
     SLACK_WEBHOOK_URL?: string;
 
+    // ATOMIC API (AT&T via Wing Alpha)
+    ATOMIC_API_URL?: string;
+    ATOMIC_USERNAME?: string;
+    ATOMIC_TOKEN?: string;
+    ATOMIC_PIN?: string;
+
+    // Wing IoT API (AT&T IoT)
+    WING_IOT_BASE_URL?: string;
+    WING_IOT_USERNAME?: string;
+    WING_IOT_API_KEY?: string;
+
     // IP Relay
     RELAY_URL?: string;
     RELAY_KEY?: string;

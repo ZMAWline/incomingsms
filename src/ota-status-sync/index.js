@@ -1,9 +1,10 @@
 // ota-status-sync worker
 // Runs every 12 hours (00:00 and 12:00 UTC).
-// For each active/suspended SIM with a Helix subscription ID:
-//   1. Fetch subscriber details to get MDN and BAN
-//   2. Run OTA refresh via Helix
-//   3. Extract the status from the response and update sims.status in DB
+// For each active/suspended SIM:
+//   - Helix: Fetch details, run OTA refresh, update status
+//   - ATOMIC: Run OTA refresh via resendOtaProfile
+//   - Wing IoT: Skip (no OTA endpoint)
+//   - Teltik: Skip (handled by teltik-worker)
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 
@@ -35,23 +36,38 @@ export default {
 // Main sync loop
 // ===========================
 async function runOtaStatusSync(env) {
+  // Get all active/suspended SIMs, excluding wing_iot and teltik (no OTA support)
   const sims = await supabaseSelect(
     env,
-    "sims?select=id,iccid,mobility_subscription_id,status,imei,activated_at&mobility_subscription_id=not.is.null&status=in.(active,suspended)&order=id.asc&limit=10000"
+    "sims?select=id,iccid,mobility_subscription_id,msisdn,status,imei,activated_at,vendor&status=in.(active,suspended)&vendor=not.in.(wing_iot,teltik)&order=id.asc&limit=10000"
   );
 
   if (!Array.isArray(sims) || sims.length === 0) {
     console.log("[OTA Sync] No SIMs to sync");
-    return { ok: true, synced: 0, errors: 0 };
+    return { ok: true, synced: 0, errors: 0, skipped: 0 };
   }
 
-  console.log(`[OTA Sync] Starting sync for ${sims.length} SIMs`);
-  const token = await getCachedToken(env);
+  // Filter: helix needs subId, atomic needs msisdn
+  const validSims = sims.filter(sim => {
+    const vendor = sim.vendor || 'helix';
+    if (vendor === 'helix') return !!sim.mobility_subscription_id;
+    if (vendor === 'atomic') return !!sim.msisdn;
+    return false;
+  });
+
+  console.log(`[OTA Sync] Starting sync for ${validSims.length} SIMs (${sims.length - validSims.length} skipped)`);
+
+  // Get Helix token only if we have helix SIMs
+  const hasHelix = validSims.some(s => (s.vendor || 'helix') === 'helix');
+  let token = null;
+  if (hasHelix) {
+    token = await getCachedToken(env);
+  }
 
   let synced = 0;
   let errors = 0;
 
-  for (const sim of sims) {
+  for (const sim of validSims) {
     try {
       await syncSimStatus(env, token, sim);
       synced++;
@@ -61,16 +77,80 @@ async function runOtaStatusSync(env) {
     }
   }
 
-  console.log(`[OTA Sync] Done. synced=${synced} errors=${errors} total=${sims.length}`);
-  return { ok: true, synced, errors, total: sims.length };
+  console.log(`[OTA Sync] Done. synced=${synced} errors=${errors} total=${validSims.length}`);
+  return { ok: true, synced, errors, total: validSims.length, skipped: sims.length - validSims.length };
 }
 
 // ===========================
-// Per-SIM status sync
+// Per-SIM status sync - routes by vendor
 // ===========================
 async function syncSimStatus(env, token, sim) {
-  const { id, iccid, mobility_subscription_id: subId } = sim;
+  const { id, iccid } = sim;
+  const vendor = sim.vendor || 'helix';
   const runId = `ota_sync_${iccid}_${Date.now()}`;
+
+  if (vendor === 'atomic') {
+    await syncSimStatusAtomic(env, sim, runId);
+  } else {
+    await syncSimStatusHelix(env, token, sim, runId);
+  }
+}
+
+async function syncSimStatusAtomic(env, sim, runId) {
+  const { id, iccid, msisdn } = sim;
+
+  // ATOMIC: Send OTA refresh
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const requestBody = {
+    wholeSaleApi: {
+      session: {
+        userName: env.ATOMIC_USERNAME,
+        token: env.ATOMIC_TOKEN,
+        pin: env.ATOMIC_PIN,
+      },
+      wholeSaleRequest: {
+        requestType: 'resendOtaProfile',
+        MSISDN: msisdn,
+        sim: iccid,
+      },
+    },
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  });
+
+  const responseText = await res.text();
+  let json = {};
+  try { json = JSON.parse(responseText); } catch {}
+
+  await logCarrierApiCall(env, {
+    run_id: runId,
+    step: 'ota_refresh',
+    iccid,
+    vendor: 'atomic',
+    request_url: url,
+    request_method: 'POST',
+    request_body: requestBody,
+    response_status: res.status,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: json,
+    error: res.ok ? null : `ATOMIC OTA failed: ${res.status}`,
+  });
+
+  // ATOMIC OTA doesn't return status like Helix - just confirms the refresh was sent
+  if (res.ok && json?.wholeSaleApi?.wholeSaleResponse?.statusCode === '00') {
+    console.log(`[OTA Sync] SIM ${iccid} (atomic): OTA refresh sent`);
+  } else {
+    console.warn(`[OTA Sync] SIM ${iccid} (atomic): OTA refresh failed`);
+  }
+}
+
+async function syncSimStatusHelix(env, token, sim, runId) {
+  const { id, iccid, mobility_subscription_id: subId } = sim;
 
   // Get subscriber details for MDN and BAN
   const details = await hxSubscriberDetails(env, token, subId, runId, iccid);
@@ -303,13 +383,14 @@ async function supabasePatch(env, path, bodyObj) {
 }
 
 // ===========================
-// Helix API Logging
+// Carrier API Logging
 // ===========================
-async function logHelixApiCall(env, logData) {
-  console.log(`[Helix API] ${logData.request_method} ${logData.request_url} -> ${logData.response_status} ${logData.response_ok ? "OK" : "FAIL"}`);
+async function logCarrierApiCall(env, logData) {
+  const vendor = logData.vendor || 'helix';
+  console.log(`[${vendor.toUpperCase()} API] ${logData.request_method} ${logData.request_url} -> ${logData.response_status} ${logData.response_ok ? "OK" : "FAIL"}`);
 
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -321,6 +402,7 @@ async function logHelixApiCall(env, logData) {
         run_id: logData.run_id,
         step: logData.step,
         iccid: logData.iccid || null,
+        vendor,
         request_url: logData.request_url,
         request_method: logData.request_method,
         request_body: logData.request_body || null,
@@ -333,6 +415,11 @@ async function logHelixApiCall(env, logData) {
       }),
     });
   } catch (err) {
-    console.warn(`[Helix API Log] Failed to save: ${err}`);
+    console.warn(`[Carrier API Log] Failed to save: ${err}`);
   }
+}
+
+// Backward compatibility alias
+async function logHelixApiCall(env, logData) {
+  return logCarrierApiCall(env, { ...logData, vendor: 'helix' });
 }

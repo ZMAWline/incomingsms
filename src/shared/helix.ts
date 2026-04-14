@@ -237,9 +237,11 @@ export async function hxChangeSubscriberStatus(env: Env, token: string, data: an
 
 async function logHelixApiCall(env: Env, log: any) {
     // Fire and forget log insertion
+    // Note: helix_api_logs is now a view on carrier_api_logs filtered by vendor='helix'
     try {
-        await supabaseInsert(env, 'helix_api_logs', [{
+        await supabaseInsert(env, 'carrier_api_logs', [{
             ...log,
+            vendor: 'helix',
             timestamp: new Date().toISOString(),
         }]);
     } catch (e) {

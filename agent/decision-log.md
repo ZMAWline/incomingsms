@@ -4,6 +4,25 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-14 — ATOMIC + Wing IoT migration architecture
+
+**Decision:** Multi-vendor routing based on `sims.vendor` column. Each worker checks vendor and routes to appropriate API:
+- `helix`: Legacy Helix API (deprecated, kept for existing SIMs)
+- `atomic`: New AT&T ATOMIC API (uses MSISDN as identifier, credentials in body)
+- `wing_iot`: AT&T IoT API (uses ICCID, Basic Auth, MDN rotation via plan swap)
+- `teltik`: T-Mobile API (separate integration, unchanged)
+
+**Why:** Helix API is being deprecated. ATOMIC and Wing IoT are replacement AT&T providers with different API patterns. ATOMIC is full-featured (suspend/restore/cancel/OTA). Wing IoT is simpler (no suspend/restore/OTA/cancel API — only activation and plan changes). Cannot mass-migrate existing Helix SIMs — they stay on Helix until ops fail.
+
+**Consequence:**
+- `carrier_api_logs` (renamed from `helix_api_logs`) now has `vendor` column — all log queries should filter by vendor when needed
+- ATOMIC uses `sims.msisdn` as identifier; Helix uses `mobility_subscription_id` — both columns may be populated
+- details-finalizer only processes `vendor='helix'` SIMs (ATOMIC/Wing IoT get MDN at activation)
+- Wing IoT SIMs cannot be suspended/restored/cancelled via API — only DB status update
+- Do NOT remove Helix code paths — existing Helix SIMs will continue using them until individually migrated
+
+---
+
 ## 2026-03-25 — Teltik 48h rotation guard stamped before polling completes
 
 **Decision:** In `rotateTeltikSims`, `sims.last_mdn_rotated_at` is written to DB immediately after the `change-number` API call succeeds (before the polling loop), not after polling confirms the new MDN.

@@ -50,7 +50,7 @@ export default {
           // Get SIM and current phone number from database
           const sims = await supabaseSelect(
             env,
-            `sims?select=id,iccid,mobility_subscription_id,status&id=eq.${encodeURIComponent(simId)}&limit=1`
+            `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor&id=eq.${encodeURIComponent(simId)}&limit=1`
           );
 
           if (!sims || sims.length === 0) {
@@ -64,7 +64,8 @@ export default {
           }
 
           const sim = sims[0];
-          const { iccid, mobility_subscription_id: subId, status } = sim;
+          const { iccid, mobility_subscription_id: subId, msisdn, status } = sim;
+          const vendor = sim.vendor || 'helix';
 
           // Skip if already in target state
           if ((action === "suspend" && status === "suspended") ||
@@ -78,38 +79,64 @@ export default {
             continue;
           }
 
-          if (!subId) {
+          // Wing IoT and Teltik don't support suspend/restore
+          if (vendor === 'wing_iot' || vendor === 'teltik') {
             errors++;
             results.push({
               sim_id: simId,
               ok: false,
-              error: "No mobility_subscription_id found"
+              error: `${vendor} SIMs do not support suspend/restore`
             });
             continue;
           }
 
-          // Get current phone number
-          const numbers = await supabaseSelect(
-            env,
-            `sim_numbers?select=e164&sim_id=eq.${simId}&valid_to=is.null&limit=1`
-          );
-
-          const phoneNumber = numbers?.[0]?.e164;
-          if (!phoneNumber) {
+          // Check for required identifier
+          if (vendor === 'helix' && !subId) {
             errors++;
             results.push({
               sim_id: simId,
               ok: false,
-              error: "No active phone number found"
+              error: "No mobility_subscription_id found (helix)"
+            });
+            continue;
+          }
+          if (vendor === 'atomic' && !msisdn) {
+            errors++;
+            results.push({
+              sim_id: simId,
+              ok: false,
+              error: "No msisdn found (atomic)"
             });
             continue;
           }
 
-          // Strip +1 prefix for Helix API (expects 10-digit MDN)
-          const mdn = phoneNumber.replace(/^\+1/, "");
+          // Get current phone number for helix
+          let phoneNumber = msisdn;
+          if (vendor === 'helix') {
+            const numbers = await supabaseSelect(
+              env,
+              `sim_numbers?select=e164&sim_id=eq.${simId}&valid_to=is.null&limit=1`
+            );
+            phoneNumber = numbers?.[0]?.e164;
+            if (!phoneNumber) {
+              errors++;
+              results.push({
+                sim_id: simId,
+                ok: false,
+                error: "No active phone number found"
+              });
+              continue;
+            }
+          }
 
-          // Call Helix API to change status
-          await hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reasonCodeId, iccid);
+          // Call carrier API to change status based on vendor
+          if (vendor === 'atomic') {
+            await atomicChangeStatus(env, msisdn, action, iccid);
+          } else {
+            // Strip +1 prefix for Helix API (expects 10-digit MDN)
+            const mdn = phoneNumber.replace(/^\+1/, "");
+            await hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reasonCodeId, iccid);
+          }
 
           // Update SIM status in database
           await supabasePatch(
@@ -197,6 +224,66 @@ function json(obj, status = 200) {
   });
 }
 
+/* ================= ATOMIC API ================= */
+
+async function atomicChangeStatus(env, msisdn, action, iccid) {
+  const runId = `status_${Date.now().toString(36)}`;
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+
+  const requestType = action === 'suspend' ? 'suspendSubscriber' : 'restoreSubscriber';
+  const reasonCode = action === 'suspend' ? 'NPG' : 'CR';
+
+  const requestBody = {
+    wholeSaleApi: {
+      session: {
+        userName: env.ATOMIC_USERNAME,
+        token: env.ATOMIC_TOKEN,
+        pin: env.ATOMIC_PIN,
+      },
+      wholeSaleRequest: {
+        requestType,
+        MSISDN: msisdn,
+        reasonCode,
+      },
+    },
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  });
+
+  const responseData = await safeReadJsonOrText(res);
+
+  await logCarrierApi(env, {
+    runId,
+    step: `change_status_${action}`,
+    iccid,
+    vendor: 'atomic',
+    requestUrl: url,
+    requestMethod: 'POST',
+    requestBody,
+    responseStatus: res.status,
+    responseOk: res.ok,
+    responseBodyText: responseData.text,
+    responseBodyJson: responseData.json,
+  });
+
+  if (!res.ok) {
+    throw new Error(`ATOMIC ${requestType} failed ${res.status}: ${responseData.text}`);
+  }
+
+  const statusCode = responseData.json?.wholeSaleApi?.wholeSaleResponse?.statusCode;
+  if (statusCode !== '00') {
+    const desc = responseData.json?.wholeSaleApi?.wholeSaleResponse?.description || 'Unknown error';
+    throw new Error(`ATOMIC ${requestType} failed: ${desc}`);
+  }
+
+  console.log(`[ATOMIC] Successfully ${action} MSISDN ${msisdn}`);
+  return responseData.json;
+}
+
 /* ================= HELIX API ================= */
 
 async function hxGetBearerToken(env) {
@@ -273,9 +360,10 @@ async function hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reas
   return statusData.json;
 }
 
-async function logHelixApi(env, data) {
+async function logCarrierApi(env, data) {
+  const vendor = data.vendor || 'helix';
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -286,6 +374,7 @@ async function logHelixApi(env, data) {
         run_id: data.runId,
         step: data.step,
         iccid: data.iccid,
+        vendor,
         request_url: data.requestUrl,
         request_method: data.requestMethod,
         request_body: data.requestBody,
@@ -297,8 +386,13 @@ async function logHelixApi(env, data) {
       }),
     });
   } catch (e) {
-    console.log(`[LogHelixApi] Failed to log: ${e}`);
+    console.log(`[LogCarrierApi] Failed to log: ${e}`);
   }
+}
+
+// Backward compatibility alias
+async function logHelixApi(env, data) {
+  return logCarrierApi(env, { ...data, vendor: 'helix' });
 }
 
 /* ================= SUPABASE ================= */

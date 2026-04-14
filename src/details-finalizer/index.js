@@ -1,8 +1,9 @@
 // =========================================================
 // DETAILS FINALIZER WORKER
 // Cron: every 5 minutes.
-// For each provisioning SIM with a sub_id, calls Helix subscriber_details,
+// For each provisioning HELIX SIM with a sub_id, calls Helix subscriber_details,
 // syncs DB via syncSimFromHelixDetails, then sets status=active once MDN is assigned.
+// Note: ATOMIC and Wing IoT SIMs don't need finalization — MDN is assigned at activation.
 // =========================================================
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
@@ -33,9 +34,10 @@ export default {
 async function runFinalizer(env, limit) {
   const token = await hxGetBearerToken(env);
 
+  // Only process Helix SIMs - ATOMIC and Wing IoT get MDN at activation time
   const sims = await supabaseSelect(
     env,
-    `sims?select=id,iccid,mobility_subscription_id,status,imei,activated_at&status=eq.provisioning&limit=${limit}`
+    `sims?select=id,iccid,mobility_subscription_id,status,imei,activated_at,vendor&status=eq.provisioning&vendor=eq.helix&limit=${limit}`
   );
 
   let processed = 0;

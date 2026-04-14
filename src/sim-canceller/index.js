@@ -42,7 +42,7 @@ export default {
           // Get SIM from database
           const sims = await supabaseSelect(
             env,
-            `sims?select=id,iccid,mobility_subscription_id,status&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+            `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
           );
 
           if (!sims || sims.length === 0) {
@@ -56,7 +56,8 @@ export default {
           }
 
           const sim = sims[0];
-          const { id: simId, mobility_subscription_id: subId, status } = sim;
+          const { id: simId, mobility_subscription_id: subId, msisdn, status } = sim;
+          const vendor = sim.vendor || 'helix';
 
           // Skip if already canceled
           if (status === 'canceled') {
@@ -69,18 +70,39 @@ export default {
             continue;
           }
 
-          if (!subId) {
+          // Check for required identifier based on vendor
+          if (vendor === 'helix' && !subId) {
             errors++;
             results.push({
               iccid,
               ok: false,
-              error: "No mobility_subscription_id found"
+              error: "No mobility_subscription_id found (helix)"
+            });
+            continue;
+          }
+          if (vendor === 'atomic' && !msisdn) {
+            errors++;
+            results.push({
+              iccid,
+              ok: false,
+              error: "No msisdn found (atomic)"
             });
             continue;
           }
 
-          // Cancel with Helix
-          await hxCancelSubscription(env, token, subId, iccid);
+          // Cancel based on vendor
+          if (vendor === 'atomic') {
+            await atomicCancelSubscription(env, msisdn, iccid);
+          } else if (vendor === 'wing_iot') {
+            // Wing IoT has no cancel API - just update DB
+            console.log(`[Wing IoT] ${iccid}: No cancel API, marking DB only`);
+          } else if (vendor === 'teltik') {
+            // Teltik has no cancel API - just update DB
+            console.log(`[Teltik] ${iccid}: No cancel API, marking DB only`);
+          } else {
+            // Helix
+            await hxCancelSubscription(env, token, subId, iccid);
+          }
 
           // Update SIM status to canceled
           await supabasePatch(
@@ -170,6 +192,63 @@ function json(obj, status = 200) {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+/* ================= ATOMIC API ================= */
+
+async function atomicCancelSubscription(env, msisdn, iccid) {
+  const runId = `cancel_${Date.now().toString(36)}`;
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+
+  const requestBody = {
+    wholeSaleApi: {
+      session: {
+        userName: env.ATOMIC_USERNAME,
+        token: env.ATOMIC_TOKEN,
+        pin: env.ATOMIC_PIN,
+      },
+      wholeSaleRequest: {
+        requestType: 'deactivateSubscriber',
+        MSISDN: msisdn,
+        reasonCode: 'DD',
+      },
+    },
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  });
+
+  const responseData = await safeReadJsonOrText(res);
+
+  await logCarrierApi(env, {
+    runId,
+    step: 'cancel_subscription',
+    iccid,
+    vendor: 'atomic',
+    requestUrl: url,
+    requestMethod: 'POST',
+    requestBody,
+    responseStatus: res.status,
+    responseOk: res.ok,
+    responseBodyText: responseData.text,
+    responseBodyJson: responseData.json,
+  });
+
+  if (!res.ok) {
+    throw new Error(`ATOMIC deactivate failed ${res.status}: ${responseData.text}`);
+  }
+
+  const statusCode = responseData.json?.wholeSaleApi?.wholeSaleResponse?.statusCode;
+  if (statusCode !== '00') {
+    const desc = responseData.json?.wholeSaleApi?.wholeSaleResponse?.description || 'Unknown error';
+    throw new Error(`ATOMIC deactivate failed: ${desc}`);
+  }
+
+  console.log(`[ATOMIC] Successfully cancelled MSISDN ${msisdn}`);
+  return responseData.json;
 }
 
 /* ================= HELIX API ================= */
@@ -294,9 +373,10 @@ async function hxCancelSubscription(env, token, subscriptionId, iccid) {
   return cancelData.json;
 }
 
-async function logHelixApi(env, data) {
+async function logCarrierApi(env, data) {
+  const vendor = data.vendor || 'helix';
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -307,6 +387,7 @@ async function logHelixApi(env, data) {
         run_id: data.runId,
         step: data.step,
         iccid: data.iccid,
+        vendor,
         request_url: data.requestUrl,
         request_method: data.requestMethod,
         request_body: data.requestBody,
@@ -318,8 +399,13 @@ async function logHelixApi(env, data) {
       }),
     });
   } catch (e) {
-    console.log(`[LogHelixApi] Failed to log: ${e}`);
+    console.log(`[LogCarrierApi] Failed to log: ${e}`);
   }
+}
+
+// Backward compatibility alias
+async function logHelixApi(env, data) {
+  return logCarrierApi(env, { ...data, vendor: 'helix' });
 }
 
 /* ================= SUPABASE ================= */

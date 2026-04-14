@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-03-25 (session 11)
+> Last updated: 2026-04-14 (session 13)
 
 ---
 
@@ -15,6 +15,14 @@ _None currently tracked. Add here when something breaks in production._
 
 ### Dashboard Redesign — Now in Production
 Gemini UI (zinc/blue palette, light mode, custom confirm/toast dialogs) was unintentionally deployed to prod in session 9, and all related bugs are now fixed. Production dashboard is running the new UI and is stable.
+
+### ATOMIC + Wing IoT Migration — Phase 2 Complete, Phase 3 Pending
+- **Phase 1 (DB):** Complete — msisdn column added, helix_api_logs renamed to carrier_api_logs with vendor column, backward-compatible view created
+- **Phase 2 (Workers):** Code updated but **NOT DEPLOYED** — bulk-activator, mdn-rotator, ota-status-sync, sim-status-changer, sim-canceller, details-finalizer all have vendor routing
+- **Secrets:** All ATOMIC + Wing IoT secrets added to workers via `wrangler secret put`
+- **Phase 3 (Dashboard):** NOT STARTED — needs vendor filter dropdown, carrier query routing, disable OTA/suspend for wing_iot
+- **New files (untracked):** src/shared/atomic.ts, src/shared/wing-iot.ts, migrations/008_atomic_wing_iot.sql, .claude/skills/atomic-api/, .claude/skills/wing-iot/
+- **Next step:** Deploy the 6 updated workers, then update dashboard
 
 ### BLIMEI / IMEI Heartbeat — Both Disabled
 - Both `imei_heartbeat` and `blimei_update` queue handlers in mdn-rotator are disabled (short-circuit added during gateway instability investigation)
@@ -48,6 +56,8 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-14 | ATOMIC + Wing IoT migration: new shared modules (atomic.ts, wing-iot.ts), vendor routing in 6 workers, DB migration (carrier_api_logs + vendor column), new API skills — **workers NOT deployed yet** | bulk-activator, mdn-rotator, ota-status-sync, sim-status-changer, sim-canceller, details-finalizer |
+| 2026-03-27 | Billing: vendor-split billing — Teltik SIMs billed per 48h block at 2× daily_rate; Helix SIMs billed per calendar day at daily_rate; both preview and CSV download updated; buildCSV uses per-row rate | dashboard |
 | 2026-03-25 | Teltik webhook: 48h guard stamped on change-number initiation (before polling); fallback to get-phone-number if polling fails; online_until = midnightNYAfterInterval(last_mdn_rotated_at, interval_hours) in all 3 code paths; carrier field (T-Mobile/att) added to all number.online payloads; webhook handler fixed for Teltik push format (destination/origin/message/timestamp) + array payload support | teltik-worker, reseller-sync, dashboard |
 | 2026-03-25 | Teltik vendor integration: new `teltik-worker` (import/webhook/rotate/setup-webhook), DB migration adds vendor/carrier/rotation_interval_hours to sims, mdn-rotator filters to helix-only + vendor guard in rotateSpecificSim, reseller-sync vendor-aware online_until + interval-based backstop skip, dashboard vendor column/filter/Import button | teltik-worker (new), mdn-rotator, reseller-sync, dashboard, DB migration |
 | 2026-03-24 | Dashboard: fixed two prod bugs from prior session — missing fetch URLs in queryHelix/queryHelixBulk (bare backtick issue) and \n→newline in dbLines.join (template literal escape bug); rewrote _check_frontend_js.js to use Node vm.runInContext to accurately simulate template evaluation | dashboard |

@@ -19,6 +19,18 @@ import {
     hxOtaRefresh,
     hxChangeSubscriberStatus
 } from '../shared/helix';
+import {
+    atomicSwapMsisdn,
+    atomicSubscriberInquiry,
+    atomicResendOta,
+    atomicSuspend,
+    atomicRestore,
+    atomicDeactivate
+} from '../shared/atomic';
+import {
+    wingRotateMdn,
+    wingGetDevice
+} from '../shared/wing-iot';
 
 // ===========================
 // Webhook Helpers (duplicated from sms-ingest/index.ts for now)
@@ -196,54 +208,114 @@ async function updateSimRotationError(env: Env, simId: string, errorMessage: str
 }
 
 
-async function rotateSingleSim(env: Env, token: string, sim: any) {
-    const subId = sim.mobility_subscription_id;
+async function rotateSingleSim(env: Env, token: string | null, sim: any) {
     const iccid = sim.iccid;
-
-    if (!subId) {
-        console.log(`SIM ${iccid}: no mobility_subscription_id, skipping`);
-        return;
-    }
-
+    const vendor = sim.vendor || 'helix';
     const runId = `rotate_${iccid}_${Date.now()}`;
 
-    // 1) MDN change
-    await hxMdnChange(env, token, subId, runId, iccid);
+    let e164: string;
+    let identifier: string; // subId for helix, msisdn for atomic/wing_iot
 
-    // 2) Get new number
-    const details: any = await hxSubscriberDetails(env, token, subId, runId, iccid);
-    const d = Array.isArray(details) ? details[0] : null;
-    const phoneNumber = d?.phoneNumber;
-    const detailsIccid = d?.iccid || iccid;
+    switch (vendor) {
+        case 'atomic': {
+            const msisdn = sim.msisdn;
+            if (!msisdn) {
+                console.log(`SIM ${iccid}: no msisdn for ATOMIC, skipping`);
+                return;
+            }
+            identifier = msisdn;
 
-    if (!phoneNumber) throw new Error(`No phoneNumber returned for SUBID ${subId}`);
+            // ATOMIC: Update address to target ZIP, then swap MSISDN
+            // For now, use existing ZIP to get a new MDN in same area code
+            const zipCode = env.HX_ZIP || '75001';
+            await atomicSwapMsisdn(env, msisdn, zipCode, runId, iccid);
 
-    const e164 = normalizeToE164(phoneNumber); // using shared utils
+            // Get new MSISDN
+            const inquiry = await atomicSubscriberInquiry(env, { msisdn }, runId, iccid);
+            const newMsisdn = inquiry?.Result?.MSISDN || inquiry?.MSISDN;
+            if (!newMsisdn) throw new Error(`ATOMIC: No new MSISDN returned after swap`);
 
-    // 3, 4, 5, 6
+            e164 = normalizeToE164(newMsisdn);
+
+            // Update sim.msisdn in DB
+            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(sim.id)}`, { msisdn: newMsisdn });
+            break;
+        }
+
+        case 'wing_iot': {
+            // Wing IoT: Plan swap dance (dialable -> non-dialable -> dialable)
+            const result = await wingRotateMdn(env, iccid, runId);
+            if (!result.newMdn) throw new Error(`Wing IoT: No new MDN returned after rotation`);
+
+            e164 = normalizeToE164(result.newMdn);
+            identifier = iccid;
+
+            // Update sim.msisdn in DB
+            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(sim.id)}`, { msisdn: result.newMdn });
+            break;
+        }
+
+        case 'helix':
+        default: {
+            const subId = sim.mobility_subscription_id;
+            if (!subId) {
+                console.log(`SIM ${iccid}: no mobility_subscription_id, skipping`);
+                return;
+            }
+            if (!token) throw new Error('Helix token required');
+            identifier = subId;
+
+            // 1) MDN change
+            await hxMdnChange(env, token, subId, runId, iccid);
+
+            // 2) Get new number
+            const details: any = await hxSubscriberDetails(env, token, subId, runId, iccid);
+            const d = Array.isArray(details) ? details[0] : null;
+            const phoneNumber = d?.phoneNumber;
+
+            if (!phoneNumber) throw new Error(`No phoneNumber returned for SUBID ${subId}`);
+
+            e164 = normalizeToE164(phoneNumber);
+            break;
+        }
+    }
+
+    // Update DB and send webhook
     await closeCurrentNumber(env, sim.id);
     await insertNewNumber(env, sim.id, e164);
     await updateSimRotationTimestamp(env, sim.id);
-    await sendNumberOnlineWebhook(env, sim.id, e164, detailsIccid, subId);
+    await sendNumberOnlineWebhook(env, sim.id, e164, iccid, identifier);
 
-    console.log(`SIM ${iccid}: rotated to ${e164}`);
+    console.log(`SIM ${iccid} (${vendor}): rotated to ${e164}`);
 }
 
 async function rotateSpecificSim(env: Env, iccid: string) {
     let sim: any = null;
     try {
-        const sims: any[] = await supabaseSelect(env, `sims?select=id,iccid,mobility_subscription_id,status&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+        const sims: any[] = await supabaseSelect(env, `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
         if (!sims.length) return { ok: false, error: `SIM not found via ICCID: ${iccid}` };
 
         sim = sims[0];
-        if (!sim.mobility_subscription_id) return { ok: false, error: `SIM ${iccid} has no subId` };
+        const vendor = sim.vendor || 'helix';
+
+        // Check for required identifier based on vendor
+        if (vendor === 'helix' && !sim.mobility_subscription_id) {
+            return { ok: false, error: `SIM ${iccid} has no subId (helix)` };
+        }
+        if ((vendor === 'atomic') && !sim.msisdn) {
+            return { ok: false, error: `SIM ${iccid} has no msisdn (atomic)` };
+        }
         if (sim.status !== 'active') return { ok: false, error: `SIM ${iccid} not active` };
 
-        const token = await getCachedToken(env);
+        // Get token only for helix
+        let token: string | null = null;
+        if (vendor === 'helix') {
+            token = await getCachedToken(env);
+        }
 
         return await retryWithBackoff(async () => {
             await rotateSingleSim(env, token, sim);
-            return { ok: true, iccid, message: `SIM ${iccid} rotated successfully` };
+            return { ok: true, iccid, vendor, message: `SIM ${iccid} rotated successfully via ${vendor}` };
         }, { attempts: 3, label: `rotateSpecificSim ${iccid}` });
 
     } catch (err) {
@@ -256,15 +328,28 @@ async function queueSimsForRotation(env: Env, options: { limit?: number } = {}) 
     const isManualRun = options.limit && options.limit < 10000;
     const queryLimit = options.limit || 10000;
 
-    let query = `sims?select=id,iccid,mobility_subscription_id,status&mobility_subscription_id=not.is.null&status=eq.active`;
+    // Select SIMs that have an identifier: mobility_subscription_id (helix) or msisdn (atomic/wing_iot)
+    // Exclude teltik - has its own rotation worker
+    let query = `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor&status=eq.active&vendor=neq.teltik`;
 
+    // SIM must have either mobility_subscription_id OR msisdn
+    // PostgREST doesn't support OR easily, so we'll filter client-side
     if (isManualRun) {
         query += `&order=last_mdn_rotated_at.asc.nullsfirst&limit=${queryLimit}`;
     } else {
         query += `&order=id.asc&limit=${queryLimit}`;
     }
 
-    const sims: any[] = await supabaseSelect(env, query);
+    const allSims: any[] = await supabaseSelect(env, query);
+
+    // Filter: must have identifier based on vendor
+    const sims = allSims.filter(sim => {
+        const vendor = sim.vendor || 'helix';
+        if (vendor === 'helix') return !!sim.mobility_subscription_id;
+        if (vendor === 'atomic' || vendor === 'wing_iot') return !!sim.msisdn || !!sim.iccid;
+        return false;
+    });
+
     if (!sims.length) return { ok: true, queued: 0, message: "No SIMs" };
 
     const messages = sims.map(sim => ({ body: sim }));

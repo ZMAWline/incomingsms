@@ -1,8 +1,8 @@
 // =========================================================
 // SIM ACTIVATOR WORKER
-// Queues individual Helix activations — one SIM at a time.
-// Queue consumer calls POST /api/mobility-activation/activate per SIM
-// (single-unit endpoint, no ICCID ordering ambiguity).
+// Queues individual SIM activations — one SIM at a time.
+// Supports multiple vendors: helix, atomic, wing_iot
+// Queue consumer routes to appropriate carrier API per SIM.
 // =========================================================
 
 export default {
@@ -61,50 +61,79 @@ export default {
         validationErrors++;
         continue;
       }
-      await env.ACTIVATION_QUEUE.send({ iccid, imei, reseller_id: resellerId, run_id: runId });
+      // Default vendor is 'atomic' for new AT&T activations
+      const vendor = 'atomic';
+      await env.ACTIVATION_QUEUE.send({ iccid, imei, reseller_id: resellerId, run_id: runId, vendor });
       queued++;
     }
 
     return json({ ok: true, queued, validation_errors: validationErrors, run_id: runId });
   },
 
-  // ── Queue consumer — one SIM at a time ───────────────────────────────────
+  // ── Queue consumer — one SIM at a time, routes by vendor ─────────────────
   async queue(batch, env) {
-    let token;
-    try {
-      token = await hxGetBearerToken(env);
-    } catch (e) {
-      console.error(`[Activator] Token fetch failed: ${e} — leaving batch in queue`);
-      // Do NOT ack — let all messages retry
-      return;
+    // Pre-fetch Helix token only if we have helix SIMs in batch
+    let helixToken = null;
+    const hasHelix = batch.messages.some(m => m.body.vendor === 'helix');
+    if (hasHelix) {
+      try {
+        helixToken = await hxGetBearerToken(env);
+      } catch (e) {
+        console.error(`[Activator] Helix token fetch failed: ${e} — leaving Helix messages in queue`);
+        // Only ack non-helix messages, retry helix ones
+        for (const msg of batch.messages) {
+          if (msg.body.vendor !== 'helix') {
+            // Process non-helix normally
+          } else {
+            // Don't ack helix messages - they'll retry
+          }
+        }
+      }
     }
 
     for (const msg of batch.messages) {
-      const { iccid, imei, reseller_id: resellerId, run_id: runId } = msg.body;
+      const { iccid, imei, reseller_id: resellerId, run_id: runId, vendor = 'atomic' } = msg.body;
       try {
-        // Skip if already has a sub_id (previous attempt may have succeeded)
+        // Skip if already activated (check for sub_id or msisdn based on vendor)
         const existing = await supabaseSelect(
           env,
-          `sims?select=id,mobility_subscription_id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+          `sims?select=id,mobility_subscription_id,msisdn,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
         );
-        if (existing?.[0]?.mobility_subscription_id) {
-          console.log(`[Activator] ${iccid}: already has sub_id — skipping`);
+        const existingSim = existing?.[0];
+        if (existingSim?.mobility_subscription_id || existingSim?.msisdn) {
+          console.log(`[Activator] ${iccid}: already activated — skipping`);
           msg.ack();
           continue;
         }
 
-        const result = await hxActivate(env, token, iccid, imei, runId);
-        const subId = String(result.mobilitySubscriptionId);
+        let result;
+        switch (vendor) {
+          case 'atomic':
+            result = await activateViaAtomic(env, iccid, imei, runId);
+            break;
+          case 'wing_iot':
+            result = await activateViaWingIot(env, iccid, runId);
+            break;
+          case 'helix':
+            if (!helixToken) {
+              console.error(`[Activator] ${iccid}: No Helix token — skipping`);
+              continue; // Don't ack, will retry
+            }
+            result = await activateViaHelix(env, helixToken, iccid, imei, runId);
+            break;
+          default:
+            throw new Error(`Unknown vendor: ${vendor}`);
+        }
 
-        const simId = await upsertSim(env, iccid, subId);
+        const simId = await upsertSimWithVendor(env, iccid, result, vendor);
         if (resellerId) await assignSimToReseller(env, resellerId, simId);
 
-        console.log(`[Activator] ${iccid}: activated subId=${subId} simId=${simId}`);
+        console.log(`[Activator] ${iccid}: activated via ${vendor}, simId=${simId}`);
         msg.ack();
       } catch (e) {
         console.error(`[Activator] ${iccid}: failed: ${e}`);
-        try { await upsertSimError(env, iccid, String(e)); } catch {}
-        msg.ack(); // ACK to prevent infinite retry — error recorded in DB, details-finalizer won't pick it up
+        try { await upsertSimError(env, iccid, String(e), vendor); } catch {}
+        msg.ack(); // ACK to prevent infinite retry — error recorded in DB
       }
     }
   },
@@ -130,19 +159,165 @@ async function handleActivateJson(request, env) {
   let queued = 0;
   let validationErrors = 0;
 
+  // Default vendor from request body, or 'atomic' for AT&T
+  const defaultVendor = body.vendor || 'atomic';
+
   for (const sim of sims) {
     const iccid = String(sim.iccid || '').trim();
     const imei = String(sim.imei || '').trim();
     const resellerId = parseInt(String(sim.reseller_id || ''), 10);
-    if (!iccid || !imei || !Number.isFinite(resellerId)) {
+    // Per-SIM vendor override, fallback to default
+    const vendor = sim.vendor || defaultVendor;
+
+    // IMEI not required for wing_iot
+    if (!iccid || (!imei && vendor !== 'wing_iot') || !Number.isFinite(resellerId)) {
       validationErrors++;
       continue;
     }
-    await env.ACTIVATION_QUEUE.send({ iccid, imei, reseller_id: resellerId, run_id: runId });
+    await env.ACTIVATION_QUEUE.send({ iccid, imei, reseller_id: resellerId, run_id: runId, vendor });
     queued++;
   }
 
   return json({ ok: true, queued, validation_errors: validationErrors, attempted: sims.length, run_id: runId });
+}
+
+/* ── Vendor-specific activation functions ──────────────────────────────────── */
+
+async function activateViaAtomic(env, iccid, imei, runId) {
+  // ATOMIC activation - returns MSISDN immediately
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const requestBody = {
+    wholeSaleApi: {
+      session: {
+        userName: env.ATOMIC_USERNAME,
+        token: env.ATOMIC_TOKEN,
+        pin: env.ATOMIC_PIN,
+      },
+      wholeSaleRequest: {
+        requestType: 'Activate',
+        partnerTransactionId: `act_${Date.now()}`,
+        imei,
+        sim: iccid,
+        eSim: 'N',
+        EID: '',
+        BAN: '',
+        firstName: 'SUB',
+        lastName: 'NINE',
+        streetNumber: env.HX_ADDRESS1?.split(' ')[0] || '1',
+        streetDirection: '',
+        streetName: env.HX_ADDRESS1?.split(' ').slice(1).join(' ') || 'Main St',
+        zip: env.HX_ZIP || '75001',
+        plan: 'ATTNOVOICE',
+        portMdn: '',
+      },
+    },
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  });
+
+  const responseText = await res.text();
+  let responseJson = {};
+  try { responseJson = JSON.parse(responseText); } catch {}
+
+  await logCarrierApiCall(env, {
+    run_id: runId,
+    step: 'activation',
+    iccid,
+    imei,
+    vendor: 'atomic',
+    request_url: url,
+    request_method: 'POST',
+    request_body: requestBody,
+    response_status: res.status,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: responseJson,
+    error: res.ok ? null : `ATOMIC activation failed: ${res.status}`,
+  });
+
+  if (!res.ok) {
+    throw new Error(`ATOMIC activation failed ${res.status}: ${responseText.slice(0, 300)}`);
+  }
+
+  const result = responseJson?.wholeSaleApi?.wholeSaleResponse?.Result;
+  if (!result?.MSISDN) {
+    throw new Error(`ATOMIC activation returned no MSISDN: ${responseText.slice(0, 300)}`);
+  }
+
+  return {
+    msisdn: result.MSISDN,
+    ban: result.BAN || '',
+    status: 'active', // ATOMIC activations are immediately active
+  };
+}
+
+async function activateViaWingIot(env, iccid, runId) {
+  // Wing IoT activation - PUT with dialable plan
+  const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
+  const url = `${baseUrl}/api/v1/devices/${iccid}`;
+  const auth = `Basic ${btoa(`${env.WING_IOT_USERNAME}:${env.WING_IOT_API_KEY}`)}`;
+
+  const requestBody = {
+    communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US',
+    status: 'Activated',
+  };
+
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      Authorization: auth,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  const responseText = await res.text();
+  let responseJson = {};
+  try { responseJson = JSON.parse(responseText); } catch {}
+
+  await logCarrierApiCall(env, {
+    run_id: runId,
+    step: 'activation',
+    iccid,
+    imei: null,
+    vendor: 'wing_iot',
+    request_url: url,
+    request_method: 'PUT',
+    request_body: requestBody,
+    response_status: res.status,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: responseJson,
+    error: res.ok ? null : `Wing IoT activation failed: ${res.status}`,
+  });
+
+  if (!res.ok) {
+    throw new Error(`Wing IoT activation failed ${res.status}: ${responseText.slice(0, 300)}`);
+  }
+
+  // GET to verify and get MDN
+  const getRes = await fetch(url, {
+    method: 'GET',
+    headers: { Authorization: auth },
+  });
+  const getJson = await getRes.json().catch(() => ({}));
+
+  return {
+    msisdn: getJson.mdn || '',
+    status: 'active',
+  };
+}
+
+async function activateViaHelix(env, token, iccid, imei, runId) {
+  const result = await hxActivate(env, token, iccid, imei, runId);
+  return {
+    mobilitySubscriptionId: String(result.mobilitySubscriptionId),
+    status: 'provisioning', // Helix needs details-finalizer to get MDN
+  };
 }
 
 /* ── Helix ─────────────────────────────────────────────────────────────────── */
@@ -284,9 +459,77 @@ async function upsertSim(env, iccid, subId) {
   return inserted[0].id;
 }
 
-async function upsertSimError(env, iccid, errorMessage) {
+async function upsertSimWithVendor(env, iccid, result, vendor) {
   const existing = await supabaseSelect(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
-  const payload = { status: 'error', last_activation_error: `Activation failed: ${errorMessage}` };
+
+  // Build payload based on vendor
+  const payload = {
+    vendor,
+    carrier: 'att', // All these vendors are AT&T
+    status: result.status || 'active',
+    last_activation_error: null,
+  };
+
+  if (vendor === 'atomic' || vendor === 'wing_iot') {
+    // ATOMIC and Wing IoT use MSISDN, not mobilitySubscriptionId
+    payload.msisdn = result.msisdn;
+    // For ATOMIC/Wing, SIM is immediately active with MDN
+    if (result.msisdn) {
+      payload.status = 'active';
+    }
+  } else if (vendor === 'helix') {
+    payload.mobility_subscription_id = result.mobilitySubscriptionId;
+    payload.status = 'provisioning'; // Helix needs finalizer to get MDN
+  }
+
+  if (existing?.[0]?.id) {
+    await supabasePatch(env, `sims?id=eq.${existing[0].id}`, payload);
+    // If we have an MSISDN, also create the sim_numbers entry
+    if (result.msisdn) {
+      await createSimNumber(env, existing[0].id, result.msisdn);
+    }
+    return existing[0].id;
+  }
+
+  const inserted = await supabaseInsert(env, 'sims', [{ iccid, ...payload }]);
+  if (!inserted?.[0]?.id) throw new Error('Supabase INSERT returned no rows');
+
+  // Create sim_numbers entry for immediate MDN
+  if (result.msisdn) {
+    await createSimNumber(env, inserted[0].id, result.msisdn);
+  }
+
+  return inserted[0].id;
+}
+
+async function createSimNumber(env, simId, mdn) {
+  // Normalize to E.164
+  const e164 = mdn.startsWith('+1') ? mdn : mdn.startsWith('1') ? `+${mdn}` : `+1${mdn}`;
+
+  // Close any existing numbers for this SIM
+  await supabasePatch(env, `sim_numbers?sim_id=eq.${simId}&valid_to=is.null`, {
+    valid_to: new Date().toISOString(),
+  });
+
+  // Insert new number
+  await supabaseInsert(env, 'sim_numbers', [{
+    sim_id: simId,
+    e164,
+    valid_from: new Date().toISOString(),
+    valid_to: null,
+    verified_at: new Date().toISOString(), // Pre-verified (no SMS verification needed)
+    verification_status: 'verified',
+  }]);
+}
+
+async function upsertSimError(env, iccid, errorMessage, vendor = 'helix') {
+  const existing = await supabaseSelect(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+  const payload = {
+    status: 'error',
+    last_activation_error: `Activation failed: ${errorMessage}`,
+    vendor,
+    carrier: 'att',
+  };
   if (existing?.[0]?.id) {
     await supabasePatch(env, `sims?id=eq.${existing[0].id}`, payload);
   } else {
@@ -303,15 +546,17 @@ async function assignSimToReseller(env, resellerId, simId) {
   await supabaseInsert(env, 'reseller_sims', [{ reseller_id: resellerId, sim_id: simId, active: true }]);
 }
 
-/* ── Helix API logging ──────────────────────────────────────────────────────── */
+/* ── Carrier API logging ───────────────────────────────────────────────────── */
 
-async function logHelixApiCall(env, logData) {
+async function logCarrierApiCall(env, logData) {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+  const vendor = logData.vendor || 'helix';
   const payload = {
     run_id: logData.run_id,
     step: logData.step,
     iccid: logData.iccid || null,
     imei: logData.imei || null,
+    vendor,
     request_url: logData.request_url,
     request_method: logData.request_method,
     request_body: logData.request_body || null,
@@ -322,8 +567,8 @@ async function logHelixApiCall(env, logData) {
     error: logData.error || null,
     created_at: new Date().toISOString(),
   };
-  console.log(`[Helix API] ${logData.request_method} ${logData.request_url} -> ${logData.response_status} ${logData.response_ok ? 'OK' : 'FAIL'}`);
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
+  console.log(`[${vendor.toUpperCase()} API] ${logData.request_method} ${logData.request_url} -> ${logData.response_status} ${logData.response_ok ? 'OK' : 'FAIL'}`);
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -333,7 +578,12 @@ async function logHelixApiCall(env, logData) {
     },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) console.error(`[Helix Log] Supabase failed: ${res.status}`);
+  if (!res.ok) console.error(`[Carrier Log] Supabase failed: ${res.status}`);
+}
+
+// Backward compatibility alias
+async function logHelixApiCall(env, logData) {
+  return logCarrierApiCall(env, { ...logData, vendor: 'helix' });
 }
 
 /* ── CSV parser ─────────────────────────────────────────────────────────────── */
