@@ -1086,7 +1086,7 @@ async function rotateSpecificSim(env, iccid) {
     // Look up the SIM by ICCID
     const sims = await supabaseSelect(
       env,
-      `sims?select=id,iccid,mobility_subscription_id,status,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+      `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
     );
 
     if (!Array.isArray(sims) || sims.length === 0) {
@@ -1094,17 +1094,34 @@ async function rotateSpecificSim(env, iccid) {
     }
 
     const sim = sims[0];
+    const vendor = sim.vendor || 'helix';
 
-    if (sim.vendor === 'teltik') {
+    if (vendor === 'teltik') {
       return { ok: false, error: 'Use teltik-worker for Teltik SIM rotation' };
-    }
-
-    if (!sim.mobility_subscription_id) {
-      return { ok: false, error: `SIM ${iccid} has no mobility_subscription_id` };
     }
 
     if (sim.status !== 'active') {
       return { ok: false, error: `SIM ${iccid} is not active (status: ${sim.status})` };
+    }
+
+    if (vendor === 'atomic') {
+      if (!sim.msisdn) {
+        return { ok: false, error: `SIM ${iccid} has no msisdn (atomic)` };
+      }
+      try {
+        console.log(`SIM ${iccid}: starting ATOMIC rotation`);
+        await rotateAtomicSim(env, sim);
+        return { ok: true, iccid, message: `SIM ${iccid} rotated successfully (atomic)` };
+      } catch (err) {
+        console.error(`SIM ${iccid}: ATOMIC rotation failed: ${err}`);
+        await updateSimRotationError(env, sim.id, `ATOMIC rotation failed: ${err}`).catch(() => {});
+        return { ok: false, iccid, error: String(err) };
+      }
+    }
+
+    // helix path (default)
+    if (!sim.mobility_subscription_id) {
+      return { ok: false, error: `SIM ${iccid} has no mobility_subscription_id` };
     }
 
     const token = await getCachedToken(env);
@@ -1122,6 +1139,104 @@ async function rotateSpecificSim(env, iccid) {
     console.error(`Manual rotation failed for ${iccid}: ${err}`);
     return { ok: false, iccid, error: String(err) };
   }
+}
+
+// ===========================
+// Rotate a single ATOMIC SIM (swap MSISDN → subscriber inquiry → DB + webhook)
+// ===========================
+async function rotateAtomicSim(env, sim) {
+  const iccid = sim.iccid;
+  const currentMsisdn = sim.msisdn;
+  const runId = `rotate_${iccid}_${Date.now()}`;
+
+  if (!currentMsisdn) throw new Error(`SIM ${iccid}: no msisdn for ATOMIC rotation`);
+  if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+    throw new Error('ATOMIC credentials not configured on mdn-rotator worker');
+  }
+
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const session = {
+    userName: env.ATOMIC_USERNAME,
+    token: env.ATOMIC_TOKEN,
+    pin: env.ATOMIC_PIN,
+  };
+  const zipCode = env.HX_ZIP || '11238';
+
+  // 1) swapMSISDN
+  const swapBody = {
+    wholeSaleApi: {
+      session,
+      wholeSaleRequest: { requestType: 'swapMSISDN', MSISDN: currentMsisdn, zipCode },
+    },
+  };
+  const swapRes = await relayFetch(env, url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(swapBody),
+  });
+  const swapText = await swapRes.text();
+  let swapJson = {};
+  try { swapJson = JSON.parse(swapText); } catch {}
+  const swapR = swapJson?.wholeSaleApi?.wholeSaleResponse;
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'mdn_change', iccid, imei: null, vendor: 'atomic',
+    request_url: url, request_method: 'POST', request_body: swapBody,
+    response_status: swapRes.status, response_ok: swapRes.ok,
+    response_body_text: swapText, response_body_json: swapJson,
+    error: (swapRes.ok && swapR?.statusCode === '00') ? null :
+      `ATOMIC swapMSISDN failed: ${swapR?.description || swapRes.status}`,
+  });
+  if (!swapRes.ok) throw new Error(`ATOMIC swapMSISDN HTTP ${swapRes.status}: ${swapText.slice(0, 300)}`);
+  if (swapR?.statusCode !== '00') {
+    throw new Error(`ATOMIC swapMSISDN failed: ${swapR?.description || 'Unknown'}`);
+  }
+
+  // Try to read new MSISDN from swap response; fall back to inquiry by SIM
+  let newMsisdn = swapR?.Result?.MSISDN || swapR?.Result?.newMSISDN || swapR?.newMSISDN || null;
+
+  if (!newMsisdn) {
+    const inqBody = {
+      wholeSaleApi: {
+        session,
+        wholeSaleRequest: { requestType: 'subsriberInquiry', MSISDN: '', sim: iccid },
+      },
+    };
+    const inqRes = await relayFetch(env, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(inqBody),
+    });
+    const inqText = await inqRes.text();
+    let inqJson = {};
+    try { inqJson = JSON.parse(inqText); } catch {}
+    const inqR = inqJson?.wholeSaleApi?.wholeSaleResponse;
+    await logCarrierApiCall(env, {
+      run_id: runId, step: 'subscriber_inquiry', iccid, imei: null, vendor: 'atomic',
+      request_url: url, request_method: 'POST', request_body: inqBody,
+      response_status: inqRes.status, response_ok: inqRes.ok,
+      response_body_text: inqText, response_body_json: inqJson,
+      error: (inqRes.ok && inqR?.statusCode === '00') ? null :
+        `ATOMIC inquiry failed: ${inqR?.description || inqRes.status}`,
+    });
+    newMsisdn = inqR?.Result?.MSISDN || null;
+  }
+
+  if (!newMsisdn) throw new Error(`ATOMIC: no new MSISDN returned after swapMSISDN`);
+
+  const e164 = normalizeUS(newMsisdn);
+  const msisdnBare = String(newMsisdn).replace(/^\+?1?/, '');
+
+  // 2) DB updates (same sequence as Helix rotation)
+  await closeCurrentNumber(env, sim.id);
+  await insertNewNumber(env, sim.id, e164);
+  await updateSimRotationTimestamp(env, sim.id);
+  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: msisdnBare });
+
+  // 3) Webhook (use MSISDN as the external identifier, same slot as mobility_subscription_id
+  //    occupies for Helix SIMs — downstream reseller systems just need *an* ID)
+  await sendNumberOnlineWebhook(env, sim.id, e164, iccid, msisdnBare);
+
+  console.log(`SIM ${iccid}: ATOMIC rotated ${currentMsisdn} → ${msisdnBare} (${e164})`);
 }
 
 // ===========================
@@ -1310,7 +1425,7 @@ async function getCachedToken(env) {
 }
 
 async function hxGetBearerToken(env) {
-  const res = await fetch(env.HX_TOKEN_URL, {
+  const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1334,7 +1449,7 @@ async function hxMdnChange(env, token, mobilitySubscriptionId, runId, iccid) {
   const method = "PATCH";
   const requestBody = { mobilitySubscriptionId };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -1380,7 +1495,7 @@ async function hxSubscriberDetails(env, token, mobilitySubscriptionId, runId, ic
   const method = "POST";
   const requestBody = { mobilitySubscriptionId };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -1862,7 +1977,7 @@ async function hxCheckImeiEligibility(env, token, imei) {
   const method = "GET";
   const runId = `check_imei_${imei}_${Date.now()}`;
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -1912,7 +2027,7 @@ async function hxChangeImei(env, token, mobilitySubscriptionId, newImei, runId, 
   const method = "PATCH";
   const requestBody = [{ mobilitySubscriptionId, imei: newImei }];
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -2059,7 +2174,7 @@ async function hxOtaRefresh(env, token, payload, runId, iccid) {
   const method = "PATCH";
   const requestBody = [payload];
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -2137,7 +2252,7 @@ async function hxChangeSubscriberStatus(env, token, statusPayload, runId, iccid,
     return rest;
   });
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -2202,7 +2317,7 @@ async function hxActivate(env, token, iccid, imei) {
     },
     service: { iccid, imei },
   };
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: { "Content-Type": "application/json", Authorization: 'Bearer ' + token },
     body: JSON.stringify(requestBody),
@@ -2222,6 +2337,156 @@ async function hxActivate(env, token, iccid, imei) {
   const match = responseText.match(/"mobilitySubscriptionId"\s*:\s*"?(\d+)"?/);
   if (match) return { mobilitySubscriptionId: match[1], _raw: responseText };
   throw new Error('Activate returned ' + res.status + ' but no mobilitySubscriptionId. Raw: ' + responseText.slice(0, 200));
+}
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: {
+        ...(init?.headers || {}),
+        'x-relay-key': env.RELAY_KEY,
+      },
+    });
+  }
+  return fetch(url, init);
+}
+
+async function retryActivateViaAtomic(env, iccid, imei, runId) {
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const requestBody = {
+    wholeSaleApi: {
+      session: {
+        userName: env.ATOMIC_USERNAME,
+        token: env.ATOMIC_TOKEN,
+        pin: env.ATOMIC_PIN,
+      },
+      wholeSaleRequest: {
+        requestType: 'Activate',
+        partnerTransactionId: runId,
+        imei,
+        sim: iccid,
+        eSim: 'N',
+        EID: '',
+        BAN: '',
+        firstName: 'SUB',
+        lastName: 'NINE',
+        streetNumber: env.HX_ADDRESS1?.split(' ')[0] || '1',
+        streetDirection: '',
+        streetName: env.HX_ADDRESS1?.split(' ').slice(1).join(' ') || 'Main St',
+        zip: env.HX_ZIP || '75001',
+        plan: 'ATTNOVOICE',
+        portMdn: '',
+      },
+    },
+  };
+  const res = await relayFetch(env, url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  });
+  const responseText = await res.text();
+  let responseJson = {};
+  try { responseJson = JSON.parse(responseText); } catch {}
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'retry_activation', iccid, imei, vendor: 'atomic',
+    request_url: url, request_method: 'POST', request_body: requestBody,
+    response_status: res.status, response_ok: res.ok,
+    response_body_text: responseText, response_body_json: responseJson,
+    error: res.ok ? null : 'ATOMIC retry activation failed: ' + res.status,
+  });
+  if (!res.ok) throw new Error('ATOMIC retry activation failed ' + res.status + ': ' + responseText.slice(0, 300));
+  const result = responseJson?.wholeSaleApi?.wholeSaleResponse?.Result;
+  if (!result?.MSISDN) throw new Error('ATOMIC activation returned no MSISDN: ' + responseText.slice(0, 300));
+  return { msisdn: result.MSISDN, ban: result.BAN || '', status: 'active' };
+}
+
+async function retryActivateViaWingIot(env, iccid, runId) {
+  const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
+  const url = baseUrl + '/v1/devices/' + encodeURIComponent(iccid);
+  const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
+
+  // Step 1: GET current status to check if plan is already set
+  const getHeaders = { Authorization: auth };
+  const getRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
+  const getJson = await getRes.json().catch(() => ({}));
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'retry_activation_check', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'GET', request_body: null,
+    response_status: getRes.status, response_ok: getRes.ok,
+    response_body_text: JSON.stringify(getJson), response_body_json: getJson,
+    error: getRes.ok ? null : 'Wing IoT status check failed: ' + getRes.status,
+  });
+
+  // Step 2: PUT to activate - only include plan if not already set
+  const hasPlan = getJson.communicationPlan === 'Wing Tel Inc - NON ABIR SMS MO/MT US';
+  const requestBody = hasPlan
+    ? { status: 'Activated' }
+    : { communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US', status: 'Activated' };
+
+  const headers = { Authorization: auth, 'Content-Type': 'application/json' };
+  const res = await relayFetch(env, url, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(requestBody),
+  });
+  const responseText = await res.text();
+  let responseJson = {};
+  try { responseJson = JSON.parse(responseText); } catch {}
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'retry_activation', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'PUT', request_body: requestBody,
+    response_status: res.status, response_ok: res.ok,
+    response_body_text: responseText, response_body_json: responseJson,
+    error: res.ok ? null : 'Wing IoT retry activation failed: ' + res.status,
+  });
+  if (!res.ok) throw new Error('Wing IoT retry activation failed ' + res.status + ': ' + responseText.slice(0, 300));
+
+  // Step 3: GET to verify and get MDN
+  const verifyRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
+  const verifyJson = await verifyRes.json().catch(() => ({}));
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'retry_activation_verify', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'GET', request_body: null,
+    response_status: verifyRes.status, response_ok: verifyRes.ok,
+    response_body_text: JSON.stringify(verifyJson), response_body_json: verifyJson,
+    error: null,
+  });
+
+  return { msisdn: verifyJson.mdn || verifyJson.msisdn || '', status: 'active' };
+}
+
+async function logCarrierApiCall(env, logData) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+  const vendor = logData.vendor || 'helix';
+  const payload = {
+    run_id: logData.run_id,
+    step: logData.step,
+    iccid: logData.iccid || null,
+    imei: logData.imei || null,
+    vendor,
+    request_url: logData.request_url,
+    request_method: logData.request_method,
+    request_body: logData.request_body || null,
+    response_status: logData.response_status,
+    response_ok: logData.response_ok,
+    response_body_text: (logData.response_body_text || '').slice(0, 5000),
+    response_body_json: logData.response_body_json || null,
+    error: logData.error || null,
+    created_at: new Date().toISOString(),
+  };
+  console.log('[' + vendor.toUpperCase() + ' API] ' + logData.request_method + ' ' + logData.request_url + ' -> ' + logData.response_status + ' ' + (logData.response_ok ? 'OK' : 'FAIL'));
+  const res = await fetch(env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) console.error('[Carrier Log] Supabase failed: ' + res.status);
 }
 
 // Convert port-info dot-notation ("06.01") to gateway letter format ("6A")
@@ -2289,13 +2554,46 @@ async function getUnoccupiedCandidates(env) {
 async function retryActivation(env, simId, manualGatewayId = null, manualPort = null) {
   const sims = await supabaseSelect(
     env,
-    'sims?select=id,iccid,status,current_imei_pool_id&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
+    'sims?select=id,iccid,status,current_imei_pool_id,vendor&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
   );
   if (!Array.isArray(sims) || sims.length === 0) throw new Error('SIM not found: ' + simId);
   const sim = sims[0];
   if (sim.status !== 'error') throw new Error('SIM ' + sim.iccid + ' is not in error state (status: ' + sim.status + ')');
-  console.log('[RetryActivation] Starting for SIM ' + simId + ' (' + sim.iccid + ')');
+  const vendor = sim.vendor || 'helix';
+  console.log('[RetryActivation] Starting for SIM ' + simId + ' (' + sim.iccid + ') vendor=' + vendor);
 
+  const runId = 'retry_' + sim.iccid + '_' + Date.now();
+  let activateResult;
+
+  // Wing IoT doesn't need gateway/IMEI - just call the API directly
+  if (vendor === 'wing_iot') {
+    try {
+      activateResult = await retryActivateViaWingIot(env, sim.iccid, runId);
+      console.log('[RetryActivation] SIM ' + sim.iccid + ': Wing IoT activation submitted, msisdn=' + (activateResult.msisdn || 'pending'));
+    } catch (err) {
+      console.error('[RetryActivation] SIM ' + sim.iccid + ': Wing IoT activation failed: ' + err);
+      await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
+        { last_activation_error: String(err) });
+      throw err;
+    }
+
+    const updateData = {
+      status: 'active',
+      last_activation_error: null,
+    };
+    if (activateResult.msisdn) updateData.msisdn = activateResult.msisdn;
+    await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), updateData);
+    console.log('[RetryActivation] SIM ' + sim.iccid + ': set to active');
+
+    return {
+      ok: true,
+      vendor,
+      msisdn: activateResult.msisdn || null,
+      message: 'Wing IoT activation complete',
+    };
+  }
+
+  // For helix/atomic: need gateway slot and IMEI
   let gatewayId, port;
   if (manualGatewayId && manualPort) {
     gatewayId = manualGatewayId;
@@ -2321,7 +2619,7 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
   const poolEntry = await allocateImeiFromPool(env, simId);
   console.log('[RetryActivation] SIM ' + sim.iccid + ': allocated IMEI ' + poolEntry.imei + ' (pool entry ' + poolEntry.id + ')');
 
-  // Step 6a: Set IMEI on gateway
+  // Set IMEI on gateway
   try {
     await callSkylineSetImei(env, gatewayId, port, poolEntry.imei);
     console.log('[RetryActivation] SIM ' + sim.iccid + ': IMEI set on gateway');
@@ -2333,36 +2631,47 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
     throw err;
   }
 
-  // Step 6b: Helix activation
-  let activateResult;
+  // Vendor-aware activation (helix or atomic)
   try {
-    const token = await getCachedToken(env);
-    activateResult = await hxActivate(env, token, sim.iccid, poolEntry.imei);
-    console.log('[RetryActivation] SIM ' + sim.iccid + ': activation submitted, subId=' + activateResult.mobilitySubscriptionId);
+    if (vendor === 'atomic') {
+      activateResult = await retryActivateViaAtomic(env, sim.iccid, poolEntry.imei, runId);
+      console.log('[RetryActivation] SIM ' + sim.iccid + ': ATOMIC activation submitted, msisdn=' + activateResult.msisdn);
+    } else {
+      const token = await getCachedToken(env);
+      activateResult = await hxActivate(env, token, sim.iccid, poolEntry.imei);
+      console.log('[RetryActivation] SIM ' + sim.iccid + ': Helix activation submitted, subId=' + activateResult.mobilitySubscriptionId);
+    }
   } catch (err) {
-    console.error('[RetryActivation] SIM ' + sim.iccid + ': Helix activation failed: ' + err);
+    console.error('[RetryActivation] SIM ' + sim.iccid + ': ' + vendor + ' activation failed: ' + err);
     await retireImeiPoolEntry(env, poolEntry.id, simId).catch(() => {});
     await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
       { last_activation_error: String(err), imei: poolEntry.imei, current_imei_pool_id: poolEntry.id });
     throw err;
   }
 
-  // Step 6c: Set SIM to provisioning
-  await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), {
-    status: 'provisioning',
+  // Set SIM to provisioning (helix) or active (atomic)
+  const newStatus = vendor === 'atomic' ? 'active' : 'provisioning';
+  const updateData = {
+    status: newStatus,
     last_activation_error: null,
     imei: poolEntry.imei,
     current_imei_pool_id: poolEntry.id,
-    mobility_subscription_id: activateResult.mobilitySubscriptionId,
-  });
-  console.log('[RetryActivation] SIM ' + sim.iccid + ': set to provisioning');
+  };
+  if (activateResult.mobilitySubscriptionId) updateData.mobility_subscription_id = activateResult.mobilitySubscriptionId;
+  if (activateResult.msisdn) updateData.msisdn = activateResult.msisdn;
+  if (activateResult.ban) updateData.att_ban = activateResult.ban;
+
+  await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), updateData);
+  console.log('[RetryActivation] SIM ' + sim.iccid + ': set to ' + newStatus);
 
   return {
     ok: true,
+    vendor,
     imei: poolEntry.imei,
     gateway_id: gatewayId,
     port,
-    message: 'Activation submitted — finalizer will complete within 5 min',
+    msisdn: activateResult.msisdn || null,
+    message: newStatus === 'active' ? 'Activation complete' : 'Activation submitted — finalizer will complete within 5 min',
   };
 }
 
@@ -2648,7 +2957,7 @@ async function recordWebhookDelivery(env, delivery) {
   });
 }
 
-async function postWebhookWithRetry(url, payload, options = {}) {
+async function postWebhookWithRetry(env, url, payload, options = {}) {
   const { maxRetries = 4, initialDelayMs = 1000, messageId = 'unknown' } = options;
 
   let lastError = null;
@@ -2658,7 +2967,7 @@ async function postWebhookWithRetry(url, payload, options = {}) {
     try {
       console.log(`[Webhook] Attempt ${attempt}/${maxRetries + 1} for ${messageId} to ${url}`);
 
-      const res = await fetch(url, {
+      const res = await relayFetch(env, url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -2722,7 +3031,7 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
     return { ok: true, status: 200, attempts: 0, skipped: true };
   }
 
-  const result = await postWebhookWithRetry(webhookUrl, payload, { messageId });
+  const result = await postWebhookWithRetry(env, webhookUrl, payload, { messageId });
 
   try {
     await recordWebhookDelivery(env, {
@@ -2806,7 +3115,7 @@ async function sendErrorSummaryToSlack(env) {
     console.log("[Slack] No errors in the last 24 hours");
     // Optionally send a success message
     if (env.SLACK_NOTIFY_SUCCESS === "true") {
-      await postToSlack(env.SLACK_WEBHOOK_URL, {
+      await postToSlack(env, env.SLACK_WEBHOOK_URL, {
         text: ":white_check_mark: MDN Rotator: No errors in the last 24 hours"
       });
     }
@@ -2875,7 +3184,7 @@ async function sendErrorSummaryToSlack(env) {
     ]
   };
 
-  const result = await postToSlack(env.SLACK_WEBHOOK_URL, slackPayload);
+  const result = await postToSlack(env, env.SLACK_WEBHOOK_URL, slackPayload);
 
   return {
     ok: result.ok,
@@ -2885,9 +3194,9 @@ async function sendErrorSummaryToSlack(env) {
   };
 }
 
-async function postToSlack(webhookUrl, payload) {
+async function postToSlack(env, webhookUrl, payload) {
   try {
-    const res = await fetch(webhookUrl, {
+    const res = await relayFetch(env, webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
