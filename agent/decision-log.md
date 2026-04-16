@@ -4,6 +4,60 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-15 — Helix quarantined via HELIX_ENABLED flag (not deleted)
+
+**Decision:** Quarantine all Helix code behind an `env.HELIX_ENABLED === 'true'` feature flag across 7 workers, rather than deleting the code.
+
+**Why:** User confirmed Helix may return in the future. A flag is a single-bit toggle to re-enable vs rebuilding from scratch. The 625 canceled Helix SIMs and their historical `carrier_api_logs` entries remain visible in the dashboard for audit purposes (the vendor filter shows "Helix (disabled)" and historical logs are still viewable via the per-SIM API Logs modal).
+
+**Consequence:**
+- Do NOT delete `src/shared/helix.ts`, HX_* secrets, TOKEN_CACHE KV, or `helix_api_logs` backward-compat view.
+- Do NOT add new Helix UI or call `helix.ts` functions without first flipping `HELIX_ENABLED=true` and notifying the user.
+- To re-enable: `printf "true" | wrangler secret put HELIX_ENABLED` on all 7 workers, then redeploy.
+- When inserting new SIMs, `vendor` MUST be one of: `atomic`, `wing_iot`, `teltik`. Never default to `helix`.
+
+---
+
+## 2026-04-15 — Surgical fixes over providers.ts abstraction
+
+**Decision:** Fix the ATOMIC cron bug and provider-leak bugs via surgical per-worker patches. Do NOT build a shared `src/shared/providers.ts` abstraction layer that wraps all vendor APIs behind a unified interface.
+
+**Why:** Blast-radius minimization on a single-developer production system. The ~15 vendor-switch sites across 7 workers each handle different vendor-specific semantics (different error handling, different response shapes, different retry logic). A shared abstraction would need to unify all of these, creating a large-surface refactor with high regression risk. The surgical approach: 2 patches to mdn-rotator's cron/queue handler, 5 flag guards to other workers, 4 dashboard bug fixes. Total: +172/-61 lines across 7 files. Low blast radius, fully tested.
+
+**Consequence:**
+- Each worker continues to do its own `if (vendor === ...)` switch. This is deliberate, not accidental.
+- If a future vendor is added, it needs branches in each relevant worker — not a single central registration.
+- If the switch-site count grows past ~20, reconsider the abstraction.
+
+---
+
+## 2026-04-15 — mdn-rotator stays on index.js (not index.ts)
+
+**Decision:** Port the vendor branching from `index.ts` INTO the production `index.js`, rather than switching the wrangler entry point to `index.ts`.
+
+**Why:** `index.ts` (485 lines) is an incomplete stub — it has placeholder Slack summaries (`"Not implemented"`), `secret = "TODO"`, missing endpoints (`/imei-gateway-sync`, `/trigger-blimei-sweep`, etc.), and no fix-sim queue handler. The production `index.js` (3217 lines) has all of these. Switching entry would have broken 80%+ of the worker's functionality.
+
+**Consequence:**
+- `index.ts` is dead code. Do not try to switch the entry point to it.
+- Future changes to mdn-rotator go in `index.js`.
+- The test env (`[env.test]`) still points `main = "index.ts"` — this was temporarily flipped to `index.js` for canary testing and reverted.
+
+---
+
+## 2026-04-15 — Dashboard edits MUST go through the `patch-dashboard` skill
+
+**Decision:** Every change to `src/dashboard/index.js` — without exception and regardless of size — must be performed by invoking the `patch-dashboard` skill (`Skill` tool, `skill: "patch-dashboard"`) before writing any patch script. Freehand patch scripts are prohibited even when they appear to follow the pattern. This rule is now hardcoded in `agent/BOOTSTRAP.md` Rule 1, `agent/constraints.md §1`, and the user's auto-memory.
+
+**Why:** On 2026-04-15 a freehand `_add_gateway_export.js` patch shipped invalid JS to prod: the CSV-escape helper contained `/[",\n\r]/` which became a multi-line regex literal after the template literal evaluated `\n` and `\r` as escape sequences. The outer-Worker syntax check (Check 1) read the frontend JS as a string and passed. Only Check 2 (`_check_frontend_js.js`, which executes `getHTML()` via `vm` and syntax-checks the extracted browser JS) would have caught it — and I had skipped it because I didn't invoke the skill. The skill enforces both checks and the `--env=""` deploy.
+
+**Consequence:**
+- Do NOT handcraft a patch script and run the outer-module check only. Always open the skill first so the frontend-JS check runs.
+- Do NOT deploy the dashboard with bare `npx wrangler deploy` — always `--env=""` (prod) or `--env test`.
+- If a future session discovers this rule is overbearing (e.g. a docs-only change), the skill itself must be amended — not bypassed.
+- `_check_frontend_js.js` is load-bearing. Do not delete.
+
+---
+
 ## 2026-04-14 — ATOMIC + Wing IoT migration architecture
 
 **Decision:** Multi-vendor routing based on `sims.vendor` column. Each worker checks vendor and routes to appropriate API:

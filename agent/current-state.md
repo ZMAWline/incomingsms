@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-14 (session 13)
+> Last updated: 2026-04-15 (session 16 — Helix quarantine)
 
 ---
 
@@ -16,13 +16,18 @@ _None currently tracked. Add here when something breaks in production._
 ### Dashboard Redesign — Now in Production
 Gemini UI (zinc/blue palette, light mode, custom confirm/toast dialogs) was unintentionally deployed to prod in session 9, and all related bugs are now fixed. Production dashboard is running the new UI and is stable.
 
-### ATOMIC + Wing IoT Migration — Phase 2 Complete, Phase 3 Pending
+### ATOMIC + Wing IoT Migration — Complete + Helix Quarantined
 - **Phase 1 (DB):** Complete — msisdn column added, helix_api_logs renamed to carrier_api_logs with vendor column, backward-compatible view created
-- **Phase 2 (Workers):** Code updated but **NOT DEPLOYED** — bulk-activator, mdn-rotator, ota-status-sync, sim-status-changer, sim-canceller, details-finalizer all have vendor routing
-- **Secrets:** All ATOMIC + Wing IoT secrets added to workers via `wrangler secret put`
-- **Phase 3 (Dashboard):** NOT STARTED — needs vendor filter dropdown, carrier query routing, disable OTA/suspend for wing_iot
-- **New files (untracked):** src/shared/atomic.ts, src/shared/wing-iot.ts, migrations/008_atomic_wing_iot.sql, .claude/skills/atomic-api/, .claude/skills/wing-iot/
-- **Next step:** Deploy the 6 updated workers, then update dashboard
+- **Phase 2 (Workers):** Complete — all 6 workers deployed with vendor routing. **mdn-rotator daily cron now rotates ATOMIC SIMs** (fixed 2026-04-15 session 16; 50/50 SIMs rotated successfully on first cron tick). Wing IoT rotation not yet wired (no active Wing SIMs to rotate; only 1 Wing SIM in error state). `index.ts` (485-line partial port) is NOT production-ready — do not switch entry point.
+- **Phase 3 (Dashboard):** Complete — vendor filter, badges, OTA/Retry disabled for wing_iot, ATOMIC query modal
+- **Helix Quarantine (2026-04-15):** `HELIX_ENABLED=false` pushed to 7 workers (mdn-rotator, bulk-activator, sim-canceller, sim-status-changer, ota-status-sync, details-finalizer, dashboard). All Helix code paths are gated behind this flag. To re-enable: `printf "true" | wrangler secret put HELIX_ENABLED` on each worker. Code is preserved, not deleted.
+- **Provider-leak bugs fixed:** `sim.vendor || 'helix'` → `'unknown'` in 3 places; billing aggregation renamed `helixDays` → `attDays` for clarity
+- **Secrets:** All ATOMIC + Wing IoT + RELAY + HELIX_ENABLED secrets on every worker
+
+### Dashboard UX Consolidation — In Progress (Phase D pending)
+- **Planned (not yet implemented):** merge set-status modals, unify per-row vs bulk Retry, per-SIM detail modal, vendor-conditional button tooltips
+- **Plan file:** `.claude/plans/generic-tickling-adleman.md` — Phases D1-D4 describe the UX work
+- Pick up in next session
 
 ### BLIMEI / IMEI Heartbeat — Both Disabled
 - Both `imei_heartbeat` and `blimei_update` queue handlers in mdn-rotator are disabled (short-circuit added during gateway instability investigation)
@@ -56,7 +61,18 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
-| 2026-04-14 | ATOMIC + Wing IoT migration: new shared modules (atomic.ts, wing-iot.ts), vendor routing in 6 workers, DB migration (carrier_api_logs + vendor column), new API skills — **workers NOT deployed yet** | bulk-activator, mdn-rotator, ota-status-sync, sim-status-changer, sim-canceller, details-finalizer |
+| 2026-04-15 | **Helix Quarantine (session 16):** Full audit + quarantine of all Helix code behind `HELIX_ENABLED=false` flag on 7 workers. mdn-rotator daily cron fixed to rotate ATOMIC SIMs (50/50 success on first prod tick). 4 provider-leak bugs fixed (vendor defaults, billing aggregation). Dashboard: Helix UI elements hidden/disabled when flag off, 3 backend routes return 503, queryHelix functions gated. | mdn-rotator, bulk-activator, sim-canceller, sim-status-changer, ota-status-sync, details-finalizer, dashboard |
+| 2026-04-15 | Dashboard: shift-click range selection on SIM checkboxes (sims page) | dashboard |
+| 2026-04-15 | mdn-rotator: ATOMIC manual rotation path added — `rotateSpecificSim` now branches on vendor; new `rotateAtomicSim` calls swapMSISDN + fallback inquiry + DB/webhook writes. Daily queue (rotateSingleSim) still silently skips ATOMIC — not yet migrated. | mdn-rotator |
+| 2026-04-15 | Dashboard: gateway "Export Table" button — scans selected gateway via skyline-gateway `/port-info?all_slots=1` and downloads CSV (port/slot/iccid/imei/number/operator/signal/sim_status/state). Caught 522 escaping bug mid-session (regex char class `\n\r` became literal newlines) — fix: `\\n\\r` in source. Surfaced by `_check_frontend_js.js`. | dashboard |
+| 2026-04-15 | Dashboard: `/api/delete-sim` route + per-row Del button; child-row cleanup (sim_numbers, inbound_sms, reseller_sims, sim_status_history) + nullify system_errors.sim_id | dashboard |
+| 2026-04-15 | Dashboard: `/api/relay-test` route + new API Tester tab; presets for ATOMIC/Wing IoT/Teltik/Helix + custom | dashboard |
+| 2026-04-15 | Dashboard: `/api/atomic-query` route + separate ATOMIC option in bulk Query modal (was merged into Helix). Auto-routes by vendor in `querySimCarrier`. ATOMIC credentials (ATOMIC_USERNAME/TOKEN/PIN) pushed to dashboard worker + added to `.dev.vars`. | dashboard |
+| 2026-04-15 | Dashboard: `RELAY_URL` + `RELAY_KEY` secrets pushed (previously missing, causing 522 on any dashboard-side external API call). Full relay + ATOMIC + Wing IoT creds now in `.dev.vars`. | dashboard |
+| 2026-04-15 | Data: 625 Helix SIMs bulk-updated to `status='canceled'` via PostgREST PATCH (no migration, one-off data op) | — |
+| 2026-04-15 | Rule hardcoded: EVERY edit to `src/dashboard/index.js` must go through the `patch-dashboard` skill. Written into `agent/BOOTSTRAP.md` Rule 1 and `agent/constraints.md §1` with no-exceptions list and mandatory two-check workflow. Incident reference: freehand patch of gateway-export shipped invalid regex to prod; only the frontend JS check (part of the skill) would have caught it before deploy. | — |
+| 2026-04-14 | ATOMIC + Wing IoT Phase 2+3: deployed 6 workers with vendor routing; dashboard updated with vendor filter (atomic/wing_iot/helix/teltik), carrier_api_logs query, vendor badges, OTA/Retry disabled for wing_iot | bulk-activator, mdn-rotator, ota-status-sync, sim-status-changer, sim-canceller, details-finalizer, dashboard |
+| 2026-04-14 | ATOMIC + Wing IoT Phase 1: new shared modules (atomic.ts, wing-iot.ts), vendor routing in 6 workers, DB migration (carrier_api_logs + vendor column), new API skills | bulk-activator, mdn-rotator, ota-status-sync, sim-status-changer, sim-canceller, details-finalizer |
 | 2026-03-27 | Billing: vendor-split billing — Teltik SIMs billed per 48h block at 2× daily_rate; Helix SIMs billed per calendar day at daily_rate; both preview and CSV download updated; buildCSV uses per-row rate | dashboard |
 | 2026-03-25 | Teltik webhook: 48h guard stamped on change-number initiation (before polling); fallback to get-phone-number if polling fails; online_until = midnightNYAfterInterval(last_mdn_rotated_at, interval_hours) in all 3 code paths; carrier field (T-Mobile/att) added to all number.online payloads; webhook handler fixed for Teltik push format (destination/origin/message/timestamp) + array payload support | teltik-worker, reseller-sync, dashboard |
 | 2026-03-25 | Teltik vendor integration: new `teltik-worker` (import/webhook/rotate/setup-webhook), DB migration adds vendor/carrier/rotation_interval_hours to sims, mdn-rotator filters to helix-only + vendor guard in rotateSpecificSim, reseller-sync vendor-aware online_until + interval-based backstop skip, dashboard vendor column/filter/Import button | teltik-worker (new), mdn-rotator, reseller-sync, dashboard, DB migration |
