@@ -24,10 +24,9 @@ Gemini UI (zinc/blue palette, light mode, custom confirm/toast dialogs) was unin
 - **Provider-leak bugs fixed:** `sim.vendor || 'helix'` → `'unknown'` in 3 places; billing aggregation renamed `helixDays` → `attDays` for clarity
 - **Secrets:** All ATOMIC + Wing IoT + RELAY + HELIX_ENABLED secrets on every worker
 
-### Dashboard UX Consolidation — Mostly Complete
-- **Done (2026-04-16):** set-status modals merged (D1), bulk Retry shows per-SIM results in modal (D2), vendor tooltips for OTA/Retry buttons (D4)
-- **Deferred:** per-SIM detail modal (D3) — tabbed modal (Details/Status/IMEI/API Logs) replacing scattered per-row click targets. ~300 lines of new template-literal HTML+JS; needs dedicated session. Highest-value remaining UX improvement.
-- **Plan file:** `.claude/plans/generic-tickling-adleman.md` — D3 description still valid
+### Dashboard UX Consolidation — Complete
+- **Done (2026-04-16):** set-status modals merged (D1), bulk Retry shows per-SIM results in modal (D2), vendor tooltips for OTA/Retry buttons (D4), per-SIM detail modal (D3)
+- **D3 detail:** Tabbed modal (Details/Status/IMEI/API Logs) opened by clicking SIM ID, Status, or IMEI row buttons. IMEI tab available for any SIM with gateway+port (no sub ID required). Wrapper functions `_sdOta`/`_sdRetry`/`_sdViewLogs` used in action buttons. Deployed 2026-04-16.
 
 ### BLIMEI / IMEI Heartbeat — Both Disabled
 - Both `imei_heartbeat` and `blimei_update` queue handlers in mdn-rotator are disabled (short-circuit added during gateway instability investigation)
@@ -61,6 +60,8 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-16 | Dashboard: port display normalized client-side — `normalizePortDisplay()` converts old letter-format ports ("13C") to dot-notation ("13.03") in SIM table, detail modal, and IMEI tab. DB data unchanged. | dashboard |
+| 2026-04-16 | Dashboard: D3 per-SIM detail modal — tabbed modal (Details/Status/IMEI/API Logs) opened by SIM ID, Status, IMEI row buttons. IMEI tab requires only gateway+port (not sub ID). `_sdOpenImei()` closes detail modal before opening IMEI dialog to avoid z-index conflict. | dashboard |
 | 2026-04-16 | Dashboard: fix Query button blocked by `HELIX_ENABLED` gate — moved guard from top of `queryHelix()` into Helix-only branch so ATOMIC and Wing IoT queries work when Helix is disabled | dashboard |
 | 2026-04-15 | **Helix Quarantine (session 16):** Full audit + quarantine of all Helix code behind `HELIX_ENABLED=false` flag on 7 workers. mdn-rotator daily cron fixed to rotate ATOMIC SIMs (50/50 success on first prod tick). 4 provider-leak bugs fixed (vendor defaults, billing aggregation). Dashboard: Helix UI elements hidden/disabled when flag off, 3 backend routes return 503, queryHelix functions gated. | mdn-rotator, bulk-activator, sim-canceller, sim-status-changer, ota-status-sync, details-finalizer, dashboard |
 | 2026-04-15 | Dashboard: shift-click range selection on SIM checkboxes (sims page) | dashboard |
