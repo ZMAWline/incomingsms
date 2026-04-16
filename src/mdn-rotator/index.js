@@ -850,12 +850,14 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
     }
 
     // Default: mdn-rotation-queue
-    let token;
+    let token = null;
     try {
       token = await getCachedToken(env);
     } catch (err) {
-      console.error(`[Queue] Token fetch failed, messages will retry: ${err}`);
-      return; // Don't ack - messages will be retried (max_retries=2 in wrangler.toml)
+      // Token fetch failure is non-fatal: ATOMIC/Wing SIMs don't need a Helix token.
+      // If a Helix SIM reaches rotateSingleSim with token=null, the Helix code path
+      // will throw — acceptable since all Helix SIMs are canceled anyway.
+      console.warn(`[Queue] Helix token fetch failed (non-fatal for non-Helix SIMs): ${err}`);
     }
 
     for (const message of batch.messages) {
@@ -968,7 +970,12 @@ async function queueSimsForRotation(env, options = {}) {
   // Build query - manual runs prioritize SIMs that were rotated longest ago
   // NULLS FIRST ensures SIMs that have never been rotated get processed first
   // !inner join on reseller_sims ensures only SIMs assigned to an active client are rotated
-  let query = `sims?select=id,iccid,mobility_subscription_id,status,last_mdn_rotated_at,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&mobility_subscription_id=not.is.null&status=eq.active&vendor=eq.helix`;
+  // Include rotation-eligible vendors (helix, atomic). Exclude teltik (handled by
+  // teltik-worker on its own 48h cadence) and wing_iot (no rotation logic yet —
+  // Wing IoT SIMs are filtered out client-side via the identifier check below).
+  // Identifier requirement enforced client-side: helix needs mobility_subscription_id,
+  // atomic needs msisdn.
+  let query = `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&status=eq.active&vendor=neq.teltik`;
 
   if (isManualRun) {
     // Manual run: order by oldest rotation first (nulls first = never rotated)
@@ -980,10 +987,20 @@ async function queueSimsForRotation(env, options = {}) {
     console.log(`[Scheduled Run] Fetching all active SIMs for EST-today filter`);
   }
 
-  const sims = await supabaseSelect(env, query);
+  const rawSims = await supabaseSelect(env, query);
 
-  if (!Array.isArray(sims) || sims.length === 0) {
-    console.log("No active SIMs found.");
+  // Per-vendor identifier filter (PostgREST OR is awkward, so filter in JS).
+  // Wing IoT SIMs have no msisdn/subId in DB and fall out here — intentional
+  // until Wing rotation is wired into this worker.
+  const sims = (Array.isArray(rawSims) ? rawSims : []).filter(s => {
+    const v = s.vendor || 'helix';
+    if (v === 'helix') return !!s.mobility_subscription_id;
+    if (v === 'atomic') return !!s.msisdn;
+    return false;
+  });
+
+  if (sims.length === 0) {
+    console.log("No active SIMs eligible for rotation (vendor/identifier filter).");
     return { ok: true, queued: 0, message: "No SIMs to rotate" };
   }
 
@@ -1244,24 +1261,46 @@ async function rotateAtomicSim(env, sim) {
 // Each SIM uses ~7 subrequests, well under the 1000 limit
 // ===========================
 async function rotateSingleSim(env, token, sim) {
-  const subId = sim.mobility_subscription_id;
   const iccid = sim.iccid;
+  const vendor = sim.vendor || 'helix';
 
-  if (!subId) {
-    console.log(`SIM ${iccid}: no mobility_subscription_id, skipping`);
-    return;
-  }
-
-  // Dedup check: skip if already rotated today (catches duplicate queue messages from multi-cron)
+  // Dedup check: skip if already rotated today (catches duplicate queue messages from multi-cron).
+  // Hoisted above the vendor dispatch so it applies to every vendor uniformly.
   const todayMidnightEst = getNYMidnightISO();
   if (sim.last_mdn_rotated_at && sim.last_mdn_rotated_at >= todayMidnightEst) {
-    console.log(`SIM ${iccid}: already rotated today (${sim.last_mdn_rotated_at}), skipping duplicate queue message`);
+    console.log(`SIM ${iccid} (${vendor}): already rotated today (${sim.last_mdn_rotated_at}), skipping duplicate queue message`);
     return;
   }
   // Re-check current DB value (queue message may be stale from an earlier cron run)
   const freshSim = await supabaseSelectOne(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}&select=last_mdn_rotated_at`);
   if (freshSim && freshSim.last_mdn_rotated_at && freshSim.last_mdn_rotated_at >= todayMidnightEst) {
-    console.log(`SIM ${iccid}: DB confirms already rotated today (${freshSim.last_mdn_rotated_at}), skipping`);
+    console.log(`SIM ${iccid} (${vendor}): DB confirms already rotated today (${freshSim.last_mdn_rotated_at}), skipping`);
+    return;
+  }
+
+  // Vendor dispatch.
+  // - atomic: delegate to rotateAtomicSim (defined elsewhere in this file)
+  // - wing_iot / teltik: explicit early-return (defense-in-depth; the cron
+  //   query in queueSimsForRotation already filters these out, so reaching
+  //   here means a stray queue message — log loudly, do not fall through to
+  //   the helix code path)
+  // - helix: fall through to the original logic below (default)
+  if (vendor === 'atomic') {
+    return await rotateAtomicSim(env, sim);
+  }
+  if (vendor === 'wing_iot') {
+    console.log(`SIM ${iccid}: wing_iot rotation not implemented in mdn-rotator yet — skipping (queue message should not have reached here; check queueSimsForRotation)`);
+    return;
+  }
+  if (vendor === 'teltik') {
+    console.log(`SIM ${iccid}: teltik handled by teltik-worker — skipping (queue message should not have reached here; check queueSimsForRotation)`);
+    return;
+  }
+
+  // ---- Helix path (default) ----
+  const subId = sim.mobility_subscription_id;
+  if (!subId) {
+    console.log(`SIM ${iccid}: no mobility_subscription_id, skipping`);
     return;
   }
 
