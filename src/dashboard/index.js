@@ -6159,6 +6159,7 @@ function getHTML(helixEnabled) {
                 <button onclick="document.getElementById('set-status-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
             </div>
             <div class="p-5">
+                <p id="set-status-count" class="text-sm text-gray-400 mb-3 hidden"></p>
                 <select id="set-status-select" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent mb-4">
                     <option value="provisioning">provisioning</option>
                     <option value="active">active</option>
@@ -6177,32 +6178,6 @@ function getHTML(helixEnabled) {
         </div>
     </div>
 
-    <!-- Bulk Set Status Modal -->
-    <div id="bulk-set-status-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-sm">
-            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
-                <h3 class="text-lg font-semibold text-white">Bulk Set Status</h3>
-                <button onclick="document.getElementById('bulk-set-status-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
-            </div>
-            <div class="p-5">
-                <p class="text-sm text-gray-400 mb-3"><span id="bulk-status-count" class="text-white font-medium">0</span> SIM(s) selected</p>
-                <select id="bulk-set-status-select" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent mb-4">
-                    <option value="provisioning">provisioning</option>
-                    <option value="active">active</option>
-                    <option value="suspended">suspended</option>
-                    <option value="canceled">canceled</option>
-                    <option value="error">error</option>
-                    <option value="pending">pending</option>
-                    <option value="helix_timeout">helix_timeout</option>
-                    <option value="data_mismatch">data_mismatch</option>
-                </select>
-                <div class="flex gap-2 justify-end">
-                    <button onclick="document.getElementById('bulk-set-status-modal').classList.add('hidden')" class="px-4 py-2 text-sm bg-dark-700 hover:bg-dark-600 text-gray-300 rounded-lg transition">Cancel</button>
-                    <button id="bulk-status-apply-btn" onclick="runBulkSetStatus()" class="px-4 py-2 text-sm bg-accent hover:bg-accent/80 text-white rounded-lg transition">Apply</button>
-                </div>
-            </div>
-        </div>
-    </div>
 
     <!-- SIM Action Modal -->
     <div id="sim-action-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -8835,33 +8810,15 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         let _setStatusSimId = null;
+        // Unified set-status modal — works for single SIM and bulk
+        let _setStatusSimIds = [];
+
         function showSetStatusModal(simId, currentStatus) {
-            _setStatusSimId = simId;
-            document.getElementById('set-status-title').textContent = 'Set Status - SIM #' + simId;
+            _setStatusSimIds = [simId];
+            document.getElementById('set-status-title').textContent = 'Set Status — SIM #' + simId;
+            document.getElementById('set-status-count').classList.add('hidden');
             document.getElementById('set-status-select').value = currentStatus;
             document.getElementById('set-status-modal').classList.remove('hidden');
-        }
-
-        async function runSetStatus() {
-            const status = document.getElementById('set-status-select').value;
-            document.getElementById('set-status-modal').classList.add('hidden');
-            try {
-                const res = await fetch(API_BASE + '/set-sim-status', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sim_id: _setStatusSimId, status })
-                });
-                const result = await res.json();
-                if (result.ok) {
-                    showToast('SIM #' + _setStatusSimId + ' status set to ' + status, 'success');
-                    loadSims(true);
-                } else {
-                    showToast('Error: ' + (result.error || 'Failed'), 'error');
-                }
-            } catch (e) {
-                showToast('Error setting status', 'error');
-                console.error(e);
-            }
         }
 
         function showBulkSetStatusModal() {
@@ -8870,23 +8827,20 @@ async function sendSimOnline(simId, phoneNumber) {
                 showToast('Select at least one SIM first', 'error');
                 return;
             }
-            document.getElementById('bulk-status-count').textContent = selectedIds.length;
-            document.getElementById('bulk-set-status-select').value = 'active';
-            document.getElementById('bulk-set-status-modal').classList.remove('hidden');
+            _setStatusSimIds = selectedIds;
+            document.getElementById('set-status-title').textContent = 'Set Status — ' + selectedIds.length + ' SIMs';
+            const countEl = document.getElementById('set-status-count');
+            countEl.textContent = selectedIds.length + ' SIM(s) selected';
+            countEl.classList.remove('hidden');
+            document.getElementById('set-status-select').value = 'active';
+            document.getElementById('set-status-modal').classList.remove('hidden');
         }
 
-        async function runBulkSetStatus() {
-            const selectedIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
-            if (selectedIds.length === 0) return;
-            const status = document.getElementById('bulk-set-status-select').value;
-            document.getElementById('bulk-set-status-modal').classList.add('hidden');
-
-            const btn = document.getElementById('bulk-status-apply-btn');
-            btn.disabled = true;
-            btn.textContent = 'Applying...';
-
+        async function runSetStatus() {
+            const status = document.getElementById('set-status-select').value;
+            document.getElementById('set-status-modal').classList.add('hidden');
             let success = 0, failed = 0;
-            for (const simId of selectedIds) {
+            for (const simId of _setStatusSimIds) {
                 try {
                     const res = await fetch(API_BASE + '/set-sim-status', {
                         method: 'POST',
@@ -8900,14 +8854,12 @@ async function sendSimOnline(simId, phoneNumber) {
                     failed++;
                 }
             }
-
-            btn.disabled = false;
-            btn.textContent = 'Apply';
-
-            if (failed === 0) {
-                showToast(success + ' SIM(s) status set to ' + status, 'success');
+            if (_setStatusSimIds.length === 1) {
+                if (failed === 0) showToast('SIM #' + _setStatusSimIds[0] + ' status set to ' + status, 'success');
+                else showToast('Error setting status', 'error');
             } else {
-                showToast(success + ' success, ' + failed + ' failed', failed > 0 ? 'warning' : 'success');
+                if (failed === 0) showToast(success + ' SIM(s) status set to ' + status, 'success');
+                else showToast(success + ' success, ' + failed + ' failed', 'warning');
             }
             loadSims(true);
         }
