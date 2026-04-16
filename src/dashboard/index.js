@@ -87,10 +87,12 @@ export default {
     }
 
     if (url.pathname === '/api/helix-query') {
+      if (env.HELIX_ENABLED !== 'true') return new Response(JSON.stringify({error:'helix_disabled'}), {status:503, headers:{...corsHeaders,'Content-Type':'application/json'}});
       return handleHelixQuery(request, env, corsHeaders);
     }
 
     if (url.pathname === '/api/helix-query-bulk' && request.method === 'POST') {
+      if (env.HELIX_ENABLED !== 'true') return new Response(JSON.stringify({error:'helix_disabled'}), {status:503, headers:{...corsHeaders,'Content-Type':'application/json'}});
       return handleHelixQueryBulk(request, env, corsHeaders);
     }
 
@@ -180,6 +182,7 @@ export default {
     }
 
     if (url.pathname === '/api/trigger-blimei-sweep' && request.method === 'POST') {
+      if (env.HELIX_ENABLED !== 'true') return new Response(JSON.stringify({error:'helix_disabled'}), {status:503, headers:{...corsHeaders,'Content-Type':'application/json'}});
       return handleTriggerBlimeiSweep(env, corsHeaders);
     }
 
@@ -7378,6 +7381,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         function queryHelixSubId(subId) {
+            if (!window.HELIX_ENABLED) { showToast('Helix is disabled', 'warning'); return; }
             document.getElementById('helix-query-modal').classList.remove('hidden');
             document.getElementById('helix-query-result').classList.add('hidden');
             document.getElementById('helix-bulk-result').classList.add('hidden');
@@ -7393,6 +7397,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function queryHelix() {
+            if (!window.HELIX_ENABLED) { showToast('Helix is disabled', 'warning'); return; }
             const vendor = document.getElementById('carrier-query-vendor').value;
             const inputVal = document.getElementById('helix-subid-input').value.trim();
             if (!inputVal) {
@@ -7555,6 +7560,7 @@ async function sendSimOnline(simId, phoneNumber) {
         let _bulkNextOffset = 0;
 
         async function queryHelixBulk(offset) {
+            if (!window.HELIX_ENABLED) { showToast('Helix is disabled', 'warning'); return; }
             const btn = document.getElementById('helix-bulk-btn');
             const nextBtn = document.getElementById('helix-bulk-next-btn');
             btn.disabled = true;
@@ -10527,6 +10533,19 @@ async function sendSimOnline(simId, phoneNumber) {
         loadData();
         setInterval(loadData, 3600000);
         initTabFromUrl();
+
+        // Helix UI quarantine — hide/disable Helix-specific controls when HELIX_ENABLED=false
+        if (!window.HELIX_ENABLED) {
+            // Activate modal: remove Helix option
+            document.querySelectorAll('#activate-vendor option[value="helix"]').forEach(o => o.remove());
+            // Carrier query modal: remove Helix options
+            document.querySelectorAll('#carrier-query-vendor option[value="helix"]').forEach(o => o.remove());
+            // SIMs vendor filter: rename to indicate disabled
+            document.querySelectorAll('#filter-vendor option[value="helix"]').forEach(o => { o.textContent = 'Helix (disabled)'; });
+            // Hide Bulk Query All SIMs button (Helix-only)
+            const bulkBtn = document.getElementById('helix-bulk-btn');
+            if (bulkBtn) bulkBtn.style.display = 'none';
+        }
     </script>
         <!-- Add Mapping Modal -->
         <div id="add-mapping-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50">
