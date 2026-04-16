@@ -469,7 +469,7 @@ export default {
 
         // For retry_activation — handles its own SIM loading
         if (action === "retry_activation") {
-          const result = await retryActivation(env, sim_id, body.gateway_id ?? null, body.port ?? null);
+          const result = await retryActivation(env, sim_id, body.gateway_id ?? null, body.port ?? null, body.imei_strategy || 'new');
           return new Response(JSON.stringify(result, null, 2), {
             status: result.ok === false && !result.slot_not_found ? 500 : 200,
             headers: { "Content-Type": "application/json" }
@@ -2593,10 +2593,10 @@ async function getUnoccupiedCandidates(env) {
   return candidates;
 }
 
-async function retryActivation(env, simId, manualGatewayId = null, manualPort = null) {
+async function retryActivation(env, simId, manualGatewayId = null, manualPort = null, imeiStrategy = 'new') {
   const sims = await supabaseSelect(
     env,
-    'sims?select=id,iccid,status,current_imei_pool_id,vendor&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
+    'sims?select=id,iccid,status,current_imei_pool_id,imei,vendor&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
   );
   if (!Array.isArray(sims) || sims.length === 0) throw new Error('SIM not found: ' + simId);
   const sim = sims[0];
@@ -2655,11 +2655,19 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 
   await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), { gateway_id: gatewayId, port });
 
-  // Retire old entry + sweep orphaned in_use entries
-  await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
-
-  const poolEntry = await allocateImeiFromPool(env, simId);
-  console.log('[RetryActivation] SIM ' + sim.iccid + ': allocated IMEI ' + poolEntry.imei + ' (pool entry ' + poolEntry.id + ')');
+  // IMEI strategy: reuse existing or allocate new from pool
+  let poolEntry;
+  if (imeiStrategy === 'same' && sim.imei) {
+    poolEntry = { id: sim.current_imei_pool_id, imei: sim.imei };
+    console.log('[RetryActivation] SIM ' + sim.iccid + ': reusing existing IMEI ' + poolEntry.imei);
+  } else {
+    if (imeiStrategy === 'same') {
+      console.warn('[RetryActivation] SIM ' + sim.iccid + ': no existing IMEI on record, falling back to new pool allocation');
+    }
+    await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
+    poolEntry = await allocateImeiFromPool(env, simId);
+    console.log('[RetryActivation] SIM ' + sim.iccid + ': allocated IMEI ' + poolEntry.imei + ' (pool entry ' + poolEntry.id + ')');
+  }
 
   // Set IMEI on gateway
   try {

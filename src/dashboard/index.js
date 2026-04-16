@@ -4134,6 +4134,27 @@ function getHTML(helixEnabled) {
                 confirmPromiseResolver = resolve;
             });
         }
+        async function showImeiStrategyChoice(simCount) {
+            return new Promise(function(resolve) {
+                var overlay = document.createElement('div');
+                overlay.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+                overlay.innerHTML =
+                    '<div class="bg-dark-800 border border-dark-600 rounded-xl p-6 max-w-sm w-full mx-4">' +
+                    '<h3 class="text-white font-semibold text-lg mb-2">IMEI Strategy</h3>' +
+                    '<p class="text-gray-300 text-sm mb-5">Choose which IMEI to use for ' + simCount + ' SIM(s):</p>' +
+                    '<div class="flex flex-col gap-2">' +
+                    '<button id="_isc-same" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded transition text-left">Same IMEI &mdash; <span class="text-blue-200 text-xs">reuse the IMEI that failed</span></button>' +
+                    '<button id="_isc-new" class="px-4 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded transition text-left">New from Pool &mdash; <span class="text-green-200 text-xs">retire old IMEI, allocate a fresh one</span></button>' +
+                    '<button id="_isc-cancel" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition mt-1">Cancel</button>' +
+                    '</div></div>';
+                document.body.appendChild(overlay);
+                function cleanup(val) { document.body.removeChild(overlay); resolve(val); }
+                overlay.querySelector('#_isc-same').onclick = function() { cleanup('same'); };
+                overlay.querySelector('#_isc-new').onclick = function() { cleanup('new'); };
+                overlay.querySelector('#_isc-cancel').onclick = function() { cleanup(null); };
+                overlay.addEventListener('click', function(e) { if (e.target === overlay) cleanup(null); });
+            });
+        }
         function handleConfirm(confirmed) {
             const modal = document.getElementById('confirm-modal');
             if (modal) {
@@ -5448,12 +5469,17 @@ function getHTML(helixEnabled) {
                 <div id="guide-retry-activation" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <h3 class="text-lg font-semibold text-white mb-3">Retry Activation</h3>
                     <div class="text-sm text-gray-300 space-y-3">
-                        <p>Retries a failed activation on Helix. The SIM must have a <code class="bg-dark-900 px-1 rounded text-accent">mobility_subscription_id</code> and the subscription must be in <span class="text-red-400">ACTIVATION_FAILED</span> status on the Helix side.</p>
-                        <ol class="list-decimal list-inside space-y-1 ml-2">
-                            <li>Dashboard sends <code class="bg-dark-900 px-1 rounded text-accent">action: "retry_activation"</code> to mdn-rotator</li>
-                            <li>Worker calls Helix retry endpoint (<code class="bg-dark-900 px-1 rounded text-accent">PATCH /api/mobility-activation/activate/{subscriptionId}</code>) with corrected ICCID/IMEI</li>
-                            <li>On success, SIM status is set back to <span class="text-yellow-400">provisioning</span></li>
-                            <li>The details-finalizer will later pick it up and finalize (get phone number, set to active)</li>
+                        <p>Retries a failed SIM activation via the carrier API (ATOMIC for AT&amp;T, Wing IoT for IoT SIMs). The SIM must be in <span class="text-red-400">error</span> status.</p>
+                        <p class="mt-1">You will be prompted to choose an IMEI strategy:</p>
+                        <ul class="list-disc list-inside space-y-1 ml-2">
+                            <li><span class="text-blue-400 font-medium">Same IMEI</span> &mdash; reuses the IMEI that failed (skips pool retire/allocate). Use when the issue was a transient API error, not an IMEI problem.</li>
+                            <li><span class="text-green-400 font-medium">New from Pool</span> &mdash; retires the old IMEI and allocates a fresh one. Use when the IMEI itself may be the cause of the error.</li>
+                        </ul>
+                        <ol class="list-decimal list-inside space-y-1 ml-2 mt-2">
+                            <li>Worker locates the SIM on a gateway (or uses the slot you provide)</li>
+                            <li>Sets the chosen IMEI on the gateway port</li>
+                            <li>Calls the carrier activation API (ATOMIC: re-activates and returns MSISDN; Wing IoT: PUT activated status)</li>
+                            <li>On success, SIM status is set to <span class="text-green-400">active</span> with the new phone number</li>
                         </ol>
                     </div>
                 </div>
@@ -8776,7 +8802,8 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkRetryActivation() {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) { showToast('Select at least one SIM', 'error'); return; }
-            if (!(await showConfirm('Retry Activation', 'Retry activation for ' + simIds.length + ' SIM(s)?'))) return;
+            var _bulkStrategy = await showImeiStrategyChoice(simIds.length);
+            if (_bulkStrategy === null) return;
 
             // Show results in sim-action-modal (same modal per-row Retry uses)
             const output = document.getElementById('sim-action-output');
@@ -8793,7 +8820,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     const res = await fetch(API_BASE + '/sim-action', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ sim_id: simId, action: 'retry_activation' })
+                        body: JSON.stringify({ sim_id: simId, action: 'retry_activation', imei_strategy: _bulkStrategy })
                     });
                     const result = await res.json();
                     if (result.ok) {
@@ -8881,8 +8908,12 @@ async function sendSimOnline(simId, phoneNumber) {
             loadSims(true);
         }
 
-        async function simAction(simId, action, skipConfirm = false) {
-            if (!skipConfirm && !(await showConfirm('Run Action', \`Run \${action} on SIM #\${simId}?\`))) return;
+        async function simAction(simId, action, skipConfirm = false, extraBody = {}) {
+            if (action === 'retry_activation') {
+                var strategy = await showImeiStrategyChoice(1);
+                if (strategy === null) return;
+                extraBody = { imei_strategy: strategy };
+            } else if (!skipConfirm && !(await showConfirm('Run Action', \`Run \${action} on SIM #\${simId}?\`))) return;
 
             const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
             currentSimActionId = simId;
@@ -8897,7 +8928,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const response = await fetch(\`\${API_BASE}/sim-action\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sim_id: simId, action })
+                    body: JSON.stringify(Object.assign({ sim_id: simId, action }, extraBody))
                 });
                 const result = await response.json();
 
@@ -8929,6 +8960,9 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function retryActivation(simId, gatewayId, port) {
+            var _strategy = await showImeiStrategyChoice(1);
+            if (_strategy === null) return;
+
             const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
             currentSimActionId = simId;
             currentSimActionIccid = sim?.iccid || null;
@@ -8939,7 +8973,7 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('sim-action-modal').classList.remove('hidden');
 
             try {
-                const reqBody = { sim_id: simId, action: 'retry_activation' };
+                const reqBody = { sim_id: simId, action: 'retry_activation', imei_strategy: _strategy };
                 if (gatewayId) reqBody.gateway_id = gatewayId;
                 if (port) reqBody.port = port;
 
