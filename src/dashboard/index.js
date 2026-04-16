@@ -425,7 +425,7 @@ async function handleSims(env, corsHeaders, url) {
         activated_at: sim.activated_at || null,
         last_activation_error: sim.last_activation_error || null,
         last_notified_at: sim.last_notified_at || null,
-        vendor: sim.vendor || 'helix',
+        vendor: sim.vendor || 'unknown',
         carrier: sim.carrier || null,
         rotation_interval_hours: sim.rotation_interval_hours || 24,
       };
@@ -2862,7 +2862,7 @@ async function logSystemError(env, { source, action, sim_id, iccid, error_messag
 
 async function logCarrierApiCall(env, logData) {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
-  const vendor = logData.vendor || 'helix';
+  const vendor = logData.vendor || 'unknown';
   const payload = {
     run_id: logData.run_id,
     step: logData.step,
@@ -3234,13 +3234,13 @@ async function handleBillingPreview(url, env, corsHeaders) {
     // Collect active days by vendor (Helix=daily billing, Teltik=48h block billing)
     const dailyRate = mapping ? parseFloat(mapping.daily_rate) : 0;
     const blockRate = +(dailyRate * 2).toFixed(2);
-    const helixDays = {}; // est_date → Set of sim_ids
-    const teltikDays = {}; // est_date → Set of sim_ids
+    const attDays = {}; // est_date → Set of sim_ids (AT&T: helix + atomic + wing_iot)
+    const teltikDays = {}; // est_date → Set of sim_ids (T-Mobile: teltik)
     if (Array.isArray(rsSims)) {
       for (const rs of rsSims) {
         const daily = rs.sims?.sim_sms_daily;
         if (!Array.isArray(daily)) continue;
-        const target = rs.sims?.vendor === 'teltik' ? teltikDays : helixDays;
+        const target = rs.sims?.vendor === 'teltik' ? teltikDays : attDays;
         for (const row of daily) {
           if (!row.est_date || row.sms_count <= 0) continue;
           if (row.est_date < start || row.est_date > end) continue;
@@ -3250,10 +3250,10 @@ async function handleBillingPreview(url, env, corsHeaders) {
       }
     }
 
-    // Helix: bill per calendar day at dailyRate
-    const helixEntries = Object.keys(helixDays).sort().map(date => ({
-      date, sim_count: helixDays[date].size, rate: dailyRate,
-      amount: +(helixDays[date].size * dailyRate).toFixed(2),
+    // AT&T (helix/atomic/wing): bill per calendar day at dailyRate
+    const attEntries = Object.keys(attDays).sort().map(date => ({
+      date, sim_count: attDays[date].size, rate: dailyRate,
+      amount: +(attDays[date].size * dailyRate).toFixed(2),
     }));
 
     // Teltik: bill per 48-hour block at blockRate
@@ -3276,7 +3276,7 @@ async function handleBillingPreview(url, env, corsHeaders) {
       amount: +(teltikBlocks[date].size * blockRate).toFixed(2),
     }));
 
-    const days = [...helixEntries, ...teltikEntries].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+    const days = [...attEntries, ...teltikEntries].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
     const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
     const totalAmount = +(days.reduce((s, d) => s + d.amount, 0)).toFixed(2);
 
@@ -3387,13 +3387,13 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
     );
     const rsSims = await smsResp.json();
 
-    const helixDaysD = {};
+    const attDaysD = {};
     const teltikDaysD = {};
     if (Array.isArray(rsSims)) {
       for (const rs of rsSims) {
         const daily = rs.sims?.sim_sms_daily;
         if (!Array.isArray(daily)) continue;
-        const targetD = rs.sims?.vendor === 'teltik' ? teltikDaysD : helixDaysD;
+        const targetD = rs.sims?.vendor === 'teltik' ? teltikDaysD : attDaysD;
         for (const row of daily) {
           if (!row.est_date || row.sms_count <= 0) continue;
           if (row.est_date < start || row.est_date > end) continue;
@@ -3406,9 +3406,9 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
     const dailyRate = parseFloat(mapping.daily_rate);
     const blockRateD = +(dailyRate * 2).toFixed(2);
 
-    const helixEntriesD = Object.keys(helixDaysD).sort().map(date => ({
-      date, sim_count: helixDaysD[date].size, rate: dailyRate,
-      amount: +(helixDaysD[date].size * dailyRate).toFixed(2),
+    const attEntriesD = Object.keys(attDaysD).sort().map(date => ({
+      date, sim_count: attDaysD[date].size, rate: dailyRate,
+      amount: +(attDaysD[date].size * dailyRate).toFixed(2),
     }));
 
     const teltikBlocksD = {};
@@ -3430,7 +3430,7 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       amount: +(teltikBlocksD[date].size * blockRateD).toFixed(2),
     }));
 
-    const days = [...helixEntriesD, ...teltikEntriesD].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+    const days = [...attEntriesD, ...teltikEntriesD].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
     const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
     const totalAmount = +(days.reduce((s, d) => s + d.amount, 0)).toFixed(2);
 
@@ -8789,7 +8789,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const simId = parseInt(selected[0].value);
             const sim = tableState.sims?.data?.find(s => s.id === simId);
             if (!sim) { showToast('SIM not found', 'error'); return; }
-            querySimCarrier(simId, sim.vendor || 'helix', sim.mobility_subscription_id || '', sim.iccid || '');
+            querySimCarrier(simId, sim.vendor || 'unknown', sim.mobility_subscription_id || '', sim.iccid || '');
         }
 
         async function bulkRetryActivation() {
