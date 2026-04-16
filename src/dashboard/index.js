@@ -4100,7 +4100,7 @@ function getHTML(helixEnabled) {
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
 
-        window.HELIX_ENABLED = \${helixEnabled};
+        window.HELIX_ENABLED = ${helixEnabled};
 
         let sidebarOpen = false;
         function toggleSidebar(open) {
@@ -7372,7 +7372,6 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function queryHelix() {
-            if (!window.HELIX_ENABLED) { showToast('Helix is disabled', 'warning'); return; }
             const vendor = document.getElementById('carrier-query-vendor').value;
             const inputVal = document.getElementById('helix-subid-input').value.trim();
             if (!inputVal) {
@@ -7467,6 +7466,7 @@ async function sendSimOnline(simId, phoneNumber) {
             }
 
             // Helix query (original)
+            if (!window.HELIX_ENABLED) { showToast('Helix is disabled', 'warning'); return; }
             try {
                 const response = await fetch(\`\${API_BASE}/helix-query\`, {
                     method: 'POST',

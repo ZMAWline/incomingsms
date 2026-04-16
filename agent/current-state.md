@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-16 (session 16 continued — D1/D2/D4 UX + verification)
+> Last updated: 2026-04-16 (session 17 — fix ATOMIC Query button)
 
 ---
 
@@ -61,6 +61,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-16 | Dashboard: fix Query button blocked by `HELIX_ENABLED` gate — moved guard from top of `queryHelix()` into Helix-only branch so ATOMIC and Wing IoT queries work when Helix is disabled | dashboard |
 | 2026-04-15 | **Helix Quarantine (session 16):** Full audit + quarantine of all Helix code behind `HELIX_ENABLED=false` flag on 7 workers. mdn-rotator daily cron fixed to rotate ATOMIC SIMs (50/50 success on first prod tick). 4 provider-leak bugs fixed (vendor defaults, billing aggregation). Dashboard: Helix UI elements hidden/disabled when flag off, 3 backend routes return 503, queryHelix functions gated. | mdn-rotator, bulk-activator, sim-canceller, sim-status-changer, ota-status-sync, details-finalizer, dashboard |
 | 2026-04-15 | Dashboard: shift-click range selection on SIM checkboxes (sims page) | dashboard |
 | 2026-04-15 | mdn-rotator: ATOMIC manual rotation path added — `rotateSpecificSim` now branches on vendor; new `rotateAtomicSim` calls swapMSISDN + fallback inquiry + DB/webhook writes. Daily queue (rotateSingleSim) still silently skips ATOMIC — not yet migrated. | mdn-rotator |
