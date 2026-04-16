@@ -82,6 +82,10 @@ export default {
       return handleSimOnline(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/wing-check') {
+      return handleWingCheck(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/helix-query') {
       return handleHelixQuery(request, env, corsHeaders);
     }
@@ -273,8 +277,20 @@ export default {
       }
     }
 
+    if (url.pathname === '/api/delete-sim' && request.method === 'POST') {
+      return handleDeleteSim(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/relay-test' && request.method === 'POST') {
+      return handleRelayTest(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/atomic-query' && request.method === 'POST') {
+      return handleAtomicQuery(request, env, corsHeaders);
+    }
+
     // Serve HTML dashboard for all non-API paths (SPA routing)
-    return new Response(getHTML(), {
+    return new Response(getHTML(env.HELIX_ENABLED === 'true'), {
       headers: { 'Content-Type': 'text/html' }
     });
   },
@@ -288,6 +304,16 @@ function checkAuth(authHeader, env) {
 
   const decoded = atob(credentials);
   return decoded === env.DASHBOARD_AUTH; // Format: "username:password"
+}
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(env.RELAY_URL + '/' + url, {
+      ...init,
+      headers: { ...(init && init.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
 }
 
 async function handleStats(env, corsHeaders) {
@@ -798,6 +824,7 @@ async function handleActivateSims(request, env, corsHeaders) {
   try {
     const body = await request.json();
     const sims = body.sims || [];
+    const vendor = body.vendor || 'atomic';
 
     if (!Array.isArray(sims) || sims.length === 0) {
       return new Response(JSON.stringify({ error: 'sims array is required' }), {
@@ -819,7 +846,7 @@ async function handleActivateSims(request, env, corsHeaders) {
     const activateResponse = await env.BULK_ACTIVATOR.fetch(activateUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sims })
+      body: JSON.stringify({ sims, vendor })
     });
 
     // Handle non-JSON responses (e.g., Cloudflare errors)
@@ -1037,7 +1064,7 @@ async function handleSimOnline(request, env, corsHeaders) {
 
     // Send the webhook
     console.log(`[SimOnline] Sending webhook to ${webhookUrl} for SIM ${simId}`);
-    const webhookResponse = await fetch(webhookUrl, {
+    const webhookResponse = await relayFetch(env, webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1118,6 +1145,67 @@ async function handleSimOnline(request, env, corsHeaders) {
   }
 }
 
+async function handleWingCheck(request, env, corsHeaders) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405, headers: corsHeaders });
+  }
+  try {
+    const { iccid } = await request.json();
+    if (!iccid) {
+      return new Response(JSON.stringify({ error: 'iccid required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
+    const url = baseUrl + '/v1/devices/' + encodeURIComponent(iccid);
+    const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
+    const runId = 'wing_check_' + iccid + '_' + Date.now();
+
+    const headers = { Authorization: auth };
+    if (env.RELAY_KEY) headers['x-relay-key'] = env.RELAY_KEY;
+    const fetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + url : url;
+    const res = await fetch(fetchUrl, {
+      method: 'GET',
+      headers
+    });
+
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+
+    // Log to carrier_api_logs
+    await logCarrierApiCall(env, {
+      run_id: runId,
+      step: 'query',
+      iccid,
+      imei: null,
+      vendor: 'wing_iot',
+      request_url: url,
+      request_method: 'GET',
+      request_body: null,
+      response_status: res.status,
+      response_ok: res.ok,
+      response_body_text: text,
+      response_body_json: json,
+      error: res.ok ? null : 'Wing IoT query failed: ' + res.status,
+    });
+
+    return new Response(JSON.stringify({
+      ok: res.ok,
+      status: res.status,
+      iccid,
+      response: json || text
+    }, null, 2), {
+      status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 async function handleHelixQuery(request, env, corsHeaders) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
@@ -1134,7 +1222,7 @@ async function handleHelixQuery(request, env, corsHeaders) {
       });
     }
 
-    const tokenRes = await fetch(env.HX_TOKEN_URL, {
+    const tokenRes = await relayFetch(env, env.HX_TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1156,7 +1244,7 @@ async function handleHelixQuery(request, env, corsHeaders) {
 
     const token = tokenData.access_token;
     const detailsUrl = env.HX_API_BASE + '/api/mobility-subscriber/details';
-    const detailsRes = await fetch(detailsUrl, {
+    const detailsRes = await relayFetch(env, detailsUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
       body: JSON.stringify({ mobilitySubscriptionId: parseInt(subId) }),
@@ -1185,6 +1273,23 @@ async function handleHelixQuery(request, env, corsHeaders) {
     if (data && (data.status === 'CANCELLED' || data.status === 'CANCELED')) {
       db_update = await syncCancelledSim(env, String(subId), data);
     }
+
+    // Log to carrier_api_logs
+    await logCarrierApiCall(env, {
+      run_id: 'helix_query_' + subId + '_' + Date.now(),
+      step: 'query',
+      iccid: data?.iccid || null,
+      imei: data?.imei || null,
+      vendor: 'helix',
+      request_url: detailsUrl,
+      request_method: 'POST',
+      request_body: { mobilitySubscriptionId: parseInt(subId) },
+      response_status: detailsRes.status,
+      response_ok: detailsRes.ok,
+      response_body_text: detailsText,
+      response_body_json: detailsData,
+      error: null,
+    });
 
     return new Response(JSON.stringify({ ok: true, mobility_subscription_id: subId, helix_response: detailsData, db_update }, null, 2), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -1259,7 +1364,7 @@ async function handleHelixQueryBulk(request, env, corsHeaders) {
       });
     }
 
-    const tokenRes = await fetch(env.HX_TOKEN_URL, {
+    const tokenRes = await relayFetch(env, env.HX_TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1294,7 +1399,7 @@ async function handleHelixQueryBulk(request, env, corsHeaders) {
 
     for (const sim of batch) {
       try {
-        const detailsRes = await fetch(env.HX_API_BASE + '/api/mobility-subscriber/details', {
+        const detailsRes = await relayFetch(env, env.HX_API_BASE + '/api/mobility-subscriber/details', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
           body: JSON.stringify({ mobilitySubscriptionId: parseInt(sim.mobility_subscription_id) }),
@@ -2426,7 +2531,7 @@ async function handleErrorLogs(env, corsHeaders, url) {
     }
 
     // Query helix_api_logs by iccid with correct column names
-    const query = `helix_api_logs?select=id,step,iccid,imei,request_url,request_method,request_body,response_status,response_ok,response_body_json,response_body_text,error,created_at&iccid=eq.${encodeURIComponent(lookupIccid)}&order=created_at.desc&limit=20`;
+    const query = `carrier_api_logs?select=id,step,iccid,imei,vendor,request_url,request_method,request_body,response_status,response_ok,response_body_json,response_body_text,error,created_at&iccid=eq.${encodeURIComponent(lookupIccid)}&order=created_at.desc&limit=20`;
     const response = await supabaseGet(env, query);
     const logs = await response.json();
     return new Response(JSON.stringify(logs), {
@@ -2669,6 +2774,43 @@ async function handleUnassignReseller(request, env, corsHeaders) {
   }
 }
 
+async function handleDeleteSim(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const simId = parseInt(body.sim_id);
+    if (!simId) {
+      return new Response(JSON.stringify({ error: 'sim_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const base = env.SUPABASE_URL + '/rest/v1';
+    const h = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      'Content-Type': 'application/json',
+    };
+    // Nullify sim_id in system_errors (nullable FK — preserve the error log)
+    await fetch(base + '/system_errors?sim_id=eq.' + simId, {
+      method: 'PATCH',
+      headers: { ...h, Prefer: 'return=minimal' },
+      body: JSON.stringify({ sim_id: null }),
+    });
+    // Delete all child records in dependency order
+    for (const table of ['sim_numbers', 'inbound_sms', 'reseller_sims', 'sim_status_history']) {
+      await fetch(base + '/' + table + '?sim_id=eq.' + simId, { method: 'DELETE', headers: h });
+    }
+    // Delete the SIM itself
+    const del = await fetch(base + '/sims?id=eq.' + simId, { method: 'DELETE', headers: h });
+    if (!del.ok) {
+      const errText = await del.text();
+      return new Response(JSON.stringify({ error: 'Failed to delete SIM: ' + errText }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, deleted: simId }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
 // Helper: insert a row into system_errors
 function parseImeiPoolConflict(status, bodyText) {
   if (status !== 409 && status !== 422) return null;
@@ -2715,6 +2857,43 @@ async function logSystemError(env, { source, action, sim_id, iccid, error_messag
     });
   } catch (e) {
     console.error('[logSystemError] Failed to log error:', e);
+  }
+}
+
+async function logCarrierApiCall(env, logData) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+  const vendor = logData.vendor || 'helix';
+  const payload = {
+    run_id: logData.run_id,
+    step: logData.step,
+    iccid: logData.iccid || null,
+    imei: logData.imei || null,
+    vendor,
+    request_url: logData.request_url,
+    request_method: logData.request_method,
+    request_body: logData.request_body || null,
+    response_status: logData.response_status,
+    response_ok: logData.response_ok,
+    response_body_text: (logData.response_body_text || '').slice(0, 5000),
+    response_body_json: logData.response_body_json || null,
+    error: logData.error || null,
+    created_at: new Date().toISOString(),
+  };
+  console.log('[' + vendor.toUpperCase() + ' API] ' + logData.request_method + ' ' + logData.request_url + ' -> ' + logData.response_status + ' ' + (logData.response_ok ? 'OK' : 'FAIL'));
+  try {
+    const res = await fetch(env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) console.error('[Carrier Log] Supabase failed: ' + res.status);
+  } catch (e) {
+    console.error('[Carrier Log] Failed to log:', e);
   }
 }
 
@@ -3046,41 +3225,67 @@ async function handleBillingPreview(url, env, corsHeaders) {
     // Get SIM-days with SMS for this reseller in the date range
     // Join: reseller_sims → sims → sim_sms_daily
     const smsResp = await supabaseGet(env,
-      'reseller_sims?select=sim_id,sims(sim_sms_daily(est_date,sms_count))' +
+      'reseller_sims?select=sim_id,sims(vendor,sim_sms_daily(est_date,sms_count))' +
       '&reseller_id=eq.' + encodeURIComponent(resellerId) +
       '&active=eq.true'
     );
     const rsSims = await smsResp.json();
 
-    // Aggregate: for each EST calendar day in range, count distinct SIMs with sms_count > 0
-    const dailyCounts = {}; // est_date → Set of sim_ids
+    // Collect active days by vendor (Helix=daily billing, Teltik=48h block billing)
+    const dailyRate = mapping ? parseFloat(mapping.daily_rate) : 0;
+    const blockRate = +(dailyRate * 2).toFixed(2);
+    const helixDays = {}; // est_date → Set of sim_ids
+    const teltikDays = {}; // est_date → Set of sim_ids
     if (Array.isArray(rsSims)) {
       for (const rs of rsSims) {
         const daily = rs.sims?.sim_sms_daily;
         if (!Array.isArray(daily)) continue;
+        const target = rs.sims?.vendor === 'teltik' ? teltikDays : helixDays;
         for (const row of daily) {
           if (!row.est_date || row.sms_count <= 0) continue;
           if (row.est_date < start || row.est_date > end) continue;
-          if (!dailyCounts[row.est_date]) dailyCounts[row.est_date] = new Set();
-          dailyCounts[row.est_date].add(rs.sim_id);
+          if (!target[row.est_date]) target[row.est_date] = new Set();
+          target[row.est_date].add(rs.sim_id);
         }
       }
     }
 
-    const dailyRate = mapping ? parseFloat(mapping.daily_rate) : 0;
-    const days = Object.keys(dailyCounts).sort().map(date => ({
-      date,
-      sim_count: dailyCounts[date].size,
-      amount: dailyCounts[date].size * dailyRate,
+    // Helix: bill per calendar day at dailyRate
+    const helixEntries = Object.keys(helixDays).sort().map(date => ({
+      date, sim_count: helixDays[date].size, rate: dailyRate,
+      amount: +(helixDays[date].size * dailyRate).toFixed(2),
     }));
+
+    // Teltik: bill per 48-hour block at blockRate
+    const teltikBlocks = {};
+    for (let bs = start; bs <= end; ) {
+      const d0 = bs;
+      const tmp = new Date(d0 + 'T00:00:00Z');
+      tmp.setUTCDate(tmp.getUTCDate() + 1);
+      const d1 = tmp.toISOString().slice(0, 10);
+      const simsInBlock = new Set();
+      for (const [date, sims] of Object.entries(teltikDays)) {
+        if (date === d0 || date === d1) { for (const s of sims) simsInBlock.add(s); }
+      }
+      if (simsInBlock.size > 0) teltikBlocks[d0] = simsInBlock;
+      tmp.setUTCDate(tmp.getUTCDate() + 1);
+      bs = tmp.toISOString().slice(0, 10);
+    }
+    const teltikEntries = Object.keys(teltikBlocks).sort().map(date => ({
+      date, sim_count: teltikBlocks[date].size, rate: blockRate,
+      amount: +(teltikBlocks[date].size * blockRate).toFixed(2),
+    }));
+
+    const days = [...helixEntries, ...teltikEntries].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
     const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
-    const totalAmount = totalSimDays * dailyRate;
+    const totalAmount = +(days.reduce((s, d) => s + d.amount, 0)).toFixed(2);
 
     return new Response(JSON.stringify({
       reseller_id: resellerId,
       reseller_name: reseller?.name || resellerId,
       mapping,
       daily_rate: dailyRate,
+      block_rate: blockRate,
       days,
       total_sim_days: totalSimDays,
       total_amount: totalAmount,
@@ -3122,7 +3327,7 @@ function buildCSV(customerName, start, end, days, dailyRate) {
       'US Business phone Rental',
       '',
       d.sim_count,
-      dailyRate.toFixed(2),
+      (d.rate !== undefined ? d.rate : dailyRate).toFixed(2),
       d.amount.toFixed(2),
     ].map(csvField).join(','));
   }
@@ -3176,34 +3381,58 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
     }
 
     const smsResp = await supabaseGet(env,
-      'reseller_sims?select=sim_id,sims(sim_sms_daily(est_date,sms_count))' +
+      'reseller_sims?select=sim_id,sims(vendor,sim_sms_daily(est_date,sms_count))' +
       '&reseller_id=eq.' + encodeURIComponent(resellerId) +
       '&active=eq.true'
     );
     const rsSims = await smsResp.json();
 
-    const dailyCounts = {};
+    const helixDaysD = {};
+    const teltikDaysD = {};
     if (Array.isArray(rsSims)) {
       for (const rs of rsSims) {
         const daily = rs.sims?.sim_sms_daily;
         if (!Array.isArray(daily)) continue;
+        const targetD = rs.sims?.vendor === 'teltik' ? teltikDaysD : helixDaysD;
         for (const row of daily) {
           if (!row.est_date || row.sms_count <= 0) continue;
           if (row.est_date < start || row.est_date > end) continue;
-          if (!dailyCounts[row.est_date]) dailyCounts[row.est_date] = new Set();
-          dailyCounts[row.est_date].add(rs.sim_id);
+          if (!targetD[row.est_date]) targetD[row.est_date] = new Set();
+          targetD[row.est_date].add(rs.sim_id);
         }
       }
     }
 
     const dailyRate = parseFloat(mapping.daily_rate);
-    const days = Object.keys(dailyCounts).sort().map(date => ({
-      date,
-      sim_count: dailyCounts[date].size,
-      amount: dailyCounts[date].size * dailyRate,
+    const blockRateD = +(dailyRate * 2).toFixed(2);
+
+    const helixEntriesD = Object.keys(helixDaysD).sort().map(date => ({
+      date, sim_count: helixDaysD[date].size, rate: dailyRate,
+      amount: +(helixDaysD[date].size * dailyRate).toFixed(2),
     }));
+
+    const teltikBlocksD = {};
+    for (let bs = start; bs <= end; ) {
+      const d0 = bs;
+      const tmp = new Date(d0 + 'T00:00:00Z');
+      tmp.setUTCDate(tmp.getUTCDate() + 1);
+      const d1 = tmp.toISOString().slice(0, 10);
+      const simsInBlock = new Set();
+      for (const [date, sims] of Object.entries(teltikDaysD)) {
+        if (date === d0 || date === d1) { for (const s of sims) simsInBlock.add(s); }
+      }
+      if (simsInBlock.size > 0) teltikBlocksD[d0] = simsInBlock;
+      tmp.setUTCDate(tmp.getUTCDate() + 1);
+      bs = tmp.toISOString().slice(0, 10);
+    }
+    const teltikEntriesD = Object.keys(teltikBlocksD).sort().map(date => ({
+      date, sim_count: teltikBlocksD[date].size, rate: blockRateD,
+      amount: +(teltikBlocksD[date].size * blockRateD).toFixed(2),
+    }));
+
+    const days = [...helixEntriesD, ...teltikEntriesD].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
     const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
-    const totalAmount = +(totalSimDays * dailyRate).toFixed(2);
+    const totalAmount = +(days.reduce((s, d) => s + d.amount, 0)).toFixed(2);
 
     if (totalSimDays === 0) {
       return new Response(JSON.stringify({ error: 'No billable SIM-days in this range' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -3682,7 +3911,7 @@ async function handleBackfillCancelDates(env, corsHeaders) {
         }
 
         // 3. Get Helix token
-        const tokenRes = await fetch(env.HX_TOKEN_URL, {
+        const tokenRes = await relayFetch(env, env.HX_TOKEN_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -3706,7 +3935,7 @@ async function handleBackfillCancelDates(env, corsHeaders) {
 
         for (const sim of needsBackfill) {
             try {
-                const detailsRes = await fetch(`${env.HX_API_BASE}/api/mobility-subscriber/details`, {
+                const detailsRes = await relayFetch(env, `${env.HX_API_BASE}/api/mobility-subscriber/details`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -3767,7 +3996,95 @@ async function handleBackfillCancelDates(env, corsHeaders) {
     }
 }
 
-function getHTML() {
+async function handleRelayTest(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const method = (body.method || 'GET').toUpperCase();
+    const url = body.url;
+    const headers = body.headers || {};
+    const reqBody = body.body;
+    if (!url) {
+      return new Response(JSON.stringify({ error: 'url is required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const init = { method, headers };
+    if (reqBody !== null && reqBody !== undefined) {
+      init.body = typeof reqBody === 'string' ? reqBody : JSON.stringify(reqBody);
+    }
+    const resp = await relayFetch(env, url, init);
+    const respBody = await resp.text();
+    const respHeaders = {};
+    resp.headers.forEach(function(val, key) { respHeaders[key] = val; });
+    return new Response(JSON.stringify({ ok: true, status: resp.status, headers: respHeaders, body: respBody }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ ok: false, error: String(error) }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+async function handleAtomicQuery(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const identifier = (body.identifier || '').trim();
+    if (!identifier) {
+      return new Response(JSON.stringify({ error: 'ICCID or MSISDN required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+      return new Response(JSON.stringify({ error: 'ATOMIC credentials not configured on dashboard worker (push ATOMIC_USERNAME, ATOMIC_TOKEN, ATOMIC_PIN secrets)' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const apiUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+    // ICCID starts with 89 and is 19-20 digits; else treat as MSISDN
+    const isIccid = /^89\d{17,19}$/.test(identifier);
+    const requestBody = {
+      wholeSaleApi: {
+        session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+        wholeSaleRequest: {
+          requestType: 'subsriberInquiry',
+          MSISDN: isIccid ? '' : identifier,
+          sim: isIccid ? identifier : '',
+        },
+      },
+    };
+    const res = await relayFetch(env, apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    await logCarrierApiCall(env, {
+      run_id: 'atomic_query_' + identifier + '_' + Date.now(),
+      step: 'query',
+      iccid: isIccid ? identifier : null,
+      imei: null,
+      vendor: 'atomic',
+      request_url: apiUrl,
+      request_method: 'POST',
+      request_body: requestBody,
+      response_status: res.status,
+      response_ok: res.ok,
+      response_body_text: text,
+      response_body_json: data,
+      error: (res.ok && data && data.wholeSaleApi && data.wholeSaleApi.wholeSaleResponse && data.wholeSaleApi.wholeSaleResponse.statusCode === '00')
+        ? null
+        : 'ATOMIC query: ' + (data && data.wholeSaleApi && data.wholeSaleApi.wholeSaleResponse ? data.wholeSaleApi.wholeSaleResponse.description : res.status),
+    });
+    return new Response(JSON.stringify({ ok: true, response: data }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ ok: false, error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+function getHTML(helixEnabled) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3779,6 +4096,8 @@ function getHTML() {
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
+
+        window.HELIX_ENABLED = \${helixEnabled};
 
         let sidebarOpen = false;
         function toggleSidebar(open) {
@@ -3977,6 +4296,10 @@ function getHTML() {
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
                     <span class="text-sm">Guide</span>
                 </a>
+                <a href="/api-tester" onclick="event.preventDefault();switchTab('api-tester')" data-tab="api-tester" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="API Tester">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                    <span class="text-sm">API Tester</span>
+                </a>
             </nav>
             <div class="mt-auto px-2">
                 <button onclick="loadData()" class="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-dark-400 hover:text-accent hover:bg-dark-600 transition" title="Refresh">
@@ -4165,6 +4488,9 @@ function getHTML() {
                     <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
                     <button onclick="bulkModifyImei()" class="px-3 py-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded transition">Modify IMEI</button>
                     <button onclick="importTeltik()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Import Teltik</button>
+                    <button onclick="showBulkSetStatusModal()" class="px-3 py-1.5 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition">Set Status</button>
+                    <button onclick="bulkQuery()" class="px-3 py-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 text-white rounded transition">Query</button>
+                    <button onclick="bulkRetryActivation()" class="px-3 py-1.5 text-xs bg-pink-600 hover:bg-pink-700 text-white rounded transition">Retry Activation</button>
                 </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
@@ -4198,7 +4524,9 @@ function getHTML() {
                                 </select>
                                 <select id="filter-vendor" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                     <option value="">All Vendors</option>
-                                    <option value="helix">Helix</option>
+                                    <option value="helix">Helix (legacy)</option>
+                                    <option value="atomic">ATOMIC</option>
+                                    <option value="wing_iot">Wing IoT</option>
                                     <option value="teltik">Teltik</option>
                                 </select>
                                 <select id="filter-special" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
@@ -4434,6 +4762,12 @@ function getHTML() {
                                 <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582 4 8 4s8 1.79 8 4"></path></svg>
                             </div>
                             <span class="text-xs text-gray-300">Sync Slots</span>
+                        </button>
+                        <button onclick="exportGatewayTable()" id="gw-export-btn" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
+                            <div class="w-10 h-10 rounded-lg bg-emerald-500/20 flex items-center justify-center group-hover:bg-emerald-500/30 transition">
+                                <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                            </div>
+                            <span class="text-xs text-gray-300">Export Table</span>
                         </button>
                     </div>
                 </div>
@@ -4787,6 +5121,7 @@ function getHTML() {
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-send-sms').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Send SMS</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-sms-ingest').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Incoming SMS</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-workers').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Workers Page</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-api-tester').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">API Tester</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-gateway').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Gateway Page</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-imei-pool').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">IMEI Pool</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-errors').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Errors Page</a>
@@ -4929,11 +5264,14 @@ function getHTML() {
                                 <li><span class="text-white">Retry Activation</span> &mdash; Retry a failed activation on Helix</li>
                                 <li><span class="text-white">Assign Reseller</span> &mdash; Link SIM to a reseller</li>
                                 <li><span class="text-white">Unassign Reseller</span> &mdash; Remove reseller assignment</li>
+                                <li><span class="text-white">Delete</span> &mdash; Permanently delete the SIM and all its history (sim_numbers, inbound_sms, reseller_sims, sim_status_history). Cannot be undone. Child rows are cleaned up first; <code class="bg-dark-900 px-1 rounded text-accent">system_errors.sim_id</code> is nullified so error history is preserved.</li>
                             </ul>
                         </div>
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">Bulk Actions (select via checkboxes)</h4>
-                            <p>Select multiple SIMs using checkboxes, then use the bulk action buttons. Supported: OTA Refresh, Rotate MDN, Fix SIM, Cancel, Resume, Unassign Reseller, Send SMS.</p>
+                            <p>Select multiple SIMs using checkboxes, then use the bulk action buttons. Supported: OTA Refresh, Rotate MDN, Fix SIM, Cancel, Resume, Unassign Reseller, Send SMS, Query.</p>
+                            <p class="mt-2"><span class="text-white font-medium">Shift-click</span>: click one checkbox, then hold <kbd class="bg-dark-900 px-1.5 py-0.5 rounded text-xs border border-dark-500">Shift</kbd> and click another &mdash; every row between them is set to the state of the second click. Works in the current rendered order (after sort/filter).</p>
+                            <p class="mt-2"><span class="text-white font-medium">Query (bulk action)</span>: auto-routes per SIM based on <code class="bg-dark-900 px-1 rounded text-accent">sims.vendor</code>. Helix SIMs query the Helix subscriber details API (by Sub ID); ATOMIC SIMs query ATOMIC <code class="bg-dark-900 px-1 rounded text-accent">subsriberInquiry</code> (by ICCID or MDN). The modal vendor select distinguishes the two &mdash; Helix and ATOMIC are separate options.</p>
                         </div>
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">SIM ID Click</h4>
@@ -5003,7 +5341,7 @@ function getHTML() {
                         </div>
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">Manual rotation</h4>
-                            <p>Click <span class="text-white">Rotate MDN</span> on a SIM row, or use the bulk action. The same flow runs but only for the selected SIM(s).</p>
+                            <p>Click <span class="text-white">Rotate MDN</span> on a SIM row, or use the bulk action. The same flow runs but only for the selected SIM(s). Manual rotation is vendor-aware: <span class="text-white">Helix</span> SIMs use the Helix MDN-change flow above; <span class="text-white">ATOMIC</span> SIMs call <code class="bg-dark-900 px-1 rounded text-accent">swapMSISDN</code> with the SIM's current MDN + a ZIP (defaults to <code class="bg-dark-900 px-1 rounded text-accent">HX_ZIP</code>), then read the new MSISDN back (from the swap response or a follow-up <code class="bg-dark-900 px-1 rounded text-accent">subsriberInquiry</code>). DB writes and <code class="bg-dark-900 px-1 rounded text-accent">number.online</code> webhook are identical regardless of vendor. <span class="text-amber-400">Note:</span> the nightly cron queue currently only rotates Helix SIMs &mdash; ATOMIC SIMs rotate only via the manual action until the queue consumer is ported.</p>
                         </div>
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">If it fails</h4>
@@ -5213,6 +5551,30 @@ function getHTML() {
                     </div>
                 </div>
 
+                <!-- API Tester -->
+                <div id="guide-api-tester" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">API Tester</h3>
+                    <div class="text-sm text-gray-300 space-y-3">
+                        <p>Ad-hoc HTTP tester that routes requests through the dashboard worker's relay. Useful for debugging carrier API calls, webhook payloads, or any endpoint that can only be reached via the relay (Cloudflare Workers cannot reach CF-proxied origins directly &mdash; see <code class="bg-dark-900 px-1 rounded text-accent">agent/constraints.md &sect;11</code>).</p>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Presets</h4>
+                            <p>One-click templates that fill method, URL, and default headers. Current presets: <span class="text-white">ATOMIC</span>, <span class="text-white">Wing IoT</span>, <span class="text-white">Teltik</span>, <span class="text-white">Helix</span>, <span class="text-white">Custom</span> (clears fields). Select a preset, then edit the body as needed.</p>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Flow</h4>
+                            <ol class="list-decimal list-inside space-y-1 ml-2">
+                                <li>Browser <code class="bg-dark-900 px-1 rounded text-accent">POST /api/relay-test</code> with <code class="bg-dark-900 px-1 rounded text-accent">{method, url, headers, body}</code></li>
+                                <li>Dashboard worker calls <code class="bg-dark-900 px-1 rounded text-accent">relayFetch(env, url, init)</code>, which rewrites to <code class="bg-dark-900 px-1 rounded text-accent">relay.zmawsolutions.com/&lt;url&gt;</code> with the <code class="bg-dark-900 px-1 rounded text-accent">x-relay-key</code> header</li>
+                                <li>Response status / headers / body are returned to the tester UI (always HTTP 200 from the worker &mdash; even for 4xx/5xx from the remote &mdash; so the structured result is always visible)</li>
+                            </ol>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Scope</h4>
+                            <p>No restriction to carrier URLs &mdash; any reachable URL can be tested. This is a superuser-grade tool; use it only for debugging.</p>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Gateway Page -->
                 <div id="guide-gateway" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <h3 class="text-lg font-semibold text-white mb-3">Gateway Page</h3>
@@ -5233,6 +5595,17 @@ function getHTML() {
                                 <li><span class="text-white">Reboot</span> &mdash; Reboots the port's cellular module</li>
                                 <li><span class="text-white">Reset</span> &mdash; Factory resets the port configuration</li>
                                 <li><span class="text-white">Switch SIM</span> &mdash; Triggers SIM rotation on multi-slot ports</li>
+                            </ul>
+                        </div>
+                        <div class="mt-2">
+                            <h4 class="text-white font-medium mb-1">Gateway-wide actions</h4>
+                            <ul class="list-disc list-inside space-y-1 ml-2">
+                                <li><span class="text-white">Switch SIM</span> &mdash; Bulk-switches SIMs across all ports on the selected gateway</li>
+                                <li><span class="text-white">IMEI</span> &mdash; Opens the IMEI modal (per-slot IMEI set / read)</li>
+                                <li><span class="text-white">Reboot / Lock / Unlock</span> &mdash; Gateway-wide versions of the per-port commands</li>
+                                <li><span class="text-white">Import IMEIs</span> &mdash; Reads every slot's IMEI from the gateway via <code class="bg-dark-900 px-1 rounded text-accent">/port-info?all_slots=1</code> and inserts new rows into <code class="bg-dark-900 px-1 rounded text-accent">imei_pool</code> (DB is authoritative for existing slots; any mismatch is reported as a discrepancy). Also links <code class="bg-dark-900 px-1 rounded text-accent">imei_pool.sim_id</code> for active slots and backfills <code class="bg-dark-900 px-1 rounded text-accent">sims.imei</code> / <code class="bg-dark-900 px-1 rounded text-accent">sims.current_imei_pool_id</code>.</li>
+                                <li><span class="text-white">Sync Slots</span> &mdash; Reconciles <code class="bg-dark-900 px-1 rounded text-accent">sims.gateway_id</code> and <code class="bg-dark-900 px-1 rounded text-accent">sims.port</code> against what the gateway reports (useful after a physical SIM swap).</li>
+                                <li><span class="text-white">Export Table</span> &mdash; Scans the gateway and downloads a CSV of every slot with <span class="text-white">Port, Slot, Slot Letter, ICCID, IMEI, Number, Operator, Signal, SIM Status, State</span>. Use for inventory snapshots or diffing against the DB. Filename: <code class="bg-dark-900 px-1 rounded text-accent">gateway_&lt;label&gt;_&lt;timestamp&gt;.csv</code>.</li>
                             </ul>
                         </div>
                         <div class="mt-2">
@@ -5540,6 +5913,65 @@ function getHTML() {
 
             </div>
 
+            <div id="tab-api-tester" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">API Call Tester</h2>
+                    <span class="text-sm text-gray-500">All requests route via relay &rarr; zmawsolutions.com</span>
+                </div>
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <!-- Request Panel -->
+                    <div class="bg-dark-800 rounded-xl border border-dark-600 p-5">
+                        <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">Request</h3>
+                        <div class="mb-4">
+                            <label class="text-xs text-gray-500 mb-1 block">Preset</label>
+                            <select id="api-tester-preset" onchange="applyApiPreset()" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                <option value="">&#8212; Custom &#8212;</option>
+                                <option value="atomic">ATOMIC (AT&amp;T)</option>
+                                <option value="wing">Wing IoT (AT&amp;T)</option>
+                                <option value="teltik">Teltik (T-Mobile)</option>
+                                <option value="helix">Helix (AT&amp;T, legacy)</option>
+                            </select>
+                        </div>
+                        <div class="flex gap-2 mb-4">
+                            <select id="api-tester-method" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-28">
+                                <option>GET</option>
+                                <option selected>POST</option>
+                                <option>PUT</option>
+                                <option>PATCH</option>
+                                <option>DELETE</option>
+                            </select>
+                            <input id="api-tester-url" type="text" placeholder="https://..." class="flex-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 font-mono focus:outline-none focus:border-accent">
+                        </div>
+                        <div class="mb-4">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="text-xs text-gray-500">Headers</span>
+                                <button onclick="addRelayHeader()" class="text-xs text-accent hover:text-green-400 transition">+ Add</button>
+                            </div>
+                            <div id="api-tester-headers" class="space-y-2"></div>
+                        </div>
+                        <div class="mb-5">
+                            <label class="text-xs text-gray-500 mb-1 block">Body (raw)</label>
+                            <textarea id="api-tester-body" rows="8" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 font-mono focus:outline-none focus:border-accent" placeholder="Raw JSON or text body"></textarea>
+                        </div>
+                        <button onclick="sendRelayTest()" id="api-tester-send" class="w-full py-2 bg-accent hover:bg-green-600 text-white rounded-lg text-sm font-medium transition">Send via Relay</button>
+                    </div>
+                    <!-- Response Panel -->
+                    <div class="bg-dark-800 rounded-xl border border-dark-600 p-5 flex flex-col">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Response</h3>
+                            <span id="api-tester-status" class="text-sm font-mono font-bold"></span>
+                        </div>
+                        <div id="api-tester-response-headers" class="mb-3 hidden">
+                            <details class="group">
+                                <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300 mb-1">Response Headers</summary>
+                                <pre id="api-tester-resp-headers-body" class="text-xs text-gray-400 font-mono bg-dark-900 rounded p-2 mt-1 overflow-x-auto border border-dark-600"></pre>
+                            </details>
+                        </div>
+                        <pre id="api-tester-response" class="flex-1 bg-dark-900 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-auto max-h-96 border border-dark-600 whitespace-pre-wrap break-all">Response will appear here...</pre>
+                    </div>
+                </div>
+            </div>
+
             </div>
         </main>
     </div>
@@ -5649,10 +6081,18 @@ function getHTML() {
                 <h3 class="text-lg font-semibold text-white">Activate SIMs</h3>
             </div>
             <div class="p-5">
+                <div class="flex items-center gap-3 mb-4">
+                    <label class="text-sm text-gray-400">Vendor:</label>
+                    <select id="activate-vendor" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                        <option value="atomic" selected>ATOMIC (AT&T)</option>
+                        <option value="wing_iot">Wing IoT (AT&T IoT)</option>
+                        <option value="helix">Helix (legacy AT&T)</option>
+                    </select>
+                </div>
                 <p class="text-sm text-gray-400 mb-3">Paste from spreadsheet or enter one SIM per line:</p>
                 <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631&#9;123456789012345&#9;1
 89014103271467425632&#9;123456789012346&#9;1"></textarea>
-                <p class="text-xs text-gray-500 mt-2">3 columns: ICCID (20 digits), IMEI (15 digits), Reseller ID — tab or comma separated</p>
+                <p class="text-xs text-gray-500 mt-2">3 columns: ICCID (20 digits), IMEI (15 digits or blank for Wing IoT), Reseller ID — tab or comma separated</p>
             </div>
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
                 <button onclick="hideActivateModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
@@ -5665,12 +6105,20 @@ function getHTML() {
     <div id="helix-query-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
         <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl">
             <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
-                <h3 class="text-lg font-semibold text-white">Query Helix Subscriber</h3>
+                <h3 class="text-lg font-semibold text-white">Carrier Query</h3>
                 <button onclick="hideHelixQueryModal()" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
             </div>
             <div class="p-5">
-                <p class="text-sm text-gray-400 mb-3">Enter a Mobility Subscription ID:</p>
-                <input type="text" id="helix-subid-input" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="e.g. 40033"/>
+                <div class="flex items-center gap-3 mb-3">
+                    <label class="text-sm text-gray-400">Vendor:</label>
+                    <select id="carrier-query-vendor" onchange="updateCarrierQueryUI()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                        <option value="helix">Helix (Sub ID)</option>
+                        <option value="atomic">ATOMIC (AT&amp;T)</option>
+                        <option value="wing_iot">Wing IoT (ICCID)</option>
+                    </select>
+                </div>
+                <p id="carrier-query-label" class="text-sm text-gray-400 mb-3">Enter a Mobility Subscription ID:</p>
+                <input type="text" id="helix-subid-input" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="e.g. 40033 or ICCID"/>
                 <div id="helix-query-result" class="mt-4 hidden">
                     <div id="helix-db-update-banner" class="hidden mb-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
                         <p class="text-xs font-semibold text-yellow-400 mb-1">&#x26A0; DB Auto-Synced — Line marked Cancelled</p>
@@ -5726,6 +6174,33 @@ function getHTML() {
         </div>
     </div>
 
+    <!-- Bulk Set Status Modal -->
+    <div id="bulk-set-status-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-sm">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 class="text-lg font-semibold text-white">Bulk Set Status</h3>
+                <button onclick="document.getElementById('bulk-set-status-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5">
+                <p class="text-sm text-gray-400 mb-3"><span id="bulk-status-count" class="text-white font-medium">0</span> SIM(s) selected</p>
+                <select id="bulk-set-status-select" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent mb-4">
+                    <option value="provisioning">provisioning</option>
+                    <option value="active">active</option>
+                    <option value="suspended">suspended</option>
+                    <option value="canceled">canceled</option>
+                    <option value="error">error</option>
+                    <option value="pending">pending</option>
+                    <option value="helix_timeout">helix_timeout</option>
+                    <option value="data_mismatch">data_mismatch</option>
+                </select>
+                <div class="flex gap-2 justify-end">
+                    <button onclick="document.getElementById('bulk-set-status-modal').classList.add('hidden')" class="px-4 py-2 text-sm bg-dark-700 hover:bg-dark-600 text-gray-300 rounded-lg transition">Cancel</button>
+                    <button id="bulk-status-apply-btn" onclick="runBulkSetStatus()" class="px-4 py-2 text-sm bg-accent hover:bg-accent/80 text-white rounded-lg transition">Apply</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- SIM Action Modal -->
     <div id="sim-action-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
         <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-3xl max-h-[90vh] flex flex-col">
@@ -5741,7 +6216,7 @@ function getHTML() {
                 <!-- Helix API Logs section -->
                 <div id="sim-action-logs-section" class="mt-6 border-t border-dark-600 pt-4 hidden">
                     <div class="flex items-center justify-between mb-3">
-                        <h4 class="text-sm font-medium text-gray-300">Recent Helix API Logs</h4>
+                        <h4 class="text-sm font-medium text-gray-300">Recent API Logs</h4>
                         <button onclick="loadSimActionLogs()" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
                             <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
                             Refresh
@@ -6035,6 +6510,7 @@ function getHTML() {
             'errors': '/errors',
             'billing': '/billing',
             'guide': '/guide',
+            'api-tester': '/api-tester',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
 
@@ -6058,7 +6534,7 @@ function getHTML() {
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', billing: 'Billing', guide: 'Guide' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', billing: 'Billing', guide: 'Guide', 'api-tester': 'API Tester' };
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
@@ -6320,11 +6796,11 @@ function renderSims() {
                     'canceled': 'bg-red-500/20 text-red-400',
                     'error': 'bg-red-500/20 text-red-400',
                 }[sim.status] || 'bg-gray-500/20 text-gray-400';
-                const vendorBadge = sim.vendor === 'teltik' ? '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>' : '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>';
+                const vendorBadge = { teltik: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>', atomic: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-blue-500/20 text-blue-300">ATOMIC</span>', wing_iot: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-green-500/20 text-green-300">Wing IoT</span>', helix: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>' }[sim.vendor] || '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">-</span>';
                 return \`
                 <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
-                    <td class="px-4 py-3"><input type="checkbox" class="sim-cb accent-green-500" value="\${sim.id}" onchange="updateSimActionBar()"></td>
-                    <td class="px-4 py-3"><button onclick="showSimLogs(\${sim.id})" class="text-indigo-400 hover:text-indigo-200 hover:underline font-mono transition" title="View Helix logs">\${sim.id}</button></td>
+                    <td class="px-4 py-3"><input type="checkbox" class="sim-cb accent-green-500" value="\${sim.id}" onclick="handleSimCbClick(event, this)" onchange="updateSimActionBar()"></td>
+                    <td class="px-4 py-3"><button onclick="showSimLogs(\${sim.id})" class="text-indigo-400 hover:text-indigo-200 hover:underline font-mono transition" title="View API logs">\${sim.id}</button></td>
                     <td class="px-4 py-3 text-gray-400" title="\${sim.gateway_name || ''}">\${gatewayDisplay}</td>
                     <td class="px-4 py-3 text-gray-400 font-mono text-xs">\${sim.iccid}</td>
                     <td class="px-4 py-3 text-gray-200">\${sim.phone_number || '-'}\${verifiedBadge}</td>
@@ -6341,11 +6817,12 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_notified_at ? new Date(sim.last_notified_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 whitespace-nowrap">
                         \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
-                        \${(sim.vendor !== 'teltik' && sim.status === 'active') ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}
-                        \${(sim.vendor !== 'teltik' && sim.status === 'error') ? \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\` : ''}
+                        \${(!['teltik', 'wing_iot'].includes(sim.vendor) && sim.status === 'active') ? \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\` : ''}
+                        \${(!['teltik', 'wing_iot'].includes(sim.vendor) && sim.status === 'error') ? \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\` : ''}
                         \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : \`<button onclick="assignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition" title="Assign to reseller">Assign</button>\`}
                         \${(sim.mobility_subscription_id && sim.gateway_id && sim.port) ? \`<button onclick="showChangeImeiModal(\${sim.id}, '\${sim.iccid}', \${sim.gateway_id}, '\${sim.port}')" class="px-2 py-1 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition ml-1" title="Change IMEI">IMEI</button>\` : ''}
                         \${\`<button onclick="showSetStatusModal(\${sim.id}, '\${sim.status}')" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition ml-1">Status</button>\`}
+                        \${\`<button onclick="deleteSim(\${sim.id}, '\${sim.iccid}')" class="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 text-white rounded transition ml-1" title="Delete this SIM permanently">Del</button>\`}
                     </td>
                 </tr>
                 \`;
@@ -6634,7 +7111,8 @@ async function sendSimOnline(simId, phoneNumber) {
                     continue;
                 }
 
-                if (imei.length !== 15) {
+                const vendor = document.getElementById('activate-vendor').value;
+                if (vendor !== 'wing_iot' && imei.length !== 15) {
                     errors.push(\`Line \${i + 1}: Invalid IMEI length (must be 15 digits)\`);
                     continue;
                 }
@@ -6658,7 +7136,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
 
-            if (!(await showConfirm('Activate SIMs', \`Are you sure you want to activate \${sims.length} SIM(s)? This will call the Helix API.\`))) {
+            const vendorLabel = { atomic: 'ATOMIC', wing_iot: 'Wing IoT', helix: 'Helix' }[document.getElementById('activate-vendor').value] || 'carrier';
+            if (!(await showConfirm('Activate SIMs', \`Are you sure you want to activate \${sims.length} SIM(s) via \${vendorLabel}?\`))) {
                 return;
             }
 
@@ -6669,14 +7148,14 @@ async function sendSimOnline(simId, phoneNumber) {
                 const response = await fetch(\`\${API_BASE}/activate\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sims })
+                    body: JSON.stringify({ sims, vendor: document.getElementById('activate-vendor').value })
                 });
 
                 const result = await response.json();
 
                 if (response.ok) {
-                    showToast(\`Activated \${result.processed} SIM(s), \${result.errors} error(s)\`,
-                        result.errors > 0 ? 'error' : 'success');
+                    showToast('Queued ' + (result.queued || 0) + ' SIM(s) for activation' + (result.validation_errors > 0 ? ', ' + result.validation_errors + ' validation error(s)' : ''),
+                        (result.validation_errors || 0) > 0 ? 'error' : 'success');
                     loadData();
                 } else {
                     showToast(\`Error activating SIMs: \${result.error}\`, 'error');
@@ -6878,6 +7357,26 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('helix-subid-input').focus();
         }
 
+        function updateCarrierQueryUI() {
+            const vendor = document.getElementById('carrier-query-vendor').value;
+            const label = document.getElementById('carrier-query-label');
+            const input = document.getElementById('helix-subid-input');
+            const bulkBtn = document.getElementById('helix-bulk-btn');
+            if (vendor === 'wing_iot') {
+                label.textContent = 'Enter ICCID:';
+                input.placeholder = 'e.g. 89010303300133220351';
+                bulkBtn.style.display = 'none';
+            } else if (vendor === 'atomic') {
+                label.textContent = 'Enter ICCID or MDN (10-digit):';
+                input.placeholder = 'ICCID (89010...) or MDN (9295551234)';
+                bulkBtn.style.display = 'none';
+            } else {
+                label.textContent = 'Enter a Mobility Subscription ID:';
+                input.placeholder = 'e.g. 40033';
+                bulkBtn.style.display = '';
+            }
+        }
+
         function queryHelixSubId(subId) {
             document.getElementById('helix-query-modal').classList.remove('hidden');
             document.getElementById('helix-query-result').classList.add('hidden');
@@ -6894,9 +7393,10 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function queryHelix() {
-            const subId = document.getElementById('helix-subid-input').value.trim();
-            if (!subId) {
-                showToast('Please enter a Subscription ID', 'error');
+            const vendor = document.getElementById('carrier-query-vendor').value;
+            const inputVal = document.getElementById('helix-subid-input').value.trim();
+            if (!inputVal) {
+                showToast(vendor === 'wing_iot' ? 'Please enter an ICCID' : 'Please enter a Subscription ID', 'error');
                 return;
             }
 
@@ -6905,11 +7405,93 @@ async function sendSimOnline(simId, phoneNumber) {
             btn.textContent = 'Querying...';
             document.getElementById('helix-bulk-result').classList.add('hidden');
 
+            // Wing IoT query
+            if (vendor === 'wing_iot') {
+                try {
+                    const response = await fetch(\`\${API_BASE}/wing-check\`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ iccid: inputVal })
+                    });
+                    const result = await response.json();
+                    const outputEl = document.getElementById('helix-query-output');
+                    const resultDiv = document.getElementById('helix-query-result');
+                    document.getElementById('helix-db-update-banner').classList.add('hidden');
+
+                    if (result.ok) {
+                        const data = result.response;
+                        let formatted = '<span class="text-green-400 font-bold">Wing IoT Device Found</span>\\n\\n';
+                        formatted += '<span class="text-blue-400">status:</span> ' + (data.status || 'N/A') + '\\n';
+                        formatted += '<span class="text-blue-400">mdn:</span> ' + (data.mdn || 'N/A') + '\\n';
+                        formatted += '<span class="text-blue-400">communicationPlan:</span> ' + (data.communicationPlan || 'N/A') + '\\n';
+                        formatted += '<span class="text-blue-400">customer:</span> ' + (data.customer || '(blank)') + '\\n';
+                        formatted += '\\n<span class="text-gray-500">--- Full Response ---</span>\\n';
+                        formatted += JSON.stringify(data, null, 2);
+                        outputEl.innerHTML = formatted;
+                    } else {
+                        outputEl.innerHTML = '<span class="text-red-400">Wing IoT Error (HTTP ' + result.status + '):</span>\\n' + JSON.stringify(result.response, null, 2);
+                    }
+                    resultDiv.classList.remove('hidden');
+                } catch (error) {
+                    showToast('Error querying Wing IoT', 'error');
+                    console.error(error);
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = 'Query';
+                }
+                return;
+            }
+
+            // ATOMIC query
+            if (vendor === 'atomic') {
+                try {
+                    const response = await fetch(API_BASE + '/atomic-query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ identifier: inputVal })
+                    });
+                    const result = await response.json();
+                    const outputEl = document.getElementById('helix-query-output');
+                    const resultDiv = document.getElementById('helix-query-result');
+                    document.getElementById('helix-db-update-banner').classList.add('hidden');
+                    if (!result.ok) {
+                        outputEl.innerHTML = '<span class="text-red-400">Error: ' + (result.error || 'Unknown') + '</span>';
+                    } else {
+                        const wr = result.response && result.response.wholeSaleApi && result.response.wholeSaleApi.wholeSaleResponse;
+                        let fmtd = '';
+                        if (wr) {
+                            const r = wr.Result || {};
+                            const ok2 = wr.statusCode === '00';
+                            fmtd += '<span class="' + (ok2 ? 'text-green-400' : 'text-red-400') + ' font-bold">statusCode: ' + wr.statusCode + '</span><br>';
+                            fmtd += '<span class="text-blue-400">description:</span> ' + wr.description + '<br>';
+                            if (r.attStatus) fmtd += '<span class="text-blue-400">attStatus:</span> <span class="' + (r.attStatus === 'Active' ? 'text-accent' : 'text-orange-400') + ' font-bold">' + r.attStatus + '</span><br>';
+                            if (r.MSISDN) fmtd += '<span class="text-blue-400">MSISDN:</span> ' + r.MSISDN + '<br>';
+                            if (r.BAN) fmtd += '<span class="text-blue-400">BAN:</span> ' + r.BAN + '<br>';
+                            if (r.activationDate) fmtd += '<span class="text-blue-400">activationDate:</span> ' + r.activationDate + '<br>';
+                            fmtd += '<br><span class="text-gray-500">--- Full Response ---</span><br>';
+                            fmtd += JSON.stringify(wr, null, 2);
+                        } else {
+                            fmtd = JSON.stringify(result.response, null, 2);
+                        }
+                        outputEl.innerHTML = fmtd;
+                    }
+                    resultDiv.classList.remove('hidden');
+                } catch (err) {
+                    showToast('Error querying ATOMIC', 'error');
+                    console.error(err);
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = 'Query';
+                }
+                return;
+            }
+
+            // Helix query (original)
             try {
                 const response = await fetch(\`\${API_BASE}/helix-query\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ mobility_subscription_id: subId })
+                    body: JSON.stringify({ mobility_subscription_id: inputVal })
                 });
 
                 const result = await response.json();
@@ -7218,6 +7800,77 @@ async function sendSimOnline(simId, phoneNumber) {
             } catch (error) {
                 grid.innerHTML = \`<p class="text-red-400 text-sm col-span-full text-center py-8">Error: \${error}</p>\`;
                 label.textContent = '';
+            }
+        }
+
+        async function exportGatewayTable() {
+            const gwSelect = document.getElementById('gw-select');
+            const gatewayId = gwSelect.value;
+            if (!gatewayId) {
+                showToast('Select a gateway first', 'error');
+                return;
+            }
+            const gwLabel = gwSelect.options[gwSelect.selectedIndex]?.text || gatewayId;
+            const btn = document.getElementById('gw-export-btn');
+            const origHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="text-xs text-gray-400">Scanning...</span>';
+            try {
+                const response = await fetch(API_BASE + '/skyline/port-info?gateway_id=' + encodeURIComponent(gatewayId) + '&all_slots=1');
+                const result = await response.json();
+                if (!result.ok) {
+                    showToast('Gateway scan failed: ' + (result.error || 'unknown'), 'error');
+                    return;
+                }
+                const ports = result.ports || [];
+                if (!ports.length) {
+                    showToast('No slots returned from gateway', 'error');
+                    return;
+                }
+                const NL = String.fromCharCode(10);
+                const esc = (v) => {
+                    if (v == null) return '';
+                    const s = String(v);
+                    return /[",\\n\\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+                };
+                const header = ['Port','Slot','Slot Letter','ICCID','IMEI','Number','Operator','Signal','SIM Status','State'];
+                const lines = [header.join(',')];
+                for (const p of ports) {
+                    const portStr = p.port || '';
+                    const m = portStr.match(/^(\d+)\.(\d+)$/);
+                    const portNum = m ? m[1] : portStr;
+                    const slotNum = m ? m[2] : '';
+                    const slotLetter = SLOT_TO_LETTER[slotNum] || slotNum;
+                    lines.push([
+                        esc(portNum),
+                        esc(slotNum),
+                        esc(slotLetter),
+                        esc(p.iccid || ''),
+                        esc(p.imei || ''),
+                        esc(p.number || ''),
+                        esc(p.operator || ''),
+                        esc(p.signal != null ? p.signal : ''),
+                        esc(p.sim_status || ''),
+                        esc(p.st != null ? p.st : ''),
+                    ].join(','));
+                }
+                const csv = lines.join(NL) + NL;
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                const safeLabel = gwLabel.replace(/[^a-z0-9]/gi, '_');
+                const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+                a.href = url;
+                a.download = 'gateway_' + safeLabel + '_' + ts + '.csv';
+                a.click();
+                URL.revokeObjectURL(url);
+                showToast('Exported ' + ports.length + ' slots', 'success');
+            } catch (err) {
+                showToast('Export error: ' + err, 'error');
+                console.error(err);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = origHtml;
             }
         }
 
@@ -8052,7 +8705,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
             logsSection.classList.add('hidden');
-            logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading Helix API logs...</p>';
+            logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading API logs...</p>';
             try {
                 const params = simId ? 'sim_id=' + simId : 'iccid=' + encodeURIComponent(iccid);
                 const resp = await fetch(\`\${API_BASE}/error-logs?\${params}\`);
@@ -8112,11 +8765,62 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('sim-action-output').classList.remove('hidden');
         }
 
+        function querySimCarrier(simId, vendor, subId, iccid) {
+            const vendorSelect = document.getElementById('carrier-query-vendor');
+            const input = document.getElementById('helix-subid-input');
+            if (vendor === 'wing_iot') {
+                vendorSelect.value = 'wing_iot';
+                input.value = iccid || '';
+            } else if (vendor === 'atomic') {
+                vendorSelect.value = 'atomic';
+                input.value = iccid || '';
+            } else {
+                vendorSelect.value = 'helix';
+                input.value = subId || '';
+            }
+            updateCarrierQueryUI();
+            document.getElementById('helix-query-modal').classList.remove('hidden');
+        }
+
+        function bulkQuery() {
+            const selected = [...document.querySelectorAll('.sim-cb:checked')];
+            if (selected.length === 0) { showToast('Select at least one SIM', 'error'); return; }
+            if (selected.length > 1) { showToast('Query works on one SIM at a time. Select only one.', 'error'); return; }
+            const simId = parseInt(selected[0].value);
+            const sim = tableState.sims?.data?.find(s => s.id === simId);
+            if (!sim) { showToast('SIM not found', 'error'); return; }
+            querySimCarrier(simId, sim.vendor || 'helix', sim.mobility_subscription_id || '', sim.iccid || '');
+        }
+
+        async function bulkRetryActivation() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) { showToast('Select at least one SIM', 'error'); return; }
+            if (!(await showConfirm('Retry Activation', 'Retry activation for ' + simIds.length + ' SIM(s)?'))) return;
+            showToast('Retrying activation for ' + simIds.length + ' SIM(s)...', 'info');
+            let success = 0, failed = 0;
+            for (const simId of simIds) {
+                try {
+                    const res = await fetch(API_BASE + '/sim-action', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sim_id: simId, action: 'retry_activation' })
+                    });
+                    const result = await res.json();
+                    if (result.ok) success++;
+                    else failed++;
+                } catch (e) {
+                    failed++;
+                }
+            }
+            showToast(success + ' success, ' + failed + ' failed', failed > 0 ? 'warning' : 'success');
+            loadSims(true);
+        }
+
         function showSimLogs(simId) {
             const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
             currentSimActionId = simId;
             currentSimActionIccid = sim?.iccid || null;
-            document.getElementById('sim-action-title').textContent = 'Helix Logs — SIM #' + simId;
+            document.getElementById('sim-action-title').textContent = 'API Logs — SIM #' + simId;
             document.getElementById('sim-action-output').textContent = '';
             document.getElementById('sim-action-output').classList.add('hidden');
             document.getElementById('sim-action-logs-section').classList.remove('hidden');
@@ -8152,6 +8856,54 @@ async function sendSimOnline(simId, phoneNumber) {
                 showToast('Error setting status', 'error');
                 console.error(e);
             }
+        }
+
+        function showBulkSetStatusModal() {
+            const selectedIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (selectedIds.length === 0) {
+                showToast('Select at least one SIM first', 'error');
+                return;
+            }
+            document.getElementById('bulk-status-count').textContent = selectedIds.length;
+            document.getElementById('bulk-set-status-select').value = 'active';
+            document.getElementById('bulk-set-status-modal').classList.remove('hidden');
+        }
+
+        async function runBulkSetStatus() {
+            const selectedIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (selectedIds.length === 0) return;
+            const status = document.getElementById('bulk-set-status-select').value;
+            document.getElementById('bulk-set-status-modal').classList.add('hidden');
+
+            const btn = document.getElementById('bulk-status-apply-btn');
+            btn.disabled = true;
+            btn.textContent = 'Applying...';
+
+            let success = 0, failed = 0;
+            for (const simId of selectedIds) {
+                try {
+                    const res = await fetch(API_BASE + '/set-sim-status', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sim_id: simId, status })
+                    });
+                    const result = await res.json();
+                    if (result.ok) success++;
+                    else failed++;
+                } catch (e) {
+                    failed++;
+                }
+            }
+
+            btn.disabled = false;
+            btn.textContent = 'Apply';
+
+            if (failed === 0) {
+                showToast(success + ' SIM(s) status set to ' + status, 'success');
+            } else {
+                showToast(success + ' success, ' + failed + ' failed', failed > 0 ? 'warning' : 'success');
+            }
+            loadSims(true);
         }
 
         async function simAction(simId, action, skipConfirm = false) {
@@ -8339,7 +9091,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const logsContainer = document.getElementById('sim-action-logs-container');
 
             logsSection.classList.remove('hidden');
-            logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading Helix logs...</p>';
+            logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading API logs...</p>';
 
             try {
                 const params = currentSimActionIccid
@@ -8371,6 +9123,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         <div class="flex items-center justify-between mb-2">
                             <div class="flex items-center gap-3">
                                 <span class="text-xs font-semibold text-blue-400">\${log.step || '-'}</span>
+                                \${log.vendor ? '<span class="text-xs font-semibold ' + ({atomic:'text-orange-400',wing_iot:'text-green-400',helix:'text-purple-400',teltik:'text-pink-400'}[log.vendor] || 'text-gray-400') + '">' + log.vendor.toUpperCase() + '</span>' : ''}
                                 <span class="text-xs \${statusColor} font-mono">HTTP \${log.response_status || '?'}</span>
                                 <span class="text-xs text-gray-500 font-mono">\${log.request_method || 'GET'}</span>
                             </div>
@@ -8391,11 +9144,11 @@ async function sendSimOnline(simId, phoneNumber) {
                     \`;
                 }).join('');
             } catch (err) {
-                console.error('Failed to load Helix API logs:', err);
+                console.error('Failed to load API logs:', err);
                 logsContainer.innerHTML = '<p class="text-red-400 text-sm">Failed to load API logs</p>';
             }
         }
-        // Retry a failed Helix API log step for the currently-viewed SIM
+        // Retry a failed API log step for the currently-viewed SIM
         function retryLogStep(step) {
             if (!currentSimActionId) { showToast('No SIM selected', 'error'); return; }
             var actionMap = {
@@ -8405,6 +9158,24 @@ async function sendSimOnline(simId, phoneNumber) {
             };
             var action = actionMap[step] || 'fix';
             simAction(currentSimActionId, action);
+        }
+
+        let lastSimCbIndex = -1;
+        function handleSimCbClick(event, cb) {
+            const all = Array.from(document.querySelectorAll('.sim-cb'));
+            const idx = all.indexOf(cb);
+            if (event.shiftKey && lastSimCbIndex !== -1 && lastSimCbIndex !== idx) {
+                const start = Math.min(lastSimCbIndex, idx);
+                const end = Math.max(lastSimCbIndex, idx);
+                const state = cb.checked;
+                for (let i = start; i <= end; i++) {
+                    if (all[i]) all[i].checked = state;
+                }
+                updateSimActionBar();
+                // Prevent text selection artefacts from shift-click
+                if (window.getSelection) window.getSelection().removeAllRanges();
+            }
+            lastSimCbIndex = idx;
         }
 
         function toggleAllSims(checkbox) {
@@ -8566,6 +9337,26 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
             } catch (err) {
                 showToast('Error unassigning: ' + err, 'error');
+            }
+        }
+
+        async function deleteSim(simId, iccid) {
+            if (!(await showConfirm('Delete SIM', 'Permanently delete SIM #' + simId + ' (ICCID: ' + iccid + ')? This deletes all SMS history and cannot be undone.'))) return;
+            try {
+                const resp = await fetch(API_BASE + '/delete-sim', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_id: simId })
+                });
+                const result = await resp.json();
+                if (result.ok) {
+                    showToast('SIM #' + simId + ' deleted', 'success');
+                    loadSims(true);
+                } else {
+                    showToast('Failed: ' + (result.error || JSON.stringify(result)), 'error');
+                }
+            } catch (err) {
+                showToast('Error deleting SIM: ' + err, 'error');
             }
         }
 
@@ -9400,7 +10191,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 data.days.forEach(d => {
                     html += \`<tr class="border-b border-dark-700"><td class="py-2 pr-4 text-gray-300">\${d.date}</td><td class="py-2 pr-4 text-gray-300">\${d.sim_count}</td><td class="py-2 text-gray-300">$\${Number(d.amount).toFixed(2)}</td></tr>\`;
                 });
-                html += \`<tr class="border-t border-dark-500"><td class="py-2 pr-4 text-white font-semibold">Total</td><td class="py-2 pr-4 text-white font-semibold">\${data.total_sim_days} SIM-days</td><td class="py-2 text-accent font-bold">$\${Number(data.total_amount).toFixed(2)}</td></tr>\`;
+                html += \`<tr class="border-t border-dark-500"><td class="py-2 pr-4 text-white font-semibold">Total</td><td class="py-2 pr-4 text-white font-semibold">\${data.total_sim_days} billable units</td><td class="py-2 text-accent font-bold">$\${Number(data.total_amount).toFixed(2)}</td></tr>\`;
                 html += "</tbody></table></div>";
                 document.getElementById("invoice-preview").innerHTML = html;
                 document.getElementById("download-invoice-btn").classList.remove("hidden");
@@ -9636,6 +10427,103 @@ async function sendSimOnline(simId, phoneNumber) {
 
         loadGatewayDropdown();
         loadResellers();
+        // ── API Tester ────────────────────────────────────────────────────────
+        var API_TESTER_PRESETS = {
+            atomic: { method: 'POST', url: 'https://solutionsatt-atomic.telgoo5.com/', headers: [['Content-Type', 'application/json']], body: '{"operation":""}' },
+            wing:   { method: 'GET',  url: 'https://restapi19.att.com/', headers: [['Authorization', 'Basic '],['Accept', 'application/json']], body: '' },
+            teltik: { method: 'GET',  url: 'https://api.smsgateway.xyz/lines?apikey=', headers: [], body: '' },
+            helix:  { method: 'POST', url: '', headers: [['Content-Type', 'application/json']], body: '{}' },
+        };
+
+        function addRelayHeader(key, val) {
+            key = key || '';
+            val = val || '';
+            var container = document.getElementById('api-tester-headers');
+            var row = document.createElement('div');
+            row.className = 'flex gap-2 items-center';
+            var keyIn = document.createElement('input');
+            keyIn.type = 'text';
+            keyIn.placeholder = 'Header name';
+            keyIn.value = key;
+            keyIn.className = 'flex-1 text-xs bg-dark-900 border border-dark-500 rounded px-2 py-1 text-gray-300 font-mono focus:outline-none focus:border-accent';
+            var valIn = document.createElement('input');
+            valIn.type = 'text';
+            valIn.placeholder = 'Value';
+            valIn.value = val;
+            valIn.className = 'flex-1 text-xs bg-dark-900 border border-dark-500 rounded px-2 py-1 text-gray-300 font-mono focus:outline-none focus:border-accent';
+            var btn = document.createElement('button');
+            btn.innerHTML = '&times;';
+            btn.className = 'text-red-400 hover:text-red-300 text-lg leading-none px-1 transition';
+            btn.onclick = function() { row.remove(); };
+            row.appendChild(keyIn);
+            row.appendChild(valIn);
+            row.appendChild(btn);
+            container.appendChild(row);
+        }
+
+        function applyApiPreset() {
+            var val = document.getElementById('api-tester-preset').value;
+            var p = val ? API_TESTER_PRESETS[val] : null;
+            if (!p) return;
+            document.getElementById('api-tester-method').value = p.method;
+            document.getElementById('api-tester-url').value = p.url;
+            document.getElementById('api-tester-headers').innerHTML = '';
+            (p.headers || []).forEach(function(h) { addRelayHeader(h[0], h[1]); });
+            document.getElementById('api-tester-body').value = p.body;
+        }
+
+        async function sendRelayTest() {
+            var method = document.getElementById('api-tester-method').value;
+            var url = (document.getElementById('api-tester-url').value || '').trim();
+            var statusEl = document.getElementById('api-tester-status');
+            var responseEl = document.getElementById('api-tester-response');
+            var respHeadersEl = document.getElementById('api-tester-resp-headers-body');
+            var respHeadersWrap = document.getElementById('api-tester-response-headers');
+            var sendBtn = document.getElementById('api-tester-send');
+            if (!url) { showToast('URL is required', 'error'); return; }
+            var headers = {};
+            document.querySelectorAll('#api-tester-headers > div').forEach(function(row) {
+                var inputs = row.querySelectorAll('input');
+                var k = inputs[0].value.trim();
+                if (k) headers[k] = inputs[1].value;
+            });
+            var hasBody = ['POST', 'PUT', 'PATCH'].includes(method);
+            var body = hasBody ? (document.getElementById('api-tester-body').value || '') : null;
+            sendBtn.textContent = 'Sending...';
+            sendBtn.disabled = true;
+            statusEl.innerHTML = '';
+            responseEl.textContent = '...';
+            respHeadersWrap.classList.add('hidden');
+            try {
+                var res = await fetch(API_BASE + '/relay-test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ method: method, url: url, headers: headers, body: body })
+                });
+                var data = await res.json();
+                if (!data.ok) {
+                    statusEl.innerHTML = '<span class="text-red-400">Error</span>';
+                    responseEl.textContent = data.error || 'Unknown error';
+                } else {
+                    var ok2xx = data.status >= 200 && data.status < 300;
+                    statusEl.innerHTML = '<span class="' + (ok2xx ? 'text-green-400' : 'text-red-400') + '">' + data.status + '</span>';
+                    var bodyText = data.body;
+                    try { bodyText = JSON.stringify(JSON.parse(data.body), null, 2); } catch(e) {}
+                    responseEl.textContent = bodyText;
+                    if (data.headers && Object.keys(data.headers).length) {
+                        respHeadersEl.textContent = JSON.stringify(data.headers, null, 2);
+                        respHeadersWrap.classList.remove('hidden');
+                    }
+                }
+            } catch (err) {
+                statusEl.innerHTML = '<span class="text-red-400">Error</span>';
+                responseEl.textContent = 'Fetch failed: ' + err;
+            } finally {
+                sendBtn.textContent = 'Send via Relay';
+                sendBtn.disabled = false;
+            }
+        }
+
         loadData();
         setInterval(loadData, 3600000);
         initTabFromUrl();

@@ -9,12 +9,13 @@ const workerCode = fs.readFileSync('src/dashboard/index.js', 'utf8');
 
 // getHTML() is a plain function that returns a template literal string.
 // Extract just the getHTML function and eval it.
-const fnStart = workerCode.indexOf('\nfunction getHTML()');
+const fnStart = workerCode.indexOf('\nfunction getHTML(');
 const fnEnd = workerCode.indexOf('\n// End of file', fnStart); // fallback
 // Find the end: the function ends at the last `}` at module level
 // Actually just eval the whole file as CJS by wrapping in a function scope
 // Safer: extract just the getHTML function body
-const start = workerCode.indexOf('function getHTML() {');
+// Match getHTML with or without parameters
+let start = workerCode.indexOf('function getHTML(');
 if (start === -1) { console.error('getHTML() not found'); process.exit(1); }
 
 // Find the closing brace of getHTML by counting braces
@@ -37,7 +38,7 @@ const getHTMLSrc = workerCode.slice(start, i + 1);
 const vm = require('vm');
 const ctx = vm.createContext({});
 const fn = vm.runInContext('(' + getHTMLSrc + ')', ctx);
-const html = fn();
+const html = fn(false);  // pass helixEnabled=false for syntax checking
 
 // Extract the last <script> block
 const scriptStart = html.lastIndexOf('<script>');
