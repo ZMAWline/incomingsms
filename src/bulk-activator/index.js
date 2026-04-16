@@ -25,7 +25,7 @@ export default {
     const limitParam = url.searchParams.get('limit');
     const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 1, 1) : null;
 
-    const csvRes = await fetch(env.SHEET_CSV_URL);
+    const csvRes = await relayFetch(env, env.SHEET_CSV_URL);
     if (!csvRes.ok) return new Response(`Failed to fetch CSV: ${csvRes.status}`, { status: 500 });
     const csvText = await csvRes.text();
 
@@ -74,7 +74,7 @@ export default {
   async queue(batch, env) {
     // Pre-fetch Helix token only if we have helix SIMs in batch
     let helixToken = null;
-    const hasHelix = batch.messages.some(m => m.body.vendor === 'helix');
+    const hasHelix = env.HELIX_ENABLED === 'true' && batch.messages.some(m => m.body.vendor === 'helix');
     if (hasHelix) {
       try {
         helixToken = await hxGetBearerToken(env);
@@ -115,6 +115,10 @@ export default {
             result = await activateViaWingIot(env, iccid, runId);
             break;
           case 'helix':
+            if (env.HELIX_ENABLED !== 'true') {
+              console.warn(`[Activator] ${iccid}: Helix is disabled — acking without activation`);
+              msg.ack(); continue;
+            }
             if (!helixToken) {
               console.error(`[Activator] ${iccid}: No Helix token — skipping`);
               continue; // Don't ack, will retry
@@ -181,6 +185,21 @@ async function handleActivateJson(request, env) {
   return json({ ok: true, queued, validation_errors: validationErrors, attempted: sims.length, run_id: runId });
 }
 
+/* ── Relay fetch helper (routes through VPS to avoid CF-to-CF blocking) ─────── */
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: {
+        ...(init?.headers || {}),
+        'x-relay-key': env.RELAY_KEY,
+      },
+    });
+  }
+  return fetch(url, init);
+}
+
 /* ── Vendor-specific activation functions ──────────────────────────────────── */
 
 async function activateViaAtomic(env, iccid, imei, runId) {
@@ -213,7 +232,7 @@ async function activateViaAtomic(env, iccid, imei, runId) {
     },
   };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(requestBody),
@@ -258,7 +277,7 @@ async function activateViaAtomic(env, iccid, imei, runId) {
 async function activateViaWingIot(env, iccid, runId) {
   // Wing IoT activation - PUT with dialable plan
   const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
-  const url = `${baseUrl}/api/v1/devices/${iccid}`;
+  const url = `${baseUrl}/v1/devices/${iccid}`;
   const auth = `Basic ${btoa(`${env.WING_IOT_USERNAME}:${env.WING_IOT_API_KEY}`)}`;
 
   const requestBody = {
@@ -266,7 +285,7 @@ async function activateViaWingIot(env, iccid, runId) {
     status: 'Activated',
   };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method: 'PUT',
     headers: {
       Authorization: auth,
@@ -300,7 +319,7 @@ async function activateViaWingIot(env, iccid, runId) {
   }
 
   // GET to verify and get MDN
-  const getRes = await fetch(url, {
+  const getRes = await relayFetch(env, url, {
     method: 'GET',
     headers: { Authorization: auth },
   });
@@ -323,7 +342,7 @@ async function activateViaHelix(env, token, iccid, imei, runId) {
 /* ── Helix ─────────────────────────────────────────────────────────────────── */
 
 async function hxGetBearerToken(env) {
-  const res = await fetch(env.HX_TOKEN_URL, {
+  const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -361,7 +380,7 @@ async function hxActivate(env, token, iccid, imei, runId) {
     service: { iccid, imei },
   };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(requestBody),

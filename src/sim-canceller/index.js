@@ -28,8 +28,11 @@ export default {
         return json({ ok: false, error: "iccids array is required" }, 400);
       }
 
-      // Get Helix bearer token
-      const token = await hxGetBearerToken(env);
+      // Get Helix bearer token (only if Helix is enabled)
+      let token = null;
+      if (env.HELIX_ENABLED === 'true') {
+        token = await hxGetBearerToken(env);
+      }
 
       let processed = 0;
       let cancelled = 0;
@@ -99,9 +102,11 @@ export default {
           } else if (vendor === 'teltik') {
             // Teltik has no cancel API - just update DB
             console.log(`[Teltik] ${iccid}: No cancel API, marking DB only`);
-          } else {
+          } else if (env.HELIX_ENABLED === 'true') {
             // Helix
             await hxCancelSubscription(env, token, subId, iccid);
+          } else {
+            console.log(`[Cancel] ${iccid}: Helix is disabled — marking DB only`);
           }
 
           // Update SIM status to canceled
@@ -181,6 +186,18 @@ export default {
   },
 };
 
+/* ================= RELAY ================= */
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
+}
+
 /* ================= HELPERS ================= */
 
 function sleep(ms) {
@@ -215,7 +232,7 @@ async function atomicCancelSubscription(env, msisdn, iccid) {
     },
   };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(requestBody),
@@ -254,7 +271,7 @@ async function atomicCancelSubscription(env, msisdn, iccid) {
 /* ================= HELIX API ================= */
 
 async function hxGetBearerToken(env) {
-  const res = await fetch(env.HX_TOKEN_URL, {
+  const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -281,7 +298,7 @@ async function hxCancelSubscription(env, token, subscriptionId, iccid) {
   const detailsUrl = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
   const detailsBody = { mobilitySubscriptionId: subscriptionId };
 
-  const detailsRes = await fetch(detailsUrl, {
+  const detailsRes = await relayFetch(env, detailsUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -331,7 +348,7 @@ async function hxCancelSubscription(env, token, subscriptionId, iccid) {
     subscriberState: "Cancel"
   }];
 
-  const cancelRes = await fetch(cancelUrl, {
+  const cancelRes = await relayFetch(env, cancelUrl, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
@@ -477,7 +494,7 @@ async function postResellerWebhook(webhookUrl, payload) {
   console.log(`[Cancel Webhook] Sending to ${webhookUrl}:`, JSON.stringify(payload));
 
   try {
-    const res = await fetch(webhookUrl, {
+    const res = await relayFetch(env, webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),

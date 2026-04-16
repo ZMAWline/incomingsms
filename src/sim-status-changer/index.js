@@ -36,8 +36,11 @@ export default {
         return json({ ok: false, error: "sim_ids array is required" }, 400);
       }
 
-      // Get Helix bearer token
-      const token = await hxGetBearerToken(env);
+      // Get Helix bearer token (only if Helix is enabled)
+      let token = null;
+      if (env.HELIX_ENABLED === 'true') {
+        token = await hxGetBearerToken(env);
+      }
 
       let processed = 0;
       let success = 0;
@@ -132,10 +135,12 @@ export default {
           // Call carrier API to change status based on vendor
           if (vendor === 'atomic') {
             await atomicChangeStatus(env, msisdn, action, iccid);
-          } else {
+          } else if (env.HELIX_ENABLED === 'true') {
             // Strip +1 prefix for Helix API (expects 10-digit MDN)
             const mdn = phoneNumber.replace(/^\+1/, "");
             await hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reasonCodeId, iccid);
+          } else {
+            throw new Error(`Helix is disabled — cannot ${action} SIM ${sim.iccid}`);
           }
 
           // Update SIM status in database
@@ -211,6 +216,18 @@ export default {
   },
 };
 
+/* ================= RELAY ================= */
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
+}
+
 /* ================= HELPERS ================= */
 
 function sleep(ms) {
@@ -248,7 +265,7 @@ async function atomicChangeStatus(env, msisdn, action, iccid) {
     },
   };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(requestBody),
@@ -287,7 +304,7 @@ async function atomicChangeStatus(env, msisdn, action, iccid) {
 /* ================= HELIX API ================= */
 
 async function hxGetBearerToken(env) {
-  const res = await fetch(env.HX_TOKEN_URL, {
+  const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -318,7 +335,7 @@ async function hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reas
     subscriberState
   }];
 
-  const statusRes = await fetch(statusUrl, {
+  const statusRes = await relayFetch(env, statusUrl, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
@@ -464,7 +481,7 @@ async function postResellerWebhook(webhookUrl, payload) {
   console.log(`[Status Webhook] Sending to ${webhookUrl}:`, JSON.stringify(payload));
 
   try {
-    const res = await fetch(webhookUrl, {
+    const res = await relayFetch(env, webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),

@@ -33,6 +33,19 @@ export default {
 };
 
 // ===========================
+// Relay fetch helper
+// ===========================
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
+}
+
+// ===========================
 // Main sync loop
 // ===========================
 async function runOtaStatusSync(env) {
@@ -57,8 +70,8 @@ async function runOtaStatusSync(env) {
 
   console.log(`[OTA Sync] Starting sync for ${validSims.length} SIMs (${sims.length - validSims.length} skipped)`);
 
-  // Get Helix token only if we have helix SIMs
-  const hasHelix = validSims.some(s => (s.vendor || 'helix') === 'helix');
+  // Get Helix token only if we have helix SIMs AND Helix is enabled
+  const hasHelix = env.HELIX_ENABLED === 'true' && validSims.some(s => (s.vendor || 'helix') === 'helix');
   let token = null;
   if (hasHelix) {
     token = await getCachedToken(env);
@@ -91,8 +104,10 @@ async function syncSimStatus(env, token, sim) {
 
   if (vendor === 'atomic') {
     await syncSimStatusAtomic(env, sim, runId);
-  } else {
+  } else if (env.HELIX_ENABLED === 'true') {
     await syncSimStatusHelix(env, token, sim, runId);
+  } else {
+    console.log(`[OTA Sync] SIM ${iccid}: Helix is disabled — skipping`);
   }
 }
 
@@ -116,7 +131,7 @@ async function syncSimStatusAtomic(env, sim, runId) {
     },
   };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(requestBody),
@@ -227,7 +242,7 @@ async function getCachedToken(env) {
 }
 
 async function hxGetBearerToken(env) {
-  const res = await fetch(env.HX_TOKEN_URL, {
+  const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -250,7 +265,7 @@ async function hxSubscriberDetails(env, token, mobilitySubscriptionId, runId, ic
   const method = "POST";
   const requestBody = { mobilitySubscriptionId };
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -286,7 +301,7 @@ async function hxOtaRefresh(env, token, data, runId, iccid) {
   const method = "PATCH";
   const requestBody = [data];
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method,
     headers: {
       "Content-Type": "application/json",

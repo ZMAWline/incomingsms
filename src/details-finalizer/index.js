@@ -32,6 +32,11 @@ export default {
 /* ── Core runner ──────────────────────────────────────────────────────────── */
 
 async function runFinalizer(env, limit) {
+  // Helix-only worker — skip entirely when Helix is quarantined
+  if (env.HELIX_ENABLED !== 'true') {
+    console.log('[Finalizer] HELIX_ENABLED is off — skipping (this worker is Helix-only)');
+    return { processed: 0, activated: 0, message: 'helix_disabled' };
+  }
   const token = await hxGetBearerToken(env);
 
   // Only process Helix SIMs - ATOMIC and Wing IoT get MDN at activation time
@@ -100,10 +105,22 @@ async function runFinalizer(env, limit) {
   return { ok: true, processed, activated, errors };
 }
 
+/* ── Relay ────────────────────────────────────────────────────────────────── */
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
+}
+
 /* ── Helix ────────────────────────────────────────────────────────────────── */
 
 async function hxGetBearerToken(env) {
-  const res = await fetch(env.HX_TOKEN_URL, {
+  const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -120,7 +137,7 @@ async function hxGetBearerToken(env) {
 }
 
 async function hxSubscriberDetails(env, token, mobilitySubscriptionId) {
-  const res = await fetch(`${env.HX_API_BASE}/api/mobility-subscriber/details`, {
+  const res = await relayFetch(env, `${env.HX_API_BASE}/api/mobility-subscriber/details`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ mobilitySubscriptionId }),
