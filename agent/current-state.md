@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-15 (session 16 — Helix quarantine)
+> Last updated: 2026-04-16 (session 16 continued — D1/D2/D4 UX + verification)
 
 ---
 
@@ -24,10 +24,10 @@ Gemini UI (zinc/blue palette, light mode, custom confirm/toast dialogs) was unin
 - **Provider-leak bugs fixed:** `sim.vendor || 'helix'` → `'unknown'` in 3 places; billing aggregation renamed `helixDays` → `attDays` for clarity
 - **Secrets:** All ATOMIC + Wing IoT + RELAY + HELIX_ENABLED secrets on every worker
 
-### Dashboard UX Consolidation — In Progress (Phase D pending)
-- **Planned (not yet implemented):** merge set-status modals, unify per-row vs bulk Retry, per-SIM detail modal, vendor-conditional button tooltips
-- **Plan file:** `.claude/plans/generic-tickling-adleman.md` — Phases D1-D4 describe the UX work
-- Pick up in next session
+### Dashboard UX Consolidation — Mostly Complete
+- **Done (2026-04-16):** set-status modals merged (D1), bulk Retry shows per-SIM results in modal (D2), vendor tooltips for OTA/Retry buttons (D4)
+- **Deferred:** per-SIM detail modal (D3) — tabbed modal (Details/Status/IMEI/API Logs) replacing scattered per-row click targets. ~300 lines of new template-literal HTML+JS; needs dedicated session. Highest-value remaining UX improvement.
+- **Plan file:** `.claude/plans/generic-tickling-adleman.md` — D3 description still valid
 
 ### BLIMEI / IMEI Heartbeat — Both Disabled
 - Both `imei_heartbeat` and `blimei_update` queue handlers in mdn-rotator are disabled (short-circuit added during gateway instability investigation)
