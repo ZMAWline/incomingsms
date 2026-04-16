@@ -6766,7 +6766,7 @@ function renderSims() {
                 const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
                 const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
                 const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-accent" title="Verified">&#10003;</span>' : '';
-                const gatewayDisplay = sim.gateway_code ? \`<span class="font-medium text-gray-200">\${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">\${sim.port || ''}</span>\` : (sim.vendor === 'teltik' ? '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-pink-500/20 text-pink-300">T-Mobile</span>' : (sim.port || '-'));
+                const gatewayDisplay = sim.gateway_code ? \`<span class="font-medium text-gray-200">\${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">\${normalizePortDisplay(sim.port) || ''}</span>\` : (sim.vendor === 'teltik' ? '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-pink-500/20 text-pink-300">T-Mobile</span>' : (normalizePortDisplay(sim.port) || '-'));
                 const statusClass = {
                     'active': 'bg-accent/20 text-accent',
                     'provisioning': 'bg-yellow-500/20 text-yellow-400',
@@ -10557,6 +10557,14 @@ async function sendSimOnline(simId, phoneNumber) {
             if (tab === 'logs' && _sdCurrentSim) loadSimDetailLogs(_sdCurrentSim.id, _sdCurrentSim.iccid);
         }
 
+        function normalizePortDisplay(p) {
+            if (!p) return p;
+            var d = p.match(/^(\d+)\.(\d+)$/);
+            if (d) return d[1] + '.' + String(parseInt(d[2])).padStart(2, '0');
+            var l = p.match(/^(\d+)([A-Ha-h])$/i);
+            if (l) return l[1] + '.' + String(l[2].toUpperCase().charCodeAt(0) - 64).padStart(2, '0');
+            return p;
+        }
         function _sdOta() { if (_sdCurrentSim) simAction(_sdCurrentSim.id, 'ota_refresh'); }
         function _sdOpenImei() { if (!_sdCurrentSim) return; var c=_sdCurrentSim; closeSimDetail(); showChangeImeiModal(c.id, c.iccid, c.gateway_id, c.port); }
         function _sdRetry() { if (_sdCurrentSim) simAction(_sdCurrentSim.id, 'retry_activation'); }
@@ -10580,7 +10588,7 @@ async function sendSimOnline(simId, phoneNumber) {
             var canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
             var canOta = sim.status === 'active' && ['teltik','wing_iot'].indexOf(sim.vendor) === -1 && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
             var canRetry = sim.status === 'error' && ['teltik','wing_iot'].indexOf(sim.vendor) === -1 && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
-            var gatewayPort = (sim.gateway_name || sim.gateway_code || (sim.gateway_id ? 'GW#' + sim.gateway_id : '')) + (sim.port ? ' / ' + sim.port : '');
+            var gatewayPort = (sim.gateway_name || sim.gateway_code || (sim.gateway_id ? 'GW#' + sim.gateway_id : '')) + (sim.port ? ' / ' + normalizePortDisplay(sim.port) : '');
             var errHtml = (sim.status === 'error' && sim.last_activation_error)
                 ? '<div class="mt-3 p-2 bg-red-900/20 border border-red-800/40 rounded text-xs text-red-400 font-mono break-all">' + sim.last_activation_error.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>'
                 : '';
@@ -10638,7 +10646,7 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('sdtab-imei').innerHTML =
                 '<div class="grid grid-cols-2 gap-4 mb-5">' +
                 _sdField('ICCID', '<span class="font-mono text-xs">' + (sim.iccid || '-') + '</span>') +
-                _sdField('Gateway / Port', '<span class="font-mono">' + ((sim.gateway_name || (sim.gateway_id ? 'GW#' + sim.gateway_id : '')) + (sim.port ? ' / ' + sim.port : '') || '-') + '</span>') +
+                _sdField('Gateway / Port', '<span class="font-mono">' + ((sim.gateway_name || (sim.gateway_id ? 'GW#' + sim.gateway_id : '')) + (sim.port ? ' / ' + normalizePortDisplay(sim.port) : '') || '-') + '</span>') +
                 _sdField('Subscription ID', '<span class="font-mono text-xs">' + (sim.mobility_subscription_id || '-') + '</span>') +
                 '</div>' +
                 (hasImei
