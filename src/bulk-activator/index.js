@@ -1,3 +1,5 @@
+import { pickRandomAddress } from '../shared/address-pool.js';
+
 // =========================================================
 // SIM ACTIVATOR WORKER
 // Queues individual SIM activations — one SIM at a time.
@@ -204,6 +206,7 @@ function relayFetch(env, url, init) {
 
 async function activateViaAtomic(env, iccid, imei, runId) {
   // ATOMIC activation - returns MSISDN immediately
+  const addr = pickRandomAddress();
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
   const requestBody = {
     wholeSaleApi: {
@@ -222,10 +225,10 @@ async function activateViaAtomic(env, iccid, imei, runId) {
         BAN: '',
         firstName: 'SUB',
         lastName: 'NINE',
-        streetNumber: env.HX_ADDRESS1?.split(' ')[0] || '1',
+        streetNumber: addr.address1.split(' ')[0],
         streetDirection: '',
-        streetName: env.HX_ADDRESS1?.split(' ').slice(1).join(' ') || 'Main St',
-        zip: env.HX_ZIP || '75001',
+        streetName: addr.address1.split(' ').slice(1).join(' '),
+        zip: addr.zipCode,
         plan: 'ATTNOVOICE',
         portMdn: '',
       },
@@ -363,6 +366,7 @@ async function hxGetBearerToken(env) {
 }
 
 async function hxActivate(env, token, iccid, imei, runId) {
+  const addr = pickRandomAddress();
   const url = `${env.HX_API_BASE}/api/mobility-activation/activate`;
   const requestBody = {
     clientId: Number(env.HX_ACTIVATION_CLIENT_ID),
@@ -372,10 +376,10 @@ async function hxActivate(env, token, iccid, imei, runId) {
     activationType: 'new_activation',
     subscriber: { firstName: 'SUB', lastName: 'NINE' },
     address: {
-      address1: env.HX_ADDRESS1,
-      city: env.HX_CITY,
-      state: env.HX_STATE,
-      zipCode: env.HX_ZIP,
+      address1: addr.address1,
+      city: addr.city,
+      state: addr.state,
+      zipCode: addr.zipCode,
     },
     service: { iccid, imei },
   };
