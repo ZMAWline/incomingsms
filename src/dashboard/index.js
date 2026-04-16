@@ -8777,8 +8777,17 @@ async function sendSimOnline(simId, phoneNumber) {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) { showToast('Select at least one SIM', 'error'); return; }
             if (!(await showConfirm('Retry Activation', 'Retry activation for ' + simIds.length + ' SIM(s)?'))) return;
-            showToast('Retrying activation for ' + simIds.length + ' SIM(s)...', 'info');
+
+            // Show results in sim-action-modal (same modal per-row Retry uses)
+            const output = document.getElementById('sim-action-output');
+            document.getElementById('sim-action-title').textContent = 'Bulk Retry — ' + simIds.length + ' SIMs';
+            output.textContent = 'Starting...';
+            output.classList.remove('hidden');
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+
             let success = 0, failed = 0;
+            const lines = [];
             for (const simId of simIds) {
                 try {
                     const res = await fetch(API_BASE + '/sim-action', {
@@ -8787,12 +8796,20 @@ async function sendSimOnline(simId, phoneNumber) {
                         body: JSON.stringify({ sim_id: simId, action: 'retry_activation' })
                     });
                     const result = await res.json();
-                    if (result.ok) success++;
-                    else failed++;
+                    if (result.ok) {
+                        success++;
+                        lines.push('SIM #' + simId + ': OK');
+                    } else {
+                        failed++;
+                        lines.push('SIM #' + simId + ': FAILED — ' + (result.error || 'unknown'));
+                    }
                 } catch (e) {
                     failed++;
+                    lines.push('SIM #' + simId + ': ERROR — ' + e.message);
                 }
+                output.textContent = lines.join('\\n') + '\\n\\nProcessing... (' + (success + failed) + '/' + simIds.length + ')';
             }
+            output.textContent = lines.join('\\n') + '\\n\\nDone: ' + success + ' success, ' + failed + ' failed';
             showToast(success + ' success, ' + failed + ' failed', failed > 0 ? 'warning' : 'success');
             loadSims(true);
         }
