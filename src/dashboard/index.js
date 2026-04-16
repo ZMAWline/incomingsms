@@ -10558,6 +10558,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         function _sdOta() { if (_sdCurrentSim) simAction(_sdCurrentSim.id, 'ota_refresh'); }
+        function _sdOpenImei() { if (!_sdCurrentSim) return; var c=_sdCurrentSim; closeSimDetail(); showChangeImeiModal(c.id, c.iccid, c.gateway_id, c.port); }
         function _sdRetry() { if (_sdCurrentSim) simAction(_sdCurrentSim.id, 'retry_activation'); }
         function _sdViewLogs() { switchSimDetailTab('logs'); }
 
@@ -10641,7 +10642,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 _sdField('Subscription ID', '<span class="font-mono text-xs">' + (sim.mobility_subscription_id || '-') + '</span>') +
                 '</div>' +
                 (hasImei
-                    ? '<button onclick="showChangeImeiModal(_sdCurrentSim.id, _sdCurrentSim.iccid, _sdCurrentSim.gateway_id, _sdCurrentSim.port)" class="px-4 py-2 text-sm bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Open Change IMEI Dialog</button>'
+                    ? '<button onclick="_sdOpenImei()" class="px-4 py-2 text-sm bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Open Change IMEI Dialog</button>'
                     : '<p class="text-sm text-gray-500">IMEI change not available — SIM needs subscription ID, gateway, and port assigned.</p>');
         }
 
