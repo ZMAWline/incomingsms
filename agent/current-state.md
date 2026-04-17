@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-17 (session 23 — Teltik MDN sync + dashboard carrier query)
+> Last updated: 2026-04-17 (session 24 — Gateway bulk lock/unlock + ATOMIC IMEI change fix)
 
 ---
 
@@ -63,6 +63,9 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-17 | Gateway page: "Lock Failed" bulk-locks all st=6 (Reg Failed) ports; "Unlock Locked" bulk-unlocks all st=7/8/12 ports. Both iterate window.portData and POST to skyline/lock or skyline/unlock per port. | dashboard |
+| 2026-04-17 | mdn-rotator change_imei: ATOMIC SIMs no longer blocked by missing mobility_subscription_id. Helix eligibility check + hxChangeImei now gated behind isHelixSim (vendor==='helix'). ATOMIC just updates gateway + IMEI pool + DB. | mdn-rotator |
+| 2026-04-17 | mdn-rotator change_imei: fixed 409 on imei_pool_unique_in_use_slot — added second retire step keyed on (gateway_id, port) to evict stale slot occupants from previous SIMs before assigning new IMEI. | mdn-rotator |
 | 2026-04-17 | Teltik MDN sync: GET /sync-mdns on teltik-worker checks all active Teltik SIMs against /v1/get-phone-number/, fixes sim_numbers on mismatch. Root cause documented: rotation stamps last_mdn_rotated_at before polling; if polling+fallback both fail, sim_numbers stays stale. | teltik-worker |
 | 2026-04-17 | Dashboard: Teltik (T-Mobile) option in Carrier Query modal — /api/teltik-query backend, single-SIM ICCID lookup, DB auto-sync banner, bulk query support. Bulk routing needs verification (hard refresh required after deploy). | dashboard |
 | 2026-04-17 | Manually fixed SIM 983 MDN: DB had +14232935084, Teltik API returned 8144182808 (+18144182808). Closed stale sim_numbers row, inserted correct MDN. | — |
