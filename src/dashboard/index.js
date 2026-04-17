@@ -4124,7 +4124,7 @@ async function handleAtomicQuery(request, env, corsHeaders) {
     if (res.ok && wr2 && wr2.statusCode === '00' && wr2.Result && wr2.Result.attStatus === 'Active') {
       if (isIccid) {
         db_update = await syncActiveSim(env, identifier, {
-          mdn: wr2.Result.MSISDN || null,
+          mdn: wr2.Result.MSISDN || wr2.Result.msisdn || null,
           activatedAt: wr2.Result.activationDate || null,
         });
       }
@@ -7534,7 +7534,7 @@ async function sendSimOnline(simId, phoneNumber) {
                             fmtd += '<span class="' + (ok2 ? 'text-green-400' : 'text-red-400') + ' font-bold">statusCode: ' + wr.statusCode + '</span><br>';
                             fmtd += '<span class="text-blue-400">description:</span> ' + wr.description + '<br>';
                             if (r.attStatus) fmtd += '<span class="text-blue-400">attStatus:</span> <span class="' + (r.attStatus === 'Active' ? 'text-accent' : 'text-orange-400') + ' font-bold">' + r.attStatus + '</span><br>';
-                            if (r.MSISDN) fmtd += '<span class="text-blue-400">MSISDN:</span> ' + r.MSISDN + '<br>';
+                            if (r.MSISDN || r.msisdn) fmtd += '<span class="text-blue-400">MSISDN:</span> ' + (r.MSISDN || r.msisdn) + '<br>';
                             if (r.BAN) fmtd += '<span class="text-blue-400">BAN:</span> ' + r.BAN + '<br>';
                             if (r.activationDate) fmtd += '<span class="text-blue-400">activationDate:</span> ' + r.activationDate + '<br>';
                             fmtd += '<br><span class="text-gray-500">--- Full Response ---</span><br>';
