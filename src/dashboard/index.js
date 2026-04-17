@@ -1194,11 +1194,16 @@ async function handleWingCheck(request, env, corsHeaders) {
       error: res.ok ? null : 'Wing IoT query failed: ' + res.status,
     });
 
+    let db_update_wing = null;
+    if (res.ok && json && json.status && json.status.toLowerCase() === 'active') {
+      db_update_wing = await syncActiveSim(env, iccid, { mdn: json.mdn || null, activatedAt: null });
+    }
     return new Response(JSON.stringify({
       ok: res.ok,
       status: res.status,
       iccid,
-      response: json || text
+      response: json || text,
+      db_update: db_update_wing,
     }, null, 2), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -1340,6 +1345,70 @@ async function syncCancelledSim(env, subId, helixData) {
     } else {
       result.history_exists = true;
       result.canceled_at = hist[0].changed_at;
+    }
+
+    return result;
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+function toE164(mdn) {
+  if (!mdn) return null;
+  const digits = String(mdn).replace(/\D/g, '');
+  if (digits.length === 10) return '+1' + digits;
+  if (digits.length === 11 && digits[0] === '1') return '+' + digits;
+  return null;
+}
+
+async function syncActiveSim(env, iccid, { mdn, activatedAt }) {
+  try {
+    const sims = await sbGet(env, 'sims?iccid=eq.' + encodeURIComponent(iccid) + '&select=id,iccid,status,activated_at&limit=1');
+    const sim = Array.isArray(sims) ? sims[0] : null;
+    if (!sim) return { found: false };
+
+    const result = { found: true, iccid: sim.iccid, sim_id: sim.id };
+    const patch = {};
+
+    if (sim.status !== 'active') {
+      patch.status = 'active';
+      result.status_updated = true;
+      result.previous_status = sim.status;
+    }
+
+    if (activatedAt && !sim.activated_at) {
+      const parsed = new Date(activatedAt);
+      if (!isNaN(parsed.getTime())) {
+        patch.activated_at = parsed.toISOString();
+        result.activated_at_set = patch.activated_at;
+      }
+    } else if (sim.activated_at) {
+      result.activated_at = sim.activated_at;
+    }
+
+    if (Object.keys(patch).length > 0) {
+      await sbPatch(env, 'sims?id=eq.' + sim.id, patch);
+    }
+
+    if (mdn) {
+      const e164 = toE164(mdn);
+      if (e164) {
+        const existing = await sbGet(env, 'sim_numbers?sim_id=eq.' + sim.id + '&valid_to=is.null&select=e164&limit=1');
+        const currentMdn = Array.isArray(existing) && existing[0] ? existing[0].e164 : null;
+        if (currentMdn !== e164) {
+          const now = new Date().toISOString();
+          if (currentMdn) {
+            await sbPatch(env, 'sim_numbers?sim_id=eq.' + sim.id + '&valid_to=is.null', { valid_to: now });
+          }
+          await sbPost(env, 'sim_numbers', { sim_id: sim.id, e164, valid_from: now, valid_to: null });
+          result.mdn_updated = true;
+          result.mdn_old = currentMdn;
+          result.mdn_new = e164;
+        } else {
+          result.mdn_already_set = true;
+          result.mdn = currentMdn;
+        }
+      }
     }
 
     return result;
@@ -4050,7 +4119,17 @@ async function handleAtomicQuery(request, env, corsHeaders) {
         ? null
         : 'ATOMIC query: ' + (data && data.wholeSaleApi && data.wholeSaleApi.wholeSaleResponse ? data.wholeSaleApi.wholeSaleResponse.description : res.status),
     });
-    return new Response(JSON.stringify({ ok: true, response: data }), {
+    let db_update = null;
+    const wr2 = data && data.wholeSaleApi && data.wholeSaleApi.wholeSaleResponse;
+    if (res.ok && wr2 && wr2.statusCode === '00' && wr2.Result && wr2.Result.attStatus === 'Active') {
+      if (isIccid) {
+        db_update = await syncActiveSim(env, identifier, {
+          mdn: wr2.Result.MSISDN || null,
+          activatedAt: wr2.Result.activationDate || null,
+        });
+      }
+    }
+    return new Response(JSON.stringify({ ok: true, response: data, db_update }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
@@ -6124,7 +6203,7 @@ function getHTML(helixEnabled) {
                 <input type="text" id="helix-subid-input" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="e.g. 40033 or ICCID"/>
                 <div id="helix-query-result" class="mt-4 hidden">
                     <div id="helix-db-update-banner" class="hidden mb-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
-                        <p class="text-xs font-semibold text-yellow-400 mb-1">&#x26A0; DB Auto-Synced — Line marked Cancelled</p>
+                        <p id="helix-db-update-title" class="text-xs font-semibold text-yellow-400 mb-1">&#x26A0; DB Auto-Synced</p>
                         <pre id="helix-db-update-output" class="text-xs font-mono text-yellow-300 whitespace-pre-wrap"></pre>
                     </div>
                     <h4 class="text-sm font-medium text-gray-400 mb-2">Result:</h4>
@@ -7410,6 +7489,17 @@ async function sendSimOnline(simId, phoneNumber) {
                     } else {
                         outputEl.innerHTML = '<span class="text-red-400">Wing IoT Error (HTTP ' + result.status + '):</span>\\n' + JSON.stringify(result.response, null, 2);
                     }
+                    const wdu = result.db_update;
+                    if (wdu && wdu.found) {
+                        const wdLines = [];
+                        if (wdu.status_updated) wdLines.push('Status: ' + wdu.previous_status + ' → active');
+                        if (wdu.mdn_updated) wdLines.push('MDN: ' + (wdu.mdn_old || '(none)') + ' → ' + wdu.mdn_new);
+                        if (wdLines.length > 0) {
+                            document.getElementById('helix-db-update-title').textContent = '\u26A0 DB Auto-Synced';
+                            document.getElementById('helix-db-update-output').textContent = wdLines.join('\\n');
+                            document.getElementById('helix-db-update-banner').classList.remove('hidden');
+                        }
+                    }
                     resultDiv.classList.remove('hidden');
                 } catch (error) {
                     showToast('Error querying Wing IoT', 'error');
@@ -7453,6 +7543,18 @@ async function sendSimOnline(simId, phoneNumber) {
                             fmtd = JSON.stringify(result.response, null, 2);
                         }
                         outputEl.innerHTML = fmtd;
+                    }
+                    const adu = result.db_update;
+                    if (adu && adu.found) {
+                        const adLines = [];
+                        if (adu.status_updated) adLines.push('Status: ' + adu.previous_status + ' → active');
+                        if (adu.mdn_updated) adLines.push('MDN: ' + (adu.mdn_old || '(none)') + ' → ' + adu.mdn_new);
+                        if (adu.activated_at_set) adLines.push('Activated at: ' + adu.activated_at_set);
+                        if (adLines.length > 0) {
+                            document.getElementById('helix-db-update-title').textContent = '\u26A0 DB Auto-Synced';
+                            document.getElementById('helix-db-update-output').textContent = adLines.join('\\n');
+                            document.getElementById('helix-db-update-banner').classList.remove('hidden');
+                        }
                     }
                     resultDiv.classList.remove('hidden');
                 } catch (err) {
@@ -8802,7 +8904,9 @@ async function sendSimOnline(simId, phoneNumber) {
                         const r = await res.json();
                         if (r.ok) {
                             okCount++;
-                            lines.push(label + ' [wing_iot]: ' + (r.response && r.response.status ? r.response.status : 'OK'));
+                            const wStatus = r.response && r.response.status ? r.response.status : 'OK';
+                            const wNote = r.db_update && r.db_update.found ? (r.db_update.status_updated ? ' [status→active]' : '') + (r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '') : '';
+                            lines.push(label + ' [wing_iot]: ' + wStatus + wNote);
                         } else {
                             failCount++;
                             lines.push(label + ' [wing_iot]: ERROR — ' + JSON.stringify(r.response || r.error));
@@ -8818,7 +8922,8 @@ async function sendSimOnline(simId, phoneNumber) {
                             const wr = r.response && r.response.wholeSaleApi && r.response.wholeSaleApi.wholeSaleResponse;
                             const attStatus = (wr && wr.Result && wr.Result.attStatus) ? wr.Result.attStatus : (wr && wr.statusCode ? wr.statusCode : 'OK');
                             okCount++;
-                            lines.push(label + ' [atomic]: ' + attStatus);
+                            const aNote = r.db_update && r.db_update.found ? (r.db_update.status_updated ? ' [status→active]' : '') + (r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '') : '';
+                            lines.push(label + ' [atomic]: ' + attStatus + aNote);
                         } else {
                             failCount++;
                             lines.push(label + ' [atomic]: ERROR — ' + (r.error || 'unknown'));
