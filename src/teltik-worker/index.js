@@ -1,7 +1,7 @@
 // =========================================================
 // TELTIK WORKER
 // Manages T-Mobile SIMs via Teltik REST API (api.smsgateway.xyz)
-// Routes: POST /import, POST /webhook, POST /rotate, GET /setup-webhook
+// Routes: POST /import, POST /webhook, POST /rotate, GET /setup-webhook, GET /sync-mdns
 // Cron: every 30 min for MDN rotation (48h interval)
 // =========================================================
 
@@ -55,6 +55,18 @@ export default {
       }
     }
 
+    if (url.pathname === '/sync-mdns') {
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      try {
+        const result = await syncTeltikMdns(env);
+        return jsonResponse(result, 200);
+      } catch (err) {
+        return jsonResponse({ ok: false, error: String(err) }, 500);
+      }
+    }
+
     return new Response('teltik-worker ok', { status: 200 });
   },
 
@@ -76,7 +88,7 @@ async function importTeltikLines(env) {
   const apiKey = env.TELTIK_API_KEY;
 
   // 1. Fetch all lines
-  const allLinesRes = await fetch(`${TELTIK_BASE}/v1/all-lines/?apikey=${apiKey}`);
+  const allLinesRes = await relayFetch(env, `${TELTIK_BASE}/v1/all-lines/?apikey=${apiKey}`);
   if (!allLinesRes.ok) {
     throw new Error(`Teltik all-lines failed: ${allLinesRes.status} ${await allLinesRes.text()}`);
   }
@@ -107,7 +119,7 @@ async function importTeltikLines(env) {
     let iccid = line.iccid || '';
     if (!iccid) {
       const mdnDigits = mdn.replace('+', ''); // Teltik uses 11-digit format without +
-      const infoRes = await fetch(`${TELTIK_BASE}/v1/get-info?apikey=${apiKey}&mdn=${encodeURIComponent(mdnDigits)}`);
+      const infoRes = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${apiKey}&mdn=${encodeURIComponent(mdnDigits)}`);
       if (infoRes.ok) {
         const info = await infoRes.json();
         iccid = info.iccid || '';
@@ -188,6 +200,87 @@ async function importTeltikLines(env) {
   }
 
   return { ok: true, imported, updated, unchanged };
+}
+
+// =========================================================
+// SYNC MDNS — reconcile DB sim_numbers against Teltik's current MDNs
+// =========================================================
+async function syncTeltikMdns(env) {
+  const apiKey = env.TELTIK_API_KEY;
+
+  const sims = await supabaseGetArray(
+    env,
+    `sims?vendor=eq.teltik&status=eq.active&select=id,iccid&order=id.asc&limit=5000`
+  );
+
+  if (!sims.length) {
+    return { ok: true, checked: 0, updated: 0, unchanged: 0, errors: 0 };
+  }
+
+  let checked = 0, updated = 0, unchanged = 0, errors = 0;
+  const mismatches = [];
+
+  for (const sim of sims) {
+    await sleep(150); // avoid hammering Teltik
+    try {
+      const phoneRes = await relayFetch(
+        env,
+        `${TELTIK_BASE}/v1/get-phone-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
+      );
+      if (!phoneRes.ok) {
+        console.log(`[SyncMDN] SIM ${sim.iccid}: get-phone-number ${phoneRes.status}`);
+        errors++;
+        continue;
+      }
+      const phoneData = await phoneRes.json();
+      const raw = phoneData.msisdn || phoneData.mdn || phoneData.phone_number || phoneData.number || '';
+      const teltikMdn = normalizeToE164(raw);
+      if (!teltikMdn) {
+        console.log(`[SyncMDN] SIM ${sim.iccid}: no MDN in response: ${JSON.stringify(phoneData)}`);
+        errors++;
+        continue;
+      }
+
+      const currentNumbers = await supabaseGetArray(
+        env,
+        `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null&select=e164&limit=1`
+      );
+      const dbMdn = currentNumbers[0]?.e164 || null;
+
+      checked++;
+
+      if (dbMdn === teltikMdn) {
+        unchanged++;
+        continue;
+      }
+
+      console.log(`[SyncMDN] SIM ${sim.iccid}: mismatch db=${dbMdn} teltik=${teltikMdn} — updating`);
+      mismatches.push({ iccid: sim.iccid, db: dbMdn, teltik: teltikMdn });
+
+      if (dbMdn) {
+        await supabasePatch(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`, {
+          valid_to: new Date().toISOString(),
+        });
+      }
+      const insRes = await supabaseInsert(env, 'sim_numbers', [{
+        sim_id: sim.id,
+        e164: teltikMdn,
+        valid_from: new Date().toISOString(),
+        verification_status: 'verified',
+      }]);
+      if (!insRes.ok) {
+        console.log(`[SyncMDN] SIM ${sim.iccid}: insert failed ${insRes.status}`);
+        errors++;
+      } else {
+        updated++;
+      }
+    } catch (err) {
+      console.error(`[SyncMDN] SIM ${sim.iccid}: ${err}`);
+      errors++;
+    }
+  }
+
+  return { ok: true, checked, updated, unchanged, errors, mismatches };
 }
 
 // =========================================================
@@ -350,7 +443,8 @@ async function rotateTeltikSims(env) {
       }
 
       // 2. Initiate number change
-      const changeRes = await fetch(
+      const changeRes = await relayFetch(
+        env,
         `${TELTIK_BASE}/v1/change-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
       );
       if (!changeRes.ok) {
@@ -376,7 +470,8 @@ async function rotateTeltikSims(env) {
         await sleep(delays[attempt]);
         let pollRes;
         try {
-          pollRes = await fetch(
+          pollRes = await relayFetch(
+            env,
             `${TELTIK_BASE}/v1/change-number/${encodeURIComponent(requestId)}?apikey=${apiKey}`
           );
         } catch (err) {
@@ -406,7 +501,8 @@ async function rotateTeltikSims(env) {
       // 3b. Fallback: if polling didn't return new MDN, fetch current number directly
       if (!newMdn) {
         console.log(`[Rotate] SIM ${sim.iccid}: polling exhausted, falling back to get-phone-number`);
-        const phoneRes = await fetch(
+        const phoneRes = await relayFetch(
+          env,
           `${TELTIK_BASE}/v1/get-phone-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
         );
         if (phoneRes.ok) {
@@ -496,7 +592,7 @@ async function setupTeltikForwardUrl(env) {
   const webhookSecret = env.TELTIK_WEBHOOK_SECRET;
   const workerUrl = `https://teltik-worker.zalmen-531.workers.dev/webhook?secret=${webhookSecret}`;
 
-  const res = await fetch(`${TELTIK_BASE}/v1/forward-url?apikey=${apiKey}`, {
+  const res = await relayFetch(env, `${TELTIK_BASE}/v1/forward-url?apikey=${apiKey}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ forward_url: workerUrl }),
@@ -508,6 +604,20 @@ async function setupTeltikForwardUrl(env) {
   }
 
   return { ok: true, status: res.status, webhookUrl: workerUrl, response: text };
+}
+
+// =========================================================
+// Relay
+// =========================================================
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
 }
 
 // =========================================================
@@ -678,14 +788,14 @@ async function recordWebhookDelivery(env, delivery) {
   });
 }
 
-async function postWebhookWithRetry(url, payload, options = {}) {
+async function postWebhookWithRetry(env, url, payload, options = {}) {
   const { maxRetries = 4, initialDelayMs = 1000, messageId = 'unknown' } = options;
   let lastError = null;
   let lastStatus = 0;
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
     try {
-      const res = await fetch(url, {
+      const res = await relayFetch(env, url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -732,7 +842,7 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
     }
   }
 
-  const result = await postWebhookWithRetry(webhookUrl, payload, { messageId });
+  const result = await postWebhookWithRetry(env, webhookUrl, payload, { messageId });
 
   try {
     await recordWebhookDelivery(env, {
