@@ -1195,8 +1195,12 @@ async function handleWingCheck(request, env, corsHeaders) {
     });
 
     let db_update_wing = null;
-    if (res.ok && json && json.status && json.status.toLowerCase() === 'active') {
-      db_update_wing = await syncActiveSim(env, iccid, { mdn: json.mdn || null, activatedAt: null });
+    const wingStatus = json && json.status ? json.status.toLowerCase() : '';
+    if (res.ok && json && (wingStatus === 'active' || wingStatus === 'activated')) {
+      db_update_wing = await syncActiveSim(env, iccid, {
+        mdn: json.mdn || json.msisdn || null,
+        activatedAt: json.dateActivated || null,
+      });
     }
     return new Response(JSON.stringify({
       ok: res.ok,
@@ -7480,7 +7484,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         const data = result.response;
                         let formatted = '<span class="text-green-400 font-bold">Wing IoT Device Found</span>\\n\\n';
                         formatted += '<span class="text-blue-400">status:</span> ' + (data.status || 'N/A') + '\\n';
-                        formatted += '<span class="text-blue-400">mdn:</span> ' + (data.mdn || 'N/A') + '\\n';
+                        formatted += '<span class="text-blue-400">mdn:</span> ' + (data.mdn || data.msisdn || 'N/A') + '\\n';
                         formatted += '<span class="text-blue-400">communicationPlan:</span> ' + (data.communicationPlan || 'N/A') + '\\n';
                         formatted += '<span class="text-blue-400">customer:</span> ' + (data.customer || '(blank)') + '\\n';
                         formatted += '\\n<span class="text-gray-500">--- Full Response ---</span>\\n';
