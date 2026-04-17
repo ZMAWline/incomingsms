@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-17 (session 24 — Gateway bulk lock/unlock + ATOMIC IMEI change fix)
+> Last updated: 2026-04-17 (session 25 — ATOMIC swapMSISDN zip fix)
 
 ---
 
@@ -63,6 +63,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-17 | ATOMIC swapMSISDN zip fix: added `activation_zip` to `sims` table; bulk-activator stores zip on activation; mdn-rotator (both batch + single path) reads `sim.activation_zip` instead of hardcoded `HX_ZIP`; dashboard ATOMIC query always overwrites `activation_zip` from inquiry `address.zipCode`; backfilled 147 existing SIMs from `carrier_api_logs`. | bulk-activator, mdn-rotator, dashboard, DB |
 | 2026-04-17 | Gateway page: "Lock Failed" bulk-locks all st=6 (Reg Failed) ports; "Unlock Locked" bulk-unlocks all st=7/8/12 ports. Both iterate window.portData and POST to skyline/lock or skyline/unlock per port. | dashboard |
 | 2026-04-17 | mdn-rotator change_imei: ATOMIC SIMs no longer blocked by missing mobility_subscription_id. Helix eligibility check + hxChangeImei now gated behind isHelixSim (vendor==='helix'). ATOMIC just updates gateway + IMEI pool + DB. | mdn-rotator |
 | 2026-04-17 | mdn-rotator change_imei: fixed 409 on imei_pool_unique_in_use_slot — added second retire step keyed on (gateway_id, port) to evict stale slot occupants from previous SIMs before assigning new IMEI. | mdn-rotator |

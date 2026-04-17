@@ -997,7 +997,7 @@ async function queueSimsForRotation(env, options = {}) {
   // Wing IoT SIMs are filtered out client-side via the identifier check below).
   // Identifier requirement enforced client-side: helix needs mobility_subscription_id,
   // atomic needs msisdn.
-  let query = `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&status=eq.active&vendor=neq.teltik`;
+  let query = `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,activation_zip,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&status=eq.active&vendor=neq.teltik`;
 
   if (isManualRun) {
     // Manual run: order by oldest rotation first (nulls first = never rotated)
@@ -1125,7 +1125,7 @@ async function rotateSpecificSim(env, iccid) {
     // Look up the SIM by ICCID
     const sims = await supabaseSelect(
       env,
-      `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+      `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor,activation_zip&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
     );
 
     if (!Array.isArray(sims) || sims.length === 0) {
@@ -1199,7 +1199,7 @@ async function rotateAtomicSim(env, sim) {
     token: env.ATOMIC_TOKEN,
     pin: env.ATOMIC_PIN,
   };
-  const zipCode = env.HX_ZIP || '11238';
+  const zipCode = sim.activation_zip || env.HX_ZIP || '11238';
 
   // 1) swapMSISDN
   const swapBody = {

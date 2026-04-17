@@ -1435,9 +1435,9 @@ function toE164(mdn) {
   return null;
 }
 
-async function syncActiveSim(env, iccid, { mdn, activatedAt }) {
+async function syncActiveSim(env, iccid, { mdn, activatedAt, zipCode }) {
   try {
-    const sims = await sbGet(env, 'sims?iccid=eq.' + encodeURIComponent(iccid) + '&select=id,iccid,status,activated_at&limit=1');
+    const sims = await sbGet(env, 'sims?iccid=eq.' + encodeURIComponent(iccid) + '&select=id,iccid,status,activated_at,activation_zip&limit=1');
     const sim = Array.isArray(sims) ? sims[0] : null;
     if (!sim) return { found: false };
 
@@ -1458,6 +1458,11 @@ async function syncActiveSim(env, iccid, { mdn, activatedAt }) {
       }
     } else if (sim.activated_at) {
       result.activated_at = sim.activated_at;
+    }
+
+    if (zipCode) {
+      patch.activation_zip = zipCode;
+      result.activation_zip_set = zipCode;
     }
 
     if (Object.keys(patch).length > 0) {
@@ -4200,6 +4205,7 @@ async function handleAtomicQuery(request, env, corsHeaders) {
         db_update = await syncActiveSim(env, identifier, {
           mdn: wr2.Result.MSISDN || wr2.Result.msisdn || null,
           activatedAt: wr2.Result.activationDate || null,
+          zipCode: (wr2.Result.address && wr2.Result.address.zipCode) || null,
         });
       }
     }

@@ -274,6 +274,7 @@ async function activateViaAtomic(env, iccid, imei, runId) {
     msisdn: result.MSISDN,
     ban: result.BAN || '',
     status: 'active', // ATOMIC activations are immediately active
+    zipCode: addr.zipCode,
   };
 }
 
@@ -499,6 +500,9 @@ async function upsertSimWithVendor(env, iccid, result, vendor) {
     // For ATOMIC/Wing, SIM is immediately active with MDN
     if (result.msisdn) {
       payload.status = 'active';
+    }
+    if (result.zipCode) {
+      payload.activation_zip = result.zipCode;
     }
   } else if (vendor === 'helix') {
     payload.mobility_subscription_id = result.mobilitySubscriptionId;
