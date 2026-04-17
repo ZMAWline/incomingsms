@@ -2657,13 +2657,13 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 
   // IMEI strategy: reuse existing or allocate new from pool
   let poolEntry;
-  if (imeiStrategy === 'same' && sim.imei) {
+  if (imeiStrategy === 'same') {
+    if (!sim.imei) {
+      throw new Error('No IMEI on SIM record — cannot reuse same IMEI. Use "New from Pool" strategy instead.');
+    }
     poolEntry = { id: sim.current_imei_pool_id, imei: sim.imei };
     console.log('[RetryActivation] SIM ' + sim.iccid + ': reusing existing IMEI ' + poolEntry.imei);
   } else {
-    if (imeiStrategy === 'same') {
-      console.warn('[RetryActivation] SIM ' + sim.iccid + ': no existing IMEI on record, falling back to new pool allocation');
-    }
     await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
     poolEntry = await allocateImeiFromPool(env, simId);
     console.log('[RetryActivation] SIM ' + sim.iccid + ': allocated IMEI ' + poolEntry.imei + ' (pool entry ' + poolEntry.id + ')');
