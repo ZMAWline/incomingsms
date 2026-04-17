@@ -1,14 +1,15 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-17 (session 21 — retry activation bug fixes + IMEI pool add fix)
+> Last updated: 2026-04-17 (session 22 — bulk query + DB sync on active carrier query)
 
 ---
 
 ## Known Issues / Degraded
 
 - **API Logs tab shows blank for ATOMIC SIMs** — the dashboard "API Logs" section queries `helix_api_logs`; ATOMIC activations log to `carrier_api_logs`. ATOMIC SIM logs are invisible in the dashboard tab. Fix: update the API Logs query to also check `carrier_api_logs` (or unify into one view).
-- **SIM 685 still in `error` state** — needs a retry activation (same pattern as SIM 688 which was fixed this session). Run retry from dashboard.
+- **SIM 685 still in `error` state** — needs a retry activation. Run retry from dashboard.
+- **Wing IoT retry activation may still fail with "already active"** — 914 handling is ATOMIC-only. Wing IoT already-active case is not explicitly handled (Wing IoT returns HTTP error codes, not status codes in body, so it would throw and surface in the error log normally).
 
 ---
 
@@ -61,6 +62,9 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-17 | Query bulk action: selecting multiple SIMs runs carrier query on each sequentially, shows per-SIM status in sim-action-modal. Single SIM still opens interactive modal. | dashboard |
+| 2026-04-17 | DB sync on active carrier query: ATOMIC (attStatus=Active) and Wing IoT (status=ACTIVATED) now update sims.status, sims.activated_at, and sim_numbers MDN automatically after a successful query. Works for both single-SIM modal and bulk query. Fixes: ATOMIC uses `msisdn` (lowercase) not `MSISDN`; Wing IoT uses `ACTIVATED` not `ACTIVE`, MDN field is `msisdn` not `mdn`, passes `dateActivated`. | dashboard |
+| 2026-04-17 | mdn-rotator: ATOMIC 914 ("sim already active with another MSISDN") during retry activation now runs a subsriberInquiry, syncs DB (status/MDN/activated_at), releases unused IMEI pool entry, and returns ok:true instead of throwing. | mdn-rotator |
 | 2026-04-17 | retryActivation: now inserts MDN into `sim_numbers` + sets `activated_at` on success; gateway scan falls back to DB slot if scan fails; `slot_not_found` response now includes `error` field (was showing "unknown" in UI). `handleSimAction` now forwards `imei_strategy` to mdn-rotator. IMEI pool add: removed Helix eligibility gate entirely (was blocking all adds). `check-imei` endpoint returns `eligible:true` on Helix token failure. SIM 688 backfilled manually. | mdn-rotator, dashboard |
 | 2026-04-16 | Retry Activation: IMEI strategy choice added — `showImeiStrategyChoice()` modal before every retry (per-SIM, bulk, detail modal). Backend `retryActivation()` accepts `imei_strategy: 'same'|'new'`. `'same'` reuses `sims.imei`; `'new'` retires old pool entry + allocates fresh one. Clear error thrown if `'same'` chosen but no IMEI on record (no silent fallback). Guide section updated to ATOMIC/Wing IoT wording. | mdn-rotator, dashboard |
 | 2026-04-16 | Activation address randomized — `src/shared/address-pool.js` with 25 addresses across 23 states; `pickRandomAddress()` called once per activation in `activateViaAtomic`, `hxActivate` (bulk-activator), `hxActivate`, `retryActivateViaAtomic` (mdn-rotator). Old `HX_ADDRESS1/CITY/STATE/ZIP` env vars no longer used in activation paths. | bulk-activator, mdn-rotator |
