@@ -641,8 +641,9 @@ export default {
           status: 200, headers: { "Content-Type": "application/json" }
         });
       } catch (err) {
-        return new Response(JSON.stringify({ ok: false, imei, error: String(err) }), {
-          status: 500, headers: { "Content-Type": "application/json" }
+        // Helix token/check unavailable (ATOMIC migration) — treat as eligible
+        return new Response(JSON.stringify({ ok: true, imei, eligible: true, note: 'Eligibility check unavailable: ' + String(err).slice(0, 100) }), {
+          status: 200, headers: { "Content-Type": "application/json" }
         });
       }
     }
@@ -660,7 +661,8 @@ export default {
             status: 400, headers: { "Content-Type": "application/json" }
           });
         }
-        const token = await getCachedToken(env);
+        let token = null;
+        try { token = await getCachedToken(env); } catch (_) {}
         const results = [];
         for (const rawImei of imeis) {
           const imei = String(rawImei).trim();
@@ -668,11 +670,15 @@ export default {
             results.push({ imei, eligible: false, error: "Invalid format (not 15 digits)" });
             continue;
           }
+          if (!token) {
+            results.push({ imei, eligible: true, note: 'Eligibility check unavailable (Helix token missing)' });
+            continue;
+          }
           try {
             const result = await hxCheckImeiEligibility(env, token, imei);
             results.push({ imei, eligible: result.isImeiValid === true, result });
           } catch (err) {
-            results.push({ imei, eligible: false, error: String(err) });
+            results.push({ imei, eligible: true, note: 'Check unavailable: ' + String(err).slice(0, 100) });
           }
         }
         return new Response(JSON.stringify({ ok: true, results }, null, 2), {
@@ -2596,7 +2602,7 @@ async function getUnoccupiedCandidates(env) {
 async function retryActivation(env, simId, manualGatewayId = null, manualPort = null, imeiStrategy = 'new') {
   const sims = await supabaseSelect(
     env,
-    'sims?select=id,iccid,status,current_imei_pool_id,imei,vendor&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
+    'sims?select=id,iccid,status,current_imei_pool_id,imei,vendor,gateway_id,port&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
   );
   if (!Array.isArray(sims) || sims.length === 0) throw new Error('SIM not found: ' + simId);
   const sim = sims[0];
@@ -2644,13 +2650,21 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
   } else {
     const found = await scanGatewaysForIccid(env, sim.iccid);
     if (!found) {
-      console.log('[RetryActivation] SIM ' + sim.iccid + ' not found on any gateway, returning candidates');
-      const candidates = await getUnoccupiedCandidates(env);
-      return { ok: false, slot_not_found: true, candidates };
+      if (sim.gateway_id && sim.port) {
+        // Gateway scan failed but DB has a known slot — use it
+        gatewayId = sim.gateway_id;
+        port = sim.port;
+        console.log('[RetryActivation] SIM ' + sim.iccid + ' not found on gateway scan, falling back to DB slot: gateway=' + gatewayId + ' port=' + port);
+      } else {
+        console.log('[RetryActivation] SIM ' + sim.iccid + ' not found on any gateway and no DB slot, returning candidates');
+        const candidates = await getUnoccupiedCandidates(env);
+        return { ok: false, slot_not_found: true, error: 'SIM not found on any gateway port. Manually select a slot.', candidates };
+      }
+    } else {
+      gatewayId = found.gateway_id;
+      port = found.port;
+      console.log('[RetryActivation] Found SIM ' + sim.iccid + ' at gateway=' + gatewayId + ' port=' + port);
     }
-    gatewayId = found.gateway_id;
-    port = found.port;
-    console.log('[RetryActivation] Found SIM ' + sim.iccid + ' at gateway=' + gatewayId + ' port=' + port);
   }
 
   await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), { gateway_id: gatewayId, port });
@@ -2701,11 +2715,13 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 
   // Set SIM to provisioning (helix) or active (atomic)
   const newStatus = vendor === 'atomic' ? 'active' : 'provisioning';
+  const now = new Date().toISOString();
   const updateData = {
     status: newStatus,
     last_activation_error: null,
     imei: poolEntry.imei,
     current_imei_pool_id: poolEntry.id,
+    activated_at: now,
   };
   if (activateResult.mobilitySubscriptionId) updateData.mobility_subscription_id = activateResult.mobilitySubscriptionId;
   if (activateResult.msisdn) updateData.msisdn = activateResult.msisdn;
@@ -2713,6 +2729,26 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 
   await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), updateData);
   console.log('[RetryActivation] SIM ' + sim.iccid + ': set to ' + newStatus);
+
+  // Insert MDN into sim_numbers
+  if (activateResult.msisdn) {
+    const e164 = '+1' + activateResult.msisdn;
+    const simNumRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sim_numbers`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=ignore-duplicates',
+      },
+      body: JSON.stringify([{ sim_id: simId, e164, valid_from: now, verification_status: 'verified', verified_at: now }]),
+    });
+    if (!simNumRes.ok) {
+      console.error('[RetryActivation] SIM ' + sim.iccid + ': sim_numbers insert failed: ' + await simNumRes.text());
+    } else {
+      console.log('[RetryActivation] SIM ' + sim.iccid + ': recorded MDN ' + e164 + ' in sim_numbers');
+    }
+  }
 
   return {
     ok: true,

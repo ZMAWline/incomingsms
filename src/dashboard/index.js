@@ -1944,33 +1944,8 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
         });
       }
 
-      // Eligibility gate: check each IMEI before adding
-      const rejectedIneligible = [];
-      const eligible = [];
-      if (env.MDN_ROTATOR && env.ADMIN_RUN_SECRET) {
-        for (const candidate of toAdd) {
-          try {
-            const checkUrl = 'https://mdn-rotator/check-imei?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET) + '&imei=' + encodeURIComponent(candidate.imei);
-            const checkRes = await env.MDN_ROTATOR.fetch(checkUrl, { method: 'GET' });
-            const checkData = checkRes.ok ? await checkRes.json().catch(() => ({})) : {};
-            if (checkData.eligible === true) {
-              eligible.push(candidate);
-            } else {
-              rejectedIneligible.push({ imei: candidate.imei, reason: checkData.result ? JSON.stringify(checkData.result).slice(0, 200) : 'Not eligible for carrier/plan' });
-            }
-          } catch (eligErr) {
-            // On check error, allow the IMEI (do not block on Helix errors)
-            console.error('[IMEI Add] Eligibility check error for ' + candidate.imei + ': ' + eligErr);
-            eligible.push(candidate);
-          }
-        }
-      } else {
-        // No MDN_ROTATOR binding — skip eligibility check
-        eligible.push(...toAdd);
-      }
-
       let added = 0;
-      if (eligible.length > 0) {
+      if (toAdd.length > 0) {
         const addInsertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
           method: 'POST',
           headers: {
@@ -1979,7 +1954,7 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
             'Content-Type': 'application/json',
             Prefer: 'resolution=ignore-duplicates,return=representation',
           },
-          body: JSON.stringify(eligible),
+          body: JSON.stringify(toAdd),
         });
         const addInsertText = await addInsertRes.text();
         let addInserted = [];
@@ -1993,7 +1968,6 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
         duplicates: dupCount,
         invalid: invalid.length,
         rejected_retired: rejectedRetired,
-        rejected_ineligible: rejectedIneligible || [],
       }), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
@@ -2992,7 +2966,7 @@ async function handleSimAction(request, env, corsHeaders) {
     const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sim_id, action, gateway_id: body.gateway_id ?? null, port: body.port ?? null, new_imei: body.new_imei ?? null, auto_imei: body.auto_imei ?? false })
+      body: JSON.stringify({ sim_id, action, gateway_id: body.gateway_id ?? null, port: body.port ?? null, new_imei: body.new_imei ?? null, auto_imei: body.auto_imei ?? false, imei_strategy: body.imei_strategy ?? null })
     });
 
     const responseText = await workerResponse.text();

@@ -1,13 +1,14 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-16 (session 20 — retry activation IMEI strategy choice)
+> Last updated: 2026-04-17 (session 21 — retry activation bug fixes + IMEI pool add fix)
 
 ---
 
 ## Known Issues / Degraded
 
-_None currently tracked. Add here when something breaks in production._
+- **API Logs tab shows blank for ATOMIC SIMs** — the dashboard "API Logs" section queries `helix_api_logs`; ATOMIC activations log to `carrier_api_logs`. ATOMIC SIM logs are invisible in the dashboard tab. Fix: update the API Logs query to also check `carrier_api_logs` (or unify into one view).
+- **SIM 685 still in `error` state** — needs a retry activation (same pattern as SIM 688 which was fixed this session). Run retry from dashboard.
 
 ---
 
@@ -60,6 +61,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-17 | retryActivation: now inserts MDN into `sim_numbers` + sets `activated_at` on success; gateway scan falls back to DB slot if scan fails; `slot_not_found` response now includes `error` field (was showing "unknown" in UI). `handleSimAction` now forwards `imei_strategy` to mdn-rotator. IMEI pool add: removed Helix eligibility gate entirely (was blocking all adds). `check-imei` endpoint returns `eligible:true` on Helix token failure. SIM 688 backfilled manually. | mdn-rotator, dashboard |
 | 2026-04-16 | Retry Activation: IMEI strategy choice added — `showImeiStrategyChoice()` modal before every retry (per-SIM, bulk, detail modal). Backend `retryActivation()` accepts `imei_strategy: 'same'|'new'`. `'same'` reuses `sims.imei`; `'new'` retires old pool entry + allocates fresh one. Clear error thrown if `'same'` chosen but no IMEI on record (no silent fallback). Guide section updated to ATOMIC/Wing IoT wording. | mdn-rotator, dashboard |
 | 2026-04-16 | Activation address randomized — `src/shared/address-pool.js` with 25 addresses across 23 states; `pickRandomAddress()` called once per activation in `activateViaAtomic`, `hxActivate` (bulk-activator), `hxActivate`, `retryActivateViaAtomic` (mdn-rotator). Old `HX_ADDRESS1/CITY/STATE/ZIP` env vars no longer used in activation paths. | bulk-activator, mdn-rotator |
 | 2026-04-16 | Dashboard: port display normalized client-side — `normalizePortDisplay()` converts old letter-format ports ("13C") to dot-notation ("13.03") in SIM table, detail modal, and IMEI tab. DB data unchanged. | dashboard |
