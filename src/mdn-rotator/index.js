@@ -2444,6 +2444,38 @@ async function retryActivateViaAtomic(env, iccid, imei, runId) {
     error: res.ok ? null : 'ATOMIC retry activation failed: ' + res.status,
   });
   if (!res.ok) throw new Error('ATOMIC retry activation failed ' + res.status + ': ' + responseText.slice(0, 300));
+  const wr914 = responseJson?.wholeSaleApi?.wholeSaleResponse;
+  if (wr914?.statusCode === '914') {
+    // SIM already active with another MSISDN — run subsriberInquiry to get current MDN
+    const inqBody = {
+      wholeSaleApi: {
+        session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+        wholeSaleRequest: { requestType: 'subsriberInquiry', MSISDN: '', sim: iccid },
+      },
+    };
+    const inqRes = await relayFetch(env, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(inqBody),
+    });
+    const inqText = await inqRes.text();
+    let inqJson = {};
+    try { inqJson = JSON.parse(inqText); } catch {}
+    await logCarrierApiCall(env, {
+      run_id: runId, step: 'retry_activation_914_inquiry', iccid, imei, vendor: 'atomic',
+      request_url: url, request_method: 'POST', request_body: inqBody,
+      response_status: inqRes.status, response_ok: inqRes.ok,
+      response_body_text: inqText, response_body_json: inqJson, error: null,
+    });
+    const inqResult = inqJson?.wholeSaleApi?.wholeSaleResponse?.Result;
+    return {
+      already_active: true,
+      msisdn: inqResult?.msisdn || inqResult?.MSISDN || '',
+      ban: inqResult?.BAN || '',
+      activationDate: inqResult?.activationDate || null,
+      status: 'active',
+    };
+  }
   const result = responseJson?.wholeSaleApi?.wholeSaleResponse?.Result;
   if (!result?.MSISDN) throw new Error('ATOMIC activation returned no MSISDN: ' + responseText.slice(0, 300));
   return { msisdn: result.MSISDN, ban: result.BAN || '', status: 'active' };
@@ -2711,6 +2743,32 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
     await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
       { last_activation_error: String(err), imei: poolEntry.imei, current_imei_pool_id: poolEntry.id });
     throw err;
+  }
+
+  // 914: SIM was already active — inquiry ran inside retryActivateViaAtomic, release pool + sync DB
+  if (activateResult.already_active) {
+    console.log('[RetryActivation] SIM ' + sim.iccid + ': already active (914) — syncing DB from inquiry');
+    if (imeiStrategy !== 'same' && poolEntry.id) {
+      await releaseImeiPoolEntry(env, poolEntry.id, simId).catch(() => {});
+    }
+    const now914 = new Date().toISOString();
+    const patch914 = { status: 'active', last_activation_error: null };
+    if (activateResult.activationDate) {
+      const parsed = new Date(activateResult.activationDate);
+      if (!isNaN(parsed.getTime())) patch914.activated_at = parsed.toISOString();
+    }
+    await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), patch914);
+    if (activateResult.msisdn) {
+      const e164 = '+1' + activateResult.msisdn.replace(/\D/g, '');
+      await supabasePatch(env, 'sim_numbers?sim_id=eq.' + encodeURIComponent(String(simId)) + '&valid_to=is.null', { valid_to: now914 });
+      await fetch(`${env.SUPABASE_URL}/rest/v1/sim_numbers`, {
+        method: 'POST',
+        headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json', Prefer: 'resolution=ignore-duplicates' },
+        body: JSON.stringify([{ sim_id: simId, e164, valid_from: now914, verification_status: 'verified', verified_at: now914 }]),
+      });
+      console.log('[RetryActivation] SIM ' + sim.iccid + ': 914 sync — recorded MDN ' + e164);
+    }
+    return { ok: true, vendor, already_active: true, msisdn: activateResult.msisdn || null, message: 'SIM was already active — DB synced from carrier query' };
   }
 
   // Set SIM to provisioning (helix) or active (atomic)
