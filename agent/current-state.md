@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-17 (session 22 — bulk query + DB sync on active carrier query)
+> Last updated: 2026-04-17 (session 23 — Teltik MDN sync + dashboard carrier query)
 
 ---
 
@@ -10,6 +10,7 @@
 - **API Logs tab shows blank for ATOMIC SIMs** — the dashboard "API Logs" section queries `helix_api_logs`; ATOMIC activations log to `carrier_api_logs`. ATOMIC SIM logs are invisible in the dashboard tab. Fix: update the API Logs query to also check `carrier_api_logs` (or unify into one view).
 - **SIM 685 still in `error` state** — needs a retry activation. Run retry from dashboard.
 - **Wing IoT retry activation may still fail with "already active"** — 914 handling is ATOMIC-only. Wing IoT already-active case is not explicitly handled (Wing IoT returns HTTP error codes, not status codes in body, so it would throw and surface in the error log normally).
+- **Teltik bulk query needs hard-refresh verification** — code is deployed and correct but user saw all 50 SIMs route to helix (likely stale browser cache). Next session: confirm bulk query routes teltik vendor correctly after hard refresh (Ctrl+Shift+R).
 
 ---
 
@@ -62,6 +63,9 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-17 | Teltik MDN sync: GET /sync-mdns on teltik-worker checks all active Teltik SIMs against /v1/get-phone-number/, fixes sim_numbers on mismatch. Root cause documented: rotation stamps last_mdn_rotated_at before polling; if polling+fallback both fail, sim_numbers stays stale. | teltik-worker |
+| 2026-04-17 | Dashboard: Teltik (T-Mobile) option in Carrier Query modal — /api/teltik-query backend, single-SIM ICCID lookup, DB auto-sync banner, bulk query support. Bulk routing needs verification (hard refresh required after deploy). | dashboard |
+| 2026-04-17 | Manually fixed SIM 983 MDN: DB had +14232935084, Teltik API returned 8144182808 (+18144182808). Closed stale sim_numbers row, inserted correct MDN. | — |
 | 2026-04-17 | Query bulk action: selecting multiple SIMs runs carrier query on each sequentially, shows per-SIM status in sim-action-modal. Single SIM still opens interactive modal. | dashboard |
 | 2026-04-17 | DB sync on active carrier query: ATOMIC (attStatus=Active) and Wing IoT (status=ACTIVATED) now update sims.status, sims.activated_at, and sim_numbers MDN automatically after a successful query. Works for both single-SIM modal and bulk query. Fixes: ATOMIC uses `msisdn` (lowercase) not `MSISDN`; Wing IoT uses `ACTIVATED` not `ACTIVE`, MDN field is `msisdn` not `mdn`, passes `dateActivated`. | dashboard |
 | 2026-04-17 | mdn-rotator: ATOMIC 914 ("sim already active with another MSISDN") during retry activation now runs a subsriberInquiry, syncs DB (status/MDN/activated_at), releases unused IMEI pool entry, and returns ok:true instead of throwing. | mdn-rotator |
