@@ -281,7 +281,7 @@ export default {
         // Load SIM from DB
         const sims = await supabaseSelect(
           env,
-          `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,status,imei,activated_at,att_ban,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
+          `sims?select=id,iccid,mobility_subscription_id,vendor,gateway_id,port,status,imei,activated_at,att_ban,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
         );
         if (!Array.isArray(sims) || sims.length === 0) {
           return new Response(JSON.stringify({ ok: false, error: `SIM not found: ${sim_id}` }), {
@@ -365,13 +365,16 @@ export default {
               status: 400, headers: { "Content-Type": "application/json" }
             });
           }
-          if (!subId) {
+
+          const isHelixSim = sim.vendor === 'helix';
+          if (isHelixSim && !subId) {
             return new Response(JSON.stringify({ ok: false, error: "SIM must have mobility_subscription_id to change IMEI" }), {
               status: 400, headers: { "Content-Type": "application/json" }
             });
           }
 
-          const hxToken = await getCachedToken(env);
+          let hxToken = null;
+          if (isHelixSim) hxToken = await getCachedToken(env);
           const changeRunId = `change_imei_${iccid}_${Date.now()}`;
           let allocatedEntry = null;
           let targetImei = newImeiRaw;
@@ -394,15 +397,18 @@ export default {
               console.log(`[ChangeImei] SIM ${iccid}: auto-allocated IMEI ${targetImei}`);
             }
 
-            // Check eligibility
-            const eligibility = await hxCheckImeiEligibility(env, hxToken, targetImei);
-            if (eligibility.isImeiValid !== true) {
-              if (allocatedEntry) await releaseImeiPoolEntry(env, allocatedEntry.id, sim_id).catch(() => {});
-              return new Response(JSON.stringify({
-                ok: false,
-                error: `IMEI ${targetImei} is not eligible for this carrier/plan`,
-                eligibility
-              }), { status: 400, headers: { "Content-Type": "application/json" } });
+            // Check IMEI eligibility (Helix only — ATOMIC has no eligibility check endpoint)
+            let eligibility = { isImeiValid: true, skipped: 'non-helix vendor' };
+            if (isHelixSim) {
+              eligibility = await hxCheckImeiEligibility(env, hxToken, targetImei);
+              if (eligibility.isImeiValid !== true) {
+                if (allocatedEntry) await releaseImeiPoolEntry(env, allocatedEntry.id, sim_id).catch(() => {});
+                return new Response(JSON.stringify({
+                  ok: false,
+                  error: `IMEI ${targetImei} is not eligible for this carrier/plan`,
+                  eligibility
+                }), { status: 400, headers: { "Content-Type": "application/json" } });
+              }
             }
 
             // Set IMEI on gateway
@@ -447,8 +453,11 @@ export default {
               );
             }
 
-            // Change IMEI on Helix
-            const helixResult = await hxChangeImei(env, hxToken, subId, targetImei, changeRunId, iccid);
+            // Change IMEI on carrier (Helix only — ATOMIC has no IMEI change endpoint)
+            let helixResult = null;
+            if (isHelixSim) {
+              helixResult = await hxChangeImei(env, hxToken, subId, targetImei, changeRunId, iccid);
+            }
 
             // Update SIM record
             await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, {
