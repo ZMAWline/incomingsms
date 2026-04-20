@@ -1139,7 +1139,7 @@ async function rotateSpecificSim(env, iccid) {
       return { ok: false, error: 'Use teltik-worker for Teltik SIM rotation' };
     }
 
-    if (sim.status !== 'active') {
+    if (sim.status !== 'active' && sim.status !== 'rotation_failed') {
       return { ok: false, error: `SIM ${iccid} is not active (status: ${sim.status})` };
     }
 
@@ -1199,9 +1199,46 @@ async function rotateAtomicSim(env, sim) {
     token: env.ATOMIC_TOKEN,
     pin: env.ATOMIC_PIN,
   };
-  const zipCode = sim.activation_zip || env.HX_ZIP || '11238';
 
-  // 1) swapMSISDN
+  // 1) subsriberInquiry — get address zip directly from AT&T before swapMSISDN
+  const preInqBody = {
+    wholeSaleApi: {
+      session,
+      wholeSaleRequest: { requestType: 'subsriberInquiry', MSISDN: '', sim: iccid },
+    },
+  };
+  const preInqRes = await relayFetch(env, url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(preInqBody),
+  });
+  const preInqText = await preInqRes.text();
+  let preInqJson = {};
+  try { preInqJson = JSON.parse(preInqText); } catch {}
+  const preInqR = preInqJson?.wholeSaleApi?.wholeSaleResponse;
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'pre_swap_inquiry', iccid, imei: null, vendor: 'atomic',
+    request_url: url, request_method: 'POST', request_body: preInqBody,
+    response_status: preInqRes.status, response_ok: preInqRes.ok,
+    response_body_text: preInqText, response_body_json: preInqJson,
+    error: (preInqRes.ok && preInqR?.statusCode === '00') ? null :
+      `ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`,
+  });
+  if (!preInqRes.ok || preInqR?.statusCode !== '00') {
+    throw new Error(`ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`);
+  }
+
+  const zipCode = preInqR.Result?.address?.zipCode || sim.activation_zip || env.HX_ZIP || '11238';
+
+  // Sync zip to DB if AT&T has a different value
+  if (preInqR.Result?.address?.zipCode && preInqR.Result.address.zipCode !== sim.activation_zip) {
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      activation_zip: preInqR.Result.address.zipCode,
+    }).catch(() => {});
+    console.log(`SIM ${iccid}: updated activation_zip ${sim.activation_zip} → ${preInqR.Result.address.zipCode}`);
+  }
+
+  // 2) swapMSISDN
   const swapBody = {
     wholeSaleApi: {
       session,
@@ -1230,7 +1267,7 @@ async function rotateAtomicSim(env, sim) {
     throw new Error(`ATOMIC swapMSISDN failed: ${swapR?.description || 'Unknown'}`);
   }
 
-  // Try to read new MSISDN from swap response; fall back to inquiry by SIM
+  // Try to read new MSISDN from swap response; fall back to post-swap inquiry by SIM
   let newMsisdn = swapR?.Result?.MSISDN || swapR?.Result?.newMSISDN || swapR?.newMSISDN || null;
 
   if (!newMsisdn) {
@@ -1265,13 +1302,13 @@ async function rotateAtomicSim(env, sim) {
   const e164 = normalizeUS(newMsisdn);
   const msisdnBare = String(newMsisdn).replace(/^\+?1?/, '');
 
-  // 2) DB updates (same sequence as Helix rotation)
+  // 3) DB updates (same sequence as Helix rotation)
   await closeCurrentNumber(env, sim.id);
   await insertNewNumber(env, sim.id, e164);
   await updateSimRotationTimestamp(env, sim.id);
   await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: msisdnBare });
 
-  // 3) Webhook (use MSISDN as the external identifier, same slot as mobility_subscription_id
+  // 4) Webhook (use MSISDN as the external identifier, same slot as mobility_subscription_id
   //    occupies for Helix SIMs — downstream reseller systems just need *an* ID)
   await sendNumberOnlineWebhook(env, sim.id, e164, iccid, msisdnBare);
 
@@ -2513,13 +2550,10 @@ async function retryActivateViaWingIot(env, iccid, runId) {
     error: getRes.ok ? null : 'Wing IoT status check failed: ' + getRes.status,
   });
 
-  // Step 2: PUT to activate - only include plan if not already set
-  const hasPlan = getJson.communicationPlan === 'Wing Tel Inc - NON ABIR SMS MO/MT US';
-  const requestBody = hasPlan
-    ? { status: 'Activated' }
-    : { communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US', status: 'Activated' };
+  // Step 2: PUT to activate - always send both fields (Wing API requires communicationPlan + status)
+  const requestBody = { communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US', status: 'ACTIVATED' };
 
-  const headers = { Authorization: auth, 'Content-Type': 'application/json' };
+  const headers = { Authorization: auth, Accept: 'application/json', 'Content-Type': 'application/json' };
   const res = await relayFetch(env, url, {
     method: 'PUT',
     headers,
@@ -2536,6 +2570,9 @@ async function retryActivateViaWingIot(env, iccid, runId) {
     error: res.ok ? null : 'Wing IoT retry activation failed: ' + res.status,
   });
   if (!res.ok) throw new Error('Wing IoT retry activation failed ' + res.status + ': ' + responseText.slice(0, 300));
+
+  // MSISDN takes ~1 minute to propagate after activation
+  await sleep(60000);
 
   // Step 3: GET to verify and get MDN
   const verifyRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
@@ -2995,6 +3032,8 @@ async function updateSimRotationTimestamp(env, simId) {
       last_rotation_at: now,
       rotation_status: 'success',
       last_rotation_error: null,
+      rotation_fail_count: 0,
+      status: 'active',
     }
   );
   console.log(`[DB] Updated rotation timestamp for sim_id=${simId}`);
@@ -3002,16 +3041,32 @@ async function updateSimRotationTimestamp(env, simId) {
 
 async function updateSimRotationError(env, simId, errorMessage) {
   console.log(`[DB] Recording rotation error for sim_id=${simId}`);
-  await supabasePatch(
+
+  // Read current fail count and last_rotation_at to support per-day reset
+  const current = await supabaseSelectOne(
     env,
-    `sims?id=eq.${encodeURIComponent(String(simId))}`,
-    {
-      rotation_status: 'failed',
-      last_rotation_error: errorMessage,
-      last_rotation_at: new Date().toISOString(),
-    }
+    `sims?id=eq.${encodeURIComponent(String(simId))}&select=rotation_fail_count,last_rotation_at`
   );
-  console.log(`[DB] Recorded rotation error for sim_id=${simId}`);
+  const todayNY = getNYMidnightISO();
+  const lastAt = current?.last_rotation_at || null;
+  const isNewDay = !lastAt || lastAt < todayNY;
+  const prevCount = isNewDay ? 0 : (current?.rotation_fail_count || 0);
+  const newCount = prevCount + 1;
+
+  const patch = {
+    rotation_status: 'failed',
+    last_rotation_error: errorMessage,
+    last_rotation_at: new Date().toISOString(),
+    rotation_fail_count: newCount,
+  };
+
+  if (newCount >= 3) {
+    patch.status = 'rotation_failed';
+    console.log(`[DB] SIM ${simId}: 3 rotation failures today — marking rotation_failed`);
+  }
+
+  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, patch);
+  console.log(`[DB] Recorded rotation error for sim_id=${simId} (attempt ${newCount}/3)`);
 }
 
 async function findResellerIdBySimId(env, simId) {

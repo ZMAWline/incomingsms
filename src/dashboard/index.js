@@ -325,24 +325,34 @@ function relayFetch(env, url, init) {
 
 async function handleStats(env, corsHeaders) {
   try {
-    // Get SIM counts
-    const simsResponse = await supabaseGet(env, 'sims?select=status');
-    const sims = await simsResponse.json();
-
-    const stats = {
-      total_sims: sims.length,
-      active_sims: sims.filter(s => s.status === 'active').length,
-      provisioning_sims: sims.filter(s => s.status === 'provisioning').length,
+    const base = env.SUPABASE_URL + '/rest/v1/';
+    const authHeaders = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      Accept: 'application/json',
+      Prefer: 'count=exact',
     };
 
-    // Get message count (last 24 hours)
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const messagesResponse = await supabaseGet(
-      env,
-      `inbound_sms?select=id&received_at=gte.${yesterday}`
-    );
-    const messages = await messagesResponse.json();
-    stats.messages_24h = messages.length;
+
+    const [totalRes, activeRes, provRes, msgRes] = await Promise.all([
+      fetch(base + 'sims?select=id&limit=1', { headers: authHeaders }),
+      fetch(base + 'sims?select=id&status=eq.active&limit=1', { headers: authHeaders }),
+      fetch(base + 'sims?select=id&status=eq.provisioning&limit=1', { headers: authHeaders }),
+      fetch(base + 'inbound_sms?select=id&received_at=gte.' + yesterday + '&limit=1', { headers: authHeaders }),
+    ]);
+
+    const getCount = res => {
+      const cr = res.headers.get('content-range') || '';
+      return parseInt(cr.split('/')[1] || '0', 10);
+    };
+
+    const stats = {
+      total_sims: getCount(totalRes),
+      active_sims: getCount(activeRes),
+      provisioning_sims: getCount(provRes),
+      messages_24h: getCount(msgRes),
+    };
 
     return new Response(JSON.stringify(stats), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -1437,7 +1447,7 @@ function toE164(mdn) {
 
 async function syncActiveSim(env, iccid, { mdn, activatedAt, zipCode }) {
   try {
-    const sims = await sbGet(env, 'sims?iccid=eq.' + encodeURIComponent(iccid) + '&select=id,iccid,status,activated_at,activation_zip&limit=1');
+    const sims = await sbGet(env, 'sims?iccid=eq.' + encodeURIComponent(iccid) + '&select=id,iccid,status,activated_at,activation_zip,msisdn&limit=1');
     const sim = Array.isArray(sims) ? sims[0] : null;
     if (!sim) return { found: false };
 
@@ -1472,6 +1482,12 @@ async function syncActiveSim(env, iccid, { mdn, activatedAt, zipCode }) {
     if (mdn) {
       const e164 = toE164(mdn);
       if (e164) {
+        const msisdnBare = String(mdn).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1');
+        if (msisdnBare && msisdnBare.length === 10 && msisdnBare !== sim.msisdn) {
+          await sbPatch(env, 'sims?id=eq.' + sim.id, { msisdn: msisdnBare });
+          result.msisdn_updated = true;
+          result.msisdn_new = msisdnBare;
+        }
         const existing = await sbGet(env, 'sim_numbers?sim_id=eq.' + sim.id + '&valid_to=is.null&select=e164&limit=1');
         const currentMdn = Array.isArray(existing) && existing[0] ? existing[0].e164 : null;
         if (currentMdn !== e164) {
@@ -3431,7 +3447,7 @@ function buildCSV(customerName, start, end, days, dailyRate) {
   const rows = [];
   rows.push([
     'InvoiceNo', 'Customer', 'InvoiceDate', 'DueDate', 'Terms',
-    'ServiceDate', 'ProductService', 'Description', 'Qty', 'Rate', 'Amount'
+    'ServiceDate', 'ProductService', 'Description', 'Item Quantity', 'Rate', 'Amount'
   ].map(csvField).join(','));
 
   // Format date as MM/DD/YYYY for QBO
@@ -5877,7 +5893,7 @@ function getHTML(helixEnabled) {
                         </div>
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">CSV Format</h4>
-                            <p>Each row is one billing day. Columns: <code class="bg-dark-900 px-1 rounded text-accent">InvoiceNo, Customer, InvoiceDate, DueDate, Terms, ServiceDate, ProductService, Description, Qty, Rate, Amount</code>. Service item is <span class="text-white">US Business phone Rental</span>. Invoice date = end of period. Terms = Due on receipt. InvoiceNo is repeated on every row.</p>
+                            <p>Each row is one billing day. Columns: <code class="bg-dark-900 px-1 rounded text-accent">InvoiceNo, Customer, InvoiceDate, DueDate, Terms, ServiceDate, ProductService, Description, Item Quantity, Rate, Amount</code>. Service item is <span class="text-white">US Business phone Rental</span>. Invoice date = end of period. Terms = Due on receipt. InvoiceNo is repeated on every row.</p>
                         </div>
                         <div class="mt-2">
                             <h4 class="text-white font-medium mb-1">Billing Logic</h4>
@@ -6968,7 +6984,7 @@ function renderSims() {
                     <td class="px-4 py-3 whitespace-nowrap">
                         \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
                         \${sim.status === 'active' ? (['teltik', 'wing_iot'].includes(sim.vendor) ? \`<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="OTA not available for \${sim.vendor === 'teltik' ? 'Teltik' : 'Wing IoT'}">OTA</button>\` : (sim.vendor === 'helix' && !window.HELIX_ENABLED) ? \`<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Helix is disabled">OTA</button>\` : \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\`) : ''}
-                        \${sim.status === 'error' ? (['teltik', 'wing_iot'].includes(sim.vendor) ? \`<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Retry not available for \${sim.vendor === 'teltik' ? 'Teltik' : 'Wing IoT'}">Retry</button>\` : (sim.vendor === 'helix' && !window.HELIX_ENABLED) ? \`<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Helix is disabled">Retry</button>\` : \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\`) : ''}
+                        \${sim.status === 'error' ? (sim.vendor === 'teltik' ? \`<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Retry not available for Teltik">Retry</button>\` : (sim.vendor === 'helix' && !window.HELIX_ENABLED) ? \`<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Helix is disabled">Retry</button>\` : \`<button onclick="retryActivation(\${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>\`) : ''}
                         \${sim.reseller_id ? \`<button onclick="unassignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>\` : \`<button onclick="assignReseller(\${sim.id})" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition" title="Assign to reseller">Assign</button>\`}
                         \${(sim.gateway_id && sim.port) ? \`<button onclick="openSimDetail(\${sim.id}, 'imei')" class="px-2 py-1 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition ml-1" title="Change IMEI">IMEI</button>\` : ''}
                         \${\`<button onclick="openSimDetail(\${sim.id}, 'status')" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition ml-1">Status</button>\`}
@@ -10982,7 +10998,7 @@ async function sendSimOnline(simId, phoneNumber) {
             var vendorBadge = '<span class="text-sm font-medium ' + vendorColor + '">' + (sim.vendor || '-') + '</span>';
             var canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
             var canOta = sim.status === 'active' && ['teltik','wing_iot'].indexOf(sim.vendor) === -1 && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
-            var canRetry = sim.status === 'error' && ['teltik','wing_iot'].indexOf(sim.vendor) === -1 && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
+            var canRetry = sim.status === 'error' && sim.vendor !== 'teltik' && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
             var gatewayPort = (sim.gateway_name || sim.gateway_code || (sim.gateway_id ? 'GW#' + sim.gateway_id : '')) + (sim.port ? ' / ' + normalizePortDisplay(sim.port) : '');
             var errHtml = (sim.status === 'error' && sim.last_activation_error)
                 ? '<div class="mt-3 p-2 bg-red-900/20 border border-red-800/40 rounded text-xs text-red-400 font-mono break-all">' + sim.last_activation_error.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>'

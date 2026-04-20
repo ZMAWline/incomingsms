@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-17 (session 25 — ATOMIC swapMSISDN zip fix)
+> Last updated: 2026-04-20 (session 27 — Wing IoT MDN query delay, stats count fix, QB CSV label)
 
 ---
 
@@ -9,6 +9,7 @@
 
 - **API Logs tab shows blank for ATOMIC SIMs** — the dashboard "API Logs" section queries `helix_api_logs`; ATOMIC activations log to `carrier_api_logs`. ATOMIC SIM logs are invisible in the dashboard tab. Fix: update the API Logs query to also check `carrier_api_logs` (or unify into one view).
 - **SIM 685 still in `error` state** — needs a retry activation. Run retry from dashboard.
+- **Wing IoT activation fix deployed 2026-04-20 — awaiting production verification.** Root cause: Wing IoT API is case-sensitive and requires `"status": "ACTIVATED"` (uppercase), not `"Activated"` (title case) as shown in the wing-iot skill docs. Also requires `Accept: application/json` header. All historical code-path PUTs have used title case → 100% failure rate (500 + `30000001 Unknown server error`) going back weeks. API tester happened to work because user manually typed `ACTIVATED`. Fixed in bulk-activator + mdn-rotator. User needs to trigger a fresh Wing IoT activation to confirm.
 - **Wing IoT retry activation may still fail with "already active"** — 914 handling is ATOMIC-only. Wing IoT already-active case is not explicitly handled (Wing IoT returns HTTP error codes, not status codes in body, so it would throw and surface in the error log normally).
 - **Teltik bulk query needs hard-refresh verification** — code is deployed and correct but user saw all 50 SIMs route to helix (likely stale browser cache). Next session: confirm bulk query routes teltik vendor correctly after hard refresh (Ctrl+Shift+R).
 
@@ -63,6 +64,8 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-20 | Wing IoT post-activation MDN query delayed 60s (MSISDN takes ~1 min to propagate). Applied to `activateViaWingIot` (bulk-activator) and `retryActivateViaWingIot` (mdn-rotator). Dashboard stats (Total SIMs, Messages 24h) now use PostgREST `count=exact` instead of fetching all rows (was capped at 1000). QB billing CSV: column header `Qty` → `Item Quantity`. | bulk-activator, mdn-rotator, dashboard |
+| 2026-04-20 | **Wing IoT activation root-cause fix:** Wing API is case-sensitive — status must be `"ACTIVATED"` (uppercase), not `"Activated"`. Also added missing `Accept: application/json` header. Applied to both `activateViaWingIot` (bulk-activator) and `retryActivateViaWingIot` (mdn-rotator). Also fixed bulk-activator's post-activation GET to read `msisdn` field (not `mdn`). Dashboard: enabled Retry Activation button for wing_iot SIMs (previously disabled — mdn-rotator retryActivation already supports wing_iot, just need button). Awaiting prod verification. | bulk-activator, mdn-rotator, dashboard |
 | 2026-04-17 | ATOMIC swapMSISDN zip fix: added `activation_zip` to `sims` table; bulk-activator stores zip on activation; mdn-rotator (both batch + single path) reads `sim.activation_zip` instead of hardcoded `HX_ZIP`; dashboard ATOMIC query always overwrites `activation_zip` from inquiry `address.zipCode`; backfilled 147 existing SIMs from `carrier_api_logs`. | bulk-activator, mdn-rotator, dashboard, DB |
 | 2026-04-17 | Gateway page: "Lock Failed" bulk-locks all st=6 (Reg Failed) ports; "Unlock Locked" bulk-unlocks all st=7/8/12 ports. Both iterate window.portData and POST to skyline/lock or skyline/unlock per port. | dashboard |
 | 2026-04-17 | mdn-rotator change_imei: ATOMIC SIMs no longer blocked by missing mobility_subscription_id. Helix eligibility check + hxChangeImei now gated behind isHelixSim (vendor==='helix'). ATOMIC just updates gateway + IMEI pool + DB. | mdn-rotator |

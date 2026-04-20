@@ -286,13 +286,14 @@ async function activateViaWingIot(env, iccid, runId) {
 
   const requestBody = {
     communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US',
-    status: 'Activated',
+    status: 'ACTIVATED',
   };
 
   const res = await relayFetch(env, url, {
     method: 'PUT',
     headers: {
       Authorization: auth,
+      Accept: 'application/json',
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(requestBody),
@@ -322,6 +323,9 @@ async function activateViaWingIot(env, iccid, runId) {
     throw new Error(`Wing IoT activation failed ${res.status}: ${responseText.slice(0, 300)}`);
   }
 
+  // MSISDN takes ~1 minute to propagate after activation
+  await new Promise(r => setTimeout(r, 60000));
+
   // GET to verify and get MDN
   const getRes = await relayFetch(env, url, {
     method: 'GET',
@@ -330,7 +334,7 @@ async function activateViaWingIot(env, iccid, runId) {
   const getJson = await getRes.json().catch(() => ({}));
 
   return {
-    msisdn: getJson.mdn || '',
+    msisdn: getJson.msisdn || getJson.mdn || '',
     status: 'active',
   };
 }
