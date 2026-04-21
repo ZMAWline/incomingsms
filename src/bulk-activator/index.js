@@ -102,7 +102,7 @@ export default {
           `sims?select=id,mobility_subscription_id,msisdn,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
         );
         const existingSim = existing?.[0];
-        if (existingSim?.mobility_subscription_id || existingSim?.msisdn) {
+        if (existingSim?.mobility_subscription_id || existingSim?.msisdn || existingSim?.status === 'provisioning') {
           console.log(`[Activator] ${iccid}: already activated — skipping`);
           msg.ack();
           continue;
@@ -323,20 +323,8 @@ async function activateViaWingIot(env, iccid, runId) {
     throw new Error(`Wing IoT activation failed ${res.status}: ${responseText.slice(0, 300)}`);
   }
 
-  // MSISDN takes ~1 minute to propagate after activation
-  await new Promise(r => setTimeout(r, 60000));
-
-  // GET to verify and get MDN
-  const getRes = await relayFetch(env, url, {
-    method: 'GET',
-    headers: { Authorization: auth },
-  });
-  const getJson = await getRes.json().catch(() => ({}));
-
-  return {
-    msisdn: getJson.msisdn || getJson.mdn || '',
-    status: 'active',
-  };
+  // MDN takes ~1-4 min to propagate — mdn-rotator's syncWingIotPendingMdns cron fills it in
+  return { msisdn: '', status: 'provisioning' };
 }
 
 async function activateViaHelix(env, token, iccid, imei, runId) {

@@ -125,6 +125,17 @@ export default {
       }
     }
 
+    if (url.pathname === "/sync-wing-iot-mdns") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const result = await syncWingIotPendingMdns(env);
+      return new Response(JSON.stringify(result, null, 2), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+
     if (url.pathname === "/trigger-blimei-sweep" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
@@ -835,6 +846,8 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
     const hour = new Date(event.scheduledTime).getUTCHours();
     // Rotation: runs every 20 min all day until all client-assigned SIMs are rotated
     ctx.waitUntil(queueSimsForRotation(env));
+    // Wing IoT pending MDN sync: fills in MDNs for SIMs that activated without one
+    ctx.waitUntil(syncWingIotPendingMdns(env));
     // IMEI heartbeat: DISABLED — investigating gateway instability
     // ctx.waitUntil(queueImeiHeartbeats(env));
     // Error summary at 7am UTC
@@ -1260,27 +1273,29 @@ async function rotateWingIotSim(env, sim) {
   });
   if (!dRes.ok) throw new Error('Wing IoT dialable switch failed: ' + dRes.status + ': ' + dText.slice(0, 300));
 
-  // 4) GET new MDN — allow a few seconds for AT&T to assign the new number
-  await sleep(5000);
-  const verifyRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
-  const verifyJson = await verifyRes.json().catch(() => ({}));
-  await logCarrierApiCall(env, {
-    run_id: runId, step: 'post_rotate_get', iccid, imei: null, vendor: 'wing_iot',
-    request_url: url, request_method: 'GET', request_body: null,
-    response_status: verifyRes.status, response_ok: verifyRes.ok,
-    response_body_text: JSON.stringify(verifyJson), response_body_json: verifyJson,
-    error: verifyRes.ok ? null : 'Wing IoT post-rotate GET failed: ' + verifyRes.status,
-  });
-  if (!verifyRes.ok) throw new Error('Wing IoT post-rotate GET failed: ' + verifyRes.status);
+  // 4) GET new MDN — poll until it changes (AT&T takes ~60s to assign new MDN)
+  let newMdnRaw = null;
+  let verifyJson = {};
+  let verifyRes;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await sleep(60000);
+    verifyRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
+    verifyJson = await verifyRes.json().catch(() => ({}));
+    await logCarrierApiCall(env, {
+      run_id: runId, step: 'post_rotate_get', iccid, imei: null, vendor: 'wing_iot',
+      request_url: url, request_method: 'GET', request_body: null,
+      response_status: verifyRes.status, response_ok: verifyRes.ok,
+      response_body_text: JSON.stringify(verifyJson), response_body_json: verifyJson,
+      error: verifyRes.ok ? null : 'Wing IoT post-rotate GET failed: ' + verifyRes.status,
+    });
+    if (!verifyRes.ok) throw new Error('Wing IoT post-rotate GET failed: ' + verifyRes.status);
+    const candidate = verifyJson.mdn || verifyJson.msisdn || null;
+    if (candidate && candidate !== oldMdn) { newMdnRaw = candidate; break; }
+    console.warn(`SIM ${iccid}: Wing IoT MDN not yet changed after ${(attempt + 1) * 60}s (still ${candidate || 'empty'}), retrying...`);
+  }
 
-  const newMdnRaw = verifyJson.mdn || verifyJson.msisdn || null;
-  if (!newMdnRaw) throw new Error('Wing IoT: no MDN in post-rotate GET response');
-
-  const e164 = normalizeUS(newMdnRaw);
-  const msisdnBare = String(newMdnRaw).replace(/^\+?1?/, '');
-
-  if (oldMdn && newMdnRaw === oldMdn) {
-    console.warn(`SIM ${iccid}: Wing IoT MDN did not change after rotation (still ${oldMdn})`);
+  if (!newMdnRaw) {
+    throw new Error(`Wing IoT: MDN did not change after 4 minutes (still ${oldMdn || 'empty'}) — rotation may not have been applied`);
   }
 
   // 5) DB updates
@@ -1293,6 +1308,61 @@ async function rotateWingIotSim(env, sim) {
   await sendNumberOnlineWebhook(env, sim.id, e164, iccid, msisdnBare);
 
   console.log(`SIM ${iccid}: Wing IoT rotated ${oldMdn || 'unknown'} → ${msisdnBare} (${e164})`);
+}
+
+// ===========================
+// Sync MDNs for Wing IoT SIMs that activated but MDN hasn't propagated yet.
+// Called on every cron tick and via /sync-wing-iot-mdns endpoint.
+// ===========================
+async function syncWingIotPendingMdns(env) {
+  const sims = await supabaseSelect(
+    env,
+    `sims?select=id,iccid,status&vendor=eq.wing_iot&msisdn=is.null&status=in.(active,provisioning)&limit=50`
+  );
+  if (!sims || sims.length === 0) return { ok: true, checked: 0, synced: 0 };
+
+  const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
+  const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
+  const headers = { Authorization: auth, Accept: 'application/json' };
+
+  let synced = 0;
+  const results = [];
+
+  for (const sim of sims) {
+    const url = baseUrl + '/v1/devices/' + encodeURIComponent(sim.iccid);
+    try {
+      const res = await relayFetch(env, url, { method: 'GET', headers });
+      if (!res.ok) {
+        results.push({ iccid: sim.iccid, ok: false, error: 'GET ' + res.status });
+        continue;
+      }
+      const data = await res.json().catch(() => ({}));
+      const mdnRaw = data.msisdn || data.mdn || null;
+      if (!mdnRaw) {
+        results.push({ iccid: sim.iccid, ok: true, pending: true });
+        continue;
+      }
+
+      const e164 = normalizeUS(mdnRaw);
+      const msisdnBare = String(mdnRaw).replace(/^\+?1?/, '');
+
+      await closeCurrentNumber(env, sim.id);
+      await insertNewNumber(env, sim.id, e164);
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        msisdn: msisdnBare,
+        status: 'active',
+      });
+      await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare);
+
+      synced++;
+      results.push({ iccid: sim.iccid, ok: true, mdn: e164 });
+      console.log(`[WingIoT MDN sync] ${sim.iccid}: wrote ${e164}`);
+    } catch (e) {
+      results.push({ iccid: sim.iccid, ok: false, error: String(e) });
+    }
+  }
+
+  return { ok: true, checked: sims.length, synced, results };
 }
 
 // ===========================

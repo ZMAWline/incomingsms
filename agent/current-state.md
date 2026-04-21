@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-21 (session 28 — Wing IoT rotation, ATOMIC fix-sim, atomic fail-count RPC, Teltik DB write fixes)
+> Last updated: 2026-04-21 (session 29 — Wing IoT MDN sync architecture, bulk IMEI results modal)
 
 ---
 
@@ -12,7 +12,8 @@
 - **SIM 991 wrong vendor account** — ATOMIC subsriberInquiry returns "SIM does not belong to this vendor". ICCID is not under the `ezbiz` ATOMIC account. Cannot be fixed by restore; needs investigation with Wing Alpha (dan@wingalpha.com) to determine correct account or whether SIM should be removed.
 - **Wing IoT SIMs 632, 781, 1019, 1108, 1109 have no gateway/port** — rotation will fail at `callSkylineSetImei` step. These are floating SIMs not physically inserted into any gateway. Rotation will error on first attempt; they'll hit rotation_failed after 3 failures unless assigned to a gateway slot first.
 - **SIM 685 still in `error` state** — needs a retry activation. Run retry from dashboard.
-- **Wing IoT activation fix deployed 2026-04-20 — awaiting production verification.** Root cause: Wing IoT API is case-sensitive and requires `"status": "ACTIVATED"` (uppercase), not `"Activated"` (title case) as shown in the wing-iot skill docs. Also requires `Accept: application/json` header. All historical code-path PUTs have used title case → 100% failure rate (500 + `30000001 Unknown server error`) going back weeks. API tester happened to work because user manually typed `ACTIVATED`. Fixed in bulk-activator + mdn-rotator. User needs to trigger a fresh Wing IoT activation to confirm.
+- **Wing IoT activation confirmed working (2026-04-21)** — ACTIVATED case-sensitivity fix verified; user activated 4 SIMs successfully. MDNs now auto-sync via cron every 20 min (see `syncWingIotPendingMdns`). Any Wing IoT SIM with `msisdn IS NULL` and `status=provisioning/active` will be filled in automatically. Can also be triggered manually: `GET /sync-wing-iot-mdns?secret=...` on mdn-rotator.
+- **Wing IoT `number.online` webhook NOT sent on activation** — bulk-activator does not call `sendNumberOnlineWebhook` after activation. Resellers won't be notified until the first rotation cron or daily reseller-sync sweep. Fix: add webhook call to bulk-activator after MDN is synced (needs shared webhook logic or a separate endpoint call).
 - **Wing IoT retry activation may still fail with "already active"** — 914 handling is ATOMIC-only. Wing IoT already-active case is not explicitly handled (Wing IoT returns HTTP error codes, not status codes in body, so it would throw and surface in the error log normally).
 - **Teltik bulk query needs hard-refresh verification** — code is deployed and correct but user saw all 50 SIMs route to helix (likely stale browser cache). Next session: confirm bulk query routes teltik vendor correctly after hard refresh (Ctrl+Shift+R).
 
@@ -67,6 +68,8 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-21 | Wing IoT MDN sync architecture: activation now stores `status=provisioning` immediately (no blocking poll); `syncWingIotPendingMdns()` added to mdn-rotator — runs on every cron tick, finds wing_iot SIMs with `msisdn IS NULL`, GETs MDN from AT&T, writes `sim_numbers` + `sims.msisdn`, sends `number.online` webhook. Also added `/sync-wing-iot-mdns` HTTP endpoint for manual trigger. Already-activated check in queue consumer now also skips `status=provisioning`. Wing IoT rotation MDN poll increased from 5s to 4×60s with change-detection (throws if MDN never changes). | bulk-activator, mdn-rotator |
+| 2026-04-21 | Dashboard: bulk Modify IMEI now opens `sim-action-modal` showing per-SIM results live (was: single toast at end). Shows `SIM #ID: OK — IMEI <imei>` or `FAILED — <reason>` per SIM, running count, final summary. | dashboard |
 | 2026-04-21 | Teltik rotation DB write bugs fixed: `msisdn` added to polling MDN field list (Teltik API uses this field, not `mdn`); fallback to `get-phone-number` now retries 3× with 15s delays instead of single call; DB writes (`sim_numbers` close + insert) now throw on non-ok response instead of silently discarding errors. | teltik-worker |
 | 2026-04-21 | Rotation fail count made atomic via Supabase RPC — replaced JS read-modify-write with `increment_rotation_fail(p_sim_id, p_error, p_today_start)` RPC that does `SET rotation_fail_count = rotation_fail_count + 1` atomically; sets `status='rotation_failed'` when count reaches 3; resets count on first failure after midnight NY. Fixes race condition where concurrent queue messages all read stale count and wrote same incremented value. | mdn-rotator, DB |
 | 2026-04-21 | ATOMIC fix-sim path added — `fixAtomicSim` in mdn-rotator: (1) retire old IMEI pool entries, allocate new IMEI, set on gateway; (2) ATOMIC subsriberInquiry to sync MDN; (3) if attStatus=Suspended, call restoreSubscriber (reasonCode=CR) and set sims.status=active. `fixSim` dispatches to this new path for vendor=atomic SIMs. `fixSim` HTTP + queue handlers now tolerate Helix token failure (non-fatal). | mdn-rotator |

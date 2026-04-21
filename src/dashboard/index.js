@@ -108,6 +108,10 @@ export default {
       return handleSkylineProxy(request, env, url, corsHeaders);
     }
 
+    if (url.pathname.startsWith('/api/kasa/')) {
+      return handleKasaProxy(request, env, url, corsHeaders);
+    }
+
     if (url.pathname === '/api/fix-sim') {
       return handleFixSim(request, env, corsHeaders);
     }
@@ -903,6 +907,34 @@ async function handleResellers(env, corsHeaders) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleKasaProxy(request, env, url, corsHeaders) {
+  if (!env.KASA_CONTROL) {
+    return new Response(JSON.stringify({error: 'KASA_CONTROL not configured'}), {
+      status: 503,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+  const kasaPath = url.pathname.replace('/api/kasa', '');
+  const kasaReq = new Request('https://kasa-control.workers.dev' + kasaPath, {
+    method: request.method,
+    headers: { 'Content-Type': 'application/json' },
+    body: (request.method !== 'GET' && request.method !== 'HEAD') ? request.body : undefined,
+  });
+  try {
+    const res = await env.KASA_CONTROL.fetch(kasaReq);
+    const body = await res.text();
+    return new Response(body, {
+      status: res.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch(err) {
+    return new Response(JSON.stringify({error: String(err)}), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 }
@@ -4954,6 +4986,20 @@ function getHTML(helixEnabled) {
                             </div>
                             <span class="text-xs text-gray-300">Export Table</span>
                         </button>
+                    </div>
+                </div>
+
+                <!-- Power Control -->
+                <div class="bg-dark-800 rounded-xl border border-dark-600 mt-6">
+                    <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                        <div>
+                            <h2 class="text-lg font-semibold text-white">Power Control</h2>
+                            <p class="text-xs text-gray-500 mt-0.5">TP-LINK_Power Strip_9A97</p>
+                        </div>
+                        <button onclick="loadKasaOutlets()" id="kasa-refresh-btn" class="px-3 py-1.5 text-xs bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Refresh</button>
+                    </div>
+                    <div id="kasa-outlets" class="p-5">
+                        <p class="text-gray-500 text-sm text-center py-4">Click Refresh to load outlet states</p>
                     </div>
                 </div>
             </div>
@@ -10026,7 +10072,14 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
                 if (!(await showConfirm('Change IMEI', (isAuto ? 'Auto-assign new IMEI from pool' : 'Change IMEI to ' + manualImei) + ' for ' + simIds.length + ' SIM(s)?'))) return;
                 modal.remove();
+                const output = document.getElementById('sim-action-output');
+                document.getElementById('sim-action-title').textContent = 'Modify IMEI — ' + simIds.length + ' SIM(s)';
+                output.textContent = 'Starting...';
+                output.classList.remove('hidden');
+                document.getElementById('sim-action-logs-section').classList.add('hidden');
+                document.getElementById('sim-action-modal').classList.remove('hidden');
                 let ok = 0, fail = 0;
+                const lines = [];
                 for (const simId of simIds) {
                     try {
                         const bodyObj = { sim_id: simId, action: 'change_imei', auto_imei: isAuto };
@@ -10037,10 +10090,22 @@ async function sendSimOnline(simId, phoneNumber) {
                             body: JSON.stringify(bodyObj)
                         });
                         const result = await resp.json();
-                        if (result.ok) { ok++; } else { fail++; }
-                    } catch (e) { fail++; }
+                        if (result.ok) {
+                            ok++;
+                            const newImei = result.new_imei || result.imei || '';
+                            lines.push('SIM #' + simId + ': OK' + (newImei ? ' — IMEI ' + newImei : ''));
+                        } else {
+                            fail++;
+                            lines.push('SIM #' + simId + ': FAILED — ' + (result.error || 'unknown'));
+                        }
+                    } catch (e) {
+                        fail++;
+                        lines.push('SIM #' + simId + ': ERROR — ' + e.message);
+                    }
+                    output.textContent = lines.join('\\n') + '\\n\\nProcessing... (' + (ok + fail) + '/' + simIds.length + ')';
                 }
-                showToast(ok + ' IMEI(s) changed' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'error' : 'success');
+                output.textContent = lines.join('\\n') + '\\n\\nDone: ' + ok + ' success, ' + fail + ' failed';
+                showToast(ok + ' IMEI(s) changed' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'warning' : 'success');
                 loadSims(true);
                 loadImeiPool();
             };
@@ -11130,6 +11195,64 @@ async function sendSimOnline(simId, phoneNumber) {
                 container.innerHTML = '<p class="text-red-400 text-sm">Failed to load logs: ' + err + '</p>';
             }
         }
+        function kasaKick(el) { kasaControl(el.dataset.alias, el.dataset.action); }
+
+        async function loadKasaOutlets() {
+            var btn = document.getElementById('kasa-refresh-btn');
+            var container = document.getElementById('kasa-outlets');
+            if (btn) btn.disabled = true;
+            container.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">Loading...</p>';
+            try {
+                var res = await fetch('/api/kasa/outlets');
+                var outlets = await res.json();
+                if (!res.ok) throw new Error(outlets.error || 'Failed to load');
+                if (!outlets.length) {
+                    container.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">No outlets found</p>';
+                    return;
+                }
+                container.innerHTML = outlets.map(function(o) {
+                    var on = o.state;
+                    var a = o.alias;
+                    return '<div class="flex items-center justify-between p-3 rounded-lg bg-dark-700 border border-dark-500 mb-2">' +
+                        '<div class="flex items-center gap-3">' +
+                        '<div class="w-2.5 h-2.5 rounded-full ' + (on ? 'bg-green-400' : 'bg-gray-600') + '"></div>' +
+                        '<span class="text-sm text-gray-200 font-medium">' + a + '</span>' +
+                        '<span class="text-xs px-1.5 py-0.5 rounded ' + (on ? 'bg-green-900/50 text-green-400' : 'bg-gray-700 text-gray-500') + '">' + (on ? 'ON' : 'OFF') + '</span>' +
+                        '</div>' +
+                        '<div class="flex gap-2">' +
+                        '<button data-alias="' + a + '" data-action="on" onclick="kasaKick(this)" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-600 text-white rounded transition"' + (on ? ' disabled style="opacity:0.5"' : '') + '>On</button>' +
+                        '<button data-alias="' + a + '" data-action="off" onclick="kasaKick(this)" class="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 text-white rounded transition"' + (!on ? ' disabled style="opacity:0.5"' : '') + '>Off</button>' +
+                        '<button data-alias="' + a + '" data-action="reboot" onclick="kasaKick(this)" class="px-2 py-1 text-xs bg-orange-700 hover:bg-orange-600 text-white rounded transition">Reboot</button>' +
+                        '</div></div>';
+                }).join('');
+            } catch(e) {
+                container.innerHTML = '<p class="text-red-400 text-sm text-center py-4">' + e.message + '</p>';
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        async function kasaControl(alias, action) {
+            if (action === 'reboot') {
+                if (!await showConfirm('Reboot outlet ' + alias + '? This will power-cycle it (10s off).')) return;
+            }
+            var label = action === 'reboot' ? 'Rebooting' : action === 'on' ? 'Turning on' : 'Turning off';
+            showToast(label + ' ' + alias + '...', 'info');
+            try {
+                var res = await fetch('/api/kasa/outlet', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({alias: alias, action: action})
+                });
+                var data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Failed');
+                showToast(alias + ': ' + action + ' successful', 'success');
+                await loadKasaOutlets();
+            } catch(e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
         // ── End D3 ───────────────────────────────────────────────────────────
     </script>
         <!-- Add Mapping Modal -->
