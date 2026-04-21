@@ -64,7 +64,10 @@ export default {
           });
         }
 
-        const token = await getCachedToken(env);
+        let token = null;
+        try { token = await getCachedToken(env); } catch (e) {
+          console.log('[FixSim] Helix token unavailable (ok for ATOMIC SIMs):', e.message);
+        }
         const results = [];
         for (const simId of simIds) {
           try {
@@ -848,7 +851,10 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
       for (const msg of batch.messages) {
         const { sim_id, iccid } = msg.body;
         try {
-          const token = await getCachedToken(env);
+          let token = null;
+          try { token = await getCachedToken(env); } catch (e) {
+            console.log('[FixSimQueue] Helix token unavailable (ok for ATOMIC SIMs):', e.message);
+          }
           await fixSim(env, token, sim_id, { autoRotate: false });
           msg.ack();
         } catch (err) {
@@ -992,11 +998,10 @@ async function queueSimsForRotation(env, options = {}) {
   // Build query - manual runs prioritize SIMs that were rotated longest ago
   // NULLS FIRST ensures SIMs that have never been rotated get processed first
   // !inner join on reseller_sims ensures only SIMs assigned to an active client are rotated
-  // Include rotation-eligible vendors (helix, atomic). Exclude teltik (handled by
-  // teltik-worker on its own 48h cadence) and wing_iot (no rotation logic yet —
-  // Wing IoT SIMs are filtered out client-side via the identifier check below).
+  // Include rotation-eligible vendors (helix, atomic, wing_iot). Exclude teltik (handled by
+  // teltik-worker on its own 48h cadence).
   // Identifier requirement enforced client-side: helix needs mobility_subscription_id,
-  // atomic needs msisdn.
+  // atomic needs msisdn, wing_iot only needs iccid (plan swap).
   let query = `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,activation_zip,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&status=eq.active&vendor=neq.teltik`;
 
   if (isManualRun) {
@@ -1012,12 +1017,13 @@ async function queueSimsForRotation(env, options = {}) {
   const rawSims = await supabaseSelect(env, query);
 
   // Per-vendor identifier filter (PostgREST OR is awkward, so filter in JS).
-  // Wing IoT SIMs have no msisdn/subId in DB and fall out here — intentional
-  // until Wing rotation is wired into this worker.
+  // Helix needs mobility_subscription_id. Atomic needs msisdn.
+  // Wing IoT only needs iccid (plan swap rotation).
   const sims = (Array.isArray(rawSims) ? rawSims : []).filter(s => {
     const v = s.vendor || 'helix';
     if (v === 'helix') return !!s.mobility_subscription_id;
     if (v === 'atomic') return !!s.msisdn;
+    if (v === 'wing_iot') return true;
     return false;
   });
 
@@ -1139,6 +1145,18 @@ async function rotateSpecificSim(env, iccid) {
       return { ok: false, error: 'Use teltik-worker for Teltik SIM rotation' };
     }
 
+    if (vendor === 'wing_iot') {
+      try {
+        console.log(`SIM ${iccid}: starting Wing IoT rotation`);
+        await rotateWingIotSim(env, sim);
+        return { ok: true, iccid, message: `SIM ${iccid} rotated successfully (wing_iot)` };
+      } catch (err) {
+        console.error(`SIM ${iccid}: Wing IoT rotation failed: ${err}`);
+        await updateSimRotationError(env, sim.id, `Wing IoT rotation failed: ${err}`).catch(() => {});
+        return { ok: false, iccid, error: String(err) };
+      }
+    }
+
     if (sim.status !== 'active' && sim.status !== 'rotation_failed') {
       return { ok: false, error: `SIM ${iccid} is not active (status: ${sim.status})` };
     }
@@ -1178,6 +1196,103 @@ async function rotateSpecificSim(env, iccid) {
     console.error(`Manual rotation failed for ${iccid}: ${err}`);
     return { ok: false, iccid, error: String(err) };
   }
+}
+
+// ===========================
+// Rotate a single Wing IoT SIM (plan swap: dialable → non-dialable → dialable)
+// AT&T assigns a new MDN when switching back to the dialable plan.
+// ===========================
+async function rotateWingIotSim(env, sim) {
+  const iccid = sim.iccid;
+  const runId = `rotate_${iccid}_${Date.now()}`;
+
+  if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
+    throw new Error('Wing IoT credentials not configured on mdn-rotator worker');
+  }
+
+  const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
+  const url = baseUrl + '/v1/devices/' + encodeURIComponent(iccid);
+  const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
+  const getHeaders = { Authorization: auth, Accept: 'application/json' };
+  const putHeaders = { Authorization: auth, Accept: 'application/json', 'Content-Type': 'application/json' };
+
+  // 1) GET current MDN before rotation
+  const getRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
+  const getJson = await getRes.json().catch(() => ({}));
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'pre_rotate_get', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'GET', request_body: null,
+    response_status: getRes.status, response_ok: getRes.ok,
+    response_body_text: JSON.stringify(getJson), response_body_json: getJson,
+    error: getRes.ok ? null : 'Wing IoT GET failed: ' + getRes.status,
+  });
+  if (!getRes.ok) throw new Error('Wing IoT GET device failed: ' + getRes.status);
+  const oldMdn = getJson.mdn || getJson.msisdn || null;
+
+  // 2) Switch to non-dialable plan
+  const nonDialableBody = { communicationPlan: 'Wing Tel Inc - ABIR 25Mbps SMS MO/MT US' };
+  const ndRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(nonDialableBody) });
+  const ndText = await ndRes.text();
+  let ndJson = {};
+  try { ndJson = JSON.parse(ndText); } catch {}
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'mdn_change_non_dialable', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'PUT', request_body: nonDialableBody,
+    response_status: ndRes.status, response_ok: ndRes.ok,
+    response_body_text: ndText, response_body_json: ndJson,
+    error: ndRes.ok ? null : 'Wing IoT non-dialable switch failed: ' + ndRes.status,
+  });
+  if (!ndRes.ok) throw new Error('Wing IoT non-dialable switch failed: ' + ndRes.status + ': ' + ndText.slice(0, 300));
+
+  // 3) Switch back to dialable plan (AT&T assigns new MDN here)
+  await sleep(2000);
+  const dialableBody = { communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US' };
+  const dRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(dialableBody) });
+  const dText = await dRes.text();
+  let dJson = {};
+  try { dJson = JSON.parse(dText); } catch {}
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'mdn_change_dialable', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'PUT', request_body: dialableBody,
+    response_status: dRes.status, response_ok: dRes.ok,
+    response_body_text: dText, response_body_json: dJson,
+    error: dRes.ok ? null : 'Wing IoT dialable switch failed: ' + dRes.status,
+  });
+  if (!dRes.ok) throw new Error('Wing IoT dialable switch failed: ' + dRes.status + ': ' + dText.slice(0, 300));
+
+  // 4) GET new MDN — allow a few seconds for AT&T to assign the new number
+  await sleep(5000);
+  const verifyRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
+  const verifyJson = await verifyRes.json().catch(() => ({}));
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'post_rotate_get', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'GET', request_body: null,
+    response_status: verifyRes.status, response_ok: verifyRes.ok,
+    response_body_text: JSON.stringify(verifyJson), response_body_json: verifyJson,
+    error: verifyRes.ok ? null : 'Wing IoT post-rotate GET failed: ' + verifyRes.status,
+  });
+  if (!verifyRes.ok) throw new Error('Wing IoT post-rotate GET failed: ' + verifyRes.status);
+
+  const newMdnRaw = verifyJson.mdn || verifyJson.msisdn || null;
+  if (!newMdnRaw) throw new Error('Wing IoT: no MDN in post-rotate GET response');
+
+  const e164 = normalizeUS(newMdnRaw);
+  const msisdnBare = String(newMdnRaw).replace(/^\+?1?/, '');
+
+  if (oldMdn && newMdnRaw === oldMdn) {
+    console.warn(`SIM ${iccid}: Wing IoT MDN did not change after rotation (still ${oldMdn})`);
+  }
+
+  // 5) DB updates
+  await closeCurrentNumber(env, sim.id);
+  await insertNewNumber(env, sim.id, e164);
+  await updateSimRotationTimestamp(env, sim.id);
+  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: msisdnBare });
+
+  // 6) Webhook
+  await sendNumberOnlineWebhook(env, sim.id, e164, iccid, msisdnBare);
+
+  console.log(`SIM ${iccid}: Wing IoT rotated ${oldMdn || 'unknown'} → ${msisdnBare} (${e164})`);
 }
 
 // ===========================
@@ -1264,7 +1379,16 @@ async function rotateAtomicSim(env, sim) {
   });
   if (!swapRes.ok) throw new Error(`ATOMIC swapMSISDN HTTP ${swapRes.status}: ${swapText.slice(0, 300)}`);
   if (swapR?.statusCode !== '00') {
-    throw new Error(`ATOMIC swapMSISDN failed: ${swapR?.description || 'Unknown'}`);
+    const desc = swapR?.description || 'Unknown';
+    if (/subscriber.*must.*be.*active|not.*active|status is not active/i.test(desc)) {
+      console.log(`SIM ${iccid}: ATOMIC subscriber not active — queuing fix-sim`);
+      if (env.FIX_SIM_QUEUE) {
+        await env.FIX_SIM_QUEUE.send({ sim_id: sim.id, iccid }).catch(e =>
+          console.error(`SIM ${iccid}: failed to enqueue fix-sim: ${e}`)
+        );
+      }
+    }
+    throw new Error(`ATOMIC swapMSISDN failed: ${desc}`);
   }
 
   // Try to read new MSISDN from swap response; fall back to post-swap inquiry by SIM
@@ -1338,18 +1462,15 @@ async function rotateSingleSim(env, token, sim) {
   }
 
   // Vendor dispatch.
-  // - atomic: delegate to rotateAtomicSim (defined elsewhere in this file)
-  // - wing_iot / teltik: explicit early-return (defense-in-depth; the cron
-  //   query in queueSimsForRotation already filters these out, so reaching
-  //   here means a stray queue message — log loudly, do not fall through to
-  //   the helix code path)
+  // - atomic: delegate to rotateAtomicSim
+  // - wing_iot: delegate to rotateWingIotSim
+  // - teltik: explicit early-return (defense-in-depth; handled by teltik-worker)
   // - helix: fall through to the original logic below (default)
   if (vendor === 'atomic') {
     return await rotateAtomicSim(env, sim);
   }
   if (vendor === 'wing_iot') {
-    console.log(`SIM ${iccid}: wing_iot rotation not implemented in mdn-rotator yet — skipping (queue message should not have reached here; check queueSimsForRotation)`);
-    return;
+    return await rotateWingIotSim(env, sim);
   }
   if (vendor === 'teltik') {
     console.log(`SIM ${iccid}: teltik handled by teltik-worker — skipping (queue message should not have reached here; check queueSimsForRotation)`);
@@ -1678,16 +1799,20 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   // Load SIM details from DB
   const sims = await supabaseSelect(
     env,
-    `sims?select=id,iccid,mobility_subscription_id,gateway_id,port,slot,current_imei_pool_id,status,imei,activated_at&id=eq.${encodeURIComponent(String(simId))}&limit=1`
+    `sims?select=id,iccid,vendor,msisdn,mobility_subscription_id,gateway_id,port,slot,current_imei_pool_id,status,imei,activated_at&id=eq.${encodeURIComponent(String(simId))}&limit=1`
   );
   if (!Array.isArray(sims) || sims.length === 0) {
     throw new Error(`SIM not found: ${simId}`);
   }
   const sim = sims[0];
   const iccid = sim.iccid;
-  const subId = sim.mobility_subscription_id;
   const runId = `fixsim_${iccid}_${Date.now()}`;
 
+  if (sim.vendor === 'atomic') {
+    return await fixAtomicSim(env, sim);
+  }
+
+  const subId = sim.mobility_subscription_id;
   if (!subId) throw new Error(`SIM ${iccid}: no mobility_subscription_id`);
 
   // Auto-discover gateway/port if not set on SIM record
@@ -1898,6 +2023,150 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
 
   console.log(`[FixSim] SIM ${iccid}: fix complete (IMEI=${newImei})`);
   return { imei: newImei, pool_entry_id: poolEntry?.id ?? null };
+}
+
+// ===========================
+// Fix a single ATOMIC SIM: new IMEI → inquiry → restore if suspended
+// ===========================
+async function fixAtomicSim(env, sim) {
+  const iccid = sim.iccid;
+  const simId = sim.id;
+  const runId = `fixsim_atomic_${iccid}_${Date.now()}`;
+
+  if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+    throw new Error('ATOMIC credentials not configured on mdn-rotator worker');
+  }
+
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const session = {
+    userName: env.ATOMIC_USERNAME,
+    token: env.ATOMIC_TOKEN,
+    pin: env.ATOMIC_PIN,
+  };
+
+  // Auto-discover gateway/port if not set
+  if (!sim.gateway_id || !sim.port) {
+    console.log(`[FixAtomicSim] SIM ${iccid}: no gateway_id/port — scanning gateways...`);
+    const found = await scanGatewaysForIccid(env, iccid);
+    if (!found) throw new Error(`SIM ${iccid}: no gateway_id/port and ICCID not found on any gateway`);
+    sim.gateway_id = found.gateway_id;
+    sim.port = found.port;
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+      gateway_id: sim.gateway_id,
+      port: sim.port,
+    });
+  }
+
+  console.log(`[FixAtomicSim] Starting for SIM ${simId} (${iccid})`);
+
+  // Step 1: Retire old pool entries, allocate fresh IMEI
+  await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
+  const poolEntry = await allocateImeiFromPool(env, simId);
+  const newImei = poolEntry.imei;
+  console.log(`[FixAtomicSim] SIM ${iccid}: allocated IMEI ${newImei} (pool entry ${poolEntry.id})`);
+
+  try {
+    // Set new IMEI on gateway
+    await retryWithBackoff(
+      () => callSkylineSetImei(env, sim.gateway_id, sim.port, newImei),
+      { attempts: 3, label: `setImei ${iccid}` }
+    );
+    console.log(`[FixAtomicSim] SIM ${iccid}: IMEI set on gateway`);
+    markGatewayImeiSynced(env, simId).catch(() => {});
+
+    // Update pool entry with slot info and SIM record with new IMEI
+    await supabasePatch(env, `imei_pool?id=eq.${encodeURIComponent(String(poolEntry.id))}`, {
+      gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString(),
+    });
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+      imei: newImei, current_imei_pool_id: poolEntry.id,
+    });
+
+    // Step 2: ATOMIC subscriber inquiry — get live status + MSISDN
+    const inqBody = {
+      wholeSaleApi: {
+        session,
+        wholeSaleRequest: { requestType: 'subsriberInquiry', MSISDN: '', sim: iccid },
+      },
+    };
+    const inqRes = await relayFetch(env, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(inqBody),
+    });
+    const inqText = await inqRes.text();
+    let inqJson = {};
+    try { inqJson = JSON.parse(inqText); } catch {}
+    const inqR = inqJson?.wholeSaleApi?.wholeSaleResponse;
+    await logCarrierApiCall(env, {
+      run_id: runId, step: 'subscriber_inquiry', iccid, imei: newImei, vendor: 'atomic',
+      request_url: url, request_method: 'POST', request_body: inqBody,
+      response_status: inqRes.status, response_ok: inqRes.ok,
+      response_body_text: inqText, response_body_json: inqJson,
+      error: (inqRes.ok && inqR?.statusCode === '00') ? null : `ATOMIC inquiry failed: ${inqR?.description || inqRes.status}`,
+    });
+    if (!inqRes.ok || inqR?.statusCode !== '00') {
+      throw new Error(`ATOMIC inquiry failed: ${inqR?.description || inqRes.status}`);
+    }
+
+    const attStatus = inqR?.Result?.attStatus;
+    const msisdnRaw = inqR?.Result?.MSISDN || sim.msisdn || null;
+    console.log(`[FixAtomicSim] SIM ${iccid}: attStatus=${attStatus} msisdn=${msisdnRaw}`);
+
+    // Sync MSISDN to DB if inquiry returned one
+    if (msisdnRaw) {
+      const msisdn10 = String(msisdnRaw).replace(/^\+?1?/, '').replace(/\D/g, '').slice(0, 10);
+      if (msisdn10 !== sim.msisdn) {
+        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { msisdn: msisdn10 }).catch(() => {});
+        console.log(`[FixAtomicSim] SIM ${iccid}: synced msisdn ${sim.msisdn} → ${msisdn10}`);
+      }
+    }
+
+    // Step 3: Restore if suspended
+    if (attStatus === 'Suspended') {
+      const mdn10 = String(msisdnRaw).replace(/^\+?1?/, '').replace(/\D/g, '').slice(0, 10);
+      if (!mdn10) throw new Error(`SIM ${iccid}: no MSISDN available for restoreSubscriber`);
+      console.log(`[FixAtomicSim] SIM ${iccid}: subscriber suspended — calling restoreSubscriber (mdn=${mdn10})`);
+
+      const restoreBody = {
+        wholeSaleApi: {
+          session,
+          wholeSaleRequest: { requestType: 'restoreSubscriber', MSISDN: mdn10, reasonCode: 'CR' },
+        },
+      };
+      const restoreRes = await relayFetch(env, url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(restoreBody),
+      });
+      const restoreText = await restoreRes.text();
+      let restoreJson = {};
+      try { restoreJson = JSON.parse(restoreText); } catch {}
+      const restoreR = restoreJson?.wholeSaleApi?.wholeSaleResponse;
+      await logCarrierApiCall(env, {
+        run_id: runId, step: 'restore_subscriber', iccid, imei: newImei, vendor: 'atomic',
+        request_url: url, request_method: 'POST', request_body: restoreBody,
+        response_status: restoreRes.status, response_ok: restoreRes.ok,
+        response_body_text: restoreText, response_body_json: restoreJson,
+        error: (restoreRes.ok && restoreR?.statusCode === '00') ? null : `ATOMIC restore failed: ${restoreR?.description || restoreRes.status}`,
+      });
+      if (!restoreRes.ok || restoreR?.statusCode !== '00') {
+        throw new Error(`ATOMIC restore failed: ${restoreR?.description || restoreRes.status}`);
+      }
+      console.log(`[FixAtomicSim] SIM ${iccid}: subscriber restored successfully`);
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { status: 'active' }).catch(() => {});
+    } else {
+      console.log(`[FixAtomicSim] SIM ${iccid}: attStatus=${attStatus} — no restore needed`);
+    }
+
+  } catch (err) {
+    console.error(`[FixAtomicSim] SIM ${iccid}: failed, rolling back pool allocation: ${err}`);
+    try { await releaseImeiPoolEntry(env, poolEntry.id, simId); } catch {}
+    throw err;
+  }
+
+  console.log(`[FixAtomicSim] SIM ${iccid}: fix complete (IMEI=${newImei})`);
+  return { imei: newImei, pool_entry_id: poolEntry.id };
 }
 
 // ===========================
@@ -3041,32 +3310,22 @@ async function updateSimRotationTimestamp(env, simId) {
 
 async function updateSimRotationError(env, simId, errorMessage) {
   console.log(`[DB] Recording rotation error for sim_id=${simId}`);
-
-  // Read current fail count and last_rotation_at to support per-day reset
-  const current = await supabaseSelectOne(
-    env,
-    `sims?id=eq.${encodeURIComponent(String(simId))}&select=rotation_fail_count,last_rotation_at`
-  );
   const todayNY = getNYMidnightISO();
-  const lastAt = current?.last_rotation_at || null;
-  const isNewDay = !lastAt || lastAt < todayNY;
-  const prevCount = isNewDay ? 0 : (current?.rotation_fail_count || 0);
-  const newCount = prevCount + 1;
-
-  const patch = {
-    rotation_status: 'failed',
-    last_rotation_error: errorMessage,
-    last_rotation_at: new Date().toISOString(),
-    rotation_fail_count: newCount,
-  };
-
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/increment_rotation_fail`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ p_sim_id: simId, p_error: errorMessage, p_today_start: todayNY }),
+  });
+  const newCount = await res.json().catch(() => null);
   if (newCount >= 3) {
-    patch.status = 'rotation_failed';
-    console.log(`[DB] SIM ${simId}: 3 rotation failures today — marking rotation_failed`);
+    console.log(`[DB] SIM ${simId}: rotation_fail_count=${newCount} → status=rotation_failed`);
+  } else {
+    console.log(`[DB] SIM ${simId}: rotation_fail_count=${newCount} (attempt ${newCount}/3)`);
   }
-
-  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, patch);
-  console.log(`[DB] Recorded rotation error for sim_id=${simId} (attempt ${newCount}/3)`);
 }
 
 async function findResellerIdBySimId(env, simId) {

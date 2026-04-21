@@ -4,6 +4,46 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-21 — Rotation fail count incremented via Supabase RPC, not in JS
+
+**Decision:** `updateSimRotationError` (mdn-rotator) no longer reads `rotation_fail_count`, increments it in JS, and writes it back. Instead it calls an RPC: `increment_rotation_fail(p_sim_id, p_error, p_today_start)` which runs `UPDATE sims SET rotation_fail_count = rotation_fail_count + 1 WHERE id = $1 RETURNING rotation_fail_count` atomically in the DB.
+
+**Why:** Concurrent queue messages were all racing to increment the same column. The JS approach: (1) SELECT rotation_fail_count, (2) add 1 in JS, (3) UPDATE — lets every concurrent message read the same stale value and write the same incremented value. With 5 failing SIMs each firing multiple concurrent queue messages, all of them read `count=1` and wrote `count=2`, so the column was stuck at 2 and `status='rotation_failed'` was never set, even after 30+ failures across multiple days. The RPC does the increment server-side in a single statement, so no read-modify-write window.
+
+**Consequence:**
+- Any future "increment a counter on concurrent access" pattern must use an RPC or raw SQL (`UPDATE ... SET col = col + 1`), not a JS read-modify-write cycle.
+- The `increment_rotation_fail` RPC also resets the count to 1 on the first failure after midnight NY (`last_rotation_at < p_today_start`), so per-day retry limits work correctly across days.
+- The function is `SECURITY DEFINER` — it runs as the DB owner, bypassing RLS. Intentional: mdn-rotator queue handler uses service role anyway.
+
+---
+
+## 2026-04-21 — ATOMIC fix-sim uses a new IMEI every time, not the existing one
+
+**Decision:** `fixAtomicSim` always retires all existing IMEI pool entries for the SIM and allocates a fresh one before running subsriberInquiry + restore. It does not try to reuse the current `sims.imei`.
+
+**Why:** The suspended ATOMIC SIMs (DSABR2 SOC) were likely suspended due to IMEI-related network issues (DLC suspension cycle, same as the Helix pattern). Reusing the same IMEI that caused suspension would likely lead to re-suspension after restore. A fresh IMEI breaks the cycle — same reasoning as the Helix fix-sim path that was already established.
+
+**Consequence:**
+- `fixAtomicSim` always burns an IMEI pool entry. Call it only when genuinely needed (suspended, or after 3 rotation failures), not as a routine maintenance step.
+- If the IMEI pool is exhausted, `fixAtomicSim` will throw at allocation step. The error is surfaced in the queue handler as a failed job.
+
+---
+
+## 2026-04-20 — Wing IoT API is case-sensitive; uses UPPERCASE status values
+
+**Decision:** Always send `"status": "ACTIVATED"` (uppercase) in Wing IoT PUT activations, not `"Activated"` (title case). Always include `Accept: application/json` header.
+
+**Why:** Empirically verified. 100% of historical code-path Wing IoT PUTs used `"Activated"` and failed with HTTP 500 + `{"errorCode":"30000001","errorMessage":"Unknown server error"}`. The dashboard API tester succeeded with `"ACTIVATED"` (202 response with `{iccid:"..."}` body). Wing's own GET response returns all statuses in uppercase (`"INVENTORY"`, `"ACTIVATED"`, etc.) — that's their canonical form. The `wing-iot` skill documentation in `.claude/skills/wing-iot/SKILL.md` shows title case `"Activated"` — **the skill doc is wrong**, the API is case-sensitive.
+
+**Consequence:**
+- Any future Wing IoT code (activation, status changes, MDN rotation) must use uppercase status strings: `"ACTIVATED"`, `"DEACTIVATED"`, `"INVENTORY"`.
+- Do NOT trust the wing-iot skill docs on status casing — verify against actual Wing API responses.
+- Consider updating the `wing-iot` skill to correct the casing (future cleanup).
+- Reading Wing responses: keep case-insensitive comparisons (e.g. `.toLowerCase()` as in `handleWingCheck`) for defense in depth.
+- Always include `Accept: application/json` on PUT requests to Wing IoT — the successful API tester call did, and the old code didn't.
+
+---
+
 ## 2026-04-15 — Helix quarantined via HELIX_ENABLED flag (not deleted)
 
 **Decision:** Quarantine all Helix code behind an `env.HELIX_ENABLED === 'true'` feature flag across 7 workers, rather than deleting the code.

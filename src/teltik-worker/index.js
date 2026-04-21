@@ -488,7 +488,7 @@ async function rotateTeltikSims(env) {
 
         if (status === 'completed' || status === 'success' || status === 'msg_received') {
           newMdn = normalizeToE164(
-            pollData.new_number || pollData.mdn || pollData.phone_number || pollData.number || ''
+            pollData.new_number || pollData.mdn || pollData.msisdn || pollData.phone_number || pollData.number || ''
           );
           if (newMdn) break;
         }
@@ -498,18 +498,22 @@ async function rotateTeltikSims(env) {
         console.log(`[Rotate] SIM ${sim.iccid}: attempt ${attempt + 1} pending, status=${pollData.status || 'unknown'}`);
       }
 
-      // 3b. Fallback: if polling didn't return new MDN, fetch current number directly
+      // 3b. Fallback: polling exhausted without MDN — retry get-phone-number up to 3x with
+      //     increasing delay. New MDN may still be propagating on Teltik's side.
       if (!newMdn) {
-        console.log(`[Rotate] SIM ${sim.iccid}: polling exhausted, falling back to get-phone-number`);
-        const phoneRes = await relayFetch(
-          env,
-          `${TELTIK_BASE}/v1/get-phone-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
-        );
-        if (phoneRes.ok) {
-          const phoneData = await phoneRes.json();
-          console.log(`[Rotate] SIM ${sim.iccid}: get-phone-number: ${JSON.stringify(phoneData)}`);
-          const msisdn = phoneData.msisdn || phoneData.mdn || phoneData.phone_number || phoneData.number || '';
-          if (msisdn) newMdn = normalizeToE164(msisdn);
+        console.log(`[Rotate] SIM ${sim.iccid}: polling exhausted without MDN, retrying get-phone-number`);
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (attempt > 0) await sleep(15000);
+          const phoneRes = await relayFetch(
+            env,
+            `${TELTIK_BASE}/v1/get-phone-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
+          );
+          if (phoneRes.ok) {
+            const phoneData = await phoneRes.json();
+            console.log(`[Rotate] SIM ${sim.iccid}: get-phone-number attempt ${attempt + 1}: ${JSON.stringify(phoneData)}`);
+            const raw = phoneData.msisdn || phoneData.mdn || phoneData.phone_number || phoneData.number || '';
+            if (raw) { newMdn = normalizeToE164(raw); break; }
+          }
         }
       }
 
@@ -518,17 +522,24 @@ async function rotateTeltikSims(env) {
       }
 
       // 4. Close old sim_numbers row and insert new
-      await supabasePatch(
+      const closeRes = await supabasePatch(
         env,
         `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`,
         { valid_to: new Date().toISOString() }
       );
-      await supabaseInsert(env, 'sim_numbers', [{
+      if (!closeRes.ok) {
+        throw new Error(`sim_numbers close failed: ${closeRes.status} ${await closeRes.text().catch(() => '')}`);
+      }
+      const insertRes = await supabaseInsert(env, 'sim_numbers', [{
         sim_id: sim.id,
         e164: newMdn,
         valid_from: new Date().toISOString(),
+        verified_at: new Date().toISOString(),
         verification_status: 'verified',
       }]);
+      if (!insertRes.ok) {
+        throw new Error(`sim_numbers insert failed: ${insertRes.status} ${await insertRes.text().catch(() => '')}`);
+      }
 
       // 5. Update sims.last_mdn_rotated_at
       const rotatedAt = new Date().toISOString();
