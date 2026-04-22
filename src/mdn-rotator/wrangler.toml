@@ -7,7 +7,7 @@ workers_dev = true
 [triggers]
 # Rotation: every 20 min all day — runs until all client-assigned SIMs are rotated
 # (queueSimsForRotation skips SIMs already rotated today, so it's a no-op once done)
-crons = ["0,20,40 * * * *"]
+crons = []  # PAUSED — parallelism caused duplicate rotations, stopped to investigate
 
 # KV namespace for token caching
 [[kv_namespaces]]
@@ -21,8 +21,8 @@ binding = "MDN_QUEUE"
 
 [[queues.consumers]]
 queue = "mdn-rotation-queue"
-max_batch_size = 10
-max_retries = 2
+max_batch_size = 25
+max_retries = 0
 max_concurrency = 1
 
 # Queue for fix-sim jobs (runs outside 30s service-binding limit)

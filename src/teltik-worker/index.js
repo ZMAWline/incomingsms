@@ -43,6 +43,28 @@ export default {
       }
     }
 
+    // Single-SIM rotate — called from the dashboard Rotate button for teltik SIMs.
+    // `force=true` bypasses the 48h interval guard.
+    if (url.pathname === '/rotate-sim' && (request.method === 'POST' || request.method === 'GET')) {
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const iccid = url.searchParams.get('iccid') || '';
+      const force = url.searchParams.get('force') === 'true';
+      if (!iccid) return jsonResponse({ ok: false, error: 'iccid required' }, 400);
+      try {
+        const rows = await supabaseGetArray(
+          env,
+          `sims?iccid=eq.${encodeURIComponent(iccid)}&vendor=eq.teltik&select=id,iccid,reseller_sims(reseller_id,active)&limit=1`
+        );
+        if (!rows || rows.length === 0) return jsonResponse({ ok: false, error: `Teltik SIM not found: ${iccid}` }, 404);
+        const result = await rotateOneTeltikSim(env, rows[0], { force });
+        return jsonResponse(result, result.ok ? 200 : 500);
+      } catch (err) {
+        return jsonResponse({ ok: false, error: String(err) }, 500);
+      }
+    }
+
     if (url.pathname === '/setup-webhook') {
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
         return new Response('Unauthorized', { status: 401 });
@@ -404,7 +426,6 @@ async function processTeltikSmsItem(body, env) {
 // ROTATE — MDN rotation for Teltik SIMs (cron + manual)
 // =========================================================
 async function rotateTeltikSims(env) {
-  const apiKey = env.TELTIK_API_KEY;
   const now = Date.now();
 
   // 1. Query active Teltik SIMs assigned to active resellers
@@ -426,7 +447,29 @@ async function rotateTeltikSims(env) {
 
   for (const sim of due) {
     try {
-      // Re-read last_mdn_rotated_at (dedup guard — queue message may be stale)
+      const result = await rotateOneTeltikSim(env, sim, { force: false });
+      if (result.skipped) skipped++;
+      else if (result.ok) rotated++;
+      else errors++;
+    } catch (err) {
+      console.error(`[Rotate] SIM ${sim.iccid}: error: ${err}`);
+      errors++;
+    }
+  }
+
+  return { ok: true, total: sims.length, due: due.length, rotated, errors, skipped };
+}
+
+// Rotate a single Teltik SIM. force=true bypasses the 48h interval guard.
+// Returns { ok, skipped?, new_mdn?, error? }.
+async function rotateOneTeltikSim(env, sim, opts = {}) {
+  const force = opts.force === true;
+  const apiKey = env.TELTIK_API_KEY;
+  const now = Date.now();
+
+  try {
+    // Dedup guard: skip if within interval — unless force=true
+    if (!force) {
       const freshRows = await supabaseGetArray(
         env,
         `sims?id=eq.${sim.id}&select=last_mdn_rotated_at,rotation_interval_hours&limit=1`
@@ -437,12 +480,14 @@ async function rotateTeltikSims(env) {
         const intervalMs = intervalHours * 60 * 60 * 1000;
         if ((now - new Date(freshRotatedAt).getTime()) < intervalMs) {
           console.log(`[Rotate] SIM ${sim.iccid}: already rotated recently, skipping`);
-          skipped++;
-          continue;
+          return { ok: false, skipped: true, reason: 'within interval' };
         }
       }
+    } else {
+      console.log(`[Rotate] SIM ${sim.iccid}: force=true — bypassing interval guard`);
+    }
 
-      // 2. Initiate number change
+    // 2. Initiate number change
       const changeRes = await relayFetch(
         env,
         `${TELTIK_BASE}/v1/change-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
@@ -583,16 +628,13 @@ async function rotateTeltikSims(env) {
         }
       }
 
-      console.log(`[Rotate] SIM ${sim.iccid}: rotated → ${newMdn}`);
-      rotated++;
+    console.log(`[Rotate] SIM ${sim.iccid}: rotated → ${newMdn}`);
+    return { ok: true, iccid: sim.iccid, sim_id: sim.id, new_mdn: newMdn };
 
-    } catch (err) {
-      console.error(`[Rotate] SIM ${sim.iccid}: error: ${err}`);
-      errors++;
-    }
+  } catch (err) {
+    console.error(`[Rotate] SIM ${sim.iccid}: error: ${err}`);
+    return { ok: false, iccid: sim.iccid, error: String(err) };
   }
-
-  return { ok: true, total: sims.length, due: due.length, rotated, errors, skipped };
 }
 
 // =========================================================

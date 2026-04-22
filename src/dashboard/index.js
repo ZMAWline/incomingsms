@@ -3155,14 +3155,33 @@ async function handleSimAction(request, env, corsHeaders) {
     const { sim_id, action } = body;
     if (!sim_id || !action) return new Response(JSON.stringify({ error: 'sim_id and action required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
-    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    // Teltik rotate is handled by teltik-worker, not mdn-rotator. Look up vendor first.
+    if (action === 'rotate') {
+      const vendorRes = await supabaseGet(env, `sims?select=iccid,vendor&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`);
+      const vendorRows = await vendorRes.json().catch(() => []);
+      const row = Array.isArray(vendorRows) && vendorRows[0] ? vendorRows[0] : null;
+      if (row && row.vendor === 'teltik') {
+        if (!env.TELTIK_WORKER) return new Response(JSON.stringify({ ok: false, error: 'TELTIK_WORKER not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const tUrl = `https://teltik-worker/rotate-sim?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&iccid=${encodeURIComponent(row.iccid)}&force=${body.force === true ? 'true' : 'false'}`;
+        const tRes = await env.TELTIK_WORKER.fetch(tUrl, { method: 'POST' });
+        const tText = await tRes.text();
+        let tResult; try { tResult = JSON.parse(tText); } catch { tResult = { ok: false, error: `Non-JSON response: ${tText.slice(0, 200)}` }; }
+        if (!tResult.ok && tResult.error) {
+          await logSystemError(env, { source: 'dashboard', action: 'rotate', sim_id, error_message: tResult.error, error_details: { vendor: 'teltik', response: tResult, status: tRes.status } });
+        }
+        return new Response(JSON.stringify({ ok: tResult.ok, action, sim_id, iccid: row.iccid, forced: body.force === true, vendor: 'teltik', detail: tResult }, null, 2), { status: tRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+
+    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
     const workerUrl = `https://mdn-rotator/sim-action?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
     const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sim_id, action, gateway_id: body.gateway_id ?? null, port: body.port ?? null, new_imei: body.new_imei ?? null, auto_imei: body.auto_imei ?? false, imei_strategy: body.imei_strategy ?? null })
+      body: JSON.stringify({ sim_id, action, gateway_id: body.gateway_id ?? null, port: body.port ?? null, new_imei: body.new_imei ?? null, auto_imei: body.auto_imei ?? false, imei_strategy: body.imei_strategy ?? null, force: body.force === true })
     });
 
     const responseText = await workerResponse.text();
@@ -6439,7 +6458,8 @@ function getHTML(helixEnabled) {
                     </div>
                 </div>
             </div>
-            <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-2">
+                <button id="sim-action-cancel" onclick="onBulkCancelClick()" class="hidden px-4 py-2 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed">Cancel remaining</button>
                 <button onclick="hideSimActionModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>
             </div>
         </div>
@@ -9336,6 +9356,13 @@ async function sendSimOnline(simId, phoneNumber) {
                 var strategy = await showImeiStrategyChoice(1);
                 if (strategy === null) return;
                 extraBody = { imei_strategy: strategy };
+            } else if (action === 'rotate') {
+                // Force-rotate warning — per-SIM manual rotate bypasses the daily dedup guard
+                if (!skipConfirm) {
+                    const ok = await showConfirm('Force-rotate SIM?', \`Rotate SIM #\${simId}?\n\n\u26A0\uFE0F This will force-rotate even if already rotated today. Reseller will receive the new MDN via webhook.\`);
+                    if (!ok) return;
+                }
+                extraBody = Object.assign({}, extraBody, { force: true });
             } else if (!skipConfirm && !(await showConfirm('Run Action', \`Run \${action} on SIM #\${simId}?\`))) return;
 
             const sim = tableState.sims?.data?.find(s => String(s.id) === String(simId));
@@ -9625,11 +9652,41 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkSimAction(action) {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            if (!(await showConfirm('Run Action', \`Run \${action} on \${simIds.length} SIM(s)?\`))) return;
-            for (const id of simIds) {
-                await simAction(id, action, true);
+            let confirmMsg;
+            if (action === 'rotate') {
+                confirmMsg = \`Rotate \${simIds.length} SIMs?\n\n\u26A0\uFE0F This will force-rotate every selected SIM \u2014 including any already rotated today. Duplicate rotations risk your AT&T account and require resellers to update the MDN each time.\`;
+            } else {
+                confirmMsg = \`Run \${action} on \${simIds.length} SIM(s)?\`;
             }
+            if (!(await showConfirm('Run Action', confirmMsg))) return;
+            window.__bulkCancel = false;
+            showBulkCancelButton();
+            const extraBody = action === 'rotate' ? { force: true } : {};
+            let done = 0;
+            for (const id of simIds) {
+                if (window.__bulkCancel) {
+                    showToast(\`Cancelled at \${done}/\${simIds.length}\`, 'info');
+                    break;
+                }
+                await simAction(id, action, true, extraBody);
+                done++;
+            }
+            hideBulkCancelButton();
             loadSims(true);
+        }
+
+        function showBulkCancelButton() {
+            const btn = document.getElementById('sim-action-cancel');
+            if (btn) { btn.classList.remove('hidden'); btn.disabled = false; btn.textContent = 'Cancel remaining'; }
+        }
+        function hideBulkCancelButton() {
+            const btn = document.getElementById('sim-action-cancel');
+            if (btn) { btn.classList.add('hidden'); btn.disabled = false; btn.textContent = 'Cancel remaining'; }
+        }
+        function onBulkCancelClick() {
+            window.__bulkCancel = true;
+            const btn = document.getElementById('sim-action-cancel');
+            if (btn) { btn.disabled = true; btn.textContent = 'Cancelling\u2026'; }
         }
 
         async function bulkResetToProvisioning() {

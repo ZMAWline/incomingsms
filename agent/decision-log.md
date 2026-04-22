@@ -4,6 +4,49 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-22 — Wing IoT rotation is two-phase: mdn-rotator flips status, details-finalizer fetches MDN
+
+**Decision:** `rotateWingIotSim` in mdn-rotator does the plan swap (PUT non-dialable → PUT dialable), stamps `last_mdn_rotated_at` + `rotation_status='mdn_pending'`, sets `sims.status='provisioning'`, and returns immediately. It does NOT poll AT&T for the new MDN. A second worker (details-finalizer, every 5 min) picks up `vendor='wing_iot' AND status='provisioning'`, GETs the MDN, closes/opens `sim_numbers`, sets status back to `active`, and fires the `number.online` webhook.
+
+**Why:** AT&T takes ~1 minute to assign a new MDN after the dialable plan swap. Polling inside the rotation queue consumer held the queue open 4+ min per SIM (tried 4×60s). With 55 Wing IoT SIMs and `max_concurrency=1`, that's 3–4 hours to drain the queue. Moving the MDN fetch to a separate worker on its own cadence:
+- Decouples API rate: rotation queue drains fast, MDN sync runs on a 5-min timer
+- Uses `status='provisioning'` as the unified signal (same state as new-activation flow) — rest of the system already filters on `status='active'` so a provisioning SIM is correctly excluded
+- Sidesteps the temptation to parallelize rotations (which caused the 4×-rotation incident earlier that day)
+
+**Consequence:**
+- **Do not put blocking API polls in the rotation queue consumer for any vendor.** ATOMIC is OK (MDN comes back in the swap response synchronously); everything else should follow the provisioning-pattern.
+- The ~1 min gap between plan swap and new MDN is observable: reseller may receive the `number.online` webhook 1–5 min after `last_mdn_rotated_at` is stamped. If immediacy matters, reduce details-finalizer cron interval.
+- `syncWingIotPendingMdns` in mdn-rotator is deleted — do not re-add. Reuse the details-finalizer runner.
+
+---
+
+## 2026-04-22 — Dashboard rotate button always force-rotates (with explicit warning)
+
+**Decision:** The per-SIM and bulk Rotate buttons in the dashboard always pass `force: true` through to the backend, bypassing the `last_mdn_rotated_at < today NY midnight` dedup guard. The confirmation dialog explicitly warns the user: "⚠️ This will force-rotate even if already rotated today." The cron path does NOT use force — only the manual dashboard path does.
+
+**Why:** The prior behavior was inconsistent: Wing IoT clicks silently failed with "already rotated today", ATOMIC clicks silently force-rotated. The user needs to be able to intentionally re-rotate a SIM if something went wrong — that's the whole purpose of a manual button. The risk is accidental double-rotations (today's incident). The mitigation: a visible warning in the confirmation dialog so the click is never unintentional, plus a reseller-facing concern in the warning text.
+
+**Consequence:**
+- **Do not remove the warning text.** It's the only thing between the user and an AT&T-breaking duplicate rotation.
+- The daily dedup guard still applies on the cron path, which is where accidental duplicates are most likely.
+- If you add other "manual rotate" paths (e.g., slack slash command, CLI), they must also pass `force: true` AND show an equivalent warning — the backend will otherwise block them.
+
+---
+
+## 2026-04-22 — Never parallelize rotation within a single CF Worker invocation
+
+**Decision:** The mdn-rotator queue consumer processes messages **serially** within a batch (`for … of`), not in parallel (`Promise.all`). `max_concurrency` stays at 1. This is a hard rule.
+
+**Why:** An earlier attempt to increase throughput combined `max_batch_size=10 + Promise.all + max_concurrency=5`. With duplicate messages from multiple cron ticks (the same SIM queued 4–5 times across ticks), 50 workers were in-flight simultaneously. All of them read `last_mdn_rotated_at IS NULL` *before any of them wrote*, all passed the TOCTOU dedup check, and all called the AT&T API. Result: 93 Wing IoT SIMs received 4 plan swaps each in 15 minutes. AT&T assigned 4 different MDNs to each SIM in rapid succession — exactly the carrier-relationship-damaging scenario we were trying to prevent.
+
+**Consequence:**
+- **Do not** set `max_concurrency > 1` on `mdn-rotation-queue`.
+- **Do not** wrap the batch loop in `Promise.all`.
+- To increase throughput, increase `max_batch_size` (currently 25) — that still processes serially inside one invocation, no TOCTOU.
+- The dedup guard in `rotateSingleSim` cannot prevent this race by design (it's a DB read, not a DB lock). Any future "speed it up" proposal that reintroduces parallelism must use a DB-level lock / RPC / UPDATE-RETURNING to atomically claim the SIM, not a read-then-check pattern.
+
+---
+
 ## 2026-04-21 — Rotation fail count incremented via Supabase RPC, not in JS
 
 **Decision:** `updateSimRotationError` (mdn-rotator) no longer reads `rotation_fail_count`, increments it in JS, and writes it back. Instead it calls an RPC: `increment_rotation_fail(p_sim_id, p_error, p_today_start)` which runs `UPDATE sims SET rotation_fail_count = rotation_fail_count + 1 WHERE id = $1 RETURNING rotation_fail_count` atomically in the DB.
