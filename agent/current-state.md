@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-23 (session 31 — cron resumed, activation-date skip added, details-finalizer backfills activated_at)
+> Last updated: 2026-04-23 (session 32 — SMS Usage analytics tab + Wing 5th-to-4th billing cycle)
 
 ---
 
@@ -79,6 +79,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-23 | **SMS Usage analytics tab added to dashboard.** New sidebar tab between Billing and Guide. Shows MTD inbound SMS per vendor, Wing pool utilization (used/153,750), soft-target marker (25/SIM × N), 30-day trend chart (Chart.js CDN), top/bottom 10 Wing SIMs, est cost under $0.01/SMS overage. Backed by new Supabase RPC `get_sms_usage_summary(p_cycle_start, p_today, p_trend_days)` returning one JSONB blob. Worker route `/api/sms-usage` edge-caches 60s; frontend polls 120s while visible. Wing billing cycle = **5th to 4th of month** (confirmed with user) — soft-coded as `BILLING_CYCLE_ANCHOR_DAY = 5` near `handleSmsUsage` in `src/dashboard/index.js`. Commits `d3b0407` + `ee461f0`. | dashboard, DB |
 | 2026-04-23 | Rotation cron resumed after session 30 redesign. Added activation-date skip: `queueSimsForRotation` filters out SIMs where `activated_at >= today NY midnight`, and `rotateSingleSim`'s dedup guard does the same check on both stale queue data and fresh DB read. Freshly activated SIMs no longer rotate same-day. | mdn-rotator |
 | 2026-04-23 | details-finalizer Wing IoT runner now backfills `activated_at = NOW()` when the column is null on the SIM being finalized. Never overrides an existing value — preserves real activation timestamps. | details-finalizer |
 | 2026-04-22 | **MDN rotation redesign (session 30):** Wing IoT plan swap now sets `status=provisioning` + `rotation_status=mdn_pending` and returns; details-finalizer's new `runWingIotFinalizer` (every 5 min) picks up provisioning Wing IoT SIMs, fetches new MDN, closes/opens sim_numbers, fires webhook. `syncWingIotPendingMdns` removed from mdn-rotator. | mdn-rotator, details-finalizer |

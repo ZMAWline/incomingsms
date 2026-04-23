@@ -4,6 +4,23 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-23 — SMS Usage analytics: Postgres RPC returning a single JSONB blob
+
+**Decision:** The SMS Usage tab is backed by a single Postgres RPC, `get_sms_usage_summary(p_cycle_start, p_today, p_trend_days)`, that returns one JSONB object with all five views: `vendors`, `wing`, `wing_top`, `wing_bottom`, `trend`. Billing-cycle anchor (`BILLING_CYCLE_ANCHOR_DAY = 5`) lives Worker-side; the Worker computes `p_cycle_start` in EST and passes it into the RPC. Worker edge-caches the response 60s in `caches.default`. Frontend polls every 120s while the tab is visible.
+
+**Why:**
+1. The alternatives were (a) query `sim_sms_daily` directly via PostgREST and aggregate client-side, or (b) split into multiple RPCs/endpoints. Option (a) ships ~12–18K rows per page load; option (b) multiplies round-trips. A single RPC returns ~100 rows total, with cycle-boundary math centralized in Postgres where `sim_sms_daily.est_date` is authoritative.
+2. The billing-cycle anchor lives Worker-side (not in Postgres) because it's a configuration value that changes with business agreements, not a data-schema invariant. Shipping it to the RPC as a parameter keeps the RPC reusable if we ever want per-vendor anchors.
+3. 60s edge cache + 120s poll was chosen because `sim_sms_daily` is trigger-fed (millisecond lag from `inbound_sms`), so staleness is bounded by cache TTL, not by ingestion latency. Polling faster than the cache TTL just wastes cache bandwidth.
+
+**Consequence:**
+- When adding new SMS-usage metrics (e.g., per-reseller, per-gateway), extend the RPC rather than creating a parallel endpoint. The RPC's CTE structure (active_sims → mtd → vendor_totals / wing_per_sim) is the template.
+- `BILLING_CYCLE_ANCHOR_DAY` is soft-coded in `src/dashboard/index.js` — change there when the Wing cycle date changes. If other vendors (Teltik, ATOMIC) ever get cycle-aware metrics, add a per-vendor anchor map rather than a single constant.
+- Chart.js is now loaded from CDN in the dashboard `<head>` (jsdelivr, v4.4.0). If additional charts are added elsewhere, reuse the same tag — don't pull a second library.
+- `$` in a string passed as `replacement` to `String.prototype.replace(searchString, replacement)` is a pattern ("$'" = text-after-match, "$&" = match, "$$" = literal `$`). During patch-script work on the dashboard, ALWAYS use function-form replace: `content.replace(OLD, () => NEW)`. This is now documented in `patching-gotchas.md` memory; do not rediscover it.
+
+---
+
 ## 2026-04-23 — Cron rotation skips SIMs activated today
 
 **Decision:** `queueSimsForRotation` (mdn-rotator) and the dedup guard in `rotateSingleSim` both filter out SIMs where `activated_at >= today NY midnight`. A SIM activated today will not be rotated by the cron until tomorrow's midnight NY. Manual rotate via the dashboard still works (it uses `force=true` which bypasses both rotation and activation guards).
