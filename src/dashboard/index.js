@@ -37,6 +37,10 @@ export default {
       return handleStats(env, corsHeaders);
     }
 
+    if (url.pathname === '/api/sms-usage') {
+      return handleSmsUsage(env, corsHeaders, url);
+    }
+
     if (url.pathname === '/api/sims') {
       return handleSims(env, corsHeaders, url);
     }
@@ -365,6 +369,82 @@ async function handleStats(env, corsHeaders) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// Billing cycle + EST date helpers for SMS usage analytics.
+// Soft-coded anchor day — change here when real Wing billing cycle date is confirmed.
+const BILLING_CYCLE_ANCHOR_DAY = 1;
+
+function currentCycleStartEst(now = new Date()) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(now).map(p => [p.type, p.value])
+  );
+  let y = parseInt(parts.year, 10);
+  let m = parseInt(parts.month, 10);
+  const d = parseInt(parts.day, 10);
+  if (d < BILLING_CYCLE_ANCHOR_DAY) {
+    m--;
+    if (m < 1) { m = 12; y--; }
+  }
+  return y + '-' + String(m).padStart(2, '0') + '-' + String(BILLING_CYCLE_ANCHOR_DAY).padStart(2, '0');
+}
+
+function todayEst(now = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
+}
+
+async function handleSmsUsage(env, corsHeaders, url) {
+  try {
+    const noCache = url && url.searchParams && url.searchParams.has('nocache');
+    const cacheKey = new Request('https://cache.local/sms-usage');
+    if (!noCache) {
+      const hit = await caches.default.match(cacheKey);
+      if (hit) return hit;
+    }
+
+    const body = {
+      p_cycle_start: currentCycleStartEst(),
+      p_today: todayEst(),
+      p_trend_days: 30,
+    };
+
+    const r = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/get_sms_usage_summary', {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!r.ok) {
+      const txt = await r.text();
+      return new Response(JSON.stringify({ error: 'rpc_failed', status: r.status, detail: txt }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const data = await r.json();
+    const resp = new Response(JSON.stringify(data), {
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'application/json',
+        'Cache-Control': 'max-age=60',
+      },
+    });
+    if (!noCache) await caches.default.put(cacheKey, resp.clone());
+    return resp;
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 }
@@ -4298,6 +4378,7 @@ function getHTML(helixEnabled) {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" defer></script>
     <script>
 
         window.HELIX_ENABLED = ${helixEnabled};
@@ -4515,6 +4596,10 @@ function getHTML(helixEnabled) {
                 <a href="/billing" onclick="event.preventDefault();switchTab('billing')" data-tab="billing" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Billing">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                     <span class="text-sm">Billing</span>
+                </a>
+                <a href="/sms-usage" onclick="event.preventDefault();switchTab('sms-usage')" data-tab="sms-usage" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="SMS Usage">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 3v18h18M7 15l4-4 4 4 5-5"></path></svg>
+                    <span class="text-sm">SMS Usage</span>
                 </a>
                 <a href="/guide" onclick="event.preventDefault();switchTab('guide')" data-tab="guide" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Guide">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
@@ -5345,6 +5430,128 @@ function getHTML(helixEnabled) {
                                 <tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No verifications yet</td></tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SMS Usage Tab -->
+            <div id="tab-sms-usage" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">SMS Usage Analytics</h2>
+                    <div class="flex items-center gap-3">
+                        <span id="sms-usage-cycle-label" class="text-xs text-gray-500"></span>
+                        <button id="sms-usage-refresh-btn" onclick="loadSmsUsage(true)" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Refresh</button>
+                    </div>
+                </div>
+
+                <!-- Row 1: four stat cards -->
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="text-xs text-gray-500 uppercase mb-1">Wing SIMs active</div>
+                        <div class="text-2xl font-bold text-white" id="sms-usage-wing-count">&mdash;</div>
+                        <div class="text-xs text-gray-400 mt-1" id="sms-usage-wing-pool-label">Pool 0 / 0</div>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="text-xs text-gray-500 uppercase mb-1">Wing avg / SIM (MTD)</div>
+                        <div class="text-2xl font-bold text-white" id="sms-usage-wing-avg">&mdash;</div>
+                        <div class="text-xs text-gray-400 mt-1" id="sms-usage-wing-minmax">min &mdash;, max &mdash;</div>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="text-xs text-gray-500 uppercase mb-1">Wing pool used</div>
+                        <div class="text-2xl font-bold text-white" id="sms-usage-wing-pct">&mdash;</div>
+                        <div class="text-xs text-gray-400 mt-1" id="sms-usage-wing-projection">Projected: &mdash;</div>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="text-xs text-gray-500 uppercase mb-1">Wing est. cost MTD</div>
+                        <div class="text-2xl font-bold text-white" id="sms-usage-wing-cost">&mdash;</div>
+                        <div class="text-xs text-gray-400 mt-1" id="sms-usage-wing-overage">Overage: &mdash;</div>
+                    </div>
+                </div>
+
+                <!-- Row 2: pool utilization bar -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-2">
+                        <h3 class="text-sm font-semibold text-white">Wing Pool Utilization</h3>
+                        <span class="text-xs text-gray-400" id="sms-usage-wing-poolbar-label">0 / 0</span>
+                    </div>
+                    <div class="relative w-full h-4 bg-dark-900 rounded-full overflow-hidden">
+                        <div id="sms-usage-wing-poolbar-fill" class="absolute left-0 top-0 h-full bg-green-500 transition-all" style="width:0%"></div>
+                        <div id="sms-usage-wing-poolbar-soft" class="absolute top-0 h-full w-px bg-yellow-300" style="left:0%"></div>
+                    </div>
+                    <div class="flex items-center justify-between mt-2 text-xs text-gray-500">
+                        <span>Soft target (25/SIM avg): <span id="sms-usage-wing-soft-target">&mdash;</span></span>
+                        <span>Hard pool (750/SIM): <span id="sms-usage-wing-hard-target">&mdash;</span></span>
+                    </div>
+                </div>
+
+                <!-- Row 3: 30-day trend chart -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-sm font-semibold text-white mb-3">Inbound SMS — last 30 days</h3>
+                    <div style="position:relative;height:280px"><canvas id="sms-usage-trend-canvas"></canvas></div>
+                </div>
+
+                <!-- Row 4: vendor totals + cycle info -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <h3 class="text-sm font-semibold text-white mb-3">By vendor (MTD)</h3>
+                        <div class="overflow-x-auto">
+                            <table class="w-full">
+                                <thead><tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-3 py-2 font-medium">Vendor</th>
+                                    <th class="px-3 py-2 font-medium text-right">SIMs</th>
+                                    <th class="px-3 py-2 font-medium text-right">SMS</th>
+                                    <th class="px-3 py-2 font-medium text-right">Avg / SIM</th>
+                                </tr></thead>
+                                <tbody id="sms-usage-vendor-tbody" class="text-sm">
+                                    <tr><td colspan="4" class="px-3 py-3 text-center text-gray-500">Loading…</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <h3 class="text-sm font-semibold text-white mb-3">Cycle info</h3>
+                        <dl class="text-sm space-y-2">
+                            <div class="flex justify-between"><dt class="text-gray-500">Cycle start</dt><dd class="text-white" id="sms-usage-info-start">&mdash;</dd></div>
+                            <div class="flex justify-between"><dt class="text-gray-500">Today (EST)</dt><dd class="text-white" id="sms-usage-info-today">&mdash;</dd></div>
+                            <div class="flex justify-between"><dt class="text-gray-500">Days elapsed</dt><dd class="text-white" id="sms-usage-info-elapsed">&mdash;</dd></div>
+                            <div class="flex justify-between"><dt class="text-gray-500">Days remaining</dt><dd class="text-white" id="sms-usage-info-remaining">&mdash;</dd></div>
+                            <div class="flex justify-between"><dt class="text-gray-500">Projected EOM Wing SMS</dt><dd class="text-white" id="sms-usage-info-projection">&mdash;</dd></div>
+                            <div class="flex justify-between"><dt class="text-gray-500">Projected pool %</dt><dd class="text-white" id="sms-usage-info-proj-pct">&mdash;</dd></div>
+                        </dl>
+                    </div>
+                </div>
+
+                <!-- Row 5: top / bottom Wing leaderboards -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <h3 class="text-sm font-semibold text-white mb-3">Top 10 Wing SIMs this cycle</h3>
+                        <div class="overflow-x-auto">
+                            <table class="w-full">
+                                <thead><tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-3 py-2 font-medium">SIM</th>
+                                    <th class="px-3 py-2 font-medium">ICCID</th>
+                                    <th class="px-3 py-2 font-medium text-right">SMS</th>
+                                </tr></thead>
+                                <tbody id="sms-usage-top-tbody" class="text-sm">
+                                    <tr><td colspan="3" class="px-3 py-3 text-center text-gray-500">Loading…</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <h3 class="text-sm font-semibold text-white mb-3">Bottom 10 Wing SIMs this cycle</h3>
+                        <div class="overflow-x-auto">
+                            <table class="w-full">
+                                <thead><tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-3 py-2 font-medium">SIM</th>
+                                    <th class="px-3 py-2 font-medium">ICCID</th>
+                                    <th class="px-3 py-2 font-medium text-right">SMS</th>
+                                </tr></thead>
+                                <tbody id="sms-usage-bottom-tbody" class="text-sm">
+                                    <tr><td colspan="3" class="px-3 py-3 text-center text-gray-500">Loading…</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -6741,6 +6948,7 @@ function getHTML(helixEnabled) {
             'imei-pool': '/imei-pool',
             'errors': '/errors',
             'billing': '/billing',
+            'sms-usage': '/sms-usage',
             'guide': '/guide',
             'api-tester': '/api-tester',
         };
@@ -6766,12 +6974,13 @@ function getHTML(helixEnabled) {
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', billing: 'Billing', guide: 'Guide', 'api-tester': 'API Tester' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
             if (tabName === 'errors') loadErrors();
             if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadWingHistory(); }
+            if (tabName === 'sms-usage') loadSmsUsage();
         }
 
         // Handle browser back/forward
@@ -11309,6 +11518,189 @@ async function sendSimOnline(simId, phoneNumber) {
                 showToast('Error: ' + e.message, 'error');
             }
         }
+
+        // ── SMS Usage Analytics ─────────────────────────────────────────────
+        let smsUsageChartInstance = null;
+        let smsUsagePollTimer = null;
+
+        async function loadSmsUsage(force) {
+            try {
+                const url = API_BASE + '/sms-usage' + (force ? '?nocache=' + Date.now() : '');
+                const r = await fetch(url);
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const data = await r.json();
+                if (data.error) throw new Error(data.error + (data.detail ? ': ' + data.detail : ''));
+                renderSmsUsageCards(data);
+                renderSmsTrend(data.trend || []);
+                renderWingLeaderboards(data);
+                startSmsUsagePoll();
+            } catch (e) {
+                if (typeof showToast === 'function') showToast('SMS Usage load failed: ' + e.message, 'error');
+                else console.error('SMS Usage load failed:', e);
+            }
+        }
+
+        function startSmsUsagePoll() {
+            if (smsUsagePollTimer) return;
+            smsUsagePollTimer = setInterval(function() {
+                const tabEl = document.getElementById('tab-sms-usage');
+                if (!tabEl || tabEl.classList.contains('hidden')) return;
+                if (document.hidden) return;
+                loadSmsUsage(false);
+            }, 120000);
+        }
+
+        function renderSmsUsageCards(data) {
+            const w = data.wing || {};
+            const v = data.vendors || [];
+            const simCount = w.wing_sim_count || 0;
+            const smsTotal = w.wing_sms_total || 0;
+            const hardPool = simCount * 750;
+            const softTarget = simCount * 25;
+            const pctUsed = hardPool > 0 ? (smsTotal / hardPool) * 100 : 0;
+
+            const cycleStart = data.cycle_start;
+            const today = data.today;
+            const cs = new Date(cycleStart + 'T00:00:00Z');
+            const td = new Date(today + 'T00:00:00Z');
+            const endOfMonth = new Date(Date.UTC(cs.getUTCFullYear(), cs.getUTCMonth() + 1, 0));
+            const daysInCycle = endOfMonth.getUTCDate();
+            const daysElapsed = Math.max(1, Math.round((td - cs) / 86400000) + 1);
+            const daysRemaining = Math.max(0, daysInCycle - daysElapsed);
+            const projectedEom = Math.round(smsTotal / daysElapsed * daysInCycle);
+            const projectedPct = hardPool > 0 ? (projectedEom / hardPool) * 100 : 0;
+            const overageNow = Math.max(0, smsTotal - hardPool);
+            const overageProj = Math.max(0, projectedEom - hardPool);
+            const estCost = (simCount * 6) + overageNow * 0.01;
+            const projCost = (simCount * 6) + overageProj * 0.01;
+
+            const fmt = function(n) { return (n || 0).toLocaleString(); };
+            const setText = function(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; };
+
+            setText('sms-usage-cycle-label', 'Cycle ' + cycleStart + ' \u2192 ' + today);
+            setText('sms-usage-wing-count', fmt(simCount));
+            setText('sms-usage-wing-pool-label', 'Pool ' + fmt(smsTotal) + ' / ' + fmt(hardPool));
+            setText('sms-usage-wing-avg', (w.wing_avg !== undefined && w.wing_avg !== null) ? Number(w.wing_avg).toFixed(2) : '\u2014');
+            setText('sms-usage-wing-minmax', 'min ' + (w.wing_min || 0) + ', max ' + (w.wing_max || 0));
+            setText('sms-usage-wing-pct', pctUsed.toFixed(2) + '%');
+            setText('sms-usage-wing-projection', 'Projected: ' + fmt(projectedEom) + ' (' + projectedPct.toFixed(1) + '%)');
+            setText('sms-usage-wing-cost', '$' + estCost.toFixed(2));
+            setText('sms-usage-wing-overage', 'Projected total: $' + projCost.toFixed(2));
+
+            const fill = document.getElementById('sms-usage-wing-poolbar-fill');
+            if (fill) {
+                fill.style.width = Math.min(100, pctUsed) + '%';
+                fill.classList.remove('bg-green-500', 'bg-yellow-500', 'bg-red-500');
+                if (pctUsed >= 100) fill.classList.add('bg-red-500');
+                else if (pctUsed >= 80) fill.classList.add('bg-yellow-500');
+                else fill.classList.add('bg-green-500');
+            }
+            const softPct = hardPool > 0 ? Math.min(100, (softTarget / hardPool) * 100) : 0;
+            const softEl = document.getElementById('sms-usage-wing-poolbar-soft');
+            if (softEl) softEl.style.left = softPct + '%';
+            setText('sms-usage-wing-poolbar-label', fmt(smsTotal) + ' / ' + fmt(hardPool));
+            setText('sms-usage-wing-soft-target', fmt(softTarget));
+            setText('sms-usage-wing-hard-target', fmt(hardPool));
+
+            setText('sms-usage-info-start', cycleStart);
+            setText('sms-usage-info-today', today);
+            setText('sms-usage-info-elapsed', daysElapsed);
+            setText('sms-usage-info-remaining', daysRemaining);
+            setText('sms-usage-info-projection', fmt(projectedEom));
+            setText('sms-usage-info-proj-pct', projectedPct.toFixed(1) + '%');
+
+            const tbody = document.getElementById('sms-usage-vendor-tbody');
+            if (tbody) {
+                if (!v.length) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-3 text-center text-gray-500">No data</td></tr>';
+                } else {
+                    tbody.innerHTML = v.map(function(row) {
+                        const n = row.active_sim_count || 0;
+                        const avg = n > 0 ? (row.sms_count / n) : 0;
+                        return '<tr class="border-b border-dark-700"><td class="px-3 py-2 text-white">' + row.vendor +
+                            '</td><td class="px-3 py-2 text-right text-gray-300">' + fmt(n) +
+                            '</td><td class="px-3 py-2 text-right text-white">' + fmt(row.sms_count) +
+                            '</td><td class="px-3 py-2 text-right text-gray-300">' + avg.toFixed(2) + '</td></tr>';
+                    }).join('');
+                }
+            }
+        }
+
+        function renderSmsTrend(trend) {
+            const byDate = {};
+            const vendorsSeen = {};
+            trend.forEach(function(r) {
+                if (!byDate[r.d]) byDate[r.d] = {};
+                byDate[r.d][r.v] = r.s;
+                vendorsSeen[r.v] = true;
+            });
+            const labels = Object.keys(byDate).sort();
+            const vendorList = Object.keys(vendorsSeen);
+            const palette = { wing_iot: '#60a5fa', atomic: '#f59e0b', teltik: '#a78bfa', helix: '#34d399' };
+            const datasets = vendorList.map(function(v) {
+                const color = palette[v] || '#9ca3af';
+                return {
+                    label: v,
+                    data: labels.map(function(d) { return byDate[d][v] || 0; }),
+                    borderColor: color,
+                    backgroundColor: color + '33',
+                    tension: 0.25,
+                    fill: false,
+                    pointRadius: 2,
+                };
+            });
+            const canvas = document.getElementById('sms-usage-trend-canvas');
+            if (!canvas) return;
+            if (typeof Chart === 'undefined') {
+                const c = canvas.getContext('2d');
+                c.fillStyle = '#9ca3af';
+                c.font = '14px sans-serif';
+                c.fillText('Chart.js not loaded yet. Reload page.', 10, 24);
+                return;
+            }
+            const ctx = canvas.getContext('2d');
+            if (smsUsageChartInstance) smsUsageChartInstance.destroy();
+            smsUsageChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: { labels: labels, datasets: datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    scales: {
+                        y: { beginAtZero: true, ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                        x: { ticks: { color: '#9ca3af' }, grid: { display: false } },
+                    },
+                    plugins: {
+                        legend: { labels: { color: '#d1d5db' } },
+                        tooltip: { mode: 'index', intersect: false },
+                    },
+                },
+            });
+        }
+
+        function renderWingLeaderboards(data) {
+            const top = data.wing_top || [];
+            const bot = data.wing_bottom || [];
+            const simsCache = (typeof tableState !== 'undefined' && tableState.sims && tableState.sims.data) ? tableState.sims.data : [];
+            const simById = {};
+            simsCache.forEach(function(s) { simById[s.id] = s; });
+
+            const buildRow = function(row) {
+                const s = simById[row.sim_id];
+                const iccid = (s && s.iccid) ? s.iccid : '\u2014';
+                return '<tr class="border-b border-dark-700"><td class="px-3 py-2 text-white">#' + row.sim_id +
+                    '</td><td class="px-3 py-2 text-gray-300 font-mono text-xs">' + iccid +
+                    '</td><td class="px-3 py-2 text-right text-white">' + (row.sms || 0).toLocaleString() + '</td></tr>';
+            };
+
+            const empty = '<tr><td colspan="3" class="px-3 py-3 text-center text-gray-500">No data</td></tr>';
+            const topBody = document.getElementById('sms-usage-top-tbody');
+            const botBody = document.getElementById('sms-usage-bottom-tbody');
+            if (topBody) topBody.innerHTML = top.length ? top.map(buildRow).join('') : empty;
+            if (botBody) botBody.innerHTML = bot.length ? bot.map(buildRow).join('') : empty;
+        }
+        // ── End SMS Usage Analytics ─────────────────────────────────────────
 
         // ── End D3 ───────────────────────────────────────────────────────────
     </script>
