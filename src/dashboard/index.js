@@ -398,6 +398,16 @@ function todayEst(now = new Date()) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
 }
 
+function estDateFromDate(d) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(d);
+}
+
+function nextEstDate(yyyyMmDd) {
+  const t = new Date(yyyyMmDd + 'T12:00:00Z');
+  t.setUTCDate(t.getUTCDate() + 1);
+  return estDateFromDate(t);
+}
+
 async function handleSmsUsage(env, corsHeaders, url) {
   try {
     const noCache = url && url.searchParams && url.searchParams.has('nocache');
@@ -2025,6 +2035,25 @@ async function supabaseGet(env, path) {
   });
 }
 
+async function supabaseGetAllArray(env, pathWithoutLimit) {
+  const pageSize = 1000;
+  const out = [];
+  for (let offset = 0; ; offset += pageSize) {
+    const sep = pathWithoutLimit.includes('?') ? '&' : '?';
+    const url = pathWithoutLimit + sep + 'limit=' + pageSize + '&offset=' + offset;
+    const resp = await supabaseGet(env, url);
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error('PostgREST fetch failed: ' + resp.status + ' ' + txt);
+    }
+    const batch = await resp.json();
+    if (!Array.isArray(batch)) return batch;
+    out.push(...batch);
+    if (batch.length < pageSize) break;
+  }
+  return out;
+}
+
 async function handleFixSim(request, env, corsHeaders) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
@@ -3496,56 +3525,104 @@ async function handleBillingPreview(url, env, corsHeaders) {
 
     // Get SIM-days with SMS for this reseller in the date range
     // Join: reseller_sims → sims → sim_sms_daily
-    const smsResp = await supabaseGet(env,
-      'reseller_sims?select=sim_id,sims(vendor,sim_sms_daily(est_date,sms_count))' +
+    const rsSims = await supabaseGetAllArray(env,
+      'reseller_sims?select=sim_id,sims(vendor,rotation_interval_hours,sim_sms_daily(est_date,sms_count))' +
       '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&active=eq.true'
+      '&active=eq.true' +
+      '&order=sim_id.asc'
     );
-    const rsSims = await smsResp.json();
 
-    // Collect active days by vendor (Helix=daily billing, Teltik=48h block billing)
     const dailyRate = mapping ? parseFloat(mapping.daily_rate) : 0;
     const blockRate = +(dailyRate * 2).toFixed(2);
-    const attDays = {}; // est_date → Set of sim_ids (AT&T: helix + atomic + wing_iot)
-    const teltikDays = {}; // est_date → Set of sim_ids (T-Mobile: teltik)
+
+    // AT&T (helix/atomic/wing): per-calendar-day at dailyRate.
+    // Teltik: one block per MDN rotation; handled after AT&T.
+    const attDays = {};
+    const teltikSimIds = [];
+    const teltikSmsDaysBySim = new Map();
+    const teltikIntervalBySim = new Map();
     if (Array.isArray(rsSims)) {
       for (const rs of rsSims) {
         const daily = rs.sims?.sim_sms_daily;
+        if (rs.sims?.vendor === 'teltik') {
+          teltikSimIds.push(rs.sim_id);
+          teltikIntervalBySim.set(rs.sim_id, rs.sims?.rotation_interval_hours || 48);
+          const days = new Set();
+          if (Array.isArray(daily)) {
+            for (const row of daily) {
+              if (row.est_date && row.sms_count > 0) days.add(row.est_date);
+            }
+          }
+          teltikSmsDaysBySim.set(rs.sim_id, days);
+          continue;
+        }
         if (!Array.isArray(daily)) continue;
-        const target = rs.sims?.vendor === 'teltik' ? teltikDays : attDays;
         for (const row of daily) {
           if (!row.est_date || row.sms_count <= 0) continue;
           if (row.est_date < start || row.est_date > end) continue;
-          if (!target[row.est_date]) target[row.est_date] = new Set();
-          target[row.est_date].add(rs.sim_id);
+          if (!attDays[row.est_date]) attDays[row.est_date] = new Set();
+          attDays[row.est_date].add(rs.sim_id);
         }
       }
     }
 
-    // AT&T (helix/atomic/wing): bill per calendar day at dailyRate
     const attEntries = Object.keys(attDays).sort().map(date => ({
       date, sim_count: attDays[date].size, rate: dailyRate,
       amount: +(attDays[date].size * dailyRate).toFixed(2),
     }));
 
-    // Teltik: bill per 48-hour block at blockRate
+    // Teltik: one block per rotation. Block = [valid_from, min(next rotation,
+    // valid_from + rotation_interval_hours)). Bills into the cycle containing
+    // valid_from's EST date. Billable iff any SMS on any EST date the block touches.
     const teltikBlocks = {};
-    for (let bs = start; bs <= end; ) {
-      const d0 = bs;
-      const tmp = new Date(d0 + 'T00:00:00Z');
-      tmp.setUTCDate(tmp.getUTCDate() + 1);
-      const d1 = tmp.toISOString().slice(0, 10);
-      const simsInBlock = new Set();
-      for (const [date, sims] of Object.entries(teltikDays)) {
-        if (date === d0 || date === d1) { for (const s of sims) simsInBlock.add(s); }
+    if (teltikSimIds.length > 0) {
+      const wideStart = new Date(start + 'T00:00:00Z');
+      wideStart.setUTCDate(wideStart.getUTCDate() - 2);
+      const wideEnd = new Date(end + 'T00:00:00Z');
+      wideEnd.setUTCDate(wideEnd.getUTCDate() + 3);
+      const idList = teltikSimIds.join(',');
+      const rotResp = await supabaseGet(env,
+        'sim_numbers?select=sim_id,valid_from&sim_id=in.(' + idList + ')' +
+        '&valid_from=gte.' + encodeURIComponent(wideStart.toISOString()) +
+        '&valid_from=lt.' + encodeURIComponent(wideEnd.toISOString()) +
+        '&order=sim_id.asc,valid_from.asc' +
+        '&limit=50000'
+      );
+      const rotations = await rotResp.json();
+      if (Array.isArray(rotations)) {
+        const byThen = new Map();
+        for (const r of rotations) {
+          if (!byThen.has(r.sim_id)) byThen.set(r.sim_id, []);
+          byThen.get(r.sim_id).push(new Date(r.valid_from));
+        }
+        for (const [simId, rots] of byThen) {
+          const intervalMs = (teltikIntervalBySim.get(simId) || 48) * 3600 * 1000;
+          for (let i = 0; i < rots.length; i++) {
+            const rotStart = rots[i];
+            const rotNext = rots[i + 1];
+            const blockEnd = new Date(Math.min(
+              rotStart.getTime() + intervalMs,
+              rotNext ? rotNext.getTime() : Number.POSITIVE_INFINITY
+            ));
+            const startEst = estDateFromDate(rotStart);
+            if (startEst < start || startEst > end) continue;
+            const endEstInclusive = estDateFromDate(new Date(blockEnd.getTime() - 1000));
+            const daysSet = teltikSmsDaysBySim.get(simId) || new Set();
+            let hasSms = false;
+            for (let cur = startEst; cur <= endEstInclusive; cur = nextEstDate(cur)) {
+              if (daysSet.has(cur)) { hasSms = true; break; }
+            }
+            if (!hasSms) continue;
+            if (!teltikBlocks[startEst]) teltikBlocks[startEst] = 0;
+            teltikBlocks[startEst] += 1;
+          }
+        }
       }
-      if (simsInBlock.size > 0) teltikBlocks[d0] = simsInBlock;
-      tmp.setUTCDate(tmp.getUTCDate() + 1);
-      bs = tmp.toISOString().slice(0, 10);
     }
+
     const teltikEntries = Object.keys(teltikBlocks).sort().map(date => ({
-      date, sim_count: teltikBlocks[date].size, rate: blockRate,
-      amount: +(teltikBlocks[date].size * blockRate).toFixed(2),
+      date, sim_count: teltikBlocks[date], rate: blockRate,
+      amount: +(teltikBlocks[date] * blockRate).toFixed(2),
     }));
 
     const days = [...attEntries, ...teltikEntries].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
@@ -3652,31 +3729,44 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       return new Response(JSON.stringify({ error: 'No customer rate configured for this reseller' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    const smsResp = await supabaseGet(env,
-      'reseller_sims?select=sim_id,sims(vendor,sim_sms_daily(est_date,sms_count))' +
+    const rsSims = await supabaseGetAllArray(env,
+      'reseller_sims?select=sim_id,sims(vendor,rotation_interval_hours,sim_sms_daily(est_date,sms_count))' +
       '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&active=eq.true'
+      '&active=eq.true' +
+      '&order=sim_id.asc'
     );
-    const rsSims = await smsResp.json();
-
-    const attDaysD = {};
-    const teltikDaysD = {};
-    if (Array.isArray(rsSims)) {
-      for (const rs of rsSims) {
-        const daily = rs.sims?.sim_sms_daily;
-        if (!Array.isArray(daily)) continue;
-        const targetD = rs.sims?.vendor === 'teltik' ? teltikDaysD : attDaysD;
-        for (const row of daily) {
-          if (!row.est_date || row.sms_count <= 0) continue;
-          if (row.est_date < start || row.est_date > end) continue;
-          if (!targetD[row.est_date]) targetD[row.est_date] = new Set();
-          targetD[row.est_date].add(rs.sim_id);
-        }
-      }
-    }
 
     const dailyRate = parseFloat(mapping.daily_rate);
     const blockRateD = +(dailyRate * 2).toFixed(2);
+
+    const attDaysD = {};
+    const teltikSimIdsD = [];
+    const teltikSmsDaysBySimD = new Map();
+    const teltikIntervalBySimD = new Map();
+    if (Array.isArray(rsSims)) {
+      for (const rs of rsSims) {
+        const daily = rs.sims?.sim_sms_daily;
+        if (rs.sims?.vendor === 'teltik') {
+          teltikSimIdsD.push(rs.sim_id);
+          teltikIntervalBySimD.set(rs.sim_id, rs.sims?.rotation_interval_hours || 48);
+          const days = new Set();
+          if (Array.isArray(daily)) {
+            for (const row of daily) {
+              if (row.est_date && row.sms_count > 0) days.add(row.est_date);
+            }
+          }
+          teltikSmsDaysBySimD.set(rs.sim_id, days);
+          continue;
+        }
+        if (!Array.isArray(daily)) continue;
+        for (const row of daily) {
+          if (!row.est_date || row.sms_count <= 0) continue;
+          if (row.est_date < start || row.est_date > end) continue;
+          if (!attDaysD[row.est_date]) attDaysD[row.est_date] = new Set();
+          attDaysD[row.est_date].add(rs.sim_id);
+        }
+      }
+    }
 
     const attEntriesD = Object.keys(attDaysD).sort().map(date => ({
       date, sim_count: attDaysD[date].size, rate: dailyRate,
@@ -3684,22 +3774,54 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
     }));
 
     const teltikBlocksD = {};
-    for (let bs = start; bs <= end; ) {
-      const d0 = bs;
-      const tmp = new Date(d0 + 'T00:00:00Z');
-      tmp.setUTCDate(tmp.getUTCDate() + 1);
-      const d1 = tmp.toISOString().slice(0, 10);
-      const simsInBlock = new Set();
-      for (const [date, sims] of Object.entries(teltikDaysD)) {
-        if (date === d0 || date === d1) { for (const s of sims) simsInBlock.add(s); }
+    if (teltikSimIdsD.length > 0) {
+      const wideStart = new Date(start + 'T00:00:00Z');
+      wideStart.setUTCDate(wideStart.getUTCDate() - 2);
+      const wideEnd = new Date(end + 'T00:00:00Z');
+      wideEnd.setUTCDate(wideEnd.getUTCDate() + 3);
+      const idList = teltikSimIdsD.join(',');
+      const rotResp = await supabaseGet(env,
+        'sim_numbers?select=sim_id,valid_from&sim_id=in.(' + idList + ')' +
+        '&valid_from=gte.' + encodeURIComponent(wideStart.toISOString()) +
+        '&valid_from=lt.' + encodeURIComponent(wideEnd.toISOString()) +
+        '&order=sim_id.asc,valid_from.asc' +
+        '&limit=50000'
+      );
+      const rotations = await rotResp.json();
+      if (Array.isArray(rotations)) {
+        const byThen = new Map();
+        for (const r of rotations) {
+          if (!byThen.has(r.sim_id)) byThen.set(r.sim_id, []);
+          byThen.get(r.sim_id).push(new Date(r.valid_from));
+        }
+        for (const [simId, rots] of byThen) {
+          const intervalMs = (teltikIntervalBySimD.get(simId) || 48) * 3600 * 1000;
+          for (let i = 0; i < rots.length; i++) {
+            const rotStart = rots[i];
+            const rotNext = rots[i + 1];
+            const blockEnd = new Date(Math.min(
+              rotStart.getTime() + intervalMs,
+              rotNext ? rotNext.getTime() : Number.POSITIVE_INFINITY
+            ));
+            const startEst = estDateFromDate(rotStart);
+            if (startEst < start || startEst > end) continue;
+            const endEstInclusive = estDateFromDate(new Date(blockEnd.getTime() - 1000));
+            const daysSet = teltikSmsDaysBySimD.get(simId) || new Set();
+            let hasSms = false;
+            for (let cur = startEst; cur <= endEstInclusive; cur = nextEstDate(cur)) {
+              if (daysSet.has(cur)) { hasSms = true; break; }
+            }
+            if (!hasSms) continue;
+            if (!teltikBlocksD[startEst]) teltikBlocksD[startEst] = 0;
+            teltikBlocksD[startEst] += 1;
+          }
+        }
       }
-      if (simsInBlock.size > 0) teltikBlocksD[d0] = simsInBlock;
-      tmp.setUTCDate(tmp.getUTCDate() + 1);
-      bs = tmp.toISOString().slice(0, 10);
     }
+
     const teltikEntriesD = Object.keys(teltikBlocksD).sort().map(date => ({
-      date, sim_count: teltikBlocksD[date].size, rate: blockRateD,
-      amount: +(teltikBlocksD[date].size * blockRateD).toFixed(2),
+      date, sim_count: teltikBlocksD[date], rate: blockRateD,
+      amount: +(teltikBlocksD[date] * blockRateD).toFixed(2),
     }));
 
     const days = [...attEntriesD, ...teltikEntriesD].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
