@@ -1,13 +1,13 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-22 (session 30 — MDN rotation redesign: async Wing IoT via details-finalizer, force flag + cancel, teltik manual rotate routing)
+> Last updated: 2026-04-23 (session 31 — cron resumed, activation-date skip added, details-finalizer backfills activated_at)
 
 ---
 
 ## Known Issues / Degraded
 
-- **MDN rotation cron is PAUSED on mdn-rotator** — `crons = []` in `src/mdn-rotator/wrangler.toml` line 10 after today's 4×-rotation incident. Redesign is deployed and ready; flip back to `crons = ["0,20,40 * * * *"]` and redeploy when ready to resume. Midnight NY (04:00 UTC) is the intended first run.
+- **MDN rotation cron is LIVE** — `crons = ["0,20,40 * * * *"]` on mdn-rotator. First scheduled run after resume happened on 2026-04-23. Serial processing (max_concurrency=1, max_batch_size=25), no Promise.all. Do not re-enable parallelism — see decision-log.
 - **~93 Wing IoT SIMs got rotated 4× today (2026-04-22)** — race condition from Promise.all + max_concurrency=5 (now reverted). AT&T assigned up to 4 different MDNs per SIM rapid-fire. Watch for AT&T pushback. All affected SIMs have `last_mdn_rotated_at = 2026-04-22 15:xx UTC` (dedup stamped via bulk UPDATE). Resellers may have stale MDNs — next rotation cycle will fix.
 - **API Logs tab shows blank for ATOMIC SIMs** — the dashboard "API Logs" section queries `helix_api_logs`; ATOMIC activations log to `carrier_api_logs`. ATOMIC SIM logs are invisible in the dashboard tab. Fix: update the API Logs query to also check `carrier_api_logs` (or unify into one view).
 - **4 suspended ATOMIC SIMs (IDs 984, 735, 990, 993)** — `attStatus: "Suspended"`, SOC `DSABR2`. swapMSISDN returns "Subscriber Must Be Active"; cron keeps failing. Now with the new 948 handler (2026-04-22), rotation auto-patches status=suspended and queues fix-sim. Fix: POST to `/fix-sim` with `{"sim_ids": [984, 735, 990, 993]}` — `fixAtomicSim` will restore them. Do this before the next rotation cron fires.
@@ -79,6 +79,8 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-23 | Rotation cron resumed after session 30 redesign. Added activation-date skip: `queueSimsForRotation` filters out SIMs where `activated_at >= today NY midnight`, and `rotateSingleSim`'s dedup guard does the same check on both stale queue data and fresh DB read. Freshly activated SIMs no longer rotate same-day. | mdn-rotator |
+| 2026-04-23 | details-finalizer Wing IoT runner now backfills `activated_at = NOW()` when the column is null on the SIM being finalized. Never overrides an existing value — preserves real activation timestamps. | details-finalizer |
 | 2026-04-22 | **MDN rotation redesign (session 30):** Wing IoT plan swap now sets `status=provisioning` + `rotation_status=mdn_pending` and returns; details-finalizer's new `runWingIotFinalizer` (every 5 min) picks up provisioning Wing IoT SIMs, fetches new MDN, closes/opens sim_numbers, fires webhook. `syncWingIotPendingMdns` removed from mdn-rotator. | mdn-rotator, details-finalizer |
 | 2026-04-22 | Dashboard rotate: ⚠️ force-rotate confirmation warning; Cancel button added to sim-action-modal for bulk runs (stops future iterations, in-flight SIM completes). Force param threaded through /api/sim-action → mdn-rotator's rotateSpecificSim (bypasses daily dedup when force=true). Teltik rotate now routes to TELTIK_WORKER service binding instead of mdn-rotator (new /rotate-sim endpoint on teltik-worker, extracted per-SIM rotateOneTeltikSim). | dashboard, mdn-rotator, teltik-worker |
 | 2026-04-22 | mdn-rotator queue `max_batch_size` 10 → 25 (continuous drain between cron ticks). | mdn-rotator |

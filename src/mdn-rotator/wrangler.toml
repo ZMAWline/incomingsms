@@ -7,7 +7,7 @@ workers_dev = true
 [triggers]
 # Rotation: every 20 min all day — runs until all client-assigned SIMs are rotated
 # (queueSimsForRotation skips SIMs already rotated today, so it's a no-op once done)
-crons = []  # PAUSED — parallelism caused duplicate rotations, stopped to investigate
+crons = ["0,20,40 * * * *"]
 
 # KV namespace for token caching
 [[kv_namespaces]]

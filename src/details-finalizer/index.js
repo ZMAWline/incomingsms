@@ -112,7 +112,7 @@ async function runWingIotFinalizer(env, limit) {
   // Both states use status='provisioning' — the unified signal that details-finalizer owns MDN sync.
   const sims = await supabaseSelect(
     env,
-    `sims?select=id,iccid,msisdn,rotation_status,status&vendor=eq.wing_iot&status=eq.provisioning&limit=${limit}`
+    `sims?select=id,iccid,msisdn,rotation_status,status,activated_at&vendor=eq.wing_iot&status=eq.provisioning&limit=${limit}`
   );
   if (!sims || sims.length === 0) return { ok: true, processed: 0, synced: 0 };
 
@@ -163,6 +163,9 @@ async function runWingIotFinalizer(env, limit) {
         status: 'active',
       };
       if (isPostRotation) patch.rotation_status = 'success';
+      // Backfill activated_at when it's null (first time the SIM becomes usable).
+      // Never override an existing date — that's the real activation timestamp.
+      if (!sim.activated_at) patch.activated_at = new Date().toISOString();
       await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
 
       await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare);

@@ -1015,7 +1015,7 @@ async function queueSimsForRotation(env, options = {}) {
   // teltik-worker on its own 48h cadence).
   // Identifier requirement enforced client-side: helix needs mobility_subscription_id,
   // atomic needs msisdn, wing_iot only needs iccid (plan swap).
-  let query = `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,activation_zip,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&status=eq.active&vendor=neq.teltik`;
+  let query = `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,activated_at,activation_zip,reseller_sims!inner(reseller_id)&reseller_sims.active=eq.true&status=eq.active&vendor=neq.teltik`;
 
   if (isManualRun) {
     // Manual run: order by oldest rotation first (nulls first = never rotated)
@@ -1046,11 +1046,18 @@ async function queueSimsForRotation(env, options = {}) {
   }
 
   // For scheduled runs: filter out SIMs already rotated today (NY timezone, DST-aware)
+  // AND SIMs activated today — freshly activated SIMs shouldn't rotate same-day.
   let simsToQueue = sims;
   if (!isManualRun) {
     const todayEstISO = getNYMidnightISO();
-    simsToQueue = sims.filter(s => !s.last_mdn_rotated_at || s.last_mdn_rotated_at < todayEstISO);
-    console.log(`[Scheduled Run] ${sims.length} active SIMs, ${simsToQueue.length} not yet rotated since ${todayEstISO} (midnight NY), ${sims.length - simsToQueue.length} skipped`);
+    const rotatedToday = sims.filter(s => s.last_mdn_rotated_at && s.last_mdn_rotated_at >= todayEstISO).length;
+    const activatedToday = sims.filter(s => s.activated_at && s.activated_at >= todayEstISO).length;
+    simsToQueue = sims.filter(s => {
+      if (s.last_mdn_rotated_at && s.last_mdn_rotated_at >= todayEstISO) return false;
+      if (s.activated_at && s.activated_at >= todayEstISO) return false;
+      return true;
+    });
+    console.log(`[Scheduled Run] ${sims.length} active SIMs, ${simsToQueue.length} eligible (NY midnight: ${todayEstISO}); skipped ${rotatedToday} already rotated today, ${activatedToday} activated today`);
   }
 
   if (simsToQueue.length === 0) {
@@ -1457,17 +1464,25 @@ async function rotateSingleSim(env, token, sim) {
   const iccid = sim.iccid;
   const vendor = sim.vendor || 'helix';
 
-  // Dedup check: skip if already rotated today (catches duplicate queue messages from multi-cron).
+  // Dedup check: skip if already rotated today OR activated today.
   // Hoisted above the vendor dispatch so it applies to every vendor uniformly.
   const todayMidnightEst = getNYMidnightISO();
   if (sim.last_mdn_rotated_at && sim.last_mdn_rotated_at >= todayMidnightEst) {
     console.log(`SIM ${iccid} (${vendor}): already rotated today (${sim.last_mdn_rotated_at}), skipping duplicate queue message`);
     return;
   }
-  // Re-check current DB value (queue message may be stale from an earlier cron run)
-  const freshSim = await supabaseSelectOne(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}&select=last_mdn_rotated_at`);
+  if (sim.activated_at && sim.activated_at >= todayMidnightEst) {
+    console.log(`SIM ${iccid} (${vendor}): activated today (${sim.activated_at}), skipping — new SIMs don't rotate same-day`);
+    return;
+  }
+  // Re-check current DB values (queue message may be stale from an earlier cron run)
+  const freshSim = await supabaseSelectOne(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}&select=last_mdn_rotated_at,activated_at`);
   if (freshSim && freshSim.last_mdn_rotated_at && freshSim.last_mdn_rotated_at >= todayMidnightEst) {
     console.log(`SIM ${iccid} (${vendor}): DB confirms already rotated today (${freshSim.last_mdn_rotated_at}), skipping`);
+    return;
+  }
+  if (freshSim && freshSim.activated_at && freshSim.activated_at >= todayMidnightEst) {
+    console.log(`SIM ${iccid} (${vendor}): DB confirms activated today (${freshSim.activated_at}), skipping`);
     return;
   }
 

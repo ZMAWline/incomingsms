@@ -4,6 +4,23 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-23 — Cron rotation skips SIMs activated today
+
+**Decision:** `queueSimsForRotation` (mdn-rotator) and the dedup guard in `rotateSingleSim` both filter out SIMs where `activated_at >= today NY midnight`. A SIM activated today will not be rotated by the cron until tomorrow's midnight NY. Manual rotate via the dashboard still works (it uses `force=true` which bypasses both rotation and activation guards).
+
+**Why:**
+1. Freshly activated SIMs often take 1–5 minutes for the MDN to fully propagate at the carrier. Rotating on the same day risks a race where the rotation plan-swap hits the carrier before activation is fully settled — which is how several "MDN change failed" errors have shown up historically.
+2. Resellers who just received a new MDN via activation webhook shouldn't have it changed again the same day — they haven't had time to dispatch it to an end user yet.
+3. The cron path is the right place for this guard: scheduled runs are meant to be non-destructive; only the manual Rotate button (which shows a force-rotate warning) should override.
+
+**Consequence:**
+- `activated_at` is now a load-bearing column for rotation eligibility. Any worker that activates SIMs **must** stamp `activated_at` at activation time — otherwise the SIM will be eligible for rotation on day-zero.
+- details-finalizer backfills `activated_at = NOW()` when null (see 2026-04-23 details-finalizer change), so Wing IoT activations are covered. ATOMIC bulk-activator already stamps it directly.
+- The skip comparison is `activated_at >= today NY midnight` (DST-aware), same shape as the rotation guard.
+- Do not add "override activation-date skip" to the cron path — if you need to rotate a same-day-activated SIM, use the dashboard Rotate button with the force warning.
+
+---
+
 ## 2026-04-22 — Wing IoT rotation is two-phase: mdn-rotator flips status, details-finalizer fetches MDN
 
 **Decision:** `rotateWingIotSim` in mdn-rotator does the plan swap (PUT non-dialable → PUT dialable), stamps `last_mdn_rotated_at` + `rotation_status='mdn_pending'`, sets `sims.status='provisioning'`, and returns immediately. It does NOT poll AT&T for the new MDN. A second worker (details-finalizer, every 5 min) picks up `vendor='wing_iot' AND status='provisioning'`, GETs the MDN, closes/opens `sim_numbers`, sets status back to `active`, and fires the `number.online` webhook.
