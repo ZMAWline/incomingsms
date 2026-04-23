@@ -375,7 +375,7 @@ async function handleStats(env, corsHeaders) {
 
 // Billing cycle + EST date helpers for SMS usage analytics.
 // Soft-coded anchor day — change here when real Wing billing cycle date is confirmed.
-const BILLING_CYCLE_ANCHOR_DAY = 1;
+const BILLING_CYCLE_ANCHOR_DAY = 5;
 
 function currentCycleStartEst(now = new Date()) {
   const parts = Object.fromEntries(
