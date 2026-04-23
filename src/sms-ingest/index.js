@@ -80,7 +80,12 @@ export default {
         const receivedAt =
           ts > 0 ? new Date(ts * 1000).toISOString() : new Date().toISOString();
 
-        const simId = await findSimIdByCurrentNumber(env, to);
+        // Prefer identity (gateway+port) over rotating MDN — MDNs change daily,
+        // so a current-number lookup can misattribute during rotation windows.
+        let simId = (gatewayIdFromPath && port)
+          ? await findSimIdByGatewayPort(env, gatewayIdFromPath, port)
+          : null;
+        if (!simId) simId = await findSimIdByCurrentNumber(env, to);
 
         // Update the SIM's port for Skyline SMS sending
         if (simId && port) {
@@ -245,6 +250,20 @@ export default {
   },
 
 };
+
+// ====================
+// Relay
+// ====================
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
+}
 
 // ====================
 // Helpers
@@ -541,7 +560,7 @@ async function recordWebhookDelivery(env, delivery) {
   });
 }
 
-async function postWebhookWithRetry(url, payload, options = {}) {
+async function postWebhookWithRetry(env, url, payload, options = {}) {
   const { maxRetries = 4, initialDelayMs = 1000, messageId = 'unknown' } = options;
 
   let lastError = null;
@@ -551,7 +570,7 @@ async function postWebhookWithRetry(url, payload, options = {}) {
     try {
       console.log(`[Webhook] Attempt ${attempt}/${maxRetries + 1} for ${messageId} to ${url}`);
 
-      const res = await fetch(url, {
+      const res = await relayFetch(env, url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -615,7 +634,7 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
     return { ok: true, status: 200, attempts: 0, skipped: true };
   }
 
-  const result = await postWebhookWithRetry(webhookUrl, payload, { messageId });
+  const result = await postWebhookWithRetry(env, webhookUrl, payload, { messageId });
 
   try {
     await recordWebhookDelivery(env, {
