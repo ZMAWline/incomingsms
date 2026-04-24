@@ -16,6 +16,12 @@ invocation_logs = true
 binding = "SKYLINE_GATEWAY"
 service = "skyline-gateway"
 
+# mdn-rotator holds ATOMIC credentials; details-finalizer reaches it via this binding
+# for subsriberInquiry reconciliation of ATOMIC SIMs stuck in provisioning.
+[[services]]
+binding = "MDN_ROTATOR"
+service = "mdn-rotator"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "details-finalizer-test"
@@ -27,6 +33,10 @@ crons = []
 [[env.test.services]]
 binding = "SKYLINE_GATEWAY"
 service = "skyline-gateway-test"
+
+[[env.test.services]]
+binding = "MDN_ROTATOR"
+service = "mdn-rotator-test"
 
 [env.test.observability.logs]
 enabled = true

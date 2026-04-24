@@ -1,13 +1,17 @@
 // =========================================================
 // DETAILS FINALIZER WORKER
 // Cron: every 5 minutes.
-// Runs two finalizers per tick:
+// Runs four finalizers per tick:
 //   1) Helix finalizer — for provisioning Helix SIMs (gated on HELIX_ENABLED)
 //   2) Wing IoT finalizer — for provisioning Wing IoT SIMs (activation + post-rotation)
-// ATOMIC SIMs don't need finalization — MDN is returned in the swap response.
+//   3) Teltik finalizer — for provisioning Teltik SIMs (post-rotation MDN sync)
+//   4) ATOMIC finalizer — for ATOMIC SIMs stuck after 5xx/network error during swapMSISDN
+//      (calls mdn-rotator's /atomic-inquiry via service binding since it holds ATOMIC creds)
 // =========================================================
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
+
+const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
 export default {
   async fetch(request, env, ctx) {
@@ -23,12 +27,16 @@ export default {
     const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 1, 1) : 1000;
     const helix = await runHelixFinalizer(env, limit);
     const wing = await runWingIotFinalizer(env, limit);
-    return json({ ok: true, helix, wing });
+    const teltik = await runTeltikFinalizer(env, limit);
+    const atomic = await runAtomicFinalizer(env, limit);
+    return json({ ok: true, helix, wing, teltik, atomic });
   },
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runHelixFinalizer(env, 25));
     ctx.waitUntil(runWingIotFinalizer(env, 50));
+    ctx.waitUntil(runTeltikFinalizer(env, 50));
+    ctx.waitUntil(runAtomicFinalizer(env, 50));
   },
 };
 
@@ -153,6 +161,15 @@ async function runWingIotFinalizer(env, limit) {
         continue;
       }
 
+      // Guardrail: refuse to mark success while AT&T still has the SIM on the non-dialable (ABIR)
+      // plan. Happens when rotation's second PUT returned 200 but AT&T didn't actually switch back.
+      // Skip; mdn-rotator's verify_dialable poll should have thrown, but keep this as defense-in-depth.
+      const plan = data.communicationPlan || null;
+      if (isPostRotation && plan && plan !== 'Wing Tel Inc - NON ABIR SMS MO/MT US') {
+        results.push({ iccid: sim.iccid, ok: true, pending: true, note: `plan=${plan} (not dialable yet)` });
+        continue;
+      }
+
       const e164 = normalizeUS(mdnRaw);
 
       await closeCurrentNumber(env, sim.id);
@@ -181,6 +198,265 @@ async function runWingIotFinalizer(env, limit) {
   }
 
   return { ok: true, processed, synced, errors, results };
+}
+
+/* ── Teltik finalizer ─────────────────────────────────────────────────────── */
+
+async function runTeltikFinalizer(env, limit) {
+  if (!env.TELTIK_API_KEY) {
+    return { processed: 0, synced: 0, message: 'teltik_api_key_missing' };
+  }
+
+  // Post-rotation: rotateOneTeltikSim flipped status=provisioning + rotation_status=mdn_pending.
+  // sim.msisdn still holds the OLD MDN — we call get-phone-number; when the returned MDN
+  // differs, the change-number actually took effect and we finalize.
+  const sims = await supabaseSelect(
+    env,
+    `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,rotation_interval_hours&vendor=eq.teltik&status=eq.provisioning&rotation_status=eq.mdn_pending&limit=${limit}`
+  );
+  if (!sims || sims.length === 0) return { ok: true, processed: 0, synced: 0 };
+
+  const apiKey = env.TELTIK_API_KEY;
+  const STUCK_MINUTES = 30;
+
+  let processed = 0;
+  let synced = 0;
+  let errors = 0;
+  let failed = 0;
+  const results = [];
+
+  for (const sim of sims) {
+    processed++;
+    const url = `${TELTIK_BASE}/v1/get-phone-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`;
+    const runId = `finalize_${sim.iccid}_${Date.now()}`;
+
+    try {
+      const res = await relayFetch(env, url, { method: 'GET' });
+      const bodyText = await res.text();
+      let data = {};
+      try { data = JSON.parse(bodyText); } catch {}
+      await logTeltikApiCall(env, {
+        run_id: runId, step: 'post_rotate_get', iccid: sim.iccid,
+        request_url: url.replace(/apikey=[^&]+/, 'apikey=***'),
+        request_method: 'GET', request_body: null,
+        response_status: res.status, response_ok: res.ok,
+        response_body_text: bodyText, response_body_json: data,
+        error: res.ok ? null : `GET ${res.status}`,
+      });
+      if (!res.ok) {
+        errors++;
+        results.push({ iccid: sim.iccid, ok: false, error: `GET ${res.status}` });
+        continue;
+      }
+      const raw = data.msisdn || data.mdn || data.phone_number || data.number || null;
+      const msisdnBare = raw ? String(raw).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
+
+      // Timeout guard: if Teltik hasn't changed the MDN in STUCK_MINUTES, mark failed so
+      // dashboard/ops can see it. last_mdn_rotated_at was stamped by claim_rotation_slot.
+      const startedAt = sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).getTime() : 0;
+      const ageMin = startedAt ? (Date.now() - startedAt) / 60000 : 0;
+
+      if (!msisdnBare || msisdnBare === sim.msisdn) {
+        if (ageMin >= STUCK_MINUTES) {
+          failed++;
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+            rotation_status: 'failed',
+            status: 'active',
+            last_rotation_error: `MDN did not change within ${STUCK_MINUTES}m (Teltik returned ${msisdnBare || 'null'})`,
+          });
+          results.push({ iccid: sim.iccid, ok: false, note: 'timeout' });
+        } else {
+          results.push({ iccid: sim.iccid, ok: true, pending: true, note: 'MDN unchanged — still pending' });
+        }
+        continue;
+      }
+
+      // Finalize
+      const e164 = `+1${msisdnBare}`;
+      await closeCurrentNumber(env, sim.id);
+      await insertNewNumber(env, sim.id, e164);
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        msisdn: msisdnBare,
+        status: 'active',
+        rotation_status: 'success',
+        last_rotation_error: null,
+      });
+
+      await sendTeltikNumberOnlineWebhook(env, sim, e164, msisdnBare);
+
+      synced++;
+      results.push({ iccid: sim.iccid, ok: true, mdn: e164, kind: 'post-rotation' });
+      console.log(`[Finalizer/Teltik] SIM ${sim.iccid}: wrote ${e164} (post-rotation)`);
+    } catch (e) {
+      errors++;
+      results.push({ iccid: sim.iccid, ok: false, error: String(e) });
+      console.error(`[Finalizer/Teltik] SIM ${sim.iccid}: ${e}`);
+    }
+  }
+
+  return { ok: true, processed, synced, errors, failed, results };
+}
+
+async function sendTeltikNumberOnlineWebhook(env, sim, e164, msisdnBare) {
+  const resellerId = await findResellerIdBySimId(env, sim.id);
+  if (!resellerId) return;
+  const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
+  if (!webhookUrl) return;
+
+  const intervalHours = sim.rotation_interval_hours || 48;
+  const onlineUntil = midnightNYAfterInterval(sim.last_mdn_rotated_at, intervalHours);
+
+  const result = await sendWebhookWithDeduplication(env, webhookUrl, {
+    event_type: 'number.online',
+    created_at: new Date().toISOString(),
+    data: {
+      sim_id: sim.id,
+      number: e164,
+      online: true,
+      online_until: onlineUntil,
+      carrier: 'T-Mobile',
+      iccid: sim.iccid,
+      mobilitySubscriptionId: null,
+      verified: true,
+    },
+  }, { idComponents: { simId: sim.id, iccid: sim.iccid, number: e164 }, resellerId });
+
+  if (result.ok) {
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      last_notified_at: new Date().toISOString(),
+    }).catch(() => {});
+  }
+}
+
+async function logTeltikApiCall(env, logData) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+  const payload = {
+    run_id: logData.run_id,
+    step: logData.step,
+    iccid: logData.iccid || null,
+    imei: null,
+    vendor: 'teltik',
+    request_url: logData.request_url,
+    request_method: logData.request_method,
+    request_body: logData.request_body || null,
+    response_status: logData.response_status,
+    response_ok: logData.response_ok,
+    response_body_text: (logData.response_body_text || '').slice(0, 5000),
+    response_body_json: logData.response_body_json || null,
+    error: logData.error || null,
+    created_at: new Date().toISOString(),
+  };
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.warn(`[Teltik API log] insert failed: ${e}`);
+  }
+}
+
+function midnightNYAfterInterval(lastRotatedAt, intervalHours) {
+  const baseDt = new Date(lastRotatedAt || Date.now());
+  const nyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(baseDt);
+  const [y, m, d] = nyDate.split('-').map(Number);
+  const intervalDays = Math.ceil((intervalHours || 48) / 24);
+  const probe = new Date(Date.UTC(y, m - 1, d + intervalDays, 5, 0, 0));
+  const probeNyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(probe);
+  const tzPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', timeZoneName: 'shortOffset'
+  }).formatToParts(probe).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-4';
+  const offsetHours = -parseInt(tzPart.replace('GMT', '') || '-4');
+  return new Date(`${probeNyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
+}
+
+/* ── ATOMIC finalizer ─────────────────────────────────────────────────────── */
+
+async function runAtomicFinalizer(env, limit) {
+  if (!env.MDN_ROTATOR) {
+    return { processed: 0, synced: 0, message: 'mdn_rotator_binding_missing' };
+  }
+  if (!env.ADMIN_RUN_SECRET) {
+    return { processed: 0, synced: 0, message: 'admin_run_secret_missing' };
+  }
+
+  // Only reconcile post-rotation stuck ATOMIC SIMs; normal activation flow doesn't use
+  // provisioning for ATOMIC. mdn_pending is the signal that swapMSISDN returned 5xx or
+  // threw a network error and we don't know the final state.
+  const sims = await supabaseSelect(
+    env,
+    `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at&vendor=eq.atomic&status=eq.provisioning&rotation_status=eq.mdn_pending&limit=${limit}`
+  );
+  if (!sims || sims.length === 0) return { ok: true, processed: 0, synced: 0 };
+
+  const STUCK_MINUTES = 30;
+
+  let processed = 0;
+  let synced = 0;
+  let errors = 0;
+  let failed = 0;
+  const results = [];
+
+  for (const sim of sims) {
+    processed++;
+    try {
+      const inqUrl = `https://mdn-rotator/atomic-inquiry?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&iccid=${encodeURIComponent(sim.iccid)}`;
+      const res = await env.MDN_ROTATOR.fetch(inqUrl, { method: 'GET' });
+      if (!res.ok) {
+        errors++;
+        results.push({ iccid: sim.iccid, ok: false, error: `inquiry ${res.status}` });
+        continue;
+      }
+      const data = await res.json().catch(() => ({}));
+      const newMsisdn = data.msisdn ? String(data.msisdn).replace(/^\+?1?/, '') : null;
+
+      const startedAt = sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).getTime() : 0;
+      const ageMin = startedAt ? (Date.now() - startedAt) / 60000 : 0;
+
+      if (!data.ok || !newMsisdn || newMsisdn === sim.msisdn) {
+        if (ageMin >= STUCK_MINUTES) {
+          failed++;
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+            rotation_status: 'failed',
+            status: 'active',
+            last_rotation_error: `ATOMIC inquiry: MDN unchanged within ${STUCK_MINUTES}m (got ${newMsisdn || 'null'})`,
+          });
+          results.push({ iccid: sim.iccid, ok: false, note: 'timeout' });
+        } else {
+          results.push({ iccid: sim.iccid, ok: true, pending: true, note: 'MDN unchanged — still pending' });
+        }
+        continue;
+      }
+
+      const e164 = `+1${newMsisdn}`;
+      await closeCurrentNumber(env, sim.id);
+      await insertNewNumber(env, sim.id, e164);
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        msisdn: newMsisdn,
+        status: 'active',
+        rotation_status: 'success',
+        last_rotation_error: null,
+      });
+
+      await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, newMsisdn);
+
+      synced++;
+      results.push({ iccid: sim.iccid, ok: true, mdn: e164, kind: 'post-rotation-recovery' });
+      console.log(`[Finalizer/ATOMIC] SIM ${sim.iccid}: reconciled ${sim.msisdn} → ${newMsisdn}`);
+    } catch (e) {
+      errors++;
+      results.push({ iccid: sim.iccid, ok: false, error: String(e) });
+      console.error(`[Finalizer/ATOMIC] SIM ${sim.iccid}: ${e}`);
+    }
+  }
+
+  return { ok: true, processed, synced, errors, failed, results };
 }
 
 /* ── Relay ────────────────────────────────────────────────────────────────── */

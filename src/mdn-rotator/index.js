@@ -129,6 +129,111 @@ export default {
       }
     }
 
+    // Invoked by details-finalizer via service binding to reconcile ATOMIC SIMs that
+    // ended up in provisioning after an uncertain swapMSISDN (HTTP 5xx / network error).
+    if (url.pathname === "/atomic-inquiry" && request.method === "GET") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const iccid = url.searchParams.get("iccid") || "";
+      if (!iccid) {
+        return new Response(JSON.stringify({ error: "iccid required" }), {
+          status: 400, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+        return new Response(JSON.stringify({ error: "ATOMIC credentials not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      try {
+        const atomicUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+        const inqBody = {
+          wholeSaleApi: {
+            session: {
+              userName: env.ATOMIC_USERNAME,
+              token: env.ATOMIC_TOKEN,
+              pin: env.ATOMIC_PIN,
+            },
+            wholeSaleRequest: { requestType: 'subsriberInquiry', MSISDN: '', sim: iccid },
+          },
+        };
+        const runId = `finalize_atomic_${iccid}_${Date.now()}`;
+        const inqRes = await relayFetch(env, atomicUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(inqBody),
+        });
+        const inqText = await inqRes.text();
+        let inqJson = {};
+        try { inqJson = JSON.parse(inqText); } catch {}
+        const inqR = inqJson?.wholeSaleApi?.wholeSaleResponse;
+        await logCarrierApiCall(env, {
+          run_id: runId, step: 'finalize_inquiry', iccid, imei: null, vendor: 'atomic',
+          request_url: atomicUrl, request_method: 'POST', request_body: inqBody,
+          response_status: inqRes.status, response_ok: inqRes.ok,
+          response_body_text: inqText, response_body_json: inqJson,
+          error: (inqRes.ok && inqR?.statusCode === '00') ? null :
+            `ATOMIC inquiry failed: ${inqR?.description || inqRes.status}`,
+        });
+        // subsriberInquiry returns the MDN at Result.msisdn (lowercase), not MSISDN.
+        // swapMSISDN's response uses Result.newMSISDN — different shape, same API.
+        const msisdn = inqR?.Result?.msisdn || inqR?.Result?.MSISDN || null;
+        const attStatus = inqR?.Result?.attStatus || null;
+        return new Response(JSON.stringify({
+          ok: inqRes.ok && inqR?.statusCode === '00',
+          http_status: inqRes.status,
+          statusCode: inqR?.statusCode || null,
+          description: inqR?.description || null,
+          msisdn,
+          attStatus,
+        }, null, 2), {
+          status: 200, headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: String(err) }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
+    if (url.pathname === "/remediate-stuck-wing" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      try {
+        const body = await request.json().catch(() => ({}));
+        const iccids = Array.isArray(body.iccids) ? body.iccids : [];
+        if (iccids.length === 0) {
+          return new Response(JSON.stringify({ error: "iccids array is required" }), {
+            status: 400, headers: { "Content-Type": "application/json" }
+          });
+        }
+        if (iccids.length > 30) {
+          return new Response(JSON.stringify({ error: "max 30 iccids per batch" }), {
+            status: 400, headers: { "Content-Type": "application/json" }
+          });
+        }
+        const results = [];
+        for (const iccid of iccids) {
+          try {
+            results.push(await remediateStuckWingSim(env, String(iccid)));
+          } catch (err) {
+            results.push({ iccid, ok: false, error: String(err) });
+          }
+        }
+        return new Response(JSON.stringify({ ok: true, results }, null, 2), {
+          status: 200, headers: { "Content-Type": "application/json" }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String(err) }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+
     if (url.pathname === "/sync-wing-iot-mdns") {
       // Moved to details-finalizer — trigger it there instead.
       return new Response(JSON.stringify({
@@ -1376,6 +1481,37 @@ async function rotateWingIotSim(env, sim, opts = {}) {
   if (!getRes.ok) throw new Error('Wing IoT GET device failed: ' + getRes.status);
   const oldMdn = getJson.mdn || getJson.msisdn || null;
 
+  // Per Wing API doc: after each PUT, GET to confirm the plan and MDN actually changed.
+  // AT&T's PUT returns 200 with just {"iccid":...} — it does NOT confirm the plan switched.
+  // Without verification, AT&T can silently leave the SIM on the wrong plan while still
+  // assigning a new MDN (observed 2026-04-24: 81 SIMs stuck on ABIR with 500/5338 MDNs).
+  async function verifyPlan(expectedPlan, prevMdn, stepLabel) {
+    const maxAttempts = 12; // ~30s total at 2500ms per attempt
+    let lastJson = {};
+    let lastMdn = prevMdn;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await sleep(2500);
+      const vRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
+      lastJson = await vRes.json().catch(() => ({}));
+      const plan = lastJson.communicationPlan || null;
+      const mdn = lastJson.mdn || lastJson.msisdn || null;
+      const planMatches = plan === expectedPlan;
+      const mdnChanged = !!mdn && mdn !== prevMdn;
+      if (attempt === maxAttempts || (planMatches && mdnChanged)) {
+        await logCarrierApiCall(env, {
+          run_id: runId, step: stepLabel, iccid, imei: null, vendor: 'wing_iot',
+          request_url: url, request_method: 'GET', request_body: null,
+          response_status: vRes.status, response_ok: vRes.ok,
+          response_body_text: JSON.stringify(lastJson), response_body_json: lastJson,
+          error: (planMatches && mdnChanged) ? null : `plan=${plan} mdn=${mdn} expected=${expectedPlan} prev=${prevMdn} attempt=${attempt}`,
+        });
+        if (planMatches && mdnChanged) return mdn;
+      }
+      lastMdn = mdn;
+    }
+    throw new Error(`Wing IoT ${stepLabel} verification failed after ${maxAttempts} GETs: plan=${lastJson.communicationPlan} mdn=${lastMdn}`);
+  }
+
   // 2) Switch to non-dialable plan
   const nonDialableBody = { communicationPlan: 'Wing Tel Inc - ABIR 25Mbps SMS MO/MT US' };
   const ndRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(nonDialableBody) });
@@ -1391,8 +1527,10 @@ async function rotateWingIotSim(env, sim, opts = {}) {
   });
   if (!ndRes.ok) throw new Error('Wing IoT non-dialable switch failed: ' + ndRes.status + ': ' + ndText.slice(0, 300));
 
-  // 3) Switch back to dialable plan (AT&T assigns new MDN here)
-  await sleep(2000);
+  // Poll GET until plan === ABIR AND MDN changed from oldMdn
+  const midMdn = await verifyPlan('Wing Tel Inc - ABIR 25Mbps SMS MO/MT US', oldMdn, 'verify_non_dialable');
+
+  // 3) Switch back to dialable plan (AT&T assigns new dialable MDN here)
   const dialableBody = { communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US' };
   const dRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(dialableBody) });
   const dText = await dRes.text();
@@ -1407,10 +1545,11 @@ async function rotateWingIotSim(env, sim, opts = {}) {
   });
   if (!dRes.ok) throw new Error('Wing IoT dialable switch failed: ' + dRes.status + ': ' + dText.slice(0, 300));
 
-  // 4) Plan swap complete. claim_rotation_slot already stamped the dedup guard
-  // (last_mdn_rotated_at + rotation_status='rotating'); we now flip into the
-  // provisioning state so details-finalizer (every 5 min) takes over: GET new
-  // MDN from AT&T, close/open sim_numbers, set status=active, fire webhook.
+  // Poll GET until plan === NON ABIR (dialable) AND MDN changed from midMdn
+  await verifyPlan('Wing Tel Inc - NON ABIR SMS MO/MT US', midMdn, 'verify_dialable');
+
+  // 4) Plan swap fully verified. Flip into provisioning so details-finalizer picks up
+  // the new dialable MDN, updates sim_numbers, and fires the number.online webhook.
   await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
     rotation_status: 'mdn_pending',
     status: 'provisioning',
@@ -1419,6 +1558,101 @@ async function rotateWingIotSim(env, sim, opts = {}) {
   });
 
   console.log(`SIM ${iccid}: Wing IoT plan swap complete (old MDN: ${oldMdn || 'unknown'}) — status=provisioning, details-finalizer will pick up new MDN`);
+}
+
+// ===========================
+// Remediate a wing_iot SIM that is stuck on ABIR (non-dialable) after a failed rotation.
+// Only runs the second half of the doc's flow: PUT dialable + GET verify.
+// Does NOT claim_rotation_slot (SIM already consumed today's slot when it got stuck).
+// Does NOT update msisdn/sim_numbers/webhook here — flips status=provisioning so
+// details-finalizer picks up the new dialable MDN on its next cron tick.
+// ===========================
+async function remediateStuckWingSim(env, iccid) {
+  if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
+    throw new Error('Wing IoT credentials not configured');
+  }
+  const sims = await supabaseSelect(env, `sims?select=id,iccid,msisdn,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+  const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
+  if (!sim) return { iccid, ok: false, error: 'SIM not found in DB' };
+  if (sim.vendor !== 'wing_iot') return { iccid, ok: false, error: `vendor=${sim.vendor} (not wing_iot)` };
+
+  const runId = `remediate_${iccid}_${Date.now()}`;
+  const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
+  const url = baseUrl + '/v1/devices/' + encodeURIComponent(iccid);
+  const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
+  const getHeaders = { Authorization: auth, Accept: 'application/json' };
+  const putHeaders = { Authorization: auth, Accept: 'application/json', 'Content-Type': 'application/json' };
+
+  // 1) GET current state — confirm actually stuck on ABIR before acting
+  const getRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
+  const getJson = await getRes.json().catch(() => ({}));
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'remediate_pre_get', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'GET', request_body: null,
+    response_status: getRes.status, response_ok: getRes.ok,
+    response_body_text: JSON.stringify(getJson), response_body_json: getJson,
+    error: getRes.ok ? null : 'GET failed: ' + getRes.status,
+  });
+  if (!getRes.ok) throw new Error('Wing IoT GET failed: ' + getRes.status);
+  const currentPlan = getJson.communicationPlan || null;
+  const currentMdn = getJson.mdn || getJson.msisdn || null;
+  if (currentPlan === 'Wing Tel Inc - NON ABIR SMS MO/MT US') {
+    return { iccid, ok: true, skipped: true, reason: 'already dialable', plan: currentPlan, mdn: currentMdn };
+  }
+  if (currentPlan !== 'Wing Tel Inc - ABIR 25Mbps SMS MO/MT US') {
+    return { iccid, ok: false, error: `unexpected plan: ${currentPlan}` };
+  }
+
+  // 2) PUT dialable
+  const dialableBody = { communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US' };
+  const dRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(dialableBody) });
+  const dText = await dRes.text();
+  let dJson = {};
+  try { dJson = JSON.parse(dText); } catch {}
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'remediate_put_dialable', iccid, imei: null, vendor: 'wing_iot',
+    request_url: url, request_method: 'PUT', request_body: dialableBody,
+    response_status: dRes.status, response_ok: dRes.ok,
+    response_body_text: dText, response_body_json: dJson,
+    error: dRes.ok ? null : 'PUT dialable failed: ' + dRes.status,
+  });
+  if (!dRes.ok) throw new Error('PUT dialable failed: ' + dRes.status + ': ' + dText.slice(0, 300));
+
+  // 3) Poll GET until plan=NON ABIR (dialable) AND MDN changed from current non-dialable MDN
+  const maxAttempts = 12;
+  let verifiedMdn = null;
+  let lastJson = {};
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await sleep(2500);
+    const vRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
+    lastJson = await vRes.json().catch(() => ({}));
+    const plan = lastJson.communicationPlan || null;
+    const mdn = lastJson.mdn || lastJson.msisdn || null;
+    const planOk = plan === 'Wing Tel Inc - NON ABIR SMS MO/MT US';
+    const mdnChanged = !!mdn && mdn !== currentMdn;
+    if (attempt === maxAttempts || (planOk && mdnChanged)) {
+      await logCarrierApiCall(env, {
+        run_id: runId, step: 'remediate_verify_dialable', iccid, imei: null, vendor: 'wing_iot',
+        request_url: url, request_method: 'GET', request_body: null,
+        response_status: vRes.status, response_ok: vRes.ok,
+        response_body_text: JSON.stringify(lastJson), response_body_json: lastJson,
+        error: (planOk && mdnChanged) ? null : `plan=${plan} mdn=${mdn} prev=${currentMdn} attempt=${attempt}`,
+      });
+      if (planOk && mdnChanged) { verifiedMdn = mdn; break; }
+    }
+  }
+  if (!verifiedMdn) {
+    throw new Error(`verification failed: plan=${lastJson.communicationPlan} mdn=${lastJson.mdn || lastJson.msisdn}`);
+  }
+
+  // 4) Flip to provisioning so details-finalizer updates msisdn + sim_numbers + webhook
+  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    rotation_status: 'mdn_pending',
+    status: 'provisioning',
+    last_rotation_error: null,
+  });
+
+  return { iccid, ok: true, old_mdn: currentMdn, new_mdn: verifiedMdn };
 }
 
 // ===========================
@@ -1498,23 +1732,44 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       wholeSaleRequest: { requestType: 'swapMSISDN', MSISDN: currentMsisdn, zipCode },
     },
   };
-  const swapRes = await relayFetch(env, url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(swapBody),
-  });
-  const swapText = await swapRes.text();
-  let swapJson = {};
-  try { swapJson = JSON.parse(swapText); } catch {}
+  let swapRes, swapText, swapJson = {}, swapNetworkError = null;
+  try {
+    swapRes = await relayFetch(env, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(swapBody),
+    });
+    swapText = await swapRes.text();
+    try { swapJson = JSON.parse(swapText); } catch {}
+  } catch (err) {
+    swapNetworkError = err;
+    swapText = String(err);
+  }
   const swapR = swapJson?.wholeSaleApi?.wholeSaleResponse;
   await logCarrierApiCall(env, {
     run_id: runId, step: 'mdn_change', iccid, imei: null, vendor: 'atomic',
     request_url: url, request_method: 'POST', request_body: swapBody,
-    response_status: swapRes.status, response_ok: swapRes.ok,
-    response_body_text: swapText, response_body_json: swapJson,
-    error: (swapRes.ok && swapR?.statusCode === '00') ? null :
-      `ATOMIC swapMSISDN failed: ${swapR?.description || swapRes.status}`,
+    response_status: swapRes?.status ?? 0, response_ok: swapRes?.ok ?? false,
+    response_body_text: swapText || '', response_body_json: swapJson,
+    error: swapNetworkError ? `ATOMIC swapMSISDN network error: ${swapNetworkError}`
+      : (swapRes.ok && swapR?.statusCode === '00') ? null
+      : `ATOMIC swapMSISDN failed: ${swapR?.description || swapRes.status}`,
   });
+  // Network error or 5xx from ATOMIC/relay: the swap may have succeeded at ATOMIC's
+  // side even though we didn't get a response. DO NOT fail the rotation — flip to
+  // provisioning so runAtomicFinalizer reconciles via subsriberInquiry on its next
+  // 5-min tick. Observed 2026-04-24: HTTP 504 caused 3-strikes failure while ATOMIC
+  // had actually assigned the new MDN, leaving DB stuck with stale msisdn.
+  if (swapNetworkError || (swapRes && swapRes.status >= 500)) {
+    console.log(`SIM ${iccid}: ATOMIC swap uncertain (${swapNetworkError ? 'network' : swapRes.status}) — flipping to provisioning for finalizer reconciliation`);
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      rotation_status: 'mdn_pending',
+      status: 'provisioning',
+      last_rotation_error: swapNetworkError ? `swap uncertain: ${String(swapNetworkError).slice(0, 300)}` : `swap uncertain: HTTP ${swapRes.status}`,
+      rotation_fail_count: 0,
+    });
+    return;
+  }
   if (!swapRes.ok) throw new Error(`ATOMIC swapMSISDN HTTP ${swapRes.status}: ${swapText.slice(0, 300)}`);
   if (swapR?.statusCode !== '00') {
     const desc = swapR?.description || 'Unknown';
@@ -1561,7 +1816,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       error: (inqRes.ok && inqR?.statusCode === '00') ? null :
         `ATOMIC inquiry failed: ${inqR?.description || inqRes.status}`,
     });
-    newMsisdn = inqR?.Result?.MSISDN || null;
+    newMsisdn = inqR?.Result?.msisdn || inqR?.Result?.MSISDN || null;
   }
 
   if (!newMsisdn) throw new Error(`ATOMIC: no new MSISDN returned after swapMSISDN`);
@@ -2248,7 +2503,7 @@ async function fixAtomicSim(env, sim) {
     }
 
     const attStatus = inqR?.Result?.attStatus;
-    const msisdnRaw = inqR?.Result?.MSISDN || sim.msisdn || null;
+    const msisdnRaw = inqR?.Result?.msisdn || inqR?.Result?.MSISDN || sim.msisdn || null;
     console.log(`[FixAtomicSim] SIM ${iccid}: attStatus=${attStatus} msisdn=${msisdnRaw}`);
 
     // Sync MSISDN to DB if inquiry returned one
@@ -2260,41 +2515,69 @@ async function fixAtomicSim(env, sim) {
       }
     }
 
-    // Step 3: Restore if suspended
-    if (attStatus === 'Suspended') {
-      const mdn10 = String(msisdnRaw).replace(/^\+?1?/, '').replace(/\D/g, '').slice(0, 10);
-      if (!mdn10) throw new Error(`SIM ${iccid}: no MSISDN available for restoreSubscriber`);
-      console.log(`[FixAtomicSim] SIM ${iccid}: subscriber suspended — calling restoreSubscriber (mdn=${mdn10})`);
+    // Step 3: Reactivate based on ATOMIC's current state.
+    //   - Suspended → restoreSubscriber (reasonCode CR)
+    //   - Cancelled / Deactivated → reconnectSubscriber (blank reasonCode)
+    // restoreSubscriber rejects Cancelled SIMs, so branching on attStatus is required.
+    // Fall back to DB msisdn if inquiry returned none (e.g., partially deactivated state).
+    // If ATOMIC replies "subscriberNumber has changed to X", retry once with X.
+    const needsReactivate = attStatus === 'Suspended' || attStatus === 'Cancelled' || attStatus === 'Deactivated';
+    if (needsReactivate) {
+      const mdnSource = msisdnRaw || sim.msisdn;
+      const mdn10Initial = mdnSource ? String(mdnSource).replace(/^\+?1?/, '').replace(/\D/g, '').slice(0, 10) : '';
+      if (!mdn10Initial) throw new Error(`SIM ${iccid}: no MSISDN available for reactivation (attStatus=${attStatus})`);
 
-      const restoreBody = {
-        wholeSaleApi: {
-          session,
-          wholeSaleRequest: { requestType: 'restoreSubscriber', MSISDN: mdn10, reasonCode: 'CR' },
-        },
-      };
-      const restoreRes = await relayFetch(env, url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(restoreBody),
-      });
-      const restoreText = await restoreRes.text();
-      let restoreJson = {};
-      try { restoreJson = JSON.parse(restoreText); } catch {}
-      const restoreR = restoreJson?.wholeSaleApi?.wholeSaleResponse;
-      await logCarrierApiCall(env, {
-        run_id: runId, step: 'restore_subscriber', iccid, imei: newImei, vendor: 'atomic',
-        request_url: url, request_method: 'POST', request_body: restoreBody,
-        response_status: restoreRes.status, response_ok: restoreRes.ok,
-        response_body_text: restoreText, response_body_json: restoreJson,
-        error: (restoreRes.ok && restoreR?.statusCode === '00') ? null : `ATOMIC restore failed: ${restoreR?.description || restoreRes.status}`,
-      });
-      if (!restoreRes.ok || restoreR?.statusCode !== '00') {
-        throw new Error(`ATOMIC restore failed: ${restoreR?.description || restoreRes.status}`);
+      const isCancelled = attStatus === 'Cancelled' || attStatus === 'Deactivated';
+      const requestType = isCancelled ? 'reconnectSubscriber' : 'restoreSubscriber';
+      const reasonCode = isCancelled ? '' : 'CR';
+      const stepLabel = isCancelled ? 'reconnect_subscriber' : 'restore_subscriber';
+
+      async function callReactivate(mdn10, retryLabel) {
+        console.log(`[FixAtomicSim] SIM ${iccid}: calling ${requestType}${retryLabel || ''} (mdn=${mdn10})`);
+        const reactivateBody = {
+          wholeSaleApi: { session, wholeSaleRequest: { requestType, MSISDN: mdn10, reasonCode } },
+        };
+        const res = await relayFetch(env, url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reactivateBody),
+        });
+        const text = await res.text();
+        let json = {};
+        try { json = JSON.parse(text); } catch {}
+        const r = json?.wholeSaleApi?.wholeSaleResponse;
+        await logCarrierApiCall(env, {
+          run_id: runId, step: stepLabel + (retryLabel ? '_retry' : ''), iccid, imei: newImei, vendor: 'atomic',
+          request_url: url, request_method: 'POST', request_body: reactivateBody,
+          response_status: res.status, response_ok: res.ok,
+          response_body_text: text, response_body_json: json,
+          error: (res.ok && r?.statusCode === '00') ? null
+            : `ATOMIC ${requestType} failed: ${r?.description || res.status}`,
+        });
+        return { ok: res.ok && r?.statusCode === '00', desc: r?.description || '', httpStatus: res.status };
       }
-      console.log(`[FixAtomicSim] SIM ${iccid}: subscriber restored successfully`);
+
+      let result = await callReactivate(mdn10Initial, '');
+
+      // ATOMIC may reject with "subscriberNumber has changed to <NEW>" — parse and retry once.
+      // The error text we've seen: "subscriberNumber has changed, ... The Subscriber has changed to 7043031130."
+      if (!result.ok) {
+        const match = result.desc.match(/(?:Subscriber has changed to|changed to)\s*\+?1?(\d{10})/i);
+        if (match) {
+          const newMdn = match[1];
+          console.log(`[FixAtomicSim] SIM ${iccid}: ATOMIC reports current MSISDN=${newMdn} — syncing DB and retrying`);
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { msisdn: newMdn }).catch(() => {});
+          result = await callReactivate(newMdn, ' (after-msisdn-sync)');
+        }
+      }
+
+      if (!result.ok) {
+        throw new Error(`ATOMIC ${requestType} failed: ${result.desc || result.httpStatus}`);
+      }
+      console.log(`[FixAtomicSim] SIM ${iccid}: subscriber ${requestType === 'reconnectSubscriber' ? 'reconnected' : 'restored'} successfully`);
       await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { status: 'active' }).catch(() => {});
     } else {
-      console.log(`[FixAtomicSim] SIM ${iccid}: attStatus=${attStatus} — no restore needed`);
+      console.log(`[FixAtomicSim] SIM ${iccid}: attStatus=${attStatus} — no reactivation needed`);
     }
 
   } catch (err) {

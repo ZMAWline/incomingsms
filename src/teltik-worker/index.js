@@ -500,146 +500,44 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
     }
     if (force) console.log(`[Rotate] SIM ${sim.iccid}: force=true — claimed with interval bypass`);
 
-    // 2. Initiate number change
-      const changeRes = await relayFetch(
-        env,
-        `${TELTIK_BASE}/v1/change-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
-      );
-      if (!changeRes.ok) {
-        const errText = await changeRes.text();
-        throw new Error(`change-number failed ${changeRes.status}: ${errText}`);
-      }
-      const changeData = await changeRes.json();
-      console.log(`[Rotate] SIM ${sim.iccid}: change-number response: ${JSON.stringify(changeData)}`);
-      const requestId = changeData.requestId || changeData.request_id;
-      if (!requestId) {
-        throw new Error(`No requestId in change-number response: ${JSON.stringify(changeData)}`);
-      }
+    // 2. Initiate number change (async on Teltik's side). Do NOT poll here — the blocking
+    //    poll inside the rotate path caused races where Teltik assigned a new MDN but our
+    //    6-attempt / 62s window expired, leaving DB stamped as failed while Teltik had
+    //    already rotated. Instead flip to provisioning and let details-finalizer (every
+    //    5 min) pick up the new MDN via get-phone-number and fire the number.online webhook.
+    const runId = `rotate_${sim.iccid}_${Date.now()}`;
+    const changeUrl = `${TELTIK_BASE}/v1/change-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`;
+    const changeRes = await relayFetch(env, changeUrl);
+    const changeText = await changeRes.text();
+    let changeData = {};
+    try { changeData = JSON.parse(changeText); } catch {}
+    await logCarrierApiCall(env, {
+      run_id: runId, step: 'change_number_initiate', iccid: sim.iccid, imei: null,
+      request_url: changeUrl.replace(/apikey=[^&]+/, 'apikey=***'),
+      request_method: 'GET', request_body: null,
+      response_status: changeRes.status, response_ok: changeRes.ok,
+      response_body_text: changeText, response_body_json: changeData,
+      error: changeRes.ok ? null : `change-number failed ${changeRes.status}`,
+    });
+    if (!changeRes.ok) {
+      throw new Error(`change-number failed ${changeRes.status}: ${changeText}`);
+    }
+    console.log(`[Rotate] SIM ${sim.iccid}: change-number response: ${changeText}`);
+    const requestId = changeData.requestId || changeData.request_id || null;
 
-      // 3. Poll for completion — max 6 attempts with exponential backoff
-      const delays = [2000, 4000, 8000, 16000, 16000, 16000];
-      let newMdn = null;
+    // 3. Flip to provisioning. claim_rotation_slot already stamped last_mdn_rotated_at +
+    //    rotation_status='rotating'; we move to 'mdn_pending' so details-finalizer owns it.
+    //    sim.msisdn stays as the old number — finalizer uses that to detect when the new
+    //    one arrives from Teltik (msisdn !== current from get-phone-number).
+    await supabasePatch(env, `sims?id=eq.${sim.id}`, {
+      rotation_status: 'mdn_pending',
+      status: 'provisioning',
+      last_rotation_error: null,
+      rotation_fail_count: 0,
+    });
 
-      for (let attempt = 0; attempt < delays.length; attempt++) {
-        await sleep(delays[attempt]);
-        let pollRes;
-        try {
-          pollRes = await relayFetch(
-            env,
-            `${TELTIK_BASE}/v1/change-number/${encodeURIComponent(requestId)}?apikey=${apiKey}`
-          );
-        } catch (err) {
-          console.log(`[Rotate] SIM ${sim.iccid}: poll attempt ${attempt + 1} network error: ${err}`);
-          continue;
-        }
-        if (!pollRes.ok) {
-          console.log(`[Rotate] SIM ${sim.iccid}: poll attempt ${attempt + 1} status ${pollRes.status}`);
-          continue;
-        }
-        const pollData = await pollRes.json();
-        console.log(`[Rotate] SIM ${sim.iccid}: poll attempt ${attempt + 1}: ${JSON.stringify(pollData)}`);
-        const status = (pollData.status || '').toLowerCase();
-
-        if (status === 'completed' || status === 'success' || status === 'msg_received') {
-          newMdn = normalizeToE164(
-            pollData.new_number || pollData.mdn || pollData.msisdn || pollData.phone_number || pollData.number || ''
-          );
-          if (newMdn) break;
-        }
-        if (status === 'failed' || status === 'error' || status === 'timeout') {
-          throw new Error(`Rotation failed: ${JSON.stringify(pollData)}`);
-        }
-        console.log(`[Rotate] SIM ${sim.iccid}: attempt ${attempt + 1} pending, status=${pollData.status || 'unknown'}`);
-      }
-
-      // 3b. Fallback: polling exhausted without MDN — retry get-phone-number up to 3x with
-      //     increasing delay. New MDN may still be propagating on Teltik's side.
-      if (!newMdn) {
-        console.log(`[Rotate] SIM ${sim.iccid}: polling exhausted without MDN, retrying get-phone-number`);
-        for (let attempt = 0; attempt < 3; attempt++) {
-          if (attempt > 0) await sleep(15000);
-          const phoneRes = await relayFetch(
-            env,
-            `${TELTIK_BASE}/v1/get-phone-number/?apikey=${apiKey}&iccid=${encodeURIComponent(sim.iccid)}`
-          );
-          if (phoneRes.ok) {
-            const phoneData = await phoneRes.json();
-            console.log(`[Rotate] SIM ${sim.iccid}: get-phone-number attempt ${attempt + 1}: ${JSON.stringify(phoneData)}`);
-            const raw = phoneData.msisdn || phoneData.mdn || phoneData.phone_number || phoneData.number || '';
-            if (raw) { newMdn = normalizeToE164(raw); break; }
-          }
-        }
-      }
-
-      if (!newMdn) {
-        throw new Error(`Could not determine new MDN for ICCID ${sim.iccid} after polling + fallback`);
-      }
-
-      // 4. Close old sim_numbers row and insert new
-      const closeRes = await supabasePatch(
-        env,
-        `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`,
-        { valid_to: new Date().toISOString() }
-      );
-      if (!closeRes.ok) {
-        throw new Error(`sim_numbers close failed: ${closeRes.status} ${await closeRes.text().catch(() => '')}`);
-      }
-      const insertRes = await supabaseInsert(env, 'sim_numbers', [{
-        sim_id: sim.id,
-        e164: newMdn,
-        valid_from: new Date().toISOString(),
-        verified_at: new Date().toISOString(),
-        verification_status: 'verified',
-      }]);
-      if (!insertRes.ok) {
-        throw new Error(`sim_numbers insert failed: ${insertRes.status} ${await insertRes.text().catch(() => '')}`);
-      }
-
-      // 5. Mark rotation successful. last_mdn_rotated_at was already stamped
-      //    atomically by claim_rotation_slot at the start; no need to stamp again.
-      const rotatedAt = new Date().toISOString();
-      await supabasePatch(env, `sims?id=eq.${sim.id}`, { rotation_status: 'success' });
-
-      // 6. Send number.online webhook to reseller
-      const resellerId = sim.reseller_sims?.[0]?.reseller_id;
-      if (resellerId) {
-        const webhookRows = await supabaseGetArray(
-          env,
-          `reseller_webhooks?reseller_id=eq.${resellerId}&enabled=eq.true&select=url&limit=1`
-        );
-        const webhookUrl = webhookRows[0]?.url;
-        if (webhookUrl) {
-          const result = await sendWebhookWithDeduplication(env, webhookUrl, {
-            event_type: 'number.online',
-            created_at: new Date().toISOString(),
-            data: {
-              sim_id: sim.id,
-              number: newMdn,
-              online: true,
-              online_until: midnightNYAfterInterval(rotatedAt, 48),
-              carrier: 'T-Mobile',
-              iccid: sim.iccid,
-              mobilitySubscriptionId: null,
-              verified: true,
-            },
-          }, {
-            idComponents: {
-              simId: sim.id,
-              iccid: sim.iccid,
-              number: newMdn,
-            },
-            resellerId,
-            force: true, // always send on actual rotation
-          });
-
-          if (result.ok && !result.skipped) {
-            await supabasePatch(env, `sims?id=eq.${sim.id}`, { last_notified_at: new Date().toISOString() });
-          }
-        }
-      }
-
-    console.log(`[Rotate] SIM ${sim.iccid}: rotated → ${newMdn}`);
-    return { ok: true, iccid: sim.iccid, sim_id: sim.id, new_mdn: newMdn };
+    console.log(`[Rotate] SIM ${sim.iccid}: change-number issued (requestId=${requestId}) — status=provisioning, details-finalizer will pick up new MDN`);
+    return { ok: true, iccid: sim.iccid, sim_id: sim.id, pending: true, requestId };
 
   } catch (err) {
     console.error(`[Rotate] SIM ${sim.iccid}: error: ${err}`);
@@ -789,6 +687,40 @@ async function supabasePatch(env, path, data) {
     },
     body: JSON.stringify(data),
   });
+}
+
+async function logCarrierApiCall(env, logData) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+  const payload = {
+    run_id: logData.run_id,
+    step: logData.step,
+    iccid: logData.iccid || null,
+    imei: logData.imei || null,
+    vendor: 'teltik',
+    request_url: logData.request_url,
+    request_method: logData.request_method,
+    request_body: logData.request_body || null,
+    response_status: logData.response_status,
+    response_ok: logData.response_ok,
+    response_body_text: (logData.response_body_text || '').slice(0, 5000),
+    response_body_json: logData.response_body_json || null,
+    error: logData.error || null,
+    created_at: new Date().toISOString(),
+  };
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.warn(`[Teltik API log] insert failed: ${e}`);
+  }
 }
 
 // Calls a Supabase RPC and returns the parsed body (for scalar returns this is

@@ -4,6 +4,28 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-24 evening — Provisioning + details-finalizer is the universal "async rotation" pattern
+
+**Decision:** Every vendor whose carrier API is asynchronous or can return before the state mutation commits now uses the same pipeline:
+
+1. Rotation worker issues the carrier call (Wing IoT PUT non-dialable+dialable with GET-verify, Teltik `change-number` fire-and-forget, ATOMIC `swapMSISDN` with 5xx/network-error branch).
+2. On uncertain outcome, flip the SIM to `status=provisioning, rotation_status=mdn_pending` and return. DO NOT retry the carrier call inline.
+3. `details-finalizer` cron (`*/5 * * * *`) runs per-vendor sub-finalizers: Wing IoT, Teltik, ATOMIC. Each calls the vendor's read API, compares current MDN with stored `sim.msisdn`. If changed, close/open `sim_numbers`, flip to `active/success`, fire `number.online`. If unchanged after 30 min, mark `rotation_status=failed` with explicit reason.
+
+**Why:**
+1. We had three separate incidents of the same shape in two days: rotation worker called the carrier, carrier returned `200/202/504`, the *effect* happened (or didn't) at the carrier, but our worker couldn't tell. Hard-failing in that window → DB stale, rotation_status=failed, operator manually reconciles via bulk query. Self-healing via `/atomic-query` or `/wing-check` was masking the scope until we compared logs.
+2. The provisioning flow explicitly separates *initiating* state change from *observing* it. The rotation worker no longer has to guess whether the carrier committed — it just marks "we started something; finalizer, figure out where it landed." This makes every carrier API call idempotent-ish from the DB's perspective.
+3. Finalizer is already the right home for this: it already runs every 5 min, already owns the `number.online` webhook for Helix and Wing, and already handles `status=provisioning` as its input filter. Extending it to Teltik + ATOMIC is additive.
+4. For ATOMIC specifically, we deliberately avoided duplicating secrets to details-finalizer. Instead added a `MDN_ROTATOR` service binding and a `/atomic-inquiry?secret=X&iccid=Y` endpoint on mdn-rotator. Keeps ATOMIC auth centralized; service binding is inherently trusted worker-to-worker. Same pattern should be used for any future read-side integration that needs an API key already held by another worker.
+
+**Consequence:**
+- **Do not re-add blocking polling inside rotation workers.** The only blocking verification is Wing IoT's `verify_non_dialable` / `verify_dialable` plan-check polling — because without it, a partial plan swap silently leaves the SIM non-dialable even after a long wait. That's vendor-specific; don't generalize it to Teltik/ATOMIC where the reconciliation state is single-valued (MDN changed or didn't).
+- Finalizer failure mode: 30-min timeout → `rotation_status=failed` + `last_rotation_error`. Dashboard needs to surface these. Right now they're visible in the SIMs table but not specifically filterable.
+- When adding a 5th vendor: implement the provisioning flip in the rotation path, add a `runXFinalizer` in details-finalizer, and (if auth required) use a service binding back to the worker that already holds the credentials. Do not push the same credential to multiple workers unless there's a concrete reason.
+- `carrier_api_logs` should capture every rotation + finalization step. As of this session, Teltik rotation + finalization logs to `vendor=teltik, step IN (change_number_initiate, post_rotate_get)`. ATOMIC finalizer logs `step=finalize_inquiry`. Wing IoT rotation already logs `pre_rotate_get`, `mdn_change_non_dialable`, `mdn_change_dialable`, `verify_non_dialable`, `verify_dialable`. Any new carrier integration should follow this naming.
+
+---
+
 ## 2026-04-24 — DB-driven polling replaces Cloudflare Queues on the rotation hot path
 
 **Decision:** `mdn-rotator` no longer uses Cloudflare Queues for scheduled rotations. Each 5-min cron tick (UTC `*/5 4-11 * * *`, narrowed by an NY-hour gate to NY 0–5) calls `processRotationBatch(env, {limit: 60, concurrency: 3})` inline via `ctx.waitUntil`. Eligibility is a DB query filtered by `status='active' AND rotation_eligible=true AND vendor IN (helix,atomic,wing_iot) AND reseller active AND claim-slot predicate`. Each SIM's atomic claim still goes through the `claim_rotation_slot` RPC. Teltik already ran this way and is unchanged.
