@@ -5,9 +5,12 @@ account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
 [triggers]
-# Rotation: every 20 min all day — runs until all client-assigned SIMs are rotated
-# (queueSimsForRotation skips SIMs already rotated today, so it's a no-op once done)
-crons = ["0,20,40 * * * *"]
+# Rotation window: 12:00 AM – 6:00 AM America/New_York (DST-aware).
+# UTC 4-11 covers both EDT (NY 0-7) and EST (NY 23-6); the in-code
+# isInsideRotationWindowNY() gate in scheduled() narrows to NY 0-5.
+# Every 5 min so processRotationBatch has ~12 ticks per night to drain
+# the fleet (60 SIMs/tick × 12 = 720 SIM budget, well above active count).
+crons = ["*/5 4-11 * * *"]
 
 # KV namespace for token caching
 [[kv_namespaces]]
@@ -21,7 +24,11 @@ binding = "MDN_QUEUE"
 
 [[queues.consumers]]
 queue = "mdn-rotation-queue"
-max_batch_size = 25
+# 10 msgs × ~12s per ATOMIC rotation = ~2 min wall clock per invocation —
+# stays well under CF Workers' 5-min paid CPU + 15-min queue-consumer wall clock,
+# so a batch cannot be truncated mid-flight (which would drop messages because
+# max_retries=0). Trade-off: lower throughput; 70 SIMs = ~14 min total serial.
+max_batch_size = 10
 max_retries = 0
 max_concurrency = 1
 

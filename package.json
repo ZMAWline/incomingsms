@@ -4,7 +4,9 @@
   "description": "A collection of Cloudflare Workers for handling incoming SMS messages with SIM card management and routing capabilities.",
   "main": "fix_both.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "check:db-constraints": "node scripts/check_db_constraints.mjs",
+    "predeploy": "npm run check:db-constraints"
   },
   "repository": {
     "type": "git",

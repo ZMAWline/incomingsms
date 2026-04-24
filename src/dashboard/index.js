@@ -169,6 +169,10 @@ export default {
       return handleUnassignReseller(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/set-rotation-eligible' && request.method === 'POST') {
+      return handleSetRotationEligible(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/assign-reseller' && request.method === 'POST') {
       return handleAssignReseller(request, env, corsHeaders);
     }
@@ -183,6 +187,10 @@ export default {
 
     if (url.pathname === '/api/sim-action' && request.method === 'POST') {
       return handleSimAction(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/sim-webhooks') {
+      return handleSimWebhooks(env, corsHeaders, url);
     }
 
     if (url.pathname === '/api/imei-sweep' && request.method === 'POST') {
@@ -467,7 +475,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,vendor,carrier,rotation_interval_hours,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=5000`;
+    let query = `sims?select=id,iccid,port,status,vendor,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=5000`;
 
     // Apply status filter
     if (statusFilter) {
@@ -539,6 +547,7 @@ async function handleSims(env, corsHeaders, url) {
         vendor: sim.vendor || 'unknown',
         carrier: sim.carrier || null,
         rotation_interval_hours: sim.rotation_interval_hours || 24,
+        rotation_eligible: sim.rotation_eligible !== false,
       };
     });
 
@@ -3022,6 +3031,46 @@ async function handleAssignReseller(request, env, corsHeaders) {
 }
 
 // Unassign SIMs from reseller
+async function handleSetRotationEligible(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const simIds = Array.isArray(body.sim_ids) ? body.sim_ids.map(Number).filter(Boolean) : [];
+    const eligible = body.eligible === true;
+    if (simIds.length === 0) {
+      return new Response(JSON.stringify({ error: 'sim_ids array required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    // Single PATCH against sims?id=in.(...) — atomic, one round-trip.
+    const url = `${env.SUPABASE_URL}/rest/v1/sims?id=in.(${simIds.join(',')})`;
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify({ rotation_eligible: eligible }),
+    });
+    const text = await res.text();
+    let data; try { data = JSON.parse(text); } catch { data = null; }
+    if (!res.ok) {
+      return new Response(JSON.stringify({ error: 'Supabase PATCH ' + res.status + ': ' + text.slice(0, 200) }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const updated = Array.isArray(data) ? data.length : 0;
+    return new Response(JSON.stringify({ ok: true, updated, eligible }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 async function handleUnassignReseller(request, env, corsHeaders) {
   try {
     const body = await request.json();
@@ -3406,6 +3455,33 @@ async function handleQboRoute(request, env, corsHeaders, url) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleSimWebhooks(env, corsHeaders, url) {
+  try {
+    const simId = parseInt(url.searchParams.get('sim_id') || '0', 10);
+    if (!simId) {
+      return new Response(JSON.stringify({ error: 'sim_id required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    // webhook_deliveries.payload is jsonb shaped like { data: { sim_id, iccid, number, ... } }
+    // PostgREST supports nested JSON path filtering: payload->data->>sim_id=eq.<id>
+    // `cs` = 'contains' — matches any row whose payload jsonb contains the given
+    // subobject. More robust than json-path filtering through PostgREST URL parsing.
+    const jsonFilter = encodeURIComponent(JSON.stringify({ data: { sim_id: simId } }));
+    const q = `webhook_deliveries?select=id,event_type,reseller_id,webhook_url,payload,status,attempts,last_attempt_at,delivered_at,created_at,response_body&event_type=eq.number.online&payload=cs.${jsonFilter}&order=created_at.desc&limit=50`;
+    const res = await supabaseGet(env, q);
+    const rows = await res.json().catch(() => []);
+    const deliveries = Array.isArray(rows) ? rows : [];
+    return new Response(JSON.stringify({ ok: true, sim_id: simId, count: deliveries.length, deliveries }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
 }
@@ -4914,6 +4990,8 @@ function getHTML(helixEnabled) {
                     <button onclick="bulkUnassignReseller()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Unassign Reseller</button>
                     <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
                     <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
+                    <button onclick="bulkSetRotationEligible(false)" class="px-3 py-1.5 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition">Pause Auto-Rotate</button>
+                    <button onclick="bulkSetRotationEligible(true)" class="px-3 py-1.5 text-xs bg-lime-600 hover:bg-lime-700 text-white rounded transition">Resume Auto-Rotate</button>
                     <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Send Online</button>
                     <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
                     <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
@@ -7377,7 +7455,7 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-500 text-xs">\${lastSms}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.activated_at ? new Date(sim.activated_at).toLocaleString() : '-'}</td>
-                    <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_notified_at ? new Date(sim.last_notified_at).toLocaleString() : '-'}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_notified_at ? \`<button onclick="viewSimWebhooks(\${sim.id})" class="text-indigo-400 hover:text-indigo-300 hover:underline" title="Show number.online deliveries sent for this SIM">\${new Date(sim.last_notified_at).toLocaleString()}</button>\` : '-'}</td>
                     <td class="px-4 py-3 whitespace-nowrap">
                         \${canSendOnline ? \`<button onclick="sendSimOnline(\${sim.id}, '\${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>\` : ''}
                         \${sim.status === 'active' ? (['teltik', 'wing_iot'].includes(sim.vendor) ? \`<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="OTA not available for \${sim.vendor === 'teltik' ? 'Teltik' : 'Wing IoT'}">OTA</button>\` : (sim.vendor === 'helix' && !window.HELIX_ENABLED) ? \`<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Helix is disabled">OTA</button>\` : \`<button onclick="simAction(\${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>\`) : ''}
@@ -7386,6 +7464,7 @@ function renderSims() {
                         \${(sim.gateway_id && sim.port) ? \`<button onclick="openSimDetail(\${sim.id}, 'imei')" class="px-2 py-1 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition ml-1" title="Change IMEI">IMEI</button>\` : ''}
                         \${\`<button onclick="openSimDetail(\${sim.id}, 'status')" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition ml-1">Status</button>\`}
                         \${\`<button onclick="deleteSim(\${sim.id}, '\${sim.iccid}')" class="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 text-white rounded transition ml-1" title="Delete this SIM permanently">Del</button>\`}
+                        \${\`<button onclick="setRotationEligible(\${sim.id}, \${!(sim.rotation_eligible === false)})" class="px-2 py-1 text-xs rounded transition ml-1 \${(sim.rotation_eligible === false) ? 'bg-slate-600 hover:bg-slate-500 text-gray-200' : 'bg-green-700 hover:bg-green-600 text-white'}" title="Toggle automatic rotation for this SIM">\${(sim.rotation_eligible === false) ? 'Auto: Off' : 'Auto: On'}</button>\`}
                     </td>
                 </tr>
                 \`;
@@ -9444,6 +9523,99 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('sim-action-output').classList.remove('hidden');
         }
 
+        async function setRotationEligible(simId, eligible) {
+            try {
+                const res = await fetch(API_BASE + '/set-rotation-eligible', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: [simId], eligible: eligible })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.ok) {
+                    showToast('Failed: ' + (data.error || res.status), 'error');
+                    return;
+                }
+                showToast('SIM #' + simId + ' auto-rotate ' + (eligible ? 'ON' : 'OFF'), 'success');
+                loadSims(true);
+            } catch (e) {
+                showToast('Error: ' + (e && e.message ? e.message : e), 'error');
+            }
+        }
+
+        async function bulkSetRotationEligible(eligible) {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) { showToast('Select at least one SIM', 'error'); return; }
+            const verb = eligible ? 'Resume' : 'Pause';
+            if (!(await showConfirm(verb + ' Auto-Rotate', verb + ' auto-rotation for ' + simIds.length + ' SIM(s)?'))) return;
+
+            const output = document.getElementById('sim-action-output');
+            document.getElementById('sim-action-title').textContent = verb + ' Auto-Rotate — ' + simIds.length + ' SIMs';
+            output.textContent = 'Working...';
+            output.classList.remove('hidden');
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+
+            try {
+                const res = await fetch(API_BASE + '/set-rotation-eligible', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: simIds, eligible: eligible })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.ok) {
+                    output.textContent = 'Failed: ' + (data.error || ('HTTP ' + res.status));
+                    return;
+                }
+                const lines = simIds.map(function(id) { return 'SIM #' + id + ': auto-rotate ' + (eligible ? 'ON' : 'OFF'); });
+                output.textContent = 'Updated ' + data.updated + ' of ' + simIds.length + ' SIM(s).' + '\\n\\n' + lines.join('\\n');
+                loadSims(true);
+            } catch (e) {
+                output.textContent = 'Error: ' + (e && e.message ? e.message : e);
+            }
+        }
+
+        async function viewSimWebhooks(simId) {
+            const titleEl = document.getElementById('sim-action-title');
+            const outEl   = document.getElementById('sim-action-output');
+            const logsSec = document.getElementById('sim-action-logs-section');
+            const modal   = document.getElementById('sim-action-modal');
+            if (logsSec) logsSec.classList.add('hidden');
+            titleEl.textContent = 'number.online webhooks — SIM #' + simId;
+            outEl.textContent = 'Loading...';
+            modal.classList.remove('hidden');
+            try {
+                const res = await fetch(\`\${API_BASE}/sim-webhooks?sim_id=\${simId}\`);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+                const rows = Array.isArray(data.deliveries) ? data.deliveries : [];
+                if (rows.length === 0) {
+                    outEl.textContent = 'No number.online deliveries logged for SIM #' + simId + '.';
+                    return;
+                }
+                const lines = rows.map(function(r) {
+                    const when   = r.created_at ? new Date(r.created_at).toLocaleString() : '—';
+                    const number = (r.payload && r.payload.data && r.payload.data.number) || '—';
+                    const iccid  = (r.payload && r.payload.data && r.payload.data.iccid)  || '—';
+                    const until  = (r.payload && r.payload.data && r.payload.data.online_until) || '—';
+                    const st     = String(r.status || 'unknown').toUpperCase();
+                    const rid    = r.reseller_id == null ? '—' : r.reseller_id;
+                    const delivered = r.delivered_at ? new Date(r.delivered_at).toLocaleString() : '—';
+                    const respSnip  = r.response_body ? String(r.response_body).slice(0, 120) : '';
+                    return (
+                        '[' + when + ']  ' + st + '  attempts=' + (r.attempts || 0) + '\\n' +
+                        '  reseller=' + rid + '  number=' + number + '  iccid=' + iccid + '\\n' +
+                        '  online_until=' + until + '\\n' +
+                        '  delivered_at=' + delivered + '\\n' +
+                        '  url=' + (r.webhook_url || '—') + '\\n' +
+                        (respSnip ? '  response=' + respSnip + '\\n' : '')
+                    );
+                }).join('\\n');
+                outEl.textContent = 'Showing ' + rows.length + ' most-recent number.online delivery(ies):\\n\\n' + lines;
+            } catch (e) {
+                outEl.textContent = 'Error loading webhooks: ' + (e && e.message ? e.message : e);
+            }
+        }
+
         function querySimCarrier(simId, vendor, subId, iccid) {
             const vendorSelect = document.getElementById('carrier-query-vendor');
             const input = document.getElementById('helix-subid-input');
@@ -9985,24 +10157,56 @@ async function sendSimOnline(simId, phoneNumber) {
             if (simIds.length === 0) return;
             let confirmMsg;
             if (action === 'rotate') {
-                confirmMsg = \`Rotate \${simIds.length} SIMs?\n\n\u26A0\uFE0F This will force-rotate every selected SIM \u2014 including any already rotated today. Duplicate rotations risk your AT&T account and require resellers to update the MDN each time.\`;
+                confirmMsg = \`Rotate \${simIds.length} SIMs?\\n\\n\u26A0\uFE0F This will force-rotate every selected SIM \u2014 including any already rotated today. Duplicate rotations risk your AT&T account and require resellers to update the MDN each time.\`;
             } else {
                 confirmMsg = \`Run \${action} on \${simIds.length} SIM(s)?\`;
             }
             if (!(await showConfirm('Run Action', confirmMsg))) return;
+
+            const extraBody = action === 'rotate' ? { force: true } : {};
+
+            // Open the shared bulk result modal once; append a line per SIM as we go.
+            const output = document.getElementById('sim-action-output');
+            document.getElementById('sim-action-title').textContent = 'Bulk ' + action + ' — ' + simIds.length + ' SIMs';
+            output.textContent = 'Starting...';
+            output.classList.remove('hidden');
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+
             window.__bulkCancel = false;
             showBulkCancelButton();
-            const extraBody = action === 'rotate' ? { force: true } : {};
-            let done = 0;
-            for (const id of simIds) {
+            let ok = 0, fail = 0, cancelled = 0;
+            const lines = [];
+            for (const simId of simIds) {
                 if (window.__bulkCancel) {
-                    showToast(\`Cancelled at \${done}/\${simIds.length}\`, 'info');
+                    cancelled = simIds.length - ok - fail;
                     break;
                 }
-                await simAction(id, action, true, extraBody);
-                done++;
+                try {
+                    const res = await fetch(API_BASE + '/sim-action', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(Object.assign({ sim_id: simId, action }, extraBody))
+                    });
+                    const result = await res.json();
+                    if (result.ok) {
+                        ok++;
+                        const msg = result.detail && result.detail.message ? result.detail.message : (result.message || '');
+                        lines.push('SIM #' + simId + ': OK' + (msg ? ' — ' + msg : ''));
+                    } else {
+                        fail++;
+                        const err = result.error || (result.detail && result.detail.error) || 'unknown';
+                        lines.push('SIM #' + simId + ': FAILED — ' + err);
+                    }
+                } catch (e) {
+                    fail++;
+                    lines.push('SIM #' + simId + ': EXCEPTION — ' + (e && e.message ? e.message : e));
+                }
+                output.textContent = lines.join('\\n') + '\\n\\nProcessing... (' + (ok + fail) + '/' + simIds.length + ')';
             }
             hideBulkCancelButton();
+            const summary = 'Done: ' + ok + ' OK' + (fail ? ', ' + fail + ' failed' : '') + (cancelled ? ', ' + cancelled + ' cancelled' : '');
+            output.textContent = summary + '\\n\\n' + lines.join('\\n');
             loadSims(true);
         }
 

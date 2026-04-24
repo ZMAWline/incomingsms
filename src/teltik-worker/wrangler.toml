@@ -5,7 +5,9 @@ account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
 [triggers]
-crons = ["10,40 * * * *"]   # every 30 min — 48h interval is wide, no need for tight schedule
+# Rotation window: 12:00 AM – 6:00 AM America/New_York (DST-aware).
+# UTC 4-11 covers both DST states; isInsideRotationWindowNY() gate narrows to NY 0-5.
+crons = ["10,40 4-11 * * *"]
 
 [observability.logs]
 enabled = true

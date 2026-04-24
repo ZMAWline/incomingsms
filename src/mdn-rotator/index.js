@@ -19,8 +19,11 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
 
-      const limit = parseInt(url.searchParams.get("limit") || "0", 10) || null;
-      const result = await queueSimsForRotation(env, { limit });
+      // DB-driven polling — processes up to `limit` SIMs inline, at concurrency=3.
+      // One /run click fully drains its batch; no CF Queue dependency.
+      const limit = parseInt(url.searchParams.get("limit") || "60", 10) || 60;
+      const concurrency = parseInt(url.searchParams.get("concurrency") || "3", 10) || 3;
+      const result = await processRotationBatch(env, { limit, concurrency });
       return new Response(JSON.stringify(result, null, 2), {
         status: 200,
         headers: { "Content-Type": "application/json" }
@@ -41,7 +44,8 @@ export default {
         });
       }
 
-      const result = await rotateSpecificSim(env, iccid);
+      const force = url.searchParams.get("force") === "true";
+      const result = await rotateSpecificSim(env, iccid, { force });
       return new Response(JSON.stringify(result, null, 2), {
         status: result.ok ? 200 : 500,
         headers: { "Content-Type": "application/json" }
@@ -839,12 +843,19 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
   },
 
   // Cron handler
-  // - Every 20 min 04:00-16:00 UTC (midnight-noon EDT / 1am-1pm EST): rotation
-  // - 7am UTC: error summary to Slack
+  // - Rotation runs ONLY 12:00-05:59 America/New_York (DST-aware via Intl).
+  //   UTC cron fires wider than that; the gate below is the source of truth.
+  // - 7am UTC: error summary to Slack (always runs, regardless of window).
   async scheduled(event, env, ctx) {
     const hour = new Date(event.scheduledTime).getUTCHours();
-    // Rotation: runs every 20 min all day until all client-assigned SIMs are rotated
-    ctx.waitUntil(queueSimsForRotation(env));
+    if (isInsideRotationWindowNY()) {
+      // DB-driven polling: processRotationBatch runs inline (no CF Queue).
+      // 60 SIMs per tick at concurrency=3 → ~3.3 min wall clock, well inside
+      // Workers' paid 15-min scheduled-invocation limit.
+      ctx.waitUntil(processRotationBatch(env, { limit: 60, concurrency: 3 }));
+    } else {
+      console.log(`[Cron] outside NY rotation window (0-5); NY hour=${getNYHour()} — skipping rotation`);
+    }
     // Wing IoT MDN sync moved to details-finalizer (runs every 5 min).
     // IMEI heartbeat: DISABLED — investigating gateway instability
     // ctx.waitUntil(queueImeiHeartbeats(env));
@@ -1144,6 +1155,90 @@ async function queueBlimeiUpdates(env) {
 }
 
 // ===========================
+// Bounded-concurrency runner: up to `concurrency` workers pull items from a
+// shared cursor. Exceptions are caught per-item so one bad SIM doesn't abort
+// the batch. Used by processRotationBatch — safe because claim_rotation_slot
+// is the atomic gate preventing any two workers from claiming the same SIM.
+// ===========================
+async function runWithConcurrency(items, concurrency, workerFn) {
+  let idx = 0;
+  const results = new Array(items.length);
+  async function worker() {
+    while (true) {
+      const my = idx++;
+      if (my >= items.length) return;
+      try {
+        results[my] = await workerFn(items[my], my);
+      } catch (e) {
+        results[my] = { error: String(e) };
+      }
+    }
+  }
+  const n = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
+}
+
+// ===========================
+// Process a single batch of eligible SIMs inline — replaces the CF Queue path.
+// Pulls up to `limit` SIMs pre-filtered in SQL, then claims + rotates each
+// (via rotateSingleSim which dispatches to the vendor function). Runs
+// `concurrency` rotations in parallel; claim_rotation_slot is the atomic gate.
+// ===========================
+async function processRotationBatch(env, options = {}) {
+  const limit = options.limit || 60;
+  const concurrency = options.concurrency || 3;
+  const todayNy = getNYMidnightISO();
+
+  // Pre-filter eligible SIMs. Over-fetch 2x since some may be filtered out in JS.
+  const query =
+    `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,activated_at,activation_zip,rotation_eligible,reseller_sims!inner(reseller_id)` +
+    `&reseller_sims.active=eq.true` +
+    `&status=eq.active` +
+    `&rotation_eligible=eq.true` +
+    `&vendor=in.(helix,atomic,wing_iot)` +
+    `&order=last_mdn_rotated_at.asc.nullsfirst` +
+    `&limit=${limit * 2}`;
+  const raw = await supabaseSelect(env, query);
+  const candidates = (Array.isArray(raw) ? raw : []).filter(s => {
+    if (s.last_mdn_rotated_at && s.last_mdn_rotated_at >= todayNy) return false;
+    if (s.activated_at && s.activated_at >= todayNy) return false;
+    const v = s.vendor || 'helix';
+    if (v === 'helix') return !!s.mobility_subscription_id;
+    if (v === 'atomic') return !!s.msisdn;
+    if (v === 'wing_iot') return true;
+    return false;
+  }).slice(0, limit);
+
+  if (candidates.length === 0) {
+    console.log('[ProcessBatch] no eligible SIMs');
+    return { ok: true, attempted: 0, ok: 0, skipped: 0, failed: 0 };
+  }
+
+  let token = null;
+  try { token = await getCachedToken(env); } catch (err) {
+    // Token fetch failure is non-fatal: ATOMIC / Wing IoT SIMs don't need it.
+    console.warn(`[ProcessBatch] Helix token fetch failed (ok for non-helix): ${err}`);
+  }
+
+  let ok = 0, skipped = 0, failed = 0;
+  await runWithConcurrency(candidates, concurrency, async (sim) => {
+    try {
+      const result = await rotateSingleSim(env, token, sim);
+      if (result && result.skipped) { skipped++; return; }
+      ok++;
+    } catch (err) {
+      failed++;
+      console.error(`[ProcessBatch] SIM ${sim.iccid} failed: ${err}`);
+      await updateSimRotationError(env, sim.id, `Rotation failed: ${err}`).catch(() => {});
+    }
+  });
+
+  console.log(`[ProcessBatch] attempted=${candidates.length} ok=${ok} skipped=${skipped} failed=${failed}`);
+  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed };
+}
+
+// ===========================
 // Rotate a specific SIM by ICCID (manual trigger)
 // ===========================
 async function rotateSpecificSim(env, iccid, options = {}) {
@@ -1177,8 +1272,11 @@ async function rotateSpecificSim(env, iccid, options = {}) {
 
     if (vendor === 'wing_iot') {
       try {
-        console.log(`SIM ${iccid}: starting Wing IoT rotation`);
-        await rotateWingIotSim(env, sim);
+        console.log(`SIM ${iccid}: starting Wing IoT rotation${force ? ' (force=true)' : ''}`);
+        const result = await rotateWingIotSim(env, sim, { force });
+        if (result && result.skipped) {
+          return { ok: false, iccid, error: `SIM ${iccid} not eligible for rotation (claim_rotation_slot=false) — pass force=true to override` };
+        }
         return { ok: true, iccid, message: `SIM ${iccid} rotated successfully (wing_iot)` };
       } catch (err) {
         console.error(`SIM ${iccid}: Wing IoT rotation failed: ${err}`);
@@ -1196,8 +1294,11 @@ async function rotateSpecificSim(env, iccid, options = {}) {
         return { ok: false, error: `SIM ${iccid} has no msisdn (atomic)` };
       }
       try {
-        console.log(`SIM ${iccid}: starting ATOMIC rotation`);
-        await rotateAtomicSim(env, sim);
+        console.log(`SIM ${iccid}: starting ATOMIC rotation${force ? ' (force=true)' : ''}`);
+        const result = await rotateAtomicSim(env, sim, { force });
+        if (result && result.skipped) {
+          return { ok: false, iccid, error: `SIM ${iccid} not eligible for rotation (claim_rotation_slot=false) — pass force=true to override` };
+        }
         return { ok: true, iccid, message: `SIM ${iccid} rotated successfully (atomic)` };
       } catch (err) {
         console.error(`SIM ${iccid}: ATOMIC rotation failed: ${err}`);
@@ -1214,8 +1315,11 @@ async function rotateSpecificSim(env, iccid, options = {}) {
     const token = await getCachedToken(env);
 
     try {
-      console.log(`SIM ${iccid}: starting rotation`);
-      await rotateSingleSim(env, token, sim);
+      console.log(`SIM ${iccid}: starting rotation${force ? ' (force=true)' : ''}`);
+      const result = await rotateSingleSim(env, token, sim, { force });
+      if (result && result.skipped) {
+        return { ok: false, iccid, error: `SIM ${iccid} not eligible for rotation (claim_rotation_slot=false) — pass force=true to override` };
+      }
       return { ok: true, iccid, message: `SIM ${iccid} rotated successfully` };
     } catch (err) {
       console.error(`SIM ${iccid}: rotation failed: ${err}`);
@@ -1231,14 +1335,27 @@ async function rotateSpecificSim(env, iccid, options = {}) {
 // ===========================
 // Rotate a single Wing IoT SIM (plan swap: dialable → non-dialable → dialable)
 // AT&T assigns a new MDN when switching back to the dialable plan.
+// opts.force=true bypasses the 24h interval guard (manual operator override).
 // ===========================
-async function rotateWingIotSim(env, sim) {
+async function rotateWingIotSim(env, sim, opts = {}) {
   const iccid = sim.iccid;
   const runId = `rotate_${iccid}_${Date.now()}`;
+  const force = opts.force === true;
 
   if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
     throw new Error('Wing IoT credentials not configured on mdn-rotator worker');
   }
+
+  // Atomic dedup: the RPC stamps last_mdn_rotated_at, last_rotation_at,
+  // rotation_status='rotating', and rotation_source in one UPDATE. If it returns
+  // false, some other process has the slot (or SIM is ineligible) — MUST NOT
+  // call the carrier API or we'd burn an extra MDN.
+  const claimed = await claimRotationSlot(env, sim.id, force);
+  if (!claimed) {
+    console.log(`SIM ${iccid}: wing_iot claim_rotation_slot=false — skipping`);
+    return { skipped: true };
+  }
+  if (force) console.log(`SIM ${iccid}: wing_iot force=true — claimed with interval bypass`);
 
   const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
   const url = baseUrl + '/v1/devices/' + encodeURIComponent(iccid);
@@ -1290,18 +1407,15 @@ async function rotateWingIotSim(env, sim) {
   });
   if (!dRes.ok) throw new Error('Wing IoT dialable switch failed: ' + dRes.status + ': ' + dText.slice(0, 300));
 
-  // 4) Plan swap complete. Stamp rotation guard and flip SIM into provisioning.
-  // details-finalizer (every 5 min) will GET the new MDN from AT&T, close the old
-  // sim_numbers row, insert the new one, set status=active, and fire the webhook.
-  // Keeping the rotation queue moving while the MDN propagates (~1 min at AT&T).
-  const now = new Date().toISOString();
+  // 4) Plan swap complete. claim_rotation_slot already stamped the dedup guard
+  // (last_mdn_rotated_at + rotation_status='rotating'); we now flip into the
+  // provisioning state so details-finalizer (every 5 min) takes over: GET new
+  // MDN from AT&T, close/open sim_numbers, set status=active, fire webhook.
   await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-    last_mdn_rotated_at: now,
-    last_rotation_at: now,
     rotation_status: 'mdn_pending',
+    status: 'provisioning',
     last_rotation_error: null,
     rotation_fail_count: 0,
-    status: 'provisioning',
   });
 
   console.log(`SIM ${iccid}: Wing IoT plan swap complete (old MDN: ${oldMdn || 'unknown'}) — status=provisioning, details-finalizer will pick up new MDN`);
@@ -1309,16 +1423,28 @@ async function rotateWingIotSim(env, sim) {
 
 // ===========================
 // Rotate a single ATOMIC SIM (swap MSISDN → subscriber inquiry → DB + webhook)
+// opts.force=true bypasses the 24h interval guard (manual operator override).
 // ===========================
-async function rotateAtomicSim(env, sim) {
+async function rotateAtomicSim(env, sim, opts = {}) {
   const iccid = sim.iccid;
   const currentMsisdn = sim.msisdn;
   const runId = `rotate_${iccid}_${Date.now()}`;
+  const force = opts.force === true;
 
   if (!currentMsisdn) throw new Error(`SIM ${iccid}: no msisdn for ATOMIC rotation`);
   if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
     throw new Error('ATOMIC credentials not configured on mdn-rotator worker');
   }
+
+  // Atomic dedup: claim_rotation_slot stamps last_mdn_rotated_at +
+  // rotation_status='rotating' + rotation_source in one UPDATE. If it returns
+  // false we MUST NOT call swapMSISDN — would burn an extra MDN.
+  const claimed = await claimRotationSlot(env, sim.id, force);
+  if (!claimed) {
+    console.log(`SIM ${iccid}: atomic claim_rotation_slot=false — skipping`);
+    return { skipped: true };
+  }
+  if (force) console.log(`SIM ${iccid}: atomic force=true — claimed with interval bypass`);
 
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
   const session = {
@@ -1457,45 +1583,24 @@ async function rotateAtomicSim(env, sim) {
 }
 
 // ===========================
-// Rotate a single SIM (called by queue consumer)
-// Each SIM uses ~7 subrequests, well under the 1000 limit
+// Rotate a single SIM (called by queue consumer).
+// Dedup is atomic: each vendor function calls claim_rotation_slot as its first
+// step. If the claim fails, the vendor function returns { skipped: true } and
+// no external API call is made. opts.force=true plumbs through for manual.
 // ===========================
-async function rotateSingleSim(env, token, sim) {
+async function rotateSingleSim(env, token, sim, opts = {}) {
   const iccid = sim.iccid;
   const vendor = sim.vendor || 'helix';
+  const force = opts.force === true;
 
-  // Dedup check: skip if already rotated today OR activated today.
-  // Hoisted above the vendor dispatch so it applies to every vendor uniformly.
-  const todayMidnightEst = getNYMidnightISO();
-  if (sim.last_mdn_rotated_at && sim.last_mdn_rotated_at >= todayMidnightEst) {
-    console.log(`SIM ${iccid} (${vendor}): already rotated today (${sim.last_mdn_rotated_at}), skipping duplicate queue message`);
-    return;
-  }
-  if (sim.activated_at && sim.activated_at >= todayMidnightEst) {
-    console.log(`SIM ${iccid} (${vendor}): activated today (${sim.activated_at}), skipping — new SIMs don't rotate same-day`);
-    return;
-  }
-  // Re-check current DB values (queue message may be stale from an earlier cron run)
-  const freshSim = await supabaseSelectOne(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}&select=last_mdn_rotated_at,activated_at`);
-  if (freshSim && freshSim.last_mdn_rotated_at && freshSim.last_mdn_rotated_at >= todayMidnightEst) {
-    console.log(`SIM ${iccid} (${vendor}): DB confirms already rotated today (${freshSim.last_mdn_rotated_at}), skipping`);
-    return;
-  }
-  if (freshSim && freshSim.activated_at && freshSim.activated_at >= todayMidnightEst) {
-    console.log(`SIM ${iccid} (${vendor}): DB confirms activated today (${freshSim.activated_at}), skipping`);
-    return;
-  }
-
-  // Vendor dispatch.
-  // - atomic: delegate to rotateAtomicSim
-  // - wing_iot: delegate to rotateWingIotSim
-  // - teltik: explicit early-return (defense-in-depth; handled by teltik-worker)
-  // - helix: fall through to the original logic below (default)
+  // Vendor dispatch. Each vendor function calls claim_rotation_slot internally;
+  // no JS-side dedup is needed here (it was removed as part of the redesign —
+  // the Postgres RPC is the single source of truth).
   if (vendor === 'atomic') {
-    return await rotateAtomicSim(env, sim);
+    return await rotateAtomicSim(env, sim, { force });
   }
   if (vendor === 'wing_iot') {
-    return await rotateWingIotSim(env, sim);
+    return await rotateWingIotSim(env, sim, { force });
   }
   if (vendor === 'teltik') {
     console.log(`SIM ${iccid}: teltik handled by teltik-worker — skipping (queue message should not have reached here; check queueSimsForRotation)`);
@@ -1508,6 +1613,14 @@ async function rotateSingleSim(env, token, sim) {
     console.log(`SIM ${iccid}: no mobility_subscription_id, skipping`);
     return;
   }
+
+  // Atomic dedup: claim the rotation slot before any Helix API call.
+  const claimed = await claimRotationSlot(env, sim.id, force);
+  if (!claimed) {
+    console.log(`SIM ${iccid}: helix claim_rotation_slot=false — skipping`);
+    return { skipped: true };
+  }
+  if (force) console.log(`SIM ${iccid}: helix force=true — claimed with interval bypass`);
 
   // Generate unique run_id for this rotation operation
   const runId = `rotate_${iccid}_${Date.now()}`;
@@ -3168,6 +3281,40 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 // ===========================
 // Supabase helpers
 // ===========================
+// Atomic check-and-stamp for a rotation slot. Returns true iff this caller
+// should proceed with the external rotation. p_force=true bypasses the
+// per-vendor interval guard AND the activation-day skip — reserved for manual.
+async function claimRotationSlot(env, simId, force) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/claim_rotation_slot`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ p_sim_id: simId, p_force: !!force }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`claim_rotation_slot failed ${res.status}: ${text}`);
+  return text.trim() === 'true';
+}
+
+// Returns the current hour (0-23) in America/New_York, DST-aware.
+// Intl midnight sometimes renders as "24" in en-US with hour12:false; % 24 normalises.
+function getNYHour() {
+  const raw = Number(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour: 'numeric', hour12: false,
+  }).format(new Date()));
+  return ((raw % 24) + 24) % 24;
+}
+
+// Scheduled rotations only run between 12:00 AM and 6:00 AM NY (hours 0-5).
+// Manual HTTP paths bypass this — they never pass through scheduled().
+function isInsideRotationWindowNY() {
+  const h = getNYHour();
+  return h >= 0 && h <= 5;
+}
+
 // Returns ISO string for midnight in New York timezone (DST-aware)
 function getNYMidnightISO() {
   const now = new Date();

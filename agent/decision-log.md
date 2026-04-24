@@ -4,6 +4,59 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-24 — DB-driven polling replaces Cloudflare Queues on the rotation hot path
+
+**Decision:** `mdn-rotator` no longer uses Cloudflare Queues for scheduled rotations. Each 5-min cron tick (UTC `*/5 4-11 * * *`, narrowed by an NY-hour gate to NY 0–5) calls `processRotationBatch(env, {limit: 60, concurrency: 3})` inline via `ctx.waitUntil`. Eligibility is a DB query filtered by `status='active' AND rotation_eligible=true AND vendor IN (helix,atomic,wing_iot) AND reseller active AND claim-slot predicate`. Each SIM's atomic claim still goes through the `claim_rotation_slot` RPC. Teltik already ran this way and is unchanged.
+
+**Why:**
+1. Reproducible CF Queue delivery stall observed on 2026-04-24: after a `/run` queued 41 eligible SIMs, only `max_batch_size` (25 then 10) were processed; the remaining sat unprocessed despite the consumer being idle and messages unacked on our side. A second `/run` click delivered another single batch and idled. This happened with `max_concurrency=1` and `max_retries=0` and standard ack semantics — reproducible across multiple tests; the queue did not re-deliver on its own timetable. Cloudflare documentation doesn't describe this behavior; the working hypothesis is consumer-warmup pacing at low message volume.
+2. The symptom is catastrophic for a daily-rotation workload: an entire night's eligible SIMs would need ~20 manual `/run` clicks to drain. Unacceptable even before counting operator friction.
+3. Teltik's queue-free inline loop has worked without any such issue. Porting that pattern to mdn-rotator is a small structural change with no new external dependency.
+4. `claim_rotation_slot` is atomic, so bounded parallelism (concurrency=3) inside the tick is safe — two workers can't both claim the same SIM.
+
+**Consequence:**
+- `mdn-rotation-queue` producer + consumer bindings in `src/mdn-rotator/wrangler.toml` and the consumer branch in `async queue(batch, env)` are currently dead code. Keep them until one verified overnight run, then remove in a small PR.
+- `queueSimsForRotation` function in `src/mdn-rotator/index.js` is no longer called by any route. Remove alongside the queue bindings.
+- `fix-sim-queue` stays — low-volume, no delivery-stall symptoms.
+- Cron cadence is now 5 min (12 ticks/night inside NY 0–5) instead of 20 min. Per-tick budget is 60 SIMs × ~10s ÷ 3 parallel ≈ 3.3 min wall clock — well inside Workers' paid 15-min scheduled-invocation limit.
+- `/run` HTTP endpoint is now the correct way to drain on-demand; one call processes up to 60 eligible SIMs inline before returning. No enqueue step.
+- Do not reintroduce CF Queues on the rotation hot path without first proving the delivery-stall was resolved (CF runtime change, different consumer config, etc.). If needed, add a feature flag and canary it.
+
+---
+
+## 2026-04-24 — Rotation eligibility uses NY calendar day, not rolling 24h
+
+**Decision:** `claim_rotation_slot` eligibility for ≤24h vendors (`rotation_interval_hours <= 24`: helix, atomic, wing_iot) is "rotated before today's NY calendar midnight." Multi-day vendors (teltik, interval 48h) keep the rolling `NOW() - interval '<N> hours'` check.
+
+**Why:**
+1. Under the "rolling 24h" rule paired with a fixed 12 AM – 6 AM NY rotation window, a SIM rotated at 5:40 AM NY yesterday needs >26 hours to elapse — which overshoots the end of today's window. The SIM can't rotate today and must wait until tomorrow's window, repeating indefinitely. Over weeks, SIMs drift later and exit the window entirely.
+2. "Once per NY calendar day" removes the cadence drift: the moment NY midnight rolls over, every SIM rotated yesterday becomes eligible, regardless of exact elapsed time. 12 window-ticks × 60 SIMs = 720 slots/night is ample for ~470 active SIMs.
+3. Teltik's 48h interval is a real-time constraint (not "not more than once per two calendar days") — kept rolling.
+
+**Consequence:**
+- The `claim_rotation_slot` branch on `rotation_interval_hours <= 24` uses `last_mdn_rotated_at < today_ny_midnight`. `> 24` branch uses `last_mdn_rotated_at < NOW() - (rotation_interval_hours || ' hours')::interval`.
+- Adding a new vendor: set `rotation_interval_hours` appropriately. ≤24 means NY-day semantics automatically.
+- Do NOT pre-emptively switch teltik to NY-day; doing so would allow two rotations within 48h (e.g. rotate 11 PM Mon → eligible again Tue midnight = 1h later).
+
+---
+
+## 2026-04-24 — Rotation stamp (`last_mdn_rotated_at`) lands via RPC before any external API call
+
+**Decision:** All vendor rotation functions (`rotateAtomicSim`, `rotateWingIotSim`, Helix inline in `rotateSingleSim`, `rotateOneTeltikSim`) call `claim_rotation_slot(sim_id, force)` as their first step. The RPC performs a single atomic `UPDATE sims SET last_mdn_rotated_at=NOW(), rotation_status='rotating', rotation_source='auto'|'manual' WHERE <eligibility predicate>` and returns true/false. External API calls are made ONLY when the RPC returned true.
+
+**Why:**
+1. On 2026-04-24 we observed two separate schema/code drift incidents where a DB CHECK constraint rejected a PATCH containing the rotation stamp, rolling back the entire transaction. In both cases — `rotation_status='mdn_pending'` (Wing IoT, 1,020 burns in a day) and `status='rotation_failed'` inside `increment_rotation_fail` (3-strikes cap silently broken since inception) — the code assumed "the call returned" meant "the state persisted." It didn't.
+2. Pre-redesign Atomic/Helix stamped `last_mdn_rotated_at` at the END of the rotation via `updateSimRotationTimestamp`, after all API + DB writes. Any throw in between left the SIM eligible to re-rotate, burning another MDN on the next cron tick.
+3. The RPC pattern stamps FIRST in a guaranteed-minimal UPDATE that touches only fields in known-allowed enum values. Even if a downstream PATCH fails, the stamp is durable. At worst we miss one rotation; never a double burn.
+
+**Consequence:**
+- Every new rotation code path MUST begin with `claim_rotation_slot`. Do not reintroduce any "stamp at the end" pattern.
+- Manual paths pass `force=true`, bypassing the interval + eligibility predicates but still stamping atomically.
+- Queue consumers, HTTP handlers, and dashboard service-binding routes all share the same RPC gate. The `force` boolean is the ONLY difference between auto and manual.
+- When adding a new `rotation_status` enum value in code, update the `check_rotation_status` constraint in the same migration AND add to the allowlist in `scripts/check_db_constraints.mjs`. `npm run check:db-constraints` runs as a `predeploy` hook.
+
+---
+
 ## 2026-04-24 — Teltik billing blocks align to MDN rotations, not to cycle-start day pairs
 
 **Decision:** Teltik 48h billing blocks are computed per-rotation, not by pairing consecutive calendar days from cycle_start. For each `sim_numbers` row in the cycle window, block = `[valid_from, min(next_rotation_valid_from, valid_from + rotation_interval_hours))`. A block is billable iff the sim had any SMS on any EST date the block touches, and the block is assigned to the cycle containing its `valid_from` EST date (never split). The per-sim 48h clock comes from `sims.rotation_interval_hours` (default 48).

@@ -93,6 +93,10 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    if (!isInsideRotationWindowNY()) {
+      console.log(`[Cron] teltik-worker outside NY rotation window (0-5); NY hour=${getNYHour()} — skipping`);
+      return;
+    }
     console.log('[Cron] teltik-worker rotation starting');
     try {
       const result = await rotateTeltikSims(env);
@@ -102,6 +106,21 @@ export default {
     }
   },
 };
+
+// =========================================================
+// Scheduling window: 12 AM – 6 AM America/New_York (DST-aware via Intl)
+// =========================================================
+function getNYHour() {
+  const raw = Number(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour: 'numeric', hour12: false,
+  }).format(new Date()));
+  return ((raw % 24) + 24) % 24;
+}
+
+function isInsideRotationWindowNY() {
+  const h = getNYHour();
+  return h >= 0 && h <= 5;
+}
 
 // =========================================================
 // IMPORT — fetch all Teltik lines and upsert into DB
@@ -465,27 +484,21 @@ async function rotateTeltikSims(env) {
 async function rotateOneTeltikSim(env, sim, opts = {}) {
   const force = opts.force === true;
   const apiKey = env.TELTIK_API_KEY;
-  const now = Date.now();
 
   try {
-    // Dedup guard: skip if within interval — unless force=true
-    if (!force) {
-      const freshRows = await supabaseGetArray(
-        env,
-        `sims?id=eq.${sim.id}&select=last_mdn_rotated_at,rotation_interval_hours&limit=1`
-      );
-      const freshRotatedAt = freshRows[0]?.last_mdn_rotated_at;
-      const intervalHours = freshRows[0]?.rotation_interval_hours || 48;
-      if (freshRotatedAt) {
-        const intervalMs = intervalHours * 60 * 60 * 1000;
-        if ((now - new Date(freshRotatedAt).getTime()) < intervalMs) {
-          console.log(`[Rotate] SIM ${sim.iccid}: already rotated recently, skipping`);
-          return { ok: false, skipped: true, reason: 'within interval' };
-        }
-      }
-    } else {
-      console.log(`[Rotate] SIM ${sim.iccid}: force=true — bypassing interval guard`);
+    // Atomic dedup: claim_rotation_slot does the interval + activation-day check
+    // AND stamps last_mdn_rotated_at + rotation_status='rotating' in one UPDATE.
+    // If it returns false, another process already claimed (or SIM isn't eligible),
+    // and we MUST NOT call the carrier — would burn an extra MDN.
+    const claimed = await supabaseRpc(env, 'claim_rotation_slot', {
+      p_sim_id: sim.id,
+      p_force: force,
+    });
+    if (!claimed) {
+      console.log(`[Rotate] SIM ${sim.iccid}: claim_rotation_slot returned false — skipping`);
+      return { ok: false, skipped: true, reason: 'claim_rotation_slot=false' };
     }
+    if (force) console.log(`[Rotate] SIM ${sim.iccid}: force=true — claimed with interval bypass`);
 
     // 2. Initiate number change
       const changeRes = await relayFetch(
@@ -502,10 +515,6 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
       if (!requestId) {
         throw new Error(`No requestId in change-number response: ${JSON.stringify(changeData)}`);
       }
-
-      // SAFETY: stamp last_mdn_rotated_at immediately — prevents re-rotation even if polling fails
-      await supabasePatch(env, `sims?id=eq.${sim.id}`, { last_mdn_rotated_at: new Date().toISOString() });
-      console.log(`[Rotate] SIM ${sim.iccid}: 48h guard stamped, requestId=${requestId}`);
 
       // 3. Poll for completion — max 6 attempts with exponential backoff
       const delays = [2000, 4000, 8000, 16000, 16000, 16000];
@@ -586,9 +595,10 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
         throw new Error(`sim_numbers insert failed: ${insertRes.status} ${await insertRes.text().catch(() => '')}`);
       }
 
-      // 5. Update sims.last_mdn_rotated_at
+      // 5. Mark rotation successful. last_mdn_rotated_at was already stamped
+      //    atomically by claim_rotation_slot at the start; no need to stamp again.
       const rotatedAt = new Date().toISOString();
-      await supabasePatch(env, `sims?id=eq.${sim.id}`, { last_mdn_rotated_at: rotatedAt });
+      await supabasePatch(env, `sims?id=eq.${sim.id}`, { rotation_status: 'success' });
 
       // 6. Send number.online webhook to reseller
       const resellerId = sim.reseller_sims?.[0]?.reseller_id;
@@ -633,6 +643,13 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
 
   } catch (err) {
     console.error(`[Rotate] SIM ${sim.iccid}: error: ${err}`);
+    // Mark status=failed so stuck-state sweeper and dashboard don't show
+    // this SIM as perpetually 'rotating'. last_mdn_rotated_at stays (from
+    // claim_rotation_slot) so we don't retry and burn another MDN this cycle.
+    await supabasePatch(env, `sims?id=eq.${sim.id}`, {
+      rotation_status: 'failed',
+      last_rotation_error: String(err).slice(0, 500),
+    }).catch(() => {});
     return { ok: false, iccid: sim.iccid, error: String(err) };
   }
 }
@@ -772,6 +789,23 @@ async function supabasePatch(env, path, data) {
     },
     body: JSON.stringify(data),
   });
+}
+
+// Calls a Supabase RPC and returns the parsed body (for scalar returns this is
+// the raw value, e.g. boolean for claim_rotation_slot).
+async function supabaseRpc(env, fnName, args) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(args || {}),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`RPC ${fnName} failed ${res.status}: ${text}`);
+  try { return JSON.parse(text); } catch { return text; }
 }
 
 // =========================================================
