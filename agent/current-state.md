@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-04-23 (session 32 — SMS Usage analytics tab + Wing 5th-to-4th billing cycle)
+> Last updated: 2026-04-24 (session 33 — billing review + rotation-aligned Teltik blocks + PostgREST pagination)
 
 ---
 
@@ -21,6 +21,9 @@
 ---
 
 ## In Progress / Pending Work
+
+### sms-ingest worker not deployed (commit b6a3a90)
+Commit `b6a3a90` (Case A identity-first + webhook relayFetch) is local/pushed but **not deployed** — the dashboard billing fixes shipped today, but the sms-ingest change was bundled with pre-existing relay-webhook work and held for explicit confirmation. Safe to deploy anytime: `cd src/sms-ingest && npx wrangler deploy --env=""`. Dormant until deployed (Case A has zero traffic; webhooks still deliver via bare fetch instead of relay).
 
 ### Dashboard Redesign — Now in Production
 Gemini UI (zinc/blue palette, light mode, custom confirm/toast dialogs) was unintentionally deployed to prod in session 9, and all related bugs are now fixed. Production dashboard is running the new UI and is stable.
@@ -79,6 +82,8 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-04-24 | **Billing fix: paginate reseller_sims (Supabase caps at 1000 regardless of &limit), rotation-aligned Teltik blocks, SMS-Usage RPC status filter.** Net recovery ~$760/cycle for TrustOTP alone. New `supabaseGetAllArray()` helper (offset+limit loop, pageSize=1000) used by both billing handlers. Teltik now bills one block per MDN rotation: block = `[valid_from, min(next_rotation, valid_from + rotation_interval_hours))`; block assigned to the cycle containing its `valid_from` EST date so a 48h window is never split across two invoices. Usage RPC: `mtd`/`trend` CTEs join `sims` raw (no status filter) since billing is retroactive; only `active_sim_count` and `wing_per_sim` keep the status filter. Commits `3c2babc` (billing) + new migration `20260423_sms_usage_billing_aligned.sql`. | dashboard, DB |
+| 2026-04-24 | **sms-ingest (COMMITTED, NOT DEPLOYED):** Case A (Skyline recv-sms JSON) now resolves `sim_id` via `gateway_id + port` before falling back to MDN lookup — MDN lookups drift during rotation windows. Case A has had zero traffic in 30 days, so dormant hardening. Same commit includes pre-existing work: `postWebhookWithRetry` now routes via `relayFetch()` (closes the last bare `fetch()` to external endpoints). Commit `b6a3a90`. Deploy with `cd src/sms-ingest && npx wrangler deploy --env=""` when ready. | sms-ingest |
 | 2026-04-23 | **SMS Usage analytics tab added to dashboard.** New sidebar tab between Billing and Guide. Shows MTD inbound SMS per vendor, Wing pool utilization (used/153,750), soft-target marker (25/SIM × N), 30-day trend chart (Chart.js CDN), top/bottom 10 Wing SIMs, est cost under $0.01/SMS overage. Backed by new Supabase RPC `get_sms_usage_summary(p_cycle_start, p_today, p_trend_days)` returning one JSONB blob. Worker route `/api/sms-usage` edge-caches 60s; frontend polls 120s while visible. Wing billing cycle = **5th to 4th of month** (confirmed with user) — soft-coded as `BILLING_CYCLE_ANCHOR_DAY = 5` near `handleSmsUsage` in `src/dashboard/index.js`. Commits `d3b0407` + `ee461f0`. | dashboard, DB |
 | 2026-04-23 | Rotation cron resumed after session 30 redesign. Added activation-date skip: `queueSimsForRotation` filters out SIMs where `activated_at >= today NY midnight`, and `rotateSingleSim`'s dedup guard does the same check on both stale queue data and fresh DB read. Freshly activated SIMs no longer rotate same-day. | mdn-rotator |
 | 2026-04-23 | details-finalizer Wing IoT runner now backfills `activated_at = NOW()` when the column is null on the SIM being finalized. Never overrides an existing value — preserves real activation timestamps. | details-finalizer |

@@ -4,6 +4,41 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-24 — Teltik billing blocks align to MDN rotations, not to cycle-start day pairs
+
+**Decision:** Teltik 48h billing blocks are computed per-rotation, not by pairing consecutive calendar days from cycle_start. For each `sim_numbers` row in the cycle window, block = `[valid_from, min(next_rotation_valid_from, valid_from + rotation_interval_hours))`. A block is billable iff the sim had any SMS on any EST date the block touches, and the block is assigned to the cycle containing its `valid_from` EST date (never split). The per-sim 48h clock comes from `sims.rotation_interval_hours` (default 48).
+
+**Why:**
+1. The previous logic paired consecutive calendar days `(start, start+1)`, `(start+2, start+3)`, etc. from `cycle_start`. This produced two bugs:
+   - A single physical 48h rotation window (e.g., rotation at noon Apr 6 → noon Apr 8) spans 3 calendar dates, so SMS on different dates could bill TWO pair-blocks for ONE rotation.
+   - A block whose rotation timestamp straddles a cycle boundary would either be double-counted (billed in both cycles) or dropped (billed in neither) depending on how SMS dates fell.
+2. The authoritative source of "when did the SIM get a new MDN" is `sim_numbers.valid_from`, which is stamped at each rotation event. Aligning billing to this data removes the impedance mismatch with the carrier's reality.
+3. Using `min(next_rotation, valid_from + 48h)` as the block upper bound (instead of always `+48h`) prevents overlap when rotations fire <48h apart (≈110 of 885 TrustOTP rotations in Apr 5–23 were under 48h). Overlapping blocks would have let the same SMS trigger two billings.
+
+**Consequence:**
+- Teltik billing cost per cycle moves. TrustOTP Apr 5–23: +$436 (649 blocks × $2.20 block rate, vs. 452 before pagination fix / 601 before rotation fix).
+- If a Teltik SIM has NO rotations within a cycle (unusual — would mean rotator never fired for it in 48h+), that SIM's SMS in the cycle are NOT billed (they belong to the last-started block, which was billed in the prior cycle). This matches user intent: "next cycle won't count that extra day because it's in the 48 block that was billed already."
+- `sims.rotation_interval_hours` is authoritative for block size. If a future vendor (not Teltik) is added with a different block interval, set that column and the existing code handles it — no new branch needed.
+- The handler issues a second PostgREST query for `sim_numbers` in a widened window (`cycle_start - 2 days` to `cycle_end + 3 days`). Don't narrow this without understanding: a rotation whose valid_from is within the cycle can have a block that extends beyond, and we need the subsequent rotation to bound it.
+
+---
+
+## 2026-04-24 — Paginate PostgREST reads in billing handlers (Supabase caps at 1000 regardless of `&limit`)
+
+**Decision:** Added `supabaseGetAllArray(env, pathWithoutLimit)` helper to `src/dashboard/index.js` that loops over `offset+limit=1000` until a short batch returns. Both billing handlers (`handleBillingPreview`, `handleBillingDownloadInvoice`) use it for their `reseller_sims` query. The caller passes the path WITHOUT a `limit` or `offset` — the helper appends them.
+
+**Why:**
+1. Supabase's PostgREST server silently caps every response at 1000 rows regardless of the URL's `&limit=<N>` parameter. This was discovered while debugging TrustOTP (1213 active reseller_sims): the dashboard billing preview was returning only 146 of 202 Teltik sims. The earlier session-level memory ("Default row limit 1000 → add `&limit=5000`") reflects an incorrect assumption — the parameter does NOT override the server cap. The `&limit=5000` pattern is therefore partially misleading; it works only for datasets already under 1000.
+2. Alternatives considered: raising Supabase's `db-max-rows` config (admin-level, impacts every query project-wide) or using PostgreSQL `Range` headers. Offset pagination is the least-invasive, local change — touches one helper and two call sites.
+3. Pagination order needs to be stable across pages. `reseller_sims` has no `id` column (composite PK on `reseller_id + sim_id`); the helper callers add `&order=sim_id.asc` explicitly.
+
+**Consequence:**
+- Any PostgREST query that could legitimately return >1000 rows (sims, reseller_sims, inbound_sms over long windows, sim_sms_daily across many sims) should use `supabaseGetAllArray` going forward — NOT `supabaseGet` with `&limit=5000`. The `&limit=5000` idiom in existing code is mostly safe-by-accident (datasets happen to be small); do not use it as a precedent.
+- If the helper's page size (1000) ever needs to be raised, verify the Supabase `db-max-rows` setting first. Raising the helper's page size beyond the server cap silently truncates again.
+- The helper returns the first non-array response as-is (for error passthrough). Callers that expect arrays should guard with `Array.isArray(rsSims)` (both billing handlers already do).
+
+---
+
 ## 2026-04-23 — SMS Usage analytics: Postgres RPC returning a single JSONB blob
 
 **Decision:** The SMS Usage tab is backed by a single Postgres RPC, `get_sms_usage_summary(p_cycle_start, p_today, p_trend_days)`, that returns one JSONB object with all five views: `vendors`, `wing`, `wing_top`, `wing_bottom`, `trend`. Billing-cycle anchor (`BILLING_CYCLE_ANCHOR_DAY = 5`) lives Worker-side; the Worker computes `p_cycle_start` in EST and passes it into the RPC. Worker edge-caches the response 60s in `caches.default`. Frontend polls every 120s while the tab is visible.
