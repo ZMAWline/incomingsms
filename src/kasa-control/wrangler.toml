@@ -1,0 +1,22 @@
+name = "kasa-control"
+main = "index.js"
+compatibility_date = "2024-01-01"
+account_id = "5313f8b98e20a8915418b2683ad7278c"
+workers_dev = true
+
+# Reboot gateway outlets every 3 hours, skipping the MDN rotation window (UTC 4-11 = NY 0-5).
+# Fires at UTC 00,03,12,15,18,21 → 6 reboots/day at ~3-hour cadence.
+[triggers]
+crons = ["0 0,3,12,15,18,21 * * *"]
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# ============ TEST ENVIRONMENT ============
+[env.test]
+name = "kasa-control-test"
+
+[env.test.observability.logs]
+enabled = true
+invocation_logs = true
