@@ -4,6 +4,34 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-28 — Billing Audit: skip rate-mismatch check on unknown plan IDs (don't guess)
+
+**Decision:** The `PLAN_RATES` map in `src/dashboard/index.js` (Billing Audit section) holds expected vendor prices keyed on `Bypassed Plan ID`. Lines whose plan ID is **not** in the map skip the rate-mismatch check entirely. The other four checks (`unknown_iccid`, `canceled_before_period`, `duplicate_charge`, `missing_from_bill`) still run.
+
+**Why:** Wing sells three plan flavors (Helix `ATT 35MB HX`, Atomic `AT&T Usage AC`, IoT `ATT SMS DC`). Only the Helix plan ID (`'796': 5.00`) was confirmed at build time — user does not yet know plan IDs or per-plan prices for the other two. Three options were considered:
+1. Guess `$5.00` for all → false alarms on every Atomic/IoT line if rate differs.
+2. Treat unknown plan as `unknown_iccid` flag → conflates plan-rate gaps with vendor billing errors.
+3. Skip rate-check when plan unknown (chosen) → no false alarms; user adds entries to `PLAN_RATES` as real bills surface them; everything else still gets audited.
+
+**Consequence:**
+- Do **not** add a fallback default rate to `PLAN_RATES`. The whole point is that absence means "no opinion."
+- When a new plan ID appears on a bill, add `'<plan_id>': <price>` to the `PLAN_RATES` map and re-run `POST /api/bill-audit/recompute` to back-apply rate-mismatch checks to historical uploads.
+- Audit summary's `expected_price` for unknown-plan lines defaults to the **billed price** (so `total_expected ≈ total_billed`, no spurious overcharge). Don't change that.
+
+---
+
+## 2026-04-28 — Bill Audit recompute: paginated reads + bulk upsert (avoids PostgREST 1000-row cap and CF subrequest cap)
+
+**Decision:** `handleBillAuditRecompute` reads bill_audit_lines via `supabaseGetAllArray` (offset+limit loop, page size 1000) and writes back via bulk POST to `/rest/v1/bill_audit_lines?on_conflict=id` with `Prefer: resolution=merge-duplicates,return=minimal`, chunked at 500 rows per request.
+
+**Why:** First-run on the 1186-row historical upload 3 silently failed at the tail because (a) the read used `&limit=10000` which PostgREST silently caps at 1000 — only the first 1000 rows were re-evaluated, leaving 186 untouched; (b) per-row PATCH would have hit the Cloudflare per-request subrequest cap (~1000) on a real-world large bill. After fixing both, recompute correctly processed all 1186 rows in a single endpoint call.
+
+**Consequence:**
+- Both bug classes (PostgREST 1000-row cap, CF subrequest cap on per-row writes) are documented hazards in the project memory. This is a reminder that they apply equally to **maintenance/recompute** endpoints, not just user-facing reads. Any future recompute or sweep that touches >1000 rows should follow the same paginated-read + bulk-write pattern.
+- Bulk upsert with `on_conflict=id` requires sending the full row payload — make sure to include all columns whose values you want preserved (we explicitly map all 19 columns in the upsert payload). If a column is omitted, PostgREST will write its default value (clobbering the existing data).
+
+---
+
 ## 2026-04-28 — `neq.X` PostgREST filters silently drop NULL rows; use `or=(col.is.null,col.neq.X)` when nullability matters
 
 **Decision:** Any PostgREST filter using `neq.X` on a nullable column must wrap the predicate in `or=(col.is.null,col.neq.X)` if NULL rows should be included. Discovered when reviewing the session-38 reseller-sync filter `&rotation_status=neq.failed` — currently 0 rows affected, but the latent bug would silently exclude future bulk-activator SIMs whose `rotation_status` defaults to NULL until first rotation.
