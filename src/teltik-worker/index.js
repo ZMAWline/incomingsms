@@ -190,6 +190,14 @@ async function importTeltikLines(env) {
       imei: null,
     };
 
+    // For brand-new rows only: stamp activation + rotation to import time so the
+    // 48h rotation cron has a baseline. Existing rows are not overwritten.
+    if (!existing) {
+      const nowIso = new Date().toISOString();
+      simData.activated_at = nowIso;
+      simData.last_mdn_rotated_at = nowIso;
+    }
+
     const upsertRes = await supabaseUpsert(env, 'sims', simData, 'iccid');
     if (!upsertRes.ok) {
       const errText = await upsertRes.text();

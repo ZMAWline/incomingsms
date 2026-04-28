@@ -5031,7 +5031,6 @@ function getHTML(helixEnabled) {
                     <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
                     <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
                     <button onclick="bulkModifyImei()" class="px-3 py-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded transition">Modify IMEI</button>
-                    <button onclick="importTeltik()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Import Teltik</button>
                     <button onclick="showBulkSetStatusModal()" class="px-3 py-1.5 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition">Set Status</button>
                     <button onclick="bulkQuery()" class="px-3 py-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 text-white rounded transition">Query</button>
                     <button onclick="bulkRetryActivation()" class="px-3 py-1.5 text-xs bg-pink-600 hover:bg-pink-700 text-white rounded transition">Retry Activation</button>
@@ -5207,6 +5206,15 @@ function getHTML(helixEnabled) {
                             <div>
                                 <p class="font-medium text-white">Reseller Sync</p>
                                 <p class="text-xs text-gray-400">Send webhooks to resellers</p>
+                            </div>
+                        </button>
+                        <button onclick="importTeltik()" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
+                            <div class="w-12 h-12 rounded-lg bg-purple-500/20 flex items-center justify-center flex-shrink-0">
+                                <svg class="w-6 h-6 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                            </div>
+                            <div>
+                                <p class="font-medium text-white">Import Teltik</p>
+                                <p class="text-xs text-gray-400">Fetch all Teltik lines &amp; upsert</p>
                             </div>
                         </button>
                     <!-- Reseller Sync Modal -->
@@ -10660,8 +10668,19 @@ async function sendSimOnline(simId, phoneNumber) {
             assignBtn.onclick = async function() {
                 const resellerId = parseInt(select.value);
                 modal.remove();
-                let assigned = 0, notified = 0, failed = 0;
+                // Open shared bulk progress modal so user can track per-SIM result
+                const output = document.getElementById('sim-action-output');
+                document.getElementById('sim-action-title').textContent = 'Bulk Assign + Notify — ' + simIds.length + ' SIMs';
+                output.textContent = 'Starting...';
+                output.classList.remove('hidden');
+                document.getElementById('sim-action-logs-section').classList.add('hidden');
+                document.getElementById('sim-action-modal').classList.remove('hidden');
+                window.__bulkCancel = false;
+                showBulkCancelButton();
+                let assigned = 0, notified = 0, failed = 0, cancelled = 0;
+                const lines = [];
                 for (const simId of simIds) {
+                    if (window.__bulkCancel) { cancelled = simIds.length - assigned - failed; break; }
                     try {
                         const resp = await fetch(API_BASE + '/assign-reseller', {
                             method: 'POST',
@@ -10680,14 +10699,31 @@ async function sendSimOnline(simId, phoneNumber) {
                                         body: JSON.stringify({ sim_id: simId })
                                     });
                                     const onlineResult = await onlineResp.json();
-                                    if (onlineResp.ok && onlineResult.ok) notified++;
-                                } catch (e) {}
+                                    if (onlineResp.ok && onlineResult.ok) {
+                                        notified++;
+                                        lines.push('SIM #' + simId + ': assigned + notified');
+                                    } else {
+                                        lines.push('SIM #' + simId + ': assigned, notify FAILED — ' + (onlineResult.error || onlineResp.status));
+                                    }
+                                } catch (e) {
+                                    lines.push('SIM #' + simId + ': assigned, notify EXCEPTION — ' + (e && e.message ? e.message : e));
+                                }
+                            } else {
+                                lines.push('SIM #' + simId + ': assigned (skipped notify — not active or no number)');
                             }
-                        } else { failed++; }
-                    } catch (e) { failed++; }
+                        } else {
+                            failed++;
+                            lines.push('SIM #' + simId + ': FAILED — ' + (result.error || 'unknown'));
+                        }
+                    } catch (e) {
+                        failed++;
+                        lines.push('SIM #' + simId + ': EXCEPTION — ' + (e && e.message ? e.message : e));
+                    }
+                    output.textContent = lines.join('\\n') + '\\n\\nProcessing... (' + (assigned + failed) + '/' + simIds.length + ')';
                 }
-                const msg = assigned + ' assigned, ' + notified + ' notified' + (failed ? ', ' + failed + ' failed' : '');
-                showToast(msg, failed ? 'error' : 'success');
+                hideBulkCancelButton();
+                const summary = 'Done: ' + assigned + ' assigned, ' + notified + ' notified' + (failed ? ', ' + failed + ' failed' : '') + (cancelled ? ', ' + cancelled + ' cancelled' : '');
+                output.textContent = summary + '\\n\\n' + lines.join('\\n');
                 loadSims(true);
             };
             btnRow.appendChild(cancelBtn);
