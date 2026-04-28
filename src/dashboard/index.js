@@ -246,19 +246,22 @@ export default {
       return handleBillingCreateInvoice(request, env, corsHeaders);
     }
 
-    if (url.pathname === '/api/wing-bill/upload' && request.method === 'POST') {
-      return handleWingBillUpload(request, env, corsHeaders);
+    if (url.pathname === '/api/bill-audit/upload' && request.method === 'POST') {
+      return handleBillAuditUpload(request, env, corsHeaders);
     }
-    if (url.pathname === '/api/wing-bill/results') {
-      return handleWingBillResults(env, corsHeaders, url);
+    if (url.pathname === '/api/bill-audit/results') {
+      return handleBillAuditResults(env, corsHeaders, url);
     }
-    if (url.pathname === '/api/wing-bill/uploads') {
-      return handleWingBillUploads(env, corsHeaders);
+    if (url.pathname === '/api/bill-audit/uploads') {
+      return handleBillAuditUploads(env, corsHeaders);
     }
-    if (url.pathname === '/api/wing-bill/export') {
-      return handleWingBillExport(env, corsHeaders, url);
+    if (url.pathname === '/api/bill-audit/export') {
+      return handleBillAuditExport(env, corsHeaders, url);
     }
-    if (url.pathname === '/api/wing-bill/backfill-cancel-dates' && request.method === 'POST') {
+    if (url.pathname === '/api/bill-audit/recompute' && request.method === 'POST') {
+      return handleBillAuditRecompute(env, corsHeaders, url);
+    }
+    if (url.pathname === '/api/bill-audit/backfill-cancel-dates' && request.method === 'POST') {
       return handleBackfillCancelDates(env, corsHeaders);
     }
 
@@ -3977,9 +3980,18 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
   }
 }
 
-// ── Wing Bill Verification ────────────────────────────────────────────────────
+// ── Billing Audit (vendor-agnostic, non-prorated) ───────────────────────────
+//
+// Rate map keyed on Wing's "Bypassed Plan ID" column. Add entries as you
+// confirm them on real bills. Lines whose plan ID is NOT in this map skip
+// the rate-mismatch check (other checks still run).
+const PLAN_RATES = {
+    '796': 5.00, // ATT 35MB HX (Helix)
+};
 
-function parseWingCSV(text) {
+const NON_BILLABLE_TERMINAL_STATUSES = new Set(['canceled', 'cancelled', 'error', 'abandoned']);
+
+function parseBillCSV(text) {
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
     if (lines.length < 2) throw new Error('CSV has no data rows');
     const headers = lines[0].split(',').map(h => h.trim());
@@ -4042,101 +4054,84 @@ async function sbPatch(env, path, data) {
     });
 }
 
-const BILLABLE_STATUSES = new Set(['active', 'suspended']);
-
-function calculateBillableDays(statusHistory, simCurrentStatus, fromDate, toDate) {
-    const totalMs = toDate.getTime() - fromDate.getTime();
-    const totalDays = Math.max(1, Math.round(totalMs / (1000 * 60 * 60 * 24)));
-
-    // If no history records, use current status for the whole period
-    if (!statusHistory || statusHistory.length === 0) {
-        const billable = BILLABLE_STATUSES.has(simCurrentStatus);
-        return { billable_days: billable ? totalDays : 0, total_days: totalDays };
-    }
-
-    // Sort history by changed_at
-    const sorted = [...statusHistory].sort((a, b) => new Date(a.changed_at) - new Date(b.changed_at));
-
-    // Determine status at start of period by walking backwards from earliest history
-    // The old_status of the first transition tells us what it was before
-    let currentStatus = sorted[0].old_status || simCurrentStatus;
-    let billableDays = 0;
-    let cursor = fromDate.getTime();
-
-    for (const entry of sorted) {
-        const changeTime = new Date(entry.changed_at).getTime();
-        if (changeTime > toDate.getTime()) break; // past end of period
-
-        const segmentEnd = Math.min(changeTime, toDate.getTime());
-        const segmentStart = Math.max(cursor, fromDate.getTime());
-
-        if (segmentEnd > segmentStart && BILLABLE_STATUSES.has(currentStatus)) {
-            billableDays += (segmentEnd - segmentStart) / (1000 * 60 * 60 * 24);
-        }
-
-        currentStatus = entry.new_status;
-        cursor = changeTime;
-    }
-
-    // Account for remaining time after last transition
-    if (cursor < toDate.getTime()) {
-        const segmentStart = Math.max(cursor, fromDate.getTime());
-        if (BILLABLE_STATUSES.has(currentStatus)) {
-            billableDays += (toDate.getTime() - segmentStart) / (1000 * 60 * 60 * 24);
-        }
-    }
-
-    return { billable_days: Math.round(billableDays), total_days: totalDays };
+// Find the most recent transition into a non-billable terminal status for this SIM.
+// Returns ISO timestamp or null.
+function findCancelTimestamp(history) {
+    if (!history || !history.length) return null;
+    const cancels = history.filter(h => NON_BILLABLE_TERMINAL_STATUSES.has((h.new_status || '').toLowerCase()));
+    if (!cancels.length) return null;
+    cancels.sort((a, b) => new Date(b.changed_at) - new Date(a.changed_at));
+    return cancels[0].changed_at;
 }
 
-async function handleWingBillUpload(request, env, corsHeaders) {
+// Apply the five audit checks to one parsed row. Returns { discrepancyType, discrepancyDetail, expectedPrice }.
+function auditOneLine({ row, sim, history, fromDate }) {
+    const price = parseFloat(row['Price'] || '0');
+    const planId = (row['Bypassed Plan ID'] || '').trim() || null;
+    const knownRate = planId && PLAN_RATES[planId] != null ? PLAN_RATES[planId] : null;
+
+    if (!sim) {
+        return { discrepancyType: 'unknown_iccid', discrepancyDetail: `ICCID ${row['Subscription Iccid'] || '(blank)'} not found in our system`, expectedPrice: 0 };
+    }
+
+    if (NON_BILLABLE_TERMINAL_STATUSES.has((sim.status || '').toLowerCase())) {
+        const canceledAt = findCancelTimestamp(history);
+        if (canceledAt && fromDate && new Date(canceledAt) < fromDate) {
+            const dt = new Date(canceledAt).toISOString().split('T')[0];
+            return { discrepancyType: 'canceled_before_period', discrepancyDetail: `SIM was ${sim.status} as of ${dt}, before bill period start`, expectedPrice: 0 };
+        }
+        // No history record but currently canceled — assume canceled before period (safe flag)
+        if (!canceledAt) {
+            return { discrepancyType: 'canceled_before_period', discrepancyDetail: `SIM is ${sim.status} (no cancel-date record); flag for review`, expectedPrice: 0 };
+        }
+    }
+
+    if (knownRate != null && Math.abs(price - knownRate) > 0.01) {
+        return { discrepancyType: 'rate_mismatch', discrepancyDetail: `Plan ${planId} expected $${knownRate.toFixed(2)} but charged $${price.toFixed(2)}`, expectedPrice: knownRate };
+    }
+
+    return { discrepancyType: null, discrepancyDetail: null, expectedPrice: knownRate != null ? knownRate : price };
+}
+
+async function handleBillAuditUpload(request, env, corsHeaders) {
     try {
-        // 1. Extract CSV
         const formData = await request.formData();
         const file = formData.get('file');
         if (!file) return new Response(JSON.stringify({ error: 'No file uploaded' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         const csvText = await file.text();
-        const filename = file.name || 'wing_bill.csv';
+        const filename = file.name || 'bill.csv';
+        const vendor = (new URL(request.url)).searchParams.get('vendor') || 'wing';
 
-        // 2. Parse CSV
-        const rows = parseWingCSV(csvText);
+        const rows = parseBillCSV(csvText);
         if (!rows.length) return new Response(JSON.stringify({ error: 'CSV has no data rows' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
-        // 3. Create upload record
-        const [upload] = await sbPost(env, 'wing_bill_uploads', { filename, total_rows: rows.length, status: 'processing' });
+        const [upload] = await sbPost(env, 'bill_audit_uploads', { filename, vendor, total_rows: rows.length, status: 'processing' });
         const uploadId = upload.id;
 
-        // 4. Fetch all SIMs
         const allSims = await sbGet(env, 'sims?select=id,iccid,status&limit=10000');
         const simsByIccid = {};
         (allSims || []).forEach(s => { simsByIccid[s.iccid] = s; });
 
-        // 5. Get expected rate
-        const expectedRate = parseFloat(env.WING_EXPECTED_RATE || '5.00');
-
-        // 6. Collect unique SIM IDs for batch history fetch
+        // Pre-resolve sim objects + collect IDs whose history we need (only canceled-status SIMs need it)
         const simIds = new Set();
         const parsedRows = rows.map(row => {
             const iccid = row['Subscription Iccid'] || '';
             const sim = simsByIccid[iccid];
-            if (sim) simIds.add(sim.id);
+            if (sim && NON_BILLABLE_TERMINAL_STATUSES.has((sim.status || '').toLowerCase())) simIds.add(sim.id);
             return { row, iccid, sim };
         });
 
-        // 7. Batch fetch status history for all relevant SIMs
         let allHistory = [];
         if (simIds.size > 0) {
             const idList = [...simIds].join(',');
-            allHistory = await sbGet(env, `sim_status_history?sim_id=in.(${idList})&order=changed_at.asc&limit=50000`) || [];
+            allHistory = await sbGet(env, `sim_status_history?sim_id=in.(${idList})&order=changed_at.desc&limit=50000`) || [];
         }
-        // Group history by sim_id
         const historyBySimId = {};
         allHistory.forEach(h => {
             if (!historyBySimId[h.sim_id]) historyBySimId[h.sim_id] = [];
             historyBySimId[h.sim_id].push(h);
         });
 
-        // 8. Process each row
         const billedIccids = new Set();
         const lineRecords = [];
 
@@ -4144,62 +4139,15 @@ async function handleWingBillUpload(request, env, corsHeaders) {
             const price = parseFloat(row['Price'] || '0');
             const fromDate = row['From Date'] ? new Date(row['From Date']) : null;
             const toDate = row['To Date'] ? new Date(row['To Date']) : null;
+            const planId = (row['Bypassed Plan ID'] || '').trim() || null;
+            const history = sim ? (historyBySimId[sim.id] || []) : [];
 
-            let discrepancyType = null;
-            let discrepancyDetail = null;
-            let expectedPrice = price;
-            let billableDays = null;
-            let totalDays = null;
-
-            if (!sim) {
-                discrepancyType = 'unknown_iccid';
-                discrepancyDetail = `ICCID ${iccid} not found in our system`;
-                expectedPrice = 0;
-            } else if (fromDate && toDate) {
-                const history = historyBySimId[sim.id] || [];
-                // Filter history to relevant period (include some buffer before for context)
-                const relevantHistory = history.filter(h => {
-                    const t = new Date(h.changed_at).getTime();
-                    return t >= fromDate.getTime() && t <= toDate.getTime();
-                });
-
-                const calc = calculateBillableDays(relevantHistory, sim.status, fromDate, toDate);
-                billableDays = calc.billable_days;
-                totalDays = calc.total_days;
-
-                if (billableDays === 0) {
-                    discrepancyType = 'not_billable';
-                    discrepancyDetail = `SIM status is '${sim.status}' — not billable for this period (0/${totalDays} days)`;
-                    expectedPrice = 0;
-                } else if (billableDays < totalDays) {
-                    expectedPrice = Math.round((price / totalDays) * billableDays * 100) / 100;
-                    if (price > expectedPrice + 0.01) {
-                        discrepancyType = 'overcharge';
-                        discrepancyDetail = `Active ${billableDays}/${totalDays} days — expected $${expectedPrice.toFixed(2)}, charged $${price.toFixed(2)}`;
-                    }
-                } else {
-                    // Fully active — check rate
-                    if (Math.abs(price - expectedRate) > 0.01) {
-                        discrepancyType = 'rate_mismatch';
-                        discrepancyDetail = `Expected $${expectedRate.toFixed(2)} but charged $${price.toFixed(2)}`;
-                    }
-                    expectedPrice = expectedRate;
-                }
-            } else {
-                // No dates — can only check rate
-                if (!BILLABLE_STATUSES.has(sim.status)) {
-                    discrepancyType = 'not_billable';
-                    discrepancyDetail = `SIM status is '${sim.status}' — should not be billed`;
-                    expectedPrice = 0;
-                } else if (Math.abs(price - expectedRate) > 0.01) {
-                    discrepancyType = 'rate_mismatch';
-                    discrepancyDetail = `Expected $${expectedRate.toFixed(2)} but charged $${price.toFixed(2)}`;
-                }
-            }
+            const audit = auditOneLine({ row, sim, history, fromDate });
 
             billedIccids.add(iccid);
             lineRecords.push({
                 upload_id: uploadId,
+                vendor,
                 wing_id: row['Id'] || null,
                 item_type: row['Item Type'] || null,
                 description: row['Description'] || null,
@@ -4208,21 +4156,21 @@ async function handleWingBillUpload(request, env, corsHeaders) {
                 subscription_name: row['Subscription Name'] || null,
                 subscription_iccid: iccid || null,
                 subscription_identifier: row['Subscription Identifier'] || null,
+                bypassed_plan_id: planId,
                 carrier: row['Carrier'] || null,
                 price,
                 sim_id: sim?.id || null,
                 sim_status: sim?.status || null,
-                expected_price: expectedPrice,
-                billable_days: billableDays,
-                total_days: totalDays,
-                discrepancy_type: discrepancyType,
-                discrepancy_detail: discrepancyDetail,
+                expected_price: audit.expectedPrice,
+                discrepancy_type: audit.discrepancyType,
+                discrepancy_detail: audit.discrepancyDetail,
             });
         }
 
-        // 9. Duplicate charge detection
+        // Duplicate-charge detection: same ICCID with overlapping periods within this upload
         const byIccid = {};
         lineRecords.forEach(r => {
+            if (!r.subscription_iccid) return;
             if (!byIccid[r.subscription_iccid]) byIccid[r.subscription_iccid] = [];
             byIccid[r.subscription_iccid].push(r);
         });
@@ -4236,21 +4184,20 @@ async function handleWingBillUpload(request, env, corsHeaders) {
                         const bFrom = new Date(b.from_date), bTo = new Date(b.to_date);
                         if (aFrom < bTo && bFrom < aTo && !b.discrepancy_type) {
                             b.discrepancy_type = 'duplicate_charge';
-                            b.discrepancy_detail = `Overlapping period with Wing ID ${a.wing_id}`;
+                            b.discrepancy_detail = `Overlapping period with line ${a.wing_id || a.subscription_iccid}`;
+                            b.expected_price = 0;
                         }
                     }
                 }
             }
         }
 
-        // 10. Missing from bill (active SIMs not in CSV)
-        const activeSims = (allSims || []).filter(s => BILLABLE_STATUSES.has(s.status));
+        const activeSims = (allSims || []).filter(s => !NON_BILLABLE_TERMINAL_STATUSES.has((s.status || '').toLowerCase()) && s.status !== 'provisioning');
         const missingFromBill = activeSims.filter(s => !billedIccids.has(s.iccid));
 
-        // 11. Batch insert line records
         for (let i = 0; i < lineRecords.length; i += 500) {
             const batch = lineRecords.slice(i, i + 500);
-            await fetch(`${env.SUPABASE_URL}/rest/v1/wing_bill_lines`, {
+            await fetch(`${env.SUPABASE_URL}/rest/v1/bill_audit_lines`, {
                 method: 'POST',
                 headers: {
                     'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4262,7 +4209,6 @@ async function handleWingBillUpload(request, env, corsHeaders) {
             });
         }
 
-        // 12. Update upload record
         const discrepancyCount = lineRecords.filter(r => r.discrepancy_type).length;
         const totalAmount = lineRecords.reduce((sum, r) => sum + (r.price || 0), 0);
         const totalExpected = lineRecords.reduce((sum, r) => sum + (r.expected_price || 0), 0);
@@ -4270,7 +4216,7 @@ async function handleWingBillUpload(request, env, corsHeaders) {
         const dates = lineRecords.map(r => r.from_date).filter(Boolean).sort();
         const endDates = lineRecords.map(r => r.to_date).filter(Boolean).sort();
 
-        await sbPatch(env, `wing_bill_uploads?id=eq.${uploadId}`, {
+        await sbPatch(env, `bill_audit_uploads?id=eq.${uploadId}`, {
             status: 'complete',
             total_amount: totalAmount,
             total_expected: totalExpected,
@@ -4280,9 +4226,9 @@ async function handleWingBillUpload(request, env, corsHeaders) {
             billing_period_end: endDates.length ? endDates[endDates.length - 1].split('T')[0] : null,
         });
 
-        // 13. Return results
         return new Response(JSON.stringify({
             upload_id: uploadId,
+            vendor,
             total_rows: lineRecords.length,
             total_amount: totalAmount,
             total_expected: totalExpected,
@@ -4294,18 +4240,18 @@ async function handleWingBillUpload(request, env, corsHeaders) {
         }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
     } catch (e) {
-        console.error('Wing bill upload error:', e);
+        console.error('Bill audit upload error:', e);
         return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 }
 
-async function handleWingBillResults(env, corsHeaders, url) {
+async function handleBillAuditResults(env, corsHeaders, url) {
     const uploadId = url.searchParams.get('upload_id');
     if (!uploadId) return new Response(JSON.stringify({ error: 'upload_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
     const [uploads, lines] = await Promise.all([
-        sbGet(env, `wing_bill_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
-        sbGet(env, `wing_bill_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
+        sbGet(env, `bill_audit_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
+        sbGet(env, `bill_audit_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
     ]);
 
     const upload = Array.isArray(uploads) ? uploads[0] : null;
@@ -4318,33 +4264,31 @@ async function handleWingBillResults(env, corsHeaders, url) {
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
-async function handleWingBillUploads(env, corsHeaders) {
-    const data = await sbGet(env, 'wing_bill_uploads?select=id,filename,billing_period_start,billing_period_end,total_rows,total_amount,total_expected,overcharge_amount,discrepancy_count,status,created_at&order=created_at.desc&limit=50');
+async function handleBillAuditUploads(env, corsHeaders) {
+    const data = await sbGet(env, 'bill_audit_uploads?select=id,vendor,filename,billing_period_start,billing_period_end,total_rows,total_amount,total_expected,overcharge_amount,discrepancy_count,status,created_at&order=created_at.desc&limit=50');
     return new Response(JSON.stringify(data || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
-async function handleWingBillExport(env, corsHeaders, url) {
+async function handleBillAuditExport(env, corsHeaders, url) {
     const uploadId = url.searchParams.get('upload_id');
     if (!uploadId) return new Response('upload_id required', { status: 400 });
 
     const [uploads, lines] = await Promise.all([
-        sbGet(env, `wing_bill_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
-        sbGet(env, `wing_bill_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
+        sbGet(env, `bill_audit_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
+        sbGet(env, `bill_audit_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
     ]);
 
     const upload = Array.isArray(uploads) ? uploads[0] : null;
     if (!upload) return new Response('Upload not found', { status: 404 });
 
     const auditLabels = {
-        'not_billable': 'NOT BILLABLE',
-        'overcharge': 'OVERCHARGE',
         'unknown_iccid': 'UNKNOWN ICCID',
+        'canceled_before_period': 'CANCELED BEFORE PERIOD',
         'rate_mismatch': 'RATE MISMATCH',
         'duplicate_charge': 'DUPLICATE',
     };
 
-    // Build CSV
-    const csvHeaders = 'Wing ID,ICCID,Description,Carrier,From Date,To Date,Billed Amount,Expected Amount,Overcharge,Billable Days,Total Days,SIM Status,Audit Result,Detail';
+    const csvHeaders = 'Bill Line ID,ICCID,Description,Plan ID,Carrier,From Date,To Date,Billed Amount,Expected Amount,Overcharge,SIM Status,Audit Result,Detail';
     const csvRows = (lines || []).map(l => {
         const overcharge = Math.max(0, (l.price || 0) - (l.expected_price || 0));
         const auditResult = l.discrepancy_type ? auditLabels[l.discrepancy_type] || l.discrepancy_type : 'OK';
@@ -4352,30 +4296,26 @@ async function handleWingBillExport(env, corsHeaders, url) {
             l.wing_id || '',
             l.subscription_iccid || '',
             `"${(l.description || '').replace(/"/g, '""')}"`,
+            l.bypassed_plan_id || '',
             l.carrier || '',
             l.from_date ? new Date(l.from_date).toLocaleDateString('en-US') : '',
             l.to_date ? new Date(l.to_date).toLocaleDateString('en-US') : '',
             (l.price || 0).toFixed(2),
             (l.expected_price || 0).toFixed(2),
             overcharge.toFixed(2),
-            l.billable_days ?? '',
-            l.total_days ?? '',
             l.sim_status || 'N/A',
             auditResult,
             `"${(l.discrepancy_detail || '').replace(/"/g, '""')}"`,
         ].join(',');
     });
 
-    // Summary row
     const totalBilled = (lines || []).reduce((s, l) => s + (l.price || 0), 0);
     const totalExpected = (lines || []).reduce((s, l) => s + (l.expected_price || 0), 0);
     const totalOvercharge = Math.max(0, totalBilled - totalExpected);
     csvRows.push('');
-    csvRows.push(`,,,,,,${totalBilled.toFixed(2)},${totalExpected.toFixed(2)},${totalOvercharge.toFixed(2)},,,,"TOTALS",`);
+    csvRows.push(`,,,,,,,${totalBilled.toFixed(2)},${totalExpected.toFixed(2)},${totalOvercharge.toFixed(2)},,"TOTALS",`);
 
     const csv = csvHeaders + '\n' + csvRows.join('\n');
-
-    // Derive invoice number from original filename (e.g. "purchase_8147715.csv" → "purchase_8147715")
     const invoiceName = (upload.filename || '').replace(/\.[^.]+$/, '') || `upload-${uploadId}`;
     const exportFilename = `${invoiceName} - Audit.csv`;
 
@@ -4388,116 +4328,142 @@ async function handleWingBillExport(env, corsHeaders, url) {
     });
 }
 
-// ── One-time backfill: populate sim_status_history cancel dates from Helix ──
-async function handleBackfillCancelDates(env, corsHeaders) {
+// One-time: re-evaluate discrepancies for existing bill_audit_lines using current logic.
+// POST /api/bill-audit/recompute             — recomputes ALL uploads
+// POST /api/bill-audit/recompute?upload_id=X — recomputes one upload
+async function handleBillAuditRecompute(env, corsHeaders, url) {
     try {
-        // 1. Get all canceled SIMs that have a mobility_subscription_id
-        const canceledSims = await sbGet(env, 'sims?select=id,iccid,mobility_subscription_id,status&status=eq.canceled&mobility_subscription_id=not.is.null&limit=5000');
-        if (!canceledSims || !canceledSims.length) {
-            return new Response(JSON.stringify({ ok: true, message: 'No canceled SIMs found', total: 0 }), {
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        const filterUploadId = url.searchParams.get('upload_id');
+        const uploadFilter = filterUploadId ? `?id=eq.${encodeURIComponent(filterUploadId)}` : '?order=id.asc&limit=200';
+        const uploads = await sbGet(env, `bill_audit_uploads${uploadFilter}`);
+        if (!uploads || !uploads.length) {
+            return new Response(JSON.stringify({ ok: true, message: 'No uploads to recompute', uploads_processed: 0 }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+
+        const allSims = await sbGet(env, 'sims?select=id,iccid,status&limit=10000');
+        const simsByIccid = {};
+        (allSims || []).forEach(s => { simsByIccid[s.iccid] = s; });
+
+        const summary = [];
+
+        for (const upload of uploads) {
+            const lines = await supabaseGetAllArray(env, `bill_audit_lines?upload_id=eq.${upload.id}&order=id.asc`) || [];
+            if (!lines.length) { summary.push({ upload_id: upload.id, lines: 0, skipped: true }); continue; }
+
+            const simIds = new Set();
+            lines.forEach(l => {
+                const sim = l.subscription_iccid ? simsByIccid[l.subscription_iccid] : null;
+                if (sim && NON_BILLABLE_TERMINAL_STATUSES.has((sim.status || '').toLowerCase())) simIds.add(sim.id);
             });
-        }
-
-        // 2. Get existing cancel history records so we skip SIMs that already have one
-        const simIds = canceledSims.map(s => s.id);
-        const existingHistory = await sbGet(env, `sim_status_history?select=sim_id&new_status=eq.canceled&sim_id=in.(${simIds.join(',')})&limit=10000`);
-        const alreadyHasHistory = new Set((existingHistory || []).map(h => h.sim_id));
-
-        const needsBackfill = canceledSims.filter(s => !alreadyHasHistory.has(s.id));
-        if (!needsBackfill.length) {
-            return new Response(JSON.stringify({
-                ok: true,
-                message: 'All canceled SIMs already have history records',
-                total_canceled: canceledSims.length,
-                already_have_history: alreadyHasHistory.size,
-                needs_backfill: 0
-            }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        }
-
-        // 3. Get Helix token
-        const tokenRes = await relayFetch(env, env.HX_TOKEN_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                grant_type: 'password',
-                client_id: env.HX_CLIENT_ID,
-                audience: env.HX_AUDIENCE,
-                username: env.HX_GRANT_USERNAME,
-                password: env.HX_GRANT_PASSWORD,
-            }),
-        });
-        const tokenData = await tokenRes.json();
-        if (!tokenRes.ok || !tokenData.access_token) {
-            return new Response(JSON.stringify({ error: 'Failed to get Helix token', details: tokenData }), {
-                status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            let history = [];
+            if (simIds.size > 0) {
+                history = await sbGet(env, `sim_status_history?sim_id=in.(${[...simIds].join(',')})&order=changed_at.desc&limit=50000`) || [];
+            }
+            const historyBySimId = {};
+            history.forEach(h => {
+                if (!historyBySimId[h.sim_id]) historyBySimId[h.sim_id] = [];
+                historyBySimId[h.sim_id].push(h);
             });
-        }
-        const token = tokenData.access_token;
 
-        // 4. Query each SIM's subscriber_details and extract canceledAt
-        const results = { backfilled: 0, no_date: 0, api_errors: 0, skipped: 0, details: [] };
+            // First pass: per-line audit
+            const updated = lines.map(l => {
+                const iccid = l.subscription_iccid || '';
+                const sim = simsByIccid[iccid] || null;
+                const fromDate = l.from_date ? new Date(l.from_date) : null;
+                const row = {
+                    'Subscription Iccid': iccid,
+                    'Bypassed Plan ID': l.bypassed_plan_id || '',
+                    'Price': String(l.price || 0),
+                };
+                const audit = auditOneLine({ row, sim, history: sim ? (historyBySimId[sim.id] || []) : [], fromDate });
+                return {
+                    ...l,
+                    sim_id: sim?.id || null,
+                    sim_status: sim?.status || null,
+                    discrepancy_type: audit.discrepancyType,
+                    discrepancy_detail: audit.discrepancyDetail,
+                    expected_price: audit.expectedPrice,
+                };
+            });
 
-        for (const sim of needsBackfill) {
-            try {
-                const detailsRes = await relayFetch(env, `${env.HX_API_BASE}/api/mobility-subscriber/details`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        Authorization: `Bearer ${token}`,
-                    },
-                    body: JSON.stringify({ mobilitySubscriptionId: parseInt(sim.mobility_subscription_id) }),
-                });
-
-                if (!detailsRes.ok) {
-                    results.api_errors++;
-                    results.details.push({ iccid: sim.iccid, error: `Helix ${detailsRes.status}` });
-                    continue;
+            // Second pass: duplicate-charge across upload
+            const byIccid = {};
+            updated.forEach(r => {
+                if (!r.subscription_iccid) return;
+                if (!byIccid[r.subscription_iccid]) byIccid[r.subscription_iccid] = [];
+                byIccid[r.subscription_iccid].push(r);
+            });
+            for (const entries of Object.values(byIccid)) {
+                if (entries.length < 2) continue;
+                for (let i = 0; i < entries.length; i++) {
+                    for (let j = i + 1; j < entries.length; j++) {
+                        const a = entries[i], b = entries[j];
+                        if (a.from_date && b.from_date && a.to_date && b.to_date) {
+                            const aFrom = new Date(a.from_date), aTo = new Date(a.to_date);
+                            const bFrom = new Date(b.from_date), bTo = new Date(b.to_date);
+                            if (aFrom < bTo && bFrom < aTo && !b.discrepancy_type) {
+                                b.discrepancy_type = 'duplicate_charge';
+                                b.discrepancy_detail = `Overlapping period with line ${a.wing_id || a.subscription_iccid}`;
+                                b.expected_price = 0;
+                            }
+                        }
+                    }
                 }
-
-                const detailsData = await detailsRes.json();
-                const d = Array.isArray(detailsData) ? detailsData[0] : detailsData;
-                const canceledAt = d?.canceledAt || d?.cancelledAt || null;
-
-                if (!canceledAt) {
-                    results.no_date++;
-                    results.details.push({ iccid: sim.iccid, sub_id: sim.mobility_subscription_id, error: 'No canceledAt in Helix response', helix_status: d?.status });
-                    continue;
-                }
-
-                // 5. Insert backfill record into sim_status_history
-                const ts = new Date(canceledAt).toISOString();
-                await sbPost(env, 'sim_status_history', {
-                    sim_id: sim.id,
-                    old_status: 'active', // best guess — was active before cancel
-                    new_status: 'canceled',
-                    changed_at: ts,
-                });
-
-                results.backfilled++;
-                results.details.push({ iccid: sim.iccid, canceled_at: ts });
-
-            } catch (err) {
-                results.api_errors++;
-                results.details.push({ iccid: sim.iccid, error: String(err) });
             }
 
-            // Rate limit: small delay between Helix calls
-            await new Promise(r => setTimeout(r, 200));
+            // Bulk upsert in chunks (avoids CF subrequest cap and PostgREST 1000-row read cap)
+            const upsertRows = updated.map(r => ({
+                id: r.id,
+                upload_id: r.upload_id,
+                vendor: r.vendor,
+                subscription_iccid: r.subscription_iccid,
+                bypassed_plan_id: r.bypassed_plan_id,
+                price: r.price,
+                from_date: r.from_date,
+                to_date: r.to_date,
+                wing_id: r.wing_id,
+                item_type: r.item_type,
+                description: r.description,
+                subscription_name: r.subscription_name,
+                subscription_identifier: r.subscription_identifier,
+                carrier: r.carrier,
+                sim_id: r.sim_id,
+                sim_status: r.sim_status,
+                discrepancy_type: r.discrepancy_type,
+                discrepancy_detail: r.discrepancy_detail,
+                expected_price: r.expected_price,
+            }));
+            for (let i = 0; i < upsertRows.length; i += 500) {
+                const batch = upsertRows.slice(i, i + 500);
+                await fetch(`${env.SUPABASE_URL}/rest/v1/bill_audit_lines?on_conflict=id`, {
+                    method: 'POST',
+                    headers: {
+                        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                        'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                        'Content-Type': 'application/json',
+                        'Prefer': 'resolution=merge-duplicates,return=minimal',
+                    },
+                    body: JSON.stringify(batch),
+                });
+            }
+
+            const totalAmount = updated.reduce((s, r) => s + (r.price || 0), 0);
+            const totalExpected = updated.reduce((s, r) => s + (r.expected_price || 0), 0);
+            const overcharge = Math.max(0, Math.round((totalAmount - totalExpected) * 100) / 100);
+            const discCount = updated.filter(r => r.discrepancy_type).length;
+            await sbPatch(env, `bill_audit_uploads?id=eq.${upload.id}`, {
+                total_amount: totalAmount,
+                total_expected: totalExpected,
+                overcharge_amount: overcharge,
+                discrepancy_count: discCount,
+            });
+
+            summary.push({ upload_id: upload.id, filename: upload.filename, lines: updated.length, discrepancies: discCount, overcharge });
         }
 
-        return new Response(JSON.stringify({
-            ok: true,
-            total_canceled: canceledSims.length,
-            already_have_history: alreadyHasHistory.size,
-            needs_backfill: needsBackfill.length,
-            ...results,
-        }, null, 2), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-
-    } catch (error) {
-        return new Response(JSON.stringify({ error: String(error) }), {
-            status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        });
+        return new Response(JSON.stringify({ ok: true, uploads_processed: summary.length, summary }, null, 2), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 }
 
@@ -5564,56 +5530,62 @@ function getHTML(helixEnabled) {
                     </div>
                 </div>
 
-                <!-- Wing Bill Verification -->
+                <!-- Billing Audit -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6 mt-8">
                     <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-semibold text-white">Wing Bill Verification</h3>
+                        <h3 class="text-lg font-semibold text-white">Billing Audit</h3>
                     </div>
-                    <p class="text-sm text-gray-400 mb-4">Upload the Wing/Helix itemized CSV to cross-reference against SIM records and detect billing discrepancies.</p>
+                    <p class="text-sm text-gray-400 mb-4">Upload a vendor itemized CSV (Wing today; Teltik later) to cross-reference against SIM records. Wing bills full month per line — no proration. Checks: unknown ICCID, canceled before period start, plan rate mismatch, duplicate line, active SIMs missing from bill.</p>
 
                     <div class="flex flex-wrap items-end gap-3 mb-4">
                         <div class="flex flex-col gap-1">
-                            <label class="text-xs text-gray-500 uppercase">CSV File</label>
-                            <input type="file" id="wing-csv-file" accept=".csv" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                            <label class="text-xs text-gray-500 uppercase">Vendor</label>
+                            <select id="audit-vendor" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                                <option value="wing">Wing</option>
+                            </select>
                         </div>
-                        <button onclick="uploadWingBill()" id="wing-upload-btn" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">
-                            Verify Bill
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">CSV File</label>
+                            <input type="file" id="audit-csv-file" accept=".csv" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        </div>
+                        <button onclick="uploadBillAudit()" id="audit-upload-btn" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">
+                            Run Audit
                         </button>
                     </div>
 
-                    <div id="wing-summary" class="hidden mb-4">
+                    <div id="audit-summary" class="hidden mb-4">
                         <div class="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
                             <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
                                 <p class="text-xs text-gray-500 uppercase">Total Lines</p>
-                                <p class="text-xl font-bold text-white" id="wing-total-rows">0</p>
+                                <p class="text-xl font-bold text-white" id="audit-total-rows">0</p>
                             </div>
                             <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
                                 <p class="text-xs text-gray-500 uppercase">Total Billed</p>
-                                <p class="text-xl font-bold text-white" id="wing-total-amount">$0.00</p>
+                                <p class="text-xl font-bold text-white" id="audit-total-amount">$0.00</p>
                             </div>
                             <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
                                 <p class="text-xs text-gray-500 uppercase">Expected</p>
-                                <p class="text-xl font-bold text-accent" id="wing-total-expected">$0.00</p>
+                                <p class="text-xl font-bold text-accent" id="audit-total-expected">$0.00</p>
                             </div>
                             <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
                                 <p class="text-xs text-gray-500 uppercase">Overcharge</p>
-                                <p class="text-xl font-bold text-red-400" id="wing-overcharge">$0.00</p>
+                                <p class="text-xl font-bold text-red-400" id="audit-overcharge">$0.00</p>
                             </div>
                             <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
                                 <p class="text-xs text-gray-500 uppercase">Discrepancies</p>
-                                <p class="text-xl font-bold" id="wing-discrepancy-count">0</p>
+                                <p class="text-xl font-bold" id="audit-discrepancy-count">0</p>
                             </div>
                             <div class="bg-dark-700 rounded-lg p-3 border border-dark-600">
                                 <p class="text-xs text-gray-500 uppercase">Missing from Bill</p>
-                                <p class="text-xl font-bold text-yellow-400" id="wing-missing-count">0</p>
+                                <p class="text-xl font-bold text-yellow-400" id="audit-missing-count">0</p>
                             </div>
                         </div>
-                        <button onclick="exportWingAudit(window._wingUploadId)" id="wing-export-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition mb-4">
+                        <button onclick="exportBillAudit(window._auditUploadId)" id="audit-export-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition mb-4">
                             Export Audit Report (CSV)
                         </button>
                     </div>
 
-                    <div id="wing-discrepancies" class="hidden mb-4">
+                    <div id="audit-discrepancies" class="hidden mb-4">
                         <h4 class="text-sm font-semibold text-red-400 uppercase mb-2">Discrepancies Found</h4>
                         <div class="overflow-x-auto max-h-96 overflow-y-auto">
                             <table class="w-full text-sm">
@@ -5622,20 +5594,20 @@ function getHTML(helixEnabled) {
                                         <th class="px-3 py-2 font-medium">Type</th>
                                         <th class="px-3 py-2 font-medium">ICCID</th>
                                         <th class="px-3 py-2 font-medium">Description</th>
+                                        <th class="px-3 py-2 font-medium">Plan</th>
                                         <th class="px-3 py-2 font-medium">Period</th>
                                         <th class="px-3 py-2 font-medium">Billed</th>
                                         <th class="px-3 py-2 font-medium">Expected</th>
-                                        <th class="px-3 py-2 font-medium">Days</th>
                                         <th class="px-3 py-2 font-medium">Status</th>
                                         <th class="px-3 py-2 font-medium">Detail</th>
                                     </tr>
                                 </thead>
-                                <tbody id="wing-discrepancy-table"></tbody>
+                                <tbody id="audit-discrepancy-table"></tbody>
                             </table>
                         </div>
                     </div>
 
-                    <div id="wing-missing" class="hidden mb-4">
+                    <div id="audit-missing" class="hidden mb-4">
                         <h4 class="text-sm font-semibold text-yellow-400 uppercase mb-2">Active SIMs Missing from Bill</h4>
                         <div class="overflow-x-auto max-h-48 overflow-y-auto">
                             <table class="w-full text-sm">
@@ -5646,20 +5618,21 @@ function getHTML(helixEnabled) {
                                         <th class="px-3 py-2 font-medium">Status</th>
                                     </tr>
                                 </thead>
-                                <tbody id="wing-missing-table"></tbody>
+                                <tbody id="audit-missing-table"></tbody>
                             </table>
                         </div>
                     </div>
                 </div>
 
-                <!-- Wing Verification History -->
+                <!-- Audit History -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
-                    <h3 class="text-lg font-semibold text-white mb-3">Verification History</h3>
+                    <h3 class="text-lg font-semibold text-white mb-3">Audit History</h3>
                     <div class="overflow-x-auto">
                         <table class="w-full">
                             <thead>
                                 <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
                                     <th class="px-4 py-3 font-medium">Date</th>
+                                    <th class="px-4 py-3 font-medium">Vendor</th>
                                     <th class="px-4 py-3 font-medium">File</th>
                                     <th class="px-4 py-3 font-medium">Period</th>
                                     <th class="px-4 py-3 font-medium">Lines</th>
@@ -5669,8 +5642,8 @@ function getHTML(helixEnabled) {
                                     <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody id="wing-history-table" class="text-sm">
-                                <tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No verifications yet</td></tr>
+                            <tbody id="audit-history-table" class="text-sm">
+                                <tr><td colspan="9" class="px-4 py-4 text-center text-gray-500">No audits yet</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -7222,7 +7195,7 @@ function getHTML(helixEnabled) {
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadWingHistory(); }
+            if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadBillAuditHistory(); }
             if (tabName === 'sms-usage') loadSmsUsage();
         }
 
@@ -11445,74 +11418,73 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
-        // ===== Wing Bill Verification =====
+        // ===== Billing Audit =====
 
-        async function uploadWingBill() {
-            const fileInput = document.getElementById('wing-csv-file');
+        async function uploadBillAudit() {
+            const fileInput = document.getElementById('audit-csv-file');
             if (!fileInput.files.length) { showToast('Select a CSV file first', 'error'); return; }
             const file = fileInput.files[0];
-            const btn = document.getElementById('wing-upload-btn');
-            btn.disabled = true; btn.textContent = 'Verifying...';
+            const vendor = document.getElementById('audit-vendor').value || 'wing';
+            const btn = document.getElementById('audit-upload-btn');
+            btn.disabled = true; btn.textContent = 'Running...';
             try {
                 const formData = new FormData();
                 formData.append('file', file);
-                const resp = await fetch(API_BASE + '/wing-bill/upload', {
+                const resp = await fetch(API_BASE + '/bill-audit/upload?vendor=' + encodeURIComponent(vendor), {
                     method: 'POST',
                     credentials: 'include',
                     body: formData,
                 });
                 const data = await resp.json();
                 if (data.error) { showToast(data.error, 'error'); return; }
-                window._wingUploadId = data.upload_id;
-                renderWingResults(data);
-                loadWingHistory();
-                showToast('Verification complete: ' + data.discrepancy_count + ' discrepancies, $' + Number(data.overcharge_amount).toFixed(2) + ' overcharge',
+                window._auditUploadId = data.upload_id;
+                renderBillAuditResults(data);
+                loadBillAuditHistory();
+                showToast('Audit complete: ' + data.discrepancy_count + ' discrepancies, $' + Number(data.overcharge_amount).toFixed(2) + ' overcharge',
                     data.discrepancy_count > 0 ? 'error' : 'success');
             } catch (e) {
                 showToast('Upload failed: ' + e, 'error');
             } finally {
-                btn.disabled = false; btn.textContent = 'Verify Bill';
+                btn.disabled = false; btn.textContent = 'Run Audit';
             }
         }
 
-        function renderWingResults(data) {
-            document.getElementById('wing-summary').classList.remove('hidden');
-            document.getElementById('wing-total-rows').textContent = data.total_rows;
-            document.getElementById('wing-total-amount').textContent = '$' + Number(data.total_amount).toFixed(2);
-            document.getElementById('wing-total-expected').textContent = '$' + Number(data.total_expected).toFixed(2);
-            document.getElementById('wing-overcharge').textContent = '$' + Number(data.overcharge_amount).toFixed(2);
-            const discEl = document.getElementById('wing-discrepancy-count');
+        function renderBillAuditResults(data) {
+            document.getElementById('audit-summary').classList.remove('hidden');
+            document.getElementById('audit-total-rows').textContent = data.total_rows;
+            document.getElementById('audit-total-amount').textContent = '$' + Number(data.total_amount).toFixed(2);
+            document.getElementById('audit-total-expected').textContent = '$' + Number(data.total_expected).toFixed(2);
+            document.getElementById('audit-overcharge').textContent = '$' + Number(data.overcharge_amount).toFixed(2);
+            const discEl = document.getElementById('audit-discrepancy-count');
             discEl.textContent = data.discrepancy_count;
             discEl.className = 'text-xl font-bold ' + (data.discrepancy_count > 0 ? 'text-red-400' : 'text-accent');
-            document.getElementById('wing-missing-count').textContent = data.missing_count || 0;
+            document.getElementById('audit-missing-count').textContent = data.missing_count || 0;
 
             const typeColors = {
-                'not_billable': 'text-red-400',
-                'overcharge': 'text-orange-400',
                 'unknown_iccid': 'text-purple-400',
+                'canceled_before_period': 'text-red-400',
                 'rate_mismatch': 'text-yellow-400',
                 'duplicate_charge': 'text-pink-400',
             };
             const typeLabels = {
-                'not_billable': 'Not Billable',
-                'overcharge': 'Overcharge',
                 'unknown_iccid': 'Unknown ICCID',
+                'canceled_before_period': 'Canceled Before Period',
                 'rate_mismatch': 'Rate Mismatch',
                 'duplicate_charge': 'Duplicate',
             };
 
-            const discSection = document.getElementById('wing-discrepancies');
-            const discTable = document.getElementById('wing-discrepancy-table');
+            const discSection = document.getElementById('audit-discrepancies');
+            const discTable = document.getElementById('audit-discrepancy-table');
             if (data.discrepancies && data.discrepancies.length > 0) {
                 discSection.classList.remove('hidden');
                 discTable.innerHTML = data.discrepancies.map(d => '<tr class="border-b border-dark-700">' +
                     '<td class="px-3 py-2 ' + (typeColors[d.discrepancy_type] || 'text-gray-300') + ' font-medium text-xs">' + (typeLabels[d.discrepancy_type] || d.discrepancy_type) + '</td>' +
                     '<td class="px-3 py-2 text-gray-300 font-mono text-xs">' + (d.subscription_iccid || '-') + '</td>' +
                     '<td class="px-3 py-2 text-gray-400">' + (d.description || '-') + '</td>' +
-                    '<td class="px-3 py-2 text-gray-400 text-xs">' + formatWingDate(d.from_date) + ' - ' + formatWingDate(d.to_date) + '</td>' +
+                    '<td class="px-3 py-2 text-gray-400 text-xs">' + (d.bypassed_plan_id || '-') + '</td>' +
+                    '<td class="px-3 py-2 text-gray-400 text-xs">' + formatAuditDate(d.from_date) + ' - ' + formatAuditDate(d.to_date) + '</td>' +
                     '<td class="px-3 py-2 text-gray-300">$' + Number(d.price).toFixed(2) + '</td>' +
                     '<td class="px-3 py-2 text-accent">$' + Number(d.expected_price || 0).toFixed(2) + '</td>' +
-                    '<td class="px-3 py-2 text-gray-400">' + (d.billable_days != null ? d.billable_days + '/' + d.total_days : '-') + '</td>' +
                     '<td class="px-3 py-2 text-gray-400">' + (d.sim_status || 'N/A') + '</td>' +
                     '<td class="px-3 py-2 text-gray-400 text-xs">' + (d.discrepancy_detail || '') + '</td>' +
                     '</tr>').join('');
@@ -11520,8 +11492,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 discSection.classList.add('hidden');
             }
 
-            const missingSection = document.getElementById('wing-missing');
-            const missingTable = document.getElementById('wing-missing-table');
+            const missingSection = document.getElementById('audit-missing');
+            const missingTable = document.getElementById('audit-missing-table');
             if (data.missing_from_bill && data.missing_from_bill.length > 0) {
                 missingSection.classList.remove('hidden');
                 missingTable.innerHTML = data.missing_from_bill.map(s => '<tr class="border-b border-dark-700">' +
@@ -11534,47 +11506,48 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
-        function formatWingDate(isoStr) {
+        function formatAuditDate(isoStr) {
             if (!isoStr) return '-';
             const d = new Date(isoStr);
             return (d.getMonth()+1) + '/' + d.getDate() + '/' + d.getFullYear();
         }
 
-        async function loadWingHistory() {
+        async function loadBillAuditHistory() {
             try {
-                const resp = await fetch(API_BASE + '/wing-bill/uploads', {
+                const resp = await fetch(API_BASE + '/bill-audit/uploads', {
                     credentials: 'include',
                 });
                 if (!resp.ok) return;
                 const uploads = await resp.json();
-                const tbody = document.getElementById('wing-history-table');
+                const tbody = document.getElementById('audit-history-table');
                 if (!uploads || !uploads.length) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No verifications yet</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-gray-500">No audits yet</td></tr>';
                     return;
                 }
                 tbody.innerHTML = uploads.map(u => '<tr class="border-b border-dark-600">' +
                     '<td class="px-4 py-3 text-gray-400 text-xs">' + new Date(u.created_at).toLocaleString() + '</td>' +
+                    '<td class="px-4 py-3 text-gray-300">' + (u.vendor || 'wing') + '</td>' +
                     '<td class="px-4 py-3 text-gray-300">' + (u.filename || '-') + '</td>' +
                     '<td class="px-4 py-3 text-gray-400 text-xs">' + (u.billing_period_start || '?') + ' - ' + (u.billing_period_end || '?') + '</td>' +
                     '<td class="px-4 py-3 text-gray-300">' + u.total_rows + '</td>' +
                     '<td class="px-4 py-3 text-gray-300">$' + Number(u.total_amount).toFixed(2) + '</td>' +
                     '<td class="px-4 py-3 ' + (u.overcharge_amount > 0 ? 'text-red-400 font-semibold' : 'text-accent') + '">$' + Number(u.overcharge_amount || 0).toFixed(2) + '</td>' +
                     '<td class="px-4 py-3 ' + (u.discrepancy_count > 0 ? 'text-red-400 font-semibold' : 'text-accent') + '">' + u.discrepancy_count + '</td>' +
-                    '<td class="px-4 py-3"><button onclick="viewWingResults(' + u.id + ')" class="text-xs text-blue-400 hover:text-blue-300 mr-2">View</button>' +
-                    '<button onclick="exportWingAudit(' + u.id + ')" class="text-xs text-accent hover:text-green-300">Export</button></td>' +
+                    '<td class="px-4 py-3"><button onclick="viewBillAuditResults(' + u.id + ')" class="text-xs text-blue-400 hover:text-blue-300 mr-2">View</button>' +
+                    '<button onclick="exportBillAudit(' + u.id + ')" class="text-xs text-accent hover:text-green-300">Export</button></td>' +
                     '</tr>').join('');
-            } catch (e) { console.error('loadWingHistory:', e); }
+            } catch (e) { console.error('loadBillAuditHistory:', e); }
         }
 
-        async function viewWingResults(uploadId) {
+        async function viewBillAuditResults(uploadId) {
             try {
-                const resp = await fetch(API_BASE + '/wing-bill/results?upload_id=' + uploadId, {
+                const resp = await fetch(API_BASE + '/bill-audit/results?upload_id=' + uploadId, {
                     credentials: 'include',
                 });
                 const data = await resp.json();
                 if (data.error) { showToast(data.error, 'error'); return; }
-                window._wingUploadId = uploadId;
-                renderWingResults({
+                window._auditUploadId = uploadId;
+                renderBillAuditResults({
                     total_rows: data.upload.total_rows,
                     total_amount: data.upload.total_amount,
                     total_expected: data.upload.total_expected,
@@ -11587,9 +11560,9 @@ async function sendSimOnline(simId, phoneNumber) {
             } catch (e) { showToast('Error: ' + e, 'error'); }
         }
 
-        function exportWingAudit(uploadId) {
-            if (!uploadId) { showToast('No verification to export', 'error'); return; }
-            window.open(API_BASE + '/wing-bill/export?upload_id=' + uploadId, '_blank');
+        function exportBillAudit(uploadId) {
+            if (!uploadId) { showToast('No audit to export', 'error'); return; }
+            window.open(API_BASE + '/bill-audit/export?upload_id=' + uploadId, '_blank');
         }
 
         // Close any visible modal on Escape key or backdrop click
