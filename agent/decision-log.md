@@ -4,6 +4,18 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-28 — `neq.X` PostgREST filters silently drop NULL rows; use `or=(col.is.null,col.neq.X)` when nullability matters
+
+**Decision:** Any PostgREST filter using `neq.X` on a nullable column must wrap the predicate in `or=(col.is.null,col.neq.X)` if NULL rows should be included. Discovered when reviewing the session-38 reseller-sync filter `&rotation_status=neq.failed` — currently 0 rows affected, but the latent bug would silently exclude future bulk-activator SIMs whose `rotation_status` defaults to NULL until first rotation.
+
+**Why:** PostgreSQL evaluates `NULL != 'failed'` as NULL (three-valued logic), and PostgreSQL treats NULL as FALSE in WHERE clauses — so `WHERE rotation_status != 'failed'` returns *only* rows where the column is non-null AND not equal to 'failed'. NULL rows are silently dropped. PostgREST's `neq.X` operator is a thin wrapper around `!=`, so it inherits this. The fix is explicit: `or=(col.is.null,col.neq.X)`.
+
+**Consequence:**
+- Audit any future PostgREST filter using `neq`, `gt`, `lt`, `gte`, `lte`, `like`, `ilike` on a nullable column. If NULL rows should match, wrap in `or=(...)`. If they shouldn't, the bare filter is correct.
+- Schema-level fix (e.g., `rotation_status NOT NULL DEFAULT 'ready'`) would make this safer at the DB layer but requires a backfill migration; deferred.
+
+---
+
 ## 2026-04-27 — Drop `verify_dialable`; let finalizer's plan-guardrail do the work
 
 **Decision:** Removed the synchronous `verify_dialable` poll after PUT-2 in `rotateWingIotSim`. After PUT-2 returns 202, immediately flip the SIM to `provisioning`/`mdn_pending` and return. The details-finalizer's existing plan-guardrail (refuses to mark active while plan ≠ `NON ABIR`) becomes the source of truth for "did AT&T actually commit the dialable swap?" — but asynchronously, on the next 5-min tick.
