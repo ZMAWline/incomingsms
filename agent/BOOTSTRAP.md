@@ -24,8 +24,8 @@ The `.claude/` memory files contain supplementary reference material (Helix endp
 
 ## The 6 Rules You Cannot Break
 
-**1. Never touch the dashboard without reading `agent/constraints.md` first.**
-The dashboard file (`src/dashboard/index.js`) uses CRLF line endings and embeds ALL frontend JS inside a template literal. Every backtick and `${...}` must be escaped. Editing with standard tools silently corrupts it. There is a known history of broken builds here.
+**1. EVERY edit to `src/dashboard/index.js` MUST go through the `patch-dashboard` skill. No exceptions.**
+Before touching the dashboard for any reason — new feature, bug fix, one-line tweak, adding a column, changing a label — invoke the skill first (`Skill` tool with `skill: "patch-dashboard"`). The skill enforces the CRLF-safe Node.js patch-script workflow, the two required syntax checks (outer Worker + frontend JS via `_check_frontend_js.js`), and the explicit-`--env` deploy rule. Do not write a patch script freehand, do not use the Edit tool, do not deploy without running both syntax checks. Violations have repeatedly broken prod (see the 2026-04-15 regex-in-char-class incident where a freehand patch produced invalid regex only the frontend check would have caught). The dashboard file uses CRLF line endings and embeds ALL frontend JS inside a template literal — every backtick and `${...}` must be escaped. Standard tools silently corrupt it.
 
 **2. Always call `op=save` after setting an IMEI on the gateway.**
 The gateway does not persist IMEI changes across reboots unless you explicitly flush to flash. The `handleSetImei` function in `src/skyline-gateway/index.js` already does this — do not remove it.
@@ -41,6 +41,9 @@ Keep migration files in `supabase/migrations/` with a timestamp prefix. Test mig
 
 **6. Shared code belongs in `src/shared/`. Do not copy-paste between workers.**
 Wrangler/esbuild bundles shared modules automatically via relative imports.
+
+**7. All external API calls must use `relayFetch(env, url, init)` — never bare `fetch(url)`.**
+CF Workers cannot reach CF-proxied origins (causes HTTP 522). The relay at `relay.zmawsolutions.com` solves this. Every new carrier API call, webhook, or third-party HTTP call must go through `relayFetch`. Supabase calls and service bindings are exempt. Run `node _check_relay.js` before deploying to verify. See `agent/constraints.md §11` for the full pattern.
 
 ---
 
@@ -60,10 +63,12 @@ cd src/<worker-name>
 printf "the-secret-value" | npx wrangler secret put SECRET_NAME
 ```
 
-### Syntax-check the dashboard after any patch
+### Syntax-check the dashboard after any patch (TWO checks required — both non-negotiable)
 ```bash
-node --input-type=module --check < src/dashboard/index.js
+node --input-type=module --check < src/dashboard/index.js   # outer Worker module
+node _check_frontend_js.js                                   # frontend JS inside <script>
 ```
+Check 1 alone is insufficient — escaping bugs in the frontend JS appear as strings to Node and pass Check 1 while breaking the browser. The `patch-dashboard` skill runs both automatically; do not skip either.
 
 ### Trigger a manual MDN rotation run
 ```

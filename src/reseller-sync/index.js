@@ -21,17 +21,22 @@ export default {
     const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 2000, 1) : 2000;
     const force = url.searchParams.get("force") === "true";
 
-    const result = await runResellerSync(env, limit, force);
-    return json(result, 200);
+    const online = await runResellerSync(env, limit, force);
+    const offline = await runOfflineRetrySweep(env);
+    return json({ ok: true, online, offline }, 200);
   },
 
   // Daily backstop cron: 15:00 UTC (10 AM EST / after all rotations complete)
   // Catches any SIMs whose number.online failed during the mdn-rotator rotation run.
   // Uses force=false so dedup skips already-delivered SIMs and only re-sends misses.
+  // Then runs runOfflineRetrySweep to retry any failed number.offline deliveries
+  // from the last 24h.
   async scheduled(event, env, ctx) {
     console.log('[Cron] reseller-sync daily backstop starting');
-    const result = await runResellerSync(env, 2000, false);
-    console.log(`[Cron] reseller-sync done: ${result.synced} sent, ${result.skipped} skipped, ${result.errors} errors`);
+    const online = await runResellerSync(env, 2000, false);
+    console.log(`[Cron] reseller-sync online: ${online.synced} sent, ${online.skipped} skipped, ${online.errors} errors`);
+    const offline = await runOfflineRetrySweep(env);
+    console.log(`[Cron] reseller-sync offline: ${offline.retried} retried, ${offline.recovered} recovered, ${offline.stillFailed} still failed`);
   },
 };
 
@@ -40,10 +45,13 @@ export default {
 async function runResellerSync(env, limit, force = false) {
   const startedAt = new Date().toISOString();
 
-  // Fetch active SIMs with current numbers, reseller info, and webhook URLs in ONE query
+  // Fetch active SIMs with current numbers, reseller info, and webhook URLs in ONE query.
+  // rotation_status=neq.failed excludes wing_iot SIMs flagged as stuck on the ABIR (non-dialable)
+  // plan — broadcasting a 5xxx interim MDN as "online" would let resellers route inbound SMS to
+  // a number that can't receive normal calls/messages.
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
+    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&rotation_status=neq.failed&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
   );
 
   let attempted = sims.length;
@@ -79,12 +87,14 @@ async function runResellerSync(env, limit, force = false) {
         continue;
       }
 
-      const intervalMs = (sim.rotation_interval_hours || 24) * 60 * 60 * 1000;
-      const cutoff = new Date(Date.now() - intervalMs).toISOString();
-      if (sim.last_notified_at && sim.last_notified_at > cutoff) {
-        skipped++;
-        details.push({ sim_id: simId, ok: true, skipped: true, reason: "Notified within rotation interval" });
-        continue;
+      if (!force) {
+        const intervalMs = (sim.rotation_interval_hours || 24) * 60 * 60 * 1000;
+        const cutoff = new Date(Date.now() - intervalMs).toISOString();
+        if (sim.last_notified_at && sim.last_notified_at > cutoff) {
+          skipped++;
+          details.push({ sim_id: simId, ok: true, skipped: true, reason: "Notified within rotation interval" });
+          continue;
+        }
       }
 
       const result = await sendWebhookWithDeduplication(env, webhookUrl, {
@@ -96,7 +106,7 @@ async function runResellerSync(env, limit, force = false) {
           number: currentNumber,
           status: sim.status,
           online: true,
-          online_until: sim.vendor === 'teltik' ? midnightNYAfterInterval(sim.last_mdn_rotated_at, sim.rotation_interval_hours || 48) : nextRotationUtcISO(),
+          online_until: midnightNYAfterInterval(sim.last_mdn_rotated_at, sim.rotation_interval_hours || 24),
           carrier: sim.vendor === 'teltik' ? 'T-Mobile' : 'att',
           verified: true,
         },
@@ -161,6 +171,18 @@ async function runResellerSync(env, limit, force = false) {
   };
 }
 
+/* ---------------- Relay ---------------- */
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
+}
+
 /* ---------------- Supabase ---------------- */
 
 async function sbGetArray(env, path) {
@@ -185,15 +207,75 @@ async function sbGetArray(env, path) {
   return data;
 }
 
+async function sbPatch(env, path, body) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Supabase PATCH ${res.status}: ${t}`);
+  }
+}
+
+/* ---------------- Offline retry sweep ---------------- */
+// Iterates webhook_deliveries rows where event_type='number.offline' AND status='failed'
+// AND created_at within the last 24h. Re-posts each one with the original message_id
+// (so dedup still applies on the receiver side) and updates the row status on success.
+
+async function runOfflineRetrySweep(env) {
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const failed = await sbGetArray(env,
+    `webhook_deliveries?select=id,webhook_url,payload,attempts,reseller_id,message_id` +
+    `&event_type=eq.number.offline&status=eq.failed` +
+    `&created_at=gte.${encodeURIComponent(since)}` +
+    `&limit=500`
+  );
+  let retried = 0, recovered = 0, stillFailed = 0;
+  for (const row of failed) {
+    retried++;
+    try {
+      const result = await postWebhookWithRetry(env, row.webhook_url, row.payload, { messageId: row.message_id });
+      const total = (row.attempts || 0) + (result.attempts || 0);
+      if (result.ok) {
+        recovered++;
+        await sbPatch(env, `webhook_deliveries?id=eq.${row.id}`, {
+          status: 'delivered',
+          delivered_at: new Date().toISOString(),
+          last_attempt_at: new Date().toISOString(),
+          attempts: total,
+        });
+      } else {
+        stillFailed++;
+        await sbPatch(env, `webhook_deliveries?id=eq.${row.id}`, {
+          attempts: total,
+          last_attempt_at: new Date().toISOString(),
+        });
+      }
+    } catch (e) {
+      stillFailed++;
+      console.error(`[OfflineRetry] row ${row.id} threw: ${e}`);
+    }
+  }
+  return { retried, recovered, stillFailed };
+}
+
 /* ---------------- Webhook Utilities ---------------- */
 
 async function generateMessageIdAsync(components) {
   const { eventType, simId, iccid, number, from, body, timestamp } = components;
 
-  // number.online: deduplicate per day so mdn-rotator and reseller-sync share the same key.
+  // number.online / number.offline: deduplicate per day so mdn-rotator,
+  // details-finalizer, and reseller-sync share the same key.
   // Other events: deduplicate per minute.
   let dedupeTs;
-  if (eventType === 'number.online') {
+  if (eventType === 'number.online' || eventType === 'number.offline') {
     dedupeTs = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
   } else {
     dedupeTs = timestamp
@@ -255,7 +337,7 @@ async function recordWebhookDelivery(env, delivery) {
   });
 }
 
-async function postWebhookWithRetry(url, payload, options = {}) {
+async function postWebhookWithRetry(env, url, payload, options = {}) {
   const { maxRetries = 4, initialDelayMs = 1000, messageId = 'unknown' } = options;
 
   let lastError = null;
@@ -265,7 +347,7 @@ async function postWebhookWithRetry(url, payload, options = {}) {
     try {
       console.log(`[Webhook] Attempt ${attempt}/${maxRetries + 1} for ${messageId} to ${url}`);
 
-      const res = await fetch(url, {
+      const res = await relayFetch(env, url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -331,7 +413,7 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
     }
   }
 
-  const result = await postWebhookWithRetry(webhookUrl, payload, { messageId });
+  const result = await postWebhookWithRetry(env, webhookUrl, payload, { messageId });
 
   try {
     await recordWebhookDelivery(env, {

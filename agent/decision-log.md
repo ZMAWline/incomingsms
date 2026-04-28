@@ -4,6 +4,48 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-27 — Drop `verify_dialable`; let finalizer's plan-guardrail do the work
+
+**Decision:** Removed the synchronous `verify_dialable` poll after PUT-2 in `rotateWingIotSim`. After PUT-2 returns 202, immediately flip the SIM to `provisioning`/`mdn_pending` and return. The details-finalizer's existing plan-guardrail (refuses to mark active while plan ≠ `NON ABIR`) becomes the source of truth for "did AT&T actually commit the dialable swap?" — but asynchronously, on the next 5-min tick.
+
+Kept `verify_non_dialable` (the FIRST verify) — it provides the natural delay between PUT-1 and PUT-2 *and* catches the case where AT&T didn't transition to ABIR (without that, PUT-2 would race ahead with no mid-state).
+
+Also bumped `verifyPlan` budget from 12×2.5 s (30 s) → 30×3 s (90 s) to ride out AT&T's slow commits when verify is needed.
+
+**Why:**
+1. Tonight's NY 0–5 rotation flagged the entire 270-SIM Wing IoT fleet as `rotation_failed` because `verify_dialable` timed out at 30 s. The carrier_api_logs showed AT&T's `dateUpdated` advancing to ~3 s *after* our verify gave up — the rotations actually succeeded, but our DB recorded them as failures.
+2. The finalizer already polls AT&T every 5 min and already has a guardrail refusing to mark active while plan ≠ NON ABIR. Synchronous verify in the rotator is duplicate verification with stricter timing. Dropping it shifts the "wait for AT&T to commit" responsibility to the layer that's *designed* to wait (cron-based, can poll forever) rather than the rotator (single-pass, fixed budget).
+3. Per the Provisioning + details-finalizer pattern from 2026-04-24, the rotator's job is to *initiate*, not *confirm*. Verify_dialable was the last violation of that pattern in the wing path.
+
+**Consequence:**
+- The finalizer's plan-guardrail at `details-finalizer/index.js:178` is now load-bearing for wing_iot rotation correctness. Don't remove it without restoring synchronous verify.
+- If AT&T never commits the dialable swap (true stuck-on-ABIR case), the SIM stays in `provisioning/mdn_pending` indefinitely — finalizer skips with `pending: true` notes. The new `runWingIotCleanupSweep` + `processRotationBatch` stuck-wing pass are how you eventually flip those to `rotation_status=failed` so they can be remediated.
+- `carrier_api_logs` will no longer contain `verify_dialable` entries for wing_iot rotations going forward. Old entries remain.
+
+---
+
+## 2026-04-27 — `rotation_status='failed'` is the universal "do not notify online" signal
+
+**Decision:** Use the existing `sims.rotation_status` column (specifically the value `'failed'`) as the cross-worker signal that a wing_iot SIM is in a known-bad MDN state and `number.online` must NOT be sent. Filter on it in three layers:
+
+1. **`reseller-sync` daily backstop** — query gains `&rotation_status=neq.failed`.
+2. **Dashboard force-resend handlers** — refuse to fire if `sim.rotation_status === 'failed'` for wing_iot.
+3. **Defensive guard inside `sendNumberOnlineWebhook`** — early-return if a sim's `vendor='wing_iot' AND rotation_status='failed'`. Catches any future caller that didn't pre-filter.
+
+The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are responsible for *setting* the flag (when AT&T returns plan=ABIR or any non-NON-ABIR plan).
+
+**Why:**
+1. We considered a new column (`plan_dialable boolean` or `current_plan text`) but that requires a migration AND backfill AND a separate update path. `rotation_status` already changes when rotation goes wrong, and it's already what `processRotationBatch`'s stuck-wing pass uses to find SIMs to remediate. Reusing it keeps the system simpler.
+2. We considered MDN-prefix heuristics (5xx prefixes are non-dialable) but the prefix space overlaps with real US area codes (510, 559, 561…). `rotation_status` is explicit, source-of-truth, and not a heuristic.
+3. The 3-layer enforcement (query filter + handler check + helper guard) is intentional — the layered defense means a future developer adding a new `number.online` call site doesn't have to remember the rule. The defensive guard catches them.
+
+**Consequence:**
+- **Anything that flips `rotation_status='failed'` for a wing_iot SIM will silently suppress its `number.online` notifications.** This is intended for ABIR-stuck SIMs but also catches any other `failed` cause. If that's wrong, narrow the predicate (e.g., also check `last_rotation_error` for "ABIR" string) — but for now, broad-and-safe is correct.
+- The defensive guard adds one Supabase round-trip per `number.online` call. Acceptable cost. If it becomes a hot-path issue, denormalize the flag onto a faster store or remove the guard and rely on the call-site filters.
+- When clearing `rotation_status='failed'` (e.g., after successful remediation via `runWingIotFinalizer`), `number.online` resumes automatically. The flag IS the gate.
+
+---
+
 ## 2026-04-24 evening — Provisioning + details-finalizer is the universal "async rotation" pattern
 
 **Decision:** Every vendor whose carrier API is asynchronous or can return before the state mutation commits now uses the same pipeline:

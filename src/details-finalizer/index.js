@@ -16,8 +16,18 @@ const TELTIK_BASE = 'https://api.smsgateway.xyz';
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname === '/sweep-wing-cleanup') {
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 200);
+      const offset = parseInt(url.searchParams.get('offset') || '0', 10) || 0;
+      const result = await runWingIotCleanupSweep(env, { limit, offset });
+      return json(result);
+    }
     if (url.pathname !== '/run') {
-      return new Response('details-finalizer ok. Use /run?secret=...', { status: 200 });
+      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0', { status: 200 });
     }
     const secret = url.searchParams.get('secret') || '';
     if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
@@ -172,6 +182,16 @@ async function runWingIotFinalizer(env, limit) {
 
       const e164 = normalizeUS(mdnRaw);
 
+      // Fire offline for the OLD MDN before closing it (only on rotation, not first activation).
+      const oldMsisdnBare = sim.msisdn || '';
+      if (oldMsisdnBare && oldMsisdnBare !== msisdnBare) {
+        try {
+          await sendNumberOfflineWebhook(env, sim.id, normalizeUS(oldMsisdnBare), sim.iccid, oldMsisdnBare, e164);
+        } catch (offErr) {
+          console.error(`[Finalizer/WingIoT] SIM ${sim.id}: number.offline failed: ${offErr}`);
+        }
+      }
+
       await closeCurrentNumber(env, sim.id);
       await insertNewNumber(env, sim.id, e164);
 
@@ -198,6 +218,127 @@ async function runWingIotFinalizer(env, limit) {
   }
 
   return { ok: true, processed, synced, errors, results };
+}
+
+/* ── Wing IoT cleanup sweep — one-shot reconciliation ────────────────────── */
+// Iterates wing_iot SIMs (status NOT IN canceled/error). For each:
+//   - GET AT&T device state
+//   - If status=ACTIVATED + plan=NON ABIR: sync DB to active+success, write
+//     sim_numbers if MDN changed, fire number.online webhook unconditionally
+//   - Else (wrong plan or wrong status): set rotation_status='failed' so the
+//     mdn-rotator's stuck-wing remediation pass picks it up
+// Concurrency 5; paginate with offset/limit so the request fits in the
+// CF Worker wall-clock budget.
+
+async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
+  if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
+    return { ok: false, error: 'wing_iot_credentials_missing' };
+  }
+
+  const sims = await supabaseSelect(
+    env,
+    `sims?select=id,iccid,msisdn,status,rotation_status,activated_at` +
+    `&vendor=eq.wing_iot` +
+    `&status=neq.canceled` +
+    `&status=neq.error` +
+    `&order=id.asc&limit=${limit}&offset=${offset}`
+  );
+  if (!sims || sims.length === 0) {
+    return { ok: true, processed: 0, offset, limit, next_offset: offset, message: 'no SIMs at offset' };
+  }
+
+  const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
+  const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
+  const headers = { Authorization: auth, Accept: 'application/json' };
+  const DIALABLE_PLAN = 'Wing Tel Inc - NON ABIR SMS MO/MT US';
+
+  let synced = 0, marked_failed = 0, errors = 0, webhooks_sent = 0, skipped = 0;
+  const sample = [];
+  const concurrency = 5;
+  let nextIdx = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = nextIdx++;
+      if (idx >= sims.length) return;
+      const sim = sims[idx];
+      try {
+        const url = baseUrl + '/v1/devices/' + encodeURIComponent(sim.iccid);
+        const res = await relayFetch(env, url, { method: 'GET', headers });
+        if (!res.ok) {
+          errors++;
+          if (sample.length < 10) sample.push({ id: sim.id, iccid: sim.iccid, ok: false, error: 'GET ' + res.status });
+          continue;
+        }
+        const data = await res.json().catch(() => ({}));
+        const wingStatus = (data.status || '').toLowerCase();
+        const plan = data.communicationPlan || '';
+        const mdnRaw = data.msisdn || data.mdn || null;
+
+        if ((wingStatus === 'activated' || wingStatus === 'active')) {
+          if (plan === DIALABLE_PLAN && mdnRaw) {
+            const msisdnBare = String(mdnRaw).replace(/^\+?1?/, '');
+            const e164 = normalizeUS(mdnRaw);
+            if (sim.msisdn !== msisdnBare) {
+              // Offline for old MDN before close (skip when there was no prior MDN).
+              if (sim.msisdn) {
+                try {
+                  await sendNumberOfflineWebhook(env, sim.id, normalizeUS(sim.msisdn), sim.iccid, sim.msisdn, e164);
+                } catch (offErr) {
+                  console.error(`[Sweep/WingIoT] SIM ${sim.id}: number.offline failed: ${offErr}`);
+                }
+              }
+              await closeCurrentNumber(env, sim.id);
+              await insertNewNumber(env, sim.id, e164);
+            }
+            const patch = {
+              status: 'active',
+              rotation_status: 'success',
+              msisdn: msisdnBare,
+              last_rotation_error: null,
+            };
+            if (!sim.activated_at) patch.activated_at = new Date().toISOString();
+            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+            try {
+              await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare);
+              webhooks_sent++;
+            } catch (we) {
+              // Webhook failure shouldn't fail the whole sweep — already logged in helper.
+            }
+            synced++;
+            if (sample.length < 10) sample.push({ id: sim.id, iccid: sim.iccid, action: 'synced', mdn: msisdnBare });
+          } else {
+            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+              rotation_status: 'failed',
+              last_rotation_error: 'Sweep cleanup: plan="' + plan + '" mdn=' + mdnRaw + '. Flagged for mdn-rotator retry at ' + new Date().toISOString(),
+            });
+            marked_failed++;
+            if (sample.length < 10) sample.push({ id: sim.id, iccid: sim.iccid, action: 'marked_failed', plan, mdn: mdnRaw });
+          }
+        } else {
+          // SIM not active on AT&T (e.g., shipped, deactivated). Leave alone.
+          skipped++;
+          if (sample.length < 10) sample.push({ id: sim.id, iccid: sim.iccid, action: 'skipped', att_status: wingStatus });
+        }
+      } catch (e) {
+        errors++;
+        if (sample.length < 10) sample.push({ id: sim.id, iccid: sim.iccid, ok: false, error: String(e) });
+      }
+    }
+  }
+
+  const workers = [];
+  for (let i = 0; i < concurrency; i++) workers.push(worker());
+  await Promise.all(workers);
+
+  return {
+    ok: true,
+    offset, limit,
+    processed: sims.length,
+    synced, marked_failed, errors, webhooks_sent, skipped,
+    next_offset: offset + sims.length,
+    sample,
+  };
 }
 
 /* ── Teltik finalizer ─────────────────────────────────────────────────────── */
@@ -273,6 +414,17 @@ async function runTeltikFinalizer(env, limit) {
 
       // Finalize
       const e164 = `+1${msisdnBare}`;
+
+      // Offline for old MDN (only on rotation, not first activation).
+      const oldMsisdnBare = sim.msisdn || '';
+      if (oldMsisdnBare && oldMsisdnBare !== msisdnBare) {
+        try {
+          await sendNumberOfflineWebhook(env, sim.id, `+1${oldMsisdnBare}`, sim.iccid, oldMsisdnBare, e164);
+        } catch (offErr) {
+          console.error(`[Finalizer/Teltik] SIM ${sim.id}: number.offline failed: ${offErr}`);
+        }
+      }
+
       await closeCurrentNumber(env, sim.id);
       await insertNewNumber(env, sim.id, e164);
       await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
@@ -435,6 +587,16 @@ async function runAtomicFinalizer(env, limit) {
       }
 
       const e164 = `+1${newMsisdn}`;
+
+      // Offline for old MDN (only on rotation, not first activation).
+      if (sim.msisdn && sim.msisdn !== newMsisdn) {
+        try {
+          await sendNumberOfflineWebhook(env, sim.id, `+1${sim.msisdn}`, sim.iccid, sim.msisdn, e164);
+        } catch (offErr) {
+          console.error(`[Finalizer/ATOMIC] SIM ${sim.id}: number.offline failed: ${offErr}`);
+        }
+      }
+
       await closeCurrentNumber(env, sim.id);
       await insertNewNumber(env, sim.id, e164);
       await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
@@ -573,6 +735,19 @@ function normalizeUS(phone) {
 /* ── Webhook (number.online) ──────────────────────────────────────────────── */
 
 async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscriptionId) {
+  // Defensive guard: never fire number.online for a wing_iot SIM stuck in
+  // rotation_status='failed' — that signals it's on the non-dialable ABIR plan
+  // and the MDN we're about to broadcast is a 5xxx interim number that can't
+  // receive normal SMS. The cleanup sweep + processRotationBatch flag these.
+  const guard = await supabaseSelect(env,
+    `sims?select=vendor,rotation_status&id=eq.${encodeURIComponent(String(simId))}&limit=1`
+  ).catch(() => []);
+  const guardRow = Array.isArray(guard) && guard[0];
+  if (guardRow && guardRow.vendor === 'wing_iot' && guardRow.rotation_status === 'failed') {
+    console.log(`[Webhook] SIM ${simId}: skipping number.online — wing_iot rotation_status=failed (likely on ABIR)`);
+    return;
+  }
+
   const resellerId = await findResellerIdBySimId(env, simId);
   if (!resellerId) {
     console.log(`[Webhook] SIM ${simId}: no active reseller, skipping number.online`);
@@ -611,6 +786,43 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
       console.error(`[Webhook] SIM ${simId}: last_notified_at PATCH failed: ${err}`);
     }
   }
+}
+
+/* ── Webhook (number.offline) ─────────────────────────────────────────────── */
+// Fired before closeCurrentNumber when an MDN is being replaced. Resellers that
+// route by phone-number (not sim_id) need the OLD number's offline event so they
+// can deprovision the route before AT&T reassigns the MDN to another customer.
+async function sendNumberOfflineWebhook(env, simId, oldNumber, iccid, oldMobilityId, newNumber) {
+  const resellerId = await findResellerIdBySimId(env, simId);
+  if (!resellerId) {
+    console.log(`[Webhook] SIM ${simId}: no active reseller, skipping number.offline`);
+    return;
+  }
+  const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
+  if (!webhookUrl) {
+    console.log(`[Webhook] SIM ${simId}: reseller ${resellerId} has no enabled webhook, skipping number.offline`);
+    return;
+  }
+
+  const result = await sendWebhookWithDeduplication(env, webhookUrl, {
+    event_type: 'number.offline',
+    created_at: new Date().toISOString(),
+    data: {
+      sim_id: simId,
+      number: oldNumber,
+      online: false,
+      iccid,
+      mobilitySubscriptionId: oldMobilityId,
+      replaced_by: newNumber,
+      verified: true,
+    },
+  }, { idComponents: { simId, iccid, number: oldNumber }, resellerId });
+
+  if (!result.ok) {
+    console.error(`[Webhook] SIM ${simId}: number.offline FAILED after ${result.attempts} attempts (old=${oldNumber})`);
+  }
+  // Deliberately do NOT stamp last_notified_at — that's specifically the last
+  // online notification timestamp.
 }
 
 async function findResellerIdBySimId(env, simId) {
@@ -677,7 +889,7 @@ async function generateMessageIdAsync(components) {
   const { eventType, simId, iccid, number, from, body, timestamp } = components;
 
   let dedupeTs;
-  if (eventType === 'number.online') {
+  if (eventType === 'number.online' || eventType === 'number.offline') {
     dedupeTs = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
   } else {
     dedupeTs = timestamp

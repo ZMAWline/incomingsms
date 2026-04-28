@@ -1315,15 +1315,41 @@ async function processRotationBatch(env, options = {}) {
     return false;
   }).slice(0, limit);
 
-  if (candidates.length === 0) {
+  // Stuck-wing remediation: pick up wing_iot SIMs flagged rotation_status='failed'
+  // (typically marked by dashboard Query when AT&T reports the SIM on ABIR). These
+  // bypass the daily dedup — we force-rotate via rotateWingIotSim, which detects
+  // "already on ABIR" in pre_rotate_get and skips PUT-1 → goes straight to PUT-2.
+  const stuckWingQuery =
+    `sims?select=id,iccid,vendor,status,msisdn,last_mdn_rotated_at,activated_at,activation_zip,rotation_eligible` +
+    `&vendor=eq.wing_iot&rotation_status=eq.failed&status=neq.canceled&limit=${limit}`;
+  const stuckRaw = await supabaseSelect(env, stuckWingQuery).catch(() => []);
+  const stuckCandidates = Array.isArray(stuckRaw) ? stuckRaw : [];
+
+  if (candidates.length === 0 && stuckCandidates.length === 0) {
     console.log('[ProcessBatch] no eligible SIMs');
-    return { ok: true, attempted: 0, ok: 0, skipped: 0, failed: 0 };
+    return { ok: true, attempted: 0, ok_count: 0, skipped: 0, failed: 0, stuck_ok: 0, stuck_failed: 0 };
   }
 
   let token = null;
   try { token = await getCachedToken(env); } catch (err) {
     // Token fetch failure is non-fatal: ATOMIC / Wing IoT SIMs don't need it.
     console.warn(`[ProcessBatch] Helix token fetch failed (ok for non-helix): ${err}`);
+  }
+
+  // Process stuck-wing remediation first — these are broken SIMs (non-dialable).
+  let stuckOk = 0, stuckFailed = 0;
+  if (stuckCandidates.length > 0) {
+    console.log(`[ProcessBatch] remediating ${stuckCandidates.length} stuck wing_iot SIMs (rotation_status=failed) with force=true`);
+    await runWithConcurrency(stuckCandidates, concurrency, async (sim) => {
+      try {
+        await rotateWingIotSim(env, sim, { force: true });
+        stuckOk++;
+      } catch (err) {
+        stuckFailed++;
+        console.error(`[ProcessBatch/StuckWing] SIM ${sim.iccid} failed: ${err}`);
+        await updateSimRotationError(env, sim.id, `Stuck-wing remediation failed: ${err}`).catch(() => {});
+      }
+    });
   }
 
   let ok = 0, skipped = 0, failed = 0;
@@ -1339,8 +1365,8 @@ async function processRotationBatch(env, options = {}) {
     }
   });
 
-  console.log(`[ProcessBatch] attempted=${candidates.length} ok=${ok} skipped=${skipped} failed=${failed}`);
-  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed };
+  console.log(`[ProcessBatch] attempted=${candidates.length} ok=${ok} skipped=${skipped} failed=${failed} stuck_ok=${stuckOk} stuck_failed=${stuckFailed}`);
+  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed, stuck_ok: stuckOk, stuck_failed: stuckFailed };
 }
 
 // ===========================
@@ -1480,17 +1506,23 @@ async function rotateWingIotSim(env, sim, opts = {}) {
   });
   if (!getRes.ok) throw new Error('Wing IoT GET device failed: ' + getRes.status);
   const oldMdn = getJson.mdn || getJson.msisdn || null;
+  const oldPlan = getJson.communicationPlan || null;
+  const ABIR_PLAN = 'Wing Tel Inc - ABIR 25Mbps SMS MO/MT US';
+  const DIALABLE_PLAN = 'Wing Tel Inc - NON ABIR SMS MO/MT US';
 
   // Per Wing API doc: after each PUT, GET to confirm the plan and MDN actually changed.
   // AT&T's PUT returns 200 with just {"iccid":...} — it does NOT confirm the plan switched.
   // Without verification, AT&T can silently leave the SIM on the wrong plan while still
   // assigning a new MDN (observed 2026-04-24: 81 SIMs stuck on ABIR with 500/5338 MDNs).
   async function verifyPlan(expectedPlan, prevMdn, stepLabel) {
-    const maxAttempts = 12; // ~30s total at 2500ms per attempt
+    // ~90s budget at 3s per poll. AT&T often takes 30–60s to commit plan changes;
+    // a 30s window was too tight (observed many "verification failed" SIMs that
+    // AT&T finalized seconds after we gave up).
+    const maxAttempts = 30;
     let lastJson = {};
     let lastMdn = prevMdn;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await sleep(2500);
+      await sleep(3000);
       const vRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
       lastJson = await vRes.json().catch(() => ({}));
       const plan = lastJson.communicationPlan || null;
@@ -1512,26 +1544,34 @@ async function rotateWingIotSim(env, sim, opts = {}) {
     throw new Error(`Wing IoT ${stepLabel} verification failed after ${maxAttempts} GETs: plan=${lastJson.communicationPlan} mdn=${lastMdn}`);
   }
 
-  // 2) Switch to non-dialable plan
-  const nonDialableBody = { communicationPlan: 'Wing Tel Inc - ABIR 25Mbps SMS MO/MT US' };
-  const ndRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(nonDialableBody) });
-  const ndText = await ndRes.text();
-  let ndJson = {};
-  try { ndJson = JSON.parse(ndText); } catch {}
-  await logCarrierApiCall(env, {
-    run_id: runId, step: 'mdn_change_non_dialable', iccid, imei: null, vendor: 'wing_iot',
-    request_url: url, request_method: 'PUT', request_body: nonDialableBody,
-    response_status: ndRes.status, response_ok: ndRes.ok,
-    response_body_text: ndText, response_body_json: ndJson,
-    error: ndRes.ok ? null : 'Wing IoT non-dialable switch failed: ' + ndRes.status,
-  });
-  if (!ndRes.ok) throw new Error('Wing IoT non-dialable switch failed: ' + ndRes.status + ': ' + ndText.slice(0, 300));
+  // 2) Switch to non-dialable plan — UNLESS the SIM is already on ABIR (stuck from
+  // a prior failed rotation). In that case PUT-1 would be a no-op and verify would
+  // never see the MDN change; skip directly to the dialable PUT to recover the SIM.
+  let midMdn;
+  if (oldPlan === ABIR_PLAN) {
+    console.log(`SIM ${iccid}: already on ABIR (msisdn=${oldMdn}) — skipping PUT-1, jumping to dialable PUT`);
+    midMdn = oldMdn;
+  } else {
+    const nonDialableBody = { communicationPlan: ABIR_PLAN };
+    const ndRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(nonDialableBody) });
+    const ndText = await ndRes.text();
+    let ndJson = {};
+    try { ndJson = JSON.parse(ndText); } catch {}
+    await logCarrierApiCall(env, {
+      run_id: runId, step: 'mdn_change_non_dialable', iccid, imei: null, vendor: 'wing_iot',
+      request_url: url, request_method: 'PUT', request_body: nonDialableBody,
+      response_status: ndRes.status, response_ok: ndRes.ok,
+      response_body_text: ndText, response_body_json: ndJson,
+      error: ndRes.ok ? null : 'Wing IoT non-dialable switch failed: ' + ndRes.status,
+    });
+    if (!ndRes.ok) throw new Error('Wing IoT non-dialable switch failed: ' + ndRes.status + ': ' + ndText.slice(0, 300));
 
-  // Poll GET until plan === ABIR AND MDN changed from oldMdn
-  const midMdn = await verifyPlan('Wing Tel Inc - ABIR 25Mbps SMS MO/MT US', oldMdn, 'verify_non_dialable');
+    // Poll GET until plan === ABIR AND MDN changed from oldMdn
+    midMdn = await verifyPlan(ABIR_PLAN, oldMdn, 'verify_non_dialable');
+  }
 
   // 3) Switch back to dialable plan (AT&T assigns new dialable MDN here)
-  const dialableBody = { communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US' };
+  const dialableBody = { communicationPlan: DIALABLE_PLAN };
   const dRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(dialableBody) });
   const dText = await dRes.text();
   let dJson = {};
@@ -1545,11 +1585,10 @@ async function rotateWingIotSim(env, sim, opts = {}) {
   });
   if (!dRes.ok) throw new Error('Wing IoT dialable switch failed: ' + dRes.status + ': ' + dText.slice(0, 300));
 
-  // Poll GET until plan === NON ABIR (dialable) AND MDN changed from midMdn
-  await verifyPlan('Wing Tel Inc - NON ABIR SMS MO/MT US', midMdn, 'verify_dialable');
-
-  // 4) Plan swap fully verified. Flip into provisioning so details-finalizer picks up
-  // the new dialable MDN, updates sim_numbers, and fires the number.online webhook.
+  // Trust the 202 Accepted on the dialable PUT. AT&T finalizes the plan switch +
+  // assigns the new dialable MDN asynchronously (observed 30–60s lag). Hand off to
+  // details-finalizer (every 5 min cron), which polls GET, waits for plan=NON ABIR
+  // AND MDN ≠ sim.msisdn, then writes sim_numbers + fires the webhook.
   await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
     rotation_status: 'mdn_pending',
     status: 'provisioning',
@@ -1618,41 +1657,15 @@ async function remediateStuckWingSim(env, iccid) {
   });
   if (!dRes.ok) throw new Error('PUT dialable failed: ' + dRes.status + ': ' + dText.slice(0, 300));
 
-  // 3) Poll GET until plan=NON ABIR (dialable) AND MDN changed from current non-dialable MDN
-  const maxAttempts = 12;
-  let verifiedMdn = null;
-  let lastJson = {};
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    await sleep(2500);
-    const vRes = await relayFetch(env, url, { method: 'GET', headers: getHeaders });
-    lastJson = await vRes.json().catch(() => ({}));
-    const plan = lastJson.communicationPlan || null;
-    const mdn = lastJson.mdn || lastJson.msisdn || null;
-    const planOk = plan === 'Wing Tel Inc - NON ABIR SMS MO/MT US';
-    const mdnChanged = !!mdn && mdn !== currentMdn;
-    if (attempt === maxAttempts || (planOk && mdnChanged)) {
-      await logCarrierApiCall(env, {
-        run_id: runId, step: 'remediate_verify_dialable', iccid, imei: null, vendor: 'wing_iot',
-        request_url: url, request_method: 'GET', request_body: null,
-        response_status: vRes.status, response_ok: vRes.ok,
-        response_body_text: JSON.stringify(lastJson), response_body_json: lastJson,
-        error: (planOk && mdnChanged) ? null : `plan=${plan} mdn=${mdn} prev=${currentMdn} attempt=${attempt}`,
-      });
-      if (planOk && mdnChanged) { verifiedMdn = mdn; break; }
-    }
-  }
-  if (!verifiedMdn) {
-    throw new Error(`verification failed: plan=${lastJson.communicationPlan} mdn=${lastJson.mdn || lastJson.msisdn}`);
-  }
-
-  // 4) Flip to provisioning so details-finalizer updates msisdn + sim_numbers + webhook
+  // 3) Trust the 202 Accepted. AT&T finalizes the plan switch + assigns the new
+  // dialable MDN asynchronously (30–60s lag). Hand off to details-finalizer.
   await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
     rotation_status: 'mdn_pending',
     status: 'provisioning',
     last_rotation_error: null,
   });
 
-  return { iccid, ok: true, old_mdn: currentMdn, new_mdn: verifiedMdn };
+  return { iccid, ok: true, old_mdn: currentMdn, new_mdn: null, pending: true };
 }
 
 // ===========================
@@ -1825,6 +1838,14 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   const msisdnBare = String(newMsisdn).replace(/^\+?1?/, '');
 
   // 3) DB updates (same sequence as Helix rotation)
+  // Offline for old MDN before closing it (only on rotation, not first activation).
+  if (sim.msisdn && sim.msisdn !== msisdnBare) {
+    try {
+      await sendNumberOfflineWebhook(env, sim.id, `+1${sim.msisdn}`, iccid, sim.msisdn, e164);
+    } catch (offErr) {
+      console.error(`[Rotator/ATOMIC] SIM ${sim.id}: number.offline failed: ${offErr}`);
+    }
+  }
   await closeCurrentNumber(env, sim.id);
   await insertNewNumber(env, sim.id, e164);
   await updateSimRotationTimestamp(env, sim.id);
@@ -1925,8 +1946,17 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
   }
 
   const e164 = normalizeUS(phoneNumber);
+  const newMsisdnBare = e164.replace(/^\+?1?/, '');
 
   // 3) Close current number (set valid_to timestamp)
+  // Offline for old MDN before closing it (only on rotation, not first activation).
+  if (sim.msisdn && sim.msisdn !== newMsisdnBare) {
+    try {
+      await sendNumberOfflineWebhook(env, sim.id, `+1${sim.msisdn}`, detailsIccid, sim.msisdn, e164);
+    } catch (offErr) {
+      console.error(`[Rotator/Helix] SIM ${sim.id}: number.offline failed: ${offErr}`);
+    }
+  }
   await closeCurrentNumber(env, sim.id);
 
   // 4) Insert new number (with valid_from timestamp, valid_to = null)
@@ -1953,6 +1983,19 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
 // Send number.online webhook
 // ===========================
 async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscriptionId) {
+  // Defensive guard: never fire number.online for a wing_iot SIM stuck in
+  // rotation_status='failed' — that signals it's on the non-dialable ABIR plan
+  // and the MDN we're about to broadcast is a 5xxx interim number that can't
+  // receive normal SMS. The cleanup sweep + processRotationBatch flag these.
+  const guard = await supabaseSelect(env,
+    `sims?select=vendor,rotation_status&id=eq.${encodeURIComponent(String(simId))}&limit=1`
+  ).catch(() => []);
+  const guardRow = Array.isArray(guard) && guard[0];
+  if (guardRow && guardRow.vendor === 'wing_iot' && guardRow.rotation_status === 'failed') {
+    console.log(`[Webhook] SIM ${simId}: skipping number.online — wing_iot rotation_status=failed (likely on ABIR)`);
+    return;
+  }
+
   const resellerId = await findResellerIdBySimId(env, simId);
   if (!resellerId) {
     console.log(`[Webhook] SIM ${simId}: no active reseller, skipping number.online`);
@@ -2006,6 +2049,46 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
       console.error(`[Webhook] SIM ${simId}: last_notified_at PATCH failed (non-critical): ${err}`);
     }
   }
+}
+
+// ===========================
+// Send number.offline webhook
+// Fired before closeCurrentNumber when an MDN is being replaced. Resellers
+// that route by phone-number (not sim_id) need the OLD number's offline event
+// so they can deprovision the route before AT&T reassigns the MDN to another
+// customer.
+// ===========================
+async function sendNumberOfflineWebhook(env, simId, oldNumber, iccid, oldMobilityId, newNumber) {
+  const resellerId = await findResellerIdBySimId(env, simId);
+  if (!resellerId) {
+    console.log(`[Webhook] SIM ${simId}: no active reseller, skipping number.offline`);
+    return;
+  }
+  const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
+  if (!webhookUrl) {
+    console.log(`[Webhook] SIM ${simId}: reseller ${resellerId} has no enabled webhook, skipping number.offline`);
+    return;
+  }
+
+  const result = await sendWebhookWithDeduplication(env, webhookUrl, {
+    event_type: 'number.offline',
+    created_at: new Date().toISOString(),
+    data: {
+      sim_id: simId,
+      number: oldNumber,
+      online: false,
+      iccid,
+      mobilitySubscriptionId: oldMobilityId,
+      replaced_by: newNumber,
+      verified: true,
+    },
+  }, { idComponents: { simId, iccid, number: oldNumber }, resellerId });
+
+  if (!result.ok) {
+    console.error(`[Webhook] SIM ${simId}: number.offline FAILED after ${result.attempts} attempts (old=${oldNumber})`);
+  }
+  // Deliberately do NOT stamp last_notified_at — that's specifically the last
+  // online notification timestamp.
 }
 
 // ===========================
@@ -3820,10 +3903,11 @@ async function findWebhookUrlByResellerId(env, resellerId) {
 async function generateMessageIdAsync(components) {
   const { eventType, simId, iccid, number, from, body, timestamp } = components;
 
-  // number.online: deduplicate per day (one send per SIM per number per UTC day).
-  // Other events: deduplicate per minute (prevents double-send on retry within the same minute).
+  // number.online / number.offline: deduplicate per day (one send per SIM per
+  // number per UTC day). Other events: deduplicate per minute (prevents
+  // double-send on retry within the same minute).
   let dedupeTs;
-  if (eventType === 'number.online') {
+  if (eventType === 'number.online' || eventType === 'number.offline') {
     dedupeTs = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
   } else {
     dedupeTs = timestamp

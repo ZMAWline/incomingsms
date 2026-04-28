@@ -1126,7 +1126,7 @@ async function handleSimOnline(request, env, corsHeaders) {
     }
 
     // Step 1: Get the SIM basic info
-    const simResponse = await supabaseGet(env, `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_mdn_rotated_at&id=eq.${simId}`);
+    const simResponse = await supabaseGet(env, `sims?select=id,iccid,status,vendor,rotation_status,rotation_interval_hours,last_mdn_rotated_at&id=eq.${simId}`);
     const sims = await simResponse.json();
 
     if (!sims || sims.length === 0) {
@@ -1137,6 +1137,21 @@ async function handleSimOnline(request, env, corsHeaders) {
     }
 
     const sim = sims[0];
+
+    // ABIR guard: never broadcast number.online for a wing_iot SIM that the
+    // rotation system has flagged as stuck on the ABIR (non-dialable) plan.
+    // Its msisdn is a 5xxx interim MDN that can't receive normal SMS.
+    if (sim.vendor === 'wing_iot' && sim.rotation_status === 'failed') {
+      return new Response(JSON.stringify({
+        ok: false,
+        error: 'SIM is stuck on ABIR (non-dialable plan). Force-rotate it first before notifying online.',
+        sim_id: simId,
+        abir_skipped: true,
+      }), {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
 
     // Step 2: Get current phone number
     const numberResponse = await supabaseGet(env, `sim_numbers?select=e164,verification_status&sim_id=eq.${simId}&valid_to=is.null&limit=1`);
@@ -1340,12 +1355,31 @@ async function handleWingCheck(request, env, corsHeaders) {
     });
 
     let db_update_wing = null;
+    let db_skip_reason = null;
     const wingStatus = json && json.status ? json.status.toLowerCase() : '';
+    const wingPlan = json && json.communicationPlan ? json.communicationPlan : '';
+    const DIALABLE_PLAN = 'Wing Tel Inc - NON ABIR SMS MO/MT US';
     if (res.ok && json && (wingStatus === 'active' || wingStatus === 'activated')) {
-      db_update_wing = await syncActiveSim(env, iccid, {
-        mdn: json.mdn || json.msisdn || null,
-        activatedAt: json.dateActivated || null,
-      });
+      if (wingPlan === DIALABLE_PLAN) {
+        db_update_wing = await syncActiveSim(env, iccid, {
+          mdn: json.mdn || json.msisdn || null,
+          activatedAt: json.dateActivated || null,
+        });
+      } else {
+        // SIM is on ABIR (non-dialable). Flag rotation_status='failed' so the
+        // mdn-rotator's remediation pass on the next /run will pick it up and
+        // run the dialable PUT (jumps straight to PUT-2 via the "already on
+        // ABIR" path in rotateWingIotSim).
+        try {
+          await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
+            rotation_status: 'failed',
+            last_rotation_error: 'Stuck on ABIR plan — flagged by Query at ' + new Date().toISOString(),
+          });
+          db_skip_reason = 'SIM is on plan "' + wingPlan + '" (not dialable). Marked rotation_status=failed — run mdn-rotator to retry the dialable PUT.';
+        } catch (e) {
+          db_skip_reason = 'SIM is on plan "' + wingPlan + '" (not dialable). Failed to flag for retry: ' + String(e);
+        }
+      }
     }
     return new Response(JSON.stringify({
       ok: res.ok,
@@ -1353,6 +1387,7 @@ async function handleWingCheck(request, env, corsHeaders) {
       iccid,
       response: json || text,
       db_update: db_update_wing,
+      db_skip_reason: db_skip_reason,
     }, null, 2), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -8088,6 +8123,11 @@ async function sendSimOnline(simId, phoneNumber) {
                             document.getElementById('helix-db-update-output').textContent = wdLines.join('\\n');
                             document.getElementById('helix-db-update-banner').classList.remove('hidden');
                         }
+                    } else if (result.db_skip_reason) {
+                        document.getElementById('helix-db-update-title').textContent = '\u26A0 DB Sync Skipped';
+                        document.getElementById('helix-db-update-output').textContent = result.db_skip_reason;
+                        document.getElementById('helix-db-update-banner').classList.remove('hidden');
+                        showToast('DB not synced — SIM is on wrong plan', 'warning');
                     }
                     resultDiv.classList.remove('hidden');
                 } catch (error) {
@@ -9662,9 +9702,22 @@ async function sendSimOnline(simId, phoneNumber) {
             const lines = [];
             let okCount = 0, failCount = 0;
 
-            for (const sim of sims) {
+            // Per-vendor endpoint + body shape — used by the catch block to retry.
+            const _epFor = (v) => v === 'wing_iot' ? '/wing-check'
+                : v === 'teltik' ? '/teltik-query'
+                : v === 'atomic' ? '/atomic-query' : '/helix-query';
+            const _bodyFor = (v, s) => v === 'helix'
+                ? { mobility_subscription_id: s.mobility_subscription_id || s.iccid || '' }
+                : v === 'atomic' ? { identifier: s.iccid || '' }
+                : { iccid: s.iccid || '' };
+
+            for (let _i = 0; _i < sims.length; _i++) {
+                const sim = sims[_i];
                 const vendor = sim.vendor || 'unknown';
                 const label = (sim.iccid || ('#' + sim.id));
+                // Spacing between calls keeps the relay + AT&T layers from
+                // saturating mid-batch. Adds ~2 min per 240 SIMs.
+                if (_i > 0) await new Promise(r => setTimeout(r, 500));
                 try {
                     if (vendor === 'wing_iot') {
                         const res = await fetch(API_BASE + '/wing-check', {
@@ -9676,7 +9729,18 @@ async function sendSimOnline(simId, phoneNumber) {
                         if (r.ok) {
                             okCount++;
                             const wStatus = r.response && r.response.status ? r.response.status : 'OK';
-                            const wNote = r.db_update && r.db_update.found ? (r.db_update.status_updated ? ' [status→active]' : '') + (r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '') : '';
+                            const wPlan = r.response && r.response.communicationPlan ? r.response.communicationPlan : '';
+                            let wNote = '';
+                            if (r.db_update && r.db_update.found) {
+                                if (r.db_update.status_updated) wNote += ' [status→active]';
+                                if (r.db_update.mdn_updated) wNote += ' [MDN→' + r.db_update.mdn_new + ']';
+                            }
+                            if (r.db_skip_reason) {
+                                const planTag = wPlan && wPlan.indexOf('ABIR') !== -1 && wPlan.indexOf('NON ABIR') === -1
+                                    ? 'ABIR (non-dialable)'
+                                    : (wPlan || 'wrong plan');
+                                wNote += ' [rotation_status→failed: stuck on ' + planTag + ']';
+                            }
                             lines.push(label + ' [wing_iot]: ' + wStatus + wNote);
                         } else {
                             failCount++;
@@ -9735,8 +9799,36 @@ async function sendSimOnline(simId, phoneNumber) {
                         }
                     }
                 } catch (e) {
-                    failCount++;
-                    lines.push(label + ' [' + vendor + ']: EXCEPTION — ' + e.message);
+                    // Up to 2 retries with 1s and 3s backoff. "failed to fetch"
+                    // can persist past a single short retry under sustained load.
+                    let _settled = false;
+                    let _lastErr = e;
+                    const _backoffs = [1000, 3000];
+                    for (let _r = 0; _r < _backoffs.length && !_settled; _r++) {
+                        await new Promise(r => setTimeout(r, _backoffs[_r]));
+                        try {
+                            const _res2 = await fetch(API_BASE + _epFor(vendor), {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(_bodyFor(vendor, sim))
+                            });
+                            const _r2 = await _res2.json();
+                            if (_r2.ok) {
+                                okCount++;
+                                lines.push(label + ' [' + vendor + ']: OK (after retry ' + (_r + 1) + ')');
+                            } else {
+                                failCount++;
+                                lines.push(label + ' [' + vendor + ']: ERROR after retry — ' + (_r2.error || 'unknown'));
+                            }
+                            _settled = true;
+                        } catch (e2) {
+                            _lastErr = e2;
+                        }
+                    }
+                    if (!_settled) {
+                        failCount++;
+                        lines.push(label + ' [' + vendor + ']: EXCEPTION — ' + e.message + ' (final: ' + _lastErr.message + ')');
+                    }
                 }
                 output.textContent = lines.join('\\n');
             }
@@ -10329,7 +10421,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
             if (!(await showConfirm('Send Webhooks', 'Send number.online webhook for ' + eligible.length + ' SIM(s)?'))) return;
-            let ok = 0, fail = 0;
+            let ok = 0, fail = 0, abirSkipped = 0;
             for (const sim of eligible) {
                 try {
                     const resp = await fetch(API_BASE + '/sim-online', {
@@ -10338,10 +10430,20 @@ async function sendSimOnline(simId, phoneNumber) {
                         body: JSON.stringify({ sim_id: sim.id })
                     });
                     const result = await resp.json();
-                    if (resp.ok && result.ok) { ok++; } else { fail++; }
+                    if (resp.ok && result.ok) {
+                        ok++;
+                    } else if (result && result.abir_skipped) {
+                        abirSkipped++;
+                    } else {
+                        fail++;
+                    }
                 } catch { fail++; }
             }
-            showToast(ok + ' sent' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'error' : 'success');
+            const parts = [ok + ' sent'];
+            if (abirSkipped) parts.push(abirSkipped + ' skipped (stuck on ABIR — force-rotate first)');
+            if (fail) parts.push(fail + ' failed');
+            const tone = fail ? 'error' : (abirSkipped ? 'warning' : 'success');
+            showToast(parts.join(', '), tone);
         }
 
         async function unassignReseller(simId) {
