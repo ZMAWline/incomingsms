@@ -46,12 +46,16 @@ async function runResellerSync(env, limit, force = false) {
   const startedAt = new Date().toISOString();
 
   // Fetch active SIMs with current numbers, reseller info, and webhook URLs in ONE query.
-  // rotation_status=neq.failed excludes wing_iot SIMs flagged as stuck on the ABIR (non-dialable)
-  // plan — broadcasting a 5xxx interim MDN as "online" would let resellers route inbound SMS to
-  // a number that can't receive normal calls/messages.
+  // The or=(rotation_status.is.null,rotation_status.neq.failed) clause excludes wing_iot
+  // SIMs flagged as stuck on the ABIR (non-dialable) plan — broadcasting a 5xxx interim
+  // MDN as "online" would let resellers route inbound SMS to a number that can't receive
+  // normal calls/messages. The is.null branch is required because PostgreSQL evaluates
+  // `NULL != 'failed'` as NULL (not TRUE), so a bare `neq.failed` would silently drop
+  // SIMs whose rotation_status is NULL (e.g., freshly activated SIMs that haven't
+  // rotated yet).
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&rotation_status=neq.failed&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
+    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
   );
 
   let attempted = sims.length;

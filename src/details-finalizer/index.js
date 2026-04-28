@@ -26,8 +26,27 @@ export default {
       const result = await runWingIotCleanupSweep(env, { limit, offset });
       return json(result);
     }
+    if (url.pathname === '/test-offline') {
+      // One-shot replay endpoint: fires number.offline for N SIMs that have a
+      // closed (old) sim_numbers row + a current open one. Used to give the
+      // reseller test fixtures without waiting for a real rotation. Auth +
+      // bounded by limit. Use ?dry=1 to preview without sending webhooks.
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const resellerId = parseInt(url.searchParams.get('reseller_id') || '0', 10);
+      if (!resellerId) {
+        return json({ ok: false, error: 'reseller_id required' }, 400);
+      }
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '10', 10) || 10, 50);
+      const dryRun = url.searchParams.get('dry') === '1';
+      const force = url.searchParams.get('force') === '1';
+      const result = await runOfflineTestBatch(env, { resellerId, limit, dryRun, force });
+      return json(result);
+    }
     if (url.pathname !== '/run') {
-      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0', { status: 200 });
+      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0 or /test-offline?secret=...&reseller_id=N&limit=10[&dry=1]', { status: 200 });
     }
     const secret = url.searchParams.get('secret') || '';
     if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
@@ -341,6 +360,109 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
   };
 }
 
+/* ── Offline-event replay (test fixtures) ────────────────────────────────── */
+// Picks the N most-recently-rotated active SIMs assigned to a given reseller
+// that have BOTH an open and a closed sim_numbers row, then fires
+// number.offline for each using the closed (old) MDN as the offline subject
+// and the open (current) MDN as `replaced_by`. Goes through the same
+// sendNumberOfflineWebhook helper that prod rotations use, so the receiver
+// sees an identical payload shape.
+
+async function runOfflineTestBatch(env, { resellerId, limit, dryRun, force }) {
+  // 1) Find active SIMs assigned to this reseller, most-recently-rotated first.
+  // We over-fetch (limit*4) to allow filtering down to ones that have both an
+  // open and a closed sim_numbers row.
+  const overFetch = Math.min(limit * 4, 100);
+  const sims = await supabaseSelect(env,
+    `sims?select=id,iccid,vendor,msisdn,mobility_subscription_id,last_mdn_rotated_at,reseller_sims!inner(reseller_id,active)` +
+    `&reseller_sims.reseller_id=eq.${resellerId}` +
+    `&reseller_sims.active=eq.true` +
+    `&status=eq.active` +
+    `&last_mdn_rotated_at=not.is.null` +
+    `&order=last_mdn_rotated_at.desc&limit=${overFetch}`
+  );
+  if (!sims || sims.length === 0) {
+    return { ok: true, fired: 0, skipped: 0, message: 'no SIMs match', candidates: [] };
+  }
+
+  // 2) For each SIM, look up the most recent CLOSED sim_numbers row + the
+  // current OPEN row. Skip if either is missing.
+  const eligible = [];
+  for (const sim of sims) {
+    if (eligible.length >= limit) break;
+    const rows = await supabaseSelect(env,
+      `sim_numbers?select=e164,valid_from,valid_to&sim_id=eq.${sim.id}&order=valid_from.desc&limit=10`
+    ).catch(() => []);
+    const open = rows.find(r => r.valid_to === null);
+    const closed = rows.find(r => r.valid_to !== null);
+    if (!open || !closed || !open.e164 || !closed.e164) continue;
+    if (open.e164 === closed.e164) continue;
+    eligible.push({ sim, oldE164: closed.e164, newE164: open.e164 });
+  }
+
+  if (eligible.length === 0) {
+    return { ok: true, fired: 0, skipped: 0, message: 'no SIMs with both open + closed sim_numbers rows', candidates: [] };
+  }
+
+  // 3) Fire number.offline for each (or just preview if dryRun).
+  const results = [];
+  let fired = 0, errors = 0;
+  for (const { sim, oldE164, newE164 } of eligible) {
+    const oldBare = oldE164.replace(/^\+?1?/, '');
+    const oldMobilityId = sim.vendor === 'helix' ? (sim.mobility_subscription_id || oldBare) : oldBare;
+    if (dryRun) {
+      results.push({ sim_id: sim.id, iccid: sim.iccid, vendor: sim.vendor, old: oldE164, replaced_by: newE164, dry: true });
+      continue;
+    }
+    try {
+      if (force) {
+        // Bypass per-day dedup so the test can be re-fired without waiting for
+        // UTC midnight. Inlines the lookup chain that sendNumberOfflineWebhook
+        // does, but passes force:true to sendWebhookWithDeduplication.
+        const rid = await findResellerIdBySimId(env, sim.id);
+        const whUrl = rid ? await findWebhookUrlByResellerId(env, rid) : null;
+        if (!whUrl) {
+          results.push({ sim_id: sim.id, iccid: sim.iccid, vendor: sim.vendor, old: oldE164, replaced_by: newE164, ok: false, error: 'no webhook' });
+          continue;
+        }
+        const r = await sendWebhookWithDeduplication(env, whUrl, {
+          event_type: 'number.offline',
+          created_at: new Date().toISOString(),
+          data: {
+            sim_id: sim.id,
+            number: oldE164,
+            online: false,
+            iccid: sim.iccid,
+            mobilitySubscriptionId: oldMobilityId,
+            replaced_by: newE164,
+            verified: true,
+          },
+        }, { idComponents: { simId: sim.id, iccid: sim.iccid, number: oldE164 }, resellerId: rid, force: true });
+        if (r.ok) fired++; else errors++;
+        results.push({ sim_id: sim.id, iccid: sim.iccid, vendor: sim.vendor, old: oldE164, replaced_by: newE164, ok: r.ok, status: r.status, attempts: r.attempts });
+      } else {
+        await sendNumberOfflineWebhook(env, sim.id, oldE164, sim.iccid, oldMobilityId, newE164);
+        fired++;
+        results.push({ sim_id: sim.id, iccid: sim.iccid, vendor: sim.vendor, old: oldE164, replaced_by: newE164, ok: true });
+      }
+    } catch (e) {
+      errors++;
+      results.push({ sim_id: sim.id, iccid: sim.iccid, vendor: sim.vendor, old: oldE164, replaced_by: newE164, ok: false, error: String(e) });
+    }
+  }
+
+  return {
+    ok: true,
+    reseller_id: resellerId,
+    requested: limit,
+    eligible_found: eligible.length,
+    fired,
+    errors,
+    dry_run: !!dryRun,
+    results,
+  };
+}
+
 /* ── Teltik finalizer ─────────────────────────────────────────────────────── */
 
 async function runTeltikFinalizer(env, limit) {
@@ -419,7 +541,7 @@ async function runTeltikFinalizer(env, limit) {
       const oldMsisdnBare = sim.msisdn || '';
       if (oldMsisdnBare && oldMsisdnBare !== msisdnBare) {
         try {
-          await sendNumberOfflineWebhook(env, sim.id, `+1${oldMsisdnBare}`, sim.iccid, oldMsisdnBare, e164);
+          await sendNumberOfflineWebhook(env, sim.id, normalizeUS(oldMsisdnBare), sim.iccid, oldMsisdnBare, e164);
         } catch (offErr) {
           console.error(`[Finalizer/Teltik] SIM ${sim.id}: number.offline failed: ${offErr}`);
         }
@@ -591,7 +713,7 @@ async function runAtomicFinalizer(env, limit) {
       // Offline for old MDN (only on rotation, not first activation).
       if (sim.msisdn && sim.msisdn !== newMsisdn) {
         try {
-          await sendNumberOfflineWebhook(env, sim.id, `+1${sim.msisdn}`, sim.iccid, sim.msisdn, e164);
+          await sendNumberOfflineWebhook(env, sim.id, normalizeUS(sim.msisdn), sim.iccid, sim.msisdn, e164);
         } catch (offErr) {
           console.error(`[Finalizer/ATOMIC] SIM ${sim.id}: number.offline failed: ${offErr}`);
         }

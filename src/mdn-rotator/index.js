@@ -1841,7 +1841,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   // Offline for old MDN before closing it (only on rotation, not first activation).
   if (sim.msisdn && sim.msisdn !== msisdnBare) {
     try {
-      await sendNumberOfflineWebhook(env, sim.id, `+1${sim.msisdn}`, iccid, sim.msisdn, e164);
+      await sendNumberOfflineWebhook(env, sim.id, normalizeUS(sim.msisdn), iccid, sim.msisdn, e164);
     } catch (offErr) {
       console.error(`[Rotator/ATOMIC] SIM ${sim.id}: number.offline failed: ${offErr}`);
     }
@@ -1952,7 +1952,7 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
   // Offline for old MDN before closing it (only on rotation, not first activation).
   if (sim.msisdn && sim.msisdn !== newMsisdnBare) {
     try {
-      await sendNumberOfflineWebhook(env, sim.id, `+1${sim.msisdn}`, detailsIccid, sim.msisdn, e164);
+      await sendNumberOfflineWebhook(env, sim.id, normalizeUS(sim.msisdn), detailsIccid, sim.msisdn, e164);
     } catch (offErr) {
       console.error(`[Rotator/Helix] SIM ${sim.id}: number.offline failed: ${offErr}`);
     }
