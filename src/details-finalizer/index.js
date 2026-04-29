@@ -26,6 +26,31 @@ export default {
       const result = await runWingIotCleanupSweep(env, { limit, offset });
       return json(result);
     }
+    if (url.pathname === '/reconcile-rotations') {
+      // Daily 6:30 AM EDT post-rotation reconciliation. Three buckets:
+      //   A — wing_iot stuck in rotation_status='mdn_pending' (status=active or
+      //       provisioning). GETs AT&T per SIM (read-only) and either syncs to
+      //       success+webhook or marks rotation_status='failed' for tomorrow's
+      //       stuck-wing pass.
+      //   B — any vendor rotated in last 24h with last_notified_at < last_mdn_rotated_at
+      //       (webhook missed). Re-fires sendNumberOnlineWebhook with force=true to
+      //       bypass the ABIR guard since we already filtered to rotation_status=success.
+      //   C — wing_iot eligible but not rotated in 24h. Logged only; no action.
+      // Hard caps: ≤60 AT&T GETs, ≤60 webhook POSTs, 0 PUTs to AT&T, 90s wall-clock,
+      // single audit row written. Cannot self-trigger (no internal fetch to own URL).
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const dryRun = url.searchParams.get('dry') === '1';
+      const force = url.searchParams.get('force') === '1';
+      // Manual call respects RECONCILIATION_ENABLED unless force=1 is passed.
+      if (!force && !dryRun && env.RECONCILIATION_ENABLED !== 'true') {
+        return json({ ok: false, skipped: true, reason: 'RECONCILIATION_ENABLED=false; pass force=1 to override' });
+      }
+      const result = await runReconciliationSweep(env, { trigger: dryRun ? 'dry' : 'manual', dryRun });
+      return json(result);
+    }
     if (url.pathname === '/test-offline') {
       // One-shot replay endpoint: fires number.offline for N SIMs that have a
       // closed (old) sim_numbers row + a current open one. Used to give the
@@ -46,7 +71,7 @@ export default {
       return json(result);
     }
     if (url.pathname !== '/run') {
-      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0 or /test-offline?secret=...&reseller_id=N&limit=10[&dry=1]', { status: 200 });
+      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0 or /reconcile-rotations?secret=...[&dry=1][&force=1] or /test-offline?secret=...&reseller_id=N&limit=10[&dry=1]', { status: 200 });
     }
     const secret = url.searchParams.get('secret') || '';
     if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
@@ -62,6 +87,17 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    // Daily reconciliation cron (6:30 AM EDT / 5:30 AM EST) — separate from the
+    // 5-min finalizer cron. Gated on RECONCILIATION_ENABLED so it can be turned
+    // off instantly via secret without redeploy.
+    if (event.cron === '30 10 * * *') {
+      if (env.RECONCILIATION_ENABLED !== 'true') {
+        console.log('[Reconcile] disabled via RECONCILIATION_ENABLED, skipping');
+        return;
+      }
+      ctx.waitUntil(runReconciliationSweep(env, { trigger: 'cron', dryRun: false }));
+      return;
+    }
     ctx.waitUntil(runHelixFinalizer(env, 25));
     ctx.waitUntil(runWingIotFinalizer(env, 50));
     ctx.waitUntil(runTeltikFinalizer(env, 50));
@@ -358,6 +394,239 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
     next_offset: offset + sims.length,
     sample,
   };
+}
+
+/* ── Daily post-rotation reconciliation ─────────────────────────────────── */
+// Runs once a day at UTC 10:30 (NY 6:30 EDT / 5:30 EST), 30 min after the
+// rotation window closes. Catches three failure modes the other safety nets
+// miss, all under hard runtime caps so it cannot loop or burn API budget:
+//   Bucket A — wing_iot stuck in rotation_status='mdn_pending' (orphan or
+//              still-provisioning). GETs AT&T per SIM (read-only) and either
+//              syncs to success+webhook (if plan=NON ABIR) or marks
+//              rotation_status='failed' so tomorrow's stuck-wing pass picks up.
+//   Bucket B — any vendor whose last_notified_at is older than its
+//              last_mdn_rotated_at within the last 24h. Re-fires
+//              sendNumberOnlineWebhook with force=true (bypasses ABIR guard
+//              since query already filters to rotation_status='success').
+//   Bucket C — wing_iot eligible-but-not-attempted in 24h. Logged only.
+// Hard caps: ≤60 AT&T GETs, ≤60 webhook POSTs, 0 PUTs to AT&T, 90s wall-clock.
+// Single audit row written to rotation_audit per run.
+
+async function runReconciliationSweep(env, { trigger, dryRun }) {
+  const startedAtMs = Date.now();
+  const startedAtISO = new Date(startedAtMs).toISOString();
+  const log = (msg) => console.log(`[Reconcile/${trigger}] ${msg}`);
+
+  const MAX_ATT_CALLS = 60;
+  const MAX_WEBHOOK_FIRES = 60;
+  const TIMEOUT_MS = 90_000;
+  const deadline = startedAtMs + TIMEOUT_MS;
+  const timeRemaining = () => Math.max(0, deadline - Date.now());
+
+  let attCalls = 0;
+  let webhookFires = 0;
+  let timedOut = false;
+
+  const cutoff24hISO = new Date(startedAtMs - 24 * 60 * 60 * 1000).toISOString();
+  const nyDateStr = new Date(startedAtMs).toLocaleDateString('en-CA', {
+    timeZone: 'America/New_York',
+  });
+
+  // ── Bucket A — wing_iot stuck mdn_pending ─────────────────────────────────
+  const bucketA = (await supabaseSelect(
+    env,
+    `sims?select=id,iccid,msisdn,status,rotation_status,activated_at` +
+      `&vendor=eq.wing_iot` +
+      `&rotation_status=eq.mdn_pending` +
+      `&status=in.(active,provisioning)` +
+      `&order=last_mdn_rotated_at.asc.nullsfirst&limit=${MAX_ATT_CALLS}`
+  )) || [];
+  const bucketAIds = bucketA.map((s) => s.id);
+  log(`Bucket A (stuck mdn_pending): ${bucketA.length} SIMs`);
+
+  // ── Bucket B — any vendor: rotated <24h ago, last_notified_at stale ───────
+  // PostgREST doesn't allow column-to-column comparison in or=(), so fetch
+  // candidates (rotated in last 24h) and filter in JS for stale notify.
+  const bucketBCandidates = (await supabaseSelect(
+    env,
+    `sims?select=id,iccid,msisdn,vendor,last_mdn_rotated_at,last_notified_at` +
+      `&status=eq.active` +
+      `&rotation_status=eq.success` +
+      `&last_mdn_rotated_at=gte.${encodeURIComponent(cutoff24hISO)}` +
+      `&order=last_mdn_rotated_at.asc&limit=500`
+  )) || [];
+  const bucketB = bucketBCandidates
+    .filter((s) => !s.last_notified_at || new Date(s.last_notified_at) < new Date(s.last_mdn_rotated_at))
+    .slice(0, MAX_WEBHOOK_FIRES);
+  const bucketBIds = bucketB.map((s) => s.id);
+  log(`Bucket B (rotated, not notified): ${bucketB.length} SIMs`);
+
+  // ── Bucket C — wing_iot eligible but not rotated in 24h (log only) ────────
+  const bucketC = (await supabaseSelect(
+    env,
+    `sims?select=id,iccid,vendor,last_mdn_rotated_at` +
+      `&status=eq.active` +
+      `&vendor=eq.wing_iot` +
+      `&rotation_eligible=eq.true` +
+      `&or=(last_mdn_rotated_at.is.null,last_mdn_rotated_at.lt.${encodeURIComponent(cutoff24hISO)})` +
+      `&limit=200`
+  )) || [];
+  const bucketCIds = bucketC.map((s) => s.id);
+  log(`Bucket C (eligible, not attempted): ${bucketC.length} SIMs`);
+
+  if (dryRun) {
+    log('Dry run — no actions taken, no audit row written');
+    return {
+      ok: true,
+      dry_run: true,
+      ny_date: nyDateStr,
+      bucket_a_count: bucketA.length,
+      bucket_b_count: bucketB.length,
+      bucket_c_count: bucketC.length,
+      bucket_a_sim_ids: bucketAIds,
+      bucket_b_sim_ids: bucketBIds,
+      bucket_c_sim_ids: bucketCIds,
+      caps: { att_calls: MAX_ATT_CALLS, webhook_fires: MAX_WEBHOOK_FIRES, timeout_ms: TIMEOUT_MS },
+    };
+  }
+
+  // ── Process Bucket A: GET AT&T per SIM, sync if plan=NON ABIR ─────────────
+  const attBaseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
+  const DIALABLE_PLAN = 'Wing Tel Inc - NON ABIR SMS MO/MT US';
+  const aActions = { synced: 0, marked_failed: 0, errors: 0, webhooks: 0, skipped_no_creds: 0 };
+
+  if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
+    aActions.skipped_no_creds = bucketA.length;
+    log('Bucket A skipped — wing_iot credentials missing');
+  } else {
+    const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
+    const headers = { Authorization: auth, Accept: 'application/json' };
+
+    for (const sim of bucketA) {
+      if (timeRemaining() < 5000) { timedOut = true; break; }
+      if (attCalls >= MAX_ATT_CALLS) break;
+      attCalls++;
+      try {
+        const res = await relayFetch(env, attBaseUrl + '/v1/devices/' + encodeURIComponent(sim.iccid), {
+          method: 'GET',
+          headers,
+        });
+        if (!res.ok) { aActions.errors++; continue; }
+        const data = await res.json().catch(() => ({}));
+        const wingStatus = String(data.status || '').toLowerCase();
+        const plan = data.communicationPlan || '';
+        const mdnRaw = data.msisdn || data.mdn || null;
+
+        const isActivated = wingStatus === 'activated' || wingStatus === 'active';
+        if (isActivated && plan === DIALABLE_PLAN && mdnRaw) {
+          const msisdnBare = String(mdnRaw).replace(/^\+?1?/, '');
+          const e164 = normalizeUS(mdnRaw);
+          if (sim.msisdn !== msisdnBare) {
+            if (sim.msisdn) {
+              try {
+                await sendNumberOfflineWebhook(env, sim.id, normalizeUS(sim.msisdn), sim.iccid, sim.msisdn, e164);
+              } catch (offErr) {
+                console.error(`[Reconcile/A] SIM ${sim.id}: offline webhook failed: ${offErr}`);
+              }
+            }
+            await closeCurrentNumber(env, sim.id);
+            await insertNewNumber(env, sim.id, e164);
+          }
+          const patch = {
+            status: 'active',
+            rotation_status: 'success',
+            msisdn: msisdnBare,
+            last_rotation_error: null,
+          };
+          if (!sim.activated_at) patch.activated_at = new Date().toISOString();
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+          if (webhookFires < MAX_WEBHOOK_FIRES) {
+            try {
+              await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare, { force: true });
+              webhookFires++;
+              aActions.webhooks++;
+            } catch (we) {
+              // already logged inside helper
+            }
+          }
+          aActions.synced++;
+        } else {
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+            rotation_status: 'failed',
+            last_rotation_error: `Reconcile: plan="${plan}" mdn=${mdnRaw} att_status=${wingStatus} at ${new Date().toISOString()}`,
+          });
+          aActions.marked_failed++;
+        }
+      } catch (e) {
+        aActions.errors++;
+        console.error(`[Reconcile/A] SIM ${sim.id}: ${e}`);
+      }
+    }
+  }
+
+  // ── Process Bucket B: re-fire number.online webhook ───────────────────────
+  const bActions = { fired: 0, errors: 0, no_msisdn: 0 };
+  for (const sim of bucketB) {
+    if (timeRemaining() < 5000) { timedOut = true; break; }
+    if (webhookFires >= MAX_WEBHOOK_FIRES) break;
+    if (!sim.msisdn) { bActions.no_msisdn++; continue; }
+    webhookFires++;
+    try {
+      const e164 = normalizeUS(sim.msisdn);
+      await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, sim.msisdn, { force: true });
+      bActions.fired++;
+    } catch (e) {
+      bActions.errors++;
+      console.error(`[Reconcile/B] SIM ${sim.id}: ${e}`);
+    }
+  }
+
+  // ── Insert audit row ──────────────────────────────────────────────────────
+  const durationMs = Date.now() - startedAtMs;
+  const auditRow = {
+    run_at: startedAtISO,
+    ny_date: nyDateStr,
+    trigger,
+    bucket_a_count: bucketA.length,
+    bucket_b_count: bucketB.length,
+    bucket_c_count: bucketC.length,
+    bucket_a_sim_ids: bucketAIds,
+    bucket_b_sim_ids: bucketBIds,
+    bucket_c_sim_ids: bucketCIds,
+    actions_taken: { bucket_a: aActions, bucket_b: bActions },
+    duration_ms: durationMs,
+    caps_hit: {
+      att_calls: attCalls,
+      webhook_fires: webhookFires,
+      timed_out: timedOut,
+      hit_att_cap: attCalls >= MAX_ATT_CALLS,
+      hit_webhook_cap: webhookFires >= MAX_WEBHOOK_FIRES,
+    },
+  };
+  try {
+    const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/rotation_audit`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(auditRow),
+    });
+    if (!insertRes.ok) {
+      log(`Audit insert failed: HTTP ${insertRes.status}`);
+    }
+  } catch (e) {
+    log(`Audit insert threw: ${e}`);
+  }
+
+  log(
+    `Done in ${durationMs}ms. A: ${aActions.synced} synced / ${aActions.marked_failed} flagged / ${aActions.errors} errors. ` +
+      `B: ${bActions.fired} webhooks fired / ${bActions.errors} errors. C: ${bucketC.length} logged. ` +
+      `attCalls=${attCalls}/${MAX_ATT_CALLS} webhookFires=${webhookFires}/${MAX_WEBHOOK_FIRES} timedOut=${timedOut}`
+  );
+
+  return { ok: true, ...auditRow };
 }
 
 /* ── Offline-event replay (test fixtures) ────────────────────────────────── */
@@ -856,18 +1125,22 @@ function normalizeUS(phone) {
 
 /* ── Webhook (number.online) ──────────────────────────────────────────────── */
 
-async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscriptionId) {
+async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscriptionId, opts = {}) {
   // Defensive guard: never fire number.online for a wing_iot SIM stuck in
   // rotation_status='failed' — that signals it's on the non-dialable ABIR plan
   // and the MDN we're about to broadcast is a 5xxx interim number that can't
   // receive normal SMS. The cleanup sweep + processRotationBatch flag these.
-  const guard = await supabaseSelect(env,
-    `sims?select=vendor,rotation_status&id=eq.${encodeURIComponent(String(simId))}&limit=1`
-  ).catch(() => []);
-  const guardRow = Array.isArray(guard) && guard[0];
-  if (guardRow && guardRow.vendor === 'wing_iot' && guardRow.rotation_status === 'failed') {
-    console.log(`[Webhook] SIM ${simId}: skipping number.online — wing_iot rotation_status=failed (likely on ABIR)`);
-    return;
+  // Bypassed when opts.force=true — caller (reconciliation) already filtered
+  // to rotation_status='success' so the guard read would be redundant.
+  if (!opts.force) {
+    const guard = await supabaseSelect(env,
+      `sims?select=vendor,rotation_status&id=eq.${encodeURIComponent(String(simId))}&limit=1`
+    ).catch(() => []);
+    const guardRow = Array.isArray(guard) && guard[0];
+    if (guardRow && guardRow.vendor === 'wing_iot' && guardRow.rotation_status === 'failed') {
+      console.log(`[Webhook] SIM ${simId}: skipping number.online — wing_iot rotation_status=failed (likely on ABIR)`);
+      return;
+    }
   }
 
   const resellerId = await findResellerIdBySimId(env, simId);

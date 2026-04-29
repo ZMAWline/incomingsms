@@ -315,6 +315,14 @@ export default {
       return handleTeltikQuery(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/rotation-audit' && request.method === 'GET') {
+      return handleRotationAudit(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/rotation-audit/run' && request.method === 'POST') {
+      return handleRotationAuditRun(request, env, corsHeaders);
+    }
+
     // Serve HTML dashboard for all non-API paths (SPA routing)
     return new Response(getHTML(env.HELIX_ENABLED === 'true'), {
       headers: { 'Content-Type': 'text/html' }
@@ -2099,6 +2107,59 @@ async function supabaseGetAllArray(env, pathWithoutLimit) {
     if (batch.length < pageSize) break;
   }
   return out;
+}
+
+async function handleRotationAudit(request, env, corsHeaders) {
+  try {
+    const base = env.SUPABASE_URL + '/rest/v1/';
+    const headers = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+    };
+    const latestRes = await fetch(base + 'rotation_audit?order=run_at.desc&limit=1', { headers });
+    const latestArr = latestRes.ok ? await latestRes.json() : [];
+    const histRes = await fetch(base + 'rotation_audit?select=id,run_at,ny_date,trigger,bucket_a_count,bucket_b_count,bucket_c_count,duration_ms&order=run_at.desc&limit=7', { headers });
+    const history = histRes.ok ? await histRes.json() : [];
+    return new Response(JSON.stringify({ latest: latestArr[0] || null, history }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleRotationAuditRun(request, env, corsHeaders) {
+  try {
+    if (!env.FINALIZER_RUN_SECRET) {
+      return new Response(JSON.stringify({ error: 'FINALIZER_RUN_SECRET not configured on dashboard worker' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    if (!env.DETAILS_FINALIZER) {
+      return new Response(JSON.stringify({ error: 'DETAILS_FINALIZER service binding not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const url = 'https://details-finalizer/reconcile-rotations?secret=' + encodeURIComponent(env.FINALIZER_RUN_SECRET) + '&force=1';
+    const r = await env.DETAILS_FINALIZER.fetch(url, { method: 'GET' });
+    const body = await r.text();
+    let parsed = null;
+    try { parsed = JSON.parse(body); } catch (_e) {}
+    return new Response(JSON.stringify({ ok: r.ok, status: r.status, result: parsed || body }), {
+      status: r.ok ? 200 : 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
 }
 
 async function handleFixSim(request, env, corsHeaders) {
@@ -5001,6 +5062,18 @@ function getHTML(helixEnabled) {
                     <button onclick="bulkQuery()" class="px-3 py-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 text-white rounded transition">Query</button>
                     <button onclick="bulkRetryActivation()" class="px-3 py-1.5 text-xs bg-pink-600 hover:bg-pink-700 text-white rounded transition">Retry Activation</button>
                 </div>
+                <div id="rotation-audit-widget" class="hidden mb-4 p-4 bg-dark-800 rounded-xl border border-dark-600 flex flex-wrap items-center gap-4">
+                    <div class="flex flex-col min-w-0">
+                        <span class="text-sm font-semibold text-white">Rotation Audit (today)</span>
+                        <span id="rotation-audit-runat" class="text-xs text-gray-500">Loading…</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button id="rotation-audit-a" onclick="showRotationAuditBucket('a')" class="px-3 py-1.5 text-xs rounded transition bg-dark-700 text-gray-400" title="Stuck mdn_pending">A: <span id="rotation-audit-a-count">–</span></button>
+                        <button id="rotation-audit-b" onclick="showRotationAuditBucket('b')" class="px-3 py-1.5 text-xs rounded transition bg-dark-700 text-gray-400" title="Rotated, not notified">B: <span id="rotation-audit-b-count">–</span></button>
+                        <button id="rotation-audit-c" onclick="showRotationAuditBucket('c')" class="px-3 py-1.5 text-xs rounded transition bg-dark-700 text-gray-400" title="Eligible, not attempted in 24h">C: <span id="rotation-audit-c-count">–</span></button>
+                    </div>
+                    <button onclick="reconcileNow()" class="ml-auto px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">Reconcile Now</button>
+                </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
                         <div class="flex flex-wrap items-center justify-between gap-4">
@@ -7197,6 +7270,7 @@ function getHTML(helixEnabled) {
             if (tabName === 'errors') loadErrors();
             if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadBillAuditHistory(); }
             if (tabName === 'sms-usage') loadSmsUsage();
+            if (tabName === 'sims') loadRotationAudit();
         }
 
         // Handle browser back/forward
@@ -7352,7 +7426,79 @@ function getHTML(helixEnabled) {
             }
         }
 
-        let lastSimsFetchedAt = 0;
+        let lastRotationAudit = null;
+
+        async function loadRotationAudit() {
+          try {
+            const res = await fetch(API_BASE + '/rotation-audit');
+            if (!res.ok) return;
+            const payload = await res.json();
+            const latest = payload.latest;
+            lastRotationAudit = latest;
+            const widget = document.getElementById('rotation-audit-widget');
+            if (!widget) return;
+            if (!latest) {
+              widget.classList.add('hidden');
+              return;
+            }
+            widget.classList.remove('hidden');
+            document.getElementById('rotation-audit-a-count').textContent = latest.bucket_a_count;
+            document.getElementById('rotation-audit-b-count').textContent = latest.bucket_b_count;
+            document.getElementById('rotation-audit-c-count').textContent = latest.bucket_c_count;
+            const runAt = new Date(latest.run_at);
+            document.getElementById('rotation-audit-runat').textContent = 'Last run: ' + runAt.toLocaleString() + ' (' + (latest.trigger || '?') + ')';
+            const colorBtn = function(id, count, activeCls) {
+              const btn = document.getElementById(id);
+              if (!btn) return;
+              btn.className = 'px-3 py-1.5 text-xs rounded transition ' + (count > 0 ? activeCls : 'bg-dark-700 text-gray-400');
+            };
+            colorBtn('rotation-audit-a', latest.bucket_a_count, 'bg-red-600 hover:bg-red-700 text-white');
+            colorBtn('rotation-audit-b', latest.bucket_b_count, 'bg-orange-600 hover:bg-orange-700 text-white');
+            colorBtn('rotation-audit-c', latest.bucket_c_count, 'bg-gray-600 hover:bg-gray-500 text-white');
+          } catch (e) {
+            console.error('loadRotationAudit failed:', e);
+          }
+        }
+
+        function showRotationAuditBucket(bucket) {
+          if (!lastRotationAudit) return;
+          const ids = lastRotationAudit['bucket_' + bucket + '_sim_ids'] || [];
+          const count = lastRotationAudit['bucket_' + bucket + '_count'] || 0;
+          const labels = { a: 'Stuck mdn_pending', b: 'Rotated, not notified', c: 'Eligible, not attempted in 24h' };
+          if (count === 0) {
+            showToast('Bucket ' + bucket.toUpperCase() + ': empty', 'info');
+            return;
+          }
+          const searchEl = document.getElementById('sims-search');
+          if (searchEl) {
+            searchEl.value = ids.join(', ');
+            searchEl.dispatchEvent(new Event('input'));
+            showToast(labels[bucket] + ': ' + count + ' SIMs (filtered in table)', 'info');
+          } else {
+            showToast(labels[bucket] + ' (' + count + '): ' + ids.join(', '), 'info');
+          }
+        }
+
+        async function reconcileNow() {
+          const ok = await showConfirm('Reconcile Now?', 'Runs post-rotation reconciliation immediately. Hard caps: ≤60 AT&T GETs, ≤60 webhook POSTs, 0 plan-change PUTs, 90s wall-clock. Bypasses RECONCILIATION_ENABLED flag.');
+          if (!ok) return;
+          showToast('Running reconciliation…', 'info');
+          try {
+            const res = await fetch(API_BASE + '/rotation-audit/run', { method: 'POST' });
+            const data = await res.json();
+            if (data.ok && data.result) {
+              const r = data.result;
+              showToast('Reconcile done — A=' + (r.bucket_a_count || 0) + ' B=' + (r.bucket_b_count || 0) + ' C=' + (r.bucket_c_count || 0) + ' (' + (r.duration_ms || 0) + 'ms)', 'success');
+              await loadRotationAudit();
+            } else {
+              showToast('Reconcile failed: ' + (data.error || JSON.stringify(data.result || data)), 'error');
+            }
+          } catch (e) {
+            showToast('Reconcile error: ' + e, 'error');
+          }
+        }
+
+                let lastSimsFetchedAt = 0;
         const SIM_CACHE_MS = 30 * 60 * 1000; // 30 minutes
 
         async function loadSims(force = false) {

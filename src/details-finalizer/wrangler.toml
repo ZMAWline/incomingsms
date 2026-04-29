@@ -5,7 +5,12 @@ account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
 [triggers]
-crons = ["*/5 * * * *"]
+# */5 * * * * — regular finalizer (Helix/Wing/Teltik/ATOMIC) every 5 min.
+# 30 10 * * * — daily reconciliation at UTC 10:30 (NY 6:30 EDT / 5:30 EST), 30
+# min after rotation window closes. Gated on RECONCILIATION_ENABLED secret;
+# scheduled() branches on event.cron so reconciliation never runs alongside
+# the regular finalizers.
+crons = ["*/5 * * * *", "30 10 * * *"]
 
 [observability.logs]
 enabled = true

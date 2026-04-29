@@ -4,6 +4,40 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-29 — Reconciliation cron ships flag-OFF with hard runtime caps (not just rate limits)
+
+**Decision:** The new `/reconcile-rotations` endpoint on details-finalizer is gated by a `RECONCILIATION_ENABLED` secret (default `"false"` — cron tick exits immediately). On top of the kill switch, the runtime is **mathematically bounded**: ≤60 AT&T GETs, ≤60 webhook POSTs, **exactly 0 plan-change PUTs**, 90s wall-clock with `Date.now()` deadline checks before each iteration, single audit row written per run, no internal `fetch` to its own URL. Bucket C (eligible-but-not-rotated) is **log-only** — never triggers a rotation, even though Bucket A and B do auto-heal. Manual operator action still required for any actual rotation.
+
+**Why:** User explicitly conditioned plan approval on "1000% won't cause API calls endlessly that will risk the API connection." Rate limits alone aren't enough — a buggy retry loop can hammer within a rate limit. Two-layer defense: (a) flag for instant kill, (b) per-run hard counters that trip even if flag is on. The "no PUTs" rule is the load-bearing constraint: reconciliation can ONLY observe AT&T (GET) and notify resellers (webhook); it can never change plans. The actual rotation cron `mdn-rotator/*/5 4-11 * * *` remains the sole source of plan changes. This makes the worst-case blast radius "extra GET reads + extra dedup'd webhook attempts" — not "wrong plan committed."
+
+**Consequence / what not to undo:**
+- Do NOT add a "rotate stuck SIMs" branch to `runReconciliationSweep` even if it seems convenient. That would break the no-PUT invariant and turn this into a second rotation source. If you need to rotate, call `mdn-rotator` directly.
+- Do NOT raise the caps without recomputing the worst-case math. 60 GETs × 30s timeout = 30 minutes; we have a 90s wall-clock so caps protect against a slow AT&T.
+- Do NOT remove the `RECONCILIATION_ENABLED` gate. The plan was approved on the basis that it could be killed in seconds without redeploy.
+- Bucket C deliberately has no auto-action. If a future requirement says "auto-rotate stragglers," that's a separate decision and should add a different endpoint, not amend this one.
+
+---
+
+## 2026-04-29 — Reconciliation Bucket B uses JS filter, not PostgREST or=()
+
+**Decision:** Bucket B query (rotated today, last_notified_at older than rotation) fetches up to 500 candidates filtered to `status=active AND rotation_status=success AND last_mdn_rotated_at >= cutoff24h`, then filters in JS for `last_notified_at IS NULL OR last_notified_at < last_mdn_rotated_at`.
+
+**Why:** PostgREST does not support column-to-column comparisons in `or=()` — `or=(last_notified_at.is.null,last_notified_at.lt.last_mdn_rotated_at)` returns `400 invalid input syntax for type timestamp with time zone: "last_mdn_rotated_at"` because PostgREST interprets the right-hand side as a literal value. Discovered at deploy time on first prod run. Alternatives considered: (a) Postgres view with the comparison (overhead), (b) RPC function (overhead), (c) JS filter (chose). Steady-state cohort size is small (today: 9 candidates, all `rotation_status=failed` so excluded), so 500-row over-fetch is cheap.
+
+**Consequence:** Future PostgREST queries that need column-to-column comparison should use the same JS-filter pattern. Don't waste time trying to get `or=()` to do it. Same trap exists for `lt`/`gt`/`gte`/`lte` between two columns.
+
+---
+
+## 2026-04-29 — Dashboard → details-finalizer cross-worker fetch uses service binding, not public URL
+
+**Decision:** `/api/rotation-audit/run` on the dashboard worker calls `env.DETAILS_FINALIZER.fetch(url, init)` (service binding) instead of `fetch('https://details-finalizer.zalmen-531.workers.dev/...')`.
+
+**Why:** Bare fetch from one Worker to another's `.workers.dev` URL returns Cloudflare error 1042 ("Network connection lost"). Workers can't reach Cloudflare-proxied IPs from inside the same network. This was already documented in `agent/networking.md` for general external CF-proxied IPs but bit me again on first prod deploy of `handleRotationAuditRun`. Service binding is direct (no network), faster, and avoids the issue entirely.
+
+**Consequence:** Any new dashboard endpoint that proxies to another worker must use a service binding. The `DETAILS_FINALIZER`, `MDN_ROTATOR`, `RESELLER_SYNC`, `TELTIK_WORKER`, etc. bindings already exist in `src/dashboard/wrangler.toml`. Don't add bare fetches to other Workers' public URLs — even if it "works" sometimes during local testing via wrangler dev, it'll fail in prod.
+
+---
+
 ## 2026-04-28 — Billing Audit: skip rate-mismatch check on unknown plan IDs (don't guess)
 
 **Decision:** The `PLAN_RATES` map in `src/dashboard/index.js` (Billing Audit section) holds expected vendor prices keyed on `Bypassed Plan ID`. Lines whose plan ID is **not** in the map skip the rate-mismatch check entirely. The other four checks (`unknown_iccid`, `canceled_before_period`, `duplicate_charge`, `missing_from_bill`) still run.
