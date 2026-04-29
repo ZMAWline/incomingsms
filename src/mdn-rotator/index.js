@@ -402,7 +402,7 @@ export default {
         // Load SIM from DB
         const sims = await supabaseSelect(
           env,
-          `sims?select=id,iccid,mobility_subscription_id,vendor,gateway_id,port,status,imei,activated_at,att_ban,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
+          `sims?select=id,iccid,msisdn,mobility_subscription_id,vendor,gateway_id,port,status,imei,activated_at,att_ban,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
         );
         if (!Array.isArray(sims) || sims.length === 0) {
           return new Response(JSON.stringify({ ok: false, error: `SIM not found: ${sim_id}` }), {
@@ -613,7 +613,122 @@ export default {
           });
         }
 
-        // For ota_refresh, cancel, resume — need Helix token + mdn/ban
+        // ATOMIC OTA: resendOtaProfile takes MSISDN + ICCID; no mobility_subscription_id involved.
+        if (action === "ota_refresh" && sim.vendor === "atomic") {
+          if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+            return new Response(JSON.stringify({ ok: false, error: "ATOMIC credentials not configured" }), {
+              status: 500, headers: { "Content-Type": "application/json" }
+            });
+          }
+          const mdnSource = sim.sim_numbers?.[0]?.e164 || sim.msisdn || null;
+          if (!mdnSource) {
+            return new Response(JSON.stringify({ ok: false, error: `No MSISDN for ATOMIC SIM ${iccid}, cannot OTA refresh` }), {
+              status: 400, headers: { "Content-Type": "application/json" }
+            });
+          }
+          const msisdn = String(mdnSource).replace(/\D/g, "").replace(/^1/, "");
+          const atomicUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+          const otaRunId = `simaction_atomic_ota_${iccid}_${Date.now()}`;
+          const otaBody = {
+            wholeSaleApi: {
+              session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+              wholeSaleRequest: { requestType: 'resendOtaProfile', MSISDN: msisdn, sim: iccid },
+            },
+          };
+          const otaRes = await relayFetch(env, atomicUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(otaBody),
+          });
+          const otaText = await otaRes.text();
+          let otaJson = {};
+          try { otaJson = JSON.parse(otaText); } catch {}
+          const otaR = otaJson?.wholeSaleApi?.wholeSaleResponse;
+          const otaOk = otaRes.ok && otaR?.statusCode === '00';
+          await logCarrierApiCall(env, {
+            run_id: otaRunId, step: 'ota_refresh', iccid, imei: null, vendor: 'atomic',
+            request_url: atomicUrl, request_method: 'POST', request_body: otaBody,
+            response_status: otaRes.status, response_ok: otaRes.ok,
+            response_body_text: otaText, response_body_json: otaJson,
+            error: otaOk ? null : `ATOMIC OTA failed: ${otaR?.description || otaRes.status}`,
+          });
+          return new Response(JSON.stringify({
+            ok: otaOk, action, sim_id, iccid,
+            description: otaR?.description || null,
+            detail: otaJson,
+          }, null, 2), {
+            status: 200, headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        // ATOMIC cancel/resume: deactivateSubscriber / reconnectSubscriber by MSISDN.
+        if ((action === "cancel" || action === "resume") && sim.vendor === "atomic") {
+          if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+            return new Response(JSON.stringify({ ok: false, error: "ATOMIC credentials not configured" }), {
+              status: 500, headers: { "Content-Type": "application/json" }
+            });
+          }
+          const mdnSource = sim.sim_numbers?.[0]?.e164 || sim.msisdn || null;
+          if (!mdnSource) {
+            return new Response(JSON.stringify({ ok: false, error: `No MSISDN for ATOMIC SIM ${iccid}, cannot ${action}` }), {
+              status: 400, headers: { "Content-Type": "application/json" }
+            });
+          }
+          const msisdn = String(mdnSource).replace(/\D/g, "").replace(/^1/, "");
+          const isCancel = action === "cancel";
+          const requestType = isCancel ? 'deactivateSubscriber' : 'reconnectSubscriber';
+          // DD = Deactivate Default; reconnect uses blank reasonCode per ATOMIC spec.
+          const reasonCode = isCancel ? 'DD' : '';
+          const newDbStatus = isCancel ? 'canceled' : 'active';
+          const stepName = isCancel ? 'manual_cancel' : 'manual_resume';
+          const atomicUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+          const actRunId = `simaction_atomic_${action}_${iccid}_${Date.now()}`;
+          const actBody = {
+            wholeSaleApi: {
+              session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+              wholeSaleRequest: { requestType, MSISDN: msisdn, reasonCode },
+            },
+          };
+          const actRes = await relayFetch(env, atomicUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(actBody),
+          });
+          const actText = await actRes.text();
+          let actJson = {};
+          try { actJson = JSON.parse(actText); } catch {}
+          const actR = actJson?.wholeSaleApi?.wholeSaleResponse;
+          const actOk = actRes.ok && actR?.statusCode === '00';
+          await logCarrierApiCall(env, {
+            run_id: actRunId, step: stepName, iccid, imei: null, vendor: 'atomic',
+            request_url: atomicUrl, request_method: 'POST', request_body: actBody,
+            response_status: actRes.status, response_ok: actRes.ok,
+            response_body_text: actText, response_body_json: actJson,
+            error: actOk ? null : `ATOMIC ${requestType} failed: ${actR?.description || actRes.status}`,
+          });
+          if (actOk) {
+            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: newDbStatus });
+          }
+          return new Response(JSON.stringify({
+            ok: actOk, action, sim_id, iccid,
+            description: actR?.description || null,
+            detail: actJson,
+          }, null, 2), {
+            status: 200, headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        // Vendors with no carrier-side OTA / status-change equivalent — fail fast with a clear message.
+        // Wing IoT only exposes activate/MDN-swap; Teltik is gateway-side.
+        if ((action === "ota_refresh" || action === "cancel" || action === "resume")
+            && (sim.vendor === "wing_iot" || sim.vendor === "teltik")) {
+          return new Response(JSON.stringify({
+            ok: false,
+            error: `Action "${action}" is not supported for vendor "${sim.vendor}". Only ATOMIC and Helix expose this endpoint.`,
+          }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+
+        // For Helix ota_refresh, cancel, resume — need Helix token + mdn/ban
         if (!subId) {
           return new Response(JSON.stringify({ ok: false, error: `SIM ${iccid} has no mobility_subscription_id` }), {
             status: 400,

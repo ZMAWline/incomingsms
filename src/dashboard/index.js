@@ -5047,9 +5047,7 @@ function getHTML(helixEnabled) {
                     <button onclick="bulkSimAction('ota_refresh')" class="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">OTA Refresh</button>
                     <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition">Rotate MDN</button>
                     <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Fix SIM</button>
-                    <button onclick="bulkAssignReseller()" class="px-3 py-1.5 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition">Assign Reseller</button>
-                    <button onclick="bulkAssignResellerAndNotify()" class="px-3 py-1.5 text-xs bg-green-600 hover:bg-green-700 text-white rounded transition">Assign + Notify</button>
-                    <button onclick="bulkUnassignReseller()" class="px-3 py-1.5 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition">Unassign Reseller</button>
+                    <button onclick="showBulkResellerActionModal()" class="px-3 py-1.5 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition">Reseller…</button>
                     <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
                     <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
                     <button onclick="bulkSetRotationEligible(false)" class="px-3 py-1.5 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition">Pause Auto-Rotate</button>
@@ -5061,6 +5059,7 @@ function getHTML(helixEnabled) {
                     <button onclick="showBulkSetStatusModal()" class="px-3 py-1.5 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition">Set Status</button>
                     <button onclick="bulkQuery()" class="px-3 py-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 text-white rounded transition">Query</button>
                     <button onclick="bulkRetryActivation()" class="px-3 py-1.5 text-xs bg-pink-600 hover:bg-pink-700 text-white rounded transition">Retry Activation</button>
+                    <button onclick="bulkDeleteSims()" class="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-800 text-white rounded transition">Delete SIMs</button>
                 </div>
                 <div id="rotation-audit-widget" class="hidden mb-4 p-4 bg-dark-800 rounded-xl border border-dark-600 flex flex-wrap items-center gap-4">
                     <div class="flex flex-col min-w-0">
@@ -10989,6 +10988,99 @@ async function sendSimOnline(simId, phoneNumber) {
             } catch (err) {
                 showToast('Error unassigning: ' + err, 'error');
             }
+        }
+
+        function showBulkResellerActionModal() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) {
+                showToast('Select at least one SIM first', 'error');
+                return;
+            }
+            const existing = document.getElementById('bulk-reseller-action-modal');
+            if (existing) existing.remove();
+            const modal = document.createElement('div');
+            modal.id = 'bulk-reseller-action-modal';
+            modal.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            const box = document.createElement('div');
+            box.className = 'bg-gray-800 rounded-xl shadow-xl w-80 p-6';
+            const titleEl = document.createElement('h3');
+            titleEl.className = 'text-lg font-semibold text-white mb-1';
+            titleEl.textContent = 'Reseller Action';
+            const subtitle = document.createElement('p');
+            subtitle.className = 'text-xs text-gray-400 mb-4';
+            subtitle.textContent = simIds.length + ' SIM(s) selected';
+            const optionsWrap = document.createElement('div');
+            optionsWrap.className = 'flex flex-col gap-2';
+            const opts = [
+                { label: 'Assign Reseller', cls: 'bg-green-700 hover:bg-green-800', fn: 'bulkAssignReseller' },
+                { label: 'Assign + Notify', cls: 'bg-green-600 hover:bg-green-700', fn: 'bulkAssignResellerAndNotify' },
+                { label: 'Unassign Reseller', cls: 'bg-purple-600 hover:bg-purple-700', fn: 'bulkUnassignReseller' }
+            ];
+            opts.forEach(function(o) {
+                const btn = document.createElement('button');
+                btn.className = 'w-full px-3 py-2 text-sm text-white rounded transition ' + o.cls;
+                btn.textContent = o.label;
+                btn.onclick = function() {
+                    modal.remove();
+                    window[o.fn]();
+                };
+                optionsWrap.appendChild(btn);
+            });
+            const cancelRow = document.createElement('div');
+            cancelRow.className = 'mt-4 flex justify-end';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'px-3 py-1.5 text-sm bg-gray-600 hover:bg-gray-700 text-gray-300 rounded transition';
+            cancelBtn.textContent = 'Cancel';
+            cancelBtn.onclick = function() { modal.remove(); };
+            cancelRow.appendChild(cancelBtn);
+            box.appendChild(titleEl);
+            box.appendChild(subtitle);
+            box.appendChild(optionsWrap);
+            box.appendChild(cancelRow);
+            modal.appendChild(box);
+            document.body.appendChild(modal);
+        }
+
+        async function bulkDeleteSims() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            if (!(await showConfirm('Delete SIMs', 'Permanently delete ' + simIds.length + ' SIM(s)? This deletes all SMS history and CANNOT be undone.'))) return;
+            const output = document.getElementById('sim-action-output');
+            document.getElementById('sim-action-title').textContent = 'Bulk Delete — ' + simIds.length + ' SIMs';
+            output.textContent = 'Starting...';
+            output.classList.remove('hidden');
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+            window.__bulkCancel = false;
+            showBulkCancelButton();
+            let deleted = 0, failed = 0, cancelled = 0;
+            const lines = [];
+            for (const simId of simIds) {
+                if (window.__bulkCancel) { cancelled = simIds.length - deleted - failed; break; }
+                try {
+                    const resp = await fetch(API_BASE + '/delete-sim', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sim_id: simId })
+                    });
+                    const result = await resp.json();
+                    if (result.ok) {
+                        deleted++;
+                        lines.push('SIM #' + simId + ': deleted');
+                    } else {
+                        failed++;
+                        lines.push('SIM #' + simId + ': FAILED — ' + (result.error || 'unknown'));
+                    }
+                } catch (e) {
+                    failed++;
+                    lines.push('SIM #' + simId + ': EXCEPTION — ' + (e && e.message ? e.message : e));
+                }
+                output.textContent = lines.join('\\n') + '\\n\\nProcessing... (' + (deleted + failed) + '/' + simIds.length + ')';
+            }
+            hideBulkCancelButton();
+            const summary = 'Done: ' + deleted + ' deleted' + (failed ? ', ' + failed + ' failed' : '') + (cancelled ? ', ' + cancelled + ' cancelled' : '');
+            output.textContent = summary + '\\n\\n' + lines.join('\\n');
+            loadSims(true);
         }
 
         async function bulkErrorAction(action) {
