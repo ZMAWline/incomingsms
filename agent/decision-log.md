@@ -4,6 +4,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-04-30 — Billing Ledger keys rate lookup on **vendor**, not plan_id
+
+**Decision:** `loadActiveRates(env)` returns `{ vendor: { rate, plan_name } }` — one active rate per vendor at a time. The `auditOneLine` rate-mismatch check and the `regenerateLedgerForVendor` `expected_amount` calc both look up by `vendor` (e.g. `wing_iot`), not by the bill CSV's `Bypassed Plan ID` (e.g. `796`).
+
+**Why:** User confirmed each carrier API has exactly one plan in our setup (atomic = one plan, wing_iot = one plan, etc.). Keying on vendor means: (a) no need to stamp `plan_id` on every SIM at activation, (b) the bill audit and the ledger use the same source of truth, (c) a partial unique index `WHERE effective_to IS NULL` on `(vendor, plan_name)` enforces "one active rate at a time" at the DB level. Plan name in `plan_rates.plan_name` is informational/display only — it's NOT used for matching. The `bypassed_plan_id` column on `bill_audit_lines` is preserved for forensic display but doesn't drive rate lookup anymore.
+
+**Consequence / what not to undo:** Do NOT re-introduce a `plan_id`-keyed `PLAN_RATES` map or add a `sims.plan_id` column for billing purposes. If a vendor ever exposes multiple plans to us (e.g. ATOMIC adds a 2nd SKU), we would need to: (a) add `sims.plan_id` populated at activation, (b) change the rate lookup to `(vendor, plan_id)`, (c) backfill historical SIMs. That migration is deliberately deferred until a real second-plan situation exists. The `plan_rates` table already supports multiple plans per vendor (the unique constraint is on `(vendor, plan_name)`), so the table doesn't need to change — only the lookup function.
+
+---
+
+## 2026-04-30 — Billing Ledger has no cron — auto-trigger + manual covers it
+
+**Decision:** No cron triggers `regenerateLedgerForVendor`. The ledger is refreshed by: (a) auto-trigger inside `handleBillAuditUpload` (after audit insert, regen runs for that vendor + reconcile runs for the upload), (b) operator clicking "Regenerate" on the Billing Ledger card (one-shot), (c) recommended manual click on the 5th and 16th of each month (when new cycles begin) and after large activation/cancel batches.
+
+**Why:** Considered (1) daily cron at NY 06:00 vs (2) per-cycle cron (day before each anchor) vs (3) no cron. User explicitly chose option 3. Reasoning for not adding a cron: the auto-trigger from bill upload covers the case where freshness actually matters (you only consult the ledger when reconciling a bill). Mid-cycle staleness is acceptable because the operational signals (new SIMs, cancels) flow through the bill audit anyway. Adds zero infrastructure surface area to maintain. Per-cycle was rejected outright as strictly worse than daily (same cost, more staleness, two cron entries for two anchors).
+
+**Consequence / what not to undo:** If we later add automation, prefer **daily** over per-cycle. Daily is strictly more useful (always-fresh for browsing) at the same cost. Don't try to be clever with "only on the 5th and 16th" — Wing/ATOMIC/Helix and Teltik have different anchor days, and the operational drift between cycles is exactly what daily prevents.
+
+---
+
 ## 2026-04-29 — Reconciliation cron ships flag-OFF with hard runtime caps (not just rate limits)
 
 **Decision:** The new `/reconcile-rotations` endpoint on details-finalizer is gated by a `RECONCILIATION_ENABLED` secret (default `"false"` — cron tick exits immediately). On top of the kill switch, the runtime is **mathematically bounded**: ≤60 AT&T GETs, ≤60 webhook POSTs, **exactly 0 plan-change PUTs**, 90s wall-clock with `Date.now()` deadline checks before each iteration, single audit row written per run, no internal `fetch` to its own URL. Bucket C (eligible-but-not-rotated) is **log-only** — never triggers a rotation, even though Bucket A and B do auto-heal. Manual operator action still required for any actual rotation.
