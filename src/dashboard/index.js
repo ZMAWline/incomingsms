@@ -3785,14 +3785,12 @@ async function handleBillingPreview(url, env, corsHeaders) {
       const wideEnd = new Date(end + 'T00:00:00Z');
       wideEnd.setUTCDate(wideEnd.getUTCDate() + 3);
       const idList = teltikSimIds.join(',');
-      const rotResp = await supabaseGet(env,
+      const rotations = await supabaseGetAllArray(env,
         'sim_numbers?select=sim_id,valid_from&sim_id=in.(' + idList + ')' +
         '&valid_from=gte.' + encodeURIComponent(wideStart.toISOString()) +
         '&valid_from=lt.' + encodeURIComponent(wideEnd.toISOString()) +
-        '&order=sim_id.asc,valid_from.asc' +
-        '&limit=50000'
+        '&order=sim_id.asc,valid_from.asc'
       );
-      const rotations = await rotResp.json();
       if (Array.isArray(rotations)) {
         const byThen = new Map();
         for (const r of rotations) {
@@ -3984,14 +3982,12 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       const wideEnd = new Date(end + 'T00:00:00Z');
       wideEnd.setUTCDate(wideEnd.getUTCDate() + 3);
       const idList = teltikSimIdsD.join(',');
-      const rotResp = await supabaseGet(env,
+      const rotations = await supabaseGetAllArray(env,
         'sim_numbers?select=sim_id,valid_from&sim_id=in.(' + idList + ')' +
         '&valid_from=gte.' + encodeURIComponent(wideStart.toISOString()) +
         '&valid_from=lt.' + encodeURIComponent(wideEnd.toISOString()) +
-        '&order=sim_id.asc,valid_from.asc' +
-        '&limit=50000'
+        '&order=sim_id.asc,valid_from.asc'
       );
-      const rotations = await rotResp.json();
       if (Array.isArray(rotations)) {
         const byThen = new Map();
         for (const r of rotations) {
