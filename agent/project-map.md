@@ -17,6 +17,7 @@
 | `phone-number-sync` | Sync phone numbers (utility worker) | HTTP | — |
 | `quickbooks` | QBO OAuth 2.0, customer mapping, invoice generation | HTTP | QBO_TOKENS KV |
 | `teltik-worker` | T-Mobile SIM management via Teltik API: import lines, receive SMS webhooks, rotate MDNs every 48h | Cron `10,40 * * * *` + HTTP `/import` `/webhook` `/rotate` `/setup-webhook` | — |
+| `reseller-portal` | Read-only customer portal + JSON API. Each reseller logs in with `rsk_live_*` API key (validated against `reseller_api_keys`); sees own SIMs, past invoices with day-by-day reconstruction, per-SIM lifetime usage. Imports `src/shared/billing.js`. | HTTP | — (Supabase service-role only; no service bindings) |
 
 ## Dashboard Service Bindings (all 10)
 

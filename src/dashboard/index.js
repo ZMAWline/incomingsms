@@ -1,3 +1,4 @@
+import { computeBillingBreakdown } from '../shared/billing.js';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -232,6 +233,16 @@ export default {
 
     if (url.pathname === '/api/qbo-invoices') {
       return handleQboInvoicesGet(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/reseller-keys' && request.method === 'GET') {
+      return handleResellerKeysList(url, env, corsHeaders);
+    }
+    if (url.pathname === '/api/reseller-keys' && request.method === 'POST') {
+      return handleResellerKeysCreate(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/reseller-keys/revoke' && request.method === 'POST') {
+      return handleResellerKeysRevoke(request, env, corsHeaders);
     }
 
     if (url.pathname === '/api/billing/preview') {
@@ -3614,6 +3625,111 @@ async function handleSimWebhooks(env, corsHeaders, url) {
   }
 }
 
+async function handleResellerKeysList(url, env, corsHeaders) {
+  try {
+    const resellerId = url.searchParams.get('reseller_id');
+    let q = 'reseller_api_keys?select=id,reseller_id,api_key,enabled,created_at,resellers(name)&order=created_at.desc';
+    if (resellerId) q += '&reseller_id=eq.' + encodeURIComponent(resellerId);
+    const resp = await supabaseGet(env, q);
+    if (!resp.ok) {
+      return new Response(JSON.stringify({ error: 'lookup failed' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const rows = await resp.json();
+    const out = (Array.isArray(rows) ? rows : []).map(r => ({
+      id: r.id,
+      reseller_id: r.reseller_id,
+      reseller_name: r.resellers?.name || null,
+      api_key_masked: maskApiKey(r.api_key),
+      enabled: r.enabled,
+      created_at: r.created_at,
+    }));
+    return new Response(JSON.stringify(out), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+function maskApiKey(k) {
+  if (!k || k.length < 8) return '****';
+  return k.slice(0, 9) + '…' + k.slice(-4);
+}
+
+function generateApiKey() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  return 'rsk_live_' + hex;
+}
+
+async function handleResellerKeysCreate(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const resellerId = body.reseller_id;
+    if (!resellerId) {
+      return new Response(JSON.stringify({ error: 'reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const checkResp = await supabaseGet(env, 'resellers?select=id&id=eq.' + encodeURIComponent(resellerId) + '&limit=1');
+    const checkRows = await checkResp.json();
+    if (!Array.isArray(checkRows) || checkRows.length === 0) {
+      return new Response(JSON.stringify({ error: 'reseller not found' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const apiKey = generateApiKey();
+    const insertResp = await fetch(env.SUPABASE_URL + '/rest/v1/reseller_api_keys', {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify({ reseller_id: resellerId, api_key: apiKey, enabled: true }),
+    });
+    if (!insertResp.ok) {
+      const txt = await insertResp.text();
+      return new Response(JSON.stringify({ error: 'insert failed: ' + txt }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const inserted = await insertResp.json();
+    const row = Array.isArray(inserted) && inserted[0] ? inserted[0] : null;
+    return new Response(JSON.stringify({
+      id: row?.id,
+      reseller_id: resellerId,
+      api_key: apiKey,
+      enabled: true,
+      created_at: row?.created_at,
+      note: 'This key is shown once. Copy it now and deliver to the reseller securely.',
+    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+async function handleResellerKeysRevoke(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const id = body.id;
+    if (!id) {
+      return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/reseller_api_keys?id=eq.' + encodeURIComponent(id), {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ enabled: false }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      return new Response(JSON.stringify({ error: 'revoke failed: ' + txt }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
 async function handleQboMappingsGet(env, corsHeaders) {
   try {
     const query = `qbo_customer_map?select=id,reseller_id,customer_name,qbo_customer_id,qbo_display_name,daily_rate,resellers(name)&order=id.desc`;
@@ -3716,136 +3832,12 @@ async function handleBillingPreview(url, env, corsHeaders) {
     if (!resellerId || !start || !end) {
       return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-
-    // Get reseller name + QBO mapping
-    const [resellerResp, mappingResp] = await Promise.all([
-      supabaseGet(env, 'resellers?select=id,name&id=eq.' + encodeURIComponent(resellerId) + '&limit=1'),
-      supabaseGet(env, 'qbo_customer_map?select=id,qbo_customer_id,qbo_display_name,daily_rate&reseller_id=eq.' + encodeURIComponent(resellerId) + '&limit=1'),
-    ]);
-    const resellerData = await resellerResp.json();
-    const mappingData = await mappingResp.json();
-    const reseller = Array.isArray(resellerData) && resellerData[0] ? resellerData[0] : null;
-    const mapping = Array.isArray(mappingData) && mappingData[0] ? mappingData[0] : null;
-
-    // Get SIM-days with SMS for this reseller in the date range
-    // Join: reseller_sims → sims → sim_sms_daily
-    const rsSims = await supabaseGetAllArray(env,
-      'reseller_sims?select=sim_id,sims(vendor,rotation_interval_hours,sim_sms_daily(est_date,sms_count))' +
-      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&active=eq.true' +
-      '&order=sim_id.asc'
-    );
-
-    const dailyRate = mapping ? parseFloat(mapping.daily_rate) : 0;
-    const blockRate = +(dailyRate * 2).toFixed(2);
-
-    // AT&T (helix/atomic/wing): per-calendar-day at dailyRate.
-    // Teltik: one block per MDN rotation; handled after AT&T.
-    const attDays = {};
-    const teltikSimIds = [];
-    const teltikSmsDaysBySim = new Map();
-    const teltikIntervalBySim = new Map();
-    if (Array.isArray(rsSims)) {
-      for (const rs of rsSims) {
-        const daily = rs.sims?.sim_sms_daily;
-        if (rs.sims?.vendor === 'teltik') {
-          teltikSimIds.push(rs.sim_id);
-          teltikIntervalBySim.set(rs.sim_id, rs.sims?.rotation_interval_hours || 48);
-          const days = new Set();
-          if (Array.isArray(daily)) {
-            for (const row of daily) {
-              if (row.est_date && row.sms_count > 0) days.add(row.est_date);
-            }
-          }
-          teltikSmsDaysBySim.set(rs.sim_id, days);
-          continue;
-        }
-        if (!Array.isArray(daily)) continue;
-        for (const row of daily) {
-          if (!row.est_date || row.sms_count <= 0) continue;
-          if (row.est_date < start || row.est_date > end) continue;
-          if (!attDays[row.est_date]) attDays[row.est_date] = new Set();
-          attDays[row.est_date].add(rs.sim_id);
-        }
-      }
-    }
-
-    const attEntries = Object.keys(attDays).sort().map(date => ({
-      date, sim_count: attDays[date].size, rate: dailyRate,
-      amount: +(attDays[date].size * dailyRate).toFixed(2),
-    }));
-
-    // Teltik: one block per rotation. Block = [valid_from, min(next rotation,
-    // valid_from + rotation_interval_hours)). Bills into the cycle containing
-    // valid_from's EST date. Billable iff any SMS on any EST date the block touches.
-    const teltikBlocks = {};
-    if (teltikSimIds.length > 0) {
-      const wideStart = new Date(start + 'T00:00:00Z');
-      wideStart.setUTCDate(wideStart.getUTCDate() - 2);
-      const wideEnd = new Date(end + 'T00:00:00Z');
-      wideEnd.setUTCDate(wideEnd.getUTCDate() + 3);
-      const idList = teltikSimIds.join(',');
-      const rotations = await supabaseGetAllArray(env,
-        'sim_numbers?select=sim_id,valid_from&sim_id=in.(' + idList + ')' +
-        '&valid_from=gte.' + encodeURIComponent(wideStart.toISOString()) +
-        '&valid_from=lt.' + encodeURIComponent(wideEnd.toISOString()) +
-        '&order=sim_id.asc,valid_from.asc'
-      );
-      if (Array.isArray(rotations)) {
-        const byThen = new Map();
-        for (const r of rotations) {
-          if (!byThen.has(r.sim_id)) byThen.set(r.sim_id, []);
-          byThen.get(r.sim_id).push(new Date(r.valid_from));
-        }
-        for (const [simId, rots] of byThen) {
-          const intervalMs = (teltikIntervalBySim.get(simId) || 48) * 3600 * 1000;
-          for (let i = 0; i < rots.length; i++) {
-            const rotStart = rots[i];
-            const rotNext = rots[i + 1];
-            const blockEnd = new Date(Math.min(
-              rotStart.getTime() + intervalMs,
-              rotNext ? rotNext.getTime() : Number.POSITIVE_INFINITY
-            ));
-            const startEst = estDateFromDate(rotStart);
-            if (startEst < start || startEst > end) continue;
-            const endEstInclusive = estDateFromDate(new Date(blockEnd.getTime() - 1000));
-            const daysSet = teltikSmsDaysBySim.get(simId) || new Set();
-            let hasSms = false;
-            for (let cur = startEst; cur <= endEstInclusive; cur = nextEstDate(cur)) {
-              if (daysSet.has(cur)) { hasSms = true; break; }
-            }
-            if (!hasSms) continue;
-            if (!teltikBlocks[startEst]) teltikBlocks[startEst] = 0;
-            teltikBlocks[startEst] += 1;
-          }
-        }
-      }
-    }
-
-    const teltikEntries = Object.keys(teltikBlocks).sort().map(date => ({
-      date, sim_count: teltikBlocks[date], rate: blockRate,
-      amount: +(teltikBlocks[date] * blockRate).toFixed(2),
-    }));
-
-    const days = [...attEntries, ...teltikEntries].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
-    const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
-    const totalAmount = +(days.reduce((s, d) => s + d.amount, 0)).toFixed(2);
-
-    return new Response(JSON.stringify({
-      reseller_id: resellerId,
-      reseller_name: reseller?.name || resellerId,
-      mapping,
-      daily_rate: dailyRate,
-      block_rate: blockRate,
-      days,
-      total_sim_days: totalSimDays,
-      total_amount: totalAmount,
-    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const result = await computeBillingBreakdown(env, { resellerId, start, end });
+    return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
     return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
-
 async function handleBillingCreateInvoice(request, env, corsHeaders) {
   // Kept for backward compatibility but no longer called by the UI.
   return new Response(JSON.stringify({ error: 'Use /api/billing/download-invoice' }), { status: 410, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -3924,109 +3916,15 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    const mappingResp = await supabaseGet(env, 'qbo_customer_map?select=id,qbo_display_name,daily_rate&reseller_id=eq.' + encodeURIComponent(resellerId) + '&limit=1');
-    const mappingData = await mappingResp.json();
-    const mapping = Array.isArray(mappingData) && mappingData[0] ? mappingData[0] : null;
-    if (!mapping) {
+    const breakdown = await computeBillingBreakdown(env, { resellerId, start, end });
+    if (!breakdown.mapping) {
       return new Response(JSON.stringify({ error: 'No customer rate configured for this reseller' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-
-    const rsSims = await supabaseGetAllArray(env,
-      'reseller_sims?select=sim_id,sims(vendor,rotation_interval_hours,sim_sms_daily(est_date,sms_count))' +
-      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&active=eq.true' +
-      '&order=sim_id.asc'
-    );
-
-    const dailyRate = parseFloat(mapping.daily_rate);
-    const blockRateD = +(dailyRate * 2).toFixed(2);
-
-    const attDaysD = {};
-    const teltikSimIdsD = [];
-    const teltikSmsDaysBySimD = new Map();
-    const teltikIntervalBySimD = new Map();
-    if (Array.isArray(rsSims)) {
-      for (const rs of rsSims) {
-        const daily = rs.sims?.sim_sms_daily;
-        if (rs.sims?.vendor === 'teltik') {
-          teltikSimIdsD.push(rs.sim_id);
-          teltikIntervalBySimD.set(rs.sim_id, rs.sims?.rotation_interval_hours || 48);
-          const days = new Set();
-          if (Array.isArray(daily)) {
-            for (const row of daily) {
-              if (row.est_date && row.sms_count > 0) days.add(row.est_date);
-            }
-          }
-          teltikSmsDaysBySimD.set(rs.sim_id, days);
-          continue;
-        }
-        if (!Array.isArray(daily)) continue;
-        for (const row of daily) {
-          if (!row.est_date || row.sms_count <= 0) continue;
-          if (row.est_date < start || row.est_date > end) continue;
-          if (!attDaysD[row.est_date]) attDaysD[row.est_date] = new Set();
-          attDaysD[row.est_date].add(rs.sim_id);
-        }
-      }
-    }
-
-    const attEntriesD = Object.keys(attDaysD).sort().map(date => ({
-      date, sim_count: attDaysD[date].size, rate: dailyRate,
-      amount: +(attDaysD[date].size * dailyRate).toFixed(2),
-    }));
-
-    const teltikBlocksD = {};
-    if (teltikSimIdsD.length > 0) {
-      const wideStart = new Date(start + 'T00:00:00Z');
-      wideStart.setUTCDate(wideStart.getUTCDate() - 2);
-      const wideEnd = new Date(end + 'T00:00:00Z');
-      wideEnd.setUTCDate(wideEnd.getUTCDate() + 3);
-      const idList = teltikSimIdsD.join(',');
-      const rotations = await supabaseGetAllArray(env,
-        'sim_numbers?select=sim_id,valid_from&sim_id=in.(' + idList + ')' +
-        '&valid_from=gte.' + encodeURIComponent(wideStart.toISOString()) +
-        '&valid_from=lt.' + encodeURIComponent(wideEnd.toISOString()) +
-        '&order=sim_id.asc,valid_from.asc'
-      );
-      if (Array.isArray(rotations)) {
-        const byThen = new Map();
-        for (const r of rotations) {
-          if (!byThen.has(r.sim_id)) byThen.set(r.sim_id, []);
-          byThen.get(r.sim_id).push(new Date(r.valid_from));
-        }
-        for (const [simId, rots] of byThen) {
-          const intervalMs = (teltikIntervalBySimD.get(simId) || 48) * 3600 * 1000;
-          for (let i = 0; i < rots.length; i++) {
-            const rotStart = rots[i];
-            const rotNext = rots[i + 1];
-            const blockEnd = new Date(Math.min(
-              rotStart.getTime() + intervalMs,
-              rotNext ? rotNext.getTime() : Number.POSITIVE_INFINITY
-            ));
-            const startEst = estDateFromDate(rotStart);
-            if (startEst < start || startEst > end) continue;
-            const endEstInclusive = estDateFromDate(new Date(blockEnd.getTime() - 1000));
-            const daysSet = teltikSmsDaysBySimD.get(simId) || new Set();
-            let hasSms = false;
-            for (let cur = startEst; cur <= endEstInclusive; cur = nextEstDate(cur)) {
-              if (daysSet.has(cur)) { hasSms = true; break; }
-            }
-            if (!hasSms) continue;
-            if (!teltikBlocksD[startEst]) teltikBlocksD[startEst] = 0;
-            teltikBlocksD[startEst] += 1;
-          }
-        }
-      }
-    }
-
-    const teltikEntriesD = Object.keys(teltikBlocksD).sort().map(date => ({
-      date, sim_count: teltikBlocksD[date], rate: blockRateD,
-      amount: +(teltikBlocksD[date] * blockRateD).toFixed(2),
-    }));
-
-    const days = [...attEntriesD, ...teltikEntriesD].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
-    const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
-    const totalAmount = +(days.reduce((s, d) => s + d.amount, 0)).toFixed(2);
+    const mapping = breakdown.mapping;
+    const dailyRate = breakdown.daily_rate;
+    const days = breakdown.days;
+    const totalSimDays = breakdown.total_sim_days;
+    const totalAmount = breakdown.total_amount;
 
     if (totalSimDays === 0) {
       return new Response(JSON.stringify({ error: 'No billable SIM-days in this range' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -6023,6 +5921,37 @@ function getHTML(helixEnabled) {
                     </div>
                 </div>
 
+                <!-- Reseller API Keys -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-semibold text-white">Reseller API Keys</h3>
+                    </div>
+                    <p class="text-xs text-gray-500 mb-4">Generate a key per reseller to grant read-only access to the customer portal at <span class="text-gray-300">reseller-portal.zalmen-531.workers.dev</span>. Each key shows full data scoped to that reseller only.</p>
+                    <div class="flex flex-wrap items-end gap-3 mb-4">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">Reseller</label>
+                            <select id="rkey-reseller" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 min-w-56"><option value="">Loading…</option></select>
+                        </div>
+                        <button onclick="generateResellerKey()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Generate Key</button>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium">Reseller</th>
+                                    <th class="px-4 py-3 font-medium">Key</th>
+                                    <th class="px-4 py-3 font-medium">Status</th>
+                                    <th class="px-4 py-3 font-medium">Created</th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="reseller-keys-table" class="text-sm">
+                                <tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- Invoice Generator -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <h3 class="text-lg font-semibold text-white mb-3">Generate Invoice</h3>
@@ -7846,7 +7775,7 @@ function getHTML(helixEnabled) {
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
+            if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); loadResellerKeys(); }
             if (tabName === 'sms-usage') loadSmsUsage();
             if (tabName === 'sims') loadRotationAudit();
         }
@@ -12052,6 +11981,89 @@ async function sendSimOnline(simId, phoneNumber) {
                     sel.appendChild(opt);
                 });
             } catch (e) { console.error("loadBillingResellers:", e); }
+        }
+
+        async function loadResellerKeys() {
+            try {
+                const [keysResp, mapsResp] = await Promise.all([
+                    fetch(\`\${API_BASE}/reseller-keys\`),
+                    fetch(\`\${API_BASE}/qbo-mappings\`),
+                ]);
+                const keys = await keysResp.json();
+                const maps = await mapsResp.json();
+                const sel = document.getElementById('rkey-reseller');
+                sel.innerHTML = '<option value="">Choose reseller…</option>' + (Array.isArray(maps) ? maps : []).map(m => '<option value="' + m.reseller_id + '">' + (m.resellers?.name || m.qbo_display_name || ('reseller_id ' + m.reseller_id)) + '</option>').join('');
+                const tbody = document.getElementById('reseller-keys-table');
+                if (!Array.isArray(keys) || keys.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">No keys yet</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = keys.map(k => '<tr class="border-b border-dark-700">' +
+                    '<td class="px-4 py-3 text-gray-300">' + (k.reseller_name || ('reseller_id ' + k.reseller_id)) + '</td>' +
+                    '<td class="px-4 py-3 text-gray-400 font-mono text-xs">' + k.api_key_masked + '</td>' +
+                    '<td class="px-4 py-3">' + (k.enabled ? '<span class="text-green-400">enabled</span>' : '<span class="text-gray-500">revoked</span>') + '</td>' +
+                    '<td class="px-4 py-3 text-gray-500 text-xs">' + (k.created_at ? new Date(k.created_at).toISOString().slice(0,10) : '') + '</td>' +
+                    '<td class="px-4 py-3">' + (k.enabled ? '<button onclick="revokeResellerKey(' + k.id + ')" class="text-xs text-red-400 hover:text-red-300">Revoke</button>' : '') + '</td>' +
+                    '</tr>').join('');
+            } catch (e) {
+                console.error('loadResellerKeys', e);
+                showToast('Failed to load reseller keys', 'error');
+            }
+        }
+
+        async function generateResellerKey() {
+            const resellerId = document.getElementById('rkey-reseller').value;
+            if (!resellerId) { showToast('Pick a reseller first', 'error'); return; }
+            const ok = await showConfirm('Generate API Key', 'A new API key will be created for this reseller. The plaintext key is shown once and cannot be retrieved later. Continue?');
+            if (!ok) return;
+            try {
+                const resp = await fetch(\`\${API_BASE}/reseller-keys\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reseller_id: parseInt(resellerId, 10) }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) { showToast('Generate failed: ' + (data.error || resp.status), 'error'); return; }
+                const magicLink = 'https://reseller-portal.zalmen-531.workers.dev/login?key=' + encodeURIComponent(data.api_key);
+                const html = '<div class="bg-dark-700 rounded-lg p-4 mb-3"><div class="text-xs text-gray-500 uppercase mb-1">API Key (shown once)</div><div class="text-accent font-mono break-all text-sm">' + data.api_key + '</div></div>' +
+                    '<div class="bg-dark-700 rounded-lg p-4"><div class="text-xs text-gray-500 uppercase mb-1">Magic Link (deliver to reseller)</div><div class="text-blue-300 font-mono break-all text-xs">' + magicLink + '</div></div>' +
+                    '<div class="text-xs text-gray-500 mt-3 italic">' + (data.note || '') + '</div>';
+                showResultModal('Reseller key generated', html, [
+                    { label: 'Copy key', action: () => navigator.clipboard.writeText(data.api_key).then(() => showToast('Key copied','info')) },
+                    { label: 'Copy link', action: () => navigator.clipboard.writeText(magicLink).then(() => showToast('Link copied','info')) },
+                ]);
+                loadResellerKeys();
+            } catch (e) {
+                showToast('Generate failed: ' + e.message, 'error');
+            }
+        }
+
+        async function revokeResellerKey(id) {
+            const ok = await showConfirm('Revoke Key', 'Revoking will immediately invalidate this key for the reseller. Continue?');
+            if (!ok) return;
+            try {
+                const resp = await fetch(\`\${API_BASE}/reseller-keys/revoke\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id }),
+                });
+                if (!resp.ok) { showToast('Revoke failed', 'error'); return; }
+                showToast('Key revoked', 'success');
+                loadResellerKeys();
+            } catch (e) {
+                showToast('Revoke failed: ' + e.message, 'error');
+            }
+        }
+
+        function showResultModal(title, bodyHtml, buttons) {
+            const root = document.getElementById('toast') ? document.body : document.body;
+            const wrap = document.createElement('div');
+            wrap.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            const btnHtml = (buttons || []).map((b, i) => '<button data-i="' + i + '" class="rkey-btn px-3 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">' + b.label + '</button>').join(' ');
+            wrap.innerHTML = '<div class="bg-dark-800 border border-dark-600 rounded-xl max-w-2xl w-full p-6"><h3 class="text-lg font-semibold text-white mb-3">' + title + '</h3>' + bodyHtml + '<div class="flex justify-end gap-2 mt-4">' + btnHtml + ' <button id="rkey-close" class="px-3 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-200 rounded-lg transition">Close</button></div></div>';
+            root.appendChild(wrap);
+            wrap.querySelectorAll('.rkey-btn').forEach(b => b.addEventListener('click', () => { (buttons[b.dataset.i].action || (()=>{}))(); }));
+            wrap.querySelector('#rkey-close').addEventListener('click', () => wrap.remove());
         }
 
         async function loadMappings() {
