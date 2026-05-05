@@ -4,6 +4,46 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-05 — Reseller portal is a separate worker, not a grafted route on dashboard
+
+**Decision:** Customer-facing reseller portal lives at `src/reseller-portal/` as its own Cloudflare Worker (`reseller-portal.zalmen-531.workers.dev`), not as new routes on the existing `dashboard` worker.
+
+**Why:** Blast radius. The dashboard is 4000+ lines of admin tooling with mutating handlers and service bindings to every other worker. One auth-check bug there leaks the entire fleet to a customer. The portal worker has only read-only handlers, no service bindings, and a different auth model (Bearer API key vs. Basic admin). It also lets the portal deploy independently — admin tweaks shouldn't gate customer changes.
+
+**Consequence / what not to undo:** Do NOT add the portal routes back into `src/dashboard/index.js` even when "it would be simpler." If any new customer-facing read view is needed, it goes on the portal worker. If a route ever needs to mutate state on the customer's behalf, think hard before adding write capability — every new mutation widens the cross-tenant blast radius.
+
+---
+
+## 2026-05-05 — Billing math lives in `src/shared/billing.js`, imported by both dashboard and portal
+
+**Decision:** `computeBillingBreakdown` extracted into `src/shared/billing.js`. Both `handleBillingPreview` (dashboard) and `/api/invoices/:id` (portal) call the same function. The dashboard's `handleBillingDownloadInvoice` also uses it.
+
+**Why:** The billing math has subtle ordering (Teltik wide-window ±2/+3 days, EST date conversion, `hasSms` early break, AT&T-vs-Teltik separation) and it already had one silently-undercharging pagination bug. Two copies guaranteed drift. A shared module is one file copied + two imports, no runtime coupling, no service binding.
+
+**Consequence / what not to undo:** Do NOT inline-copy this logic into a third caller (e.g., a future "monthly summary" worker). Any new code path that needs the same per-day breakdown imports `computeBillingBreakdown`. If you change the math, change it in `src/shared/billing.js` and re-run the byte-identical regression check (`/api/billing/preview` for TrustOTP 4/18-5/1 must equal $10,476.40 / 7,461 / 27 rows).
+
+---
+
+## 2026-05-05 — Reseller API keys stored plaintext for MVP
+
+**Decision:** `reseller_api_keys.api_key` is plaintext. `authenticate()` does a direct `eq.<key>` Supabase lookup.
+
+**Why:** Single-tenant operator with a handful of resellers. Hashing requires either per-request bcrypt (Workers latency) or a non-trivial scheme that breaks the UNIQUE-index lookup. Mitigations in place: TLS-only transport, `enabled=false` soft-revoke, never logged, plaintext shown to admin once and not retrievable. Acceptable risk for MVP.
+
+**Consequence / what not to undo:** Do NOT assume the keys in DB are hashes. Before scaling beyond a handful of resellers (or before any Supabase dump leaves trusted hands), migrate to SHA-256 hashed: (1) hash on insert in dashboard's `handleResellerKeysCreate`, (2) hash the presented key in `authenticate` before lookup, (3) one-shot migration to hash existing rows. Keep the `rsk_live_` prefix scheme so log greps still work.
+
+---
+
+## 2026-05-05 — Past-invoice drill-down shows as-billed total only; per-day breakdown labeled as reconstruction
+
+**Decision:** Reseller portal's `/api/invoices/:id` returns `invoice.as_billed_total` (from `qbo_invoices.total`) as the headline number. The per-day breakdown rows below are computed fresh from `computeBillingBreakdown` and explicitly labeled "Reconstructed from current SMS records." The recount total is intentionally NOT surfaced.
+
+**Why:** The portal is positioned as dispute prevention through transparency. If we showed a now-recomputed total alongside the as-billed total and they differed (because SMS data was backfilled, a SIM was reassigned, or rotation history changed after invoicing), we'd create new disputes from a feature designed to reduce them. `qbo_invoices` stores only a total — there's no per-day "as-billed" detail to surface, so the breakdown rows must come from the live recount; we just label them honestly.
+
+**Consequence / what not to undo:** Do NOT add a "now-recomputed total" column to the portal invoice view, even if it seems like helpful transparency. If the user ever wants future invoices to show actual as-billed per-day numbers (not reconstruction), the path is to add a `qbo_invoice_lines` table that snapshots the breakdown at invoice creation time — older invoices keep the reconstruction-with-disclaimer treatment.
+
+---
+
 ## 2026-04-30 — Billing Ledger keys rate lookup on **vendor**, not plan_id
 
 **Decision:** `loadActiveRates(env)` returns `{ vendor: { rate, plan_name } }` — one active rate per vendor at a time. The `auditOneLine` rate-mismatch check and the `regenerateLedgerForVendor` `expected_amount` calc both look up by `vendor` (e.g. `wing_iot`), not by the bill CSV's `Bypassed Plan ID` (e.g. `796`).
