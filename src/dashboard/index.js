@@ -526,7 +526,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,vendor,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc&limit=5000`;
+    let query = `sims?select=id,iccid,port,status,vendor,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
 
     // Apply status filter
     if (statusFilter) {
@@ -535,8 +535,7 @@ async function handleSims(env, corsHeaders, url) {
       query += `&status=neq.canceled`;
     }
 
-    const response = await supabaseGet(env, query);
-    const sims = await response.json();
+    const sims = await supabaseGetAllArray(env, query);
 
     // Filter by reseller if specified (done client-side since nested filter is complex)
     let filteredSims = sims;
