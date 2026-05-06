@@ -402,18 +402,17 @@ async function handleStats(env, corsHeaders) {
 
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-    const [totalRes, activeRes, provRes, msgRes, suspRes, errRes, canRes, atmRes, telRes, wingRes, helRes] = await Promise.all([
+    const [totalRes, activeRes, provRes, msgRes, suspRes, errRes, atmRes, telRes, wingRes, helRes] = await Promise.all([
       fetch(base + 'sims?select=id&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&status=eq.active&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&status=eq.provisioning&limit=1', { headers: authHeaders }),
       fetch(base + 'inbound_sms?select=id&received_at=gte.' + yesterday + '&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&status=eq.suspended&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&status=eq.error&limit=1', { headers: authHeaders }),
-      fetch(base + 'sims?select=id&status=eq.canceled&limit=1', { headers: authHeaders }),
-      fetch(base + 'sims?select=id&vendor=eq.atomic&limit=1', { headers: authHeaders }),
-      fetch(base + 'sims?select=id&vendor=eq.teltik&limit=1', { headers: authHeaders }),
-      fetch(base + 'sims?select=id&vendor=eq.wing_iot&limit=1', { headers: authHeaders }),
-      fetch(base + 'sims?select=id&vendor=eq.helix&limit=1', { headers: authHeaders }),
+      fetch(base + 'sims?select=id&vendor=eq.atomic&status=neq.canceled&limit=1', { headers: authHeaders }),
+      fetch(base + 'sims?select=id&vendor=eq.teltik&status=neq.canceled&limit=1', { headers: authHeaders }),
+      fetch(base + 'sims?select=id&vendor=eq.wing_iot&status=neq.canceled&limit=1', { headers: authHeaders }),
+      fetch(base + 'sims?select=id&vendor=eq.helix&status=neq.canceled&limit=1', { headers: authHeaders }),
     ]);
 
     const getCount = res => {
@@ -428,7 +427,6 @@ async function handleStats(env, corsHeaders) {
       messages_24h: getCount(msgRes),
       suspended_sims: getCount(suspRes),
       error_sims: getCount(errRes),
-      canceled_sims: getCount(canRes),
       vendor_atomic: getCount(atmRes),
       vendor_teltik: getCount(telRes),
       vendor_wing_iot: getCount(wingRes),
@@ -7932,13 +7930,13 @@ function getHTML(helixEnabled) {
                 window._dashStatusChart = new Chart(statusCtx, {
                     type: 'doughnut',
                     data: {
-                        labels: ['Active', 'Provisioning', 'Suspended', 'Error', 'Canceled'],
+                        labels: ['Active', 'Provisioning', 'Suspended', 'Error'],
                         datasets: [{
                             data: [
                                 data.active_sims || 0, data.provisioning_sims || 0,
-                                data.suspended_sims || 0, data.error_sims || 0, data.canceled_sims || 0
+                                data.suspended_sims || 0, data.error_sims || 0
                             ],
-                            backgroundColor: ['#22c55e', '#eab308', '#f97316', '#ef4444', '#991b1b'],
+                            backgroundColor: ['#22c55e', '#eab308', '#f97316', '#ef4444'],
                             borderWidth: 0
                         }]
                     },
