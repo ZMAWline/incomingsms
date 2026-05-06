@@ -1435,6 +1435,7 @@ async function handleWingCheck(request, env, corsHeaders) {
         try {
           await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
             rotation_status: 'failed',
+            status: 'rotation_failed',
             last_rotation_error: 'Stuck on ABIR plan — flagged by Query at ' + new Date().toISOString(),
           });
           db_skip_reason = 'SIM is on plan "' + wingPlan + '" (not dialable). Marked rotation_status=failed — run mdn-rotator to retry the dialable PUT.';
@@ -1442,6 +1443,19 @@ async function handleWingCheck(request, env, corsHeaders) {
           db_skip_reason = 'SIM is on plan "' + wingPlan + '" (not dialable). Failed to flag for retry: ' + String(e);
         }
       }
+    } else {
+      const errMsg = !res.ok
+        ? 'Wing query HTTP ' + res.status
+        : (!json
+            ? 'Wing query: invalid JSON response'
+            : 'Wing query: unexpected carrier status "' + wingStatus + '"');
+      try {
+        await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
+          status: 'error',
+          last_rotation_error: errMsg + ' at ' + new Date().toISOString(),
+        });
+        db_skip_reason = errMsg;
+      } catch (_) {}
     }
     return new Response(JSON.stringify({
       ok: res.ok,
@@ -1509,6 +1523,10 @@ async function handleHelixQuery(request, env, corsHeaders) {
     try {
       detailsData = JSON.parse(detailsText);
     } catch {
+      await sbPatch(env, 'sims?mobility_subscription_id=eq.' + encodeURIComponent(subId), {
+        status: 'error',
+        last_rotation_error: 'Helix query: invalid JSON response at ' + new Date().toISOString(),
+      }).catch(() => {});
       return new Response(JSON.stringify({ error: 'Invalid JSON from Helix', raw: detailsText.slice(0, 500) }), {
         status: 502,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -1516,6 +1534,10 @@ async function handleHelixQuery(request, env, corsHeaders) {
     }
 
     if (!detailsRes.ok) {
+      await sbPatch(env, 'sims?mobility_subscription_id=eq.' + encodeURIComponent(subId), {
+        status: 'error',
+        last_rotation_error: 'Helix query HTTP ' + detailsRes.status + ' at ' + new Date().toISOString(),
+      }).catch(() => {});
       return new Response(JSON.stringify({ error: 'Helix API error', status: detailsRes.status, details: detailsData }), {
         status: 502,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -1604,7 +1626,20 @@ async function handleTeltikQuery(request, env, corsHeaders) {
       const rawMdn = json.msisdn || json.mdn || json.phone_number || '';
       if (rawMdn) {
         db_update = await syncActiveSim(env, iccid, { mdn: rawMdn, activatedAt: null });
+      } else {
+        await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
+          status: 'error',
+          last_rotation_error: 'Teltik query: no MDN in response at ' + new Date().toISOString(),
+        }).catch(() => {});
       }
+    } else {
+      const errMsg = !res.ok
+        ? 'Teltik query HTTP ' + res.status
+        : 'Teltik query: invalid JSON response';
+      await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
+        status: 'error',
+        last_rotation_error: errMsg + ' at ' + new Date().toISOString(),
+      }).catch(() => {});
     }
 
     return new Response(JSON.stringify({
@@ -4990,6 +5025,16 @@ async function handleAtomicQuery(request, env, corsHeaders) {
           zipCode: (wr2.Result.address && wr2.Result.address.zipCode) || null,
         });
       }
+    } else if (isIccid) {
+      const errMsg = !res.ok
+        ? 'ATOMIC query HTTP ' + res.status
+        : (wr2 && wr2.statusCode !== '00'
+            ? 'ATOMIC statusCode ' + wr2.statusCode + ': ' + (wr2.description || '')
+            : 'ATOMIC query: status not Active (got "' + (wr2 && wr2.Result && wr2.Result.attStatus) + '")');
+      await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(identifier), {
+        status: 'error',
+        last_rotation_error: errMsg.trim() + ' at ' + new Date().toISOString(),
+      }).catch(() => {});
     }
     return new Response(JSON.stringify({ ok: true, response: data, db_update }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },

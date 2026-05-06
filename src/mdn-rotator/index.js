@@ -1666,6 +1666,11 @@ async function rotateWingIotSim(env, sim, opts = {}) {
   if (oldPlan === ABIR_PLAN) {
     console.log(`SIM ${iccid}: already on ABIR (msisdn=${oldMdn}) — skipping PUT-1, jumping to dialable PUT`);
     midMdn = oldMdn;
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      rotation_status: 'failed',
+      status: 'rotation_failed',
+      last_rotation_error: 'Stuck on ABIR plan — detected by rotator at ' + new Date().toISOString(),
+    }).catch(() => {});
   } else {
     const nonDialableBody = { communicationPlan: ABIR_PLAN };
     const ndRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(nonDialableBody) });
