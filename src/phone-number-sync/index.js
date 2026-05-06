@@ -183,10 +183,22 @@ function normalizeToE164(phoneNumber) {
   return `+${digits}`;
 }
 
+/* ================= RELAY ================= */
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
+}
+
 /* ================= HELIX API ================= */
 
 async function hxGetBearerToken(env) {
-  const res = await fetch(env.HX_TOKEN_URL, {
+  const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -207,7 +219,8 @@ async function hxGetBearerToken(env) {
 }
 
 async function hxGetSubscription(env, token, subscriptionId) {
-  const res = await fetch(
+  const res = await relayFetch(
+    env,
     `${env.HX_API_BASE}/api/mobility-subscriber/details`,
     {
       method: "POST",

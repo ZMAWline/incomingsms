@@ -35,6 +35,16 @@ interface AtomicResponse {
     };
 }
 
+function relayFetch(env: Env, url: string, init?: RequestInit): Promise<Response> {
+    if (env.RELAY_URL && env.RELAY_KEY) {
+        return fetch(`${env.RELAY_URL}/${url}`, {
+            ...init,
+            headers: { ...(init?.headers as Record<string, string> || {}), 'x-relay-key': env.RELAY_KEY },
+        });
+    }
+    return fetch(url, init);
+}
+
 function getSession(env: Env): AtomicSession {
     if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
         throw new Error('ATOMIC credentials not configured');
@@ -65,7 +75,7 @@ async function atomicRequest(
         },
     };
 
-    const res = await fetch(url, {
+    const res = await relayFetch(env, url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),

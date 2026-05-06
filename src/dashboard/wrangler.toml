@@ -52,6 +52,10 @@ service = "quickbooks"
 binding = "TELTIK_WORKER"
 service = "teltik-worker"
 
+[[services]]
+binding = "KASA_CONTROL"
+service = "kasa-control"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "dashboard-test"
@@ -103,3 +107,7 @@ service = "quickbooks-test"
 [[env.test.services]]
 binding = "TELTIK_WORKER"
 service = "teltik-worker-test"
+
+[[env.test.services]]
+binding = "KASA_CONTROL"
+service = "kasa-control-test"

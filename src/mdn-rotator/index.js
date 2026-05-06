@@ -2403,6 +2403,10 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
     return await fixAtomicSim(env, sim);
   }
 
+  if (sim.vendor === 'wing_iot') {
+    throw new Error(`SIM ${iccid}: no fix sim sequence for wing sims`);
+  }
+
   const subId = sim.mobility_subscription_id;
   if (!subId) throw new Error(`SIM ${iccid}: no mobility_subscription_id`);
 

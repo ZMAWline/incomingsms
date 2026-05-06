@@ -50,6 +50,18 @@ export default {
   },
 };
 
+// ===== Relay =====
+
+function relayFetch(env, url, init) {
+  if (env.RELAY_URL && env.RELAY_KEY) {
+    return fetch(`${env.RELAY_URL}/${url}`, {
+      ...init,
+      headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
+    });
+  }
+  return fetch(url, init);
+}
+
 // ===== OAuth Handlers =====
 
 function handleAuthUrl(env) {
@@ -71,7 +83,7 @@ async function handleCallback(url, env) {
     return json({ error: 'Missing code or realmId' }, 400);
   }
 
-  const tokenRes = await fetch(QBO_TOKEN_URL, {
+  const tokenRes = await relayFetch(env, QBO_TOKEN_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -203,7 +215,7 @@ async function getValidAccessToken(env) {
 
   // Refresh the token
   console.log('Refreshing QBO access token...');
-  const res = await fetch(QBO_TOKEN_URL, {
+  const res = await relayFetch(env, QBO_TOKEN_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -241,7 +253,7 @@ async function qboRequest(env, path, options = {}) {
   const { accessToken, realmId } = await getValidAccessToken(env);
   const url = `${QBO_API_BASE}/${realmId}${path}`;
 
-  const res = await fetch(url, {
+  const res = await relayFetch(env, url, {
     method: options.method || 'GET',
     headers: {
       'Authorization': `Bearer ${accessToken}`,

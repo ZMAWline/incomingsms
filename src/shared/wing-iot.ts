@@ -20,6 +20,16 @@ interface WingDeviceResponse {
     [key: string]: any;
 }
 
+function relayFetch(env: Env, url: string, init?: RequestInit): Promise<Response> {
+    if (env.RELAY_URL && env.RELAY_KEY) {
+        return fetch(`${env.RELAY_URL}/${url}`, {
+            ...init,
+            headers: { ...(init?.headers as Record<string, string> || {}), 'x-relay-key': env.RELAY_KEY },
+        });
+    }
+    return fetch(url, init);
+}
+
 function getAuthHeader(env: Env): string {
     if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
         throw new Error('Wing IoT credentials not configured');
@@ -41,9 +51,9 @@ export async function wingGetDevice(
     runId: string
 ): Promise<WingDeviceResponse> {
     const baseUrl = getBaseUrl(env);
-    const url = `${baseUrl}/api/v1/devices/${iccid}`;
+    const url = `${baseUrl}/v1/devices/${iccid}`;
 
-    const res = await fetch(url, {
+    const res = await relayFetch(env, url, {
         method: 'GET',
         headers: {
             Authorization: getAuthHeader(env),
@@ -87,14 +97,14 @@ export async function wingActivateDevice(
     runId: string
 ): Promise<WingDeviceResponse> {
     const baseUrl = getBaseUrl(env);
-    const url = `${baseUrl}/api/v1/devices/${iccid}`;
+    const url = `${baseUrl}/v1/devices/${iccid}`;
 
     const requestBody = {
         communicationPlan: WING_DIALABLE_PLAN,
         status: 'Activated',
     };
 
-    const res = await fetch(url, {
+    const res = await relayFetch(env, url, {
         method: 'PUT',
         headers: {
             Authorization: getAuthHeader(env),
@@ -147,13 +157,13 @@ export async function wingChangePlan(
     runId: string
 ): Promise<WingDeviceResponse> {
     const baseUrl = getBaseUrl(env);
-    const url = `${baseUrl}/api/v1/devices/${iccid}`;
+    const url = `${baseUrl}/v1/devices/${iccid}`;
 
     const requestBody = {
         communicationPlan,
     };
 
-    const res = await fetch(url, {
+    const res = await relayFetch(env, url, {
         method: 'PUT',
         headers: {
             Authorization: getAuthHeader(env),
