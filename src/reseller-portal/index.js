@@ -3,6 +3,15 @@ import { computeBillingBreakdown, estDateFromDate } from '../shared/billing.js';
 const COOKIE_NAME = 'rp_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
 
+const ATT_VENDORS = new Set(['wing_iot', 'atomic', 'helix']);
+const TMOBILE_VENDORS = new Set(['teltik']);
+function vendorToCarrier(vendor) {
+  if (!vendor) return null;
+  if (ATT_VENDORS.has(vendor)) return 'AT&T';
+  if (TMOBILE_VENDORS.has(vendor)) return 'T-Mobile';
+  return null;
+}
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, OPTIONS',
@@ -100,7 +109,7 @@ async function handleSims(auth, env) {
     active: r.active,
     assigned_at: r.created_at,
     iccid: r.sims?.iccid || null,
-    vendor: r.sims?.vendor || null,
+    carrier: vendorToCarrier(r.sims?.vendor),
     msisdn: r.sims?.msisdn || null,
     status: r.sims?.status || null,
     activated_at: r.sims?.activated_at || null,
@@ -111,7 +120,7 @@ async function handleSims(auth, env) {
 
 async function handleInvoices(auth, env) {
   const resp = await sbGet(env,
-    'qbo_invoices?select=id,week_start,week_end,sim_count,total,status,created_at,qbo_customer_map!inner(reseller_id)' +
+    'qbo_invoices?select=id,week_start,week_end,sim_count,total,status,paid_at,created_at,qbo_customer_map!inner(reseller_id)' +
     '&qbo_customer_map.reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&order=week_start.desc'
   );
@@ -124,6 +133,7 @@ async function handleInvoices(auth, env) {
     sim_count: r.sim_count,
     total: r.total,
     status: r.status,
+    paid_at: r.paid_at,
     created_at: r.created_at,
   }));
   return jsonResp(out);
@@ -131,7 +141,7 @@ async function handleInvoices(auth, env) {
 
 async function handleInvoiceDetail(invoiceId, auth, env) {
   const resp = await sbGet(env,
-    'qbo_invoices?select=id,week_start,week_end,sim_count,total,status,created_at,qbo_customer_map!inner(reseller_id)' +
+    'qbo_invoices?select=id,week_start,week_end,sim_count,total,status,paid_at,created_at,qbo_customer_map!inner(reseller_id)' +
     '&id=eq.' + encodeURIComponent(invoiceId) +
     '&qbo_customer_map.reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&limit=1'
@@ -155,6 +165,7 @@ async function handleInvoiceDetail(invoiceId, auth, env) {
       as_billed_sim_count: inv.sim_count,
       as_billed_total: inv.total,
       status: inv.status,
+      paid_at: inv.paid_at,
       created_at: inv.created_at,
     },
     breakdown: {
@@ -173,6 +184,7 @@ async function handleSimLifetime(simId, auth, env) {
     '&sim_id=eq.' + encodeURIComponent(simId) +
     '&limit=1'
   );
+  // Note: vendor is fetched for billing-block calc below; the API only exposes derived carrier.
   if (!ownResp.ok) return jsonResp({ error: 'lookup failed' }, 500);
   const ownRows = await ownResp.json();
   if (!Array.isArray(ownRows) || ownRows.length === 0) return notFound();
@@ -230,7 +242,7 @@ async function handleSimLifetime(simId, auth, env) {
   return jsonResp({
     sim_id: Number(simId),
     iccid: sim.iccid || null,
-    vendor: vendor || null,
+    carrier: vendorToCarrier(vendor),
     current_msisdn: sim.msisdn || null,
     status: sim.status || null,
     activated_at: sim.activated_at || null,
@@ -341,14 +353,14 @@ function renderSimTable(sims, container) {
   if (!sims.length) { container.innerHTML = '<div class="text-slate-500 text-sm py-4">None</div>'; return; }
   const rows = sims.map(s => '<tr class="hover:bg-slate-800 cursor-pointer" onclick="openLifetime(' + s.sim_id + ')">' +
     '<td class="px-3 py-2 text-slate-300 font-mono text-xs">' + esc(s.iccid) + '</td>' +
-    '<td class="px-3 py-2 text-slate-300">' + esc(s.vendor) + '</td>' +
+    '<td class="px-3 py-2 text-slate-300">' + esc(s.carrier || '—') + '</td>' +
     '<td class="px-3 py-2 text-slate-300 font-mono">' + esc(s.msisdn || '—') + '</td>' +
     '<td class="px-3 py-2 text-slate-300">' + esc(s.status) + '</td>' +
     '<td class="px-3 py-2 text-slate-400 text-xs">' + fmtDate(s.assigned_at) + '</td>' +
     '</tr>').join('');
   container.innerHTML =
     '<div class="overflow-x-auto rounded-lg border border-slate-700"><table class="w-full text-sm"><thead class="bg-slate-800 text-slate-400 text-xs uppercase">' +
-    '<tr><th class="px-3 py-2 text-left">ICCID</th><th class="px-3 py-2 text-left">Vendor</th><th class="px-3 py-2 text-left">MSISDN</th><th class="px-3 py-2 text-left">Status</th><th class="px-3 py-2 text-left">Assigned</th></tr>' +
+    '<tr><th class="px-3 py-2 text-left">ICCID</th><th class="px-3 py-2 text-left">Carrier</th><th class="px-3 py-2 text-left">MSISDN</th><th class="px-3 py-2 text-left">Status</th><th class="px-3 py-2 text-left">Assigned</th></tr>' +
     '</thead><tbody class="divide-y divide-slate-800">' + rows + '</tbody></table></div>';
 }
 
@@ -375,13 +387,19 @@ async function loadInvoices() {
   if (!invoices) return;
   const list = document.getElementById('invoices-list');
   if (!invoices.length) { list.innerHTML = '<div class="text-slate-500 text-sm">No invoices yet.</div>'; return; }
-  const rows = invoices.map(inv => '<tr class="hover:bg-slate-800 cursor-pointer" onclick="openInvoice(' + inv.id + ')">' +
-    '<td class="px-3 py-2 text-slate-300">' + esc(inv.week_start) + ' — ' + esc(inv.week_end) + '</td>' +
-    '<td class="px-3 py-2 text-slate-300 text-right">' + esc(inv.sim_count) + '</td>' +
-    '<td class="px-3 py-2 text-slate-100 font-medium text-right">' + fmtUsd(inv.total) + '</td>' +
-    '<td class="px-3 py-2 text-slate-400 text-xs">' + esc(inv.status || '') + '</td>' +
-    '<td class="px-3 py-2 text-cyan-400 text-xs">View →</td>' +
-    '</tr>').join('');
+  const rows = invoices.map(inv => {
+    const isPaid = inv.status === 'paid';
+    const badge = isPaid
+      ? '<span class="px-2 py-0.5 text-xs font-medium rounded-full bg-emerald-500/20 text-emerald-300">Paid' + (inv.paid_at ? ' ' + fmtDate(inv.paid_at) : '') + '</span>'
+      : '<span class="px-2 py-0.5 text-xs font-medium rounded-full bg-slate-600/40 text-slate-300">Unpaid</span>';
+    return '<tr class="hover:bg-slate-800 cursor-pointer" onclick="openInvoice(' + inv.id + ')">' +
+      '<td class="px-3 py-2 text-slate-300">' + esc(inv.week_start) + ' — ' + esc(inv.week_end) + '</td>' +
+      '<td class="px-3 py-2 text-slate-300 text-right">' + esc(inv.sim_count) + '</td>' +
+      '<td class="px-3 py-2 text-slate-100 font-medium text-right">' + fmtUsd(inv.total) + '</td>' +
+      '<td class="px-3 py-2">' + badge + '</td>' +
+      '<td class="px-3 py-2 text-cyan-400 text-xs">View →</td>' +
+      '</tr>';
+  }).join('');
   list.innerHTML =
     '<div class="overflow-x-auto rounded-lg border border-slate-700"><table class="w-full text-sm"><thead class="bg-slate-800 text-slate-400 text-xs uppercase">' +
     '<tr><th class="px-3 py-2 text-left">Period</th><th class="px-3 py-2 text-right">Billable units</th><th class="px-3 py-2 text-right">Invoiced</th><th class="px-3 py-2 text-left">Status</th><th class="px-3 py-2"></th></tr>' +
@@ -398,8 +416,12 @@ async function openInvoice(id) {
     '<td class="px-3 py-2 text-slate-300 text-right">' + esc(d.sim_count) + '</td>' +
     '<td class="px-3 py-2 text-slate-300 text-right">' + fmtUsd(d.rate) + '</td>' +
     '<td class="px-3 py-2 text-slate-100 text-right">' + fmtUsd(d.amount) + '</td></tr>').join('');
+  const isPaid = inv.status === 'paid';
+  const badge = isPaid
+    ? '<span class="px-2 py-1 text-xs font-medium rounded-full bg-emerald-500/20 text-emerald-300 ml-2 align-middle">Paid' + (inv.paid_at ? ' ' + fmtDate(inv.paid_at) : '') + '</span>'
+    : '<span class="px-2 py-1 text-xs font-medium rounded-full bg-slate-600/40 text-slate-300 ml-2 align-middle">Unpaid</span>';
   showModal(
-    '<h2 class="text-lg font-semibold mb-1">Invoice ' + esc(inv.week_start) + ' — ' + esc(inv.week_end) + '</h2>' +
+    '<h2 class="text-lg font-semibold mb-1">Invoice ' + esc(inv.week_start) + ' — ' + esc(inv.week_end) + badge + '</h2>' +
     '<div class="mb-4 flex gap-6 text-sm">' +
       '<div><div class="text-slate-500">Invoiced amount</div><div class="text-2xl font-semibold text-cyan-300">' + fmtUsd(inv.as_billed_total) + '</div></div>' +
       '<div><div class="text-slate-500">Billable units</div><div class="text-2xl font-semibold text-slate-200">' + esc(inv.as_billed_sim_count) + '</div></div>' +
@@ -417,7 +439,7 @@ async function openLifetime(simId) {
   if (!d) return;
   showModal(
     '<h2 class="text-lg font-semibold mb-1">SIM ' + esc(d.iccid) + '</h2>' +
-    '<div class="text-slate-500 text-xs mb-4">Vendor ' + esc(d.vendor) + ' · Status ' + esc(d.status) + ' · ' + (d.currently_active ? 'Currently active' : 'Previously assigned') + '</div>' +
+    '<div class="text-slate-500 text-xs mb-4">Carrier ' + esc(d.carrier || '—') + ' · Status ' + esc(d.status) + ' · ' + (d.currently_active ? 'Currently active' : 'Previously assigned') + '</div>' +
     '<div class="grid grid-cols-2 gap-4 mb-4">' +
       '<div class="bg-slate-900 rounded p-4"><div class="text-slate-500 text-xs uppercase mb-1">Total SMS lifetime</div><div class="text-2xl font-semibold text-cyan-300">' + esc(d.total_sms_lifetime) + '</div></div>' +
       '<div class="bg-slate-900 rounded p-4"><div class="text-slate-500 text-xs uppercase mb-1">Billable ' + esc(d.unit_label) + ' lifetime</div><div class="text-2xl font-semibold text-cyan-300">' + esc(d.billable_units_lifetime) + '</div></div>' +

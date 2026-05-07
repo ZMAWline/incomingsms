@@ -234,6 +234,9 @@ export default {
     if (url.pathname === '/api/qbo-invoices') {
       return handleQboInvoicesGet(env, corsHeaders);
     }
+    if (url.pathname.startsWith('/api/qbo-invoices/') && request.method === 'PATCH') {
+      return handleQboInvoicePatch(request, env, corsHeaders, url);
+    }
 
     if (url.pathname === '/api/reseller-keys' && request.method === 'GET') {
       return handleResellerKeysList(url, env, corsHeaders);
@@ -3860,7 +3863,7 @@ async function handleQboMappingsDelete(url, env, corsHeaders) {
 
 async function handleQboInvoicesGet(env, corsHeaders) {
   try {
-    const query = `qbo_invoices?select=id,week_start,week_end,sim_count,total,status,error_message,qbo_customer_map(qbo_display_name)&order=created_at.desc&limit=50`;
+    const query = `qbo_invoices?select=id,week_start,week_end,sim_count,total,status,paid_at,error_message,qbo_customer_map(qbo_display_name)&order=created_at.desc&limit=50`;
     const response = await supabaseGet(env, query);
     const data = await response.json();
     const mapped = (Array.isArray(data) ? data : []).map(inv => ({
@@ -3875,6 +3878,40 @@ async function handleQboInvoicesGet(env, corsHeaders) {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
+  }
+}
+
+
+async function handleQboInvoicePatch(request, env, corsHeaders, url) {
+  try {
+    const id = url.pathname.split('/').pop();
+    if (!id || !/^\d+$/.test(id)) return new Response(JSON.stringify({ error: 'invalid id' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const body = await request.json();
+    const patch = {};
+    if (typeof body.paid === 'boolean') {
+      if (body.paid) {
+        patch.status = 'paid';
+        patch.paid_at = new Date().toISOString();
+      } else {
+        patch.status = 'draft';
+        patch.paid_at = null;
+      }
+    }
+    if (!Object.keys(patch).length) return new Response(JSON.stringify({ error: 'nothing to update' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/qbo_invoices?id=eq.${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: {
+        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+        'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal',
+      },
+      body: JSON.stringify(patch),
+    });
+    if (!resp.ok) return new Response(JSON.stringify({ error: 'update failed' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true, ...patch }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
 
@@ -4122,7 +4159,12 @@ async function handlePlanRatesDelete(env, corsHeaders, url) {
 
 const NON_BILLABLE_TERMINAL_STATUSES = new Set(['canceled', 'cancelled', 'error', 'abandoned']);
 
-function parseBillCSV(text) {
+function parseBillCSV(text, vendor) {
+    if (vendor === 'teltik') return parseTeltikCSV(text);
+    return parseWingCSV(text);
+}
+
+function parseWingCSV(text) {
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
     if (lines.length < 2) throw new Error('CSV has no data rows');
     const headers = lines[0].split(',').map(h => h.trim());
@@ -4132,6 +4174,83 @@ function parseBillCSV(text) {
         headers.forEach((h, i) => { row[h] = (values[i] || '').trim(); });
         return row;
     });
+}
+
+function parseUSDateMDY(s) {
+    const parts = s.split('/').map(n => parseInt(n, 10));
+    if (parts.length !== 3 || parts.some(isNaN)) return null;
+    return new Date(Date.UTC(parts[2], parts[0] - 1, parts[1]));
+}
+
+function unquote(s) {
+    if (!s) return '';
+    s = s.trim();
+    if (s.startsWith('"') && s.endsWith('"')) s = s.slice(1, -1);
+    return s.trim();
+}
+
+function parseTeltikCSV(text) {
+    const allLines = text.split('\n').map(l => l.replace(/\r$/, ''));
+    let invoiceNo = null, periodStart = null, periodEnd = null;
+    for (let i = 0; i < Math.min(40, allLines.length); i++) {
+        const ln = allLines[i];
+        const mi = ln.match(/Invoice No\.?\s*([A-Za-z0-9-]+)/i);
+        if (mi && !invoiceNo) invoiceNo = mi[1];
+        const mb = ln.match(/Period Beginning\.?\s*(\d{1,2}\/\d{1,2}\/\d{4})/i);
+        if (mb && !periodStart) periodStart = parseUSDateMDY(mb[1]);
+        const me = ln.match(/Period Ending\.?\s*(\d{1,2}\/\d{1,2}\/\d{4})/i);
+        if (me && !periodEnd) periodEnd = parseUSDateMDY(me[1]);
+    }
+
+    let headerIdx = -1;
+    for (let i = 0; i < allLines.length; i++) {
+        const ln = allLines[i].toUpperCase();
+        if (ln.includes('LINE NUMBER') && ln.includes('SIM NUMBER') && ln.includes('PLAN NAME')) { headerIdx = i; break; }
+    }
+    if (headerIdx === -1) throw new Error('Teltik CSV: header row (LINE NUMBER, SIM NUMBER, PLAN NAME) not found');
+
+    const headers = splitCSVLine(allLines[headerIdx]).map(h => unquote(h));
+    const idxOf = (name) => headers.findIndex(h => h.toUpperCase() === name.toUpperCase());
+    const iSim = idxOf('SIM NUMBER');
+    const iLine = idxOf('LINE NUMBER');
+    const iPlan = idxOf('PLAN NAME');
+    const iPlanCharges = idxOf('PLAN CHARGES');
+    if (iSim < 0 || iLine < 0 || iPlan < 0 || iPlanCharges < 0) {
+        throw new Error('Teltik CSV: required header columns missing');
+    }
+
+    const fromIso = periodStart ? periodStart.toISOString() : '';
+    const toIso = periodEnd ? periodEnd.toISOString() : '';
+    const out = [];
+    for (let i = headerIdx + 1; i < allLines.length; i++) {
+        const raw = allLines[i];
+        if (!raw || !raw.trim()) continue;
+        const values = splitCSVLine(raw);
+        const sim = unquote(values[iSim] || '').replace(/^'/, '').trim();
+        const lineNum = unquote(values[iLine] || '').trim();
+        if (!sim || !lineNum) continue;
+        const plan = unquote(values[iPlan] || '').trim();
+        const planChargesStr = unquote(values[iPlanCharges] || '0').replace(/[$,\s]/g, '');
+        const price = parseFloat(planChargesStr) || 0;
+        const row = {
+            'Id': lineNum,
+            'Item Type': 'Plan',
+            'Description': plan,
+            'From Date': fromIso,
+            'To Date': toIso,
+            'Subscription Name': plan,
+            'Subscription Iccid': sim,
+            'Subscription Identifier': lineNum,
+            'Bypassed Plan ID': '',
+            'Carrier': 'T-Mobile',
+            'Price': String(price),
+        };
+        if (out.length === 0 && invoiceNo) row._invoice_no = invoiceNo;
+        out.push(row);
+    }
+    if (!out.length) throw new Error('Teltik CSV: no data rows after header');
+    if (invoiceNo && out[0]) out[0]._invoice_no = invoiceNo;
+    return out;
 }
 
 function splitCSVLine(line) {
@@ -4356,7 +4475,7 @@ async function reconcileLedgerForUpload(env, uploadId) {
     const uploadResp = await sbGet(env, `bill_audit_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`);
     if (!uploadResp || !uploadResp.length) throw new Error('upload not found');
     const upload = uploadResp[0];
-    const invoiceNo = (upload.filename || '').replace(/\.[^.]+$/, '') || null;
+    const invoiceNo = upload.invoice_no || (upload.filename || '').replace(/\.[^.]+$/, '') || null;
     const vendor = normalizeVendorName(upload.vendor || 'wing_iot');
     const ledgerVendorFilter = vendor === 'wing_aggregator'
         ? `vendor=in.(${WING_AGGREGATOR_VENDORS.join(',')})`
@@ -4554,8 +4673,7 @@ async function handleBillingLedgerSummary(env, corsHeaders, url) {
     }
 }
 
-// Time-aware audit: matches each line against plan_rates whose [effective_from, effective_to]
-// window contains the line's from_date, so old bills validate against the rate active on that date.
+// Time-aware audit + Teltik activation proration.
 function auditOneLine({ row, sim, history, fromDate, vendor, allPlanRates }) {
     const price = parseFloat(row['Price'] || '0');
     const planId = (row['Bypassed Plan ID'] || '').trim() || null;
@@ -4596,7 +4714,8 @@ function auditOneLine({ row, sim, history, fromDate, vendor, allPlanRates }) {
         if (matched) rateEntry = { rate: parseFloat(matched.rate), plan_name: matched.plan_name };
     }
 
-    const knownRate = rateEntry ? rateEntry.rate : null;
+    let knownRate = rateEntry ? rateEntry.rate : null;
+    let prorated = false;
 
     if (!sim) {
         return { discrepancyType: 'unknown_iccid', discrepancyDetail: `ICCID ${row['Subscription Iccid'] || '(blank)'} not found in our system`, expectedPrice: 0, resolvedVendor };
@@ -4613,9 +4732,23 @@ function auditOneLine({ row, sim, history, fromDate, vendor, allPlanRates }) {
         }
     }
 
+    // Teltik prorates plan charges on activation only (vendor-billing-cycles memory).
+    // If the SIM activated mid-bill-period, expected = rate × daysActive / cycleDays.
+    if (knownRate != null && resolvedVendor === 'teltik' && sim.activated_at && fromDate && row['To Date']) {
+        const activatedAt = new Date(sim.activated_at);
+        const periodEnd = new Date(row['To Date']);
+        if (activatedAt > fromDate && activatedAt <= periodEnd) {
+            const daysActive = Math.max(1, Math.round((periodEnd - activatedAt) / 86400000) + 1);
+            const daysCycle = Math.max(1, Math.round((periodEnd - fromDate) / 86400000) + 1);
+            knownRate = Math.round((knownRate * daysActive / daysCycle) * 100) / 100;
+            prorated = true;
+        }
+    }
+
     if (knownRate != null && Math.abs(price - knownRate) > 0.01) {
         const planLabel = rateEntry.plan_name || planId || resolvedVendor;
-        return { discrepancyType: 'rate_mismatch', discrepancyDetail: `${planLabel}: expected $${knownRate.toFixed(2)} but charged $${price.toFixed(2)}`, expectedPrice: knownRate, resolvedVendor };
+        const proLabel = prorated ? ' (prorated)' : '';
+        return { discrepancyType: 'rate_mismatch', discrepancyDetail: `${planLabel}${proLabel}: expected $${knownRate.toFixed(2)} but charged $${price.toFixed(2)}`, expectedPrice: knownRate, resolvedVendor };
     }
 
     return { discrepancyType: null, discrepancyDetail: null, expectedPrice: knownRate != null ? knownRate : price, resolvedVendor };
@@ -4630,14 +4763,20 @@ async function handleBillAuditUpload(request, env, corsHeaders) {
         const filename = file.name || 'bill.csv';
         const vendor = (new URL(request.url)).searchParams.get('vendor') || 'wing';
 
-        const rows = parseBillCSV(csvText);
+        let rows;
+        try {
+            rows = parseBillCSV(csvText, vendor);
+        } catch (parseErr) {
+            return new Response(JSON.stringify({ error: String(parseErr.message || parseErr) }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
         if (!rows.length) return new Response(JSON.stringify({ error: 'CSV has no data rows' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const parsedInvoiceNo = rows[0] && rows[0]._invoice_no ? rows[0]._invoice_no : null;
 
-        const [upload] = await sbPost(env, 'bill_audit_uploads', { filename, vendor, total_rows: rows.length, status: 'processing' });
+        const [upload] = await sbPost(env, 'bill_audit_uploads', { filename, vendor, total_rows: rows.length, status: 'processing', invoice_no: parsedInvoiceNo });
         const uploadId = upload.id;
 
         const allPlanRates = await sbGet(env, 'plan_rates?order=effective_from.desc') || [];
-        const allSims = await supabaseGetAllArray(env, 'sims?select=id,iccid,status,vendor') || [];
+        const allSims = await supabaseGetAllArray(env, 'sims?select=id,iccid,status,vendor,activated_at') || [];
         const simsByIccid = {};
         (allSims || []).forEach(s => { simsByIccid[s.iccid] = s; });
 
@@ -4820,7 +4959,7 @@ async function handleBillAuditResults(env, corsHeaders, url) {
 }
 
 async function handleBillAuditUploads(env, corsHeaders) {
-    const data = await sbGet(env, 'bill_audit_uploads?select=id,vendor,filename,billing_period_start,billing_period_end,total_rows,total_amount,total_expected,overcharge_amount,discrepancy_count,status,created_at&order=created_at.desc&limit=50');
+    const data = await sbGet(env, 'bill_audit_uploads?select=id,vendor,filename,invoice_no,billing_period_start,billing_period_end,total_rows,total_amount,total_expected,overcharge_amount,discrepancy_count,status,created_at&order=created_at.desc&limit=50');
     return new Response(JSON.stringify(data || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
@@ -4941,7 +5080,7 @@ async function handleBillAuditRecompute(env, corsHeaders, url) {
         }
 
         const allPlanRates = await sbGet(env, 'plan_rates?order=effective_from.desc') || [];
-        const allSims = await supabaseGetAllArray(env, 'sims?select=id,iccid,status,vendor') || [];
+        const allSims = await supabaseGetAllArray(env, 'sims?select=id,iccid,status,vendor,activated_at') || [];
         const simsByIccid = {};
         (allSims || []).forEach(s => { simsByIccid[s.iccid] = s; });
 
@@ -4980,6 +5119,7 @@ async function handleBillAuditRecompute(env, corsHeaders, url) {
                     'Subscription Iccid': iccid,
                     'Bypassed Plan ID': l.bypassed_plan_id || '',
                     'Description': l.description || '',
+                    'To Date': l.to_date || '',
                     'Price': String(l.price || 0),
                 };
                 const audit = auditOneLine({ row, sim, history: sim ? (historyBySimId[sim.id] || []) : [], fromDate, vendor: upload.vendor, allPlanRates });
@@ -6217,11 +6357,12 @@ function getHTML(helixEnabled) {
                                     <th class="px-4 py-3 font-medium">Period</th>
                                     <th class="px-4 py-3 font-medium">SIM-days</th>
                                     <th class="px-4 py-3 font-medium">Total</th>
+                                    <th class="px-4 py-3 font-medium">Status</th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="invoice-history-table" class="text-sm">
-                                <tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -12524,19 +12665,42 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (!resp.ok) return;
                 const invoices = await resp.json();
                 const tbody = document.getElementById("invoice-history-table");
-                if (!invoices.length) { tbody.innerHTML = '<tr><td colspan=5 class="px-4 py-4 text-center text-gray-500">No invoices yet</td></tr>'; return; }
-                tbody.innerHTML = invoices.map(inv => \`
+                if (!invoices.length) { tbody.innerHTML = '<tr><td colspan=6 class="px-4 py-4 text-center text-gray-500">No invoices yet</td></tr>'; return; }
+                tbody.innerHTML = invoices.map(inv => {
+                    const isPaid = inv.status === 'paid';
+                    const badge = isPaid
+                        ? '<span class="px-2 py-0.5 text-xs font-medium rounded-full bg-accent/20 text-accent">Paid' + (inv.paid_at ? ' ' + new Date(inv.paid_at).toLocaleDateString() : '') + '</span>'
+                        : '<span class="px-2 py-0.5 text-xs font-medium rounded-full bg-gray-500/20 text-gray-300">' + (inv.status || 'draft') + '</span>';
+                    const toggleBtn = isPaid
+                        ? '<button onclick="markInvoicePaid(' + inv.id + ', false)" class="text-xs text-yellow-400 hover:text-yellow-300 ml-2">Unmark</button>'
+                        : '<button onclick="markInvoicePaid(' + inv.id + ', true)" class="text-xs text-accent hover:text-green-300 ml-2">Mark Paid</button>';
+                    return \`
                     <tr class="border-b border-dark-600">
                         <td class="px-4 py-3 text-gray-300">\${inv.customer_name || "-"}</td>
                         <td class="px-4 py-3 text-gray-400 text-xs">\${inv.week_start} – \${inv.week_end}</td>
                         <td class="px-4 py-3 text-gray-300">\${inv.sim_count}</td>
                         <td class="px-4 py-3 text-accent">$\${Number(inv.total).toFixed(2)}</td>
-                        <td class="px-4 py-3"><button onclick="downloadHistoryIIF(\${inv.id})" class="text-xs text-blue-400 hover:text-blue-300">Download CSV</button></td>
-                    </tr>\`
-                ).join("");
+                        <td class="px-4 py-3">\${badge}</td>
+                        <td class="px-4 py-3"><button onclick="downloadHistoryIIF(\${inv.id})" class="text-xs text-blue-400 hover:text-blue-300">Download CSV</button>\${toggleBtn}</td>
+                    </tr>\`;
+                }).join("");
             } catch (error) {
                 console.error("Error loading invoice history:", error);
             }
+        }
+
+        async function markInvoicePaid(invoiceId, paid) {
+            try {
+                const resp = await fetch(API_BASE + '/qbo-invoices/' + invoiceId, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ paid }),
+                });
+                const result = await resp.json();
+                if (result.error) { showToast('Failed: ' + result.error, 'error'); return; }
+                showToast(paid ? 'Invoice marked paid' : 'Invoice marked unpaid', 'success');
+                loadInvoiceHistory();
+            } catch (e) { showToast('Error: ' + e, 'error'); }
         }
 
         // ===== Billing Audit =====
