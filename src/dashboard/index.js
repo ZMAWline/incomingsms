@@ -263,6 +263,9 @@ export default {
     if (url.pathname === '/api/bill-audit/results') {
       return handleBillAuditResults(env, corsHeaders, url);
     }
+    if (url.pathname === '/api/bill-audit/uploads' && request.method === 'DELETE') {
+      return handleBillAuditDelete(env, corsHeaders, url);
+    }
     if (url.pathname === '/api/bill-audit/uploads') {
       return handleBillAuditUploads(env, corsHeaders);
     }
@@ -4034,6 +4037,21 @@ async function loadActiveRates(env, atDate) {
     return out;
 }
 
+// Plan-name → vendor lookup, used for the Wing aggregator upload where
+// the bill mixes ATOMIC/Helix/Wing IoT lines distinguished by plan name.
+async function loadActivePlanMap(env, atDate) {
+    const at = atDate ? new Date(atDate).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+    const rows = await sbGet(env, `plan_rates?or=(effective_to.is.null,effective_to.gte.${at})&effective_from=lte.${at}&order=effective_from.desc`);
+    const byPlan = {};
+    (rows || []).forEach(r => {
+        const key = (r.plan_name || '').trim().toLowerCase();
+        if (key && !byPlan[key]) byPlan[key] = { vendor: r.vendor, rate: parseFloat(r.rate), plan_name: r.plan_name };
+    });
+    return byPlan;
+}
+
+const WING_AGGREGATOR_VENDORS = ['wing_iot', 'atomic', 'helix'];
+
 async function handlePlanRatesList(env, corsHeaders) {
     const rows = await sbGet(env, 'plan_rates?order=vendor.asc,plan_name.asc,effective_from.desc');
     return new Response(JSON.stringify(rows || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -4338,7 +4356,11 @@ async function reconcileLedgerForUpload(env, uploadId) {
     const uploadResp = await sbGet(env, `bill_audit_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`);
     if (!uploadResp || !uploadResp.length) throw new Error('upload not found');
     const upload = uploadResp[0];
+    const invoiceNo = (upload.filename || '').replace(/\.[^.]+$/, '') || null;
     const vendor = normalizeVendorName(upload.vendor || 'wing_iot');
+    const ledgerVendorFilter = vendor === 'wing_aggregator'
+        ? `vendor=in.(${WING_AGGREGATOR_VENDORS.join(',')})`
+        : `vendor=eq.${vendor}`;
 
     const lines = await supabaseGetAllArray(env, `bill_audit_lines?upload_id=eq.${uploadId}&order=id.asc`) || [];
     if (!lines.length) return { upload_id: uploadId, matched: 0, missing: 0, phantom: 0 };
@@ -4349,7 +4371,7 @@ async function reconcileLedgerForUpload(env, uploadId) {
     for (let i = 0; i < iccids.length; i += CHUNK) {
         const chunk = iccids.slice(i, i + CHUNK);
         const inClause = chunk.map(s => `"${s}"`).join(',');
-        const rows = await supabaseGetAllArray(env, `billing_ledger?vendor=eq.${vendor}&iccid=in.(${inClause})&order=period_start.asc`) || [];
+        const rows = await supabaseGetAllArray(env, `billing_ledger?${ledgerVendorFilter}&iccid=in.(${inClause})&order=period_start.asc`) || [];
         ledgerRows.push(...rows);
     }
     const ledgerByIccid = {};
@@ -4397,6 +4419,7 @@ async function reconcileLedgerForUpload(env, uploadId) {
             billed_amount: billed,
             bill_audit_line_id: line.id,
             status,
+            invoice_no: invoiceNo,
         });
     }
 
@@ -4450,10 +4473,12 @@ async function handleBillingLedgerList(env, corsHeaders, url) {
     try {
         const filters = [];
         const sim_id = url.searchParams.get('sim_id');
+        const iccid = (url.searchParams.get('iccid') || '').trim();
         const vendor = url.searchParams.get('vendor');
         const status = url.searchParams.get('status');
         const periodMonth = url.searchParams.get('period_month'); // YYYY-MM
         if (sim_id) filters.push(`sim_id=eq.${encodeURIComponent(sim_id)}`);
+        if (iccid) filters.push(`iccid=ilike.*${encodeURIComponent(iccid)}*`);
         if (vendor) filters.push(`vendor=eq.${encodeURIComponent(vendor)}`);
         if (status) filters.push(`status=eq.${encodeURIComponent(status)}`);
         if (periodMonth && /^\d{4}-\d{2}$/.test(periodMonth)) {
@@ -4529,36 +4554,71 @@ async function handleBillingLedgerSummary(env, corsHeaders, url) {
     }
 }
 
-// Apply the five audit checks to one parsed row. Returns { discrepancyType, discrepancyDetail, expectedPrice }.
-// ratesByVendor: { vendor: { rate, plan_name } } — from loadActiveRates()
-function auditOneLine({ row, sim, history, fromDate, vendor, ratesByVendor }) {
+// Time-aware audit: matches each line against plan_rates whose [effective_from, effective_to]
+// window contains the line's from_date, so old bills validate against the rate active on that date.
+function auditOneLine({ row, sim, history, fromDate, vendor, allPlanRates }) {
     const price = parseFloat(row['Price'] || '0');
     const planId = (row['Bypassed Plan ID'] || '').trim() || null;
-    const rateEntry = (ratesByVendor && vendor) ? ratesByVendor[vendor] : null;
+    const description = (row['Description'] || '').trim();
+
+    function pickRate(predicate) {
+        const candidates = (allPlanRates || []).filter(predicate);
+        if (!candidates.length) return null;
+        if (!fromDate) return candidates[0];
+        const match = candidates.find(r => {
+            const ef = new Date(r.effective_from);
+            const et = r.effective_to ? new Date(r.effective_to) : null;
+            return ef <= fromDate && (!et || et >= fromDate);
+        });
+        return match || null;
+    }
+
+    let rateEntry = null;
+    let resolvedVendor = vendor;
+
+    if (vendor === 'wing_aggregator') {
+        const key = description.toLowerCase().trim();
+        const matched = key ? pickRate(r => (r.plan_name || '').toLowerCase().trim() === key) : null;
+        if (matched) {
+            rateEntry = { rate: parseFloat(matched.rate), plan_name: matched.plan_name };
+            resolvedVendor = matched.vendor;
+        } else {
+            const dateLabel = fromDate ? fromDate.toISOString().split('T')[0] : 'today';
+            return {
+                discrepancyType: 'unknown_plan',
+                discrepancyDetail: `Plan "${description || planId || '(blank)'}" has no plan_rates row active on ${dateLabel}`,
+                expectedPrice: 0,
+                resolvedVendor: null,
+            };
+        }
+    } else {
+        const matched = pickRate(r => r.vendor === vendor);
+        if (matched) rateEntry = { rate: parseFloat(matched.rate), plan_name: matched.plan_name };
+    }
+
     const knownRate = rateEntry ? rateEntry.rate : null;
 
     if (!sim) {
-        return { discrepancyType: 'unknown_iccid', discrepancyDetail: `ICCID ${row['Subscription Iccid'] || '(blank)'} not found in our system`, expectedPrice: 0 };
+        return { discrepancyType: 'unknown_iccid', discrepancyDetail: `ICCID ${row['Subscription Iccid'] || '(blank)'} not found in our system`, expectedPrice: 0, resolvedVendor };
     }
 
     if (NON_BILLABLE_TERMINAL_STATUSES.has((sim.status || '').toLowerCase())) {
         const canceledAt = findCancelTimestamp(history);
         if (canceledAt && fromDate && new Date(canceledAt) < fromDate) {
             const dt = new Date(canceledAt).toISOString().split('T')[0];
-            return { discrepancyType: 'canceled_before_period', discrepancyDetail: `SIM was ${sim.status} as of ${dt}, before bill period start`, expectedPrice: 0 };
+            return { discrepancyType: 'canceled_before_period', discrepancyDetail: `SIM was ${sim.status} as of ${dt}, before bill period start`, expectedPrice: 0, resolvedVendor };
         }
-        // No history record but currently canceled — assume canceled before period (safe flag)
         if (!canceledAt) {
-            return { discrepancyType: 'canceled_before_period', discrepancyDetail: `SIM is ${sim.status} (no cancel-date record); flag for review`, expectedPrice: 0 };
+            return { discrepancyType: 'canceled_before_period', discrepancyDetail: `SIM is ${sim.status} (no cancel-date record); flag for review`, expectedPrice: 0, resolvedVendor };
         }
     }
 
     if (knownRate != null && Math.abs(price - knownRate) > 0.01) {
-        const planLabel = rateEntry.plan_name || planId || vendor;
-        return { discrepancyType: 'rate_mismatch', discrepancyDetail: `${planLabel}: expected $${knownRate.toFixed(2)} but charged $${price.toFixed(2)}`, expectedPrice: knownRate };
+        const planLabel = rateEntry.plan_name || planId || resolvedVendor;
+        return { discrepancyType: 'rate_mismatch', discrepancyDetail: `${planLabel}: expected $${knownRate.toFixed(2)} but charged $${price.toFixed(2)}`, expectedPrice: knownRate, resolvedVendor };
     }
 
-    return { discrepancyType: null, discrepancyDetail: null, expectedPrice: knownRate != null ? knownRate : price };
+    return { discrepancyType: null, discrepancyDetail: null, expectedPrice: knownRate != null ? knownRate : price, resolvedVendor };
 }
 
 async function handleBillAuditUpload(request, env, corsHeaders) {
@@ -4576,8 +4636,8 @@ async function handleBillAuditUpload(request, env, corsHeaders) {
         const [upload] = await sbPost(env, 'bill_audit_uploads', { filename, vendor, total_rows: rows.length, status: 'processing' });
         const uploadId = upload.id;
 
-        const ratesByVendor = await loadActiveRates(env);
-        const allSims = await sbGet(env, 'sims?select=id,iccid,status&limit=10000');
+        const allPlanRates = await sbGet(env, 'plan_rates?order=effective_from.desc') || [];
+        const allSims = await supabaseGetAllArray(env, 'sims?select=id,iccid,status,vendor') || [];
         const simsByIccid = {};
         (allSims || []).forEach(s => { simsByIccid[s.iccid] = s; });
 
@@ -4592,8 +4652,12 @@ async function handleBillAuditUpload(request, env, corsHeaders) {
 
         let allHistory = [];
         if (simIds.size > 0) {
-            const idList = [...simIds].join(',');
-            allHistory = await sbGet(env, `sim_status_history?sim_id=in.(${idList})&order=changed_at.desc&limit=50000`) || [];
+            const idArr = [...simIds];
+            for (let i = 0; i < idArr.length; i += 200) {
+                const chunk = idArr.slice(i, i + 200);
+                const part = await supabaseGetAllArray(env, `sim_status_history?sim_id=in.(${chunk.join(',')})&order=changed_at.desc`) || [];
+                allHistory.push(...part);
+            }
         }
         const historyBySimId = {};
         allHistory.forEach(h => {
@@ -4611,12 +4675,12 @@ async function handleBillAuditUpload(request, env, corsHeaders) {
             const planId = (row['Bypassed Plan ID'] || '').trim() || null;
             const history = sim ? (historyBySimId[sim.id] || []) : [];
 
-            const audit = auditOneLine({ row, sim, history, fromDate, vendor, ratesByVendor });
+            const audit = auditOneLine({ row, sim, history, fromDate, vendor, allPlanRates });
 
             billedIccids.add(iccid);
             lineRecords.push({
                 upload_id: uploadId,
-                vendor,
+                vendor: audit.resolvedVendor || vendor,
                 wing_id: row['Id'] || null,
                 item_type: row['Item Type'] || null,
                 description: row['Description'] || null,
@@ -4661,7 +4725,14 @@ async function handleBillAuditUpload(request, env, corsHeaders) {
             }
         }
 
-        const activeSims = (allSims || []).filter(s => !NON_BILLABLE_TERMINAL_STATUSES.has((s.status || '').toLowerCase()) && s.status !== 'provisioning');
+        const targetVendors = vendor === 'wing_aggregator'
+            ? new Set(WING_AGGREGATOR_VENDORS)
+            : new Set([vendor]);
+        const activeSims = (allSims || []).filter(s =>
+            !NON_BILLABLE_TERMINAL_STATUSES.has((s.status || '').toLowerCase()) &&
+            s.status !== 'provisioning' &&
+            targetVendors.has(s.vendor)
+        );
         const missingFromBill = activeSims.filter(s => !billedIccids.has(s.iccid));
 
         for (let i = 0; i < lineRecords.length; i += 500) {
@@ -4695,10 +4766,14 @@ async function handleBillAuditUpload(request, env, corsHeaders) {
             billing_period_end: endDates.length ? endDates[endDates.length - 1].split('T')[0] : null,
         });
 
-        // Auto-update ledger for this vendor + reconcile this upload
+        // Auto-update ledger for this vendor (or all 3 AT&T vendors when aggregator) + reconcile this upload
         let ledgerResult = null;
         try {
-            await regenerateLedgerForVendor(env, vendor);
+            if (vendor === 'wing_aggregator') {
+                for (const v of WING_AGGREGATOR_VENDORS) await regenerateLedgerForVendor(env, v);
+            } else {
+                await regenerateLedgerForVendor(env, vendor);
+            }
             ledgerResult = await reconcileLedgerForUpload(env, uploadId);
         } catch (recErr) {
             console.error('Ledger reconciliation error:', recErr);
@@ -4747,6 +4822,51 @@ async function handleBillAuditResults(env, corsHeaders, url) {
 async function handleBillAuditUploads(env, corsHeaders) {
     const data = await sbGet(env, 'bill_audit_uploads?select=id,vendor,filename,billing_period_start,billing_period_end,total_rows,total_amount,total_expected,overcharge_amount,discrepancy_count,status,created_at&order=created_at.desc&limit=50');
     return new Response(JSON.stringify(data || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
+// Delete an audit upload + its lines + reset any ledger rows that were tied to it.
+async function handleBillAuditDelete(env, corsHeaders, url) {
+    try {
+        const id = url.searchParams.get('id');
+        if (!id) return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+        const lines = await supabaseGetAllArray(env, `bill_audit_lines?upload_id=eq.${encodeURIComponent(id)}&select=id`) || [];
+        if (lines.length) {
+            const lineIds = lines.map(l => l.id);
+            for (let i = 0; i < lineIds.length; i += 200) {
+                const chunk = lineIds.slice(i, i + 200);
+                await sbPatch(env, `billing_ledger?bill_audit_line_id=in.(${chunk.join(',')})`, {
+                    bill_audit_line_id: null,
+                    billed_amount: null,
+                    invoice_no: null,
+                    status: 'pending',
+                });
+            }
+        }
+
+        await fetch(`${env.SUPABASE_URL}/rest/v1/bill_audit_lines?upload_id=eq.${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+            headers: {
+                'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                'Prefer': 'return=minimal',
+            },
+        });
+
+        const delResp = await fetch(`${env.SUPABASE_URL}/rest/v1/bill_audit_uploads?id=eq.${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+            headers: {
+                'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                'Prefer': 'return=minimal',
+            },
+        });
+        if (!delResp.ok) return new Response(JSON.stringify({ error: 'delete failed' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+        return new Response(JSON.stringify({ ok: true, lines_deleted: lines.length, ledger_reset: lines.length }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
 }
 
 async function handleBillAuditExport(env, corsHeaders, url) {
@@ -4820,8 +4940,8 @@ async function handleBillAuditRecompute(env, corsHeaders, url) {
             return new Response(JSON.stringify({ ok: true, message: 'No uploads to recompute', uploads_processed: 0 }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         }
 
-        const ratesByVendor = await loadActiveRates(env);
-        const allSims = await sbGet(env, 'sims?select=id,iccid,status&limit=10000');
+        const allPlanRates = await sbGet(env, 'plan_rates?order=effective_from.desc') || [];
+        const allSims = await supabaseGetAllArray(env, 'sims?select=id,iccid,status,vendor') || [];
         const simsByIccid = {};
         (allSims || []).forEach(s => { simsByIccid[s.iccid] = s; });
 
@@ -4838,7 +4958,12 @@ async function handleBillAuditRecompute(env, corsHeaders, url) {
             });
             let history = [];
             if (simIds.size > 0) {
-                history = await sbGet(env, `sim_status_history?sim_id=in.(${[...simIds].join(',')})&order=changed_at.desc&limit=50000`) || [];
+                const idArr = [...simIds];
+                for (let i = 0; i < idArr.length; i += 200) {
+                    const chunk = idArr.slice(i, i + 200);
+                    const part = await supabaseGetAllArray(env, `sim_status_history?sim_id=in.(${chunk.join(',')})&order=changed_at.desc`) || [];
+                    history.push(...part);
+                }
             }
             const historyBySimId = {};
             history.forEach(h => {
@@ -4854,13 +4979,15 @@ async function handleBillAuditRecompute(env, corsHeaders, url) {
                 const row = {
                     'Subscription Iccid': iccid,
                     'Bypassed Plan ID': l.bypassed_plan_id || '',
+                    'Description': l.description || '',
                     'Price': String(l.price || 0),
                 };
-                const audit = auditOneLine({ row, sim, history: sim ? (historyBySimId[sim.id] || []) : [], fromDate, vendor: l.vendor || upload.vendor, ratesByVendor });
+                const audit = auditOneLine({ row, sim, history: sim ? (historyBySimId[sim.id] || []) : [], fromDate, vendor: upload.vendor, allPlanRates });
                 return {
                     ...l,
                     sim_id: sim?.id || null,
                     sim_status: sim?.status || null,
+                    vendor: audit.resolvedVendor || l.vendor,
                     discrepancy_type: audit.discrepancyType,
                     discrepancy_detail: audit.discrepancyDetail,
                     expected_price: audit.expectedPrice,
@@ -5126,6 +5253,27 @@ function getHTML(helixEnabled) {
                 overlay.addEventListener('click', function(e) { if (e.target === overlay) cleanup(null); });
             });
         }
+        function showDatePrompt(title, message, defaultDate) {
+            return new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+                overlay.innerHTML =
+                    '<div class="bg-dark-800 border border-dark-600 rounded-xl p-6 max-w-sm w-full mx-4">' +
+                    '<h3 class="text-white font-semibold text-lg mb-2">' + title + '</h3>' +
+                    '<p class="text-gray-300 text-sm mb-4">' + message + '</p>' +
+                    '<input id="_dp-date" type="date" class="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-200 mb-4" value="' + (defaultDate || '') + '">' +
+                    '<div class="flex justify-end gap-2">' +
+                    '<button id="_dp-cancel" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">Cancel</button>' +
+                    '<button id="_dp-ok" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded transition">OK</button>' +
+                    '</div></div>';
+                document.body.appendChild(overlay);
+                const cleanup = (val) => { document.body.removeChild(overlay); resolve(val); };
+                overlay.querySelector('#_dp-cancel').onclick = () => cleanup(null);
+                overlay.querySelector('#_dp-ok').onclick = () => cleanup(overlay.querySelector('#_dp-date').value || null);
+                overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(null); });
+                setTimeout(() => overlay.querySelector('#_dp-date').focus(), 0);
+            });
+        }
         function handleConfirm(confirmed) {
             const modal = document.getElementById('confirm-modal');
             if (modal) {
@@ -5282,6 +5430,10 @@ function getHTML(helixEnabled) {
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
                     <span class="text-sm">Errors</span>
                     <span id="error-badge" class="hidden ml-auto min-w-[16px] h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center px-1">0</span>
+                </a>
+                <a href="/invoicing" onclick="event.preventDefault();switchTab('invoicing')" data-tab="invoicing" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Invoicing">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                    <span class="text-sm">Invoicing</span>
                 </a>
                 <a href="/billing" onclick="event.preventDefault();switchTab('billing')" data-tab="billing" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Billing">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
@@ -5970,9 +6122,9 @@ function getHTML(helixEnabled) {
 
 
             <!-- Billing Tab -->
-            <div id="tab-billing" class="tab-content hidden">
+            <div id="tab-invoicing" class="tab-content hidden">
                 <div class="flex items-center justify-between mb-6">
-                    <h2 class="text-xl font-bold text-white">Billing & Invoicing</h2>
+                    <h2 class="text-xl font-bold text-white">Invoicing</h2>
                 </div>
 
                 <!-- Customer Mapping -->
@@ -6075,20 +6227,26 @@ function getHTML(helixEnabled) {
                     </div>
                 </div>
 
+            </div>
+
+            <!-- Billing tab -->
+            <div id="tab-billing" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">Billing</h2>
+                </div>
+
                 <!-- Billing Audit -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6 mt-8">
                     <div class="flex items-center justify-between mb-3">
                         <h3 class="text-lg font-semibold text-white">Billing Audit</h3>
                     </div>
-                    <p class="text-sm text-gray-400 mb-4">Upload a vendor itemized CSV (Wing today; Teltik later) to cross-reference against SIM records. Wing bills full month per line — no proration. Checks: unknown ICCID, canceled before period start, plan rate mismatch, duplicate line, active SIMs missing from bill.</p>
+                    <p class="text-sm text-gray-400 mb-4">Upload the Wing aggregator invoice (covers ATOMIC/Helix/Wing IoT — vendor derived from plan name in the Description column) or a Teltik invoice. AT&T bills full month per line — no proration. Checks: unknown ICCID, unknown plan, canceled before period start, rate mismatch, duplicate line, active SIMs missing from bill.</p>
 
                     <div class="flex flex-wrap items-end gap-3 mb-4">
                         <div class="flex flex-col gap-1">
                             <label class="text-xs text-gray-500 uppercase">Vendor</label>
                             <select id="audit-vendor" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
-                                <option value="wing_iot">Wing IoT</option>
-                                <option value="atomic">ATOMIC</option>
-                                <option value="helix">Helix</option>
+                                <option value="wing_aggregator">Wing aggregator (Wing IoT / ATOMIC / Helix)</option>
                                 <option value="teltik">Teltik</option>
                             </select>
                         </div>
@@ -6249,6 +6407,10 @@ function getHTML(helixEnabled) {
 
                     <div class="flex flex-wrap items-end gap-3 mb-4">
                         <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">ICCID search</label>
+                            <input id="ledger-iccid-search" type="text" placeholder="full or partial ICCID" oninput="onLedgerIccidInput()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-56">
+                        </div>
+                        <div class="flex flex-col gap-1">
                             <label class="text-xs text-gray-500 uppercase">Vendor</label>
                             <select id="ledger-vendor" onchange="loadBillingLedger(1)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
                                 <option value="">All</option>
@@ -6288,13 +6450,14 @@ function getHTML(helixEnabled) {
                                     <th class="px-3 py-2 font-medium">Vendor</th>
                                     <th class="px-3 py-2 font-medium">Plan</th>
                                     <th class="px-3 py-2 font-medium">Period</th>
+                                    <th class="px-3 py-2 font-medium">Invoice</th>
                                     <th class="px-3 py-2 font-medium">Expected</th>
                                     <th class="px-3 py-2 font-medium">Billed</th>
                                     <th class="px-3 py-2 font-medium">Δ</th>
                                     <th class="px-3 py-2 font-medium">Status</th>
                                 </tr>
                             </thead>
-                            <tbody id="ledger-table"><tr><td colspan="9" class="px-3 py-3 text-center text-gray-500">Click Refresh to load</td></tr></tbody>
+                            <tbody id="ledger-table"><tr><td colspan="10" class="px-3 py-3 text-center text-gray-500">Click Refresh to load</td></tr></tbody>
                         </table>
                     </div>
                     <div class="flex items-center justify-between mt-3">
@@ -7821,6 +7984,7 @@ function getHTML(helixEnabled) {
             'gateway': '/gateway',
             'imei-pool': '/imei-pool',
             'errors': '/errors',
+            'invoicing': '/invoicing',
             'billing': '/billing',
             'sms-usage': '/sms-usage',
             'guide': '/guide',
@@ -7848,12 +8012,13 @@ function getHTML(helixEnabled) {
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateway') loadPortStatus();
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'billing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); loadResellerKeys(); }
+            if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); }
+            if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
             if (tabName === 'sims') loadRotationAudit();
         }
@@ -12490,9 +12655,28 @@ async function sendSimOnline(simId, phoneNumber) {
                     '<td class="px-4 py-3 ' + (u.overcharge_amount > 0 ? 'text-red-400 font-semibold' : 'text-accent') + '">$' + Number(u.overcharge_amount || 0).toFixed(2) + '</td>' +
                     '<td class="px-4 py-3 ' + (u.discrepancy_count > 0 ? 'text-red-400 font-semibold' : 'text-accent') + '">' + u.discrepancy_count + '</td>' +
                     '<td class="px-4 py-3"><button onclick="viewBillAuditResults(' + u.id + ')" class="text-xs text-blue-400 hover:text-blue-300 mr-2">View</button>' +
-                    '<button onclick="exportBillAudit(' + u.id + ')" class="text-xs text-accent hover:text-green-300">Export</button></td>' +
+                    '<button onclick="exportBillAudit(' + u.id + ')" class="text-xs text-accent hover:text-green-300 mr-2">Export</button>' +
+                    '<button onclick="deleteBillAudit(' + u.id + ')" class="text-xs text-red-400 hover:text-red-300">Delete</button></td>' +
                     '</tr>').join('');
             } catch (e) { console.error('loadBillAuditHistory:', e); }
+        }
+
+        async function deleteBillAudit(uploadId) {
+            const ok = await showConfirm('Delete Bill Audit', 'Permanently delete this audit? Linked ledger rows will be reset to pending. This cannot be undone.');
+            if (!ok) return;
+            try {
+                const resp = await fetch(API_BASE + '/bill-audit/uploads?id=' + encodeURIComponent(uploadId), { method: 'DELETE', credentials: 'include' });
+                const result = await resp.json();
+                if (result.error) { showToast('Failed: ' + result.error, 'error'); return; }
+                showToast('Audit deleted (' + (result.lines_deleted || 0) + ' lines)', 'success');
+                loadBillAuditHistory();
+                if (window._auditUploadId === uploadId) {
+                    window._auditUploadId = null;
+                    document.getElementById('audit-summary').classList.add('hidden');
+                    document.getElementById('audit-discrepancies').classList.add('hidden');
+                    document.getElementById('audit-missing').classList.add('hidden');
+                }
+            } catch (e) { showToast('Error: ' + e, 'error'); }
         }
 
         async function viewBillAuditResults(uploadId) {
@@ -13197,18 +13381,18 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function endPlanRate(id) {
-            const ok = await showConfirm('End Rate', 'Mark this rate as ended (effective_to = today)? It will be preserved as history but no longer used by audits.');
-            if (!ok) return;
             const today = new Date().toISOString().split('T')[0];
+            const date = await showDatePrompt('End Rate', 'Set the last date this rate applies. Bills with from-date on or before this will use this rate; later bills should match the next rate.', today);
+            if (!date) return;
             try {
                 const resp = await fetch(\`\${API_BASE}/plan-rates/\${id}\`, {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ effective_to: today }),
+                    body: JSON.stringify({ effective_to: date }),
                 });
                 const result = await resp.json();
                 if (result.error) { showToast('Failed: ' + result.error, 'error'); return; }
-                showToast('Rate ended', 'success');
+                showToast('Rate ended ' + date, 'success');
                 loadPlanRates();
             } catch (e) { showToast('Error: ' + e, 'error'); }
         }
@@ -13268,7 +13452,9 @@ async function sendSimOnline(simId, phoneNumber) {
             const vendor = document.getElementById('ledger-vendor').value;
             const status = document.getElementById('ledger-status').value;
             const month = document.getElementById('ledger-month').value;
+            const iccidSearch = (document.getElementById('ledger-iccid-search')?.value || '').trim();
             const qs = [];
+            if (iccidSearch) qs.push('iccid=' + encodeURIComponent(iccidSearch));
             if (vendor) qs.push('vendor=' + encodeURIComponent(vendor));
             if (status) qs.push('status=' + encodeURIComponent(status));
             if (month) qs.push('period_month=' + encodeURIComponent(month));
@@ -13281,7 +13467,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const total = data.total || 0;
                 const tbody = document.getElementById('ledger-table');
                 if (!rows.length) {
-                    tbody.innerHTML = '<tr><td colspan="9" class="px-3 py-3 text-center text-gray-500">No ledger rows. Adjust filters or click Regenerate above.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="px-3 py-3 text-center text-gray-500">No ledger rows. Adjust filters or click Regenerate above.</td></tr>';
                 } else {
                     const statusColors = { pending: 'text-gray-400', billed: 'text-accent', over: 'text-red-400', under: 'text-yellow-400', missing: 'text-orange-400', phantom: 'text-pink-400', disputed: 'text-purple-400', resolved: 'text-green-400' };
                     tbody.innerHTML = rows.map(r => {
@@ -13301,6 +13487,7 @@ async function sendSimOnline(simId, phoneNumber) {
                             <td class="px-3 py-2">\${r.vendor}</td>
                             <td class="px-3 py-2 text-gray-400">\${r.plan_name || '-'}</td>
                             <td class="px-3 py-2 text-gray-400 text-xs">\${r.period_start} → \${r.period_end}</td>
+                            <td class="px-3 py-2 font-mono text-xs text-gray-400">\${r.invoice_no || '-'}</td>
                             <td class="px-3 py-2 font-mono">\${expected}</td>
                             <td class="px-3 py-2 font-mono">\${billed}</td>
                             <td class="px-3 py-2 font-mono text-xs">\${deltaCell}</td>
@@ -13317,6 +13504,11 @@ async function sendSimOnline(simId, phoneNumber) {
             } catch (e) { console.error('loadBillingLedger:', e); }
         }
 
+        let _ledgerIccidTimer = null;
+        function onLedgerIccidInput() {
+            clearTimeout(_ledgerIccidTimer);
+            _ledgerIccidTimer = setTimeout(() => loadBillingLedger(1), 250);
+        }
         function ledgerPrev() { if (_ledgerPage > 1) loadBillingLedger(_ledgerPage - 1); }
         function ledgerNext() { loadBillingLedger(_ledgerPage + 1); }
         function filterLedgerStatus(s) {
