@@ -558,24 +558,34 @@ async function handleSims(env, corsHeaders, url) {
       );
     }
 
-    // Get SMS stats via DB-side aggregation (avoids row-limit truncation)
+    // Get SMS stats via DB-side aggregation, chunked into batches of 500
+    // sim_ids per RPC call. PostgREST caps response rows at 1000, so a single
+    // call with all sim_ids silently truncates once >1000 SIMs have messages.
     const simIds = filteredSims.map(s => s.id);
     const smsMap = {}; // sim_id -> { count, last_received }
     if (simIds.length > 0) {
+      const CHUNK = 500;
+      const chunks = [];
+      for (let i = 0; i < simIds.length; i += CHUNK) chunks.push(simIds.slice(i, i + CHUNK));
       const smsUrl = env.SUPABASE_URL + '/rest/v1/rpc/get_sms_counts_24h';
-      const smsResp = await fetch(smsUrl, {
-        method: 'POST',
-        headers: {
-          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-          Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({ sim_ids: simIds }),
-      });
-      const smsRows = await smsResp.json();
-      for (const row of smsRows) {
-        smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
+      const rpcHeaders = {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      };
+      const responses = await Promise.all(chunks.map(chunk =>
+        fetch(smsUrl, {
+          method: 'POST',
+          headers: rpcHeaders,
+          body: JSON.stringify({ sim_ids: chunk }),
+        }).then(r => r.json())
+      ));
+      for (const rows of responses) {
+        if (!Array.isArray(rows)) continue;
+        for (const row of rows) {
+          smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
+        }
       }
     }
 
