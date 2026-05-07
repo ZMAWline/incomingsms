@@ -4,6 +4,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-07 — Bill Audit collapses Wing IoT / ATOMIC / Helix into one "Wing aggregator" upload option; per-line vendor derived from CSV plan name
+
+**Decision:** The audit-vendor `<select>` shows two options: `wing_aggregator` (covers `wing_iot` + `atomic` + `helix`) and `teltik`. For a `wing_aggregator` upload, each CSV line's actual vendor is derived from its `Description` field matched against `plan_rates.plan_name` (case-insensitive, time-aware). The line is stored on `bill_audit_lines.vendor` with the *resolved* vendor (e.g., `helix`), while the upload row keeps `bill_audit_uploads.vendor='wing_aggregator'`. Reconciliation queries the ledger across all three vendors when the upload is `wing_aggregator`. Missing-from-bill scope filter uses the same set.
+
+**Why:** Wing is the aggregator and bills the user a single invoice covering all three AT&T vendor accounts. Forcing the operator to upload three separate "vendor" audits for one paper invoice was wrong both procedurally (the operator never sees three separate invoices) and operationally (the rate-mismatch check needed plan-level resolution anyway because plan rates differ per vendor on the same invoice). Storing the resolved vendor per line keeps per-vendor analytics intact (e.g., ledger filters, regenerate per vendor) without duplicating uploads.
+
+**Consequence / what not to undo:** Do NOT add `wing_iot`/`atomic`/`helix` back to the audit dropdown — there is one invoice. Do NOT change `bill_audit_lines.vendor` to mirror `bill_audit_uploads.vendor` — the per-line resolution is what makes ledger reconciliation work across three vendors from a single upload. If the audit needs a new AT&T-aggregator vendor in the future, add it to `WING_AGGREGATOR_VENDORS` and ensure plan_rates entries exist with distinguishable `plan_name`s (the disambiguator).
+
+---
+
+## 2026-05-07 — Reseller portal exposes carrier (AT&T / T-Mobile) only; never the internal vendor name
+
+**Decision:** Reseller-portal API responses (`/api/sims`, `/api/sims/:id/lifetime`) return a `carrier` field derived from `vendorToCarrier(vendor)` (`wing_iot`/`atomic`/`helix` → `AT&T`, `teltik` → `T-Mobile`). The raw `vendor` value is never sent to the customer. The portal HTML/SPA shows a "Carrier" column instead of "Vendor".
+
+**Why:** Internal vendor names (`wing_iot`, `atomic`, `helix`, `teltik`) are operational labels that leak our supply chain — which aggregator/MVNO each SIM is provisioned through. Customers care which network the SIM rides (delivery success, coverage, MMS support); they do not need to know whether it came from Wing IoT vs. ATOMIC. Hiding it (a) prevents accidentally signaling supplier changes when we re-platform a SIM (e.g., Helix → ATOMIC migration), and (b) keeps the portal usable when we add new vendor accounts on the same carrier.
+
+**Consequence / what not to undo:** Do NOT add `vendor` back to any reseller-portal response. New customer-facing fields go through a deliberate carrier/feature mapping. The `vendor` field still exists on the dashboard side (admin tooling) and is internally used by `handleSimLifetime` to compute Teltik-vs-AT&T billing units — that's fine, it just doesn't cross the portal API boundary.
+
+---
+
 ## 2026-05-05 — Reseller portal is a separate worker, not a grafted route on dashboard
 
 **Decision:** Customer-facing reseller portal lives at `src/reseller-portal/` as its own Cloudflare Worker (`reseller-portal.zalmen-531.workers.dev`), not as new routes on the existing `dashboard` worker.
