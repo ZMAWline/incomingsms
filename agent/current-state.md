@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-07 (session 46 close — billing/invoicing split, Teltik audit parser, mark-paid, reseller-portal carrier-only, time-aware audit)
+> Last updated: 2026-05-08 (session 47 close — SIMs page UX overhaul: chip-based filters, URL state, sticky header, Columns toggle)
 
 ---
 
@@ -25,6 +25,26 @@
 ---
 
 ## In Progress / Pending Work
+
+### SIMs page UX overhaul — Live in prod (session 47, 2026-05-08)
+Replaced the flat row of `<select>` filters with a three-row chip-based filter zone:
+- **Preset chips** (top row): Not rotated today, No SMS in 12h, Any error, No reseller, Auto-rotate paused, Stuck provisioning >1h. Clicking an inactive preset clears non-preset filters; toggling off leaves other state alone. AND-semantics across active presets.
+- **Filter buttons** (middle row): Status / Vendor / Gateway / Reseller open a shared `#sims-filter-menu` popover with checkboxes + per-option counts (computed off current data). Activated date-range + search box also in this row.
+- **Active-filter chips** (bottom row, hidden when empty): one chip per applied filter with × button, plus Clear-all. Uses `data-chip-kind` / `data-chip-key` attributes + delegated click handler — no inline `onclick` (avoids template-literal `\"` escape-level issues — see decision log 2026-05-08).
+- **State object** `simsFilterState` is the single source of truth: `{status[], resellerIds[], vendors[], gateways[], presets:Set, activatedFrom, activatedTo, search}`. Adapters (`onSims*Change`) mutate it; `renderSims()` reads it.
+- **URL state sync**: `syncSimsUrl()` (replaceState, called from renderSims) encodes filters + sort + pagination as `?status=active,error&vendor=atomic&search=foo&sort=phone:desc&page=3&size=100`. `hydrateSimsFromUrl()` runs at the top of `loadData()` (initial boot) and inside the popstate handler (back-button); URL is canonical on refresh / deep link / share.
+- **Sticky thead** on vertical scroll: table wrapped in `overflow-y-auto max-height: calc(100vh - 280px)` with `<thead><tr class="sticky top-0 z-10 bg-dark-800">`.
+- **Columns ▾ menu** next to Refresh: 10 hideable columns (gateway_code, iccid, vendor, mobility_subscription_id, reseller_name, sms_count, last_sms_received, last_mdn_rotated_at, activated_at, last_notified_at). Persisted in `localStorage['simsColumnVis']`. Always-visible: id, phone_number, status, plus the structural checkbox + actions cells. `applySimsColumnVisibility()` runs at end of every renderSims.
+- **Contextual empty state**: when filters return zero rows, "No SIMs match these filters" + Clear-all button. When no filters set and zero rows, the original message.
+- **`/` keyboard shortcut** focuses `#sims-search` from anywhere on the SIMs tab (bails when target is INPUT/TEXTAREA/contentEditable or a modifier is held).
+- **Search debounced** at 250ms (was firing on every keystroke).
+- **Default sort flipped** from `id asc` (oldest first) to `id desc` (newest first).
+- **Multi-status loadSims fix**: only sends `hide_cancelled=false` to server when user picks `canceled` or `__all__`. Multi-status without those gets the smaller default-set and client-filters the union (previously returning full cancelled history was timing out / erroring).
+
+**Files:** `src/dashboard/index.js` only. Deployed to prod 2026-05-08, version `543f1682`. Test-env baseline at `dashboard-test.zalmen-531.workers.dev` is up to date with prod.
+
+### kasa-control-test created with prod-inheriting cron (caveat from session 47)
+To deploy `dashboard-test`, the `kasa-control-test` worker had to be created (was missing). `src/kasa-control/wrangler.toml` does NOT scope `[triggers]` to env.test, so the test worker inherits `crons = ["0 0,3,12,15,18,21 * * *"]`. Without `KASA_USERNAME`/`KASA_PASSWORD` secrets on the test env it fails safely, but it's noisy. Either set test-env secrets or add `[env.test.triggers] crons = []` to the kasa-control wrangler.toml when convenient.
 
 ### Daily reconciliation cron — shipped flag-OFF, awaiting operator sign-off (session 41)
 **Live in prod but dormant.** New `/reconcile-rotations` endpoint on details-finalizer + cron `30 10 * * *` UTC (NY 6:30 EDT). Three buckets: A (wing_iot stuck `mdn_pending`), B (rotated today, last_notified_at stale), C (eligible-but-not-attempted in 24h, log-only). Hard caps in code: ≤60 AT&T GETs, ≤60 webhook POSTs, **0 plan-change PUTs**, 90s wall-clock, 1 audit row per run, cannot self-trigger. Feature-flag-gated by `RECONCILIATION_ENABLED` secret on details-finalizer (set to `"false"`); cron tick at UTC 10:30 logs `[Reconcile] disabled, skipping` and exits. Manual trigger via dashboard "Reconcile Now" button (uses `force=1` to bypass flag). Audit trail in `rotation_audit` table.

@@ -4,6 +4,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-08 — Dashboard chip / popover UIs use data-attributes + delegated handlers, never inline `onclick="fn('arg1','arg2')"` with quoted args
+
+**Decision:** Active-filter chips (and similar dynamic HTML emitted from `renderSimsActiveChips()`) embed the kind/key as `data-chip-kind="..." data-chip-key="..."` attributes on the wrapping element, and a single delegated `click` listener on the container reads those attributes to dispatch. Do **not** generate `'<button onclick="clearSimsFilterChip(\'' + kind + '\', \'' + key + '\')">'` markup.
+
+**Why:** The dashboard's frontend JS lives inside a template literal returned by `getHTML()`. That outer template literal eats one level of escape sequences — `\"` in the source becomes `"` in the emitted HTML, breaking any inner JS string literal that relied on `\"` to embed a quote. The first cut of Phase B did exactly that and the browser threw `SyntaxError: Unexpected identifier 'clearSimsFilterChip'` because the constructed JS string `"<button onclick="clearSims..."` was already terminated by the unescaped quote. Counting backslashes through three nested escape contexts (Node string literal → outer template literal → browser JS string) is a footgun.
+
+**Consequence / what not to undo:** Do NOT switch chips, popover items, or any other dynamically-built HTML in the dashboard back to inline `onclick="someFn('arg')"` with quoted args. Use data-attributes + a delegated handler attached once (idempotent guard via `container._someBound = true`). Same rule applies to any new clickable controls produced via `innerHTML` from inside `renderSims`-style functions. The chip pattern in `renderSimsActiveChips()` is the canonical reference.
+
+---
+
+## 2026-05-08 — SIMs page filter state lives in `simsFilterState` object, not the DOM
+
+**Decision:** A single in-memory object `simsFilterState = {status[], resellerIds[], vendors[], gateways[], presets:Set, activatedFrom, activatedTo, search}` is the source of truth for SIMs page filtering. Every UI affordance (preset chips, multi-select popover, date inputs, search box, active-filter × buttons) reads from and writes to this object. `renderSims()` reads only from `simsFilterState` (no `getElementById('filter-…').value` calls). `loadSims()` derives server query params from `simsFilterState`.
+
+**Why:** Pre-Phase A, `renderSims` queried 7 different DOM elements every render and `loadSims` queried two more. Adding multi-select dropdowns or URL hydration would have required mirroring the same logic in many places. With one state object: chip × buttons, URL hydrate, presets, "Clear all" — every mutation goes through one of a small set of adapters; render is purely a function of state. Also lets `syncSimsUrl()` serialize the whole filter view from one object instead of scraping the DOM.
+
+**Consequence / what not to undo:** Do NOT add a new SIMs filter by reading `document.getElementById(...)` inside `renderSims` or `loadSims`. Add it as a field on `simsFilterState` and an adapter `onSims*Change()`. URL hydration in `hydrateSimsFromUrl()` and serialization in `syncSimsUrl()` must also be updated when adding a new filter dimension — those two functions plus `clearAllSimsFilters()` plus `renderSimsActiveChips()` form the four touch-points. Same pattern is the obvious model for similar overhauls of Messages / IMEI / Errors tabs later.
+
+---
+
 ## 2026-05-07 — Bill Audit collapses Wing IoT / ATOMIC / Helix into one "Wing aggregator" upload option; per-line vendor derived from CSV plan name
 
 **Decision:** The audit-vendor `<select>` shows two options: `wing_aggregator` (covers `wing_iot` + `atomic` + `helix`) and `teltik`. For a `wing_aggregator` upload, each CSV line's actual vendor is derived from its `Description` field matched against `plan_rates.plan_name` (case-insensitive, time-aware). The line is stored on `bill_audit_lines.vendor` with the *resolved* vendor (e.g., `helix`), while the upload row keeps `bill_audit_uploads.vendor='wing_aggregator'`. Reconciliation queries the ledger across all three vendors when the upload is `wing_aggregator`. Missing-from-bill scope filter uses the same set.
