@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-08 (session 47 close — SIMs page UX overhaul: chip-based filters, URL state, sticky header, Columns toggle)
+> Last updated: 2026-05-08 (session 48 — gateway management UI + /gateway → /gateways rename)
 
 ---
 
@@ -25,6 +25,13 @@
 ---
 
 ## In Progress / Pending Work
+
+### Gateway management UI — Live in prod (session 48, 2026-05-08)
+Renamed sidebar route `/gateway` → `/gateways` (legacy `/gateway` URL still resolves via a `ROUTE_TO_TAB['/gateway'] = 'gateways'` alias for old bookmarks; tab id `tab-gateway` → `tab-gateways`, `data-tab` + `switchTab()` callers updated, `PAGE_TITLES` updated). Added a "Gateway Management" card at the top of the page: table showing code, name, host:api_port, username, password (masked with click-to-reveal), total_ports, slots_per_port, active, with **+ Add Gateway** button and per-row **Edit** / **Delete**. Backed by full CRUD on `/api/gateways` — `GET` now returns `host,api_port,username,password,slots_per_port,mac_address` (was a subset), `POST` accepts the new fields, `PATCH ?id=N` and `DELETE ?id=N` added. Add/edit modal covers all gateway columns plus a show/hide password toggle. Existing port-status grid + quick-action buttons + Power Control sections under the card are unchanged.
+
+**Caveat:** gateway passwords are stored plaintext in the `gateways` table and the management UI surfaces them on demand to dashboard admins. Same trust boundary as before, just exposed in the UI now.
+
+**Files:** `src/dashboard/index.js` only. Deployed to prod 2026-05-08, version `e17bbeda-7b2d-48cd-acbd-cdb3f29125aa`.
 
 ### SIMs page UX overhaul — Live in prod (session 47, 2026-05-08)
 Replaced the flat row of `<select>` filters with a three-row chip-based filter zone:

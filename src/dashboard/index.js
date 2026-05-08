@@ -1117,10 +1117,12 @@ async function handleKasaProxy(request, env, url, corsHeaders) {
 }
 
 async function handleGateways(request, env, corsHeaders) {
-  // GET - list all gateways
+  const url = new URL(request.url);
+  const idParam = url.searchParams.get('id');
+
   if (request.method === 'GET') {
     try {
-      const response = await supabaseGet(env, 'gateways?select=id,mac_address,code,name,location,total_ports,active&order=code.asc');
+      const response = await supabaseGet(env, 'gateways?select=id,mac_address,code,name,location,host,api_port,username,password,total_ports,slots_per_port,active&order=code.asc');
       const gateways = await response.json();
       return new Response(JSON.stringify(gateways), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -1133,11 +1135,10 @@ async function handleGateways(request, env, corsHeaders) {
     }
   }
 
-  // POST - add new gateway
   if (request.method === 'POST') {
     try {
       const body = await request.json();
-      const { mac_address, code, name, location, total_ports } = body;
+      const { mac_address, code, name, location, host, api_port, username, password, total_ports, slots_per_port, active } = body;
 
       if (!mac_address || !code) {
         return new Response(JSON.stringify({ error: 'mac_address and code are required' }), {
@@ -1159,8 +1160,13 @@ async function handleGateways(request, env, corsHeaders) {
           code,
           name: name || null,
           location: location || null,
+          host: host || null,
+          api_port: api_port || 80,
+          username: username || null,
+          password: password || null,
           total_ports: total_ports || 64,
-          active: true
+          slots_per_port: slots_per_port || 1,
+          active: active !== false,
         }),
       });
 
@@ -1184,9 +1190,91 @@ async function handleGateways(request, env, corsHeaders) {
     }
   }
 
+  if (request.method === 'PATCH') {
+    if (!idParam) {
+      return new Response(JSON.stringify({ error: 'id query param is required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    try {
+      const body = await request.json();
+      const allowed = ['mac_address','code','name','location','host','api_port','username','password','total_ports','slots_per_port','active'];
+      const patch = {};
+      for (const k of allowed) {
+        if (k in body) patch[k] = body[k];
+      }
+      if (!Object.keys(patch).length) {
+        return new Response(JSON.stringify({ error: 'no editable fields provided' }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      patch.updated_at = new Date().toISOString();
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways?id=eq.${encodeURIComponent(idParam)}`, {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=representation',
+        },
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        return new Response(JSON.stringify({ error: `Failed to update gateway: ${errText}` }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      const updated = await res.json();
+      return new Response(JSON.stringify({ ok: true, gateway: updated[0] || null }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  if (request.method === 'DELETE') {
+    if (!idParam) {
+      return new Response(JSON.stringify({ error: 'id query param is required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    try {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways?id=eq.${encodeURIComponent(idParam)}`, {
+        method: 'DELETE',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        return new Response(JSON.stringify({ error: `Failed to delete gateway: ${errText}` }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
   return new Response('Method not allowed', { status: 405 });
 }
-
 async function handleSimOnline(request, env, corsHeaders) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
@@ -5558,9 +5646,9 @@ function getHTML(helixEnabled) {
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
                     <span class="text-sm">Workers</span>
                 </a>
-                <a href="/gateway" onclick="event.preventDefault();switchTab('gateway')" data-tab="gateway" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Gateway">
+                <a href="/gateways" onclick="event.preventDefault();switchTab('gateways')" data-tab="gateways" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Gateways">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
-                    <span class="text-sm">Gateway</span>
+                    <span class="text-sm">Gateways</span>
                 </a>
                 <a href="/imei-pool" onclick="event.preventDefault();switchTab('imei-pool')" data-tab="imei-pool" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="IMEI Pool">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
@@ -6021,8 +6109,37 @@ function getHTML(helixEnabled) {
                 </div>
             </div>
 
-            <!-- Gateway Tab -->
-            <div id="tab-gateway" class="tab-content hidden">
+            <!-- Gateways Tab -->
+            <div id="tab-gateways" class="tab-content hidden">
+                <!-- Gateway Management -->
+                <div class="bg-dark-800 rounded-xl border border-dark-600 mb-6">
+                    <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                        <h2 class="text-lg font-semibold text-white">Gateway Management</h2>
+                        <div class="flex items-center gap-2">
+                            <button onclick="loadGatewaysList()" class="px-3 py-1.5 text-xs bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Refresh</button>
+                            <button onclick="showAddGatewayModal()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add Gateway</button>
+                        </div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600 bg-dark-900/40">
+                                <th class="py-2 px-4">Code</th>
+                                <th class="py-2 px-4">Name</th>
+                                <th class="py-2 px-4">Host:Port</th>
+                                <th class="py-2 px-4">Username</th>
+                                <th class="py-2 px-4">Password</th>
+                                <th class="py-2 px-4">Ports</th>
+                                <th class="py-2 px-4">Slots/Port</th>
+                                <th class="py-2 px-4">Active</th>
+                                <th class="py-2 px-4 text-right">Actions</th>
+                            </tr></thead>
+                            <tbody id="gateways-tbody" class="text-gray-300">
+                                <tr><td colspan="9" class="py-6 px-4 text-center text-gray-500">Loading…</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- Gateway Selector -->
                 <div class="flex flex-wrap items-center gap-4 mb-6">
                     <select id="gw-select" onchange="loadPortStatus()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-4 py-2 text-gray-200 focus:outline-none focus:border-accent min-w-[200px]">
@@ -8090,6 +8207,49 @@ function getHTML(helixEnabled) {
         </div>
     </div>
 
+    <!-- Add/Edit Gateway Modal -->
+    <div id="gateway-edit-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-lg max-h-[90vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 id="gateway-edit-title" class="text-lg font-semibold text-white">Add Gateway</h3>
+                <button onclick="hideGatewayEditModal()" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 overflow-y-auto flex-1 space-y-3">
+                <input id="gateway-edit-id" type="hidden">
+                <div class="grid grid-cols-2 gap-3">
+                    <div><label class="block text-xs text-gray-400 mb-1">Code *</label><input id="gateway-edit-code" type="text" placeholder="64-1" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent"></div>
+                    <div><label class="block text-xs text-gray-400 mb-1">Name</label><input id="gateway-edit-name" type="text" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent"></div>
+                </div>
+                <div><label class="block text-xs text-gray-400 mb-1">MAC Address *</label><input id="gateway-edit-mac" type="text" placeholder="AA:BB:CC:DD:EE:FF" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono"></div>
+                <div class="grid grid-cols-3 gap-3">
+                    <div class="col-span-2"><label class="block text-xs text-gray-400 mb-1">Host (IP / DNS)</label><input id="gateway-edit-host" type="text" placeholder="54.254.97.139" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono"></div>
+                    <div><label class="block text-xs text-gray-400 mb-1">API Port</label><input id="gateway-edit-api-port" type="number" min="1" max="65535" placeholder="80" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent"></div>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div><label class="block text-xs text-gray-400 mb-1">Username</label><input id="gateway-edit-username" type="text" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono"></div>
+                    <div>
+                        <label class="block text-xs text-gray-400 mb-1">Password</label>
+                        <div class="flex gap-1">
+                            <input id="gateway-edit-password" type="password" class="flex-1 min-w-0 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono">
+                            <button id="gateway-edit-pwd-toggle" type="button" onclick="toggleGatewayEditPwdVisibility()" class="px-2 py-2 text-xs bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Show</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="grid grid-cols-3 gap-3">
+                    <div><label class="block text-xs text-gray-400 mb-1">Total Ports</label><input id="gateway-edit-total-ports" type="number" min="1" max="1024" placeholder="64" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent"></div>
+                    <div><label class="block text-xs text-gray-400 mb-1">Slots / Port</label><input id="gateway-edit-slots-per-port" type="number" min="1" max="16" placeholder="1" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent"></div>
+                    <div><label class="block text-xs text-gray-400 mb-1">Location</label><input id="gateway-edit-location" type="text" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent"></div>
+                </div>
+                <div><label class="flex items-center gap-2 text-sm text-gray-300"><input id="gateway-edit-active" type="checkbox" checked class="w-4 h-4 rounded bg-dark-700 border-dark-500"> Active</label></div>
+                <p id="gateway-edit-error" class="text-xs text-red-400 hidden"></p>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-2">
+                <button onclick="hideGatewayEditModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Cancel</button>
+                <button id="gateway-edit-save-btn" onclick="saveGatewayForm()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Save</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Change IMEI Modal -->
     <div id="change-imei-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
         <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-lg max-h-[85vh] flex flex-col">
@@ -8132,7 +8292,7 @@ function getHTML(helixEnabled) {
             'sims': '/sims',
             'messages': '/messages',
             'workers': '/workers',
-            'gateway': '/gateway',
+            'gateways': '/gateways',
             'imei-pool': '/imei-pool',
             'errors': '/errors',
             'invoicing': '/invoicing',
@@ -8142,6 +8302,7 @@ function getHTML(helixEnabled) {
             'api-tester': '/api-tester',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
+        ROUTE_TO_TAB['/gateway'] = 'gateways'; // legacy alias for old bookmarks
 
         function switchTab(tabName, push = true) {
             toggleSidebar(false);
@@ -8163,10 +8324,10 @@ function getHTML(helixEnabled) {
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateway: 'Gateway', 'imei-pool': 'IMEI Pool', errors: 'Errors', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
             if (tabName === 'imei-pool') loadImeiPool();
-            if (tabName === 'gateway') loadPortStatus();
+            if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
             if (tabName === 'errors') loadErrors();
             if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
@@ -10122,6 +10283,203 @@ async function sendSimOnline(simId, phoneNumber) {
             15: { bg: 'bg-blue-400', label: 'Mobile Net' },
             16: { bg: 'bg-red-500', label: 'Timeout' },
         };
+
+        // ===== Gateway Management =====
+        let gatewaysCache = [];
+
+        function gwEscHtml(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        async function loadGatewaysList() {
+            const tbody = document.getElementById('gateways-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '<tr><td colspan="9" class="py-6 px-4 text-center text-gray-500">Loading…</td></tr>';
+            try {
+                const r = await fetch(\`\${API_BASE}/gateways\`);
+                const list = await r.json();
+                if (!Array.isArray(list) || !list.length) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="py-6 px-4 text-center text-gray-500">No gateways configured</td></tr>';
+                    gatewaysCache = [];
+                    return;
+                }
+                gatewaysCache = list;
+
+                // refresh top selector with same data
+                try {
+                    const sel = document.getElementById('gw-select');
+                    if (sel) {
+                        const cur = sel.value;
+                        sel.innerHTML = '<option value="">Select a gateway...</option>' +
+                            list.map(g => '<option value="' + g.id + '">' + gwEscHtml(g.code) + (g.name && g.name !== g.code ? ' — ' + gwEscHtml(g.name) : '') + '</option>').join('');
+                        if (cur) sel.value = cur;
+                    }
+                } catch(e) {}
+
+                tbody.innerHTML = list.map((g, idx) => {
+                    const hostPort = g.host
+                        ? '<span class="font-mono">' + gwEscHtml(g.host) + ':' + (g.api_port || 80) + '</span>'
+                        : '<span class="text-gray-500 italic">—</span>';
+                    const userCell = g.username
+                        ? '<span class="font-mono">' + gwEscHtml(g.username) + '</span>'
+                        : '<span class="text-gray-500 italic">—</span>';
+                    const pwdCell = g.password
+                        ? '<span class="font-mono" data-pwd="' + encodeURIComponent(g.password) + '" data-shown="0">••••••••</span> <button onclick="toggleGwPwdInTable(this)" class="ml-1 text-[11px] text-blue-400 hover:text-blue-300">show</button>'
+                        : '<span class="text-gray-500 italic">—</span>';
+                    return '<tr class="border-b border-dark-700 hover:bg-dark-700/40">'
+                        + '<td class="py-2 px-4 font-mono text-white">' + gwEscHtml(g.code) + '</td>'
+                        + '<td class="py-2 px-4">' + gwEscHtml(g.name || '') + '</td>'
+                        + '<td class="py-2 px-4 text-xs">' + hostPort + '</td>'
+                        + '<td class="py-2 px-4 text-xs">' + userCell + '</td>'
+                        + '<td class="py-2 px-4 text-xs">' + pwdCell + '</td>'
+                        + '<td class="py-2 px-4">' + (g.total_ports || '') + '</td>'
+                        + '<td class="py-2 px-4">' + (g.slots_per_port || 1) + '</td>'
+                        + '<td class="py-2 px-4">' + (g.active ? '<span class="text-green-400">Yes</span>' : '<span class="text-gray-500">No</span>') + '</td>'
+                        + '<td class="py-2 px-4 text-right whitespace-nowrap">'
+                        + '<button onclick="showEditGatewayModal(' + idx + ')" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 rounded text-gray-200 transition mr-1">Edit</button>'
+                        + '<button onclick="deleteGateway(' + idx + ')" class="px-2 py-1 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Delete</button>'
+                        + '</td>'
+                        + '</tr>';
+                }).join('');
+            } catch(e) {
+                console.error('loadGatewaysList failed', e);
+                tbody.innerHTML = '<tr><td colspan="9" class="py-6 px-4 text-center text-red-400">Error loading gateways</td></tr>';
+            }
+        }
+
+        function toggleGwPwdInTable(btn) {
+            const span = btn.previousElementSibling;
+            if (!span) return;
+            const shown = span.dataset.shown === '1';
+            if (shown) {
+                span.textContent = '••••••••';
+                span.dataset.shown = '0';
+                btn.textContent = 'show';
+            } else {
+                span.textContent = decodeURIComponent(span.dataset.pwd || '');
+                span.dataset.shown = '1';
+                btn.textContent = 'hide';
+            }
+        }
+
+        function showAddGatewayModal() {
+            document.getElementById('gateway-edit-id').value = '';
+            document.getElementById('gateway-edit-title').textContent = 'Add Gateway';
+            document.getElementById('gateway-edit-code').value = '';
+            document.getElementById('gateway-edit-name').value = '';
+            document.getElementById('gateway-edit-mac').value = '';
+            document.getElementById('gateway-edit-host').value = '';
+            document.getElementById('gateway-edit-api-port').value = '80';
+            document.getElementById('gateway-edit-username').value = '';
+            const pwd = document.getElementById('gateway-edit-password');
+            pwd.value = ''; pwd.type = 'password';
+            const pwdBtn = document.getElementById('gateway-edit-pwd-toggle');
+            if (pwdBtn) pwdBtn.textContent = 'Show';
+            document.getElementById('gateway-edit-total-ports').value = '64';
+            document.getElementById('gateway-edit-slots-per-port').value = '1';
+            document.getElementById('gateway-edit-location').value = '';
+            document.getElementById('gateway-edit-active').checked = true;
+            document.getElementById('gateway-edit-error').classList.add('hidden');
+            document.getElementById('gateway-edit-modal').classList.remove('hidden');
+        }
+
+        function showEditGatewayModal(idx) {
+            const g = gatewaysCache[idx];
+            if (!g) return;
+            document.getElementById('gateway-edit-id').value = g.id;
+            document.getElementById('gateway-edit-title').textContent = 'Edit Gateway: ' + (g.code || '');
+            document.getElementById('gateway-edit-code').value = g.code || '';
+            document.getElementById('gateway-edit-name').value = g.name || '';
+            document.getElementById('gateway-edit-mac').value = g.mac_address || '';
+            document.getElementById('gateway-edit-host').value = g.host || '';
+            document.getElementById('gateway-edit-api-port').value = g.api_port || 80;
+            document.getElementById('gateway-edit-username').value = g.username || '';
+            const pwd = document.getElementById('gateway-edit-password');
+            pwd.value = g.password || ''; pwd.type = 'password';
+            const pwdBtn = document.getElementById('gateway-edit-pwd-toggle');
+            if (pwdBtn) pwdBtn.textContent = 'Show';
+            document.getElementById('gateway-edit-total-ports').value = g.total_ports || 64;
+            document.getElementById('gateway-edit-slots-per-port').value = g.slots_per_port || 1;
+            document.getElementById('gateway-edit-location').value = g.location || '';
+            document.getElementById('gateway-edit-active').checked = g.active !== false;
+            document.getElementById('gateway-edit-error').classList.add('hidden');
+            document.getElementById('gateway-edit-modal').classList.remove('hidden');
+        }
+
+        function hideGatewayEditModal() {
+            document.getElementById('gateway-edit-modal').classList.add('hidden');
+        }
+
+        function toggleGatewayEditPwdVisibility() {
+            const inp = document.getElementById('gateway-edit-password');
+            const btn = document.getElementById('gateway-edit-pwd-toggle');
+            if (inp.type === 'password') { inp.type = 'text'; if (btn) btn.textContent = 'Hide'; }
+            else { inp.type = 'password'; if (btn) btn.textContent = 'Show'; }
+        }
+
+        async function saveGatewayForm() {
+            const errEl = document.getElementById('gateway-edit-error');
+            errEl.classList.add('hidden');
+            const id = document.getElementById('gateway-edit-id').value;
+            const code = document.getElementById('gateway-edit-code').value.trim();
+            const mac = document.getElementById('gateway-edit-mac').value.trim();
+            if (!code) { errEl.textContent = 'Code is required'; errEl.classList.remove('hidden'); return; }
+            if (!mac && !id) { errEl.textContent = 'MAC address is required'; errEl.classList.remove('hidden'); return; }
+            const payload = {
+                code,
+                name: document.getElementById('gateway-edit-name').value.trim() || null,
+                mac_address: mac || undefined,
+                host: document.getElementById('gateway-edit-host').value.trim() || null,
+                api_port: parseInt(document.getElementById('gateway-edit-api-port').value) || 80,
+                username: document.getElementById('gateway-edit-username').value.trim() || null,
+                password: document.getElementById('gateway-edit-password').value || null,
+                total_ports: parseInt(document.getElementById('gateway-edit-total-ports').value) || 64,
+                slots_per_port: parseInt(document.getElementById('gateway-edit-slots-per-port').value) || 1,
+                location: document.getElementById('gateway-edit-location').value.trim() || null,
+                active: document.getElementById('gateway-edit-active').checked,
+            };
+            if (id) {
+                if (payload.mac_address === undefined) delete payload.mac_address;
+            }
+            const btn = document.getElementById('gateway-edit-save-btn');
+            btn.disabled = true; const oldLabel = btn.textContent; btn.textContent = 'Saving…';
+            try {
+                const url = id ? \`\${API_BASE}/gateways?id=\${id}\` : \`\${API_BASE}/gateways\`;
+                const method = id ? 'PATCH' : 'POST';
+                const r = await fetch(url, { method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+                const result = await r.json();
+                if (!r.ok || result.error) { throw new Error(result.error || 'Save failed'); }
+                hideGatewayEditModal();
+                showToast('Gateway saved', 'success');
+                loadGatewaysList();
+            } catch(e) {
+                errEl.textContent = String(e.message || e);
+                errEl.classList.remove('hidden');
+            } finally {
+                btn.disabled = false; btn.textContent = oldLabel;
+            }
+        }
+
+        async function deleteGateway(idx) {
+            const g = gatewaysCache[idx];
+            if (!g) return;
+            const ok = await showConfirm('Delete Gateway', 'Delete gateway "' + (g.code || g.id) + '"? Any SIMs assigned to it will be left orphaned. This cannot be undone.');
+            if (!ok) return;
+            try {
+                const r = await fetch(\`\${API_BASE}/gateways?id=\${g.id}\`, { method: 'DELETE' });
+                const result = await r.json();
+                if (!r.ok || result.error) throw new Error(result.error || 'Delete failed');
+                showToast('Gateway "' + (g.code || g.id) + '" deleted', 'success');
+                loadGatewaysList();
+            } catch(e) {
+                showToast('Delete failed: ' + (e.message || e), 'error');
+            }
+        }
 
         async function loadPortStatus() {
             const gatewayId = document.getElementById('gw-select').value;
