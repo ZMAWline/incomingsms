@@ -5817,52 +5817,42 @@ function getHTML(helixEnabled) {
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                                     Refresh
                                 </button>
+                                <button onclick="openSimsColumnsMenu(this)" class="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-gray-400 hover:text-white bg-dark-700 hover:bg-dark-600 border border-dark-500 rounded-lg transition">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h7"/></svg>
+                                    Columns
+                                </button>
                             </div>
-                            <div class="flex flex-wrap items-center gap-3">
-                                <select id="filter-status" onchange="loadSims(true)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
-                                    <option value="">All (except cancelled)</option>
-                                    <option value="all">All (include cancelled)</option>
-                                    <option value="active" selected>Active</option>
-                                    <option value="provisioning">Provisioning</option>
-                                    <option value="pending">Pending</option>
-                                    <option value="suspended">Suspended</option>
-                                    <option value="canceled">Cancelled</option>
-                                    <option value="error">Error</option>
-                                    <option value="helix_timeout">Helix Timeout</option>
-                                    <option value="data_mismatch">Data Mismatch</option>
-                                </select>
-                                <select id="filter-reseller" onchange="loadSims(true)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
-                                    <option value="">All Resellers</option>
-                                </select>
-                                <select id="filter-gateway" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
-                                    <option value="">All Gateways</option>
-                                </select>
-                                <select id="filter-vendor" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
-                                    <option value="">All Vendors</option>
-                                    <option value="helix">Helix (legacy)</option>
-                                    <option value="atomic">ATOMIC</option>
-                                    <option value="wing_iot">Wing IoT</option>
-                                    <option value="teltik">Teltik</option>
-                                </select>
-                                <select id="filter-special" onchange="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
-                                    <option value="">No Quick Filter</option>
-                                    <option value="not_rotated_today">Not rotated today</option>
-                                    <option value="no_sms_12h">No SMS in 12h</option>
-                                </select>
-                                <label class="text-xs text-gray-500 flex items-center gap-1">Activated
-                                  <input id="filter-activated-from" type="date" oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent" title="Activated from">
-                                  <span class="text-gray-600">&#8211;</span>
-                                  <input id="filter-activated-to" type="date" oninput="renderSims()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent" title="Activated to">
-                                </label>
-                                <input id="sims-search" type="text" placeholder="Search... (comma-separated for multiple)" oninput="renderSims()" onpaste="normalizePastedSearch(this,event,renderSims)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-48">
-                                <span id="sims-count" class="text-sm text-gray-500"></span>
+                            <div class="flex flex-col gap-3 w-full">
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Quick</span>
+                                    <button data-preset="not_rotated_today"  onclick="toggleSimsPreset('not_rotated_today')"  class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Not rotated today</button>
+                                    <button data-preset="no_sms_12h"         onclick="toggleSimsPreset('no_sms_12h')"         class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No SMS in 12h</button>
+                                    <button data-preset="any_error"          onclick="toggleSimsPreset('any_error')"          class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Any error</button>
+                                    <button data-preset="no_reseller"        onclick="toggleSimsPreset('no_reseller')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No reseller</button>
+                                    <button data-preset="auto_paused"        onclick="toggleSimsPreset('auto_paused')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Auto-rotate paused</button>
+                                    <button data-preset="stuck_provisioning" onclick="toggleSimsPreset('stuck_provisioning')" class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Stuck provisioning &gt;1h</button>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <button id="sims-fb-status"   onclick="openSimsFilterMenu('status', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Status<span id="sims-fb-status-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
+                                    <button id="sims-fb-vendor"   onclick="openSimsFilterMenu('vendor', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Vendor<span id="sims-fb-vendor-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
+                                    <button id="sims-fb-gateway"  onclick="openSimsFilterMenu('gateway', this)"  class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Gateway<span id="sims-fb-gateway-count"  class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
+                                    <button id="sims-fb-reseller" onclick="openSimsFilterMenu('reseller', this)" class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Reseller<span id="sims-fb-reseller-count" class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
+                                    <span class="flex items-center gap-1 text-xs text-gray-500">Activated
+                                        <input id="filter-activated-from" type="date" onchange="onSimsActivatedFromChange(this.value)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1 text-gray-300 focus:outline-none focus:border-accent" title="Activated from">
+                                        <span class="text-gray-600">&#8211;</span>
+                                        <input id="filter-activated-to" type="date" onchange="onSimsActivatedToChange(this.value)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1 text-gray-300 focus:outline-none focus:border-accent" title="Activated to">
+                                    </span>
+                                    <input id="sims-search" type="text" placeholder="Search&hellip; (press / to focus)" oninput="onSimsSearchInput(this.value)" onpaste="normalizePastedSearch(this,event,function(){onSimsSearchInput(document.getElementById('sims-search').value);})" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-56">
+                                    <span id="sims-count" class="text-sm text-gray-500 ml-auto"></span>
+                                </div>
+                                <div id="sims-active-chips" class="flex flex-wrap items-center gap-2 hidden"></div>
                             </div>
                         </div>
                     </div>
-                    <div class="overflow-x-auto">
+                    <div class="overflow-x-auto overflow-y-auto" style="max-height: calc(100vh - 280px);">
                         <table class="w-full">
                             <thead>
-                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600 sticky top-0 z-10 bg-dark-800">
                                     <th class="px-4 py-3 font-medium"><input type="checkbox" onchange="toggleAllSims(this)" class="accent-green-500"></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','id')">ID <span class="sort-arrow" data-table="sims" data-col="id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','gateway_code')">Gateway <span class="sort-arrow" data-table="sims" data-col="gateway_code"></span></th>
@@ -5881,10 +5871,30 @@ function getHTML(helixEnabled) {
                                 </tr>
                             </thead>
                             <tbody id="sims-table" class="text-sm">
-                                <tr><td colspan="13" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="15" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     <div id="sims-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
+                    </div>
+                </div>
+
+                <!-- Column visibility popover -->
+                <div id="sims-columns-menu" class="hidden fixed z-40 bg-dark-800 border border-dark-600 rounded-lg shadow-xl w-64 max-h-96 flex flex-col" style="top:0;left:0">
+                    <div class="p-2 border-b border-dark-700 flex items-center justify-between">
+                        <span class="text-xs uppercase tracking-wide text-gray-500">Show columns</span>
+                        <button onclick="resetSimsColumns()" class="text-xs text-gray-400 hover:text-white">Reset</button>
+                    </div>
+                    <div id="sims-columns-menu-list" class="overflow-auto flex-1 p-2 flex flex-col gap-0.5"></div>
+                </div>
+                <!-- Multi-select filter popover (shared by Status/Vendor/Gateway/Reseller) -->
+                <div id="sims-filter-menu" class="hidden fixed z-40 bg-dark-800 border border-dark-600 rounded-lg shadow-xl w-72 max-h-96 flex flex-col" style="top:0;left:0">
+                    <div class="p-2 border-b border-dark-700">
+                        <input id="sims-filter-menu-search" placeholder="Filter options&hellip;" class="w-full text-sm bg-dark-700 border border-dark-600 rounded px-2 py-1 text-gray-300 focus:outline-none focus:border-accent">
+                    </div>
+                    <div id="sims-filter-menu-list" class="overflow-auto flex-1 p-2 flex flex-col gap-0.5"></div>
+                    <div class="flex justify-between border-t border-dark-700 p-2">
+                        <button onclick="simsFilterMenuClear()" class="text-xs text-gray-400 hover:text-white px-2 py-1">Clear</button>
+                        <button onclick="simsFilterMenuClose()" class="text-xs text-accent hover:text-green-400 px-2 py-1">Done</button>
                     </div>
                 </div>
             </div>
@@ -8161,24 +8171,564 @@ function getHTML(helixEnabled) {
             if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
-            if (tabName === 'sims') loadRotationAudit();
+            if (tabName === 'sims') { loadRotationAudit(); try { syncSimsUrl(); } catch(e){} }
         }
 
         // Handle browser back/forward
         window.addEventListener('popstate', (e) => {
             const tab = e.state?.tab || ROUTE_TO_TAB[location.pathname] || 'dashboard';
             switchTab(tab, false);
+            if (tab === 'sims') {
+                try {
+                    const had = hydrateSimsFromUrl();
+                    if (had) loadSims(true);
+                } catch(e){ console.error('popstate hydrate failed', e); }
+            }
         });
 
         // Init tab from URL on page load
 
+        // ===== Keyboard shortcut: '/' focuses SIMs search =====
+        document.addEventListener('keydown', function(e){
+            if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+            const t = e.target;
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+            const simsTab = document.getElementById('tab-sims');
+            if (!simsTab || simsTab.classList.contains('hidden')) return;
+            const input = document.getElementById('sims-search');
+            if (input) { e.preventDefault(); input.focus(); input.select(); }
+        });
+
         // ===== Sort & Filter Engine =====
         const tableState = {
-            sims: { data: [], sortKey: 'id', sortDir: 'asc', page: 1, pageSize: 50 },
+            sims: { data: [], sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
             messages: { data: [], sortKey: 'received_at', sortDir: 'desc', page: 1, pageSize: 50 },
             imei: { data: [], sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
             errors: { data: [], sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
         };
+
+        // ===== SIMs Filter State (Phase A: structured state object, debounced search) =====
+        let simsFilterState = {
+            status: ['active'],     // [] = exclude cancelled (server default); ['__all__'] = include cancelled; ['<status>'] = single
+            resellerIds: [],        // 'none' sentinel = no-reseller; integer = reseller id
+            vendors: [],
+            gateways: [],
+            presets: new Set(),
+            activatedFrom: '',
+            activatedTo: '',
+            search: '',
+        };
+        function simNotRotatedToday(s) {
+            const todayUTC = new Date().toISOString().slice(0, 10);
+            return !s.last_mdn_rotated_at || s.last_mdn_rotated_at.slice(0, 10) < todayUTC;
+        }
+        function simNoSms12h(s) {
+            const cutoff12h = Date.now() - 12 * 60 * 60 * 1000;
+            return !s.last_sms_received || new Date(s.last_sms_received).getTime() < cutoff12h;
+        }
+        function simStuckProvisioning1h(s) {
+            if (s.status !== 'provisioning') return false;
+            const ref = s.activated_at || s.created_at;
+            if (!ref) return false;
+            return (Date.now() - new Date(ref).getTime()) > 3600000;
+        }
+        const SIM_PRESETS = {
+            not_rotated_today:  { label: 'Not rotated today',     test: simNotRotatedToday },
+            no_sms_12h:         { label: 'No SMS in 12h',         test: simNoSms12h },
+            no_reseller:        { label: 'No reseller',           test: function(s){ return !s.reseller_id; } },
+            auto_paused:        { label: 'Auto-rotate paused',    test: function(s){ return s.rotation_eligible === false; } },
+            any_error:          { label: 'Any error',             test: function(s){ return ['error','helix_timeout','data_mismatch'].includes(s.status); } },
+            stuck_provisioning: { label: 'Stuck provisioning >1h', test: simStuckProvisioning1h },
+        };
+        let simsColumnVis = (function(){ try { return JSON.parse(localStorage.getItem('simsColumnVis') || '{}'); } catch(e) { return {}; } })();
+        let _simsSearchTimer = null;
+        function onSimsSearchInput(v) {
+            clearTimeout(_simsSearchTimer);
+            _simsSearchTimer = setTimeout(function(){
+                simsFilterState.search = (v || '').trim();
+                tableState.sims.page = 1;
+                renderSims();
+            }, 250);
+        }
+        function onSimsStatusChange(v) {
+            if (v === '') simsFilterState.status = [];
+            else if (v === 'all') simsFilterState.status = ['__all__'];
+            else simsFilterState.status = [v];
+            tableState.sims.page = 1;
+            loadSims(true);
+        }
+        function onSimsResellerChange(v) {
+            if (v === '') simsFilterState.resellerIds = [];
+            else if (v === 'none') simsFilterState.resellerIds = ['none'];
+            else { const n = parseInt(v, 10); simsFilterState.resellerIds = Number.isFinite(n) ? [n] : [v]; }
+            tableState.sims.page = 1;
+            loadSims(true);
+        }
+        function onSimsVendorChange(v) {
+            simsFilterState.vendors = v ? [v] : [];
+            tableState.sims.page = 1;
+            renderSims();
+        }
+        function onSimsGatewayChange(v) {
+            simsFilterState.gateways = v ? [v] : [];
+            tableState.sims.page = 1;
+            renderSims();
+        }
+        function onSimsPresetChange(v) {
+            simsFilterState.presets = new Set(v ? [v] : []);
+            tableState.sims.page = 1;
+            renderSims();
+        }
+        function onSimsActivatedFromChange(v) {
+            simsFilterState.activatedFrom = v || '';
+            tableState.sims.page = 1;
+            renderSims();
+        }
+        function onSimsActivatedToChange(v) {
+            simsFilterState.activatedTo = v || '';
+            tableState.sims.page = 1;
+            renderSims();
+        }
+
+        // ===== SIMs filter UI: presets, multi-select popover, active chips =====
+        function getResellerOptions() {
+            const cache = window._simsResellersCache || [];
+            return cache.map(function(r){ return { value: String(r.id), text: r.name || ('#' + r.id) }; });
+        }
+        function renderSimsPresetChips() {
+            document.querySelectorAll('[data-preset]').forEach(function(btn){
+                const id = btn.getAttribute('data-preset');
+                const active = simsFilterState.presets.has(id);
+                btn.className = active
+                    ? 'sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-accent bg-accent text-white transition'
+                    : 'sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition';
+            });
+        }
+        function toggleSimsPreset(id) {
+            if (simsFilterState.presets.has(id)) {
+                // Toggling off — leave other filters alone.
+                simsFilterState.presets.delete(id);
+                tableState.sims.page = 1;
+                renderSimsPresetChips();
+                renderSims();
+                return;
+            }
+            // Activating preset: clear all non-preset filters first.
+            const hadServerFilters = simsFilterState.status.length > 0 || simsFilterState.resellerIds.length > 0;
+            simsFilterState.status = [];
+            simsFilterState.resellerIds = [];
+            simsFilterState.vendors = [];
+            simsFilterState.gateways = [];
+            simsFilterState.activatedFrom = '';
+            simsFilterState.activatedTo = '';
+            simsFilterState.search = '';
+            const fa = document.getElementById('filter-activated-from'); if (fa) fa.value = '';
+            const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = '';
+            const sa = document.getElementById('sims-search');            if (sa) sa.value = '';
+            simsFilterState.presets.add(id);
+            tableState.sims.page = 1;
+            renderSimsPresetChips();
+            if (hadServerFilters) loadSims(true); else renderSims();
+        }
+        function setSimsCountBadges() {
+            function fmt(arr){ return (arr && arr.length > 0) ? '(' + arr.length + ')' : ''; }
+            const set = function(id, v){ const el = document.getElementById(id); if (el) el.textContent = v; };
+            set('sims-fb-status-count',   fmt(simsFilterState.status));
+            set('sims-fb-vendor-count',   fmt(simsFilterState.vendors));
+            set('sims-fb-gateway-count',  fmt(simsFilterState.gateways));
+            set('sims-fb-reseller-count', fmt(simsFilterState.resellerIds));
+        }
+        function renderSimsActiveChips() {
+            const container = document.getElementById('sims-active-chips');
+            if (!container) return;
+            if (!container._simsChipsBound) {
+                container._simsChipsBound = true;
+                container.addEventListener('click', function(e){
+                    const xBtn = e.target.closest && e.target.closest('.sims-chip-x');
+                    if (xBtn) {
+                        const span = xBtn.closest('[data-chip-kind]');
+                        if (span) {
+                            clearSimsFilterChip(span.getAttribute('data-chip-kind'), span.getAttribute('data-chip-key'));
+                        }
+                        return;
+                    }
+                    const allBtn = e.target.closest && e.target.closest('.sims-clear-all');
+                    if (allBtn) clearAllSimsFilters();
+                });
+            }
+            const chips = [];
+            function htmlEscape(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+            function chipEl(kind, key, displayLabel, captionLabel) {
+                return '<span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded-full bg-dark-700 border border-dark-500 text-gray-200" data-chip-kind="' + kind + '" data-chip-key="' + htmlEscape(String(key)) + '">' +
+                    '<span class="text-gray-500">' + htmlEscape(captionLabel) + ':</span> ' + htmlEscape(displayLabel) +
+                    '<button class="sims-chip-x ml-1 text-gray-400 hover:text-white" title="Remove">×</button>' +
+                    '</span>';
+            }
+            // Status
+            simsFilterState.status.forEach(function(v){
+                const display = v === '__all__' ? 'incl. cancelled' : String(v);
+                chips.push(chipEl('status', v, display, 'Status'));
+            });
+            // Vendor
+            simsFilterState.vendors.forEach(function(v){ chips.push(chipEl('vendor', v, String(v), 'Vendor')); });
+            // Gateway
+            simsFilterState.gateways.forEach(function(v){ chips.push(chipEl('gateway', v, String(v), 'GW')); });
+            // Reseller
+            simsFilterState.resellerIds.forEach(function(v){
+                let display = String(v);
+                if (v === 'none') display = '(unassigned)';
+                else {
+                    const cache = window._simsResellersCache || [];
+                    const r = cache.find(function(rr){ return rr.id === v || String(rr.id) === String(v); });
+                    if (r) display = r.name || ('#' + v);
+                }
+                chips.push(chipEl('reseller', v, display, 'Reseller'));
+            });
+            // Presets
+            simsFilterState.presets.forEach(function(id){
+                const p = SIM_PRESETS[id];
+                if (p) chips.push(chipEl('preset', id, p.label, 'Preset'));
+            });
+            // Date range
+            if (simsFilterState.activatedFrom) chips.push(chipEl('activatedFrom', simsFilterState.activatedFrom, simsFilterState.activatedFrom, 'From'));
+            if (simsFilterState.activatedTo)   chips.push(chipEl('activatedTo',   simsFilterState.activatedTo,   simsFilterState.activatedTo,   'To'));
+            // Search
+            if (simsFilterState.search) chips.push(chipEl('search', simsFilterState.search, simsFilterState.search, 'Search'));
+            if (chips.length > 0) {
+                chips.push('<button class="sims-clear-all px-2 py-0.5 text-xs rounded-full bg-red-700/70 hover:bg-red-700 text-white border border-red-600">Clear all</button>');
+                container.classList.remove('hidden');
+                container.innerHTML = '<span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Active</span>' + chips.join('');
+            } else {
+                container.classList.add('hidden');
+                container.innerHTML = '';
+            }
+        }
+        function clearSimsFilterChip(kind, key) {
+            if (kind === 'status') {
+                simsFilterState.status = simsFilterState.status.filter(function(s){ return String(s) !== String(key); });
+                tableState.sims.page = 1;
+                loadSims(true);
+                return;
+            }
+            if (kind === 'vendor')  simsFilterState.vendors  = simsFilterState.vendors.filter(function(s){ return String(s) !== String(key); });
+            else if (kind === 'gateway') simsFilterState.gateways = simsFilterState.gateways.filter(function(s){ return String(s) !== String(key); });
+            else if (kind === 'reseller') {
+                simsFilterState.resellerIds = simsFilterState.resellerIds.filter(function(s){ return String(s) !== String(key); });
+                tableState.sims.page = 1;
+                loadSims(true);
+                return;
+            }
+            else if (kind === 'preset') {
+                simsFilterState.presets.delete(key);
+                renderSimsPresetChips();
+            }
+            else if (kind === 'activatedFrom') { simsFilterState.activatedFrom = ''; const el = document.getElementById('filter-activated-from'); if (el) el.value = ''; }
+            else if (kind === 'activatedTo')   { simsFilterState.activatedTo = '';   const el = document.getElementById('filter-activated-to');   if (el) el.value = ''; }
+            else if (kind === 'search') {        simsFilterState.search = '';        const el = document.getElementById('sims-search');           if (el) el.value = ''; }
+            tableState.sims.page = 1;
+            renderSims();
+        }
+        function clearAllSimsFilters() {
+            simsFilterState.status = [];
+            simsFilterState.resellerIds = [];
+            simsFilterState.vendors = [];
+            simsFilterState.gateways = [];
+            simsFilterState.presets = new Set();
+            simsFilterState.activatedFrom = '';
+            simsFilterState.activatedTo = '';
+            simsFilterState.search = '';
+            const fa = document.getElementById('filter-activated-from'); if (fa) fa.value = '';
+            const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = '';
+            const sa = document.getElementById('sims-search');            if (sa) sa.value = '';
+            tableState.sims.page = 1;
+            renderSimsPresetChips();
+            loadSims(true);
+        }
+        function openSimsFilterMenu(kind, anchorEl) {
+            const menu = document.getElementById('sims-filter-menu');
+            if (!menu) return;
+            menu._kind = kind;
+            const data = tableState.sims.data || [];
+            let opts = [];
+            if (kind === 'status') {
+            const STATUS_OPTS = [
+                { value: 'active', label: 'Active' },
+                { value: 'provisioning', label: 'Provisioning' },
+                { value: 'pending', label: 'Pending' },
+                { value: 'suspended', label: 'Suspended' },
+                { value: 'canceled', label: 'Cancelled' },
+                { value: 'error', label: 'Error' },
+                { value: 'helix_timeout', label: 'Helix Timeout' },
+                { value: 'data_mismatch', label: 'Data Mismatch' },
+                { value: '__all__', label: 'Include cancelled (server flag)' },
+            ];
+                const counts = {};
+                data.forEach(function(s){ counts[s.status] = (counts[s.status]||0) + 1; });
+                opts = STATUS_OPTS.map(function(o){ return { value: o.value, label: o.label, count: o.value === '__all__' ? 0 : (counts[o.value] || 0) }; });
+            } else if (kind === 'vendor') {
+            const VENDOR_OPTS = [
+                { value: 'helix', label: 'Helix (legacy)' },
+                { value: 'atomic', label: 'ATOMIC' },
+                { value: 'wing_iot', label: 'Wing IoT' },
+                { value: 'teltik', label: 'Teltik' },
+            ];
+                const counts = {};
+                data.forEach(function(s){ counts[s.vendor] = (counts[s.vendor]||0) + 1; });
+                opts = VENDOR_OPTS.map(function(o){ return { value: o.value, label: o.label, count: counts[o.value] || 0 }; });
+            } else if (kind === 'gateway') {
+                const counts = {};
+                data.forEach(function(s){ if (s.gateway_code) counts[s.gateway_code] = (counts[s.gateway_code]||0) + 1; });
+                opts = Object.keys(counts).sort().map(function(g){ return { value: g, label: g, count: counts[g] }; });
+                if (opts.length === 0) opts = [{ value: '', label: '(no gateways in current data)', count: 0 }];
+            } else if (kind === 'reseller') {
+                const cache = window._simsResellersCache || [];
+                const counts = {};
+                data.forEach(function(s){ if (s.reseller_id != null) counts[s.reseller_id] = (counts[s.reseller_id]||0) + 1; });
+                const noneCount = data.filter(function(s){ return !s.reseller_id; }).length;
+                opts = [{ value: 'none', label: '(unassigned)', count: noneCount }];
+                cache.forEach(function(r){
+                    opts.push({ value: String(r.id), label: r.name || ('#' + r.id), count: counts[r.id] || 0 });
+                });
+            }
+            const selected = simsFilterMenuGetSelected(kind);
+            const list = document.getElementById('sims-filter-menu-list');
+            list.innerHTML = opts.map(function(o){
+                const v = String(o.value);
+                const checked = selected.has(v) ? 'checked' : '';
+                const safeV = v.replace(/"/g, '&quot;');
+                const safeLabel = String(o.label).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                return '<label class="flex items-center gap-2 px-2 py-1 rounded hover:bg-dark-700 cursor-pointer text-sm text-gray-300">' +
+                    '<input type="checkbox" ' + checked + ' value="' + safeV + '" class="accent-green-500" onchange="simsFilterMenuToggle(this)">' +
+                    '<span class="flex-1">' + safeLabel + '</span>' +
+                    '<span class="text-gray-500 text-xs">(' + (o.count || 0) + ')</span>' +
+                    '</label>';
+            }).join('');
+            const search = document.getElementById('sims-filter-menu-search');
+            if (search) { search.value = ''; search.oninput = simsFilterMenuFilter; setTimeout(function(){ search.focus(); }, 0); }
+            // Position menu under the anchor button
+            const rect = anchorEl.getBoundingClientRect();
+            const menuW = 288, menuMaxH = 384;
+            const left = Math.max(8, Math.min(window.innerWidth - menuW - 8, rect.left));
+            const top  = Math.min(window.innerHeight - menuMaxH - 8, rect.bottom + 6);
+            menu.style.left = left + 'px';
+            menu.style.top = top + 'px';
+            menu.classList.remove('hidden');
+            setTimeout(function(){ document.addEventListener('mousedown', simsFilterMenuMaybeClose, true); }, 0);
+        }
+        function simsFilterMenuGetSelected(kind) {
+            if (kind === 'status')   return new Set(simsFilterState.status.map(String));
+            if (kind === 'vendor')   return new Set(simsFilterState.vendors.map(String));
+            if (kind === 'gateway')  return new Set(simsFilterState.gateways.map(String));
+            if (kind === 'reseller') return new Set(simsFilterState.resellerIds.map(String));
+            return new Set();
+        }
+        function simsFilterMenuToggle(cb) {
+            const menu = document.getElementById('sims-filter-menu');
+            const kind = menu._kind;
+            const v = cb.value;
+            const checked = cb.checked;
+            function pushUnique(arr, val) {
+                if (!arr.some(function(x){ return String(x) === String(val); })) arr.push(val);
+            }
+            if (kind === 'status') {
+                if (checked) pushUnique(simsFilterState.status, v);
+                else simsFilterState.status = simsFilterState.status.filter(function(s){ return String(s) !== v; });
+                tableState.sims.page = 1;
+                loadSims(true);
+            } else if (kind === 'reseller') {
+                const val = (v === 'none') ? 'none' : (parseInt(v, 10) || v);
+                if (checked) pushUnique(simsFilterState.resellerIds, val);
+                else simsFilterState.resellerIds = simsFilterState.resellerIds.filter(function(s){ return String(s) !== String(val); });
+                tableState.sims.page = 1;
+                loadSims(true);
+            } else {
+                const key = kind === 'vendor' ? 'vendors' : 'gateways';
+                if (checked) pushUnique(simsFilterState[key], v);
+                else simsFilterState[key] = simsFilterState[key].filter(function(s){ return String(s) !== v; });
+                tableState.sims.page = 1;
+                renderSims();
+            }
+        }
+        function simsFilterMenuFilter() {
+            const q = (this.value || '').toLowerCase();
+            const items = document.querySelectorAll('#sims-filter-menu-list label');
+            items.forEach(function(el){
+                const txt = el.textContent.toLowerCase();
+                el.style.display = txt.includes(q) ? '' : 'none';
+            });
+        }
+        function simsFilterMenuClose() {
+            const menu = document.getElementById('sims-filter-menu');
+            if (menu) menu.classList.add('hidden');
+            document.removeEventListener('mousedown', simsFilterMenuMaybeClose, true);
+        }
+        function simsFilterMenuMaybeClose(e) {
+            const menu = document.getElementById('sims-filter-menu');
+            if (!menu || menu.classList.contains('hidden')) return;
+            if (menu.contains(e.target)) return;
+            if (e.target.closest && e.target.closest('.sims-filter-btn')) return;
+            simsFilterMenuClose();
+        }
+        function simsFilterMenuClear() {
+            const menu = document.getElementById('sims-filter-menu');
+            if (!menu) return;
+            const kind = menu._kind;
+            if      (kind === 'status')   { simsFilterState.status = [];      loadSims(true); }
+            else if (kind === 'vendor')   { simsFilterState.vendors = [];     renderSims(); }
+            else if (kind === 'gateway')  { simsFilterState.gateways = [];    renderSims(); }
+            else if (kind === 'reseller') { simsFilterState.resellerIds = []; loadSims(true); }
+            tableState.sims.page = 1;
+            simsFilterMenuClose();
+        }
+
+        // ===== SIMs URL state sync =====
+        function syncSimsUrl() {
+            if (location.pathname !== '/sims') return;
+            const params = new URLSearchParams();
+            const s = simsFilterState;
+            // Defaults: status=['active']; everything else empty/zero. Omit when at default.
+            const isDefaultStatus = s.status.length === 1 && s.status[0] === 'active';
+            if (s.status.length > 0 && !isDefaultStatus) params.set('status', s.status.join(','));
+            if (s.status.length === 0) params.set('status', 'none'); // explicit empty (any non-cancelled)
+            if (s.vendors.length)      params.set('vendor', s.vendors.join(','));
+            if (s.gateways.length)     params.set('gateway', s.gateways.join(','));
+            if (s.resellerIds.length)  params.set('reseller', s.resellerIds.join(','));
+            if (s.presets.size > 0)    params.set('presets', Array.from(s.presets).join(','));
+            if (s.activatedFrom)       params.set('from', s.activatedFrom);
+            if (s.activatedTo)         params.set('to', s.activatedTo);
+            if (s.search)              params.set('search', s.search);
+            const t = tableState.sims;
+            if (t.sortKey !== 'id' || t.sortDir !== 'desc') params.set('sort', t.sortKey + ':' + t.sortDir);
+            if (t.page !== 1)         params.set('page', String(t.page));
+            if (t.pageSize !== 50)    params.set('size', String(t.pageSize));
+            const qs = params.toString();
+            const newUrl = '/sims' + (qs ? ('?' + qs) : '');
+            if (newUrl !== location.pathname + location.search) {
+                history.replaceState(history.state || { tab: 'sims' }, '', newUrl);
+            }
+        }
+        function hydrateSimsFromUrl() {
+            if (location.pathname !== '/sims') return false;
+            const params = new URLSearchParams(location.search);
+            if ([...params.keys()].length === 0) return false;
+            const s = simsFilterState;
+            if (params.has('status')) {
+                const v = params.get('status');
+                if (v === 'none') s.status = [];
+                else s.status = v.split(',').filter(Boolean);
+            }
+            if (params.has('vendor'))   s.vendors  = params.get('vendor').split(',').filter(Boolean);
+            if (params.has('gateway'))  s.gateways = params.get('gateway').split(',').filter(Boolean);
+            if (params.has('reseller')) {
+                s.resellerIds = params.get('reseller').split(',').filter(Boolean).map(function(v){
+                    if (v === 'none') return 'none';
+                    const n = parseInt(v, 10);
+                    return Number.isFinite(n) ? n : v;
+                });
+            }
+            if (params.has('presets'))   s.presets = new Set(params.get('presets').split(',').filter(Boolean));
+            if (params.has('from'))      s.activatedFrom = params.get('from');
+            if (params.has('to'))        s.activatedTo = params.get('to');
+            if (params.has('search'))    s.search = params.get('search');
+            if (params.has('sort')) {
+                const parts = params.get('sort').split(':');
+                if (parts[0]) tableState.sims.sortKey = parts[0];
+                if (parts[1] === 'asc' || parts[1] === 'desc') tableState.sims.sortDir = parts[1];
+            }
+            if (params.has('page'))     tableState.sims.page     = Math.max(1, parseInt(params.get('page'), 10) || 1);
+            if (params.has('size'))     tableState.sims.pageSize = Math.max(10, parseInt(params.get('size'), 10) || 50);
+            // Sync DOM inputs (popover button counts/preset chips refresh on next renderSims)
+            const sa = document.getElementById('sims-search');             if (sa) sa.value = s.search || '';
+            const fa = document.getElementById('filter-activated-from');   if (fa) fa.value = s.activatedFrom || '';
+            const ta = document.getElementById('filter-activated-to');     if (ta) ta.value = s.activatedTo || '';
+            return true;
+        }
+
+        // ===== SIMs column visibility =====
+        function applySimsColumnVisibility() {
+            const headerKeys = [];
+            const ths = document.querySelectorAll('#tab-sims thead th');
+            ths.forEach(function(th){
+                const span = th.querySelector('.sort-arrow');
+                const key = span ? span.getAttribute('data-col') : null;
+                if (key) th.setAttribute('data-col', key);
+                headerKeys.push(key);
+            });
+            const rows = document.querySelectorAll('#sims-table tr');
+            rows.forEach(function(row){
+                Array.from(row.children).forEach(function(td, idx){
+                    const key = headerKeys[idx];
+                    if (key) td.setAttribute('data-col', key);
+                });
+            });
+            const hidden = simsColumnVis;
+            ths.forEach(function(th){
+                const k = th.getAttribute('data-col');
+                if (k && hidden[k] === false) th.classList.add('hidden'); else th.classList.remove('hidden');
+            });
+            rows.forEach(function(row){
+                Array.from(row.children).forEach(function(td){
+                    const k = td.getAttribute('data-col');
+                    if (k && hidden[k] === false) td.classList.add('hidden'); else td.classList.remove('hidden');
+                });
+            });
+        }
+        function openSimsColumnsMenu(anchorEl) {
+            const menu = document.getElementById('sims-columns-menu');
+            if (!menu) return;
+            const COLUMN_LABELS = {
+                gateway_code: 'Gateway',
+                iccid: 'ICCID',
+                vendor: 'Vendor',
+                mobility_subscription_id: 'Sub ID',
+                reseller_name: 'Reseller',
+                sms_count: 'SMS',
+                last_sms_received: 'Last SMS',
+                last_mdn_rotated_at: 'Last Rotated',
+                activated_at: 'Activated',
+                last_notified_at: 'Last Notified',
+            };
+            const list = document.getElementById('sims-columns-menu-list');
+            list.innerHTML = Object.keys(COLUMN_LABELS).map(function(k){
+                const visible = simsColumnVis[k] !== false;
+                const checked = visible ? 'checked' : '';
+                const safeLabel = COLUMN_LABELS[k];
+                return '<label class="flex items-center gap-2 px-2 py-1 rounded hover:bg-dark-700 cursor-pointer text-sm text-gray-300">' +
+                    '<input type="checkbox" ' + checked + ' value="' + k + '" class="accent-green-500" onchange="toggleSimsColumn(this.value, this.checked)">' +
+                    '<span>' + safeLabel + '</span>' +
+                    '</label>';
+            }).join('');
+            const rect = anchorEl.getBoundingClientRect();
+            const menuW = 256, menuMaxH = 384;
+            const left = Math.max(8, Math.min(window.innerWidth - menuW - 8, rect.left));
+            const top  = Math.min(window.innerHeight - menuMaxH - 8, rect.bottom + 6);
+            menu.style.left = left + 'px';
+            menu.style.top = top + 'px';
+            menu.classList.remove('hidden');
+            setTimeout(function(){ document.addEventListener('mousedown', simsColumnsMenuMaybeClose, true); }, 0);
+        }
+        function simsColumnsMenuMaybeClose(e) {
+            const menu = document.getElementById('sims-columns-menu');
+            if (!menu || menu.classList.contains('hidden')) return;
+            if (menu.contains(e.target)) return;
+            menu.classList.add('hidden');
+            document.removeEventListener('mousedown', simsColumnsMenuMaybeClose, true);
+        }
+        function toggleSimsColumn(key, visible) {
+            simsColumnVis[key] = !!visible;
+            try { localStorage.setItem('simsColumnVis', JSON.stringify(simsColumnVis)); } catch(e){}
+            applySimsColumnVisibility();
+        }
+        function resetSimsColumns() {
+            simsColumnVis = {};
+            try { localStorage.removeItem('simsColumnVis'); } catch(e){}
+            applySimsColumnVisibility();
+            const menu = document.getElementById('sims-columns-menu');
+            if (menu && !menu.classList.contains('hidden')) {
+                // refresh checkboxes
+                openSimsColumnsMenu(document.querySelector('button[onclick*=openSimsColumnsMenu]'));
+            }
+        }
 
         function sortTable(table, key) {
             const state = tableState[table];
@@ -8326,6 +8876,7 @@ function getHTML(helixEnabled) {
         }
 
         async function loadData() {
+            try { hydrateSimsFromUrl(); } catch(e) { console.error('hydrateSimsFromUrl failed', e); }
             try {
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 8000);
@@ -8356,11 +8907,7 @@ function getHTML(helixEnabled) {
             try {
                 const response = await fetch(\`\${API_BASE}/resellers\`);
                 const resellers = await response.json();
-                const select = document.getElementById('filter-reseller');
-                const currentValue = select.value;
-                select.innerHTML = '<option value="">All Resellers</option><option value="none">No Reseller</option>' +
-                    resellers.map(r => \`<option value="\${r.id}">\${r.name}</option>\`).join('');
-                select.value = currentValue;
+                window._simsResellersCache = Array.isArray(resellers) ? resellers : [];
             } catch (error) {
                 console.error('Error loading resellers:', error);
             }
@@ -8452,18 +8999,20 @@ function getHTML(helixEnabled) {
                 return;
             }
             try {
-                const statusFilter = document.getElementById('filter-status').value;
-                const resellerFilter = document.getElementById('filter-reseller').value;
-
                 const params = new URLSearchParams();
-                if (statusFilter === 'all') {
-                    params.set('hide_cancelled', 'false');
-                } else if (statusFilter) {
-                    params.set('status', statusFilter);
+                const sArr = simsFilterState.status;
+                const includeCancelled = sArr.includes('__all__') || sArr.includes('canceled');
+                if (includeCancelled) {
                     params.set('hide_cancelled', 'false');
                 }
-                if (resellerFilter && resellerFilter !== 'none') {
-                    params.set('reseller_id', resellerFilter);
+                if (sArr.length === 1 && sArr[0] !== '__all__') {
+                    params.set('status', sArr[0]);
+                }
+                // Multi-status without canceled/__all__: server hides cancelled (default),
+                // returning a smaller set. renderSims() filters the union client-side.
+                const rIds = simsFilterState.resellerIds;
+                if (rIds.length === 1 && rIds[0] !== 'none') {
+                    params.set('reseller_id', String(rIds[0]));
                 }
                 if (force) params.set('force', 'true');
 
@@ -8489,29 +9038,40 @@ function getHTML(helixEnabled) {
                 console.error(error);
             }
         }
-
 function renderSims() {
+  renderSimsPresetChips();
+  renderSimsActiveChips();
+  setSimsCountBadges();
+  syncSimsUrl();
   const state = tableState.sims;
-  const search = (document.getElementById('sims-search')?.value || '').trim();
   let data = state.data;
-  if (search) data = data.filter(s => matchesSearch(s, search));
-  const resellerFilterVal = document.getElementById('filter-reseller')?.value;
-  if (resellerFilterVal === 'none') data = data.filter(s => !s.reseller_id);
-  const gatewayFilterVal = document.getElementById('filter-gateway')?.value;
-  if (gatewayFilterVal) data = data.filter(s => s.gateway_code === gatewayFilterVal);
-  const vendorFilterVal = document.getElementById('filter-vendor')?.value;
-  if (vendorFilterVal) data = data.filter(s => s.vendor === vendorFilterVal);
-  const activatedFrom = document.getElementById('filter-activated-from')?.value;
-  const activatedTo = document.getElementById('filter-activated-to')?.value;
-  if (activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= activatedFrom);
-  if (activatedTo) data = data.filter(s => s.activated_at && s.activated_at <= activatedTo + 'T23:59:59');
-  const specialFilter = document.getElementById('filter-special') && document.getElementById('filter-special').value;
-  if (specialFilter === 'not_rotated_today') {
-    const todayUTC = new Date().toISOString().slice(0, 10);
-    data = data.filter(function(s) { return !s.last_mdn_rotated_at || s.last_mdn_rotated_at.slice(0, 10) < todayUTC; });
-  } else if (specialFilter === 'no_sms_12h') {
-    const cutoff12h = Date.now() - 12 * 60 * 60 * 1000;
-    data = data.filter(function(s) { return !s.last_sms_received || new Date(s.last_sms_received).getTime() < cutoff12h; });
+  // Search (debounced upstream via onSimsSearchInput)
+  if (simsFilterState.search) data = data.filter(s => matchesSearch(s, simsFilterState.search));
+  // Reseller (multi: 'none' sentinel = unassigned, otherwise numeric id)
+  const rIds = simsFilterState.resellerIds;
+  if (rIds.length > 0) {
+    data = data.filter(s => rIds.some(id => id === 'none' ? !s.reseller_id : (s.reseller_id === id || s.reseller_id === parseInt(id, 10))));
+  }
+  // Gateway (multi)
+  if (simsFilterState.gateways.length > 0) {
+    data = data.filter(s => simsFilterState.gateways.includes(s.gateway_code));
+  }
+  // Vendor (multi)
+  if (simsFilterState.vendors.length > 0) {
+    data = data.filter(s => simsFilterState.vendors.includes(s.vendor));
+  }
+  // Status (only client-filter when multi-select; single-status case already filtered server-side)
+  const sArr = simsFilterState.status;
+  if (sArr.length > 1 && !sArr.includes('__all__')) {
+    data = data.filter(s => sArr.includes(s.status));
+  }
+  // Activated date range
+  if (simsFilterState.activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= simsFilterState.activatedFrom);
+  if (simsFilterState.activatedTo) data = data.filter(s => s.activated_at && s.activated_at <= simsFilterState.activatedTo + 'T23:59:59');
+  // Presets (AND across active presets)
+  for (const pid of simsFilterState.presets) {
+    const p = SIM_PRESETS[pid];
+    if (p && p.test) data = data.filter(p.test);
   }
   data = genericSort(data, state.sortKey, state.sortDir);
 
@@ -8524,7 +9084,16 @@ function renderSims() {
             renderPaginationControls('sims-pagination', 'sims', totalFiltered);
 
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="12" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
+                const fs = simsFilterState;
+                const hasFilters = (fs.status.length > 0 && !(fs.status.length === 1 && fs.status[0] === 'active'))
+                    || fs.vendors.length || fs.gateways.length || fs.resellerIds.length
+                    || fs.presets.size > 0 || fs.activatedFrom || fs.activatedTo || fs.search;
+                if (hasFilters) {
+                    tbody.innerHTML = '<tr><td colspan="15" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="15" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
+                }
+                applySimsColumnVisibility();
                 return;
             }
             tbody.innerHTML = data.map(sim => {
@@ -8571,6 +9140,7 @@ function renderSims() {
                 </tr>
                 \`;
 }).join('');
+            applySimsColumnVisibility();
         }
 
 
@@ -11554,8 +12124,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function assignReseller(simId) {
-            const sel = document.getElementById('filter-reseller');
-            const opts = [...sel.options].filter(o => o.value);
+            const opts = getResellerOptions();
             if (opts.length === 0) {
                 showToast('No resellers available', 'error');
                 return;
@@ -11620,8 +12189,7 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkAssignReseller() {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            const sel = document.getElementById('filter-reseller');
-            const opts = [...sel.options].filter(o => o.value);
+            const opts = getResellerOptions();
             if (opts.length === 0) {
                 showToast('No resellers available', 'error');
                 return;
@@ -11691,8 +12259,7 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkAssignResellerAndNotify() {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            const sel = document.getElementById('filter-reseller');
-            const opts = [...sel.options].filter(o => o.value);
+            const opts = getResellerOptions();
             if (opts.length === 0) { showToast('No resellers available', 'error'); return; }
             const existing = document.getElementById('assign-reseller-modal');
             if (existing) existing.remove();
