@@ -4,6 +4,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-08 — Dashboard SPA route renamed `/gateway` → `/gateways`; legacy URL kept via ROUTE_TO_TAB alias
+
+**Decision:** The dashboard's gateway page is now `/gateways` (sidebar link, `TAB_ROUTES`, tab id `tab-gateways`, `data-tab="gateways"`, all `switchTab('gateways')` callers, `PAGE_TITLES.gateways`). Old `/gateway` URLs still resolve to the same page via a one-line legacy alias added immediately after the auto-generated `ROUTE_TO_TAB` map: `ROUTE_TO_TAB['/gateway'] = 'gateways';`.
+
+**Why:** Renaming the user-facing label from "Gateway" to "Gateways" matched the new management UI (multiple gateways listed at once), but breaking deep links / bookmarks for everyone with `/gateway` saved would be unfriendly. Adding the alias is one line and zero perf cost — the SPA reads it on init and on `popstate`. We did NOT add `/gateway` to `TAB_ROUTES` itself because that would make `switchTab('gateway')` a valid call again (it isn't — only the route alias is supported, never the tab name).
+
+**Consequence / what not to undo:** Do NOT delete `ROUTE_TO_TAB['/gateway'] = 'gateways';` until the team has actively moved off `/gateway` bookmarks (low priority — there's no cost to keeping the alias). When adding new tabs, prefer plural URLs (`/sims`, `/messages`, `/workers`, `/gateways`, `/errors`) — `/imei-pool` is the lone singular outlier, kept as-is.
+
+---
+
+## 2026-05-08 — Gateway passwords stored plaintext in `gateways.password` and surfaced in dashboard UI on demand
+
+**Decision:** The new "Gateway Management" UI on `/gateways` displays each gateway's `password` column (masked by default, click "show" to reveal) and the add/edit modal allows editing it directly. We did NOT introduce encryption-at-rest, a secrets-manager binding, or a separate redacted "view-only" admin role.
+
+**Why:** The `gateways` table has stored `password` as plaintext since the table existed (used by `skyline-gateway` worker on every API call: `params.set('username', gateway.username); params.set('password', gateway.password)`). Hiding it in the UI while leaving it readable to anyone with service-role DB access (i.e., anyone who can deploy a worker on this CF account) would have been security theater. The dashboard is admin-auth gated (basic auth `admin / dashboard123`) — same trust boundary that already exists for the SUPABASE_SERVICE_ROLE_KEY secret on the worker.
+
+**Consequence / what not to undo:** Do NOT add encryption to `gateways.password` without coordinating with `src/skyline-gateway/index.js` (specifically `loadGateway` + every `skylineFetch`/`handshake` site that builds `username`/`password` URLSearchParams). Any encryption scheme must round-trip transparently for the worker. If the threat model changes (e.g. dashboard becomes multi-user with non-admin roles), revisit the "show on click" UX and consider RBAC instead of encryption.
+
+---
+
 ## 2026-05-08 — Dashboard chip / popover UIs use data-attributes + delegated handlers, never inline `onclick="fn('arg1','arg2')"` with quoted args
 
 **Decision:** Active-filter chips (and similar dynamic HTML emitted from `renderSimsActiveChips()`) embed the kind/key as `data-chip-kind="..." data-chip-key="..."` attributes on the wrapping element, and a single delegated `click` listener on the container reads those attributes to dispatch. Do **not** generate `'<button onclick="clearSimsFilterChip(\'' + kind + '\', \'' + key + '\')">'` markup.
