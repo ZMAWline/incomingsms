@@ -46,16 +46,19 @@ async function runResellerSync(env, limit, force = false) {
   const startedAt = new Date().toISOString();
 
   // Fetch active SIMs with current numbers, reseller info, and webhook URLs in ONE query.
-  // The or=(rotation_status.is.null,rotation_status.neq.failed) clause excludes wing_iot
-  // SIMs flagged as stuck on the ABIR (non-dialable) plan — broadcasting a 5xxx interim
-  // MDN as "online" would let resellers route inbound SMS to a number that can't receive
-  // normal calls/messages. The is.null branch is required because PostgreSQL evaluates
-  // `NULL != 'failed'` as NULL (not TRUE), so a bare `neq.failed` would silently drop
-  // SIMs whose rotation_status is NULL (e.g., freshly activated SIMs that haven't
-  // rotated yet).
+  // The or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed) clause
+  // excludes ONLY wing_iot SIMs whose rotation_status='failed'. That state means the SIM
+  // is stuck on the ABIR (non-dialable) plan — broadcasting a 5xxx interim MDN as "online"
+  // would let resellers route inbound SMS to a number that can't receive normal calls/messages.
+  // For teltik/atomic/helix, a failed rotation just means the carrier API errored mid-rotation
+  // (e.g., Teltik 502, ATOMIC swapMSISDN timeout) — the OLD MDN remains valid in sim_numbers
+  // and should still be broadcast as online. Suppressing those silently strands lines from
+  // the reseller's view (incident: 2026-05-09 — 71 teltik SIMs invisible after Teltik 502 outage).
+  // The is.null branch is required because PostgreSQL evaluates `NULL != 'failed'` as NULL
+  // (not TRUE), so a bare `neq.failed` would silently drop fresh activations with NULL status.
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.asc&limit=${limit}`
+    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=last_notified_at.asc.nullsfirst&limit=${limit}`
   );
 
   let attempted = sims.length;
@@ -135,6 +138,23 @@ async function runResellerSync(env, limit, force = false) {
           },
           body: JSON.stringify({ last_notified_at: new Date().toISOString() }),
         });
+
+        // Capture rental_id from the reseller's webhook response and persist it on
+        // reseller_sims so the reseller-portal can show "Rental #N" instead of ICCID.
+        // Reseller responds with a body like {"success":true,"rentalId":1401254}.
+        const rentalId = parseRentalIdFromResponse(result.responseBody);
+        if (rentalId != null) {
+          await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${simId}`, {
+            method: 'PATCH',
+            headers: {
+              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({ last_rental_id: rentalId }),
+          }).catch(err => console.log(`[ResellerSync] Failed to write last_rental_id for sim ${simId}: ${err}`));
+        }
       }
 
       if (result.skipped) {
@@ -439,6 +459,29 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Parse a rental_id from a reseller's webhook response body.
+// TrustOTP returns {"success":true,"message":"Rental created","rentalId":1401254}.
+// We accept rentalId / rental_id / id (loose so other resellers don't need a rewrite),
+// and fall back to a regex if JSON.parse fails (malformed/partial bodies).
+function parseRentalIdFromResponse(body) {
+  if (!body) return null;
+  const s = String(body);
+  try {
+    const obj = JSON.parse(s);
+    const v = obj && (obj.rentalId ?? obj.rental_id ?? obj.id);
+    if (v != null) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  } catch {}
+  const m = s.match(/"rental[_]?[Ii]d"\s*:\s*([0-9]+)/);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
 }
 
 function midnightNYAfterInterval(lastRotatedAt, intervalHours) {

@@ -248,6 +248,14 @@ export default {
       return handleResellerKeysRevoke(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/reseller-credentials' && request.method === 'GET') {
+      return handleResellerCredentialsList(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/reseller-credentials' && request.method === 'POST') {
+      return handleResellerCredentials(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/billing/preview') {
       return handleBillingPreview(url, env, corsHeaders);
     }
@@ -408,7 +416,15 @@ async function handleStats(env, corsHeaders) {
 
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-    const [totalRes, activeRes, provRes, msgRes, suspRes, errRes, atmRes, telRes, wingRes, helRes] = await Promise.all([
+    // Notification freshness — broadcastable SIMs (active + rs.active=true,
+    // excluding wing_iot ABIR-stuck) split by per-vendor notification window.
+    const cutoff24hISO = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const cutoff48hISO = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const broadcastBase = (vendor) => 'sims?select=id,reseller_sims!inner(active)&status=eq.active&vendor=eq.' + vendor + '&reseller_sims.active=eq.true&limit=1';
+    const wingBroadcastSuffix = '&or=(rotation_status.is.null,rotation_status.neq.failed)';
+
+    const [totalRes, activeRes, provRes, msgRes, suspRes, errRes, atmRes, telRes, wingRes, helRes,
+           atmTotalRes, atmFreshRes, helTotalRes, helFreshRes, wingTotalRes, wingFreshRes, telTotalRes, telFreshRes] = await Promise.all([
       fetch(base + 'sims?select=id&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&status=eq.active&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&status=eq.provisioning&limit=1', { headers: authHeaders }),
@@ -419,6 +435,14 @@ async function handleStats(env, corsHeaders) {
       fetch(base + 'sims?select=id&vendor=eq.teltik&status=neq.canceled&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&vendor=eq.wing_iot&status=neq.canceled&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&vendor=eq.helix&status=neq.canceled&limit=1', { headers: authHeaders }),
+      fetch(base + broadcastBase('atomic'), { headers: authHeaders }),
+      fetch(base + broadcastBase('atomic') + '&last_notified_at=gte.' + encodeURIComponent(cutoff24hISO), { headers: authHeaders }),
+      fetch(base + broadcastBase('helix'), { headers: authHeaders }),
+      fetch(base + broadcastBase('helix') + '&last_notified_at=gte.' + encodeURIComponent(cutoff24hISO), { headers: authHeaders }),
+      fetch(base + broadcastBase('wing_iot') + wingBroadcastSuffix, { headers: authHeaders }),
+      fetch(base + broadcastBase('wing_iot') + wingBroadcastSuffix + '&last_notified_at=gte.' + encodeURIComponent(cutoff24hISO), { headers: authHeaders }),
+      fetch(base + broadcastBase('teltik'), { headers: authHeaders }),
+      fetch(base + broadcastBase('teltik') + '&last_notified_at=gte.' + encodeURIComponent(cutoff48hISO), { headers: authHeaders }),
     ]);
 
     const getCount = res => {
@@ -437,6 +461,12 @@ async function handleStats(env, corsHeaders) {
       vendor_teltik: getCount(telRes),
       vendor_wing_iot: getCount(wingRes),
       vendor_helix: getCount(helRes),
+      freshness: {
+        atomic:   { total: getCount(atmTotalRes),  fresh: getCount(atmFreshRes),  window_hours: 24 },
+        helix:    { total: getCount(helTotalRes),  fresh: getCount(helFreshRes),  window_hours: 24 },
+        wing_iot: { total: getCount(wingTotalRes), fresh: getCount(wingFreshRes), window_hours: 24 },
+        teltik:   { total: getCount(telTotalRes),  fresh: getCount(telFreshRes),  window_hours: 48 },
+      },
     };
 
     return new Response(JSON.stringify(stats), {
@@ -3880,6 +3910,84 @@ async function handleResellerKeysRevoke(request, env, corsHeaders) {
   }
 }
 
+// PBKDF2-SHA256 password hashing for the reseller-portal login flow.
+// Format must stay in sync with src/reseller-portal/index.js verifyPassword.
+const RP_PBKDF2_ITERS = 100000;
+function _u8ToB64(u8) { return btoa(String.fromCharCode.apply(null, u8)); }
+async function hashResellerPassword(password) {
+  const enc = new TextEncoder();
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const km = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: RP_PBKDF2_ITERS, hash: 'SHA-256' },
+    km, 256
+  );
+  return 'pbkdf2_sha256$' + RP_PBKDF2_ITERS + '$' + _u8ToB64(salt) + '$' + _u8ToB64(new Uint8Array(bits));
+}
+
+async function handleResellerCredentials(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const resellerId = body.reseller_id;
+    const username = (body.username || '').trim().toLowerCase();
+    const password = body.password || '';
+    if (!resellerId) return new Response(JSON.stringify({ error: 'reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!username || !/^[a-z0-9._-]{3,40}$/.test(username)) return new Response(JSON.stringify({ error: 'username must be 3-40 chars: a-z, 0-9, . _ -' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const hasPassword = !!password;
+    if (hasPassword && password.length < 8) return new Response(JSON.stringify({ error: 'password must be at least 8 characters' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+    // Reject duplicate username for a different reseller.
+    const dupResp = await supabaseGet(env, 'resellers?select=id&username=eq.' + encodeURIComponent(username) + '&id=neq.' + encodeURIComponent(resellerId) + '&limit=1');
+    const dupRows = dupResp.ok ? await dupResp.json() : [];
+    if (Array.isArray(dupRows) && dupRows.length > 0) {
+      return new Response(JSON.stringify({ error: 'username already in use by another reseller' }), { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    const update = { username };
+    if (hasPassword) {
+      update.password_hash = await hashResellerPassword(password);
+      update.password_updated_at = new Date().toISOString();
+    }
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/resellers?id=eq.' + encodeURIComponent(resellerId), {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify(update),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      return new Response(JSON.stringify({ error: 'update failed: ' + txt }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, reseller_id: Number(resellerId), username, password_changed: hasPassword }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+async function handleResellerCredentialsList(env, corsHeaders) {
+  try {
+    const resp = await supabaseGet(env, 'resellers?select=id,name,username,password_hash,password_updated_at&order=name.asc');
+    if (!resp.ok) return new Response(JSON.stringify({ error: 'lookup failed' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const rows = await resp.json();
+    const out = (Array.isArray(rows) ? rows : []).map(function(r){
+      return {
+        reseller_id: r.id,
+        reseller_name: r.name || ('#' + r.id),
+        username: r.username || null,
+        has_password: !!r.password_hash,
+        password_updated_at: r.password_updated_at || null,
+      };
+    });
+    return new Response(JSON.stringify(out), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
 async function handleQboMappingsGet(env, corsHeaders) {
   try {
     const query = `qbo_customer_map?select=id,reseller_id,customer_name,qbo_customer_id,qbo_display_name,daily_rate,resellers(name)&order=id.desc`;
@@ -5775,6 +5883,20 @@ function getHTML(helixEnabled) {
                     </div>
                 </div>
 
+                <!-- Notification Freshness -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <div>
+                            <h3 class="text-sm font-medium text-gray-300">Notification Freshness</h3>
+                            <p class="text-xs text-gray-500 mt-0.5">AT&amp;T notified within 24h, T-Mobile within 48h</p>
+                        </div>
+                        <span id="freshness-summary" class="text-xs text-gray-500"></span>
+                    </div>
+                    <div id="freshness-rows" class="space-y-1.5 text-sm text-gray-300">
+                        <div class="text-gray-500 text-xs">Loading&hellip;</div>
+                    </div>
+                </div>
+
                 <!-- SIM Charts -->
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
                     <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
@@ -5919,6 +6041,7 @@ function getHTML(helixEnabled) {
                                     <button data-preset="no_reseller"        onclick="toggleSimsPreset('no_reseller')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No reseller</button>
                                     <button data-preset="auto_paused"        onclick="toggleSimsPreset('auto_paused')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Auto-rotate paused</button>
                                     <button data-preset="stuck_provisioning" onclick="toggleSimsPreset('stuck_provisioning')" class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Stuck provisioning &gt;1h</button>
+                                    <button data-preset="not_notified"       onclick="toggleSimsPreset('not_notified')"       class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="AT&T not notified today, T-Mobile not notified today or yesterday">Not Notified</button>
                                 </div>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <button id="sims-fb-status"   onclick="openSimsFilterMenu('status', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Status<span id="sims-fb-status-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
@@ -6423,13 +6546,55 @@ function getHTML(helixEnabled) {
                     <div class="flex items-center justify-between mb-3">
                         <h3 class="text-lg font-semibold text-white">Reseller API Keys</h3>
                     </div>
-                    <p class="text-xs text-gray-500 mb-4">Generate a key per reseller to grant read-only access to the customer portal at <span class="text-gray-300">reseller-portal.zalmen-531.workers.dev</span>. Each key shows full data scoped to that reseller only.</p>
+                    <p class="text-xs text-gray-500 mb-4">Generate a key per reseller to grant read-only access to the customer portal at <span class="text-gray-300">portal.incoming-sms.com</span>. Each key shows full data scoped to that reseller only.</p>
                     <div class="flex flex-wrap items-end gap-3 mb-4">
                         <div class="flex flex-col gap-1">
                             <label class="text-xs text-gray-500 uppercase">Reseller</label>
                             <select id="rkey-reseller" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 min-w-56"><option value="">Loading…</option></select>
                         </div>
                         <button onclick="generateResellerKey()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Generate Key</button>
+                    </div>
+                    <div class="border-t border-dark-600 pt-4 mb-4">
+                        <h4 class="text-sm font-medium text-gray-300 mb-1">Login Credentials</h4>
+                        <p class="text-xs text-gray-500 mb-3">Set the username and password the reseller uses to sign in to the portal. Replaces any existing password.</p>
+                        <div class="flex flex-wrap items-end gap-3">
+                            <div class="flex flex-col gap-1">
+                                <label class="text-xs text-gray-500 uppercase">Reseller</label>
+                                <select id="rcred-reseller" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 min-w-56"><option value="">Loading…</option></select>
+                            </div>
+                            <div class="flex flex-col gap-1">
+                                <label class="text-xs text-gray-500 uppercase">Username</label>
+                                <input id="rcred-username" type="text" autocomplete="off" placeholder="trustotp" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 w-44">
+                            </div>
+                            <div class="flex flex-col gap-1">
+                                <label class="text-xs text-gray-500 uppercase">Password</label>
+                                <input id="rcred-password" type="password" autocomplete="new-password" placeholder="min 8 chars" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 w-44">
+                            </div>
+                            <button onclick="generateRandomPasswordIntoField()" class="px-3 py-2 text-xs bg-dark-600 hover:bg-dark-500 text-gray-200 rounded-lg transition" title="Generate a strong random password">Random</button>
+                            <button onclick="saveResellerCredentials()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Save Credentials</button>
+                        </div>
+                    </div>
+                    <div class="border-t border-dark-600 pt-4 mb-2">
+                        <div class="flex items-center justify-between mb-2">
+                            <h4 class="text-sm font-medium text-gray-300">All resellers</h4>
+                            <button onclick="loadResellerCredentials()" class="text-xs text-gray-400 hover:text-gray-200" title="Reload">&#8635; Refresh</button>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                        <th class="px-3 py-2 font-medium">Reseller</th>
+                                        <th class="px-3 py-2 font-medium">Username</th>
+                                        <th class="px-3 py-2 font-medium">Password</th>
+                                        <th class="px-3 py-2 font-medium">Last updated</th>
+                                        <th class="px-3 py-2 font-medium text-right">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="reseller-creds-table" class="divide-y divide-dark-700">
+                                    <tr><td colspan="5" class="px-3 py-4 text-center text-gray-500">Loading&hellip;</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                     <div class="overflow-x-auto">
                         <table class="w-full">
@@ -8387,6 +8552,15 @@ function getHTML(helixEnabled) {
             const cutoff12h = Date.now() - 12 * 60 * 60 * 1000;
             return !s.last_sms_received || new Date(s.last_sms_received).getTime() < cutoff12h;
         }
+        function simNotNotified(s) {
+            // Only meaningful for broadcastable SIMs. Skip non-active and ABIR-stuck wing_iot.
+            if (s.status !== 'active') return false;
+            if (s.vendor === 'wing_iot' && s.rotation_status === 'failed') return false;
+            const windowHours = (s.vendor === 'teltik') ? 48 : 24;
+            const cutoff = Date.now() - windowHours * 60 * 60 * 1000;
+            if (!s.last_notified_at) return true;
+            return new Date(s.last_notified_at).getTime() < cutoff;
+        }
         function simStuckProvisioning1h(s) {
             if (s.status !== 'provisioning') return false;
             const ref = s.activated_at || s.created_at;
@@ -8400,6 +8574,7 @@ function getHTML(helixEnabled) {
             auto_paused:        { label: 'Auto-rotate paused',    test: function(s){ return s.rotation_eligible === false; } },
             any_error:          { label: 'Any error',             test: function(s){ return ['error','helix_timeout','data_mismatch'].includes(s.status); } },
             stuck_provisioning: { label: 'Stuck provisioning >1h', test: simStuckProvisioning1h },
+            not_notified:       { label: 'Not Notified',         test: simNotNotified },
         };
         let simsColumnVis = (function(){ try { return JSON.parse(localStorage.getItem('simsColumnVis') || '{}'); } catch(e) { return {}; } })();
         let _simsSearchTimer = null;
@@ -9054,6 +9229,7 @@ function getHTML(helixEnabled) {
                 document.getElementById('messages-24h').textContent = data.messages_24h || 0;
                 updateActiveRing(data.active_sims || 0, data.total_sims || 0);
                 renderDashboardCharts(data);
+                try { renderFreshness(data); } catch(e) { console.error('renderFreshness failed', e); }
                 document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
                 loadSims(true);
                 loadMessages();
@@ -9064,11 +9240,76 @@ function getHTML(helixEnabled) {
             }
         }
 
+        function renderFreshness(data) {
+            const f = (data && data.freshness) || {};
+            const rows = document.getElementById('freshness-rows');
+            const summary = document.getElementById('freshness-summary');
+            if (!rows) return;
+            const groups = [
+                { key: 'teltik',   label: 'T-Mobile',       sub: 'Teltik',   windowLabel: '48h' },
+                { key: 'atomic',   label: 'AT&amp;T ATOMIC',  sub: '',         windowLabel: '24h' },
+                { key: 'wing_iot', label: 'AT&amp;T Wing IoT',sub: '',         windowLabel: '24h' },
+                { key: 'helix',    label: 'AT&amp;T Helix',   sub: '(legacy)', windowLabel: '24h' }
+            ];
+            let totalFresh = 0, totalTotal = 0;
+            let html = '';
+            groups.forEach(function(g){
+                const v = f[g.key] || { fresh: 0, total: 0 };
+                if (!v.total) return;
+                totalFresh += v.fresh; totalTotal += v.total;
+                const stale = Math.max(0, v.total - v.fresh);
+                const pct = v.total > 0 ? Math.round((v.fresh / v.total) * 100) : 0;
+                html +=
+                    '<div class="flex items-center gap-3 py-1">' +
+                        '<span class="w-40 text-gray-300">' + g.label +
+                            ' <span class="text-gray-600 text-xs ml-1">' + g.windowLabel + '</span>' +
+                            (g.sub ? ' <span class="text-gray-600 text-xs">' + g.sub + '</span>' : '') +
+                        '</span>' +
+                        '<span class="text-emerald-400 tabular-nums w-16 text-right">' + v.fresh + '</span>' +
+                        '<span class="text-gray-600">/</span>' +
+                        '<span class="tabular-nums w-16">' + v.total + '</span>' +
+                        '<span class="text-xs text-gray-500 ml-1 w-10">' + pct + '%</span>' +
+                        (stale > 0
+                            ? '<a href="/sims?presets=not_notified" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + stale + ' stale &rarr;</a>'
+                            : '<span class="ml-auto text-xs text-emerald-400">&#10003; all fresh</span>') +
+                    '</div>';
+            });
+            const totalStale = Math.max(0, totalTotal - totalFresh);
+            const totalPct = totalTotal > 0 ? Math.round((totalFresh / totalTotal) * 100) : 0;
+            html += '<div class="border-t border-dark-600 mt-1 pt-2 flex items-center gap-3 font-semibold">' +
+                '<span class="w-40 text-gray-300">Total</span>' +
+                '<span class="text-emerald-400 tabular-nums w-16 text-right">' + totalFresh + '</span>' +
+                '<span class="text-gray-600">/</span>' +
+                '<span class="text-white tabular-nums w-16">' + totalTotal + '</span>' +
+                '<span class="text-xs text-gray-500 ml-1 w-10">' + totalPct + '%</span>' +
+                (totalStale > 0
+                    ? '<a href="/sims?presets=not_notified" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + totalStale + ' stale &rarr;</a>'
+                    : '<span class="ml-auto text-xs text-emerald-400">&#10003; all fresh</span>') +
+                '</div>';
+            rows.innerHTML = html;
+            if (summary) summary.textContent = totalTotal > 0 ? (totalFresh + ' of ' + totalTotal + ' fresh') : '';
+        }
+        function goToStaleSims() {
+            try {
+                if (typeof switchTab === 'function') switchTab('sims');
+                history.replaceState(null, '', '/sims?presets=not_notified');
+                setTimeout(function(){
+                    if (typeof simsFilterState !== 'undefined') {
+                        simsFilterState.presets = new Set(['not_notified']);
+                        if (typeof renderSimsPresetChips === 'function') renderSimsPresetChips();
+                        if (typeof renderSims === 'function') renderSims();
+                    }
+                }, 50);
+            } catch(e) { console.error('goToStaleSims failed', e); }
+        }
+
         async function loadResellers() {
             try {
                 const response = await fetch(\`\${API_BASE}/resellers\`);
                 const resellers = await response.json();
                 window._simsResellersCache = Array.isArray(resellers) ? resellers : [];
+                try { populateRcredResellers(); } catch(e) {}
+                try { loadResellerCredentials(); } catch(e) {}
             } catch (error) {
                 console.error('Error loading resellers:', error);
             }
@@ -13369,6 +13610,210 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
+                function rcEscape(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+        function rcRelativeTime(iso) {
+            if (!iso) return '';
+            const t = new Date(iso).getTime();
+            if (!Number.isFinite(t)) return '';
+            const diff = Date.now() - t;
+            const s = Math.round(diff / 1000);
+            if (s < 60) return s + 's ago';
+            const m = Math.round(s / 60); if (m < 60) return m + 'm ago';
+            const h = Math.round(m / 60); if (h < 24) return h + 'h ago';
+            const d = Math.round(h / 24); if (d < 30) return d + 'd ago';
+            return new Date(iso).toLocaleDateString();
+        }
+        function rcRandomPassword() {
+            const bytes = new Uint8Array(12);
+            crypto.getRandomValues(bytes);
+            const charset = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
+            let pw = ''; for (let i = 0; i < bytes.length; i++) pw += charset[bytes[i] % charset.length];
+            return pw;
+        }
+        async function loadResellerCredentials() {
+            const tbody = document.getElementById('reseller-creds-table');
+            if (!tbody) return;
+            try {
+                const resp = await fetch(API_BASE + '/reseller-credentials');
+                if (!resp.ok) { tbody.innerHTML = '<tr><td colspan="5" class="px-3 py-4 text-center text-red-400">Failed to load' + (resp.status ? ' (' + resp.status + ')' : '') + '</td></tr>'; return; }
+                const rows = await resp.json();
+                if (!Array.isArray(rows) || rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-3 py-4 text-center text-gray-500">No resellers</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = rows.map(function(r){
+                    const userCell = r.username
+                        ? '<span class="text-gray-200 font-mono text-xs">' + rcEscape(r.username) + '</span>'
+                        : '<span class="text-gray-600">&mdash;</span>';
+                    const pwCell = r.has_password
+                        ? '<span class="px-2 py-0.5 text-xs rounded bg-emerald-500/20 text-emerald-300">&#10003; Set</span>'
+                        : '<span class="text-gray-600">&mdash;</span>';
+                    const updCell = r.password_updated_at
+                        ? '<span class="text-xs text-gray-400" title="' + rcEscape(r.password_updated_at) + '">' + rcEscape(rcRelativeTime(r.password_updated_at)) + '</span>'
+                        : '<span class="text-gray-600">&mdash;</span>';
+                    const safeName = JSON.stringify(r.reseller_name);
+                    const safeUser = JSON.stringify(r.username || '');
+                    const reseller = '<span class="text-gray-200">' + rcEscape(r.reseller_name) + '</span><span class="text-gray-600 ml-2 text-xs">#' + r.reseller_id + '</span>';
+                    const actions =
+                        '<button onclick="resetResellerCredentials(' + r.reseller_id + ', ' + safeName + ', ' + safeUser + ')" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition mr-1">Reset</button>' +
+                        '<button onclick="editResellerCredentials(' + r.reseller_id + ', ' + safeName + ', ' + safeUser + ')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">Edit</button>';
+                    return '<tr><td class="px-3 py-2">' + reseller + '</td><td class="px-3 py-2">' + userCell + '</td><td class="px-3 py-2">' + pwCell + '</td><td class="px-3 py-2">' + updCell + '</td><td class="px-3 py-2 text-right whitespace-nowrap">' + actions + '</td></tr>';
+                }).join('');
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="5" class="px-3 py-4 text-center text-red-400">' + rcEscape(String(e)) + '</td></tr>';
+            }
+        }
+
+        function _rcCloseModal() {
+            const m = document.getElementById('rc-modal');
+            if (m) m.remove();
+        }
+        function _rcCopyNewPw() {
+            const el = document.getElementById('rc-new-pw');
+            if (!el) return;
+            navigator.clipboard.writeText(el.textContent || '').then(function(){ showToast('Password copied', 'success'); });
+        }
+        function _rcGenEditPw() {
+            const f = document.getElementById('rc-edit-password');
+            if (!f) return;
+            f.value = rcRandomPassword();
+            f.type = 'text';
+        }
+        function _rcOpenModal(html) {
+            _rcCloseModal();
+            const div = document.createElement('div');
+            div.id = 'rc-modal';
+            div.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            div.innerHTML = '<div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-md p-5">' + html + '</div>';
+            div.addEventListener('click', function(e){ if (e.target === div) _rcCloseModal(); });
+            document.body.appendChild(div);
+        }
+
+        async function resetResellerCredentials(resellerId, resellerName, currentUsername) {
+            let username = (currentUsername || '').trim().toLowerCase();
+            if (!username) {
+                username = prompt('No username set yet. Choose a username for ' + resellerName + ' (a-z, 0-9, . _ -):') || '';
+                username = username.trim().toLowerCase();
+                if (!username || !/^[a-z0-9._-]{3,40}$/.test(username)) { showToast('Invalid username', 'error'); return; }
+            }
+            const ok = await showConfirm('Reset password', 'Generate a new random password for ' + resellerName + '? The current password will be overwritten. The new password is shown once.');
+            if (!ok) return;
+            const newPw = rcRandomPassword();
+            try {
+                const resp = await fetch(API_BASE + '/reseller-credentials', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reseller_id: Number(resellerId), username, password: newPw }),
+                });
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) { showToast('Reset failed: ' + (data.error || resp.status), 'error'); return; }
+                _rcOpenModal(
+                    '<h3 class="text-lg font-semibold text-white mb-1">New password for ' + rcEscape(resellerName) + '</h3>' +
+                    '<p class="text-xs text-gray-500 mb-3">Username <span class="font-mono text-gray-300">' + rcEscape(username) + '</span>. Copy the password now &mdash; it cannot be retrieved later.</p>' +
+                    '<div class="flex items-center gap-2 mb-4">' +
+                        '<code id="rc-new-pw" class="flex-1 bg-dark-900 border border-dark-600 rounded px-3 py-2 text-cyan-200 font-mono text-sm break-all">' + rcEscape(newPw) + '</code>' +
+                        '<button onclick="_rcCopyNewPw()" class="px-3 py-2 text-xs bg-dark-700 hover:bg-dark-600 text-white rounded transition">Copy</button>' +
+                    '</div>' +
+                    '<div class="flex justify-end">' +
+                        '<button onclick="_rcCloseModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>' +
+                    '</div>'
+                );
+                loadResellerCredentials();
+            } catch (e) {
+                showToast('Reset failed: ' + e.message, 'error');
+            }
+        }
+
+        function editResellerCredentials(resellerId, resellerName, currentUsername) {
+            const u = currentUsername || '';
+            _rcOpenModal(
+                '<h3 class="text-lg font-semibold text-white mb-1">Edit credentials</h3>' +
+                '<p class="text-xs text-gray-500 mb-3">' + rcEscape(resellerName) + ' &middot; #' + resellerId + '</p>' +
+                '<div class="space-y-3 mb-4">' +
+                    '<div>' +
+                        '<label class="block text-xs uppercase tracking-wide text-gray-500 mb-1">Username</label>' +
+                        '<input id="rc-edit-username" type="text" value="' + rcEscape(u) + '" class="w-full bg-dark-900 border border-dark-600 rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-accent">' +
+                    '</div>' +
+                    '<div>' +
+                        '<label class="block text-xs uppercase tracking-wide text-gray-500 mb-1">New password <span class="text-gray-600 normal-case">(blank = keep current)</span></label>' +
+                        '<div class="flex gap-2">' +
+                            '<input id="rc-edit-password" type="password" placeholder="min 8 chars" class="flex-1 bg-dark-900 border border-dark-600 rounded px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-accent">' +
+                            '<button onclick="_rcGenEditPw()" class="px-3 py-2 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded transition" title="Generate random password">Random</button>' +
+                        '</div>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="flex justify-end gap-2">' +
+                    '<button onclick="_rcCloseModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Cancel</button>' +
+                    '<button onclick="saveEditCredentials(' + resellerId + ')" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Save</button>' +
+                '</div>'
+            );
+        }
+
+        async function saveEditCredentials(resellerId) {
+            const username = (document.getElementById('rc-edit-username').value || '').trim().toLowerCase();
+            const password = document.getElementById('rc-edit-password').value || '';
+            if (!username || !/^[a-z0-9._-]{3,40}$/.test(username)) return showToast('Username must be 3-40 chars: a-z, 0-9, . _ -', 'error');
+            if (password && password.length < 8) return showToast('Password must be at least 8 chars', 'error');
+            try {
+                const reqBody = { reseller_id: Number(resellerId), username };
+                if (password) reqBody.password = password;
+                const resp = await fetch(API_BASE + '/reseller-credentials', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(reqBody),
+                });
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) return showToast('Save failed: ' + (data.error || resp.status), 'error');
+                _rcCloseModal();
+                showToast('Credentials updated', 'success');
+                loadResellerCredentials();
+            } catch (e) {
+                showToast('Save failed: ' + e.message, 'error');
+            }
+        }
+
+                function populateRcredResellers() {
+            const sel = document.getElementById('rcred-reseller');
+            if (!sel) return;
+            const cache = window._simsResellersCache || [];
+            sel.innerHTML = '<option value="">-- Select reseller --</option>' +
+                cache.map(function(r){ return '<option value="' + r.id + '">' + (r.name || '#' + r.id) + '</option>'; }).join('');
+        }
+        function generateRandomPasswordIntoField() {
+            const bytes = new Uint8Array(12);
+            crypto.getRandomValues(bytes);
+            const charset = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
+            let pw = '';
+            for (let i = 0; i < bytes.length; i++) pw += charset[bytes[i] % charset.length];
+            const fld = document.getElementById('rcred-password');
+            fld.value = pw;
+            fld.type = 'text';
+            showToast('Random password generated — copy it before leaving this page', 'info');
+        }
+        async function saveResellerCredentials() {
+            const resellerId = document.getElementById('rcred-reseller').value;
+            const username = (document.getElementById('rcred-username').value || '').trim().toLowerCase();
+            const password = document.getElementById('rcred-password').value || '';
+            if (!resellerId) return showToast('Pick a reseller', 'error');
+            if (!username) return showToast('Enter a username', 'error');
+            if (!password || password.length < 8) return showToast('Password must be at least 8 chars', 'error');
+            try {
+                const resp = await fetch(API_BASE + '/reseller-credentials', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reseller_id: Number(resellerId), username, password }),
+                });
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) return showToast('Save failed: ' + (data.error || resp.status), 'error');
+                showToast('Credentials saved for ' + (data.username || username), 'success');
+                document.getElementById('rcred-password').value = '';
+                document.getElementById('rcred-password').type = 'password';
+                try { loadResellerCredentials(); } catch(e) {}
+            } catch (e) {
+                showToast('Save failed: ' + e.message, 'error');
+            }
+        }
+
         async function generateResellerKey() {
             const resellerId = document.getElementById('rkey-reseller').value;
             if (!resellerId) { showToast('Pick a reseller first', 'error'); return; }
@@ -13382,7 +13827,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 });
                 const data = await resp.json();
                 if (!resp.ok) { showToast('Generate failed: ' + (data.error || resp.status), 'error'); return; }
-                const magicLink = 'https://reseller-portal.zalmen-531.workers.dev/login?key=' + encodeURIComponent(data.api_key);
+                const magicLink = 'https://portal.incoming-sms.com/login?key=' + encodeURIComponent(data.api_key);
                 const html = '<div class="bg-dark-700 rounded-lg p-4 mb-3"><div class="text-xs text-gray-500 uppercase mb-1">API Key (shown once)</div><div class="text-accent font-mono break-all text-sm">' + data.api_key + '</div></div>' +
                     '<div class="bg-dark-700 rounded-lg p-4"><div class="text-xs text-gray-500 uppercase mb-1">Magic Link (deliver to reseller)</div><div class="text-blue-300 font-mono break-all text-xs">' + magicLink + '</div></div>' +
                     '<div class="text-xs text-gray-500 mt-3 italic">' + (data.note || '') + '</div>';

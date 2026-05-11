@@ -4,6 +4,12 @@ compatibility_date = "2024-01-01"
 account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
+# Custom domain — auto-provisions DNS + TLS via Cloudflare.
+# The legacy reseller-portal.zalmen-531.workers.dev URL stays active alongside.
+routes = [
+  { pattern = "portal.incoming-sms.com", custom_domain = true }
+]
+
 [observability.logs]
 enabled = true
 invocation_logs = true
