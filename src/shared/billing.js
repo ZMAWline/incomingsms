@@ -39,12 +39,64 @@ async function sbGetAll(env, pathWithoutLimit) {
   return out;
 }
 
+const ATT_VENDORS = ['atomic', 'helix', 'wing_iot'];
+
+// Pick the most recent rule active on `day` for the given vendor scope.
+// AT&T vendors fall back to vendor=null rules; Teltik does not (different unit).
+function pickActiveRule(rules, day, vendor) {
+  const order = vendor === 'teltik' ? ['teltik'] : [vendor, null];
+  for (const scope of order) {
+    let best = null;
+    for (const r of rules) {
+      if ((r.vendor || null) !== scope) continue;
+      if (r.effective_from > day) continue;
+      if (r.effective_to && r.effective_to < day) continue;
+      if (!best || r.effective_from > best.effective_from) best = r;
+    }
+    if (best) return best;
+  }
+  return null;
+}
+
+function rateFromRule(rule, count) {
+  if (!rule || !Array.isArray(rule.tiers)) return null;
+  const sorted = [...rule.tiers].sort((a, b) => (Number(a.min_count) || 0) - (Number(b.min_count) || 0));
+  for (const t of sorted) {
+    const min = Number(t.min_count) || 0;
+    const max = (t.max_count == null || t.max_count === '') ? Infinity : Number(t.max_count);
+    if (count >= min && count <= max) {
+      return {
+        rate: parseFloat(t.rate),
+        tier: { min_count: min, max_count: max === Infinity ? null : max, rate: parseFloat(t.rate) },
+        rule_id: rule.id,
+      };
+    }
+  }
+  return null;
+}
+
+// Resolve the rate for a single (day, vendor, count). Returns
+// { rate, tier?, rule_id? } with `rate` always populated (falls back to default).
+function resolveRate(rules, day, vendor, count, fallback) {
+  const rule = pickActiveRule(rules, day, vendor);
+  if (rule) {
+    const hit = rateFromRule(rule, count);
+    if (hit) return hit;
+  }
+  return { rate: fallback, tier: null, rule_id: null };
+}
+
 // Mirrors handleBillingPreview in src/dashboard/index.js exactly.
 // AT&T (helix/atomic/wing_iot): one SIM-day at dailyRate per (sim, EST date)
 //   where sim_sms_daily.sms_count > 0 and date in [start, end].
 // Teltik: one block at 2*dailyRate per sim_numbers.valid_from whose EST
 //   date is in [start, end], iff any covered EST day has SMS for that sim.
 //   Block range = [valid_from, min(valid_from + rotation_interval_hours, next valid_from)).
+//
+// Volume tiers: if reseller_rates rows match a given (date, vendor), the rate
+// for that bucket is chosen by tier (all-at-rate). AT&T vendors aggregate
+// into a single per-date entry when they all resolve to the same rate
+// (preserves legacy output shape for resellers with no rules).
 export async function computeBillingBreakdown(env, { resellerId, start, end }) {
   const [resellerResp, mappingResp] = await Promise.all([
     sbGet(env, 'resellers?select=id,name&id=eq.' + encodeURIComponent(resellerId) + '&limit=1'),
@@ -62,17 +114,26 @@ export async function computeBillingBreakdown(env, { resellerId, start, end }) {
     '&order=sim_id.asc'
   );
 
+  const rules = await sbGetAll(env,
+    'reseller_rates?select=id,vendor,effective_from,effective_to,tiers' +
+    '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+    '&effective_from=lte.' + end +
+    '&or=(effective_to.is.null,effective_to.gte.' + start + ')'
+  );
+
   const dailyRate = mapping ? parseFloat(mapping.daily_rate) : 0;
   const blockRate = +(dailyRate * 2).toFixed(2);
 
-  const attDays = {};
+  // attDaysByDateVendor[date][vendor] = Set of sim_ids
+  const attDaysByDateVendor = {};
   const teltikSimIds = [];
   const teltikSmsDaysBySim = new Map();
   const teltikIntervalBySim = new Map();
   if (Array.isArray(rsSims)) {
     for (const rs of rsSims) {
+      const vendor = rs.sims?.vendor;
       const daily = rs.sims?.sim_sms_daily;
-      if (rs.sims?.vendor === 'teltik') {
+      if (vendor === 'teltik') {
         teltikSimIds.push(rs.sim_id);
         teltikIntervalBySim.set(rs.sim_id, rs.sims?.rotation_interval_hours || 48);
         const days = new Set();
@@ -84,20 +145,57 @@ export async function computeBillingBreakdown(env, { resellerId, start, end }) {
         teltikSmsDaysBySim.set(rs.sim_id, days);
         continue;
       }
+      if (!ATT_VENDORS.includes(vendor)) continue;
       if (!Array.isArray(daily)) continue;
       for (const row of daily) {
         if (!row.est_date || row.sms_count <= 0) continue;
         if (row.est_date < start || row.est_date > end) continue;
-        if (!attDays[row.est_date]) attDays[row.est_date] = new Set();
-        attDays[row.est_date].add(rs.sim_id);
+        if (!attDaysByDateVendor[row.est_date]) attDaysByDateVendor[row.est_date] = {};
+        if (!attDaysByDateVendor[row.est_date][vendor]) attDaysByDateVendor[row.est_date][vendor] = new Set();
+        attDaysByDateVendor[row.est_date][vendor].add(rs.sim_id);
       }
     }
   }
 
-  const attEntries = Object.keys(attDays).sort().map(date => ({
-    date, sim_count: attDays[date].size, rate: dailyRate,
-    amount: +(attDays[date].size * dailyRate).toFixed(2),
-  }));
+  const attEntries = [];
+  for (const date of Object.keys(attDaysByDateVendor).sort()) {
+    const perVendor = attDaysByDateVendor[date];
+    // Compute per-vendor rate decisions. Aggregate when all vendors land on
+    // the same rate (legacy behavior preserved when no rules apply).
+    const decisions = ATT_VENDORS.map(v => {
+      const count = perVendor[v] ? perVendor[v].size : 0;
+      if (count === 0) return null;
+      const decided = resolveRate(rules, date, v, count, dailyRate);
+      return { vendor: v, count, ...decided };
+    }).filter(Boolean);
+    if (decisions.length === 0) continue;
+    const allSameRate = decisions.every(d => d.rate === decisions[0].rate && d.rule_id === decisions[0].rule_id);
+    if (allSameRate) {
+      const totalCount = decisions.reduce((s, d) => s + d.count, 0);
+      const entry = {
+        date,
+        sim_count: totalCount,
+        rate: decisions[0].rate,
+        amount: +(totalCount * decisions[0].rate).toFixed(2),
+      };
+      if (decisions[0].tier) entry.tier = decisions[0].tier;
+      if (decisions[0].rule_id) entry.rule_id = decisions[0].rule_id;
+      attEntries.push(entry);
+    } else {
+      for (const d of decisions) {
+        const entry = {
+          date,
+          vendor: d.vendor,
+          sim_count: d.count,
+          rate: d.rate,
+          amount: +(d.count * d.rate).toFixed(2),
+        };
+        if (d.tier) entry.tier = d.tier;
+        if (d.rule_id) entry.rule_id = d.rule_id;
+        attEntries.push(entry);
+      }
+    }
+  }
 
   const teltikBlocks = {};
   if (teltikSimIds.length > 0) {
@@ -143,10 +241,20 @@ export async function computeBillingBreakdown(env, { resellerId, start, end }) {
     }
   }
 
-  const teltikEntries = Object.keys(teltikBlocks).sort().map(date => ({
-    date, sim_count: teltikBlocks[date], rate: blockRate,
-    amount: +(teltikBlocks[date] * blockRate).toFixed(2),
-  }));
+  const teltikEntries = Object.keys(teltikBlocks).sort().map(date => {
+    const count = teltikBlocks[date];
+    const decided = resolveRate(rules, date, 'teltik', count, blockRate);
+    const entry = {
+      date,
+      vendor: 'teltik',
+      sim_count: count,
+      rate: decided.rate,
+      amount: +(count * decided.rate).toFixed(2),
+    };
+    if (decided.tier) entry.tier = decided.tier;
+    if (decided.rule_id) entry.rule_id = decided.rule_id;
+    return entry;
+  });
 
   const days = [...attEntries, ...teltikEntries].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
   const totalSimDays = days.reduce((s, d) => s + d.sim_count, 0);
@@ -161,5 +269,6 @@ export async function computeBillingBreakdown(env, { resellerId, start, end }) {
     days,
     total_sim_days: totalSimDays,
     total_amount: totalAmount,
+    rules_applied: rules.length > 0,
   };
 }

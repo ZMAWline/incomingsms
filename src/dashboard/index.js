@@ -303,6 +303,19 @@ export default {
       return handlePlanRatesDelete(env, corsHeaders, url);
     }
 
+    if (url.pathname === '/api/reseller-rates' && request.method === 'GET') {
+      return handleResellerRatesList(env, corsHeaders, url);
+    }
+    if (url.pathname === '/api/reseller-rates' && request.method === 'POST') {
+      return handleResellerRatesCreate(request, env, corsHeaders);
+    }
+    if (url.pathname.startsWith('/api/reseller-rates/') && request.method === 'PATCH') {
+      return handleResellerRatesUpdate(request, env, corsHeaders, url);
+    }
+    if (url.pathname.startsWith('/api/reseller-rates/') && request.method === 'DELETE') {
+      return handleResellerRatesDelete(env, corsHeaders, url);
+    }
+
     if (url.pathname === '/api/billing-ledger' && request.method === 'GET') {
       return handleBillingLedgerList(env, corsHeaders, url);
     }
@@ -4353,6 +4366,118 @@ async function handlePlanRatesDelete(env, corsHeaders, url) {
     }
 }
 
+// ── Reseller Rates (selling-side, time-bounded, volume tiers) ───────────────
+// Used by computeBillingBreakdown in src/shared/billing.js to override the flat
+// qbo_customer_map.daily_rate per (reseller, vendor, date, sim_count).
+
+function sanitizeTiers(input) {
+    if (!Array.isArray(input)) throw new Error('tiers must be an array');
+    if (input.length === 0) throw new Error('tiers must not be empty');
+    const cleaned = input.map((t, idx) => {
+        const min = Number(t.min_count);
+        const max = (t.max_count == null || t.max_count === '') ? null : Number(t.max_count);
+        const rate = Number(t.rate);
+        if (!Number.isInteger(min) || min < 0) throw new Error('tier ' + idx + ': min_count must be a non-negative integer');
+        if (max != null && (!Number.isInteger(max) || max < min)) throw new Error('tier ' + idx + ': max_count must be an integer >= min_count or null');
+        if (!Number.isFinite(rate) || rate < 0) throw new Error('tier ' + idx + ': rate must be a non-negative number');
+        return { min_count: min, max_count: max, rate };
+    }).sort((a, b) => a.min_count - b.min_count);
+    for (let i = 0; i < cleaned.length; i++) {
+        if (i > 0 && cleaned[i].min_count <= cleaned[i - 1].min_count) throw new Error('tiers must have strictly increasing min_count');
+        if (cleaned[i].max_count != null && cleaned[i].max_count < cleaned[i].min_count) throw new Error('tier ' + i + ': max_count < min_count');
+    }
+    return cleaned;
+}
+
+function validateVendor(v) {
+    if (v == null || v === '') return null;
+    if (!['atomic', 'helix', 'wing_iot', 'teltik'].includes(v)) throw new Error('invalid vendor');
+    return v;
+}
+
+async function handleResellerRatesList(env, corsHeaders, url) {
+    try {
+        const resellerId = url.searchParams.get('reseller_id');
+        let q = 'reseller_rates?select=id,reseller_id,vendor,effective_from,effective_to,tiers,notes,created_at,updated_at,resellers(name)&order=reseller_id.asc,vendor.asc.nullsfirst,effective_from.desc';
+        if (resellerId) q = q.replace('?', '?reseller_id=eq.' + encodeURIComponent(resellerId) + '&');
+        const rows = await sbGet(env, q);
+        const mapped = (rows || []).map(r => Object.assign({}, r, { reseller_name: r.resellers?.name || null }));
+        return new Response(JSON.stringify(mapped), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+}
+
+async function handleResellerRatesCreate(request, env, corsHeaders) {
+    try {
+        const body = await request.json();
+        const reseller_id = body.reseller_id != null ? parseInt(body.reseller_id) : NaN;
+        if (!Number.isInteger(reseller_id)) {
+            return new Response(JSON.stringify({ error: 'reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        const vendor = validateVendor(body.vendor);
+        const effective_from = body.effective_from || new Date().toISOString().split('T')[0];
+        const effective_to = body.effective_to || null;
+        const tiers = sanitizeTiers(body.tiers);
+        const notes = body.notes ? String(body.notes) : null;
+
+        // Auto-close prior open row for same (reseller, vendor)
+        const filter = 'reseller_rates?reseller_id=eq.' + reseller_id + '&effective_to=is.null&' + (vendor == null ? 'vendor=is.null' : 'vendor=eq.' + encodeURIComponent(vendor));
+        const existing = await sbGet(env, filter);
+        if (Array.isArray(existing) && existing.length) {
+            const closeDate = new Date(effective_from + 'T12:00:00Z');
+            closeDate.setUTCDate(closeDate.getUTCDate() - 1);
+            const closeIso = closeDate.toISOString().split('T')[0];
+            for (const row of existing) {
+                if (row.effective_from > closeIso) continue;
+                await sbPatch(env, 'reseller_rates?id=eq.' + row.id, { effective_to: closeIso });
+            }
+        }
+        const [created] = await sbPost(env, 'reseller_rates', { reseller_id, vendor, effective_from, effective_to, tiers, notes });
+        return new Response(JSON.stringify(created), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: String(e.message || e) }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+}
+
+async function handleResellerRatesUpdate(request, env, corsHeaders, url) {
+    try {
+        const id = url.pathname.split('/').pop();
+        if (!id) return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const body = await request.json();
+        const patch = {};
+        if (body.effective_from != null) patch.effective_from = body.effective_from;
+        if ('effective_to' in body) patch.effective_to = body.effective_to || null;
+        if (body.tiers != null) patch.tiers = sanitizeTiers(body.tiers);
+        if ('notes' in body) patch.notes = body.notes ? String(body.notes) : null;
+        if (!Object.keys(patch).length) return new Response(JSON.stringify({ error: 'no fields to update' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        await sbPatch(env, 'reseller_rates?id=eq.' + encodeURIComponent(id), patch);
+        return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: String(e.message || e) }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+}
+
+async function handleResellerRatesDelete(env, corsHeaders, url) {
+    try {
+        const id = url.pathname.split('/').pop();
+        if (!id) return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const resp = await fetch(env.SUPABASE_URL + '/rest/v1/reseller_rates?id=eq.' + encodeURIComponent(id), {
+            method: 'DELETE',
+            headers: {
+                apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+                Prefer: 'return=minimal',
+            },
+        });
+        if (!resp.ok) return new Response(JSON.stringify({ error: 'delete failed' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+}
+
+
 const NON_BILLABLE_TERMINAL_STATUSES = new Set(['canceled', 'cancelled', 'error', 'abandoned']);
 
 function parseBillCSV(text, vendor) {
@@ -6541,6 +6666,34 @@ function getHTML(helixEnabled) {
                     </div>
                 </div>
 
+                <!-- Volume Pricing Rules -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-semibold text-white">Volume Pricing Rules</h3>
+                        <button onclick="showAddResellerRateModal()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add Rule</button>
+                    </div>
+                    <p class="text-sm text-gray-400 mb-4">Override the flat Customer Rate above with time-bounded, volume-tiered selling prices per reseller. All-at-rate: whatever tier the daily SIM count falls in determines the rate for ALL units that day. AT&amp;T tiers are per SIM-day; Teltik tiers are per block (rental). Adding a new rule auto-closes the prior open rule for the same (reseller, vendor).</p>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-3 py-2 font-medium">Reseller</th>
+                                    <th class="px-3 py-2 font-medium">Vendor</th>
+                                    <th class="px-3 py-2 font-medium">Tiers</th>
+                                    <th class="px-3 py-2 font-medium">Effective From</th>
+                                    <th class="px-3 py-2 font-medium">Effective To</th>
+                                    <th class="px-3 py-2 font-medium">Status</th>
+                                    <th class="px-3 py-2 font-medium">Notes</th>
+                                    <th class="px-3 py-2 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="reseller-rates-table" class="text-gray-200">
+                                <tr><td colspan="8" class="px-3 py-3 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- Reseller API Keys -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <div class="flex items-center justify-between mb-3">
@@ -8494,7 +8647,7 @@ function getHTML(helixEnabled) {
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); }
+            if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
             if (tabName === 'sims') { loadRotationAudit(); try { syncSimsUrl(); } catch(e){} }
@@ -13972,12 +14125,15 @@ async function sendSimOnline(simId, phoneNumber) {
                     document.getElementById("download-invoice-btn").classList.add("hidden");
                     return;
                 }
-                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Daily Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span></div>';
-                html += '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2 pr-4">Date (EST)</th><th class="py-2 pr-4">SIMs w/ SMS</th><th class="py-2">Amount</th></tr></thead><tbody>';
+                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Default Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span>' + (data.rules_applied ? ' &nbsp;·&nbsp; <span class="text-blue-400">Volume Pricing rules active</span>' : '') + '</div>';
+                html += '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2 pr-4">Date (EST)</th><th class="py-2 pr-4">Scope</th><th class="py-2 pr-4">Units</th><th class="py-2 pr-4">Rate</th><th class="py-2">Amount</th></tr></thead><tbody>';
                 data.days.forEach(d => {
-                    html += \`<tr class="border-b border-dark-700"><td class="py-2 pr-4 text-gray-300">\${d.date}</td><td class="py-2 pr-4 text-gray-300">\${d.sim_count}</td><td class="py-2 text-gray-300">$\${Number(d.amount).toFixed(2)}</td></tr>\`;
+                    const scope = d.vendor ? d.vendor : 'AT&amp;T';
+                    const unit = d.vendor === 'teltik' ? '/block' : '/SIM-day';
+                    const tierTag = d.tier ? ' <span class="text-xs text-blue-400">[tier ' + d.tier.min_count + (d.tier.max_count == null ? '+' : '\u2013' + d.tier.max_count) + ']</span>' : '';
+                    html += \`<tr class="border-b border-dark-700"><td class="py-2 pr-4 text-gray-300">\${d.date}</td><td class="py-2 pr-4 text-gray-400 text-xs">\${scope}</td><td class="py-2 pr-4 text-gray-300">\${d.sim_count}</td><td class="py-2 pr-4 text-gray-300 font-mono">$\${Number(d.rate).toFixed(4)}\${unit}\${tierTag}</td><td class="py-2 text-gray-300">$\${Number(d.amount).toFixed(2)}</td></tr>\`;
                 });
-                html += \`<tr class="border-t border-dark-500"><td class="py-2 pr-4 text-white font-semibold">Total</td><td class="py-2 pr-4 text-white font-semibold">\${data.total_sim_days} billable units</td><td class="py-2 text-accent font-bold">$\${Number(data.total_amount).toFixed(2)}</td></tr>\`;
+                html += \`<tr class="border-t border-dark-500"><td class="py-2 pr-4 text-white font-semibold" colspan="2">Total</td><td class="py-2 pr-4 text-white font-semibold">\${data.total_sim_days} units</td><td class="py-2 pr-4"></td><td class="py-2 text-accent font-bold">$\${data.total_amount.toFixed ? data.total_amount.toFixed(2) : Number(data.total_amount).toFixed(2)}</td></tr>\`;
                 html += "</tbody></table></div>";
                 document.getElementById("invoice-preview").innerHTML = html;
                 document.getElementById("download-invoice-btn").classList.remove("hidden");
@@ -14943,6 +15099,178 @@ async function sendSimOnline(simId, phoneNumber) {
             } catch (e) { showToast('Error: ' + e, 'error'); }
         }
 
+
+        // ===== Reseller Rates (Volume Pricing Rules) =====
+        async function loadResellerRates() {
+            try {
+                const resp = await fetch(\`\${API_BASE}/reseller-rates\`);
+                const rows = await resp.json();
+                const tbody = document.getElementById('reseller-rates-table');
+                window._resellerRatesCache = Array.isArray(rows) ? rows : [];
+                if (!rows || !rows.length) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="px-3 py-3 text-center text-gray-500">No rules yet. Click + Add Rule.</td></tr>';
+                    return;
+                }
+                const today = new Date().toISOString().split('T')[0];
+                tbody.innerHTML = rows.map(r => {
+                    const active = (r.effective_from <= today) && (r.effective_to == null || r.effective_to >= today);
+                    const statusBadge = active
+                        ? '<span class="px-2 py-0.5 text-xs font-medium rounded-full bg-accent/20 text-accent">Active</span>'
+                        : (r.effective_from > today
+                            ? '<span class="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-500/20 text-blue-400">Scheduled</span>'
+                            : '<span class="px-2 py-0.5 text-xs font-medium rounded-full bg-gray-500/20 text-gray-400">Ended</span>');
+                    const vendorLabel = r.vendor ? r.vendor : '<span class="text-gray-500 italic">all AT&amp;T</span>';
+                    const unit = r.vendor === 'teltik' ? '/block' : '/SIM-day';
+                    const tiersHtml = (r.tiers || []).map(t => {
+                        const range = (t.max_count == null ? (t.min_count + '+') : (t.min_count + '\u2013' + t.max_count));
+                        return '<span class="inline-block px-2 py-0.5 mr-1 mb-1 rounded bg-dark-700 text-xs">' + range + ': $' + Number(t.rate).toFixed(4) + unit + '</span>';
+                    }).join('');
+                    return \`<tr class="border-b border-dark-700"><td class="px-3 py-2">\${r.reseller_name || r.reseller_id}</td><td class="px-3 py-2">\${vendorLabel}</td><td class="px-3 py-2">\${tiersHtml}</td><td class="px-3 py-2 text-gray-400">\${r.effective_from}</td><td class="px-3 py-2 text-gray-400">\${r.effective_to || '-'}</td><td class="px-3 py-2">\${statusBadge}</td><td class="px-3 py-2 text-gray-500 text-xs">\${r.notes || ''}</td><td class="px-3 py-2 whitespace-nowrap"><button onclick="editResellerRate(\${r.id})" class="px-2 py-1 text-xs bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">Edit</button>\${(r.effective_to == null ? \`<button onclick="endResellerRate(\${r.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition ml-1">End</button>\` : '')}<button onclick="deleteResellerRate(\${r.id})" class="px-2 py-1 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition ml-1">Del</button></td></tr>\`;
+                }).join('');
+            } catch (e) { console.error('loadResellerRates:', e); }
+        }
+
+        async function _populateResellerRateResellerSelect() {
+            const sel = document.getElementById('rr-reseller');
+            sel.innerHTML = '<option value="">-- Select Reseller --</option>';
+            try {
+                const resp = await fetch(\`\${API_BASE}/resellers\`);
+                const resellers = await resp.json();
+                (resellers || []).forEach(r => {
+                    const opt = document.createElement('option');
+                    opt.value = r.id; opt.textContent = r.name;
+                    sel.appendChild(opt);
+                });
+            } catch (e) { console.error(e); }
+        }
+
+        function _renderRrTierRows(tiers) {
+            const wrap = document.getElementById('rr-tiers');
+            wrap.innerHTML = '';
+            (tiers && tiers.length ? tiers : [{ min_count: 1, max_count: null, rate: '' }]).forEach(t => _addRrTierRow(t));
+        }
+
+        function _addRrTierRow(t) {
+            const wrap = document.getElementById('rr-tiers');
+            const row = document.createElement('div');
+            row.className = 'flex items-center gap-2 rr-tier-row';
+            row.innerHTML = '<input type="number" min="0" step="1" class="rr-tier-min flex-1 px-2 py-1.5 bg-dark-700 border border-dark-500 rounded text-gray-200 text-sm" placeholder="Min" value="' + (t && t.min_count != null ? t.min_count : '') + '">' +
+                            '<span class="text-gray-500 text-xs">to</span>' +
+                            '<input type="number" min="0" step="1" class="rr-tier-max flex-1 px-2 py-1.5 bg-dark-700 border border-dark-500 rounded text-gray-200 text-sm" placeholder="Max (blank = no cap)" value="' + (t && t.max_count != null ? t.max_count : '') + '">' +
+                            '<span class="text-gray-500 text-xs">@ $</span>' +
+                            '<input type="number" min="0" step="0.0001" class="rr-tier-rate flex-1 px-2 py-1.5 bg-dark-700 border border-dark-500 rounded text-gray-200 text-sm" placeholder="0.50" value="' + (t && t.rate != null ? t.rate : '') + '">' +
+                            '<button type="button" onclick="this.parentElement.remove()" class="px-2 py-1 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">&times;</button>';
+            wrap.appendChild(row);
+        }
+
+        function _collectRrTiers() {
+            const rows = document.querySelectorAll('.rr-tier-row');
+            const out = [];
+            rows.forEach(r => {
+                const min = r.querySelector('.rr-tier-min').value.trim();
+                const max = r.querySelector('.rr-tier-max').value.trim();
+                const rate = r.querySelector('.rr-tier-rate').value.trim();
+                if (min === '' && max === '' && rate === '') return;
+                out.push({ min_count: min === '' ? null : parseInt(min), max_count: max === '' ? null : parseInt(max), rate: rate === '' ? null : parseFloat(rate) });
+            });
+            return out;
+        }
+
+        async function showAddResellerRateModal() {
+            document.getElementById('rr-modal-title').textContent = 'Add Volume Pricing Rule';
+            document.getElementById('rr-id').value = '';
+            document.getElementById('rr-vendor').value = '';
+            document.getElementById('rr-effective-from').value = new Date().toISOString().split('T')[0];
+            document.getElementById('rr-effective-to').value = '';
+            document.getElementById('rr-notes').value = '';
+            document.getElementById('rr-reseller').disabled = false;
+            document.getElementById('rr-vendor').disabled = false;
+            _renderRrTierRows(null);
+            await _populateResellerRateResellerSelect();
+            document.getElementById('rr-modal').classList.remove('hidden');
+        }
+
+        async function editResellerRate(id) {
+            const r = (window._resellerRatesCache || []).find(x => x.id === id);
+            if (!r) { showToast('Rule not in cache — refresh', 'error'); return; }
+            document.getElementById('rr-modal-title').textContent = 'Edit Volume Pricing Rule';
+            document.getElementById('rr-id').value = String(r.id);
+            await _populateResellerRateResellerSelect();
+            document.getElementById('rr-reseller').value = String(r.reseller_id);
+            document.getElementById('rr-reseller').disabled = true;
+            document.getElementById('rr-vendor').value = r.vendor || '';
+            document.getElementById('rr-vendor').disabled = true;
+            document.getElementById('rr-effective-from').value = r.effective_from;
+            document.getElementById('rr-effective-to').value = r.effective_to || '';
+            document.getElementById('rr-notes').value = r.notes || '';
+            _renderRrTierRows(r.tiers);
+            document.getElementById('rr-modal').classList.remove('hidden');
+        }
+
+        function closeResellerRateModal() { document.getElementById('rr-modal').classList.add('hidden'); }
+
+        async function saveResellerRate() {
+            const id = document.getElementById('rr-id').value.trim();
+            const reseller_id = document.getElementById('rr-reseller').value;
+            const vendor = document.getElementById('rr-vendor').value || null;
+            const effective_from = document.getElementById('rr-effective-from').value;
+            const effective_to = document.getElementById('rr-effective-to').value || null;
+            const notes = document.getElementById('rr-notes').value.trim() || null;
+            const tiers = _collectRrTiers();
+            if (!id && !reseller_id) { showToast('Reseller required', 'error'); return; }
+            if (!effective_from) { showToast('Effective From required', 'error'); return; }
+            if (!tiers.length) { showToast('At least one tier required', 'error'); return; }
+            try {
+                const headers = { 'Content-Type': 'application/json' };
+                let resp;
+                if (id) {
+                    resp = await fetch(\`\${API_BASE}/reseller-rates/\${id}\`, {
+                        method: 'PATCH', headers,
+                        body: JSON.stringify({ effective_from, effective_to, tiers, notes }),
+                    });
+                } else {
+                    resp = await fetch(\`\${API_BASE}/reseller-rates\`, {
+                        method: 'POST', headers,
+                        body: JSON.stringify({ reseller_id: parseInt(reseller_id), vendor, effective_from, effective_to, tiers, notes }),
+                    });
+                }
+                const result = await resp.json();
+                if (result.error) { showToast('Failed: ' + result.error, 'error'); return; }
+                showToast('Rule saved', 'success');
+                closeResellerRateModal();
+                loadResellerRates();
+            } catch (e) { showToast('Error: ' + e, 'error'); }
+        }
+
+        async function endResellerRate(id) {
+            const today = new Date().toISOString().split('T')[0];
+            const date = await showDatePrompt('End Rule', 'Set the last date this rule applies. Days after this revert to the next rule (or the Customer Rate fallback).', today);
+            if (!date) return;
+            try {
+                const resp = await fetch(\`\${API_BASE}/reseller-rates/\${id}\`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ effective_to: date }),
+                });
+                const result = await resp.json();
+                if (result.error) { showToast('Failed: ' + result.error, 'error'); return; }
+                showToast('Rule ended ' + date, 'success');
+                loadResellerRates();
+            } catch (e) { showToast('Error: ' + e, 'error'); }
+        }
+
+        async function deleteResellerRate(id) {
+            const ok = await showConfirm('Delete Rule', 'Permanently delete this rule? This cannot be undone.');
+            if (!ok) return;
+            try {
+                const resp = await fetch(\`\${API_BASE}/reseller-rates/\${id}\`, { method: 'DELETE' });
+                const result = await resp.json();
+                if (result.error) { showToast('Failed: ' + result.error, 'error'); return; }
+                showToast('Rule deleted', 'success');
+                loadResellerRates();
+            } catch (e) { showToast('Error: ' + e, 'error'); }
+        }
+
         // ===== Billing Ledger =====
         
 
@@ -15237,6 +15565,64 @@ async function sendSimOnline(simId, phoneNumber) {
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-2">
                 <button onclick="closePlanRateModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Cancel</button>
                 <button onclick="savePlanRate()" class="px-4 py-2 text-sm bg-accent hover:bg-blue-600 text-white rounded-lg transition">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reseller Rate (Volume Pricing) Modal -->
+    <div id="rr-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl max-h-[90vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 id="rr-modal-title" class="text-lg font-semibold text-white">Add Volume Pricing Rule</h3>
+                <button onclick="closeResellerRateModal()" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 space-y-4 overflow-y-auto">
+                <input type="hidden" id="rr-id">
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs text-gray-500 uppercase">Reseller</label>
+                        <select id="rr-reseller" class="w-full mt-1 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">
+                            <option value="">-- Select Reseller --</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-500 uppercase">Vendor scope</label>
+                        <select id="rr-vendor" class="w-full mt-1 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">
+                            <option value="">All AT&amp;T (atomic / helix / wing_iot)</option>
+                            <option value="atomic">ATOMIC only</option>
+                            <option value="helix">Helix only</option>
+                            <option value="wing_iot">Wing IoT only</option>
+                            <option value="teltik">Teltik (per block)</option>
+                        </select>
+                        <p class="text-xs text-gray-500 mt-1">AT&amp;T scopes price per SIM-day. Teltik prices per block (rental).</p>
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs text-gray-500 uppercase">Effective From</label>
+                        <input type="date" id="rr-effective-from" class="w-full mt-1 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">
+                    </div>
+                    <div>
+                        <label class="text-xs text-gray-500 uppercase">Effective To (optional)</label>
+                        <input type="date" id="rr-effective-to" class="w-full mt-1 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">
+                    </div>
+                </div>
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="text-xs text-gray-500 uppercase">Tiers (all-at-rate)</label>
+                        <button type="button" onclick="_addRrTierRow()" class="text-xs text-accent hover:text-green-400">+ Add Tier</button>
+                    </div>
+                    <p class="text-xs text-gray-500 mb-2">Each tier covers a SIM-count range. Daily count picks the row; all units that day are priced at that row\'s rate. Leave Max blank on the last row for "no cap".</p>
+                    <div id="rr-tiers" class="space-y-2"></div>
+                </div>
+                <div>
+                    <label class="text-xs text-gray-500 uppercase">Notes</label>
+                    <input type="text" id="rr-notes" placeholder="optional" class="w-full mt-1 px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-2">
+                <button onclick="closeResellerRateModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Cancel</button>
+                <button onclick="saveResellerRate()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Save</button>
             </div>
         </div>
     </div>
