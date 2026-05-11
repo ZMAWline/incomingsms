@@ -14126,11 +14126,21 @@ async function sendSimOnline(simId, phoneNumber) {
                     return;
                 }
                 let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Default Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span>' + (data.rules_applied ? ' &nbsp;·&nbsp; <span class="text-blue-400">Volume Pricing rules active</span>' : '') + '</div>';
+                if (data.active_counts) {
+                    const ac = data.active_counts;
+                    const parts = [];
+                    if (ac.all_att > 0) parts.push('AT&amp;T: <span class="text-white">' + ac.all_att + '</span>');
+                    if (ac.atomic > 0 && (ac.helix > 0 || ac.wing_iot > 0)) parts.push('atomic: <span class="text-white">' + ac.atomic + '</span>');
+                    if (ac.helix > 0 && (ac.atomic > 0 || ac.wing_iot > 0)) parts.push('helix: <span class="text-white">' + ac.helix + '</span>');
+                    if (ac.wing_iot > 0 && (ac.atomic > 0 || ac.helix > 0)) parts.push('wing_iot: <span class="text-white">' + ac.wing_iot + '</span>');
+                    if (ac.teltik > 0) parts.push('teltik: <span class="text-white">' + ac.teltik + '</span>');
+                    if (parts.length) html += '<div class="mb-3 text-xs text-gray-500">Active SIMs assigned (drives tier selection): ' + parts.join(' &middot; ') + '</div>';
+                }
                 html += '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2 pr-4">Date (EST)</th><th class="py-2 pr-4">Scope</th><th class="py-2 pr-4">Units</th><th class="py-2 pr-4">Rate</th><th class="py-2">Amount</th></tr></thead><tbody>';
                 data.days.forEach(d => {
                     const scope = d.vendor ? d.vendor : 'AT&amp;T';
                     const unit = d.vendor === 'teltik' ? '/block' : '/SIM-day';
-                    const tierTag = d.tier ? ' <span class="text-xs text-blue-400">[tier ' + d.tier.min_count + (d.tier.max_count == null ? '+' : '\u2013' + d.tier.max_count) + ']</span>' : '';
+                    const tierTag = d.tier ? ' <span class="text-xs text-blue-400" title="Selected because reseller has ' + (d.tier_input_count != null ? d.tier_input_count : '?') + ' active SIMs in scope">[tier ' + d.tier.min_count + (d.tier.max_count == null ? '+' : '\u2013' + d.tier.max_count) + ']</span>' : '';
                     html += \`<tr class="border-b border-dark-700"><td class="py-2 pr-4 text-gray-300">\${d.date}</td><td class="py-2 pr-4 text-gray-400 text-xs">\${scope}</td><td class="py-2 pr-4 text-gray-300">\${d.sim_count}</td><td class="py-2 pr-4 text-gray-300 font-mono">$\${Number(d.rate).toFixed(4)}\${unit}\${tierTag}</td><td class="py-2 text-gray-300">$\${Number(d.amount).toFixed(2)}</td></tr>\`;
                 });
                 html += \`<tr class="border-t border-dark-500"><td class="py-2 pr-4 text-white font-semibold" colspan="2">Total</td><td class="py-2 pr-4 text-white font-semibold">\${data.total_sim_days} units</td><td class="py-2 pr-4"></td><td class="py-2 text-accent font-bold">$\${data.total_amount.toFixed ? data.total_amount.toFixed(2) : Number(data.total_amount).toFixed(2)}</td></tr>\`;
