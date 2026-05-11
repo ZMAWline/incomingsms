@@ -58,6 +58,10 @@ export default {
       return handleGateways(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/gateway-defective-slots') {
+      return handleGatewayDefectiveSlots(request, env, corsHeaders);
+    }
+
     if (url.pathname.startsWith('/api/run/')) {
       const workerName = url.pathname.replace('/api/run/', '');
       return handleRunWorker(request, env, workerName, corsHeaders);
@@ -587,7 +591,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,vendor,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
+    let query = `sims?select=id,iccid,port,status,vendor,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_rotation_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
 
     // Apply status filter
     if (statusFilter) {
@@ -662,6 +666,7 @@ async function handleSims(env, corsHeaders, url) {
         gateway_code: sim.gateways?.code || null,
         gateway_name: sim.gateways?.name || null,
         last_mdn_rotated_at: sim.last_mdn_rotated_at || null,
+        last_rotation_at: sim.last_rotation_at || null,
         activated_at: sim.activated_at || null,
         last_activation_error: sim.last_activation_error || null,
         last_notified_at: sim.last_notified_at || null,
@@ -1318,6 +1323,82 @@ async function handleGateways(request, env, corsHeaders) {
 
   return new Response('Method not allowed', { status: 405 });
 }
+
+async function handleGatewayDefectiveSlots(request, env, corsHeaders) {
+  const url = new URL(request.url);
+  const jsonHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
+
+  if (request.method === 'GET') {
+    const gatewayId = url.searchParams.get('gateway_id');
+    if (!gatewayId) {
+      return new Response(JSON.stringify({ error: 'gateway_id query param is required' }), { status: 400, headers: jsonHeaders });
+    }
+    try {
+      const res = await supabaseGet(env, `gateway_defective_slots?select=id,port_slot,reason,created_at&gateway_id=eq.${encodeURIComponent(gatewayId)}&order=port_slot.asc`);
+      const slots = await res.json();
+      return new Response(JSON.stringify({ ok: true, slots }), { headers: jsonHeaders });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: jsonHeaders });
+    }
+  }
+
+  if (request.method === 'POST') {
+    try {
+      const body = await request.json();
+      const gatewayId = body.gateway_id;
+      const portSlot = normalizeImeiPoolPort(body.port_slot);
+      const reason = body.reason || null;
+      if (!gatewayId || !portSlot) {
+        return new Response(JSON.stringify({ error: 'gateway_id and port_slot are required' }), { status: 400, headers: jsonHeaders });
+      }
+      const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/gateway_defective_slots?on_conflict=gateway_id,port_slot`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates,return=representation',
+        },
+        body: JSON.stringify({ gateway_id: gatewayId, port_slot: portSlot, reason }),
+      });
+      if (!insertRes.ok) {
+        const errText = await insertRes.text();
+        return new Response(JSON.stringify({ error: `Failed to mark defective: ${errText}` }), { status: 500, headers: jsonHeaders });
+      }
+      const rows = await insertRes.json();
+      return new Response(JSON.stringify({ ok: true, slot: rows[0] || null }), { headers: jsonHeaders });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: jsonHeaders });
+    }
+  }
+
+  if (request.method === 'DELETE') {
+    const gatewayId = url.searchParams.get('gateway_id');
+    const portSlot = normalizeImeiPoolPort(url.searchParams.get('port_slot'));
+    if (!gatewayId || !portSlot) {
+      return new Response(JSON.stringify({ error: 'gateway_id and port_slot are required' }), { status: 400, headers: jsonHeaders });
+    }
+    try {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateway_defective_slots?gateway_id=eq.${encodeURIComponent(gatewayId)}&port_slot=eq.${encodeURIComponent(portSlot)}`, {
+        method: 'DELETE',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        return new Response(JSON.stringify({ error: `Failed to unmark defective: ${errText}` }), { status: 500, headers: jsonHeaders });
+      }
+      return new Response(JSON.stringify({ ok: true }), { headers: jsonHeaders });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: jsonHeaders });
+    }
+  }
+
+  return new Response('Method not allowed', { status: 405 });
+}
+
 async function handleSimOnline(request, env, corsHeaders) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
@@ -1335,7 +1416,7 @@ async function handleSimOnline(request, env, corsHeaders) {
     }
 
     // Step 1: Get the SIM basic info
-    const simResponse = await supabaseGet(env, `sims?select=id,iccid,status,vendor,rotation_status,rotation_interval_hours,last_mdn_rotated_at&id=eq.${simId}`);
+    const simResponse = await supabaseGet(env, `sims?select=id,iccid,status,vendor,rotation_status,rotation_interval_hours,last_mdn_rotated_at,last_rotation_at&id=eq.${simId}`);
     const sims = await simResponse.json();
 
     if (!sims || sims.length === 0) {
@@ -6200,7 +6281,7 @@ function getHTML(helixEnabled) {
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_mdn_rotated_at')">Last Rotated <span class="sort-arrow" data-table="sims" data-col="last_mdn_rotated_at"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_rotation_at')">Last Rotated <span class="sort-arrow" data-table="sims" data-col="last_rotation_at"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','activated_at')">Activated <span class="sort-arrow" data-table="sims" data-col="activated_at"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_notified_at')">Last Notified <span class="sort-arrow" data-table="sims" data-col="last_notified_at"></span></th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
@@ -6408,9 +6489,26 @@ function getHTML(helixEnabled) {
                             <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-red-500 inline-block"></span> Error/No SIM</span>
                             <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-orange-500 inline-block"></span> No Balance</span>
                         </div>
+                        <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none ml-3">
+                            <input id="show-defective-slots" type="checkbox" onchange="onShowDefectiveSlotsToggle()" class="w-3.5 h-3.5 accent-accent">
+                            Show defective
+                        </label>
                     </div>
                     <div id="port-grid" class="p-5 grid grid-cols-4 md:grid-cols-8 lg:grid-cols-16 gap-2">
                         <p class="text-gray-500 text-sm col-span-full text-center py-8">Select a gateway to view port status</p>
+                    </div>
+                </div>
+
+                <!-- Under-Filled Ports -->
+                <div class="bg-dark-800 rounded-xl border border-dark-600 mb-6">
+                    <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                        <div>
+                            <h2 class="text-lg font-semibold text-white">Under-Filled Ports</h2>
+                            <p class="text-xs text-gray-500 mt-0.5">Multi-slot ports holding fewer SIMs than their target (target = min(5, working slots)).</p>
+                        </div>
+                    </div>
+                    <div id="under-filled-list" class="p-5">
+                        <p class="text-gray-500 text-sm text-center py-4">Select a gateway to see under-filled ports.</p>
                     </div>
                 </div>
 
@@ -9173,7 +9271,7 @@ function getHTML(helixEnabled) {
                 reseller_name: 'Reseller',
                 sms_count: 'SMS',
                 last_sms_received: 'Last SMS',
-                last_mdn_rotated_at: 'Last Rotated',
+                last_rotation_at: 'Last Rotated',
                 activated_at: 'Activated',
                 last_notified_at: 'Last Notified',
             };
@@ -9271,7 +9369,7 @@ function getHTML(helixEnabled) {
             if (!query) return true;
             const terms = query.split(/[,;\\n\\r]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
             if (!terms.length) return true;
-            const DATE_FIELDS = ['activated_at','last_sms_received','last_mdn_rotated_at','last_notified_at','created_at','updated_at'];
+            const DATE_FIELDS = ['activated_at','last_sms_received','last_mdn_rotated_at','last_rotation_at','last_notified_at','created_at','updated_at'];
             const strings = Object.entries(obj).flatMap(([k, v]) => {
               if (v == null) return [];
               const base = String(v);
@@ -9679,7 +9777,7 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-400">\${sim.reseller_name || '-'}</td>
                     <td class="px-4 py-3 text-gray-300">\${sim.sms_count || 0}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${lastSms}</td>
-                    <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).toLocaleString() : '-'}</td>
+                    <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_rotation_at ? new Date(sim.last_rotation_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.activated_at ? new Date(sim.activated_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${sim.last_notified_at ? \`<button onclick="viewSimWebhooks(\${sim.id})" class="text-indigo-400 hover:text-indigo-300 hover:underline" title="Show number.online deliveries sent for this SIM">\${new Date(sim.last_notified_at).toLocaleString()}</button>\` : '-'}</td>
                     <td class="px-4 py-3 whitespace-nowrap">
@@ -10680,6 +10778,111 @@ async function sendSimOnline(simId, phoneNumber) {
 
         // ===== Gateway Management =====
         let gatewaysCache = [];
+        let defectiveSlotsCache = new Set();
+        let showDefectiveSlots = false;
+
+        function slotNormalize(portSlot) {
+            if (!portSlot) return '';
+            const s = String(portSlot);
+            const m = s.match(/^(\\d+)\\.(\\d+)$/);
+            if (m) return m[1] + '.' + String(parseInt(m[2])).padStart(2, '0');
+            const letterToSlot = { A:1, B:2, C:3, D:4, E:5, F:6, G:7, H:8 };
+            const lm = s.match(/^(\\d+)([A-Ha-h])$/);
+            if (lm) return lm[1] + '.' + String(letterToSlot[lm[2].toUpperCase()] || 1).padStart(2, '0');
+            return s;
+        }
+
+        async function loadDefectiveSlots(gatewayId) {
+            defectiveSlotsCache = new Set();
+            if (!gatewayId) return;
+            try {
+                const r = await fetch(\`\${API_BASE}/gateway-defective-slots?gateway_id=\${gatewayId}\`);
+                const j = await r.json();
+                if (j && j.ok && Array.isArray(j.slots)) {
+                    for (const s of j.slots) defectiveSlotsCache.add(slotNormalize(s.port_slot));
+                }
+            } catch(e) { console.error('loadDefectiveSlots failed', e); }
+        }
+
+        function onShowDefectiveSlotsToggle() {
+            const cb = document.getElementById('show-defective-slots');
+            showDefectiveSlots = !!(cb && cb.checked);
+            loadPortStatus();
+        }
+
+        async function markSlotDefective(portSlot) {
+            const gatewayId = document.getElementById('gw-select').value;
+            if (!gatewayId) return;
+            const ok = await showConfirm('Mark Slot Defective', 'Mark slot ' + portSlot + ' as defective? It will be hidden from the port grid and excluded from the 5-slot target.');
+            if (!ok) return;
+            try {
+                const r = await fetch(\`\${API_BASE}/gateway-defective-slots\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway_id: gatewayId, port_slot: portSlot })
+                });
+                const j = await r.json();
+                if (!r.ok || j.error) throw new Error(j.error || 'Mark failed');
+                showToast('Slot ' + portSlot + ' marked defective', 'success');
+                document.getElementById('port-detail-modal').classList.add('hidden');
+                await loadPortStatus();
+            } catch(e) { showToast('Mark failed: ' + (e.message || e), 'error'); }
+        }
+
+        async function unmarkSlotDefective(portSlot) {
+            const gatewayId = document.getElementById('gw-select').value;
+            if (!gatewayId) return;
+            try {
+                const r = await fetch(\`\${API_BASE}/gateway-defective-slots?gateway_id=\${gatewayId}&port_slot=\${encodeURIComponent(portSlot)}\`, { method: 'DELETE' });
+                const j = await r.json();
+                if (!r.ok || j.error) throw new Error(j.error || 'Unmark failed');
+                showToast('Slot ' + portSlot + ' marked working', 'success');
+                document.getElementById('port-detail-modal').classList.add('hidden');
+                await loadPortStatus();
+            } catch(e) { showToast('Unmark failed: ' + (e.message || e), 'error'); }
+        }
+
+        function renderUnderFilledPorts() {
+            const container = document.getElementById('under-filled-list');
+            if (!container) return;
+            const ports = window.portData || [];
+            if (!ports.length) {
+                container.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">No port data.</p>';
+                return;
+            }
+            const byPort = {};
+            for (const p of ports) {
+                const m = (p.port || '').match(/^(\\d+)\\./);
+                if (!m) continue;
+                const portNum = m[1];
+                if (!byPort[portNum]) byPort[portNum] = [];
+                byPort[portNum].push(p);
+            }
+            const rows = [];
+            const sortedPortNums = Object.keys(byPort).sort((a, b) => parseInt(a) - parseInt(b));
+            for (const portNum of sortedPortNums) {
+                const slots = byPort[portNum];
+                if (slots.length <= 1) continue;
+                const defective = slots.filter(s => defectiveSlotsCache.has(s.port)).length;
+                const seated = slots.filter(s => s.inserted === 1 && !defectiveSlotsCache.has(s.port)).length;
+                const target = Math.min(5, slots.length - defective);
+                if (target <= 0) continue;
+                if (seated >= target) continue;
+                const need = target - seated;
+                const defNote = defective ? ', ' + defective + ' defective' : '';
+                rows.push('<div class="flex items-center justify-between py-2 px-3 rounded bg-dark-700 border border-dark-600">' +
+                    '<span class="font-mono text-gray-200">Port ' + portNum + '</span>' +
+                    '<span class="text-xs text-gray-400">' + seated + '/' + target + ' seated' + defNote + '</span>' +
+                    '<span class="text-xs text-orange-400">needs ' + need + ' more</span>' +
+                    '</div>');
+            }
+            if (!rows.length) {
+                container.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">All multi-slot ports are at or above target.</p>';
+                return;
+            }
+            container.innerHTML = '<div class="grid gap-2">' + rows.join('') + '</div>';
+        }
+
 
         function gwEscHtml(s) {
             return String(s == null ? '' : s)
@@ -10883,13 +11086,18 @@ async function sendSimOnline(simId, phoneNumber) {
             if (!gatewayId) {
                 grid.innerHTML = '<p class="text-gray-500 text-sm col-span-full text-center py-8">Select a gateway to view port status</p>';
                 label.textContent = '';
+                const ul = document.getElementById('under-filled-list');
+                if (ul) ul.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">Select a gateway to see under-filled ports.</p>';
                 return;
             }
 
             grid.innerHTML = '<p class="text-gray-400 text-sm col-span-full text-center py-8">Loading...</p>';
 
             try {
-                const response = await fetch(\`\${API_BASE}/skyline/port-info?gateway_id=\${gatewayId}&all_slots=1\`);
+                const [response] = await Promise.all([
+                    fetch(\`\${API_BASE}/skyline/port-info?gateway_id=\${gatewayId}&all_slots=1\`),
+                    loadDefectiveSlots(gatewayId),
+                ]);
                 const result = await response.json();
 
                 if (!result.ok) {
@@ -10905,19 +11113,33 @@ async function sendSimOnline(simId, phoneNumber) {
                     return;
                 }
 
-                label.textContent = \`\${ports.length} slot(s) - Updated \${new Date().toLocaleTimeString()}\`;
                 window.portData = ports;
+                const cb = document.getElementById('show-defective-slots');
+                if (cb) cb.checked = showDefectiveSlots;
+                const visible = ports.filter(p => showDefectiveSlots || !defectiveSlotsCache.has(p.port));
+                const defCount = ports.length - visible.length;
+                label.textContent = \`\${visible.length} slot(s)\${defCount ? ' (' + defCount + ' defective hidden)' : ''} - Updated \${new Date().toLocaleTimeString()}\`;
 
-                grid.innerHTML = ports.map(p => {
+                // Group by physical port number to detect multi-slot layout.
+                const byPortGroups = {};
+                for (const pp of ports) {
+                    const mm = (pp.port || '').match(/^(\\d+)\\./);
+                    const pn = mm ? mm[1] : (pp.port || '');
+                    (byPortGroups[pn] = byPortGroups[pn] || []).push(pp);
+                }
+                const sortedPortNumsForGrid = Object.keys(byPortGroups).sort((a, b) => parseInt(a) - parseInt(b));
+                const isMultiSlotGw = sortedPortNumsForGrid.some(k => byPortGroups[k].length > 1);
+
+                function renderSlotCard(p) {
                     const portLabel = p.port || '?';
+                    const isDefective = defectiveSlotsCache.has(portLabel);
                     const st = p.st ?? -1;
                     const info = PORT_STATUS_COLORS[st] || { bg: 'bg-gray-600', label: 'Unknown' };
                     const number = p.number ? p.number.replace('+1', '') : '';
                     const sig = p.signal != null ? p.signal : '-';
-                    const shortIccid = p.iccid ? '...' + p.iccid.slice(-6) : '';
-
                     const tooltip = [
                         'Port ' + portLabel + ': ' + info.label + ' (st=' + st + ')',
+                        isDefective ? 'DEFECTIVE' : '',
                         p.number ? 'Number: ' + p.number : 'No number assigned',
                         p.iccid ? 'ICCID: ' + p.iccid : '',
                         p.imei ? 'IMEI: ' + p.imei : '',
@@ -10925,25 +11147,48 @@ async function sendSimOnline(simId, phoneNumber) {
                         'Signal: ' + sig,
                         p.sim_status ? 'SIM Status: ' + p.sim_status : '',
                     ].filter(Boolean).join('\\n');
-
-                    return \`
-                        <div class="flex flex-col items-center p-2 rounded-lg bg-dark-700 border border-dark-500 hover:border-dark-400 transition cursor-pointer group relative" title="\${tooltip}" onclick="selectPort('\${portLabel}')">
-                            <div class="flex items-center gap-1 mb-1">
-                                <div class="w-3 h-3 rounded-full \${info.bg}"></div>
-                                <span class="text-[10px] text-gray-500">\${sig}</span>
-                            </div>
-                            <span class="text-xs font-bold text-gray-200">\${portLabel.split('.')[0]}</span>
-                            \${number ? \`<span class="text-[10px] text-accent font-medium truncate max-w-full">\${number}</span>\` : \`<span class="text-[10px] text-gray-600">---</span>\`}
-                            <span class="text-[10px] text-gray-500">\${info.label}</span>
+                    const cardBg = isDefective ? 'bg-dark-900 opacity-60 border-red-700/60' : 'bg-dark-700 border-dark-500';
+                    const dot = isDefective ? 'bg-red-700' : info.bg;
+                    const statusLabel = isDefective ? 'Defective' : info.label;
+                    const slotNumLabel = portLabel.includes('.') ? portLabel.split('.')[1] : '';
+                    return \`<div class="flex flex-col items-center p-2 rounded-lg \${cardBg} border hover:border-dark-400 transition cursor-pointer group relative min-w-[64px]" title="\${tooltip}" onclick="selectPort('\${portLabel}')">
+                        <div class="flex items-center gap-1 mb-1">
+                            <div class="w-3 h-3 rounded-full \${dot}"></div>
+                            <span class="text-[10px] text-gray-500">\${sig}</span>
                         </div>
-                    \`;
-                }).join('');
+                        <span class="text-xs font-bold text-gray-200">\${portLabel.split('.')[0]}\${slotNumLabel ? '.' + slotNumLabel : ''}</span>
+                        \${number ? \`<span class="text-[10px] text-accent font-medium truncate max-w-full">\${number}</span>\` : \`<span class="text-[10px] text-gray-600">---</span>\`}
+                        <span class="text-[10px] \${isDefective ? 'text-red-400' : 'text-gray-500'}">\${statusLabel}</span>
+                    </div>\`;
+                }
+
+                if (isMultiSlotGw) {
+                    grid.className = 'p-5 flex flex-col gap-2';
+                    grid.innerHTML = sortedPortNumsForGrid.map(pn => {
+                        const slots = byPortGroups[pn];
+                        const vis = slots.filter(p => showDefectiveSlots || !defectiveSlotsCache.has(p.port));
+                        if (!vis.length) return '';
+                        const hiddenDefective = slots.length - vis.length;
+                        const portMeta = hiddenDefective ? \`<span class="text-[10px] text-gray-500">(\${hiddenDefective} defective hidden)</span>\` : '';
+                        return \`<div class="flex items-center gap-3 p-2 rounded-lg bg-dark-800/60 border border-dark-700">
+                            <div class="flex flex-col items-center justify-center font-mono text-xs font-bold text-gray-300 w-14 flex-shrink-0">
+                                <span>P\${pn}</span>
+                                \${portMeta}
+                            </div>
+                            <div class="flex gap-2 flex-wrap flex-1">\${vis.map(renderSlotCard).join('')}</div>
+                        </div>\`;
+                    }).join('');
+                } else {
+                    grid.className = 'p-5 grid grid-cols-4 md:grid-cols-8 lg:grid-cols-16 gap-2';
+                    grid.innerHTML = visible.map(renderSlotCard).join('');
+                }
+
+                renderUnderFilledPorts();
             } catch (error) {
                 grid.innerHTML = \`<p class="text-red-400 text-sm col-span-full text-center py-8">Error: \${error}</p>\`;
                 label.textContent = '';
             }
         }
-
         async function exportGatewayTable() {
             const gwSelect = document.getElementById('gw-select');
             const gatewayId = gwSelect.value;
@@ -11079,7 +11324,8 @@ async function sendSimOnline(simId, phoneNumber) {
                                     <td class="py-2 pl-3 whitespace-nowrap">
                                         <button onclick="gwSlotAction('lock','\${p.port}')" class="px-2 py-1 text-xs bg-orange-700 hover:bg-orange-600 text-white rounded transition mr-1" title="Lock SIM slot">Lock</button>
                                         <button onclick="gwSlotAction('unlock','\${p.port}')" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-600 text-white rounded transition mr-1" title="Unlock SIM slot">Unlock</button>
-                                        <button onclick="gwSlotAction('switch','\${p.port}')" class="px-2 py-1 text-xs bg-purple-700 hover:bg-purple-600 text-white rounded transition" title="Switch to this SIM slot">Switch</button>
+                                        <button onclick="gwSlotAction('switch','\${p.port}')" class="px-2 py-1 text-xs bg-purple-700 hover:bg-purple-600 text-white rounded transition mr-1" title="Switch to this SIM slot">Switch</button>
+                                        \${defectiveSlotsCache.has(p.port) ? \`<button onclick="unmarkSlotDefective('\${p.port}')" class="px-2 py-1 text-xs bg-gray-700 hover:bg-gray-600 text-white rounded transition" title="Mark this slot working again">Mark Working</button>\` : \`<button onclick="markSlotDefective('\${p.port}')" class="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 text-white rounded transition" title="Mark this slot defective (hidden from grid)">Mark Defective</button>\`}
                                     </td>
                                 </tr>
                             \`;
@@ -14630,7 +14876,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 _sdField('Subscription ID', '<span class="font-mono text-xs">' + (sim.mobility_subscription_id || '') + '</span>') +
                 _sdField('Rotation Interval', sim.rotation_interval_hours ? sim.rotation_interval_hours + 'h' : '') +
                 _sdField('SMS (24h)', String(sim.sms_count || 0)) +
-                _sdField('Last Rotated', sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).toLocaleString() : '') +
+                _sdField('Last Rotated', sim.last_rotation_at ? new Date(sim.last_rotation_at).toLocaleString() : '') +
                 _sdField('Activated', sim.activated_at ? new Date(sim.activated_at).toLocaleString() : '') +
                 _sdField('Last Notified', sim.last_notified_at ? new Date(sim.last_notified_at).toLocaleString() : '') +
                 _sdField('Last SMS', sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '') +
