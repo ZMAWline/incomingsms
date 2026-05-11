@@ -4,6 +4,56 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-10 — `reseller-sync` ABIR guardrail is now wing_iot-only; teltik/atomic/helix `rotation_status='failed'` SIMs still get `number.online`
+
+**Decision:** The filter that excludes failed-rotation SIMs from the daily `number.online` broadcast is now `or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed)` (was `or=(rotation_status.is.null,rotation_status.neq.failed)`). The "don't broadcast" rule applies **only** when both `vendor='wing_iot'` and `rotation_status='failed'` are true. For other vendors a failed rotation just means the carrier API errored mid-rotation; the OLD MDN remains valid in `sim_numbers` and continues to receive SMS, so the reseller should still see it as online.
+
+**Why:** The original guardrail was added to prevent broadcasting wing_iot SIMs stuck on the ABIR (non-dialable) plan — those have an interim 5xxx MDN that can't actually receive normal calls/SMS. But Teltik 502 errors and ATOMIC swapMSISDN timeouts leave the SIM with its previous MDN intact; suppressing them strands SIMs from the reseller's "active" view. Incident 2026-05-09: a Teltik 502 outage left 71 TrustOTP SIMs invisible after rotation, even though their old MDNs were still receiving SMS. Reseller-portal-side count dropped to 1004 vs our 1951 broadcastable.
+
+**Consequence / what not to undo:** Do NOT widen this filter back to all vendors. The wing_iot ABIR case is genuinely unsafe (broadcasting an MDN that can't receive normal SMS would route reseller traffic into a black hole — a customer-facing functional bug). Other vendors' failure modes are recoverable on the next rotation cron tick. If a new vendor is added that has a similar "interim unsafe MDN" failure mode, add it to the filter explicitly (`vendor.in.(wing_iot,new_vendor)`-style logic) rather than reverting to the broad form. Also: changing `order=` from `id.asc` to `last_notified_at.asc.nullsfirst` was deliberate — within the PostgREST 1000-row cap, stale SIMs must come first or the daily sweep can't drain a fleet > 1000.
+
+---
+
+## 2026-05-10 — Reseller-portal supports two auth modes: legacy API key (`rsk_…`) AND username/password (HMAC-signed session token `rps_…`)
+
+**Decision:** Both auth paths coexist. `authenticate(request, env)` inspects the cookie/Bearer prefix: `rsk_…` looks up `reseller_api_keys` (existing flow); `rps_…` verifies an HMAC-SHA256 signature against `PORTAL_SESSION_SECRET` and resolves the reseller via the `resellers` table. Password storage: PBKDF2-SHA256 with 100k iters, format `pbkdf2_sha256$<iters>$<salt_b64>$<hash_b64>` (Django-compatible). Username/password is **additive** — we did NOT remove API-key auth.
+
+**Why:** Resellers asked for human-friendly login, and admins wanted to be able to set/reset credentials from the dashboard. But (a) some resellers consume `/api/sims` programmatically with the Bearer header — breaking that would break integrations, and (b) the new "API Access" tab in the portal explicitly shows the API key for programmatic use, so the key flow is still primary for non-browser callers. Constant-time `verifyPassword` (with a dummy-hash branch for non-existent users) prevents user enumeration via timing.
+
+**Consequence / what not to undo:** Do NOT delete the `rsk_` branch in `authenticate()`. Do NOT change the PBKDF2 hash format without updating BOTH `src/dashboard/index.js` (`hashResellerPassword`) AND `src/reseller-portal/index.js` (`verifyPassword`) — they must stay in lock-step or no one can log in. The shared format header `pbkdf2_sha256$` is the discriminator. If you bump iterations or switch to Argon2, support reading the old format during a migration window (parse the algorithm prefix, dispatch to the right verifier). `PORTAL_SESSION_SECRET` is a Worker secret on `reseller-portal` only — rotating it logs everyone out (acceptable). Never log it.
+
+---
+
+## 2026-05-10 — Reseller-portal shows the reseller their own plaintext API key on demand (Stripe model, not GitHub model)
+
+**Decision:** The new "API Access" tab in the reseller portal calls `/api/credentials` and renders the full plaintext API key with copy buttons. This intentionally diverges from the "show once at creation, never again" model that GitHub PATs use.
+
+**Why:** A reseller logged into their own portal is by definition authorized to act as themselves; if they forget their API key, having to ping their account manager to revoke + reissue is friction without a security benefit. Stripe shows test keys and (after a delay) live keys to the authenticated account owner; the same logic applies here. The dashboard admin UI on the operator side continues to mask keys after creation (different threat model — operators view all resellers' keys, so plaintext exposure there has bigger blast radius).
+
+**Consequence / what not to undo:** Do NOT change `handleCredentials` in `src/reseller-portal/index.js` to mask the key without explicit user direction — resellers will lose self-service recovery. If we ever scale to multi-user-per-reseller, this becomes worth revisiting because not every team member should see the shared key. Note also: `reseller_api_keys.api_key` is plaintext at rest (see existing technical-debt entry in `current-state.md`); both this decision and that one assume the same trust boundary, so they should be revisited together if/when we hash keys at rest.
+
+---
+
+## 2026-05-10 — Custom domain provisioned via `routes` block in wrangler.toml (not CF dashboard UI)
+
+**Decision:** `portal.incoming-sms.com` was bound to `reseller-portal` by adding `routes = [{ pattern = "portal.incoming-sms.com", custom_domain = true }]` to `src/reseller-portal/wrangler.toml` and re-deploying with `npx wrangler deploy --env=""`. The workers.dev URL stays active alongside (`workers_dev = true`) as a fallback.
+
+**Why:** Version-controlled config beats clicking through the dashboard UI — the binding survives account moves and is reproducible if we ever recreate the worker. `custom_domain = true` (Custom Domain mode) gets full request control + automatic SSL + no proxied-DNS gotchas; `custom_domain = false` (Workers Route) requires a separate proxied DNS record and routes by URL pattern, which is unnecessary for a one-worker hostname mapping.
+
+**Consequence / what not to undo:** Do NOT delete the `routes = [...]` block from wrangler.toml — that's the source of truth for the binding. Removing it on next deploy would un-bind the domain. If you need to add a second hostname, append another entry to the array. The `workers_dev = true` line is the kill switch for the legacy `*.workers.dev` URL — keep it for the moment so cached reseller bookmarks still work; flip to `false` once migration is confirmed complete. Note: DNS NXDOMAIN cached locally can persist for several minutes after first provisioning — confirmed working via 1.1.1.1 / 8.8.8.8; client-side fixes are `ipconfig /flushdns` + browser restart, or wait out the negative TTL.
+
+---
+
+## 2026-05-10 — Rental_id captured directly from `number.online` response body and persisted on `reseller_sims.last_rental_id`
+
+**Decision:** When `reseller-sync` successfully delivers a `number.online` webhook, it parses the reseller's response body for `rentalId` (with fallbacks to `rental_id` and `id`) and writes the value to `reseller_sims.last_rental_id`. One value per (reseller, sim) pair, overwritten on each successful delivery. The portal SIMs table displays this as the primary identifier instead of ICCID. We did NOT create a separate `reseller_rentals` history table.
+
+**Why:** TrustOTP responds with `{"success":true,"rentalId":1401254}` — that's the customer-facing identifier they use internally. Showing it in the portal lets resellers correlate their dashboard view to ours without us having to know their internal mapping. The single-column-on-`reseller_sims` shape is simplest and matches the portal's "what's my CURRENT rental?" UX; if we ever need historical rental_ids for forensics, `webhook_deliveries.response_body` already has the full audit trail. Tolerant parsing (rentalId / rental_id / id, JSON + regex fallback) means other resellers don't need a code change to start populating the column.
+
+**Consequence / what not to undo:** Do NOT remove `parseRentalIdFromResponse` from `src/reseller-sync/index.js`. If you ever rename the column, update BOTH the reseller-sync writer AND the reseller-portal's `handleSims` selector. If a new reseller's response shape uses a different field name (e.g. `subscription_id`), extend the helper rather than dropping the column. The backfill (one-time) populated 2565 rows from `webhook_deliveries.response_body` — do not re-run it; new rows are populated forward-only by reseller-sync.
+
+---
+
 ## 2026-05-08 — Dashboard SPA route renamed `/gateway` → `/gateways`; legacy URL kept via ROUTE_TO_TAB alias
 
 **Decision:** The dashboard's gateway page is now `/gateways` (sidebar link, `TAB_ROUTES`, tab id `tab-gateways`, `data-tab="gateways"`, all `switchTab('gateways')` callers, `PAGE_TITLES.gateways`). Old `/gateway` URLs still resolve to the same page via a one-line legacy alias added immediately after the auto-generated `ROUTE_TO_TAB` map: `ROUTE_TO_TAB['/gateway'] = 'gateways';`.
