@@ -127,6 +127,13 @@ export default {
             { valid_to: now }
           );
 
+          // Remove from reseller's active fleet so billing & tier counts drop the SIM
+          await supabasePatch(
+            env,
+            `reseller_sims?sim_id=eq.${simId}&active=eq.true`,
+            { active: false }
+          );
+
           // Send webhook notification (if configured)
           try {
             const resellerId = await findResellerIdBySimId(env, simId);

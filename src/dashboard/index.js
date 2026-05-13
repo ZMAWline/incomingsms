@@ -215,6 +215,14 @@ export default {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
+    if (url.pathname === '/api/teltik-reconcile' && request.method === 'POST') {
+      const res = await env.TELTIK_WORKER.fetch(
+        new Request('https://teltik-worker/reconcile?secret=' + env.ADMIN_RUN_SECRET, { method: 'POST' })
+      );
+      return new Response(await res.text(), { status: res.status,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
     if (url.pathname === '/api/sync-gateway-slots' && request.method === 'POST') {
       return handleSyncGatewaySlots(request, env, corsHeaders);
     }
@@ -1901,6 +1909,12 @@ async function syncCancelledSim(env, subId, helixData) {
     } else {
       result.status_already_canceled = true;
     }
+
+    // Idempotent cancel-side cleanup: expire active sim_numbers and remove from reseller_sims.active.
+    // Filters ensure no work happens if these are already in the desired state — safe to call repeatedly.
+    const nowIsoCancel = new Date().toISOString();
+    await sbPatch(env, 'sim_numbers?sim_id=eq.' + sim.id + '&valid_to=is.null', { valid_to: nowIsoCancel });
+    await sbPatch(env, 'reseller_sims?sim_id=eq.' + sim.id + '&active=eq.true', { active: false });
 
     const hist = await sbGet(env, 'sim_status_history?sim_id=eq.' + sim.id + '&new_status=eq.canceled&limit=1');
     if (!Array.isArray(hist) || hist.length === 0) {
@@ -5735,7 +5749,7 @@ function getHTML(helixEnabled) {
     <title>SMS Gateway Dashboard</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Sofia+Sans:wght@300;400;450;500;600;700&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" defer></script>
     <script>
@@ -5837,9 +5851,9 @@ function getHTML(helixEnabled) {
             if (moon) moon.classList.toggle('hidden', !isLight);
         }
         (function() {
-            if (localStorage.getItem('theme') === 'light') {
-                document.documentElement.classList.add('light');
-            }
+            // Mastercard cream theme is now the single source of truth.
+            // Legacy 'light' / 'dark' localStorage values are ignored.
+            try { localStorage.removeItem('theme'); } catch(_) {}
         })();
 
         tailwind.config = {
@@ -5859,9 +5873,25 @@ function getHTML(helixEnabled) {
                             100: 'rgb(var(--dark-100) / <alpha-value>)',
                         },
                         accent: {
-                            DEFAULT: '#3b82f6',
-                            hover: '#2563eb',
-                            glow: 'rgba(59, 130, 246, 0.5)'
+                            DEFAULT: '#141413',
+                            hover: '#2B2B2B',
+                            glow: 'rgba(20, 20, 19, 0.25)'
+                        },
+                        signal: {
+                            DEFAULT: '#CF4500',
+                            light: '#F37338',
+                            clay: '#9A3A0A'
+                        },
+                        cream: {
+                            DEFAULT: '#F3F0EE',
+                            lifted: '#FCFBFA',
+                            paper: '#FFFFFF',
+                            border: '#D9D5CF'
+                        },
+                        ink: {
+                            DEFAULT: '#141413',
+                            soft: '#262627',
+                            mute: '#696969'
                         },
                         surface: {
                             DEFAULT: 'rgb(var(--dark-800) / <alpha-value>)',
@@ -5869,65 +5899,384 @@ function getHTML(helixEnabled) {
                         }
                     },
                     fontFamily: {
-                        sans: ['Fira Sans', 'system-ui', 'sans-serif'],
-                        mono: ['Fira Code', 'monospace'],
+                        sans: ['Sofia Sans', 'Inter', 'system-ui', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
                     }
                 }
             }
         }
     </script>
     <style>
+        /* ====================================================================
+           Mastercard-inspired design system — Canvas Cream / Ink Black
+           Single source of theme tokens. All Tailwind dark-* classes are
+           remapped through these variables; an override layer below brings
+           hard-coded Tailwind palette colors (blue/green/red/yellow/orange)
+           into the system.
+           ==================================================================== */
         :root {
-            --dark-950: 5 5 7;
-            --dark-900: 9 9 11;
-            --dark-800: 24 24 27;
-            --dark-700: 39 39 42;
-            --dark-600: 63 63 70;
-            --dark-500: 82 82 91;
-            --dark-400: 161 161 170;
-            --dark-300: 212 212 216;
-            --dark-200: 228 228 231;
-            --dark-100: 244 244 245;
+            /* Tonal scale: 950 = page canvas (lightest paper-cream),
+               100 = primary ink, monotonic toward darker as numbers descend. */
+            --dark-950: 243 240 238;   /* Canvas Cream  #F3F0EE — page bg */
+            --dark-900: 252 251 250;   /* Lifted Cream  #FCFBFA — panel bg */
+            --dark-800: 255 255 255;   /* Paper White   #FFFFFF — raised card */
+            --dark-700: 217 213 207;   /* Border Taupe  #D9D5CF — strong border */
+            --dark-600: 196 190 182;   /* Hairline      #C4BEB6 — divider */
+            --dark-500: 105 105 105;   /* Slate Gray    #696969 — muted text */
+            --dark-400: 85  85  85;    /* Granite       #555555 — body alt */
+            --dark-300: 74  74  76;    /* Charcoal soft #4A4A4C */
+            --dark-200: 38  38  39;    /* Charcoal      #262627 */
+            --dark-100: 20  20  19;    /* Ink Black     #141413 — primary text */
+            /* Identity palette */
+            --mc-canvas: #F3F0EE;
+            --mc-lifted: #FCFBFA;
+            --mc-paper:  #FFFFFF;
+            --mc-ink:    #141413;
+            --mc-soft:   #262627;
+            --mc-mute:   #696969;
+            --mc-border: #D9D5CF;
+            --mc-hair:   rgba(20, 20, 19, 0.08);
+            --mc-signal: #CF4500;
+            --mc-signal-light: #F37338;
+            --mc-clay:   #9A3A0A;
+            --mc-link:   #3860BE;
+            /* Atmospheric shadows */
+            --mc-shadow-1: 0 4px 24px rgba(0, 0, 0, 0.04);
+            --mc-shadow-2: 0 24px 48px rgba(0, 0, 0, 0.08);
+            --mc-shadow-3: 0 70px 110px rgba(0, 0, 0, 0.25);
         }
-        html.light {
-            --dark-950: 255 255 255;
-            --dark-900: 248 250 252;
-            --dark-800: 241 245 249;
-            --dark-700: 226 232 240;
-            --dark-600: 203 213 225;
-            --dark-500: 100 116 139;
-            --dark-400: 71 85 105;
-            --dark-300: 51 65 85;
-            --dark-200: 30 41 59;
-            --dark-100: 15 23 42;
+        /* html.light is preserved for backward compatibility but maps to the
+           same cream theme — there is no second theme right now. */
+        html.light { }
+
+        /* -------------------------------------------------------------------
+           Base typography  (MarkForMC → Sofia Sans substitute, weight 450 body)
+           ------------------------------------------------------------------- */
+        html, body {
+            background: var(--mc-canvas);
+            color: var(--mc-ink);
+            font-family: 'Sofia Sans', 'Inter', system-ui, sans-serif;
+            font-weight: 450;
+            font-feature-settings: 'ss01', 'cv01';
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
         }
-        html.light .text-white { color: rgb(var(--dark-100)) !important; }
-        html.light .sidebar-btn.text-white { color: #3b82f6 !important; background-color: rgba(59,130,246,0.1) !important; border-left-color: #3b82f6 !important; }
-        html.light ::-webkit-scrollbar-track { background: rgb(var(--dark-800)); }
-        html.light ::-webkit-scrollbar-thumb { background: rgb(var(--dark-600)); border-radius: 3px; }
-        /* text-gray-* classes are Tailwind built-ins that don't adapt — override for light mode */
-        html.light .text-gray-200 { color: rgb(30 41 59) !important; }
-        html.light .text-gray-300 { color: rgb(51 65 85) !important; }
-        html.light .text-gray-400 { color: rgb(71 85 105) !important; }
-        html.light .text-gray-500 { color: rgb(100 116 139) !important; }
-        html.light .text-gray-600 { color: rgb(71 85 105) !important; }
-        * { font-family: 'Inter', system-ui, sans-serif; }
+        * { font-family: 'Sofia Sans', 'Inter', system-ui, sans-serif; }
+        code, pre, .font-mono, [class*='font-mono'] {
+            font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace !important;
+        }
+        h1, h2, h3, h4 { font-weight: 500; letter-spacing: -0.02em; color: var(--mc-ink); }
+        h1 { line-height: 1.0; }
+        h2 { line-height: 1.22; }
+        h3 { line-height: 1.2; }
+        p  { line-height: 1.4; font-weight: 450; }
+
+        /* -------------------------------------------------------------------
+           Scrollbar — discreet on cream
+           ------------------------------------------------------------------- */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: var(--mc-canvas); }
+        ::-webkit-scrollbar-thumb { background: var(--mc-border); border-radius: 999px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--mc-mute); }
+
+        /* -------------------------------------------------------------------
+           Override layer — map hard-coded Tailwind palette to Mastercard tones
+           Specificity uses attribute selectors so we catch all shade variants.
+           ------------------------------------------------------------------- */
+
+        /* Default text color sweep — any "text-white" used as content text
+           becomes ink; the rule below restores actual white when nested
+           inside a colored/dark surface (buttons, badges). */
+        .text-white { color: var(--mc-ink) !important; }
+        .text-gray-100, .text-gray-200, .text-gray-300 { color: var(--mc-soft) !important; }
+        .text-gray-400, .text-gray-500 { color: var(--mc-mute) !important; }
+        .text-gray-600, .text-gray-700, .text-gray-800, .text-gray-900 { color: var(--mc-ink) !important; }
+
+        /* Restore white text when inside any colored or ink-dark surface */
+        [class*='bg-blue'] .text-white, [class*='bg-blue'].text-white,
+        [class*='bg-green'] .text-white, [class*='bg-green'].text-white,
+        [class*='bg-red'] .text-white, [class*='bg-red'].text-white,
+        [class*='bg-orange'] .text-white, [class*='bg-orange'].text-white,
+        [class*='bg-yellow'] .text-white, [class*='bg-yellow'].text-white,
+        [class*='bg-purple'] .text-white, [class*='bg-purple'].text-white,
+        [class*='bg-pink'] .text-white, [class*='bg-pink'].text-white,
+        [class*='bg-indigo'] .text-white, [class*='bg-indigo'].text-white,
+        [class*='bg-cyan'] .text-white, [class*='bg-cyan'].text-white,
+        [class*='bg-teal'] .text-white, [class*='bg-teal'].text-white,
+        [class*='bg-emerald'] .text-white, [class*='bg-emerald'].text-white,
+        [class*='bg-rose'] .text-white, [class*='bg-rose'].text-white,
+        [class*='bg-amber'] .text-white, [class*='bg-amber'].text-white,
+        [class*='bg-fuchsia'] .text-white, [class*='bg-fuchsia'].text-white,
+        [class*='bg-violet'] .text-white, [class*='bg-violet'].text-white,
+        .bg-accent .text-white, .bg-accent.text-white,
+        .bg-black .text-white, .bg-black.text-white,
+        .bg-ink .text-white, .bg-ink.text-white,
+        button.text-white, a.text-white, input.text-white,
+        [role="button"] .text-white, [role="button"].text-white
+        { color: #ffffff !important; }
+
+        /* Primary intent (blue family) → Ink Black */
+        .bg-blue-500, .bg-blue-600, .bg-blue-700, .bg-blue-800, .bg-blue-900,
+        .bg-indigo-500, .bg-indigo-600, .bg-indigo-700, .bg-indigo-800
+        { background-color: var(--mc-ink) !important; }
+        [class*='hover:bg-blue-']:hover,
+        [class*='hover:bg-indigo-']:hover
+        { background-color: var(--mc-soft) !important; }
+
+        /* Translucent blue badge backgrounds → ink tints */
+        [class*='bg-blue-500\/'], [class*='bg-blue-600\/'], [class*='bg-blue-400\/'],
+        [class*='bg-indigo-500\/'], [class*='bg-indigo-600\/']
+        { background-color: rgba(20, 20, 19, 0.08) !important; }
+
+        /* Success (green family) — deeper, muted forest */
+        .bg-green-500, .bg-green-600, .bg-green-700, .bg-green-800,
+        .bg-emerald-500, .bg-emerald-600, .bg-emerald-700, .bg-emerald-800,
+        .bg-teal-500, .bg-teal-600, .bg-teal-700, .bg-teal-800
+        { background-color: #15803d !important; }
+        [class*='hover:bg-green-']:hover,
+        [class*='hover:bg-emerald-']:hover,
+        [class*='hover:bg-teal-']:hover
+        { background-color: #166534 !important; }
+        [class*='bg-green-500\/'], [class*='bg-green-600\/'], [class*='bg-green-400\/'],
+        [class*='bg-emerald-500\/'], [class*='bg-emerald-600\/']
+        { background-color: rgba(21, 128, 61, 0.12) !important; }
+
+        /* Destructive (red family) — keep strong red but unify tone */
+        .bg-red-500, .bg-red-600, .bg-red-700, .bg-red-800,
+        .bg-rose-500, .bg-rose-600, .bg-rose-700, .bg-rose-800
+        { background-color: #B91C1C !important; }
+        [class*='hover:bg-red-']:hover,
+        [class*='hover:bg-rose-']:hover
+        { background-color: #991B1B !important; }
+        [class*='bg-red-500\/'], [class*='bg-red-600\/'], [class*='bg-red-400\/']
+        { background-color: rgba(185, 28, 28, 0.10) !important; }
+
+        /* Warning (yellow/amber family) → Signal Orange */
+        .bg-yellow-500, .bg-yellow-600, .bg-yellow-700, .bg-yellow-800,
+        .bg-amber-500, .bg-amber-600, .bg-amber-700, .bg-amber-800,
+        .bg-orange-500, .bg-orange-600, .bg-orange-700, .bg-orange-800
+        { background-color: var(--mc-signal) !important; }
+        [class*='hover:bg-yellow-']:hover,
+        [class*='hover:bg-amber-']:hover,
+        [class*='hover:bg-orange-']:hover
+        { background-color: var(--mc-clay) !important; }
+        [class*='bg-yellow-500\/'], [class*='bg-amber-500\/'], [class*='bg-orange-500\/']
+        { background-color: rgba(207, 69, 0, 0.10) !important; }
+
+        /* Text accents — preserve semantics with Mastercard tones */
+        [class*='text-blue-'] { color: var(--mc-link) !important; }
+        [class*='text-indigo-'] { color: var(--mc-link) !important; }
+        [class*='text-green-'], [class*='text-emerald-'], [class*='text-teal-'] { color: #15803d !important; }
+        [class*='text-red-'], [class*='text-rose-'] { color: #B91C1C !important; }
+        [class*='text-yellow-'], [class*='text-amber-'], [class*='text-orange-'] { color: var(--mc-signal) !important; }
+        [class*='text-purple-'], [class*='text-violet-'], [class*='text-fuchsia-'] { color: var(--mc-clay) !important; }
+
+        /* Borders — translate Tailwind white-alpha borders to ink-alpha */
+        [class*='border-white\/'] { border-color: var(--mc-hair) !important; }
+        [class*='bg-white\/']     { background-color: rgba(20, 20, 19, 0.04) !important; }
+        [class*='divide-white\/'] > * + * { border-color: var(--mc-hair) !important; }
+        .border-dark-700, .border-dark-600, .border-dark-500 { border-color: var(--mc-border) !important; }
+        .border-dark-800, .border-dark-900, .border-dark-950 { border-color: var(--mc-hair) !important; }
+
+        /* Hover states using bg-white-alpha or bg-dark-X */
+        [class*='hover:bg-white/']:hover { background-color: rgba(20, 20, 19, 0.05) !important; }
+        [class*='hover:bg-dark-']:hover { background-color: rgba(20, 20, 19, 0.04) !important; }
+
+        /* Selection */
+        ::selection { background: rgba(207, 69, 0, 0.18); color: var(--mc-ink); }
+
+        /* -------------------------------------------------------------------
+           Sidebar — pivots from dark-translucent to cream/paper
+           ------------------------------------------------------------------- */
+        #sidebar {
+            background: var(--mc-lifted) !important;
+            border-right: 1px solid var(--mc-hair);
+            backdrop-filter: none !important;
+        }
+        .sidebar-btn { transition: color 0.15s, background-color 0.15s; border-radius: 999px; margin: 2px 8px; padding-left: 18px !important; padding-right: 18px !important; }
+        .sidebar-btn { border-left-color: transparent !important; }
+        .sidebar-btn.text-white {
+            color: var(--mc-ink) !important;
+            background-color: var(--mc-canvas) !important;
+            border-left-color: transparent !important;
+        }
+        .sidebar-btn:hover { background-color: rgba(20, 20, 19, 0.04) !important; color: var(--mc-ink) !important; }
+        .sidebar-btn:focus-visible { outline: 2px solid var(--mc-ink); outline-offset: 2px; }
+
+        /* -------------------------------------------------------------------
+           Buttons — Mastercard pill system
+           ------------------------------------------------------------------- */
+        button, .btn, [role="button"] {
+            border-radius: 20px;
+            font-family: 'Sofia Sans', 'Inter', system-ui, sans-serif;
+            font-weight: 500;
+            letter-spacing: -0.01em;
+            transition: transform 0.06s ease, background-color 0.15s ease, color 0.15s ease, box-shadow 0.2s ease;
+        }
+        button:active, .btn:active { transform: translateY(0.5px); }
+
+        /* Buttons whose only background hint is text-* (no bg-*) get an
+           outlined pill treatment so they read as MC secondary buttons.
+           Skipped via the explicit bg-* rules above. */
+
+        /* Bare bg-dark-* buttons → ink outline-style */
+        button.bg-dark-700, button.bg-dark-800, button.bg-dark-600, button.bg-dark-500 {
+            background-color: var(--mc-paper) !important;
+            color: var(--mc-ink) !important;
+            border: 1.5px solid var(--mc-ink) !important;
+        }
+        button.bg-dark-700:hover, button.bg-dark-800:hover, button.bg-dark-600:hover { background-color: var(--mc-canvas) !important; }
+
+        /* Tab pills (used heavily) — let dark-700/600 act like outlined pills */
+
+        /* MC named classes for hand-tune passes */
+        .mc-pill { border-radius: 999px !important; }
+        .mc-btn-primary {
+            background-color: var(--mc-ink) !important;
+            color: var(--mc-canvas) !important;
+            border: 1.5px solid var(--mc-ink) !important;
+            padding: 8px 24px !important;
+            border-radius: 20px !important;
+            font-weight: 500 !important;
+            letter-spacing: -0.01em !important;
+        }
+        .mc-btn-primary:hover { background-color: var(--mc-soft) !important; }
+        .mc-btn-secondary {
+            background-color: var(--mc-paper) !important;
+            color: var(--mc-ink) !important;
+            border: 1.5px solid var(--mc-ink) !important;
+            padding: 8px 24px !important;
+            border-radius: 20px !important;
+            font-weight: 450 !important;
+        }
+        .mc-btn-secondary:hover { background-color: var(--mc-canvas) !important; }
+        .mc-btn-signal {
+            background-color: var(--mc-signal) !important;
+            color: #ffffff !important;
+            border: 0 !important;
+            padding: 6px 30px !important;
+            border-radius: 24px !important;
+        }
+        .mc-btn-signal:hover { background-color: var(--mc-clay) !important; }
+        .mc-btn-danger {
+            background-color: #B91C1C !important;
+            color: #ffffff !important;
+            border: 0 !important;
+            padding: 8px 24px !important;
+            border-radius: 20px !important;
+        }
+        .mc-btn-danger:hover { background-color: #991B1B !important; }
+
+        /* -------------------------------------------------------------------
+           Cards & containers
+           ------------------------------------------------------------------- */
+        .mc-card {
+            background: var(--mc-paper);
+            border: 1px solid var(--mc-hair);
+            border-radius: 24px;
+            box-shadow: var(--mc-shadow-1);
+        }
+        .mc-card-stadium {
+            border-radius: 40px;
+            background: var(--mc-paper);
+            box-shadow: var(--mc-shadow-2);
+        }
+        .mc-eyebrow {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--mc-mute);
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .mc-eyebrow::before {
+            content: "";
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--mc-signal-light);
+            display: inline-block;
+        }
+
+        /* Make every existing rounded-* on a card-like surface a bit softer */
+        .rounded-2xl { border-radius: 24px !important; }
+        .rounded-xl  { border-radius: 20px !important; }
+        .rounded-lg  { border-radius: 14px !important; }
+        .rounded     { border-radius: 10px !important; }
+        .rounded-md  { border-radius: 12px !important; }
+        .rounded-full { border-radius: 999px !important; }
+
+        /* -------------------------------------------------------------------
+           Body surface tinting — any dark-800/900/950 backgrounds default to
+           the cream paper system once the variables remap; we add additional
+           polish on common card patterns.
+           ------------------------------------------------------------------- */
+        .bg-dark-950 { background-color: var(--mc-canvas) !important; }
+        .bg-dark-900 { background-color: var(--mc-lifted) !important; }
+        .bg-dark-800 { background-color: var(--mc-paper) !important; }
+        .bg-dark-700 { background-color: var(--mc-canvas) !important; }
+
+        /* -------------------------------------------------------------------
+           Inputs — pill-friendly with ink borders
+           ------------------------------------------------------------------- */
+        input[type="text"], input[type="search"], input[type="number"], input[type="email"],
+        input[type="password"], input[type="date"], input[type="datetime-local"],
+        input[type="time"], input[type="url"], input[type="tel"],
+        textarea, select {
+            background-color: var(--mc-paper) !important;
+            color: var(--mc-ink) !important;
+            border: 1px solid var(--mc-border) !important;
+            border-radius: 14px !important;
+            font-family: 'Sofia Sans', 'Inter', system-ui, sans-serif !important;
+            font-weight: 450 !important;
+        }
+        input:focus, textarea:focus, select:focus {
+            outline: none !important;
+            border-color: var(--mc-ink) !important;
+            box-shadow: 0 0 0 3px rgba(20, 20, 19, 0.08) !important;
+        }
+        input[type="checkbox"], input[type="radio"] {
+            accent-color: var(--mc-ink);
+        }
+        ::placeholder { color: var(--mc-mute) !important; opacity: 1; }
+
+        /* -------------------------------------------------------------------
+           Tables — quieter dividers, Mastercard rhythm
+           ------------------------------------------------------------------- */
+        table { border-collapse: separate; border-spacing: 0; }
+        thead tr { border-bottom: 1px solid var(--mc-border); }
+        tbody tr { border-bottom: 1px solid var(--mc-hair); }
+        thead th {
+            color: var(--mc-mute) !important;
+            font-size: 11px !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.10em !important;
+            text-transform: uppercase !important;
+        }
+        tbody td { color: var(--mc-ink); }
+
+        /* -------------------------------------------------------------------
+           Misc UI fixes for legacy classes
+           ------------------------------------------------------------------- */
         .progress-ring { transform: rotate(-90deg); }
         .progress-ring__circle { transition: stroke-dashoffset 0.5s ease; }
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: #111118; }
-        ::-webkit-scrollbar-thumb { background: #2a2a35; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #3a3a48; }
-        .sidebar-btn { transition: color 0.15s, background-color 0.15s; }
-        .sidebar-btn.text-white { color: #3b82f6 !important; background-color: rgba(59,130,246,0.1) !important; border-left-color: #3b82f6 !important; }
-        .sidebar-btn:focus-visible { outline: 2px solid #3b82f6; outline-offset: 2px; }
+        hr { border-color: var(--mc-hair); }
+        a { color: var(--mc-ink); }
+        a:hover { color: var(--mc-link); }
+
+        /* The theme-toggle button is now decorative; hide for cleaner header */
+        #theme-toggle { display: none !important; }
+
+        /* Mobile sidebar */
         @media (max-width: 1024px) {
             .sidebar-open { transform: translateX(0) !important; }
             .sidebar-overlay-active { display: block !important; }
         }
     </style>
 </head>
-<body class="bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-dark-800 via-dark-900 to-dark-900 text-dark-100 min-h-screen selection:bg-accent/30 tracking-wide overflow-x-hidden">
+<body class="bg-cream text-ink min-h-screen selection:bg-signal/20 tracking-tight overflow-x-hidden" style="background-color:#F3F0EE;">
     <!-- Mobile Sidebar Overlay -->
     <div id="sidebar-overlay" onclick="toggleSidebar(false)" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 hidden transition-opacity duration-300"></div>
 
@@ -5935,12 +6284,12 @@ function getHTML(helixEnabled) {
         <!-- Sidebar -->
         <aside id="sidebar" class="fixed inset-y-0 left-0 w-72 bg-dark-950/80 flex flex-col py-6 border-r border-white/5 z-50 backdrop-blur-2xl transition-transform duration-300 -translate-x-full lg:translate-x-0 lg:static lg:w-64">
             <div class="flex items-center gap-3 px-6 mb-10">
-                <div class="w-9 h-9 bg-accent rounded-lg flex items-center justify-center flex-shrink-0">
-                    <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                <div class="flex items-center justify-center flex-shrink-0" style="width:44px;height:44px;background:var(--mc-ink);border-radius:50%;">
+                    <svg class="w-5 h-5" style="color:#ffffff;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
                 </div>
                 <div>
-                    <p class="text-sm font-semibold text-white leading-tight">SMS</p>
-                    <p class="text-xs text-dark-500 leading-tight">Gateway</p>
+                    <p class="leading-tight" style="font-size:15px;font-weight:500;letter-spacing:-0.01em;color:var(--mc-ink);">SMS Gateway</p>
+                    <p class="leading-tight" style="font-size:11px;font-weight:700;letter-spacing:0.10em;text-transform:uppercase;color:var(--mc-mute);margin-top:2px;">Operator</p>
                 </div>
             </div>
             <nav class="flex flex-col gap-1 px-2">
@@ -5994,10 +6343,10 @@ function getHTML(helixEnabled) {
                     <span class="text-sm">API Tester</span>
                 </a>
             </nav>
-            <div class="mt-auto px-2">
-                <button onclick="loadData()" class="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-dark-400 hover:text-accent hover:bg-dark-600 transition" title="Refresh">
-                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                    <span class="text-sm">Refresh</span>
+            <div class="mt-auto px-6 pb-4">
+                <button onclick="loadData()" class="w-full inline-flex items-center justify-center gap-2 transition" title="Refresh" style="padding:8px 24px;border-radius:999px;background:var(--mc-paper);border:1.5px solid var(--mc-ink);color:var(--mc-ink);font-size:14px;font-weight:500;">
+                    <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                    <span>Refresh data</span>
                 </button>
             </div>
         </aside>
@@ -6005,32 +6354,36 @@ function getHTML(helixEnabled) {
         <!-- Main Content -->
         <main class="flex-1 w-full min-w-0 overflow-auto">
             <!-- Mobile Top Header -->
-            <div class="lg:hidden flex items-center justify-between p-4 bg-dark-950/50 border-b border-white/5 backdrop-blur-md sticky top-0 z-30">
+            <div class="lg:hidden flex items-center justify-between p-4 sticky top-0 z-30" style="background:var(--mc-lifted);border-bottom:1px solid var(--mc-hair);">
                 <div class="flex items-center gap-3">
-                    <div class="w-8 h-8 bg-accent rounded flex items-center justify-center">
-                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                    <div class="flex items-center justify-center" style="width:36px;height:36px;background:var(--mc-ink);border-radius:50%;">
+                        <svg class="w-4 h-4" style="color:#ffffff;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
                     </div>
-                    <span class="font-bold text-white tracking-tight">SMS Gateway</span>
+                    <span style="font-size:15px;font-weight:500;letter-spacing:-0.01em;color:var(--mc-ink);">SMS Gateway</span>
                 </div>
-                <button onclick="toggleSidebar(true)" class="p-2 text-dark-400 hover:text-white transition">
+                <button onclick="toggleSidebar(true)" class="p-2 transition" style="color:var(--mc-ink);">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
                 </button>
             </div>
 
             <div class="p-4 lg:p-8">
             <!-- Header -->
-            <header class="flex flex-col md:flex-row md:items-center justify-between mb-8 pb-4 border-b border-white/5 gap-4">
+            <header class="flex flex-col md:flex-row md:items-end justify-between mb-10 pb-6 gap-4" style="border-bottom:1px solid var(--mc-hair);">
                 <div>
-                    <h1 class="text-3xl font-bold text-white tracking-tight">SMS Gateway</h1>
-                    <p class="text-sm text-dark-400 mt-1 font-medium">Monitor SIMs, messages, and system status</p>
+                    <span class="mc-eyebrow" id="page-eyebrow">Overview</span>
+                    <h1 id="page-title" class="mt-3 tracking-tight" style="font-size:40px;font-weight:500;letter-spacing:-0.02em;line-height:1.05;color:var(--mc-ink);">Dashboard</h1>
+                    <p id="page-subtitle" class="mt-2" style="font-size:15px;font-weight:450;color:var(--mc-mute);max-width:640px;line-height:1.45;">Monitor SIMs, messages, and system status</p>
                 </div>
-                <div class="flex items-center gap-4">
+                <div class="flex items-center gap-3 pb-1">
                     <button id="theme-toggle" onclick="toggleLightMode()" class="p-1.5 rounded-lg text-dark-400 hover:text-dark-100 hover:bg-dark-700/50 transition" title="Toggle light mode">
                         <svg id="theme-icon-sun" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707M17.657 17.657l-.707-.707M6.343 6.343l-.707-.707M12 8a4 4 0 100 8 4 4 0 000-8z"/></svg>
                         <svg id="theme-icon-moon" class="w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
                     </button>
-                    <span id="last-updated" class="text-xs text-dark-500"></span>
-                    <div class="w-2 h-2 bg-accent rounded-full animate-pulse" title="Connected"></div>
+                    <span id="last-updated" class="text-xs" style="color:var(--mc-mute);"></span>
+                    <span class="inline-flex items-center gap-2 py-1.5 px-3" style="background:var(--mc-paper);border:1px solid var(--mc-hair);border-radius:999px;font-size:12px;font-weight:500;color:var(--mc-ink);">
+                      <span class="w-1.5 h-1.5 rounded-full animate-pulse" style="background:#15803d;"></span>
+                      <span>Connected</span>
+                    </span>
                 </div>
             </header>
 
@@ -8741,6 +9094,29 @@ function getHTML(helixEnabled) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
             const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
+            const PAGE_HEADERS = {
+                dashboard:   ['Overview',       'Dashboard',          'Monitor SIMs, messages, and system status.'],
+                sims:        ['Inventory',      'SIMs',               'Browse, filter, and manage every SIM card in the fleet.'],
+                messages:    ['Inbox',          'Messages',           'Recent inbound SMS captured across the gateway fleet.'],
+                workers:     ['Infrastructure', 'Workers',            'Trigger maintenance jobs and review worker activity.'],
+                gateways:    ['Hardware',       'Gateways',           'SkyLine gateway health, port status, and slot capacity.'],
+                'imei-pool': ['Identity',       'IMEI Pool',          'Pool of device identifiers available for assignment.'],
+                errors:      ['Incidents',      'Errors',             'Recent worker errors and activation failures.'],
+                invoicing:   ['Billing',        'Invoicing',          'Reseller plans, QuickBooks mappings, and invoices.'],
+                billing:     ['Billing',        'Reseller Billing',   'Charging audit, billing ledger, and plan rates.'],
+                'sms-usage': ['Analytics',      'SMS Usage',          'Inbound SMS volume per SIM over time.'],
+                guide:       ['Reference',      'Operations Guide',   'Cheat sheet for everyday dashboard operations.'],
+                'api-tester':['Tools',          'API Tester',         'Make raw requests against internal APIs for debugging.']
+            };
+            const _hdr = PAGE_HEADERS[tabName];
+            const _eb = document.getElementById('page-eyebrow');
+            const _tl = document.getElementById('page-title');
+            const _st = document.getElementById('page-subtitle');
+            if (_hdr) {
+                if (_eb) _eb.textContent = _hdr[0];
+                if (_tl) _tl.textContent = _hdr[1];
+                if (_st) _st.textContent = _hdr[2];
+            }
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }

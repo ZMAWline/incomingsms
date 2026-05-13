@@ -31,6 +31,14 @@ export default {
       return handleTeltikSmsWebhook(request, env);
     }
 
+    // Lifecycle webhook (sim.activated / sim.canceled / sim.swapped).
+    // HMAC-SHA256 of the raw body against TELTIK_LIFECYCLE_SECRET, header
+    // X-Teltik-Signature: sha256=<hex>. Returns 2xx fast; processing is sync
+    // but cheap (one event at a time) so no need for ctx.waitUntil yet.
+    if (url.pathname === '/lifecycle-webhook' && request.method === 'POST') {
+      return handleTeltikLifecycleWebhook(request, env);
+    }
+
     if (url.pathname === '/rotate' && request.method === 'POST') {
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
         return new Response('Unauthorized', { status: 401 });
@@ -72,6 +80,18 @@ export default {
       try {
         const result = await setupTeltikForwardUrl(env);
         return jsonResponse(result, result.ok ? 200 : 500);
+      } catch (err) {
+        return jsonResponse({ ok: false, error: String(err) }, 500);
+      }
+    }
+
+    if (url.pathname === '/reconcile') {
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      try {
+        const result = await reconcileWithTeltik(env);
+        return jsonResponse(result, 200);
       } catch (err) {
         return jsonResponse({ ok: false, error: String(err) }, 500);
       }
@@ -249,6 +269,84 @@ async function importTeltikLines(env) {
   }
 
   return { ok: true, imported, updated, unchanged };
+}
+
+// =========================================================
+// RECONCILE — compare Teltik's authoritative line list against our DB.
+// Returns counts + the ICCID/MDN sets that are out of sync.
+// =========================================================
+async function reconcileWithTeltik(env) {
+  const apiKey = env.TELTIK_API_KEY;
+  const res = await relayFetch(env, `${TELTIK_BASE}/v1/all-lines/?apikey=${apiKey}`);
+  if (!res.ok) throw new Error(`Teltik all-lines failed: ${res.status} ${await res.text()}`);
+  const lines = await res.json();
+  if (!Array.isArray(lines)) throw new Error('Teltik returned non-array');
+
+  // Pull every Teltik ICCID we know about from our DB (paginated to bypass PostgREST 1000-row cap).
+  const dbRows = await supabaseGetAllArray(env, `sims?vendor=eq.teltik&select=id,iccid,status`);
+  const dbByIccid = new Map();
+  const simIdToIccid = new Map();
+  for (const r of dbRows) {
+    dbByIccid.set(String(r.iccid), r.status);
+    simIdToIccid.set(r.id, r.iccid);
+  }
+
+  // Active sim_numbers for the MDN-→ICCID fast path (paginated).
+  const activeNums = await supabaseGetAllArray(env, `sim_numbers?valid_to=is.null&select=sim_id,e164`);
+  const e164ToSimId = new Map();
+  for (const n of activeNums) e164ToSimId.set(String(n.e164), n.sim_id);
+
+  const teltikIccids = new Set();
+  const unmatchedByMdn = [];
+  for (const line of lines) {
+    const rawMdn = line.mdn || line.phone_number || line.number || line.phonenumber || '';
+    if (!rawMdn) continue;
+    const mdn = normalizeToE164(rawMdn);
+    let iccid = line.iccid || '';
+    if (!iccid && mdn) {
+      const simId = e164ToSimId.get(mdn);
+      if (simId) iccid = simIdToIccid.get(simId) || '';
+    }
+    if (iccid) {
+      teltikIccids.add(String(iccid));
+    } else {
+      unmatchedByMdn.push({ mdn, line });
+    }
+  }
+
+  // For unmatched-by-MDN, call get-info to resolve their ICCID (slow path).
+  const unresolved = [];
+  for (const u of unmatchedByMdn) {
+    if (!u.mdn) { unresolved.push(u); continue; }
+    await sleep(120);
+    const mdnDigits = u.mdn.replace('+', '');
+    const r = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${apiKey}&mdn=${encodeURIComponent(mdnDigits)}`);
+    if (!r.ok) { unresolved.push({ ...u, error: `get-info ${r.status}` }); continue; }
+    const info = await r.json();
+    if (info.iccid) teltikIccids.add(String(info.iccid));
+    else unresolved.push({ ...u, info });
+  }
+
+  const dbIccids = new Set(dbByIccid.keys());
+  const dbActiveIccids = new Set([...dbByIccid.entries()].filter(([_, s]) => s === 'active').map(([k]) => k));
+
+  const inTeltikNotInDb = [...teltikIccids].filter(i => !dbIccids.has(i));
+  const inTeltikButCanceledInDb = [...teltikIccids].filter(i => dbByIccid.get(i) === 'canceled');
+  const activeInDbNotInTeltik = [...dbActiveIccids].filter(i => !teltikIccids.has(i));
+
+  return {
+    ok: true,
+    teltik_line_count: lines.length,
+    teltik_resolved_iccids: teltikIccids.size,
+    teltik_unresolved: unresolved.length,
+    db_teltik_total: dbIccids.size,
+    db_teltik_active: dbActiveIccids.size,
+    db_teltik_canceled: dbIccids.size - dbActiveIccids.size,
+    in_teltik_not_in_db: inTeltikNotInDb,
+    in_teltik_but_canceled_in_db: inTeltikButCanceledInDb,
+    active_in_db_not_in_teltik: activeInDbNotInTeltik,
+    unresolved_lines: unresolved.slice(0, 10),
+  };
 }
 
 // =========================================================
@@ -653,6 +751,35 @@ async function supabaseGetArray(env, path) {
   return Array.isArray(data) ? data : [];
 }
 
+// Paginated fetch that bypasses the PostgREST 1000-row cap by chunking via
+// Range headers. `path` MUST NOT include &limit= or &offset=.
+async function supabaseGetAllArray(env, path) {
+  const all = [];
+  const pageSize = 1000;
+  let offset = 0;
+  while (true) {
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+      method: 'GET',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        Range: `${offset}-${offset + pageSize - 1}`,
+        'Range-Unit': 'items',
+      },
+    });
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : []; } catch { data = []; }
+    if (!res.ok) throw new Error(`Supabase ${res.status}: ${JSON.stringify(data)}`);
+    if (!Array.isArray(data) || data.length === 0) break;
+    all.push(...data);
+    if (data.length < pageSize) break;
+    offset += pageSize;
+    if (offset > 50000) break; // safety stop
+  }
+  return all;
+}
+
 async function supabaseGetOne(env, path) {
   const rows = await supabaseGetArray(env, path);
   return rows[0] || null;
@@ -887,4 +1014,268 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
   }
 
   return result;
+}
+
+// =========================================================
+// LIFECYCLE WEBHOOK — sim.activated / sim.canceled / sim.swapped
+// Auth: HMAC-SHA256 of raw body with TELTIK_LIFECYCLE_SECRET.
+// Dedup: event_id is PK on teltik_lifecycle_events.
+// =========================================================
+async function handleTeltikLifecycleWebhook(request, env) {
+  const rawBody = await request.text();
+  const signature = request.headers.get('X-Teltik-Signature') || '';
+
+  if (!env.TELTIK_LIFECYCLE_SECRET) {
+    console.error('[Lifecycle] TELTIK_LIFECYCLE_SECRET not configured');
+    return new Response('Unauthorized', { status: 401 });
+  }
+  const sigOk = await verifyHmacSha256(rawBody, signature, env.TELTIK_LIFECYCLE_SECRET);
+  if (!sigOk) {
+    console.warn('[Lifecycle] HMAC verification failed');
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  let body;
+  try { body = JSON.parse(rawBody); } catch { return new Response('Invalid JSON', { status: 400 }); }
+
+  const eventId = body && body.event_id;
+  const eventType = body && body.event_type;
+  const occurredAt = body && body.occurred_at;
+  const data = body && body.data;
+  if (!eventId || !eventType || !occurredAt || !data) {
+    return new Response('Invalid envelope', { status: 400 });
+  }
+
+  // Insert dedup row. If event_id already exists, the upsert is a no-op and
+  // we return early so re-deliveries don't re-apply the side effects.
+  const insRes = await fetch(`${env.SUPABASE_URL}/rest/v1/teltik_lifecycle_events?on_conflict=event_id`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=ignore-duplicates,return=minimal',
+    },
+    body: JSON.stringify([{ event_id: eventId, event_type: eventType, occurred_at: occurredAt, data }]),
+  });
+  if (!insRes.ok && insRes.status !== 409) {
+    const t = await insRes.text();
+    console.error(`[Lifecycle] dedup insert failed ${insRes.status}: ${t}`);
+    return jsonResponse({ ok: false, error: 'dedup insert failed' }, 500);
+  }
+
+  const existing = await supabaseGetOne(
+    env,
+    `teltik_lifecycle_events?event_id=eq.${encodeURIComponent(eventId)}&select=event_id,processed_at&limit=1`
+  );
+  if (existing && existing.processed_at) {
+    return jsonResponse({ ok: true, dedup: true, event_id: eventId }, 200);
+  }
+
+  let outcome = 'noop';
+  let errMsg = null;
+  let simId = null;
+  try {
+    if (eventType === 'sim.activated') {
+      ({ outcome, simId } = await applyTeltikActivation(env, data));
+    } else if (eventType === 'sim.canceled' || eventType === 'sim.cancelled') {
+      ({ outcome, simId } = await applyTeltikCancellation(env, data));
+    } else if (eventType === 'sim.swapped') {
+      ({ outcome, simId } = await applyTeltikSwap(env, data));
+    } else {
+      outcome = 'noop';
+      errMsg = `unknown event_type: ${eventType}`;
+    }
+  } catch (err) {
+    outcome = 'error';
+    errMsg = String(err).slice(0, 1000);
+    console.error(`[Lifecycle] ${eventType} handler error:`, err);
+  }
+
+  await supabasePatch(env, `teltik_lifecycle_events?event_id=eq.${encodeURIComponent(eventId)}`, {
+    processed_at: new Date().toISOString(),
+    outcome,
+    error: errMsg,
+    sim_id: simId,
+  }).catch(() => {});
+
+  return jsonResponse({ ok: outcome !== 'error', event_id: eventId, outcome, sim_id: simId }, outcome === 'error' ? 500 : 200);
+}
+
+// data: { iccid, msisdn, plan? }
+async function applyTeltikActivation(env, data) {
+  const iccid = (data.iccid || '').trim();
+  const rawMdn = data.msisdn || data.mdn || '';
+  const mdnE164 = normalizeToE164(rawMdn);
+  const mdnBare = rawMdn ? String(rawMdn).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
+  if (!iccid || !mdnE164) return { outcome: 'noop', simId: null };
+
+  const nowIso = new Date().toISOString();
+  const upsertRes = await supabaseUpsert(env, 'sims', {
+    iccid,
+    vendor: 'teltik',
+    carrier: 'tmobile',
+    rotation_interval_hours: 48,
+    status: 'active',
+    msisdn: mdnBare,
+    activated_at: nowIso,
+    last_mdn_rotated_at: nowIso,
+    last_rotation_at: nowIso,
+    rotation_status: 'success',
+    last_rotation_error: null,
+  }, 'iccid');
+  if (!upsertRes.ok) throw new Error(`sims upsert failed: ${upsertRes.status}`);
+
+  const simRow = await supabaseGetOne(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`);
+  if (!simRow) return { outcome: 'error', simId: null };
+
+  const cur = await supabaseGetArray(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null&select=e164&limit=1`);
+  const curE164 = cur[0]?.e164;
+  if (curE164 !== mdnE164) {
+    if (curE164) {
+      await supabasePatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, { valid_to: nowIso });
+    }
+    await supabaseInsert(env, 'sim_numbers', [{
+      sim_id: simRow.id,
+      e164: mdnE164,
+      valid_from: nowIso,
+      verification_status: 'verified',
+    }]);
+  }
+  return { outcome: 'applied', simId: simRow.id };
+}
+
+// data: { iccid, msisdn?, reason? }
+async function applyTeltikCancellation(env, data) {
+  const iccid = (data.iccid || '').trim();
+  if (!iccid) return { outcome: 'noop', simId: null };
+
+  const simRow = await supabaseGetOne(
+    env,
+    `sims?iccid=eq.${encodeURIComponent(iccid)}&vendor=eq.teltik&select=id&limit=1`
+  );
+  if (!simRow) return { outcome: 'noop', simId: null };
+
+  await supabasePatch(env, `sims?id=eq.${simRow.id}`, {
+    status: 'canceled',
+    status_reason: data.reason ? `teltik:${data.reason}` : 'teltik_lifecycle_webhook',
+  });
+  await supabasePatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, {
+    valid_to: new Date().toISOString(),
+  });
+  await supabasePatch(env, `reseller_sims?sim_id=eq.${simRow.id}&active=eq.true`, {
+    active: false,
+  });
+  return { outcome: 'applied', simId: simRow.id };
+}
+
+// data: { old_iccid, new_iccid, old_msisdn?, new_msisdn?, reason? }
+async function applyTeltikSwap(env, data) {
+  const oldIccid = (data.old_iccid || '').trim();
+  const newIccid = (data.new_iccid || '').trim();
+  if (!oldIccid || !newIccid) return { outcome: 'noop', simId: null };
+
+  const simRow = await supabaseGetOne(
+    env,
+    `sims?iccid=eq.${encodeURIComponent(oldIccid)}&vendor=eq.teltik&select=id,iccid,msisdn,rotation_interval_hours&limit=1`
+  );
+  if (!simRow) {
+    console.log(`[Lifecycle/swap] no sim for old_iccid=${oldIccid}`);
+    return { outcome: 'noop', simId: null };
+  }
+
+  const nowIso = new Date().toISOString();
+  const rawNewMdn = data.new_msisdn || data.new_mdn || '';
+  const newMdnE164 = rawNewMdn ? normalizeToE164(rawNewMdn) : null;
+  const newMdnBare = rawNewMdn ? String(rawNewMdn).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
+  const mdnChanged = newMdnBare && simRow.msisdn !== newMdnBare;
+
+  const patch = {
+    iccid: newIccid,
+    status: 'active',
+    rotation_status: 'success',
+    last_rotation_error: null,
+  };
+  if (mdnChanged) {
+    patch.msisdn = newMdnBare;
+    // Treat the swap as a successful rotation — reset the cycle clock so we don't
+    // burn a rotation right after Teltik just handed us a fresh MDN.
+    patch.last_rotation_at = nowIso;
+    patch.last_mdn_rotated_at = nowIso;
+  }
+  await supabasePatch(env, `sims?id=eq.${simRow.id}`, patch);
+
+  if (mdnChanged && newMdnE164) {
+    await supabasePatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, { valid_to: nowIso });
+    await supabaseInsert(env, 'sim_numbers', [{
+      sim_id: simRow.id,
+      e164: newMdnE164,
+      valid_from: nowIso,
+      verification_status: 'verified',
+    }]);
+    try {
+      await sendTeltikSwapWebhooks(env, simRow, newIccid, newMdnE164, newMdnBare, nowIso);
+    } catch (err) {
+      console.error(`[Lifecycle/swap] reseller webhook err: ${err}`);
+    }
+  }
+
+  return { outcome: 'applied', simId: simRow.id };
+}
+
+async function sendTeltikSwapWebhooks(env, sim, newIccid, newE164, newMsisdnBare, rotatedAtIso) {
+  const rows = await supabaseGetArray(
+    env,
+    `reseller_sims?sim_id=eq.${sim.id}&active=eq.true&select=reseller_id,resellers!inner(reseller_webhooks(url,enabled))&limit=1`
+  );
+  const resellerId = rows[0]?.reseller_id;
+  const webhook = rows[0]?.resellers?.reseller_webhooks?.find(w => w.enabled);
+  const webhookUrl = webhook?.url;
+  if (!resellerId || !webhookUrl) return;
+
+  // Old number goes offline (only if there was a prior MDN).
+  if (sim.msisdn) {
+    const oldE164 = normalizeToE164(sim.msisdn);
+    await sendWebhookWithDeduplication(env, webhookUrl, {
+      event_type: 'number.offline',
+      created_at: new Date().toISOString(),
+      data: {
+        sim_id: sim.id, number: oldE164, online: false, carrier: 'T-Mobile',
+        iccid: sim.iccid, verified: true,
+      },
+    }, { idComponents: { simId: sim.id, iccid: sim.iccid, number: oldE164, kind: 'swap_offline' }, resellerId });
+  }
+
+  // New number online — online_until from the fresh rotation stamp.
+  const intervalHours = sim.rotation_interval_hours || 48;
+  const onlineUntil = midnightNYAfterInterval(rotatedAtIso, intervalHours);
+  const onlineRes = await sendWebhookWithDeduplication(env, webhookUrl, {
+    event_type: 'number.online',
+    created_at: new Date().toISOString(),
+    data: {
+      sim_id: sim.id, number: newE164, online: true, online_until: onlineUntil,
+      carrier: 'T-Mobile', iccid: newIccid, mobilitySubscriptionId: null, verified: true,
+    },
+  }, { idComponents: { simId: sim.id, iccid: newIccid, number: newE164, kind: 'swap_online' }, resellerId });
+
+  if (onlineRes.ok) {
+    await supabasePatch(env, `sims?id=eq.${sim.id}`, { last_notified_at: new Date().toISOString() }).catch(() => {});
+  }
+}
+
+async function verifyHmacSha256(rawBody, signatureHeader, secret) {
+  if (!signatureHeader || !secret) return false;
+  const sigHex = signatureHeader.startsWith('sha256=') ? signatureHeader.slice(7) : signatureHeader;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sigBuf = await crypto.subtle.sign('HMAC', key, enc.encode(rawBody));
+  const expectedHex = Array.from(new Uint8Array(sigBuf))
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+  if (expectedHex.length !== sigHex.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expectedHex.length; i++) diff |= expectedHex.charCodeAt(i) ^ sigHex.charCodeAt(i);
+  return diff === 0;
 }

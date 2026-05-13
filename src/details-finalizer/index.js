@@ -254,7 +254,10 @@ async function runWingIotFinalizer(env, limit) {
         msisdn: msisdnBare,
         status: 'active',
       };
-      if (isPostRotation) patch.rotation_status = 'success';
+      if (isPostRotation) {
+        patch.rotation_status = 'success';
+        patch.last_rotation_at = new Date().toISOString();
+      }
       // Backfill activated_at when it's null (first time the SIM becomes usable).
       // Never override an existing date — that's the real activation timestamp.
       if (!sim.activated_at) patch.activated_at = new Date().toISOString();
@@ -352,6 +355,9 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
               msisdn: msisdnBare,
               last_rotation_error: null,
             };
+            // Real rotation (prior MDN replaced) → stamp success time.
+            // First-activation reconcile (no prior MDN) → leave last_rotation_at null.
+            if (sim.msisdn && sim.msisdn !== msisdnBare) patch.last_rotation_at = new Date().toISOString();
             if (!sim.activated_at) patch.activated_at = new Date().toISOString();
             await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
             try {
@@ -538,6 +544,9 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
             msisdn: msisdnBare,
             last_rotation_error: null,
           };
+          // Real rotation (prior MDN replaced) → stamp success time.
+          // First-activation reconcile (no prior MDN) → leave last_rotation_at null.
+          if (sim.msisdn && sim.msisdn !== msisdnBare) patch.last_rotation_at = new Date().toISOString();
           if (!sim.activated_at) patch.activated_at = new Date().toISOString();
           await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
           if (webhookFires < MAX_WEBHOOK_FIRES) {
@@ -822,6 +831,7 @@ async function runTeltikFinalizer(env, limit) {
         msisdn: msisdnBare,
         status: 'active',
         rotation_status: 'success',
+        last_rotation_at: new Date().toISOString(),
         last_rotation_error: null,
       });
 
@@ -994,6 +1004,7 @@ async function runAtomicFinalizer(env, limit) {
         msisdn: newMsisdn,
         status: 'active',
         rotation_status: 'success',
+        last_rotation_at: new Date().toISOString(),
         last_rotation_error: null,
       });
 

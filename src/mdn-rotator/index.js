@@ -833,6 +833,8 @@ export default {
             subscriberState: "Cancel",
           }, runId, iccid, "manual_cancel");
           await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: 'canceled' });
+          await supabasePatch(env, `sim_numbers?sim_id=eq.${encodeURIComponent(String(sim_id))}&valid_to=is.null`, { valid_to: new Date().toISOString() });
+          await supabasePatch(env, `reseller_sims?sim_id=eq.${encodeURIComponent(String(sim_id))}&active=eq.true`, { active: false });
           return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
@@ -1592,10 +1594,12 @@ async function rotateWingIotSim(env, sim, opts = {}) {
     throw new Error('Wing IoT credentials not configured on mdn-rotator worker');
   }
 
-  // Atomic dedup: the RPC stamps last_mdn_rotated_at, last_rotation_at,
+  // Atomic dedup: the RPC stamps last_mdn_rotated_at (cadence gate),
   // rotation_status='rotating', and rotation_source in one UPDATE. If it returns
   // false, some other process has the slot (or SIM is ineligible) — MUST NOT
-  // call the carrier API or we'd burn an extra MDN.
+  // call the carrier API or we'd burn an extra MDN. last_rotation_at is NOT
+  // stamped here — it gets stamped only on success completion in
+  // updateSimRotationTimestamp / details-finalizer.
   const claimed = await claimRotationSlot(env, sim.id, force);
   if (!claimed) {
     console.log(`SIM ${iccid}: wing_iot claim_rotation_slot=false — skipping`);
@@ -2058,6 +2062,8 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
   if (rotateHelixStatus === 'canceled' || rotateHelixStatus === 'cancelled') {
     console.log(`SIM ${iccid}: subscriber is CANCELED in Helix — updating DB and skipping rotation`);
     await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { status: 'canceled' });
+    await supabasePatch(env, `sim_numbers?sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null`, { valid_to: new Date().toISOString() });
+    await supabasePatch(env, `reseller_sims?sim_id=eq.${encodeURIComponent(String(sim.id))}&active=eq.true`, { active: false });
     return;
   }
 
