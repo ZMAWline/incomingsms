@@ -1359,11 +1359,21 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
       });
       lastStatus = res.status;
       const responseBody = await res.text().catch(() => '');
-      if (res.ok) return { ok: true, status: res.status, attempts: attempt, responseBody };
-      if (res.status >= 400 && res.status < 500) {
+      if (res.ok) {
+        // number.online: 2xx is only a true success if the reseller echoes a rentalId.
+        // Incident 2026-05-11 16:59:57Z: TrustOTP returned 200 with empty body for a
+        // ~53s batch; we marked 168 SIMs delivered, no rentals were created on their
+        // side, and the next-day per-day dedup hid the gap.
+        if (payload?.event_type === 'number.online' && parseRentalIdFromResponse(responseBody) == null) {
+          lastError = `2xx with no rentalId (status ${res.status}, body ${responseBody.slice(0, 200) || '<empty>'})`;
+        } else {
+          return { ok: true, status: res.status, attempts: attempt, responseBody };
+        }
+      } else if (res.status >= 400 && res.status < 500) {
         return { ok: false, status: res.status, attempts: attempt, error: `Client error: ${res.status}`, responseBody };
+      } else {
+        lastError = `Server error ${res.status}: ${responseBody.slice(0, 200)}`;
       }
-      lastError = `Server error ${res.status}: ${responseBody.slice(0, 200)}`;
     } catch (err) {
       lastError = `Network error: ${String(err)}`;
       lastStatus = 0;
@@ -1371,6 +1381,27 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
     if (attempt <= maxRetries) await sleep(initialDelayMs * Math.pow(2, attempt - 1));
   }
   return { ok: false, status: lastStatus, attempts: maxRetries + 1, error: lastError, responseBody: lastError };
+}
+
+// Loose rentalId extractor; matches TrustOTP's {"rentalId":N} and any reseller that
+// returns rental_id / id. Used by postWebhookWithRetry to validate number.online 2xx.
+function parseRentalIdFromResponse(body) {
+  if (!body) return null;
+  const s = String(body);
+  try {
+    const obj = JSON.parse(s);
+    const v = obj && (obj.rentalId ?? obj.rental_id ?? obj.id);
+    if (v != null) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  } catch {}
+  const m = s.match(/"rental[_]?[Ii]d"\s*:\s*([0-9]+)/);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
 }
 
 function sleep(ms) {

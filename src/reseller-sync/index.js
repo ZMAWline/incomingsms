@@ -382,17 +382,25 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
       const responseBody = await res.text().catch(() => '');
 
       if (res.ok) {
-        console.log(`[Webhook] Success ${res.status} for ${messageId} after ${attempt} attempt(s)`);
-        return { ok: true, status: res.status, attempts: attempt, responseBody };
-      }
-
-      if (res.status >= 400 && res.status < 500) {
+        // number.online: 2xx is only a true success if the reseller echoes a rentalId.
+        // Incident 2026-05-11 16:59:57Z: TrustOTP returned 200 with empty body for a
+        // ~53s batch; we marked 168 SIMs delivered, no rentals were created on their
+        // side, and the next-day per-day dedup hid the gap. Retry on empty body; if
+        // retries fail, status='failed' is written and the daily backstop picks it up.
+        if (payload?.event_type === 'number.online' && parseRentalIdFromResponse(responseBody) == null) {
+          lastError = `2xx with no rentalId (status ${res.status}, body ${responseBody.slice(0, 200) || '<empty>'})`;
+          console.log(`[Webhook] ${lastError} for ${messageId} — retrying`);
+        } else {
+          console.log(`[Webhook] Success ${res.status} for ${messageId} after ${attempt} attempt(s)`);
+          return { ok: true, status: res.status, attempts: attempt, responseBody };
+        }
+      } else if (res.status >= 400 && res.status < 500) {
         console.log(`[Webhook] Client error ${res.status} for ${messageId}: ${responseBody.slice(0, 200)}`);
         return { ok: false, status: res.status, attempts: attempt, error: `Client error: ${res.status}`, responseBody };
+      } else {
+        lastError = `Server error ${res.status}: ${responseBody.slice(0, 200)}`;
+        console.log(`[Webhook] ${lastError} for ${messageId}`);
       }
-
-      lastError = `Server error ${res.status}: ${responseBody.slice(0, 200)}`;
-      console.log(`[Webhook] ${lastError} for ${messageId}`);
 
     } catch (err) {
       lastError = `Network error: ${String(err)}`;
