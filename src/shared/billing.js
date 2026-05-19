@@ -303,3 +303,202 @@ export async function computeBillingBreakdown(env, { resellerId, start, end }) {
     },
   };
 }
+
+// Read-only utilization audit. For a reseller and a window [start, end] (EST
+// dates), counts how many of their currently-active assigned SIMs received
+// at least one inbound SMS during the window, per vendor. Returns the idle
+// SIM list so the operator can see exactly which ICCIDs went dark.
+//
+// "Active in window" = any sim_sms_daily row in [start, end] with sms_count>0.
+// This is a coarser predicate than billing's per-rotation-block check — a SIM
+// active on a window-edge day of an unrotated block would count here but not
+// bill. Acceptable for the question "is the customer using these SIMs?".
+export async function computeResellerUtilization(env, { resellerId, start, end, vendors }) {
+  const vendorList = (Array.isArray(vendors) && vendors.length)
+    ? vendors
+    : ['teltik', 'atomic', 'helix', 'wing_iot'];
+
+  const rsRows = await sbGetAll(env,
+    'reseller_sims?select=sim_id,created_at,sims!inner(id,iccid,vendor,status,rotation_interval_hours,' +
+    'sim_numbers(e164,valid_to),' +
+    'sim_sms_daily(est_date,sms_count))' +
+    '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+    '&active=eq.true' +
+    '&sims.status=eq.active' +
+    '&sims.vendor=in.(' + vendorList.map(encodeURIComponent).join(',') + ')' +
+    '&order=sim_id.asc'
+  );
+
+  const byVendor = new Map(); // vendor -> { total_active, active_in_window, idle: [], all: [] }
+  for (const v of vendorList) byVendor.set(v, { total_active: 0, active_in_window: 0, idle: [], all: [] });
+
+  // For Teltik block-level computation we need per-SIM smsDays Set + interval.
+  const allSmsDaysBySim = new Map();
+  const teltikIntervalBySim = new Map();
+  const teltikRecordById = new Map();
+
+  for (const rs of (Array.isArray(rsRows) ? rsRows : [])) {
+    const sim = rs.sims;
+    if (!sim || !byVendor.has(sim.vendor)) continue;
+    const bucket = byVendor.get(sim.vendor);
+    bucket.total_active += 1;
+
+    // Current MDN: sim_numbers row with valid_to=null
+    let currentE164 = null;
+    if (Array.isArray(sim.sim_numbers)) {
+      for (const n of sim.sim_numbers) {
+        if (n && n.valid_to == null) { currentE164 = n.e164; break; }
+      }
+    }
+
+    // SMS aggregation
+    let smsDaysInWindow = 0;
+    let smsTotalInWindow = 0;
+    let lastSmsDate = null;
+    const allDays = new Set();
+    if (Array.isArray(sim.sim_sms_daily)) {
+      for (const row of sim.sim_sms_daily) {
+        if (!row || !row.est_date || !(row.sms_count > 0)) continue;
+        allDays.add(row.est_date);
+        if (lastSmsDate == null || row.est_date > lastSmsDate) lastSmsDate = row.est_date;
+        if (row.est_date >= start && row.est_date <= end) {
+          smsDaysInWindow += 1;
+          smsTotalInWindow += Number(row.sms_count) || 0;
+        }
+      }
+    }
+    allSmsDaysBySim.set(sim.id, allDays);
+
+    const record = {
+      sim_id: sim.id,
+      iccid: sim.iccid,
+      current_e164: currentE164,
+      last_sms_date: lastSmsDate,
+      sms_days_in_window: smsDaysInWindow,
+      sms_total_in_window: smsTotalInWindow,
+      assigned_since: rs.created_at || null,
+      // Block-level (populated below for Teltik only)
+      blocks_in_window: null,
+      blocks_billed: null,
+      blocks_idle: null,
+      block_utilization_pct: null,
+      idle_block_dates: null,
+    };
+    bucket.all.push(record);
+    if (smsDaysInWindow > 0) bucket.active_in_window += 1;
+    else bucket.idle.push(record);
+
+    if (sim.vendor === 'teltik') {
+      teltikIntervalBySim.set(sim.id, sim.rotation_interval_hours || 48);
+      teltikRecordById.set(sim.id, record);
+    }
+  }
+
+  // Block-level for Teltik. Mirrors computeBillingBreakdown's block iteration:
+  // a block = one rotation event (sim_numbers.valid_from); it's billable iff
+  // any covered EST day had SMS. Fetch rotations in a wider window so blocks
+  // straddling the edges are accounted for.
+  const teltikBucket = byVendor.get('teltik');
+  if (teltikBucket && teltikRecordById.size > 0) {
+    const teltikSimIds = Array.from(teltikRecordById.keys());
+    const wideStart = new Date(start + 'T00:00:00Z');
+    wideStart.setUTCDate(wideStart.getUTCDate() - 2);
+    const wideEnd = new Date(end + 'T00:00:00Z');
+    wideEnd.setUTCDate(wideEnd.getUTCDate() + 3);
+    const rotations = await sbGetAll(env,
+      'sim_numbers?select=sim_id,valid_from&sim_id=in.(' + teltikSimIds.join(',') + ')' +
+      '&valid_from=gte.' + encodeURIComponent(wideStart.toISOString()) +
+      '&valid_from=lt.' + encodeURIComponent(wideEnd.toISOString()) +
+      '&order=sim_id.asc,valid_from.asc'
+    );
+
+    const rotsBySim = new Map();
+    for (const r of (Array.isArray(rotations) ? rotations : [])) {
+      if (!rotsBySim.has(r.sim_id)) rotsBySim.set(r.sim_id, []);
+      rotsBySim.get(r.sim_id).push(new Date(r.valid_from));
+    }
+
+    let totalBlocks = 0, billedBlocks = 0;
+    for (const [simId, rec] of teltikRecordById) {
+      const rots = rotsBySim.get(simId) || [];
+      const intervalMs = (teltikIntervalBySim.get(simId) || 48) * 3600 * 1000;
+      const smsDays = allSmsDaysBySim.get(simId) || new Set();
+      let blocksInWindow = 0, billed = 0;
+      const idleDates = [];
+      for (let i = 0; i < rots.length; i++) {
+        const rotStart = rots[i];
+        const rotNext = rots[i + 1];
+        const blockEnd = new Date(Math.min(
+          rotStart.getTime() + intervalMs,
+          rotNext ? rotNext.getTime() : Number.POSITIVE_INFINITY
+        ));
+        const startEst = estDateFromDate(rotStart);
+        if (startEst < start || startEst > end) continue;
+        blocksInWindow += 1;
+        const endEstInclusive = estDateFromDate(new Date(blockEnd.getTime() - 1000));
+        let hasSms = false;
+        for (let cur = startEst; cur <= endEstInclusive; cur = nextEstDate(cur)) {
+          if (smsDays.has(cur)) { hasSms = true; break; }
+        }
+        if (hasSms) billed += 1;
+        else idleDates.push(startEst);
+      }
+      rec.blocks_in_window = blocksInWindow;
+      rec.blocks_billed = billed;
+      rec.blocks_idle = blocksInWindow - billed;
+      rec.block_utilization_pct = blocksInWindow > 0
+        ? +(billed / blocksInWindow * 100).toFixed(1)
+        : null;
+      rec.idle_block_dates = idleDates;
+      totalBlocks += blocksInWindow;
+      billedBlocks += billed;
+    }
+
+    teltikBucket.total_blocks = totalBlocks;
+    teltikBucket.billed_blocks = billedBlocks;
+    teltikBucket.idle_blocks = totalBlocks - billedBlocks;
+    teltikBucket.block_utilization_pct = totalBlocks > 0
+      ? +(billedBlocks / totalBlocks * 100).toFixed(1)
+      : null;
+  }
+
+  const result = [];
+  for (const v of vendorList) {
+    const b = byVendor.get(v);
+    // Sort idle list: never-used first, then oldest last_sms_date first
+    b.idle.sort((a, b2) => {
+      if (a.last_sms_date == null && b2.last_sms_date != null) return -1;
+      if (a.last_sms_date != null && b2.last_sms_date == null) return 1;
+      if (a.last_sms_date == null && b2.last_sms_date == null) return 0;
+      return a.last_sms_date < b2.last_sms_date ? -1 : a.last_sms_date > b2.last_sms_date ? 1 : 0;
+    });
+    // For Teltik, also sort `all` by blocks_idle DESC (worst first) so the
+    // dashboard table surfaces underutilized SIMs at the top.
+    if (v === 'teltik') {
+      b.all.sort((a, b2) => (b2.blocks_idle || 0) - (a.blocks_idle || 0));
+    }
+    result.push({
+      vendor: v,
+      total_active: b.total_active,
+      active_in_window: b.active_in_window,
+      idle_count: b.total_active - b.active_in_window,
+      utilization_pct: b.total_active > 0
+        ? +(b.active_in_window / b.total_active * 100).toFixed(1)
+        : null,
+      // Teltik-only block-level fields (null for AT&T vendors):
+      total_blocks: b.total_blocks != null ? b.total_blocks : null,
+      billed_blocks: b.billed_blocks != null ? b.billed_blocks : null,
+      idle_blocks: b.idle_blocks != null ? b.idle_blocks : null,
+      block_utilization_pct: b.block_utilization_pct != null ? b.block_utilization_pct : null,
+      idle: b.idle,
+      all: b.all,
+    });
+  }
+
+  return {
+    reseller_id: resellerId,
+    start,
+    end,
+    vendors: result,
+  };
+}

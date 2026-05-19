@@ -1,4 +1,4 @@
-import { computeBillingBreakdown } from '../shared/billing.js';
+import { computeBillingBreakdown, computeResellerUtilization } from '../shared/billing.js';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -270,6 +270,10 @@ export default {
 
     if (url.pathname === '/api/billing/preview') {
       return handleBillingPreview(url, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/utilization') {
+      return handleUtilization(url, env, corsHeaders);
     }
 
     if (url.pathname === '/api/billing/download-invoice') {
@@ -4238,6 +4242,29 @@ async function handleBillingPreview(url, env, corsHeaders) {
     return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
+async function handleUtilization(url, env, corsHeaders) {
+  try {
+    const resellerId = url.searchParams.get('reseller_id');
+    const days = Math.max(1, Math.min(90, parseInt(url.searchParams.get('days') || '7', 10) || 7));
+    const vendorParam = url.searchParams.get('vendor');
+    if (!resellerId) {
+      return new Response(JSON.stringify({ error: 'reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    // Window: last `days` calendar days in EST, inclusive of today.
+    const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' });
+    const now = new Date();
+    const end = fmt.format(now);
+    const startD = new Date(now.getTime());
+    startD.setUTCDate(startD.getUTCDate() - (days - 1));
+    const start = fmt.format(startD);
+    const vendors = vendorParam ? vendorParam.split(',').map(s => s.trim()).filter(Boolean) : null;
+    const result = await computeResellerUtilization(env, { resellerId, start, end, vendors });
+    return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
 async function handleBillingCreateInvoice(request, env, corsHeaders) {
   // Kept for backward compatibility but no longer called by the UI.
   return new Response(JSON.stringify({ error: 'Use /api/billing/download-invoice' }), { status: 410, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -7093,6 +7120,65 @@ function getHTML(helixEnabled) {
                     <h2 class="text-xl font-bold text-white">Invoicing</h2>
                 </div>
 
+                <!-- SIM Utilization Audit -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-semibold text-white">SIM Utilization Audit</h3>
+                        <span class="text-xs text-gray-500">Read-only — Teltik shows block-level (each 48h block billable iff ≥1 SMS); AT&amp;T shows SIM-level (any SMS in window)</span>
+                    </div>
+                    <p class="text-sm text-gray-400 mb-4">For Teltik: how many of the 48h rotation blocks in the window had traffic (this matches what you actually bill). For AT&amp;T: how many SIMs received SMS at all. Lists worst-utilized SIMs first.</p>
+
+                    <div class="flex flex-wrap items-end gap-3 mb-4">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">Reseller</label>
+                            <select id="util-reseller" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 min-w-[200px]"><option value="">Loading…</option></select>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">Vendor</label>
+                            <select id="util-vendor" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                                <option value="teltik" selected>Teltik</option>
+                                <option value="atomic">ATOMIC (AT&amp;T)</option>
+                                <option value="helix">Helix</option>
+                                <option value="wing_iot">Wing IoT</option>
+                                <option value="teltik,atomic,helix,wing_iot">All vendors</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">Window</label>
+                            <select id="util-days" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                                <option value="7" selected>Last 7 days</option>
+                                <option value="14">Last 14 days</option>
+                                <option value="30">Last 30 days</option>
+                            </select>
+                        </div>
+                        <button onclick="runUtilizationAudit()" id="util-run-btn" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Run Audit</button>
+                        <label class="flex items-center gap-2 text-sm text-gray-400 ml-2"><input type="checkbox" id="util-show-all" onchange="renderUtilizationTable()"> Show fully-utilized SIMs too</label>
+                        <button onclick="exportUtilizationCsv()" id="util-export-btn" class="px-3 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition hidden">Export CSV</button>
+                    </div>
+
+                    <div id="util-summary" class="hidden mb-4"></div>
+                    <div id="util-table-wrap" class="hidden overflow-x-auto max-h-[32rem] overflow-y-auto">
+                        <table class="w-full text-sm">
+                            <thead class="sticky top-0 bg-dark-800">
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-3 py-2 font-medium">Vendor</th>
+                                    <th class="px-3 py-2 font-medium">ICCID</th>
+                                    <th class="px-3 py-2 font-medium">Current MDN</th>
+                                    <th class="px-3 py-2 font-medium">Blocks (window)</th>
+                                    <th class="px-3 py-2 font-medium">Billed</th>
+                                    <th class="px-3 py-2 font-medium">Idle blocks</th>
+                                    <th class="px-3 py-2 font-medium">Block util %</th>
+                                    <th class="px-3 py-2 font-medium">Idle block dates</th>
+                                    <th class="px-3 py-2 font-medium">Last SMS</th>
+                                    <th class="px-3 py-2 font-medium">SMS days</th>
+                                    <th class="px-3 py-2 font-medium">Total SMS</th>
+                                </tr>
+                            </thead>
+                            <tbody id="util-table" class="text-gray-200"></tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- Customer Mapping -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <div class="flex items-center justify-between mb-3">
@@ -9121,7 +9207,7 @@ function getHTML(helixEnabled) {
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); }
+            if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
             if (tabName === 'sims') { loadRotationAudit(); try { syncSimsUrl(); } catch(e){} }
@@ -14953,6 +15039,173 @@ async function sendSimOnline(simId, phoneNumber) {
             if (!isoStr) return '-';
             const d = new Date(isoStr);
             return (d.getMonth()+1) + '/' + d.getDate() + '/' + d.getFullYear();
+        }
+
+        let _utilLastResult = null;
+        let _utilLastQuery = null;
+
+        async function loadUtilizationResellers() {
+            try {
+                const sel = document.getElementById('util-reseller');
+                if (!sel) return;
+                if (sel.dataset.loaded === '1') return;
+                const resp = await fetch(API_BASE + '/resellers');
+                if (!resp.ok) { sel.innerHTML = '<option value="">Failed to load</option>'; return; }
+                const list = await resp.json();
+                if (!Array.isArray(list) || list.length === 0) {
+                    sel.innerHTML = '<option value="">No resellers</option>';
+                    return;
+                }
+                const opts = list.map(r => '<option value="' + r.id + '">' + (r.name || ('Reseller #' + r.id)) + '</option>').join('');
+                sel.innerHTML = opts;
+                // Default to TrustOTP if present (case-insensitive match)
+                const trust = list.find(r => (r.name || '').toLowerCase().includes('trustotp'));
+                if (trust) sel.value = String(trust.id);
+                sel.dataset.loaded = '1';
+            } catch (e) { console.error('loadUtilizationResellers:', e); }
+        }
+
+        async function runUtilizationAudit() {
+            const rid = document.getElementById('util-reseller').value;
+            const vendor = document.getElementById('util-vendor').value;
+            const days = document.getElementById('util-days').value;
+            if (!rid) { showToast('Pick a reseller first', 'error'); return; }
+            const btn = document.getElementById('util-run-btn');
+            const orig = btn.textContent;
+            btn.disabled = true; btn.textContent = 'Running…';
+            try {
+                const url = API_BASE + '/utilization?reseller_id=' + encodeURIComponent(rid) +
+                    '&days=' + encodeURIComponent(days) + '&vendor=' + encodeURIComponent(vendor);
+                const resp = await fetch(url);
+                const data = await resp.json();
+                if (!resp.ok) { showToast('Audit failed: ' + (data.error || resp.status), 'error'); return; }
+                _utilLastResult = data;
+                _utilLastQuery = { reseller_id: rid, vendor: vendor, days: days };
+                renderUtilizationSummary();
+                renderUtilizationTable();
+                document.getElementById('util-export-btn').classList.remove('hidden');
+            } catch (e) {
+                console.error('runUtilizationAudit:', e);
+                showToast('Audit failed: ' + String(e), 'error');
+            } finally {
+                btn.disabled = false; btn.textContent = orig;
+            }
+        }
+
+        function renderUtilizationSummary() {
+            const wrap = document.getElementById('util-summary');
+            if (!_utilLastResult) { wrap.classList.add('hidden'); return; }
+            const vendors = _utilLastResult.vendors || [];
+            const cards = vendors.map(v => {
+                // For Teltik prefer block-level pct (the metric that drives the bill);
+                // for AT&T vendors fall back to SIM-level (their billing is per SIM-day).
+                const isTeltik = v.vendor === 'teltik';
+                const primaryPct = isTeltik ? v.block_utilization_pct : v.utilization_pct;
+                const color = (primaryPct == null) ? 'gray' : (primaryPct >= 99 ? 'green' : (primaryPct >= 90 ? 'yellow' : 'red'));
+                const barColor = color === 'green' ? 'bg-accent' : color === 'yellow' ? 'bg-yellow-500' : color === 'red' ? 'bg-red-500' : 'bg-gray-500';
+                const txtColor = color === 'green' ? 'text-accent' : color === 'yellow' ? 'text-yellow-400' : color === 'red' ? 'text-red-400' : 'text-gray-400';
+                const pctTxt = (primaryPct == null) ? '—' : (primaryPct.toFixed(1) + '%');
+                const barWidth = (primaryPct == null) ? 0 : Math.max(0, Math.min(100, primaryPct));
+                let bigLine, subLine;
+                if (isTeltik && v.total_blocks != null) {
+                    bigLine = v.billed_blocks + ' / ' + v.total_blocks + ' blocks';
+                    subLine = pctTxt + ' utilized • ' + v.idle_blocks + ' idle blocks • ' + v.active_in_window + '/' + v.total_active + ' SIMs active';
+                } else {
+                    bigLine = v.active_in_window + ' / ' + v.total_active + ' SIMs';
+                    subLine = pctTxt + ' utilized • ' + v.idle_count + ' idle';
+                }
+                return '<div class="bg-dark-700 rounded-lg p-3 border border-dark-600">' +
+                    '<p class="text-xs text-gray-500 uppercase">' + v.vendor + (isTeltik ? ' (block-level)' : ' (SIM-level)') + '</p>' +
+                    '<p class="text-2xl font-bold ' + txtColor + '">' + bigLine + '</p>' +
+                    '<p class="text-xs text-gray-400 mb-2">' + subLine + '</p>' +
+                    '<div class="w-full bg-dark-900 rounded-full h-2"><div class="' + barColor + ' h-2 rounded-full" style="width:' + barWidth + '%"></div></div>' +
+                '</div>';
+            }).join('');
+            const range = '<p class="text-xs text-gray-500 mb-2">Window: ' + _utilLastResult.start + ' to ' + _utilLastResult.end + ' (EST)</p>';
+            wrap.innerHTML = range + '<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">' + cards + '</div>';
+            wrap.classList.remove('hidden');
+        }
+
+        function renderUtilizationTable() {
+            const wrap = document.getElementById('util-table-wrap');
+            const tbody = document.getElementById('util-table');
+            if (!_utilLastResult) { wrap.classList.add('hidden'); return; }
+            const showAll = document.getElementById('util-show-all').checked;
+            const rows = [];
+            for (const v of (_utilLastResult.vendors || [])) {
+                const isTeltik = v.vendor === 'teltik';
+                let list;
+                if (showAll) {
+                    list = v.all || [];
+                } else if (isTeltik) {
+                    // Show SIMs that contributed to the leak: have at least one idle block.
+                    list = (v.all || []).filter(r => (r.blocks_idle || 0) > 0);
+                } else {
+                    list = v.idle || [];
+                }
+                for (const r of list) {
+                    const lastSms = r.last_sms_date || 'never';
+                    const blocksWin = (r.blocks_in_window != null) ? r.blocks_in_window : '—';
+                    const billed = (r.blocks_billed != null) ? r.blocks_billed : '—';
+                    const idle = (r.blocks_idle != null) ? r.blocks_idle : '—';
+                    const blockPct = (r.block_utilization_pct != null) ? (r.block_utilization_pct.toFixed(1) + '%') : '—';
+                    const blockPctColor = (r.block_utilization_pct == null) ? 'text-gray-400' : (r.block_utilization_pct >= 99 ? 'text-accent' : (r.block_utilization_pct >= 90 ? 'text-yellow-400' : 'text-red-400'));
+                    const idleDates = (r.idle_block_dates && r.idle_block_dates.length) ? r.idle_block_dates.join(', ') : '—';
+                    const rowClass = ((r.blocks_idle || 0) > 0) ? 'border-b border-dark-700 bg-dark-900/40' : 'border-b border-dark-700';
+                    rows.push('<tr class="' + rowClass + '">' +
+                        '<td class="px-3 py-2 text-gray-400 text-xs">' + v.vendor + '</td>' +
+                        '<td class="px-3 py-2 font-mono text-xs text-gray-300">' + (r.iccid || '-') + '</td>' +
+                        '<td class="px-3 py-2 font-mono text-xs text-gray-300">' + (r.current_e164 || '-') + '</td>' +
+                        '<td class="px-3 py-2 text-gray-300">' + blocksWin + '</td>' +
+                        '<td class="px-3 py-2 text-gray-300">' + billed + '</td>' +
+                        '<td class="px-3 py-2 ' + ((r.blocks_idle || 0) > 0 ? 'text-red-400 font-semibold' : 'text-gray-300') + '">' + idle + '</td>' +
+                        '<td class="px-3 py-2 ' + blockPctColor + '">' + blockPct + '</td>' +
+                        '<td class="px-3 py-2 text-gray-400 text-xs">' + idleDates + '</td>' +
+                        '<td class="px-3 py-2 text-gray-300">' + lastSms + '</td>' +
+                        '<td class="px-3 py-2 text-gray-300">' + r.sms_days_in_window + '</td>' +
+                        '<td class="px-3 py-2 text-gray-300">' + r.sms_total_in_window + '</td>' +
+                    '</tr>');
+                }
+            }
+            tbody.innerHTML = rows.length
+                ? rows.join('')
+                : '<tr><td colspan="11" class="px-3 py-4 text-center text-gray-500">' + (showAll ? 'No SIMs.' : 'No SIMs with idle blocks — 100% block utilization.') + '</td></tr>';
+            wrap.classList.remove('hidden');
+        }
+
+        function exportUtilizationCsv() {
+            if (!_utilLastResult) return;
+            const showAll = document.getElementById('util-show-all').checked;
+            const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+            const headers = ['vendor','iccid','current_e164','blocks_in_window','blocks_billed','blocks_idle','block_utilization_pct','idle_block_dates','last_sms_date','sms_days_in_window','sms_total_in_window','assigned_since'];
+            const lines = [headers.map(esc).join(',')];
+            for (const v of (_utilLastResult.vendors || [])) {
+                const isTeltik = v.vendor === 'teltik';
+                let list;
+                if (showAll) list = v.all || [];
+                else if (isTeltik) list = (v.all || []).filter(r => (r.blocks_idle || 0) > 0);
+                else list = v.idle || [];
+                for (const r of list) {
+                    lines.push([
+                        v.vendor, r.iccid || '', r.current_e164 || '',
+                        r.blocks_in_window == null ? '' : r.blocks_in_window,
+                        r.blocks_billed == null ? '' : r.blocks_billed,
+                        r.blocks_idle == null ? '' : r.blocks_idle,
+                        r.block_utilization_pct == null ? '' : r.block_utilization_pct,
+                        r.idle_block_dates ? r.idle_block_dates.join('|') : '',
+                        r.last_sms_date || '', r.sms_days_in_window, r.sms_total_in_window,
+                        r.assigned_since || ''
+                    ].map(esc).join(','));
+                }
+            }
+            const blob = new Blob([lines.join('\\n')], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const q = _utilLastQuery || {};
+            a.href = url;
+            a.download = 'utilization_' + (q.reseller_id || 'r') + '_' + (q.vendor || 'v') + '_' + (q.days || 'd') + 'd.csv';
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            URL.revokeObjectURL(url);
         }
 
         async function loadBillAuditHistory() {
