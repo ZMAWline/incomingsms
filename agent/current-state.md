@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-12 (session 52 — Mastercard-inspired dashboard redesign, test-env only)
+> Last updated: 2026-05-20 (session 56 — Apex PPU-then-MDN Phase 0 + Phase 1 complete; Phases 2-5 pending)
 
 ---
 
@@ -25,6 +25,33 @@
 ---
 
 ## In Progress / Pending Work
+
+### Apex PPU-then-MDN — Phases 0 + 1 done; Phases 2-5 pending (session 56, 2026-05-20)
+**Status: DB ready, picker built, address pool seeded. NO production rotator change yet. Workers built against new `.mjs` imports but NOT redeployed — current prod still uses old `.js` import path + 25-entry pool.**
+
+**Plan:** `docs/superpowers/plans/2026-05-20-apex-ppu-then-mdn.md` (6 phases, ~25 tasks). **Spec:** `docs/superpowers/specs/2026-05-20-apex-ppu-then-mdn-design.md`.
+
+**Done in this session (8 commits, none pushed):**
+- **Phase 0 (DB):** applied two migrations via Supabase MCP: `address_pool_usage` (table + 2 indexes + `claim_address_pool_entry(text,text)` plpgsql RPC using `FOR UPDATE SKIP LOCKED`, granted to `service_role`) and `sims_canary_apex_ppu` (`canary_apex_ppu boolean NOT NULL DEFAULT false`). RPC smoke-tested: returns LRU pick, honors `excludeState`/`excludeZip` predicates, increments `use_count` + `last_used_at`.
+- **Phase 1.1 (verifier):** `scripts/verify-address-pool.mjs` — ESM check for 6 required string fields, no dup ids, no dup zips per state, ≥20 zips per state across 51 states (50 + DC). Fails non-zero on the old 25-entry pool by design.
+- **Phase 1.2 (pool expansion):** `src/shared/address-pool.mjs` rewritten with **1122 civic addresses** (22 per state × 51 states), each with stable id slug `<state-lower>-<zip>-<street-slug>`. Followed up with a fix commit that corrected HI city/zip mismatches (96741, 96732), replaced 2 DC PO-Box-only ZIPs (20013, 20025) with retail-delivery ZIPs, and regenerated 367 id slugs that had drifted from their `zipCode` field. Low-confidence states flagged for spot-check if AT&T later rejects PPU addresses: HI, AK, WY, VT, ND (some entries derived from pattern knowledge rather than verified lookups).
+- **Phase 1.3 (picker + tests):** `src/shared/address-picker.mjs` exports `APEX_VENDORS`, `isApexVendor`, `pickNextPpuAddress(env, opts)`, `seedAddressPoolUsage(env)`. Uses bare `fetch()` (Supabase is relay-exempt). 6 unit tests in `tests/address-picker.test.mjs` cover happy path, exhaustion, HTTP error, db-id-not-in-pool. Tests properly save/restore `globalThis.fetch` in `try/finally`.
+- **Phase 1.4 (seed):** `scripts/seed-address-pool.mjs` committed. Actual seeding done via Supabase MCP (4 batches of ~300 rows each) — verified final state `row_count = 1122, states = 51, unused = 1122`.
+
+**Forced collateral change (worth knowing):** Because `package.json` has `"type": "commonjs"`, Node treats `.js` files as CommonJS and cannot `import` from them. To let both Cloudflare Workers AND Node test/seed scripts share the address pool, `src/shared/address-pool.js` was **renamed to `.mjs`** and ESM-purified. Import paths in `src/bulk-activator/index.js:1` and `src/mdn-rotator/index.js:2` were updated to `../shared/address-pool.mjs`. **Both worker files are committed with the new path but NOT redeployed.** Deploying them now would only switch their random-pool size from 25 → 1122 (still using `pickRandomAddress`, not the new LRU picker — Phase 2/3 wire the picker in). Risk of leaving them un-deployed: zero (prod still works on the deployed bundle). Risk of cherry-picking a worker deploy from main without applying both worker files: zero, because both already have the `.mjs` path. See `decision-log.md` 2026-05-20 entry for full context.
+
+**To finish (Phases 2-5):**
+- **Phase 2** — atomic rotation: add `atomicUpdateSubscriberInfo` helper in mdn-rotator, insert PPU-update step before `swapMSISDN` behind `APEX_PPU_THEN_MDN_ENABLED` env flag + `sims.canary_apex_ppu` per-SIM gate, deploy flag-off, then flip one SIM's `canary_apex_ppu = true` and verify 4-step audit trail (`pre_swap_inquiry → ppu_update → mdn_change → subscriber_inquiry`).
+- **Phase 3** — activation/retry sites: swap `pickRandomAddress` → `pickNextPpuAddress` in the activate + retry-activate functions in mdn-rotator (~lines 3303 and 3358).
+- **Phase 4** — helix: add `hxUpdateSubscriberDetails` to `src/shared/helix.ts`, mirror Phase 2 wiring in the helix rotation branch.
+- **Phase 5** — expand canary to full fleet after 24h+48h stability checks, remove the canary gate, drop deprecated `pickRandomAddress`, update `.claude/skills/atomic-api/SKILL.md` with Rule 5 (PPU before swap), append `agent/constraints.md` §<N>.
+
+**Hot starts for the next session:**
+- Pick up at Phase 2 (Task 2.1 in the plan). The picker is already exported and tested; just import it into the rotator.
+- Worker deploys for `bulk-activator` and `mdn-rotator` are queued behind Phase 2 — no need to deploy in isolation.
+- Plan references say `address-pool.js` / `address-picker.js` in many places — translate every such reference to `.mjs` when reading the plan tasks.
+
+---
 
 ### PR-B: in-window retry for failed Teltik rotations — code staged, migration not applied (session 55, 2026-05-20)
 **Status: code on disk in `src/teltik-worker/index.js`, NOT deployed. Migration file at `supabase/migrations/20260520_claim_rotation_retry_slot.sql`, NOT applied to Supabase.**

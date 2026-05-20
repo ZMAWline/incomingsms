@@ -4,6 +4,34 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-20 — Shared modules consumed by both Workers and Node scripts use `.mjs` extension, not `.js`
+
+**Decision:** During Phase 1 of the Apex PPU-then-MDN rollout, `src/shared/address-pool.js` was **renamed to `src/shared/address-pool.mjs`** and `src/shared/address-picker.mjs` was created with the same extension. Both files export ESM (`export const`, `export function`) and are imported from both (a) Cloudflare Workers (`src/bulk-activator/index.js`, `src/mdn-rotator/index.js`) and (b) Node test scripts (`tests/address-picker.test.mjs`) and seeders (`scripts/seed-address-pool.mjs`, `scripts/verify-address-pool.mjs`). The worker imports were updated to use the `.mjs` path. The plan document (`docs/superpowers/plans/2026-05-20-apex-ppu-then-mdn.md`) still references the `.js` filename throughout — translate to `.mjs` when reading Phase 2+ tasks.
+
+**Why:** `package.json` declares `"type": "commonjs"`, so Node treats `.js` files as CommonJS. Node's `import` statement cannot import a `.js` file under a CommonJS-typed package — it errors or fails to find named exports. The address-pool module needs to be importable from **both** sides:
+- **Workers:** wrangler+esbuild bundles arbitrary file extensions and ESM works in `.js` files under any package type — so workers don't care which extension.
+- **Node scripts (verifier, tests, seeder):** these run under raw Node, which respects `package.json` `"type"` and requires `.mjs` for ESM under a CommonJS package.
+
+Two alternatives were considered and rejected:
+1. **Flip `package.json` to `"type": "module"`** — would have let `.js` stay `.js` cleanly. Rejected because the project has one CommonJS file (`src/mdn-rotator/_patch_queue_token.js`, a dev helper) that would have needed renaming to `.cjs`, and the change affects how Node interprets *every* `.js` file in the repo — potential subtle effects on root-level dev scripts (`_check_frontend_js.js`, `_check_relay.js`, `fix_both.js`) that weren't going to be verified exhaustively in-session. The blast radius was too wide for what's effectively a one-file problem.
+2. **Use `require()` / dynamic `import()` in the Node scripts** — would have let the workers keep `.js` but made the test/seeder code messier and forced async-IIFE wrapping. Rejected as ugly.
+
+The `.mjs` rename is one file (plus updating two worker import lines), zero runtime risk, and clearly localized.
+
+**Consequence / what not to undo:** Going forward, **any shared `src/shared/*.js` module that needs to be importable from Node scripts must be `.mjs`** (or pure CommonJS with `module.exports`, but that loses ESM ergonomics). Other `src/shared/*.ts` files (`atomic.ts`, `helix.ts`, `wing-iot.ts`, `supabase.ts`, `utils.ts`, `types.ts`) and `.js` files (`subscriber-sync.js`, `billing.js`) are consumed only by workers via wrangler bundling — they don't have this constraint unless tests/scripts start importing them. Do NOT flip `package.json` to `"type": "module"` casually; if you do, audit every root-level `.js` script for CommonJS-only constructs first (`require`, `module.exports`, `__dirname`, `__filename`). The plan-doc references to `.js` filenames for address-pool/address-picker should be considered **stale** — translate to `.mjs` when executing Phase 2+ tasks. The plan was written before this constraint surfaced.
+
+---
+
+## 2026-05-20 — Address pool seeding done via Supabase MCP, not via the script we just committed
+
+**Decision:** Although `scripts/seed-address-pool.mjs` is committed and works, the actual 1122-row seed of `address_pool_usage` was performed via four `mcp__supabase__execute_sql` batched `INSERT … ON CONFLICT (address_id) DO NOTHING` statements, not by running the script. The script is committed as a future-use tool for re-seeding after pool changes; the initial seed is already in Supabase.
+
+**Why:** The script requires `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE` env vars in the local shell. Those aren't stored as plain env in this workspace — they're wrangler secrets, not exported to bash. The MCP path bypasses the env-var requirement entirely and accomplishes the same idempotent upsert. Either path produces the same DB state.
+
+**Consequence / what not to undo:** Future re-seeds (e.g. after appending entries to the static pool) can use either approach. The script remains the canonical "what to run when an operator wants to seed locally" path; the MCP approach is for in-Claude-session work where exporting secrets to bash isn't convenient. If anyone wants to *delete* the script later for being "unused," don't — operators outside Claude need it.
+
+---
+
 ## 2026-05-20 — In-window retry for failed Teltik rotations uses a sibling RPC, not a `last_mdn_rotated_at` column split
 
 **Decision:** When extending the rotation system to allow failed-today Teltik SIMs to be retried by subsequent cron ticks within the same 12–6am NY window, **do NOT** alter `claim_rotation_slot` semantics or introduce a new `last_rotation_attempt_at` column. Instead add a **sibling RPC** `claim_rotation_retry_slot(p_sim_id bigint)` whose predicate is strictly scoped to Teltik + `rotation_status='failed'` + failed-today + 15-min backoff. `rotateOneTeltikSim(env, sim, { retry: true })` branches on the new flag and calls the sibling RPC instead of the main one. Everything below the claim (change-number call, error handling, finalizer handoff) is identical for both paths.
