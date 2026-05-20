@@ -1,5 +1,5 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
-import { pickRandomAddress } from '../shared/address-pool.js';
+import { pickRandomAddress } from '../shared/address-pool.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER

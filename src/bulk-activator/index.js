@@ -1,4 +1,4 @@
-import { pickRandomAddress } from '../shared/address-pool.js';
+import { pickRandomAddress } from '../shared/address-pool.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER

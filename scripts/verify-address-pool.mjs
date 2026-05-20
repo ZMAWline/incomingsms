@@ -1,6 +1,4 @@
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const { ADDRESS_POOL } = require('../src/shared/address-pool.js');
+import { ADDRESS_POOL } from '../src/shared/address-pool.mjs';
 
 const REQUIRED_FIELDS = ['id', 'streetNumber', 'streetName', 'city', 'state', 'zipCode'];
 const MIN_ZIPS_PER_STATE = 20;
