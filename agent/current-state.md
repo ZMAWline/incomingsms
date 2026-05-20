@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-20 (session 56 — Apex PPU-then-MDN Phase 0 + Phase 1 complete; Phases 2-5 pending)
+> Last updated: 2026-05-20 (session 57 — Apex PPU-then-MDN Phase 2 closed; pool replaced with OSM-sourced data + self-heal layer; canary live on SIM 2619)
 
 ---
 
@@ -21,35 +21,45 @@
 - **Billing Ledger: 149 phantom Apr-5 helix rows for SIMs canceled in March** — `regenerateLedgerForVendor` bulk-fetches `sim_status_history` ordered by `changed_at desc` in chunks of 200 SIM IDs; with ~625 helix SIMs and lots of recent activity, the older March cancel rows fall off the page-1 cap so `findCancelTimestamp` returns null for those SIMs and the loop generates cycles all the way to today. **Fix:** filter the history query to terminal-status rows only (`new_status=in.(canceled,cancelled,error,abandoned)`) — shrinks result by ~10× so pagination never truncates. Verified pattern: SQL query with that filter returns the correct cancel ts for SIM 9 (2026-03-20). Quick patch — defer to next session unless user wants it now.
 - **`WING_EXPECTED_RATE = "5.00"` env var on dashboard worker is unused** — replaced by `plan_rates` table lookup. Remove from `src/dashboard/wrangler.toml` `[vars]` block when convenient. Harmless if left in.
 - **Bill audits stored before 2026-05-07 may have stale discrepancy_type/expected_price** — pre-session-46 audits compared each line against the rate active *today* rather than the rate active on the line's `from_date`. If a rate changed since the audit was run (or if Teltik plans need to be configured retroactively), those rows can be refreshed via `POST /api/bill-audit/recompute?upload_id=N`. Or just delete + re-upload the CSV via the new red Delete button in Audit History.
+- ~~Apex PPU address-pool contaminated with synthetic addresses~~ — **RESOLVED 2026-05-20.** Pool replaced via `scripts/build-address-pool.mjs` (OpenStreetMap Overpass API → 1529 entries, 50 states × 30 + DC × 29). `address_pool_usage` TRUNCATEd + reseeded. Self-heal layer (migration `address_pool_usage_verify_failure`, `markAddressVerifyFailure` in picker, try/catch in `rotateAtomicSim`) means any address AT&T rejects gets quarantined for 90 days and never re-picked. Re-canary on SIM 2619: 3 consecutive force-rotations succeeded (AL 35112 → AK 99504 → AL 35209), final state `msisdn=2059486765 activation_zip=35209 status=active rotation_status=success`.
 
 ---
 
 ## In Progress / Pending Work
 
-### Apex PPU-then-MDN — Phases 0 + 1 done; Phases 2-5 pending (session 56, 2026-05-20)
-**Status: DB ready, picker built, address pool seeded. NO production rotator change yet. Workers built against new `.mjs` imports but NOT redeployed — current prod still uses old `.js` import path + 25-entry pool.**
+### Apex PPU-then-MDN — Phase 2 closed; live canary on SIM 2619 (session 57, 2026-05-20)
+**Status: apex flow shipped, flag ON, canary live on SIM 2619 only. End-to-end validated across 3 consecutive force-rotations with the new OSM pool. Tomorrow's `*/5 4-11 UTC` cron will exercise apex on production code path for SIM 2619 (legacy for the other ~625 atomic SIMs since their `canary_apex_ppu` is still false).**
 
 **Plan:** `docs/superpowers/plans/2026-05-20-apex-ppu-then-mdn.md` (6 phases, ~25 tasks). **Spec:** `docs/superpowers/specs/2026-05-20-apex-ppu-then-mdn-design.md`.
 
-**Done in this session (8 commits, none pushed):**
-- **Phase 0 (DB):** applied two migrations via Supabase MCP: `address_pool_usage` (table + 2 indexes + `claim_address_pool_entry(text,text)` plpgsql RPC using `FOR UPDATE SKIP LOCKED`, granted to `service_role`) and `sims_canary_apex_ppu` (`canary_apex_ppu boolean NOT NULL DEFAULT false`). RPC smoke-tested: returns LRU pick, honors `excludeState`/`excludeZip` predicates, increments `use_count` + `last_used_at`.
-- **Phase 1.1 (verifier):** `scripts/verify-address-pool.mjs` — ESM check for 6 required string fields, no dup ids, no dup zips per state, ≥20 zips per state across 51 states (50 + DC). Fails non-zero on the old 25-entry pool by design.
-- **Phase 1.2 (pool expansion):** `src/shared/address-pool.mjs` rewritten with **1122 civic addresses** (22 per state × 51 states), each with stable id slug `<state-lower>-<zip>-<street-slug>`. Followed up with a fix commit that corrected HI city/zip mismatches (96741, 96732), replaced 2 DC PO-Box-only ZIPs (20013, 20025) with retail-delivery ZIPs, and regenerated 367 id slugs that had drifted from their `zipCode` field. Low-confidence states flagged for spot-check if AT&T later rejects PPU addresses: HI, AK, WY, VT, ND (some entries derived from pattern knowledge rather than verified lookups).
-- **Phase 1.3 (picker + tests):** `src/shared/address-picker.mjs` exports `APEX_VENDORS`, `isApexVendor`, `pickNextPpuAddress(env, opts)`, `seedAddressPoolUsage(env)`. Uses bare `fetch()` (Supabase is relay-exempt). 6 unit tests in `tests/address-picker.test.mjs` cover happy path, exhaustion, HTTP error, db-id-not-in-pool. Tests properly save/restore `globalThis.fetch` in `try/finally`.
-- **Phase 1.4 (seed):** `scripts/seed-address-pool.mjs` committed. Actual seeding done via Supabase MCP (4 batches of ~300 rows each) — verified final state `row_count = 1122, states = 51, unused = 1122`.
+**Done this session (7 commits on `main`, all live; mdn-rotator now at version `8f9f0665`):**
+- **Task 2.1** (`85fa96c`) — added `atomicUpdateSubscriberInfo(env, {session, msisdn, address}, runId, iccid)` helper in `src/mdn-rotator/index.js` just above `rotateAtomicSim`. Uses `relayFetch`, logs `step='ppu_update'` via `logCarrierApiCall`, throws on non-`'00'` statusCode.
+- **Task 2.2** (`3f12b5e`) — added `import { pickNextPpuAddress } from '../shared/address-picker.mjs'`; appended `,canary_apex_ppu` to the two `sims?select=` queries that feed `rotateAtomicSim` (lines 1417 + 1498); inserted apex flow between `pre_swap_inquiry` success and `swapMSISDN`, gated by `APEX_PPU_THEN_MDN_ENABLED='true'` AND (`APEX_PPU_CANARY_ONLY!='true'` OR `sim.canary_apex_ppu===true`). `wrangler.toml` has no `[vars]` block — env flags live as wrangler secrets.
+- **Task 2.3** — deployed `--env=""` to prod (`a3bc6107`) with flag unset; verified `ppu_update_total_24h=0` while `atomic_swap_ok_24h=289` — legacy path healthy, apex dormant.
+- **Picker env-var fix** (`4e3fbcc`) — first canary returned `HTTP 401 "Invalid API key"`. Picker used `env.SUPABASE_SERVICE_ROLE`, project convention is `SUPABASE_SERVICE_ROLE_KEY` (see `src/dashboard/index.js:440`, `src/bulk-activator/index.js:423`, `src/skyline-gateway/index.js:356`). Renamed in picker + test + seed; redeployed.
+- **Task 2.4 first run (mixed)** — SIM 2619 canary: rotation 1 succeeded end-to-end (`ak-99501-632-w-6th-ave` = Anchorage City Hall; MO 314 → AK 907); rotations 2 + 3 failed at `ppu_update` because the picker chose synthetic AL addresses (`100 Municipal Dr, Moody`, `400 Blount County Blvd, Oneonta`) that AT&T's CASS-style verifier rejected. Root cause: the 1122-entry pool was LLM-generated and contained fabricated entries.
+- **Phase A — Self-heal layer** (`6ad20f2`) — migration `address_pool_usage_verify_failure` adds `verify_failed_at timestamptz` + `last_verify_error text` columns + `address_pool_usage_verify_failed` index; updated `claim_address_pool_entry` RPC to skip rows where `verify_failed_at IS NOT NULL` (or `> 90 days ago` — auto-retest). New `markAddressVerifyFailure(env, addressId, err)` export in `src/shared/address-picker.mjs` PATCHes those columns. `rotateAtomicSim` wraps `atomicUpdateSubscriberInfo` in try/catch that calls `markAddressVerifyFailure` before re-throwing. The 2 known-bad AL addresses were quarantined directly in DB. Deployed as `125a23bd`.
+- **Phase B — OSM pool builder** (committed as part of `78efdb4`) — `scripts/build-address-pool.mjs` queries OpenStreetMap Overpass API per-state for tagged civic buildings (`amenity=post_office|library|townhall|courthouse|fire_station`) with complete `addr:housenumber + addr:street + addr:city + addr:postcode`. Built-in retry on 429/504 (transient Overpass errors — seen on WV and TN during the 51-state run). Polite 5s delay between states; ~8 min runtime for full build. Picker logic enforces one ZIP per state (no duplicates).
+- **Phase C — Pool replaced + reseeded** (`78efdb4`) — `src/shared/address-pool.mjs` now contains **1529 OSM-sourced entries** across 51 states (50 × 30 + DC × 29). `address_pool_usage` was `TRUNCATE`d and reseeded via 6 chunked `INSERT ... ON CONFLICT DO NOTHING` statements through Supabase MCP — final state `row_count=1529, states=51, unused=1529`. Verifier still passes. Deployed as `8f9f0665`.
+- **Re-canary validation** — re-enabled `APEX_PPU_THEN_MDN_ENABLED=true` secret, `UPDATE sims SET canary_apex_ppu=true WHERE id=2619`, force-rotated 3 times. **3/3 success.** Picks were `25 Post Office Drive, Moody AL 35112` → `1251 Muldoon Road, Anchorage AK 99504` → `2850 19th Street South, Homewood AL 35209`. SIM ended at `msisdn=2059486765 (AL 205)`, `activation_zip=35209`, `status=active`, `rotation_status=success`. Pool LRU advanced correctly; picker excluded the SIM's previous state+zip on each pick.
 
-**Forced collateral change (worth knowing):** Because `package.json` has `"type": "commonjs"`, Node treats `.js` files as CommonJS and cannot `import` from them. To let both Cloudflare Workers AND Node test/seed scripts share the address pool, `src/shared/address-pool.js` was **renamed to `.mjs`** and ESM-purified. Import paths in `src/bulk-activator/index.js:1` and `src/mdn-rotator/index.js:2` were updated to `../shared/address-pool.mjs`. **Both worker files are committed with the new path but NOT redeployed.** Deploying them now would only switch their random-pool size from 25 → 1122 (still using `pickRandomAddress`, not the new LRU picker — Phase 2/3 wire the picker in). Risk of leaving them un-deployed: zero (prod still works on the deployed bundle). Risk of cherry-picking a worker deploy from main without applying both worker files: zero, because both already have the `.mjs` path. See `decision-log.md` 2026-05-20 entry for full context.
+**Current production state (left intentionally as-is overnight):**
+- `APEX_PPU_THEN_MDN_ENABLED='true'` secret on mdn-rotator prod.
+- `APEX_PPU_CANARY_ONLY` never explicitly set — defaults to `'true'` in code.
+- Only SIM `2619` has `canary_apex_ppu=true`. Tomorrow's `*/5 4-11 UTC` cron will rotate it via apex flow (production code path validation). All other ATOMIC SIMs continue legacy.
+- `address_pool_usage`: 1529 rows / 51 states / 6 rows with `use_count=1` (3 from the new pool's successful canary picks, 3 from the pre-deploy "in DB but not in static pool" misses that still incremented use_count via the RPC). Zero quarantined rows now.
+- 4 pool entries are now in OSM that weren't in the deployed bundle yet at the moment of canary rotation 1-3 — those got picked, returned "in DB but not in static pool" errors, and incremented use_count without being usable. Redeploy fixed it. (Lesson: redeploy worker first, *then* swap pool table.)
 
-**To finish (Phases 2-5):**
-- **Phase 2** — atomic rotation: add `atomicUpdateSubscriberInfo` helper in mdn-rotator, insert PPU-update step before `swapMSISDN` behind `APEX_PPU_THEN_MDN_ENABLED` env flag + `sims.canary_apex_ppu` per-SIM gate, deploy flag-off, then flip one SIM's `canary_apex_ppu = true` and verify 4-step audit trail (`pre_swap_inquiry → ppu_update → mdn_change → subscriber_inquiry`).
+**To finish (Phases 3-5):**
 - **Phase 3** — activation/retry sites: swap `pickRandomAddress` → `pickNextPpuAddress` in the activate + retry-activate functions in mdn-rotator (~lines 3303 and 3358).
 - **Phase 4** — helix: add `hxUpdateSubscriberDetails` to `src/shared/helix.ts`, mirror Phase 2 wiring in the helix rotation branch.
 - **Phase 5** — expand canary to full fleet after 24h+48h stability checks, remove the canary gate, drop deprecated `pickRandomAddress`, update `.claude/skills/atomic-api/SKILL.md` with Rule 5 (PPU before swap), append `agent/constraints.md` §<N>.
 
 **Hot starts for the next session:**
-- Pick up at Phase 2 (Task 2.1 in the plan). The picker is already exported and tested; just import it into the rotator.
-- Worker deploys for `bulk-activator` and `mdn-rotator` are queued behind Phase 2 — no need to deploy in isolation.
-- Plan references say `address-pool.js` / `address-picker.js` in many places — translate every such reference to `.mjs` when reading the plan tasks.
+- Check overnight: `SELECT count(*) AS apex_ok, count(*) FILTER (WHERE error IS NOT NULL) AS apex_err FROM carrier_api_logs WHERE step='ppu_update' AND created_at > now() - interval '12 hours'` — expect `apex_ok=1+` (SIM 2619 cron rotation) and `apex_err=0`.
+- If clean, proceed to Phase 3 (activation site picker swap) or expand canary to a wider atomic SIM set with `UPDATE sims SET canary_apex_ppu=true WHERE vendor='atomic' AND id IN (...) ORDER BY last_mdn_rotated_at NULLS FIRST LIMIT 10`.
+- Production state: rotator at version `8f9f0665`. Pool at 1529 entries (`src/shared/address-pool.mjs`). Self-heal layer is live — any AT&T-rejected address gets quarantined automatically.
+- Plan references say `address-pool.js` / `address-picker.js` in many places — translate every such reference to `.mjs` when reading the plan tasks (still applies).
 
 ---
 
