@@ -255,7 +255,7 @@ Flag check lives inside `runApexMdnChange`'s entry point. Same flag governs both
 
 1. Merge code with flag = `false`. Migration applied, table seeded, picker available but unused. No behavior change.
 2. Run picker-only verification (steps above).
-3. Set flag = `true`, enable on **atomic canary SIM** only via per-SIM allow-list (TBD — could be a column or a one-off check). Watch one 20-min cron tick.
+3. Set flag = `true`. Canary is gated by a new boolean column `sims.canary_apex_ppu` (default `false`). `runApexMdnChange` checks both the env flag AND the column: when the flag is on but the column scope is in effect, only SIMs with `canary_apex_ppu=true` run through the new path; non-canary SIMs continue on the legacy path. Set the column to `true` for one atomic SIM and watch one 20-min cron tick. Once expanding (step 4), set the column to `true` for all atomic SIMs; once removing the column gate (step 6), drop the column check.
 4. Expand to all atomic SIMs after 24 hours of clean `carrier_api_logs`.
 5. Repeat for helix.
 6. After 48 hours of stability, remove the flag check from `runApexMdnChange()`.
@@ -316,11 +316,16 @@ Add a callout immediately above the request block on line 223:
 **When to call:** Mandatory before every `swapMSISDN` (see Rule 5). Optional standalone for name/address-only updates with no MDN change.
 ```
 
+## Locked Decisions
+
+1. **Address sourcing:** civic / public-building addresses only (libraries, post offices, courthouses, city halls). No residential.
+2. **Canary mechanism:** boolean column `sims.canary_apex_ppu` (default `false`). `runApexMdnChange` checks both the env flag and the column during the canary phase.
+3. **Feature flag:** single `APEX_PPU_THEN_MDN_ENABLED` env var governing both vendors.
+
 ## Open Items (resolve during implementation)
 
-1. **Helix `UpdateSubscriberInfo` request shape** — confirm exact endpoint and body during implementation. Migration table in the existing skill lists it as `4.4 Update Subscriber`, but the request payload may differ from ATOMIC's. Test against staging before flipping the helix flag.
-2. **Canary allow-list mechanism** — decide whether the canary phase uses a `sims.canary_apex_ppu` boolean column or a hardcoded ICCID list in the flag check. Either works; column is more flexible.
-3. **`pickRandomAddress()` deprecation timeline** — keep as a delegator for now; remove after flag is removed.
+1. **Helix `UpdateSubscriberInfo` request shape** — confirm exact endpoint and body during implementation. The migration table in the existing skill lists it as `4.4 Update Subscriber`, but the request payload may differ from ATOMIC's. Test against staging before flipping the column on for any helix SIM.
+2. **`pickRandomAddress()` deprecation timeline** — keep as a delegator for now; remove after the env flag is removed.
 
 ## Success Criteria
 
