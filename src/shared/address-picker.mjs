@@ -26,8 +26,8 @@ export async function pickNextPpuAddress(env, opts = {}) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      apikey:        env.SUPABASE_SERVICE_ROLE,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE}`,
+      apikey:        env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
     },
     body: JSON.stringify({ p_exclude_state: excludeState, p_exclude_zip: excludeZip }),
   });
@@ -59,8 +59,8 @@ export async function seedAddressPoolUsage(env) {
     method: 'POST',
     headers: {
       'Content-Type':   'application/json',
-      apikey:           env.SUPABASE_SERVICE_ROLE,
-      Authorization:    `Bearer ${env.SUPABASE_SERVICE_ROLE}`,
+      apikey:           env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization:    `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       Prefer:           'resolution=merge-duplicates,return=minimal',
     },
     body: JSON.stringify(rows),

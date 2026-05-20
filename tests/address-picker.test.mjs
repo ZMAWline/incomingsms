@@ -19,7 +19,7 @@ test('pickNextPpuAddress returns full address record on RPC hit', async () => {
   const sample = ADDRESS_POOL[0];
   const fakeEnv = {
     SUPABASE_URL: 'https://example.supabase.co',
-    SUPABASE_SERVICE_ROLE: 'fake',
+    SUPABASE_SERVICE_ROLE_KEY: 'fake',
   };
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify(sample.id), { status: 200 });
@@ -33,7 +33,7 @@ test('pickNextPpuAddress returns full address record on RPC hit', async () => {
 });
 
 test('pickNextPpuAddress throws on pool exhausted (RPC returns null)', async () => {
-  const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE: 'fake' };
+  const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'fake' };
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response('null', { status: 200 });
   try {
@@ -47,7 +47,7 @@ test('pickNextPpuAddress throws on pool exhausted (RPC returns null)', async () 
 });
 
 test('pickNextPpuAddress throws on RPC error', async () => {
-  const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE: 'fake' };
+  const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'fake' };
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response('boom', { status: 500 });
   try {
@@ -58,7 +58,7 @@ test('pickNextPpuAddress throws on RPC error', async () => {
 });
 
 test('pickNextPpuAddress throws if DB returns id not in static pool', async () => {
-  const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE: 'fake' };
+  const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'fake' };
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify('does-not-exist-id'), { status: 200 });
   try {
