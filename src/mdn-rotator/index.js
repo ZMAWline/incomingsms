@@ -1,6 +1,6 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { pickRandomAddress } from '../shared/address-pool.mjs';
-import { pickNextPpuAddress } from '../shared/address-picker.mjs';
+import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -1923,9 +1923,16 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       excludeZip:   currentZip,
     });
     console.log(`SIM ${iccid}: apex flow — picked PPU ${newAddr.id} (${newAddr.state} ${newAddr.zipCode})`);
-    await atomicUpdateSubscriberInfo(env, {
-      session, msisdn: currentMsisdn, address: newAddr,
-    }, runId, iccid);
+    try {
+      await atomicUpdateSubscriberInfo(env, {
+        session, msisdn: currentMsisdn, address: newAddr,
+      }, runId, iccid);
+    } catch (ppuErr) {
+      // AT&T rejected this address — quarantine it in address_pool_usage so
+      // the picker won't choose it again for 90 days (see claim_address_pool_entry).
+      await markAddressVerifyFailure(env, newAddr.id, String(ppuErr));
+      throw ppuErr;
+    }
     zipCode = newAddr.zipCode;
     await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       activation_zip: newAddr.zipCode,

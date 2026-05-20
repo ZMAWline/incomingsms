@@ -45,6 +45,36 @@ export async function pickNextPpuAddress(env, opts = {}) {
   return entry;
 }
 
+// Quarantine an address after AT&T's verifier rejects it. The picker RPC
+// skips rows with verify_failed_at NOT NULL (or older than 90 days) so the
+// same bad address never burns a second rotation. Best-effort: errors are
+// logged and swallowed — the caller will already re-throw the original
+// rotation error, and missing one quarantine row is not worth failing on.
+export async function markAddressVerifyFailure(env, addressId, errorMessage) {
+  if (!addressId) return;
+  const url = `${env.SUPABASE_URL}/rest/v1/address_pool_usage?address_id=eq.${encodeURIComponent(addressId)}`;
+  try {
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type':  'application/json',
+        apikey:          env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization:   `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        Prefer:          'return=minimal',
+      },
+      body: JSON.stringify({
+        verify_failed_at:  new Date().toISOString(),
+        last_verify_error: String(errorMessage || '').slice(0, 500),
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`markAddressVerifyFailure(${addressId}) HTTP ${res.status}: ${await res.text()}`);
+    }
+  } catch (err) {
+    console.warn(`markAddressVerifyFailure(${addressId}) threw: ${err}`);
+  }
+}
+
 // Idempotent seeder. Called once after deploying the static pool change.
 // Upserts every static entry into address_pool_usage (last_used_at left NULL
 // for new entries, preserved for existing ones).
