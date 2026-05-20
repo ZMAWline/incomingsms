@@ -617,16 +617,26 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
     const changeText = await changeRes.text();
     let changeData = {};
     try { changeData = JSON.parse(changeText); } catch {}
+    // Teltik returns HTTP 200 with body {status:"FAILED"} for application-level rejections
+    // (the change-number request was accepted-then-denied, not a transport error). Treat
+    // those as hard failures up front instead of flipping to mdn_pending and stalling the
+    // details-finalizer for 30 min on an MDN that will never change.
+    const bodyStatus = changeData && changeData.status ? String(changeData.status).toUpperCase() : null;
+    const bodyFailed = bodyStatus === 'FAILED';
     await logCarrierApiCall(env, {
       run_id: runId, step: 'change_number_initiate', iccid: sim.iccid, imei: null,
       request_url: changeUrl.replace(/apikey=[^&]+/, 'apikey=***'),
       request_method: 'GET', request_body: null,
       response_status: changeRes.status, response_ok: changeRes.ok,
       response_body_text: changeText, response_body_json: changeData,
-      error: changeRes.ok ? null : `change-number failed ${changeRes.status}`,
+      error: changeRes.ok ? (bodyFailed ? `change-number body status=FAILED` : null) : `change-number failed ${changeRes.status}`,
     });
     if (!changeRes.ok) {
       throw new Error(`change-number failed ${changeRes.status}: ${changeText}`);
+    }
+    if (bodyFailed) {
+      const detail = changeData.error || changeData.message || changeText;
+      throw new Error(`change-number body status=FAILED: ${String(detail).slice(0, 300)}`);
     }
     console.log(`[Rotate] SIM ${sim.iccid}: change-number response: ${changeText}`);
     const requestId = changeData.requestId || changeData.request_id || null;

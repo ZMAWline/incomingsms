@@ -273,7 +273,7 @@ async function handleSims(auth, env, url) {
   : activeFilter === 'false' ? '&active=eq.false'
   : '';
   const rows = await sbGetAll(env,
-    'reseller_sims?select=sim_id,active,created_at,last_rental_id,sims(iccid,vendor,msisdn,status,activated_at,last_mdn_rotated_at,rotation_interval_hours)' +
+    'reseller_sims?select=sim_id,active,created_at,last_rental_id,sims(iccid,vendor,msisdn,status,activated_at,last_mdn_rotated_at,last_rotation_at,rotation_interval_hours)' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     activeClause +
     '&order=active.desc,sim_id.asc'
@@ -281,10 +281,11 @@ async function handleSims(auth, env, url) {
   const out = (Array.isArray(rows) ? rows : []).map(r => {
     const sim = r.sims || {};
     const interval = sim.rotation_interval_hours || (sim.vendor === 'teltik' ? 48 : 24);
-    const start = sim.last_mdn_rotated_at || sim.activated_at || null;
-    const expires = sim.last_mdn_rotated_at
-      ? midnightNYAfterInterval(sim.last_mdn_rotated_at, interval)
-      : null;
+    // Prefer last_rotation_at (success-only) over last_mdn_rotated_at (attempt-time) so a
+    // failed rotation doesn't push the displayed online_until forward by 48h.
+    const baseTs = sim.last_rotation_at || sim.last_mdn_rotated_at || null;
+    const start = baseTs || sim.activated_at || null;
+    const expires = baseTs ? midnightNYAfterInterval(baseTs, interval) : null;
     return {
       sim_id: r.sim_id,
       active: r.active,

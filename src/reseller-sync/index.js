@@ -58,7 +58,7 @@ async function runResellerSync(env, limit, force = false) {
   // (not TRUE), so a bare `neq.failed` would silently drop fresh activations with NULL status.
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=last_notified_at.asc.nullsfirst&limit=${limit}`
+    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,last_rotation_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=last_notified_at.asc.nullsfirst&limit=${limit}`
   );
 
   let attempted = sims.length;
@@ -113,7 +113,11 @@ async function runResellerSync(env, limit, force = false) {
           number: currentNumber,
           status: sim.status,
           online: true,
-          online_until: midnightNYAfterInterval(sim.last_mdn_rotated_at, sim.rotation_interval_hours || 24),
+          // Prefer last_rotation_at (set by details-finalizer only on real MDN-swap success)
+          // over last_mdn_rotated_at (stamped by claim_rotation_slot on every attempt, including
+          // failures). Fall back when last_rotation_at is NULL (first-activation: never rotated yet,
+          // but last_mdn_rotated_at was set at import time as the MDN-start timestamp).
+          online_until: midnightNYAfterInterval(sim.last_rotation_at || sim.last_mdn_rotated_at, sim.rotation_interval_hours || 24),
           carrier: sim.vendor === 'teltik' ? 'T-Mobile' : 'att',
           verified: true,
         },
