@@ -26,6 +26,8 @@ const ADDRESS_POOL = [
   { address1: '750 N Lincoln Memorial Dr', city: 'Milwaukee',    state: 'WI', zipCode: '53202' },
 ];
 
-export function pickRandomAddress() {
+function pickRandomAddress() {
   return ADDRESS_POOL[Math.floor(Math.random() * ADDRESS_POOL.length)];
 }
+
+module.exports = { ADDRESS_POOL, pickRandomAddress };
