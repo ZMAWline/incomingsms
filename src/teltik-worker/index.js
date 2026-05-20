@@ -566,9 +566,25 @@ async function rotateTeltikSims(env) {
     return (now - new Date(sim.last_mdn_rotated_at).getTime()) >= intervalMs;
   });
 
-  console.log(`[Rotate] ${sims.length} active Teltik SIMs, ${due.length} due for rotation`);
+  // 2. Second pass: pick up SIMs that failed earlier this NY-night and are eligible
+  //    for in-window retry. The claim_rotation_retry_slot RPC enforces the precise
+  //    predicate (rotation_status=failed, today's NY date, 15-min backoff, etc.) —
+  //    we just shortlist candidates here. Status must be active OR provisioning
+  //    (latter covers SIMs stuck mid-rotation that the stuck-state sweeper flipped
+  //    to rotation_status='failed' but never restored status to 'active').
+  const retryCandidates = await supabaseGetArray(
+    env,
+    `sims?vendor=eq.teltik&status=in.(active,provisioning)&rotation_status=eq.failed&rotation_eligible=eq.true&reseller_sims!inner(reseller_id,active)&reseller_sims.active=eq.true&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
+  );
 
-  let rotated = 0, errors = 0, skipped = 0;
+  // Dedup: a SIM might appear in both `due` (never-rotated edge) and `retryCandidates`;
+  // prefer the normal-due path so it goes through claim_rotation_slot, not the retry RPC.
+  const dueIds = new Set(due.map(s => s.id));
+  const retryList = retryCandidates.filter(s => !dueIds.has(s.id));
+
+  console.log(`[Rotate] ${sims.length} active Teltik SIMs, ${due.length} due, ${retryList.length} eligible for in-window retry`);
+
+  let rotated = 0, errors = 0, skipped = 0, retried = 0, retrySkipped = 0;
 
   for (const sim of due) {
     try {
@@ -582,29 +598,61 @@ async function rotateTeltikSims(env) {
     }
   }
 
-  return { ok: true, total: sims.length, due: due.length, rotated, errors, skipped };
+  // Retry pass: rotateOneTeltikSim with retry:true takes the claim_rotation_retry_slot
+  // path. The RPC will reject any SIM that doesn't meet the in-window predicate, so the
+  // 15-min backoff and NY-today-only constraint are enforced at the DB layer (single
+  // source of truth — the worker just kicks the tires).
+  for (const sim of retryList) {
+    try {
+      const result = await rotateOneTeltikSim(env, sim, { force: false, retry: true });
+      if (result.skipped) retrySkipped++;
+      else if (result.ok) retried++;
+      else errors++;
+    } catch (err) {
+      console.error(`[Rotate/Retry] SIM ${sim.iccid}: error: ${err}`);
+      errors++;
+    }
+  }
+
+  return {
+    ok: true,
+    total: sims.length,
+    due: due.length,
+    rotated,
+    errors,
+    skipped,
+    retry_eligible: retryList.length,
+    retried,
+    retry_skipped: retrySkipped,
+  };
 }
 
 // Rotate a single Teltik SIM. force=true bypasses the 48h interval guard.
+// retry=true routes through claim_rotation_retry_slot instead, which only accepts
+// SIMs whose previous attempt failed today and is older than the 15-min backoff.
 // Returns { ok, skipped?, new_mdn?, error? }.
 async function rotateOneTeltikSim(env, sim, opts = {}) {
   const force = opts.force === true;
+  const retry = opts.retry === true;
   const apiKey = env.TELTIK_API_KEY;
 
   try {
     // Atomic dedup: claim_rotation_slot does the interval + activation-day check
     // AND stamps last_mdn_rotated_at + rotation_status='rotating' in one UPDATE.
-    // If it returns false, another process already claimed (or SIM isn't eligible),
-    // and we MUST NOT call the carrier — would burn an extra MDN.
-    const claimed = await supabaseRpc(env, 'claim_rotation_slot', {
-      p_sim_id: sim.id,
-      p_force: force,
-    });
+    // The retry variant uses a sibling RPC with a different predicate (failed-today,
+    // 15-min backoff) — see supabase/migrations/20260520_claim_rotation_retry_slot.sql.
+    // If the RPC returns false, the SIM isn't eligible and we MUST NOT call the
+    // carrier — would burn an extra MDN.
+    const claimed = retry
+      ? await supabaseRpc(env, 'claim_rotation_retry_slot', { p_sim_id: sim.id })
+      : await supabaseRpc(env, 'claim_rotation_slot', { p_sim_id: sim.id, p_force: force });
     if (!claimed) {
-      console.log(`[Rotate] SIM ${sim.iccid}: claim_rotation_slot returned false — skipping`);
-      return { ok: false, skipped: true, reason: 'claim_rotation_slot=false' };
+      const rpcName = retry ? 'claim_rotation_retry_slot' : 'claim_rotation_slot';
+      console.log(`[Rotate] SIM ${sim.iccid}: ${rpcName} returned false — skipping`);
+      return { ok: false, skipped: true, reason: `${rpcName}=false` };
     }
     if (force) console.log(`[Rotate] SIM ${sim.iccid}: force=true — claimed with interval bypass`);
+    if (retry) console.log(`[Rotate] SIM ${sim.iccid}: retry=true — in-window retry of failed rotation`);
 
     // 2. Initiate number change (async on Teltik's side). Do NOT poll here — the blocking
     //    poll inside the rotate path caused races where Teltik assigned a new MDN but our
