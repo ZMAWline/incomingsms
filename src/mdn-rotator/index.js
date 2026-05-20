@@ -1,5 +1,6 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { pickRandomAddress } from '../shared/address-pool.mjs';
+import { pickNextPpuAddress } from '../shared/address-picker.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -1414,7 +1415,7 @@ async function processRotationBatch(env, options = {}) {
 
   // Pre-filter eligible SIMs. Over-fetch 2x since some may be filtered out in JS.
   const query =
-    `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,activated_at,activation_zip,rotation_eligible,reseller_sims!inner(reseller_id)` +
+    `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,activated_at,activation_zip,rotation_eligible,canary_apex_ppu,reseller_sims!inner(reseller_id)` +
     `&reseller_sims.active=eq.true` +
     `&status=eq.active` +
     `&rotation_eligible=eq.true` +
@@ -1495,7 +1496,7 @@ async function rotateSpecificSim(env, iccid, options = {}) {
     // Look up the SIM by ICCID
     const sims = await supabaseSelect(
       env,
-      `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor,activation_zip,last_mdn_rotated_at&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+      `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor,activation_zip,last_mdn_rotated_at,canary_apex_ppu&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
     );
 
     if (!Array.isArray(sims) || sims.length === 0) {
@@ -1896,7 +1897,8 @@ async function rotateAtomicSim(env, sim, opts = {}) {
     throw new Error(`ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`);
   }
 
-  const zipCode = preInqR.Result?.address?.zipCode || sim.activation_zip || env.HX_ZIP || '11238';
+  const currentZip   = preInqR.Result?.address?.zipCode || sim.activation_zip || null;
+  const currentState = preInqR.Result?.address?.state || null;
 
   // Sync zip to DB if AT&T has a different value
   if (preInqR.Result?.address?.zipCode && preInqR.Result.address.zipCode !== sim.activation_zip) {
@@ -1904,6 +1906,32 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       activation_zip: preInqR.Result.address.zipCode,
     }).catch(() => {});
     console.log(`SIM ${iccid}: updated activation_zip ${sim.activation_zip} → ${preInqR.Result.address.zipCode}`);
+  }
+
+  // Apex flow: pick a new PPU address (different state + zip) and update
+  // AT&T's PPU before swapMSISDN. Per ATOMIC API Rule #5 (2026-05-20), swap
+  // will be rejected if zipCode doesn't match the subscriber's current PPU.
+  // Gated by env flag + per-SIM canary column during rollout.
+  const apexEnabled = String(env.APEX_PPU_THEN_MDN_ENABLED || '').toLowerCase() === 'true';
+  const canaryOnly  = String(env.APEX_PPU_CANARY_ONLY || 'true').toLowerCase() === 'true';
+  const useApexFlow = apexEnabled && (!canaryOnly || sim.canary_apex_ppu === true);
+
+  let zipCode;
+  if (useApexFlow) {
+    const newAddr = await pickNextPpuAddress(env, {
+      excludeState: currentState,
+      excludeZip:   currentZip,
+    });
+    console.log(`SIM ${iccid}: apex flow — picked PPU ${newAddr.id} (${newAddr.state} ${newAddr.zipCode})`);
+    await atomicUpdateSubscriberInfo(env, {
+      session, msisdn: currentMsisdn, address: newAddr,
+    }, runId, iccid);
+    zipCode = newAddr.zipCode;
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      activation_zip: newAddr.zipCode,
+    }).catch(() => {});
+  } else {
+    zipCode = currentZip || env.HX_ZIP || '11238';
   }
 
   // 2) swapMSISDN
