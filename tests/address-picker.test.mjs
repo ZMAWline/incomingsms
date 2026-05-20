@@ -21,29 +21,49 @@ test('pickNextPpuAddress returns full address record on RPC hit', async () => {
     SUPABASE_URL: 'https://example.supabase.co',
     SUPABASE_SERVICE_ROLE: 'fake',
   };
+  const origFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify(sample.id), { status: 200 });
-  const got = await pickNextPpuAddress(fakeEnv, {});
-  assert.equal(got.id, sample.id);
-  assert.equal(got.zipCode, sample.zipCode);
+  try {
+    const got = await pickNextPpuAddress(fakeEnv, {});
+    assert.equal(got.id, sample.id);
+    assert.equal(got.zipCode, sample.zipCode);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });
 
 test('pickNextPpuAddress throws on pool exhausted (RPC returns null)', async () => {
   const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE: 'fake' };
+  const origFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response('null', { status: 200 });
-  await assert.rejects(
-    () => pickNextPpuAddress(fakeEnv, { excludeState: 'CA', excludeZip: '90012' }),
-    /pool exhausted/i
-  );
+  try {
+    await assert.rejects(
+      () => pickNextPpuAddress(fakeEnv, { excludeState: 'CA', excludeZip: '90012' }),
+      /pool exhausted/i
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });
 
 test('pickNextPpuAddress throws on RPC error', async () => {
   const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE: 'fake' };
+  const origFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response('boom', { status: 500 });
-  await assert.rejects(() => pickNextPpuAddress(fakeEnv, {}), /HTTP 500/);
+  try {
+    await assert.rejects(() => pickNextPpuAddress(fakeEnv, {}), /HTTP 500/);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });
 
 test('pickNextPpuAddress throws if DB returns id not in static pool', async () => {
   const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE: 'fake' };
+  const origFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify('does-not-exist-id'), { status: 200 });
-  await assert.rejects(() => pickNextPpuAddress(fakeEnv, {}), /not in static pool/);
+  try {
+    await assert.rejects(() => pickNextPpuAddress(fakeEnv, {}), /not in static pool/);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });
