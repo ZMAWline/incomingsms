@@ -1792,6 +1792,50 @@ async function remediateStuckWingSim(env, iccid) {
   return { iccid, ok: true, old_mdn: currentMdn, new_mdn: null, pending: true };
 }
 
+// Issues ATOMIC UpdateSubscriberInfo. Throws on non-'00' statusCode or
+// network error. Returns the parsed response on success.
+async function atomicUpdateSubscriberInfo(env, { session, msisdn, address }, runId, iccid) {
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const body = {
+    wholeSaleApi: {
+      session,
+      wholeSaleRequest: {
+        requestType: 'UpdateSubscriberInfo',
+        MSISDN:    msisdn,
+        firstName: 'EZ',
+        lastName:  'Biz',
+        address: {
+          streetNumber:    address.streetNumber,
+          streetName:      address.streetName,
+          streetDirection: address.streetDirection || '',
+          zipCode:         address.zipCode,
+        },
+      },
+    },
+  };
+  const res = await relayFetch(env, url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json = {};
+  try { json = JSON.parse(text); } catch {}
+  const r = json?.wholeSaleApi?.wholeSaleResponse;
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'ppu_update', iccid, imei: null, vendor: 'atomic',
+    request_url: url, request_method: 'POST', request_body: body,
+    response_status: res.status, response_ok: res.ok,
+    response_body_text: text, response_body_json: json,
+    error: (res.ok && r?.statusCode === '00') ? null
+         : `ATOMIC UpdateSubscriberInfo failed: ${r?.description || res.status}`,
+  });
+  if (!res.ok || r?.statusCode !== '00') {
+    throw new Error(`ATOMIC UpdateSubscriberInfo failed: ${r?.description || res.status}`);
+  }
+  return r;
+}
+
 // ===========================
 // Rotate a single ATOMIC SIM (swap MSISDN → subscriber inquiry → DB + webhook)
 // opts.force=true bypasses the 24h interval guard (manual operator override).
