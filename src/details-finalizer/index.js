@@ -70,6 +70,21 @@ export default {
       const result = await runOfflineTestBatch(env, { resellerId, limit, dryRun, force });
       return json(result);
     }
+    if (url.pathname === '/rotation-review') {
+      // Daily morning review of last night's rotation cron (called by CCR
+      // routine at 12:30 UTC). Queries Supabase for rotation stats across all
+      // vendors, auto-fixes recoverable failure patterns (notably Teltik's
+      // "Only 1 per 48h" cohort where Teltik rotated but our worker died
+      // before capturing the response), triggers a finalizer drain, then
+      // returns a markdown report the CCR agent commits to the repo.
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const dryRun = url.searchParams.get('dry') === '1';
+      const result = await runRotationReview(env, { dryRun });
+      return new Response(result, { status: 200, headers: { 'Content-Type': 'text/markdown; charset=utf-8' } });
+    }
     if (url.pathname === '/refill-pool') {
       // Manual trigger for the address-pool refill cron. Replaces quarantined
       // PPU addresses with new OSM-sourced civic-building addresses in the
@@ -1043,6 +1058,199 @@ async function runAtomicFinalizer(env, limit) {
   }
 
   return { ok: true, processed, synced, errors, failed, results };
+}
+
+/* ── Rotation Review (daily 12:30 UTC) ────────────────────────────────────── */
+// Called by CCR routine after the cron window closes. Produces a markdown
+// report summarizing tonight's rotation health and auto-fixes recoverable
+// failure patterns we learned about the hard way in session 58.
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+function ymdUtc(d = new Date()) { return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`; }
+function nyMidnightUtcIso(d = new Date()) {
+  // Start of today's NY calendar date as a UTC ISO timestamp. Same logic as
+  // the SQL helper in claim_rotation_slot (and getNYMidnightISO in mdn-rotator).
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(d).reduce((acc, p) => (p.type !== 'literal' && (acc[p.type] = p.value), acc), {});
+  // 04:00 UTC is NY midnight in EDT; 05:00 in EST. Pick whichever falls inside
+  // the NY day boundary by computing both candidates and using the one that
+  // round-trips to the same NY date.
+  for (const offset of [4, 5]) {
+    const candidate = `${parts.year}-${parts.month}-${parts.day}T${pad2(offset)}:00:00Z`;
+    const back = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(new Date(candidate)).reduce((acc, p) => (p.type !== 'literal' && (acc[p.type] = p.value), acc), {});
+    if (back.year === parts.year && back.month === parts.month && back.day === parts.day) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function rotationReviewQuery(env, fragment) {
+  // Wrapper for read-only queries that returns the array (uses Range header
+  // to bypass the 1000-cap when needed; review queries are bounded anyway).
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${fragment}`, {
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+  if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text().catch(() => '')}`);
+  return res.json();
+}
+
+async function runRotationReview(env, opts = {}) {
+  const dryRun = opts.dryRun === true;
+  const tonightStart = nyMidnightUtcIso() || new Date(Date.now() - 12 * 3600 * 1000).toISOString();
+  const today = ymdUtc();
+
+  // ── 1. Tally last night's rotations by vendor ──────────────────────────────
+  const tally = {};
+  for (const v of ['atomic', 'helix', 'wing_iot', 'teltik']) {
+    const rows = await rotationReviewQuery(env,
+      `sims?select=rotation_status,status,last_mdn_rotated_at,last_rotation_at,last_notified_at&vendor=eq.${v}&last_mdn_rotated_at=gt.${encodeURIComponent(tonightStart)}&limit=5000`);
+    const stats = { rotated: rows.length, success: 0, mdn_pending: 0, rotating: 0, failed: 0, notified: 0 };
+    for (const r of rows) {
+      if (r.rotation_status === 'success') stats.success++;
+      else if (r.rotation_status === 'mdn_pending') stats.mdn_pending++;
+      else if (r.rotation_status === 'rotating')   stats.rotating++;
+      else if (r.rotation_status === 'failed')     stats.failed++;
+      if (r.last_notified_at && r.last_mdn_rotated_at && r.last_notified_at >= r.last_mdn_rotated_at) stats.notified++;
+    }
+    tally[v] = stats;
+  }
+
+  // ── 2. Identify failure patterns ───────────────────────────────────────────
+  const failedRows = await rotationReviewQuery(env,
+    `sims?select=id,iccid,vendor,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error&rotation_status=eq.failed&last_mdn_rotated_at=gt.${encodeURIComponent(tonightStart)}&limit=5000`);
+  const patterns = { teltik_already_rotated: [], teltik_body_failed: [], stuck_sweeper: [], atomic_ppu_exhausted: [], atomic_pre_swap: [], swap_zip_rejected: [], other: [] };
+  for (const r of failedRows) {
+    const err = String(r.last_rotation_error || '');
+    if (/Only 1 number change allowed/i.test(err))                       patterns.teltik_already_rotated.push(r);
+    else if (/change-number body status=FAILED/i.test(err))              patterns.teltik_body_failed.push(r);
+    else if (/^stuck in rotating/.test(err))                             patterns.stuck_sweeper.push(r);
+    else if (/PPU exhausted/i.test(err))                                 patterns.atomic_ppu_exhausted.push(r);
+    else if (/pre-swap inquiry failed/i.test(err))                       patterns.atomic_pre_swap.push(r);
+    else if (/zipCode Not Supported/i.test(err) || /zipCode.*not.*support/i.test(err)) patterns.swap_zip_rejected.push(r);
+    else patterns.other.push(r);
+  }
+
+  // ── 3. Auto-fixes ──────────────────────────────────────────────────────────
+  const actions = { flipped_to_mdn_pending: 0, finalizer_drained: { helix: 0, wing: 0, teltik: 0, atomic: 0 } };
+
+  // 3a. Flip "Only 1 number change allowed" failures to mdn_pending so the
+  //     Teltik finalizer picks them up, calls get-phone-number, syncs the
+  //     new MDN, and fires number.online. Safe because we KNOW Teltik
+  //     rotated them — its own "1 per 48h" guard proves it.
+  if (!dryRun && patterns.teltik_already_rotated.length > 0) {
+    const ids = patterns.teltik_already_rotated.map(r => r.id).join(',');
+    const url = `${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`;
+    const flipRes = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({ status: 'provisioning', rotation_status: 'mdn_pending' }),
+    });
+    if (flipRes.ok) actions.flipped_to_mdn_pending = patterns.teltik_already_rotated.length;
+  }
+
+  // 3b. Drain pending finalizer work (covers mdn_pending from normal cron AND
+  //     the SIMs we just flipped in 3a). Each runner is bounded by its limit,
+  //     so the wall-clock impact is predictable.
+  if (!dryRun) {
+    try { actions.finalizer_drained.helix  = (await runHelixFinalizer (env, 200))?.activated ?? 0; } catch (e) { console.error('[Review] helix drain:',  e); }
+    try { actions.finalizer_drained.wing   = (await runWingIotFinalizer(env, 200))?.activated ?? 0; } catch (e) { console.error('[Review] wing drain:',   e); }
+    try { actions.finalizer_drained.teltik = (await runTeltikFinalizer (env, 500))?.synced    ?? 0; } catch (e) { console.error('[Review] teltik drain:', e); }
+    try { actions.finalizer_drained.atomic = (await runAtomicFinalizer (env, 200))?.synced    ?? 0; } catch (e) { console.error('[Review] atomic drain:', e); }
+  }
+
+  // ── 4. Pool health (count=exact bypasses the 1000-row cap) ─────────────────
+  async function poolCount(filter) {
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/address_pool_usage?${filter}&select=address_id&limit=1`, {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        Prefer: 'count=exact',
+      },
+    });
+    const cr = res.headers.get('content-range') || '';
+    const m = cr.match(/\/(\d+|\*)$/);
+    return m && m[1] !== '*' ? parseInt(m[1], 10) : 0;
+  }
+  const poolStats = {
+    total:              await poolCount(''),
+    quarantined:        await poolCount('verify_failed_at=not.is.null'),
+    quarantined_tonight:await poolCount(`verify_failed_at=gt.${encodeURIComponent(tonightStart)}`),
+  };
+
+  // ── 5. Render markdown ─────────────────────────────────────────────────────
+  const lines = [];
+  lines.push(`# Rotation Review — ${today}`);
+  lines.push(`Generated: ${new Date().toISOString()} (NY-night started ${tonightStart}, dryRun=${dryRun})`);
+  lines.push('');
+  lines.push('## Tally by vendor');
+  lines.push('');
+  lines.push('| Vendor | Rotated | Success | mdn_pending | rotating | Failed | Notified |');
+  lines.push('|--------|--------:|--------:|------------:|---------:|-------:|---------:|');
+  for (const v of ['atomic', 'helix', 'wing_iot', 'teltik']) {
+    const s = tally[v];
+    lines.push(`| ${v} | ${s.rotated} | ${s.success} | ${s.mdn_pending} | ${s.rotating} | ${s.failed} | ${s.notified} |`);
+  }
+  lines.push('');
+
+  lines.push('## Failure patterns');
+  lines.push('');
+  for (const [k, v] of Object.entries(patterns)) {
+    if (v.length === 0) continue;
+    lines.push(`- **${k}** (${v.length}): ${v.slice(0, 3).map(r => `#${r.id}`).join(', ')}${v.length > 3 ? ` …+${v.length - 3} more` : ''}`);
+  }
+  if (Object.values(patterns).every(v => v.length === 0)) lines.push('_No failures tonight — clean run._');
+  lines.push('');
+
+  lines.push('## Auto-fixes applied');
+  lines.push('');
+  lines.push(`- Flipped "Only 1 per 48h" Teltik failures → mdn_pending: **${actions.flipped_to_mdn_pending}**`);
+  lines.push(`- Finalizer drain: helix=${actions.finalizer_drained.helix}, wing=${actions.finalizer_drained.wing}, teltik=${actions.finalizer_drained.teltik}, atomic=${actions.finalizer_drained.atomic}`);
+  lines.push('');
+
+  lines.push('## Address pool');
+  lines.push('');
+  lines.push(`- Total: ${poolStats.total} | Quarantined: ${poolStats.quarantined} | Quarantined tonight: ${poolStats.quarantined_tonight}`);
+  lines.push('');
+
+  // Specific failures with detail (capped to avoid 100-row noise)
+  if (patterns.other.length > 0 || patterns.atomic_pre_swap.length > 0 || patterns.swap_zip_rejected.length > 0 || patterns.teltik_body_failed.length > 0) {
+    lines.push('## Failures needing human review');
+    lines.push('');
+    for (const cat of ['atomic_pre_swap', 'swap_zip_rejected', 'teltik_body_failed', 'other']) {
+      for (const r of patterns[cat].slice(0, 10)) {
+        const err = String(r.last_rotation_error || '').slice(0, 140);
+        lines.push(`- **${cat}** SIM #${r.id} (${r.vendor}, msisdn=${r.msisdn || '—'}): ${err}`);
+      }
+    }
+    lines.push('');
+  }
+
+  // Stuck-sweeper failures usually mean Teltik DID rotate but our worker died
+  // mid-flight. The auto-fix above handles the "Only 1 per 48h" variant; pure
+  // stuck-sweeper rows without that error message need manual recovery.
+  if (patterns.stuck_sweeper.length > 0) {
+    lines.push('## Stuck-sweeper failures (worker died mid-rotation)');
+    lines.push('');
+    lines.push(`${patterns.stuck_sweeper.length} SIMs. Force-rotate to retry; if Teltik returns "Only 1 per 48h", flip to mdn_pending instead.`);
+    lines.push('');
+  }
+
+  lines.push('---');
+  lines.push('_Generated by details-finalizer /rotation-review. Source: src/details-finalizer/index.js runRotationReview()._');
+
+  return lines.join('\n');
 }
 
 /* ── Address Pool Refill ──────────────────────────────────────────────────── */
