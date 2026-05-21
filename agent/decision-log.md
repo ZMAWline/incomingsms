@@ -4,6 +4,51 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-21 — Rotation-review safety net built as the agreed subset of `sim-rotation-cron-spec.md`, not full spec
+
+**Decision:** The user shared `sim-rotation-cron-spec.md` (16 sections, ~320 lines) as the design target for a daily rotation verification cron. After review, only the high-value 80% was built; the enterprise-y 20% was explicitly skipped. What's in:
+- Per-SIM 3-attempts-per-NY-day budget enforced via SQL helper `attempts_today(sim_id, action)` reading from `remediation_attempts`.
+- Run-lock via `cron_runs` table (partial unique index `(kind) WHERE status='running'`, stale-30min auto-expire).
+- Vendor 5xx circuit breaker (5 consecutive 5xx → skip remaining for that vendor in this run).
+- Playbook as ES module `src/shared/rotation-playbook.mjs` (not a DB table) — 10 patterns, each with regex matcher + action + safe flag. New patterns = edit file, deploy.
+- Second-read verification on atomic force-rotates via `/atomic-inquiry` over service binding.
+- Multi-day pattern detection (walks last 7d of `remediation_attempts`).
+- Email via Resend (gated on `RESEND_API_KEY` + `REPORT_EMAIL_TO`).
+- Dry-run flag (`?dry=1`).
+- Dashboard `/rotation-reviews` tab for operator interaction (see separate decision below).
+
+What's deliberately out:
+- Signed approve/reject links in email with 24h token expiry — overkill for solo operator; code changes go through normal PR review.
+- Separate `sim_rotation_checks` / `pending_approvals` tables — overlaps with `sims.last_rotation_error` + `carrier_api_logs` + the simpler `pending_review_items` we built.
+- Cost-per-run tracking — vendor APIs cost pennies.
+- SMS fallback when email fails — CCR routine + email are two layers; adding a third is overengineering.
+- Healthchecks.io dead-man's switch — adds an external dep; missing the morning email is sufficient signal at this scale.
+- Snapshot-before-bulk — git history + Supabase PITR cover this.
+- 30% rate-budget reserve per vendor — not at the scale where vendor rate limits constrain.
+- Idempotency keys on vendor calls — already handled at vendor level (Teltik's "1 per 48h" guard, `claim_rotation_slot` dedup).
+- §16's "4-week phased rollout" (dry-run for a week, then one vendor, etc.) — we already had an MVP running; the build is already cautious in code (per-SIM budget, breaker, lock).
+
+**Why:** The full spec assumes a multi-engineer enterprise environment (signed approvals, audit/compliance trails, multi-channel alerting). The operator runs solo at ~1500 SIMs. The agreed-on cut keeps the spec's *philosophy* — broad operational autonomy, narrow code-change autonomy — without inheriting its enterprise machinery. The user explicitly asked for "the right balance" after seeing the gap analysis.
+
+**Consequence / what not to undo:** If a future contributor reads `sim-rotation-cron-spec.md` and starts implementing the missing pieces, check first whether the actual pain warrants it. The skipped items were skipped on purpose. Adding signed approve links or a 3rd notification channel makes sense only if (a) the operator's role expands to multiple humans, or (b) a specific incident proves the simpler design insufficient. The playbook-as-module + pending_review_items table together cover the spec's "approval gate" need by surfacing decisions to the operator in a low-friction way — extending those is the natural growth path, not adding the spec's parallel `pending_approvals` infrastructure.
+
+---
+
+## 2026-05-21 — Two-way agent↔operator comms through `pending_review_items`, not direct CCR session reuse
+
+**Decision:** The dashboard exposes operator-to-agent communication via a single `pending_review_items` table with `status` lifecycle (`open` → `answered`/`acknowledged`/`snoozed`/`dismissed`) and an `operator_response` text field. The agent writes items on its scheduled run; the operator responds via dashboard buttons (Reply / Ack / Snooze / Dismiss); the next scheduled run reads back the `operator_response` and threads it into the report's "Operator responses since last run" section. The dashboard also exposes "Ask the agent" which creates an `operator_question` row (optionally also triggering an immediate review run).
+
+**Why:** Considered three alternatives and rejected all:
+1. **Real-time chat / WebSocket session** — CCR routines are stateless per-run; staying alive long enough for back-and-forth would require building actual session infrastructure on top of CCR. Massive scope vs. value at this scale.
+2. **On-demand CCR run with a specific question baked in** (via dashboard hitting RemoteTrigger API) — would need a claude.ai API token stored as a worker secret + handle async polling for the answer. The token is also non-trivial to scope correctly. Defer until there's clear demand.
+3. **Multiple tables for different message types** (pending_questions, pending_approvals, agent_announcements, etc.) — spec's approach. Three+ tables for what one table with a `kind` column handles cleanly.
+
+The single-table approach is async by nature (operator's reply gets picked up on next scheduled run), but the dashboard's "Save + run now" button reduces the loop to ~5s when needed. For the rare case of urgent back-and-forth, the operator can still hit the terminal — but day-to-day the dashboard is enough.
+
+**Consequence / what not to undo:** Don't add separate `agent_announcements` or `pending_questions` tables — extend `pending_review_items.kind` instead. Don't try to make the dashboard chat real-time without a clear use case (and even then, CCR session-resume isn't a thing today; you'd be building your own agent runtime). The `agent_seen_at` column already exists on `pending_review_items` — use it to track which operator responses the agent has incorporated, so we can show in the dashboard "agent has read your reply".
+
+---
+
 ## 2026-05-20 — Shared modules consumed by both Workers and Node scripts use `.mjs` extension, not `.js`
 
 **Decision:** During Phase 1 of the Apex PPU-then-MDN rollout, `src/shared/address-pool.js` was **renamed to `src/shared/address-pool.mjs`** and `src/shared/address-picker.mjs` was created with the same extension. Both files export ESM (`export const`, `export function`) and are imported from both (a) Cloudflare Workers (`src/bulk-activator/index.js`, `src/mdn-rotator/index.js`) and (b) Node test scripts (`tests/address-picker.test.mjs`) and seeders (`scripts/seed-address-pool.mjs`, `scripts/verify-address-pool.mjs`). The worker imports were updated to use the `.mjs` path. The plan document (`docs/superpowers/plans/2026-05-20-apex-ppu-then-mdn.md`) still references the `.js` filename throughout — translate to `.mjs` when reading Phase 2+ tasks.
