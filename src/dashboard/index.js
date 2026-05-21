@@ -406,6 +406,27 @@ export default {
       return handleRotationAuditRun(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/rotation-reviews' && request.method === 'GET') {
+      return handleRotationReviewsList(request, env, corsHeaders);
+    }
+    if (url.pathname.startsWith('/api/rotation-reviews/') && request.method === 'GET') {
+      const runId = url.pathname.slice('/api/rotation-reviews/'.length);
+      return handleRotationReviewGet(runId, env, corsHeaders);
+    }
+    if (url.pathname === '/api/rotation-review/run' && request.method === 'POST') {
+      return handleRotationReviewRun(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/pending-items' && request.method === 'GET') {
+      return handlePendingItemsList(request, env, corsHeaders);
+    }
+    if (url.pathname.startsWith('/api/pending-items/') && url.pathname.endsWith('/respond') && request.method === 'POST') {
+      const id = url.pathname.slice('/api/pending-items/'.length, -('/respond'.length));
+      return handlePendingItemRespond(id, request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/operator-question' && request.method === 'POST') {
+      return handleOperatorQuestion(request, env, corsHeaders);
+    }
+
     // Serve HTML dashboard for all non-API paths (SPA routing)
     return new Response(getHTML(env.HELIX_ENABLED === 'true'), {
       headers: { 'Content-Type': 'text/html' }
@@ -2490,6 +2511,187 @@ async function handleRotationAuditRun(request, env, corsHeaders) {
     return new Response(JSON.stringify({ error: String(e) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleRotationReviewsList(request, env, corsHeaders) {
+  try {
+    const url = new URL(request.url);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '10', 10) || 10, 50);
+    const base = env.SUPABASE_URL + '/rest/v1/';
+    const headers = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+    };
+    const res = await fetch(base + 'cron_runs?kind=eq.rotation_review&select=id,run_id,started_at,ended_at,status,summary&order=started_at.desc&limit=' + limit, { headers });
+    const rows = res.ok ? await res.json() : [];
+    return new Response(JSON.stringify({ rows }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleRotationReviewGet(runIdOrDbId, env, corsHeaders) {
+  try {
+    const base = env.SUPABASE_URL + '/rest/v1/';
+    const headers = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+    };
+    // Try as run_id (uuid) first, then fall back to id (bigint)
+    let res = await fetch(base + 'cron_runs?run_id=eq.' + encodeURIComponent(runIdOrDbId) + '&select=*&limit=1', { headers });
+    let rows = res.ok ? await res.json() : [];
+    if (rows.length === 0 && /^\d+$/.test(runIdOrDbId)) {
+      res = await fetch(base + 'cron_runs?id=eq.' + runIdOrDbId + '&select=*&limit=1', { headers });
+      rows = res.ok ? await res.json() : [];
+    }
+    if (rows.length === 0) {
+      return new Response(JSON.stringify({ error: 'not found' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    return new Response(JSON.stringify({ run: rows[0] }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleRotationReviewRun(request, env, corsHeaders) {
+  try {
+    if (!env.FINALIZER_RUN_SECRET || !env.DETAILS_FINALIZER) {
+      return new Response(JSON.stringify({ error: 'FINALIZER_RUN_SECRET or DETAILS_FINALIZER not configured' }), {
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const url = 'https://details-finalizer/rotation-review?secret=' + encodeURIComponent(env.FINALIZER_RUN_SECRET);
+    const r = await env.DETAILS_FINALIZER.fetch(url, { method: 'GET' });
+    const body = await r.text();
+    return new Response(JSON.stringify({ ok: r.ok, status: r.status, report_md: body }), {
+      status: r.ok ? 200 : 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handlePendingItemsList(request, env, corsHeaders) {
+  try {
+    const url = new URL(request.url);
+    const status = url.searchParams.get('status') || 'open';
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 500);
+    const base = env.SUPABASE_URL + '/rest/v1/';
+    const headers = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+    };
+    const filter = status === 'all' ? '' : '&status=eq.' + encodeURIComponent(status);
+    const res = await fetch(base + 'pending_review_items?select=*' + filter + '&order=created_at.desc&limit=' + limit, { headers });
+    const rows = res.ok ? await res.json() : [];
+    // Also return count of open items for the sidebar badge
+    const countRes = await fetch(base + 'pending_review_items?status=eq.open&select=id&limit=1', {
+      headers: { ...headers, Prefer: 'count=exact' }
+    });
+    const cr = countRes.headers.get('content-range') || '';
+    const m = cr.match(/\/(\d+|\*)$/);
+    const openCount = m && m[1] !== '*' ? parseInt(m[1], 10) : 0;
+    return new Response(JSON.stringify({ rows, open_count: openCount }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handlePendingItemRespond(id, request, env, corsHeaders) {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const action = String(body.action || '');
+    const responseText = body.response_text ? String(body.response_text).slice(0, 4000) : null;
+    if (!['reply', 'acknowledge', 'snooze', 'dismiss'].includes(action)) {
+      return new Response(JSON.stringify({ error: 'invalid action' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const update = { resolved_at: new Date().toISOString() };
+    if (action === 'reply')       { update.status = 'answered';     update.operator_response = responseText; }
+    if (action === 'acknowledge') { update.status = 'acknowledged'; if (responseText) update.operator_response = responseText; }
+    if (action === 'snooze')      { update.status = 'snoozed';      update.resolved_at = null; if (responseText) update.operator_response = responseText; }
+    if (action === 'dismiss')     { update.status = 'dismissed';    if (responseText) update.operator_response = responseText; }
+
+    const base = env.SUPABASE_URL + '/rest/v1/';
+    const headers = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    };
+    const res = await fetch(base + 'pending_review_items?id=eq.' + encodeURIComponent(id), {
+      method: 'PATCH', headers, body: JSON.stringify(update),
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      return new Response(JSON.stringify({ error: 'patch failed: ' + res.status + ' ' + t.slice(0, 200) }), {
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const rows = await res.json().catch(() => []);
+    return new Response(JSON.stringify({ ok: true, item: rows[0] || null }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleOperatorQuestion(request, env, corsHeaders) {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const summary = String(body.summary || '').slice(0, 200);
+    const details = String(body.details_md || body.summary || '').slice(0, 4000);
+    if (!summary) {
+      return new Response(JSON.stringify({ error: 'summary required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const res = await fetch(env.SUPABASE_URL + '/rest/v1/pending_review_items', {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify([{ kind: 'operator_question', summary, details_md: details, status: 'open' }]),
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      return new Response(JSON.stringify({ error: 'insert failed: ' + res.status + ' ' + t.slice(0, 200) }), {
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const rows = await res.json().catch(() => []);
+    return new Response(JSON.stringify({ ok: true, item: rows[0] || null }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
 }
@@ -6349,6 +6551,11 @@ function getHTML(helixEnabled) {
                     <span class="text-sm">Errors</span>
                     <span id="error-badge" class="hidden ml-auto min-w-[16px] h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center px-1">0</span>
                 </a>
+                <a href="/rotation-reviews" onclick="event.preventDefault();switchTab('rotation-reviews')" data-tab="rotation-reviews" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Rotation Reviews">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>
+                    <span class="text-sm font-medium">Rotation Reviews</span>
+                    <span id="sidebar-review-badge" class="hidden ml-auto text-xs px-2 py-0.5 rounded-full bg-red-600 text-white">0</span>
+                </a>
                 <a href="/invoicing" onclick="event.preventDefault();switchTab('invoicing')" data-tab="invoicing" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Invoicing">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
                     <span class="text-sm">Invoicing</span>
@@ -7109,6 +7316,89 @@ function getHTML(helixEnabled) {
                     <div id="error-logs-section" class="hidden">
                         <h4 class="text-sm font-semibold text-gray-400 mb-2">API Logs (most recent first)</h4>
                         <div id="error-logs-container" class="space-y-2 max-h-96 overflow-y-auto"></div>
+                    </div>
+                </div>
+            </div>
+
+
+            <!-- Rotation Reviews Tab -->
+            <div id="tab-rotation-reviews" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <div class="flex items-center gap-3">
+                        <h2 class="text-xl font-bold text-white">Rotation Reviews</h2>
+                        <span id="review-status-pill" class="text-xs px-2 py-1 rounded-full bg-dark-700 text-dark-300">idle</span>
+                    </div>
+                    <button onclick="runReviewNow()" id="run-review-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-700 text-white rounded-lg transition flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                        Run review now
+                    </button>
+                </div>
+
+                <!-- Pending operator items -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-semibold text-white">Pending operator items <span id="pending-count-inline" class="ml-2 text-sm px-2 py-0.5 rounded-full bg-red-600 text-white">0</span></h3>
+                        <div class="flex items-center gap-2">
+                            <select id="pending-filter" onchange="loadPendingItems()" class="px-2 py-1 text-xs bg-dark-700 border border-dark-500 rounded text-gray-200">
+                                <option value="open">Open</option>
+                                <option value="answered">Answered (awaiting agent)</option>
+                                <option value="acknowledged">Acknowledged</option>
+                                <option value="snoozed">Snoozed</option>
+                                <option value="dismissed">Dismissed</option>
+                                <option value="all">All</option>
+                            </select>
+                            <button onclick="loadPendingItems()" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Refresh</button>
+                        </div>
+                    </div>
+                    <div id="pending-items-list" class="space-y-2"><p class="text-sm text-dark-400">Loading...</p></div>
+
+                    <div class="mt-6 pt-4 border-t border-dark-600">
+                        <label class="text-sm font-semibold text-dark-300 block mb-2">Ask the agent / leave a note</label>
+                        <textarea id="ask-agent-input" rows="3" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="The agent will see this on its next run (or you can trigger a run now)..."></textarea>
+                        <div class="flex justify-end gap-2 mt-2">
+                            <button onclick="askAgent(false)" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Save for next run</button>
+                            <button onclick="askAgent(true)" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-700 text-white rounded">Save + run now</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Last 10 reviews table -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-semibold text-white">Last 10 reviews</h3>
+                        <button onclick="loadRotationReviews()" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Refresh</button>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead><tr class="text-left text-xs uppercase tracking-wider text-dark-400 border-b border-dark-600">
+                                <th class="py-2">Started</th><th>Status</th><th>Duration</th><th>Atomic</th><th>Teltik</th><th>Wing</th><th>Failed</th><th>Pending</th><th></th>
+                            </tr></thead>
+                            <tbody id="reviews-table-body"><tr><td colspan="9" class="py-4 text-center text-dark-400">Loading...</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Modal: full markdown report -->
+            <div id="review-report-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+                <div class="bg-dark-800 rounded-xl border border-dark-600 max-w-4xl w-full max-h-[85vh] overflow-y-auto">
+                    <div class="sticky top-0 bg-dark-800 border-b border-dark-600 flex items-center justify-between p-4">
+                        <h3 class="text-lg font-semibold text-white" id="review-report-title">Rotation review</h3>
+                        <button onclick="document.getElementById('review-report-modal').classList.add('hidden')" class="text-dark-400 hover:text-white text-2xl leading-none">&times;</button>
+                    </div>
+                    <div id="review-report-content" class="p-6 prose prose-invert max-w-none"></div>
+                </div>
+            </div>
+
+            <!-- Modal: reply to pending item -->
+            <div id="pending-reply-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+                <div class="bg-dark-800 rounded-xl border border-dark-600 max-w-xl w-full p-6">
+                    <h3 class="text-lg font-semibold text-white mb-1">Reply to item</h3>
+                    <p id="pending-reply-summary" class="text-sm text-dark-400 mb-4"></p>
+                    <textarea id="pending-reply-text" rows="5" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Your response..."></textarea>
+                    <div class="flex justify-end gap-2 mt-4">
+                        <button onclick="document.getElementById('pending-reply-modal').classList.add('hidden')" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Cancel</button>
+                        <button onclick="submitPendingReply()" id="pending-reply-submit" class="px-4 py-1.5 text-xs bg-accent hover:bg-green-700 text-white rounded">Submit reply</button>
                     </div>
                 </div>
             </div>
@@ -9150,6 +9440,7 @@ function getHTML(helixEnabled) {
             'gateways': '/gateways',
             'imei-pool': '/imei-pool',
             'errors': '/errors',
+            'rotation-reviews': '/rotation-reviews',
             'invoicing': '/invoicing',
             'billing': '/billing',
             'sms-usage': '/sms-usage',
@@ -9179,7 +9470,7 @@ function getHTML(helixEnabled) {
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'rotation-reviews': 'Rotation Reviews', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
             const PAGE_HEADERS = {
                 dashboard:   ['Overview',       'Dashboard',          'Monitor SIMs, messages, and system status.'],
                 sims:        ['Inventory',      'SIMs',               'Browse, filter, and manage every SIM card in the fleet.'],
@@ -9188,6 +9479,7 @@ function getHTML(helixEnabled) {
                 gateways:    ['Hardware',       'Gateways',           'SkyLine gateway health, port status, and slot capacity.'],
                 'imei-pool': ['Identity',       'IMEI Pool',          'Pool of device identifiers available for assignment.'],
                 errors:      ['Incidents',      'Errors',             'Recent worker errors and activation failures.'],
+                'rotation-reviews': ['Automation',  'Rotation Reviews',   'Daily agent review of recent rotation runs.'],
                 invoicing:   ['Billing',        'Invoicing',          'Reseller plans, QuickBooks mappings, and invoices.'],
                 billing:     ['Billing',        'Reseller Billing',   'Charging audit, billing ledger, and plan rates.'],
                 'sms-usage': ['Analytics',      'SMS Usage',          'Inbound SMS volume per SIM over time.'],
@@ -9211,6 +9503,7 @@ function getHTML(helixEnabled) {
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
             if (tabName === 'sims') { loadRotationAudit(); try { syncSimsUrl(); } catch(e){} }
+            if (tabName === 'rotation-reviews') { loadRotationReviews(); }
         }
 
         // Handle browser back/forward
@@ -10029,6 +10322,266 @@ function getHTML(helixEnabled) {
         }
 
         let lastRotationAudit = null;
+
+
+        // ─── Rotation Reviews tab ───────────────────────────────────────────
+        let _pendingReplyId = null;
+
+        async function loadRotationReviews() {
+            try {
+                const r = await fetch(\`\${API_BASE}/rotation-reviews?limit=10\`);
+                const data = await r.json();
+                const tbody = document.getElementById('reviews-table-body');
+                if (!data.rows || data.rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="9" class="py-4 text-center text-dark-400">No reviews yet. Hit Run Now to make one.</td></tr>';
+                } else {
+                    tbody.innerHTML = data.rows.map(r => {
+                        const s = r.summary || {};
+                        const t = s.tally || {};
+                        const start = new Date(r.started_at);
+                        const dur = r.ended_at ? Math.round((new Date(r.ended_at) - start) / 1000) + 's' : '—';
+                        const statusBadge = r.status === 'completed'
+                            ? \`<span class="text-xs px-2 py-0.5 rounded bg-green-700/50 text-green-300">ok</span>\`
+                            : r.status === 'running'
+                            ? \`<span class="text-xs px-2 py-0.5 rounded bg-blue-700/50 text-blue-300">running</span>\`
+                            : \`<span class="text-xs px-2 py-0.5 rounded bg-red-700/50 text-red-300">\${r.status}</span>\`;
+                        const failed = ((t.atomic||{}).failed||0) + ((t.teltik||{}).failed||0) + ((t.wing_iot||{}).failed||0) + ((t.helix||{}).failed||0);
+                        return \`<tr class="border-b border-dark-700/50 hover:bg-dark-800/50">
+                            <td class="py-2">\${start.toLocaleString()}</td>
+                            <td>\${statusBadge}</td>
+                            <td>\${dur}</td>
+                            <td>\${(t.atomic||{}).rotated||0}/\${(t.atomic||{}).success||0}</td>
+                            <td>\${(t.teltik||{}).rotated||0}/\${(t.teltik||{}).success||0}</td>
+                            <td>\${(t.wing_iot||{}).rotated||0}/\${(t.wing_iot||{}).success||0}</td>
+                            <td>\${failed > 0 ? \`<span class="text-red-400">\${failed}</span>\` : '0'}</td>
+                            <td>\${s.pending_open || 0}</td>
+                            <td><button onclick="viewReviewReport('\${r.run_id}')" class="text-xs text-accent hover:underline">View</button></td>
+                        </tr>\`;
+                    }).join('');
+                }
+            } catch (e) {
+                document.getElementById('reviews-table-body').innerHTML = \`<tr><td colspan="9" class="py-4 text-center text-red-400">Error: \${e.message}</td></tr>\`;
+            }
+            await loadPendingItems();
+        }
+
+        async function viewReviewReport(runId) {
+            try {
+                const r = await fetch(\`\${API_BASE}/rotation-reviews/\${encodeURIComponent(runId)}\`);
+                const data = await r.json();
+                if (!data.run) {
+                    showToast('Report not found', 'error');
+                    return;
+                }
+                const md = data.run.report_md || '_(no report stored)_';
+                document.getElementById('review-report-title').textContent = 'Review ' + new Date(data.run.started_at).toLocaleString();
+                document.getElementById('review-report-content').innerHTML = simpleMarkdownToHtml(md);
+                document.getElementById('review-report-modal').classList.remove('hidden');
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        function simpleMarkdownToHtml(md) {
+            const esc = (s) => String(s).replace(/[&<>]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c]));
+            const lines = md.split('\\n');
+            let html = '', inTable = false, inList = false;
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (/^# /.test(line))   { if (inList) { html += '</ul>'; inList = false; } html += \`<h1 class="text-2xl font-bold text-white mb-3 mt-4">\${esc(line.slice(2))}</h1>\`; continue; }
+                if (/^## /.test(line))  { if (inList) { html += '</ul>'; inList = false; } html += \`<h2 class="text-lg font-semibold text-white mb-2 mt-4">\${esc(line.slice(3))}</h2>\`; continue; }
+                if (/^---$/.test(line)) { if (inList) { html += '</ul>'; inList = false; } html += '<hr class="my-4 border-dark-600">'; continue; }
+                if (/^\|.*\|$/.test(line)) {
+                    const cells = line.slice(1, -1).split('|').map(c => c.trim());
+                    if (/^[-:\s|]+$/.test(line.replace(/[|]/g, ''))) continue;
+                    if (!inTable) { html += '<table class="text-sm border-collapse my-3">'; inTable = true; }
+                    const isHeader = (i > 0 && /^\|.*\|$/.test(lines[i+1] || '') && /^[-:\s|]+$/.test((lines[i+1]||'').replace(/[|]/g, '')));
+                    const tag = isHeader ? 'th' : 'td';
+                    html += '<tr>' + cells.map(c => \`<\${tag} class="border border-dark-600 px-3 py-1">\${esc(c)}</\${tag}>\`).join('') + '</tr>';
+                    continue;
+                }
+                if (inTable) { html += '</table>'; inTable = false; }
+                if (/^- /.test(line)) {
+                    if (!inList) { html += '<ul class="list-disc list-inside text-sm text-dark-200 space-y-1 my-2">'; inList = true; }
+                    html += \`<li>\${esc(line.slice(2)).replace(/\\*\\*(.+?)\\*\\*/g, '<strong class="text-white">$1</strong>').replace(/\`([^\`]+)\`/g, '<code class="bg-dark-900 px-1 rounded text-accent text-xs">$1</code>')}</li>\`;
+                    continue;
+                }
+                if (inList) { html += '</ul>'; inList = false; }
+                if (line.trim() === '') { html += '<br>'; continue; }
+                html += \`<p class="text-sm text-dark-200 my-1">\${esc(line).replace(/\\*\\*(.+?)\\*\\*/g, '<strong class="text-white">$1</strong>').replace(/\`([^\`]+)\`/g, '<code class="bg-dark-900 px-1 rounded text-accent text-xs">$1</code>')}</p>\`;
+            }
+            if (inList) html += '</ul>';
+            if (inTable) html += '</table>';
+            return html;
+        }
+
+        async function runReviewNow() {
+            const btn = document.getElementById('run-review-btn');
+            const pill = document.getElementById('review-status-pill');
+            btn.disabled = true; btn.classList.add('opacity-50');
+            pill.textContent = 'running...';
+            pill.className = 'text-xs px-2 py-1 rounded-full bg-blue-700/50 text-blue-300';
+            try {
+                const r = await fetch(\`\${API_BASE}/rotation-review/run\`, { method: 'POST' });
+                const data = await r.json();
+                if (data.ok) {
+                    showToast('Review completed', 'success');
+                    pill.textContent = 'idle';
+                    pill.className = 'text-xs px-2 py-1 rounded-full bg-dark-700 text-dark-300';
+                } else {
+                    showToast('Review failed: ' + (data.error || ('status ' + (data.status || '?'))), 'error');
+                    pill.textContent = 'failed';
+                    pill.className = 'text-xs px-2 py-1 rounded-full bg-red-700/50 text-red-300';
+                }
+                await loadRotationReviews();
+                await loadPendingItems();
+                await refreshReviewBadge();
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+                pill.textContent = 'error';
+                pill.className = 'text-xs px-2 py-1 rounded-full bg-red-700/50 text-red-300';
+            } finally {
+                btn.disabled = false; btn.classList.remove('opacity-50');
+            }
+        }
+
+        async function loadPendingItems() {
+            const filter = document.getElementById('pending-filter')?.value || 'open';
+            const listEl = document.getElementById('pending-items-list');
+            const countEl = document.getElementById('pending-count-inline');
+            try {
+                const r = await fetch(\`\${API_BASE}/pending-items?status=\${filter}&limit=200\`);
+                const data = await r.json();
+                if (countEl) countEl.textContent = data.open_count || 0;
+                const badge = document.getElementById('sidebar-review-badge');
+                if (badge) {
+                    if (data.open_count > 0) {
+                        badge.textContent = data.open_count;
+                        badge.classList.remove('hidden');
+                    } else {
+                        badge.classList.add('hidden');
+                    }
+                }
+                if (!data.rows || data.rows.length === 0) {
+                    listEl.innerHTML = '<p class="text-sm text-dark-400">No items.</p>';
+                    return;
+                }
+                listEl.innerHTML = data.rows.map(it => {
+                    const ago = timeAgo(new Date(it.created_at));
+                    const kindBadge = \`<span class="text-xs px-2 py-0.5 rounded bg-dark-700 text-dark-300">\${it.kind}</span>\`;
+                    const statusBadge = it.status === 'open'         ? '<span class="text-xs px-2 py-0.5 rounded bg-red-700/40 text-red-300">open</span>'
+                                      : it.status === 'answered'     ? '<span class="text-xs px-2 py-0.5 rounded bg-blue-700/40 text-blue-300">answered</span>'
+                                      : it.status === 'acknowledged' ? '<span class="text-xs px-2 py-0.5 rounded bg-green-700/40 text-green-300">ack</span>'
+                                      : it.status === 'snoozed'      ? '<span class="text-xs px-2 py-0.5 rounded bg-yellow-700/40 text-yellow-300">snoozed</span>'
+                                      : '<span class="text-xs px-2 py-0.5 rounded bg-dark-700 text-dark-400">dismissed</span>';
+                    const respondedNote = it.operator_response
+                        ? \`<div class="mt-2 pl-3 border-l-2 border-blue-500/40 text-xs text-blue-200/80">You: \${escapeHtml(it.operator_response)}</div>\`
+                        : '';
+                    const actions = it.status === 'open' ? \`
+                        <button onclick="openPendingReply(\${it.id}, '\${escapeAttr(it.summary)}')" class="px-2 py-1 text-xs bg-accent hover:bg-green-700 text-white rounded">Reply</button>
+                        <button onclick="respondPending(\${it.id}, 'acknowledge')" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Ack</button>
+                        <button onclick="respondPending(\${it.id}, 'snooze')" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Snooze</button>
+                        <button onclick="respondPending(\${it.id}, 'dismiss')" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Dismiss</button>
+                    \` : '';
+                    return \`<div class="border border-dark-600 rounded-lg p-3 hover:bg-dark-800/50">
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="flex-1 min-w-0">
+                                <div class="flex items-center gap-2 mb-1">\${kindBadge}\${statusBadge}<span class="text-xs text-dark-400">\${ago}</span></div>
+                                <div class="text-sm text-gray-200">\${escapeHtml(it.summary)}</div>
+                                \${respondedNote}
+                            </div>
+                            <div class="flex flex-wrap gap-1 flex-shrink-0">\${actions}</div>
+                        </div>
+                    </div>\`;
+                }).join('');
+            } catch (e) {
+                listEl.innerHTML = \`<p class="text-sm text-red-400">Error: \${e.message}</p>\`;
+            }
+        }
+
+        function escapeHtml(s) { return String(s||'').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+        function escapeAttr(s) { return String(s||'').replace(/'/g, "\\\\'").replace(/"/g, '&quot;'); }
+        function timeAgo(d) {
+            const s = Math.floor((Date.now() - d.getTime()) / 1000);
+            if (s < 60) return s + 's ago';
+            if (s < 3600) return Math.floor(s/60) + 'm ago';
+            if (s < 86400) return Math.floor(s/3600) + 'h ago';
+            return Math.floor(s/86400) + 'd ago';
+        }
+
+        function openPendingReply(id, summary) {
+            _pendingReplyId = id;
+            document.getElementById('pending-reply-summary').textContent = summary;
+            document.getElementById('pending-reply-text').value = '';
+            document.getElementById('pending-reply-modal').classList.remove('hidden');
+        }
+
+        async function submitPendingReply() {
+            const text = document.getElementById('pending-reply-text').value.trim();
+            if (!text) { showToast('Please enter a reply', 'error'); return; }
+            await respondPending(_pendingReplyId, 'reply', text);
+            document.getElementById('pending-reply-modal').classList.add('hidden');
+        }
+
+        async function respondPending(id, action, responseText) {
+            try {
+                const body = { action };
+                if (responseText) body.response_text = responseText;
+                const r = await fetch(\`\${API_BASE}/pending-items/\${id}/respond\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const data = await r.json();
+                if (data.ok) {
+                    showToast(\`Item \${action}d\`, 'success');
+                    await loadPendingItems();
+                    await refreshReviewBadge();
+                } else {
+                    showToast('Error: ' + (data.error || 'unknown'), 'error');
+                }
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function askAgent(triggerNow) {
+            const text = document.getElementById('ask-agent-input').value.trim();
+            if (!text) { showToast('Type a message first', 'error'); return; }
+            try {
+                // Use a special "operator_question" pending item by directly posting via REST
+                // (no dedicated endpoint — leverage the respond endpoint's PATCH after creating via the standard create)
+                // Workaround: create via a small dedicated route would be cleaner; for now we create through Supabase REST.
+                const c = await fetch(\`\${API_BASE}/operator-question\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ summary: text.slice(0, 120), details_md: text }),
+                });
+                if (!c.ok) { showToast('Failed to save question', 'error'); return; }
+                document.getElementById('ask-agent-input').value = '';
+                await loadPendingItems();
+                if (triggerNow) { await runReviewNow(); }
+                else showToast('Saved. Agent will see it on next run.', 'success');
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function refreshReviewBadge() {
+            try {
+                const r = await fetch(\`\${API_BASE}/pending-items?status=open&limit=1\`);
+                const data = await r.json();
+                const badge = document.getElementById('sidebar-review-badge');
+                if (!badge) return;
+                if (data.open_count > 0) { badge.textContent = data.open_count; badge.classList.remove('hidden'); }
+                else badge.classList.add('hidden');
+            } catch (_) {}
+        }
+
+        // Poll badge every 60s
+        setInterval(refreshReviewBadge, 60000);
+        // Kick off once after boot
+        setTimeout(refreshReviewBadge, 2000);
 
         async function loadRotationAudit() {
           try {

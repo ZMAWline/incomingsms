@@ -1139,7 +1139,9 @@ async function acquireReviewLock(env, kind = 'rotation_review') {
   return { acquired: true, run: Array.isArray(rows) ? rows[0] : rows };
 }
 
-async function releaseReviewLock(env, runDbId, status, summary) {
+async function releaseReviewLock(env, runDbId, status, summary, reportMd) {
+  const body = { status, ended_at: new Date().toISOString(), summary };
+  if (reportMd) body.report_md = reportMd;
   await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs?id=eq.${runDbId}`, {
     method: 'PATCH',
     headers: {
@@ -1148,7 +1150,48 @@ async function releaseReviewLock(env, runDbId, status, summary) {
       'Content-Type': 'application/json',
       Prefer: 'return=minimal',
     },
-    body: JSON.stringify({ status, ended_at: new Date().toISOString(), summary }),
+    body: JSON.stringify(body),
+  }).catch(() => {});
+}
+
+// ---- pending_review_items helpers --------------------------------------
+async function loadOpenPendingItems(env) {
+  return rotationReviewQuery(env,
+    `pending_review_items?status=in.(open,answered)&select=id,kind,summary,sim_id,status,operator_response,agent_seen_at,created_at&order=created_at.desc&limit=200`);
+}
+
+async function findOpenPendingForSim(env, simId, kind) {
+  // Used for dedup so we don't create duplicate items for the same SIM+kind
+  const rows = await rotationReviewQuery(env,
+    `pending_review_items?status=eq.open&kind=eq.${encodeURIComponent(kind)}&sim_id=eq.${simId}&select=id&limit=1`);
+  return rows[0] || null;
+}
+
+async function insertPendingItem(env, item) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify([item]),
+  });
+  return res.ok;
+}
+
+async function markPendingItemSeen(env, ids) {
+  if (!ids || ids.length === 0) return;
+  await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items?id=in.(${ids.join(',')})`, {
+    method: 'PATCH',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify({ agent_seen_at: new Date().toISOString() }),
   }).catch(() => {});
 }
 
@@ -1489,6 +1532,55 @@ async function runRotationReview(env, opts = {}) {
     // ── 6. Multi-day pattern detection ───────────────────────────────────────
     const multiDayFailures = await detectMultiDayFailures(env, 3);
 
+    // ── 6b. Read operator responses from pending items ───────────────────────
+    const openPending = await loadOpenPendingItems(env).catch(() => []);
+    const answeredItems = openPending.filter(i => i.status === 'answered' && i.operator_response);
+    const stillOpenCount = openPending.filter(i => i.status === 'open').length;
+
+    // ── 6c. Create/update pending_review_items for this run ──────────────────
+    let newPendingCreated = 0;
+    if (!dryRun) {
+      for (const { entry, sims } of Object.values(buckets)) {
+        if (entry.safe) continue; // auto-fix; no operator action needed
+        for (const sim of sims) {
+          const existing = await findOpenPendingForSim(env, sim.id, 'human_review_failure');
+          if (existing) continue;
+          const summary = `${entry.id}: SIM #${sim.id} (${sim.vendor})`;
+          const details = `**Bucket:** ${entry.id}\n**Vendor:** ${sim.vendor}\n**MSISDN:** ${sim.msisdn || '—'}\n**Error:** ${(sim.last_rotation_error || '').slice(0, 400)}\n\n**Playbook description:** ${entry.description}`;
+          await insertPendingItem(env, {
+            kind: 'human_review_failure', summary, details_md: details,
+            run_id: runId, sim_id: sim.id, status: 'open',
+          });
+          newPendingCreated++;
+        }
+      }
+      for (const sim of unclassified) {
+        const existing = await findOpenPendingForSim(env, sim.id, 'unclassified_pattern');
+        if (existing) continue;
+        const summary = `unclassified: SIM #${sim.id} (${sim.vendor})`;
+        const details = `**No playbook entry matched.** Operator decision needed; consider adding a playbook entry to \`src/shared/rotation-playbook.mjs\`.\n\n**Vendor:** ${sim.vendor}\n**MSISDN:** ${sim.msisdn || '—'}\n**Error:** ${(sim.last_rotation_error || '').slice(0, 400)}`;
+        await insertPendingItem(env, {
+          kind: 'unclassified_pattern', summary, details_md: details,
+          run_id: runId, sim_id: sim.id, status: 'open',
+        });
+        newPendingCreated++;
+      }
+      for (const s of multiDayFailures) {
+        const existing = await findOpenPendingForSim(env, s.sim_id, 'multi_day_failure');
+        if (existing) continue;
+        const summary = `multi_day: SIM #${s.sim_id} failed ${s.days_failed} days running`;
+        const details = `SIM #${s.sim_id} has now failed force_rotate on **${s.days_failed} consecutive NY-days**. Suggested action: manually rotate via dashboard, or mark the SIM as quarantined if a vendor-side issue is suspected.`;
+        await insertPendingItem(env, {
+          kind: 'multi_day_failure', summary, details_md: details,
+          run_id: runId, sim_id: s.sim_id, status: 'open',
+        });
+        newPendingCreated++;
+      }
+      // Mark any answered items as seen so they roll out of the "needs attention" count
+      const answeredIds = answeredItems.map(i => i.id);
+      if (answeredIds.length > 0) await markPendingItemSeen(env, answeredIds);
+    }
+
     // ── 7. Render markdown report ────────────────────────────────────────────
     const lines = [];
     lines.push(`# Rotation Review — ${today}`);
@@ -1578,6 +1670,24 @@ async function runRotationReview(env, opts = {}) {
       lines.push('');
     }
 
+    if (answeredItems.length > 0) {
+      lines.push('## Operator responses since last run');
+      lines.push('');
+      for (const it of answeredItems) {
+        lines.push(`- **${it.kind}** ${it.summary} → operator: "${(it.operator_response || '').slice(0, 200)}"`);
+      }
+      lines.push('');
+    }
+
+    if (newPendingCreated > 0 || stillOpenCount > 0) {
+      lines.push('## Pending operator items');
+      lines.push('');
+      lines.push(`- New items this run: **${newPendingCreated}**`);
+      lines.push(`- Still open from prior runs: **${stillOpenCount}**`);
+      lines.push(`- Respond via the dashboard /rotation-reviews page.`);
+      lines.push('');
+    }
+
     lines.push('---');
     lines.push(`_Generated by details-finalizer /rotation-review in ${(Date.now() - startedAt) / 1000}s. Source: src/details-finalizer/index.js runRotationReview(). Playbook: src/shared/rotation-playbook.mjs (${PLAYBOOK.length} entries)._`);
 
@@ -1598,8 +1708,12 @@ async function runRotationReview(env, opts = {}) {
 
     if (!dryRun && lockHandle?.run?.id) {
       await releaseReviewLock(env, lockHandle.run.id, 'completed', {
-        tally, actions, pool: poolStats, multi_day_count: multiDayFailures.length, breaker: breaker.trippedVendors(),
-      });
+        tally, actions, pool: poolStats,
+        multi_day_count: multiDayFailures.length,
+        breaker: breaker.trippedVendors(),
+        pending_open: stillOpenCount,
+        pending_new:  newPendingCreated,
+      }, report);
     }
     return report;
   } catch (err) {
