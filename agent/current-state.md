@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-20 (session 57 — Apex PPU-then-MDN Phase 2 closed; pool replaced with OSM-sourced data + self-heal layer; canary live on SIM 2619)
+> Last updated: 2026-05-21 (session 57 cont. — Apex PPU-then-MDN Phase 3 shipped; activation/retry sites now use LRU picker on both mdn-rotator and bulk-activator)
 
 ---
 
@@ -50,15 +50,20 @@
 - `address_pool_usage`: 1529 rows / 51 states / 6 rows with `use_count=1` (3 from the new pool's successful canary picks, 3 from the pre-deploy "in DB but not in static pool" misses that still incremented use_count via the RPC). Zero quarantined rows now.
 - 4 pool entries are now in OSM that weren't in the deployed bundle yet at the moment of canary rotation 1-3 — those got picked, returned "in DB but not in static pool" errors, and incremented use_count without being usable. Redeploy fixed it. (Lesson: redeploy worker first, *then* swap pool table.)
 
-**To finish (Phases 3-5):**
-- **Phase 3** — activation/retry sites: swap `pickRandomAddress` → `pickNextPpuAddress` in the activate + retry-activate functions in mdn-rotator (~lines 3303 and 3358).
-- **Phase 4** — helix: add `hxUpdateSubscriberDetails` to `src/shared/helix.ts`, mirror Phase 2 wiring in the helix rotation branch.
-- **Phase 5** — expand canary to full fleet after 24h+48h stability checks, remove the canary gate, drop deprecated `pickRandomAddress`, update `.claude/skills/atomic-api/SKILL.md` with Rule 5 (PPU before swap), append `agent/constraints.md` §<N>.
+**Phase 3 — DONE (2026-05-21, commit `4946d26`):**
+- mdn-rotator `hxActivate` (line ~3382) and `retryActivateViaAtomic` (line ~3437): replaced `pickRandomAddress` with `await pickNextPpuAddress(env, {})`. Functions were already async. Removed the now-unused `pickRandomAddress` import. Deployed as version `2681f1b8`.
+- **bulk-activator (out of original plan scope but required):** the OSM pool rename in session 56 changed the entry shape from `{ address1, city, state, zipCode }` to `{ id, streetNumber, streetName, streetDirection, city, state, zipCode }`. Both `activateViaAtomic` (line ~209) and `hxActivate` (line ~367) still consumed `addr.address1` — the deployed prod bundle still had the old `.js` pool inlined so it kept working, but the *committed* code path was broken. Updated both sites: Helix activations now send `address1: ${streetNumber} ${streetName}`; ATOMIC activations send `streetNumber/streetDirection/streetName` directly. Same `pickNextPpuAddress(env, {})` picker. Deployed as version `ad5cc18f`.
+- **Self-heal at activation:** all 4 sites wrap the AT&T-rejection path with a `markAddressVerifyFailure(env, addr.id, ...)` call when the response or error text matches `/address.*verif/i`. Symmetric with the apex rotation flow's catch block.
+- **Verification:** code paths confirmed by syntax check + grep (no `pickRandomAddress` or stale `addr.address1` access remains). End-to-end verification deferred — last atomic activation was 2026-05-04; will validate organically on the next activation. Look for `step='activation'` rows in `carrier_api_logs` with the new request-body shape and a matching `address_pool_usage.use_count` bump.
+
+**To finish (Phases 4-5):**
+- **Phase 4** — helix: add `hxUpdateSubscriberDetails` to `src/shared/helix.ts`, mirror Phase 2 wiring in the helix rotation branch (`runHelixRotation` ~line 2010 area).
+- **Phase 5** — expand canary to full atomic fleet after 24h+48h stability checks; then helix; then remove the canary gate; drop deprecated `pickRandomAddress` from `src/shared/address-pool.mjs`; update `.claude/skills/atomic-api/SKILL.md` with Rule 5 (PPU before swap); append `agent/constraints.md` §<N>.
 
 **Hot starts for the next session:**
-- Check overnight: `SELECT count(*) AS apex_ok, count(*) FILTER (WHERE error IS NOT NULL) AS apex_err FROM carrier_api_logs WHERE step='ppu_update' AND created_at > now() - interval '12 hours'` — expect `apex_ok=1+` (SIM 2619 cron rotation) and `apex_err=0`.
-- If clean, proceed to Phase 3 (activation site picker swap) or expand canary to a wider atomic SIM set with `UPDATE sims SET canary_apex_ppu=true WHERE vendor='atomic' AND id IN (...) ORDER BY last_mdn_rotated_at NULLS FIRST LIMIT 10`.
-- Production state: rotator at version `8f9f0665`. Pool at 1529 entries (`src/shared/address-pool.mjs`). Self-heal layer is live — any AT&T-rejected address gets quarantined automatically.
+- First: check tonight's apex cron — `SELECT count(*) AS apex_ok, count(*) FILTER (WHERE error IS NOT NULL) AS apex_err FROM carrier_api_logs WHERE step='ppu_update' AND created_at > now() - interval '12 hours'`. Expect `apex_ok=1+` (SIM 2619 only) and `apex_err=0`. NY-midnight cron window opens at UTC 04:00 = 2026-05-21 04:00.
+- If clean, expand canary (e.g. `UPDATE sims SET canary_apex_ppu=true WHERE vendor='atomic' AND id IN (...) ORDER BY last_mdn_rotated_at NULLS FIRST LIMIT 10`) OR start Phase 4 (helix mirror).
+- Production state: mdn-rotator at version `2681f1b8`, bulk-activator at version `ad5cc18f`. `APEX_PPU_THEN_MDN_ENABLED=true` secret on mdn-rotator. Pool at 1529 OSM-sourced entries with self-heal active.
 - Plan references say `address-pool.js` / `address-picker.js` in many places — translate every such reference to `.mjs` when reading the plan tasks (still applies).
 
 ---
