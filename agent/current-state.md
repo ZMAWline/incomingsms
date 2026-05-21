@@ -1,11 +1,41 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-21 (session 58 — PR-B shipped + PPU retry loop + DB-driven address pool + 6h refill cron)
+> Last updated: 2026-05-21 (session 58 cont. — PR-B URL bug post-mortem + full overnight drain)
 
 ---
 
-## Session 58 (2026-05-21) — PPU retry + DB-driven pool
+## Session 58 cont. (2026-05-21 ~13:00–14:30 UTC) — overnight rotation post-mortem
+
+**Discovered: tonight's Teltik cron rotated 0 SIMs** despite ~714 Group B SIMs being eligible. Root cause: PR-B (shipped at 01:38 UTC) introduced a malformed PostgREST URL in the retry-candidates query — `reseller_sims!inner(reseller_id,active)` was a standalone URL parameter instead of inside `select=`. PostgREST rejected every cron tick with `PGRST108: 'reseller_sims' is not an embedded resource in this request`. The exception propagated up through `rotateTeltikSims` and was caught at the scheduled() handler level, which just logged and exited — silent failure, zero DB writes, no SIM rotated all night. **Fixed in commit `da7f55c` / version `bd5ed97d`:** moved embed inside `select=`; wrapped retry-candidates fetch in try/catch so a future malformed query in the retry path can never again kill the main rotation pass.
+
+**Also discovered: 39 atomic SIMs failed PPU at the very first cron tick (04:16 UTC) and were locked out for the rest of the night** because the cron's pre-filter `last_mdn_rotated_at >= today_NY_midnight` excluded any SIM that `claim_rotation_slot` had stamped during the failure. My PPU retry-loop fix (commit `327abaf`, deployed 06:19 UTC) was deployed AFTER those SIMs had been claimed and stamped, so it didn't help them.
+
+**Manual drain performed (all force-rotate from operator workstation, ~13:00–14:25 UTC):**
+- **Atomic** — `/tmp/force_rotate.sh` looped curl `/rotate-sim?force=true` over all 43 failed SIMs. 42 succeeded (PPU retry loop validated end-to-end on real traffic). 1 SIM (#674) failed at `pre_swap_inquiry` — pre-existing AT&T-side issue, not retryable.
+- **Teltik** — `/tmp/teltik_parallel.sh` fired 627 eligible SIMs at 15-way parallel via `/rotate-sim?force=true`. 540 returned `ok+pending` cleanly. **87 hit CF wall-clock (worker killed before the change-number HTTP response was captured); Teltik DID rotate them but our DB never learned.** After 30 min the stuck-state sweeper flipped those 99 to `rotation_status='failed'`. Confirmed via retry pass: 96 came back `Only 1 number change allowed per sim in 48 hours.` (Teltik's own guard).
+- **Bulk SQL flip:** `UPDATE sims SET status='provisioning', rotation_status='mdn_pending' WHERE last_rotation_error LIKE '%Only 1 number change allowed%'` (96 rows). Then `details-finalizer /run?limit=...` loop (5 passes × ~90s) drained the resulting 283 mdn_pending cohort to success+notified via `get-phone-number` + `number.online` webhook.
+
+**Final overnight tally:**
+
+| Vendor | Rotated | Notified | Pending finalize | Genuinely failed |
+|--------|---------|----------|-----------------|------------------|
+| Atomic | 292 | 290 | 2 | 1 (SIM 674, pre_swap_inquiry) |
+| Teltik | 734 | 720 | 11 | 3 (SIM 3576 same MDN, 3364 + 3309 Teltik body FAILED) |
+| Wing IoT | 263 | 263 | 0 | 0 |
+| **Total** | **1289** | **1273 (98.8%)** | **13** | **4** |
+
+The 13 pending will clear in the next two 5-min finalizer cron ticks.
+
+**Lessons / followups:**
+1. **PR-B URL bug never tripped in any pre-deploy test** because no test exercises the cron path. Need a smoke check for PostgREST `PGRST*` errors in the cron handler that alerts immediately rather than silently logging.
+2. **Parallel drain pattern (curl 15-way) is too aggressive for CF Worker wall-clock.** Better pattern for future drains: bounded parallel with 5–10 concurrent + 60–90s per-call timeout, OR add `ctx.waitUntil` inside the worker's `/rotate-sim` handler so the HTTP response doesn't kill the rotation work.
+3. **Stuck-state sweeper masked the real symptom for 30 min** (rotations were *initiated* at Teltik but our DB went straight from `rotating` → `failed` instead of `rotating` → `mdn_pending` → `success`). Could shorten the sweeper's 30-min threshold or add a sibling sweeper that calls `get-phone-number` before declaring failure.
+4. **Cycle-group concern revived.** The current single-cohort design means a bug in one cron tick wipes out ~700 customer-facing rotations all at once. Splitting Teltik into Cycle Groups A/B (deferred per `project_teltik_cycle_groups_deferred.md`) would have halved the blast radius. Still deferred unless this pattern recurs.
+
+---
+
+## Session 58 (2026-05-21 earlier) — PPU retry + DB-driven pool
 
 **Apex PPU retry loop (mdn-rotator `1646b5cd`):** rotateAtomicSim + rotateSingleSim helix mirror now wrap the PPU step in a 3-attempt loop. First pick excludes current state+zip; retries drop exclusions for any-zip LRU. If all attempts fail, `last_mdn_rotated_at` is restored to its pre-claim value so the next cron tick re-attempts the SIM instead of locking it out via the "< NY midnight" gate. Diagnosed via SIM 652: tonight's apex flow stamped `last_mdn_rotated_at=NOW()` on claim but PPU failed → SIM was effectively stuck until tomorrow night. Now self-recovers.
 
