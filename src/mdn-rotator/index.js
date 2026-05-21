@@ -1,5 +1,4 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
-import { pickRandomAddress } from '../shared/address-pool.mjs';
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
 
 // =========================================================
@@ -3379,7 +3378,7 @@ function normalizeUS(phone) {
 // ===========================
 
 async function hxActivate(env, token, iccid, imei) {
-  const addr = pickRandomAddress();
+  const addr = await pickNextPpuAddress(env, {});
   const url = env.HX_API_BASE + '/api/mobility-activation/activate';
   const method = "POST";
   const runId = 'retry_activate_' + iccid + '_' + Date.now();
@@ -3391,7 +3390,7 @@ async function hxActivate(env, token, iccid, imei) {
     activationType: "new_activation",
     subscriber: { firstName: "SUB", lastName: "NINE" },
     address: {
-      address1: addr.address1,
+      address1: `${addr.streetNumber} ${addr.streetName}`,
       city: addr.city,
       state: addr.state,
       zipCode: addr.zipCode,
@@ -3413,7 +3412,12 @@ async function hxActivate(env, token, iccid, imei) {
     response_body_text: responseText, response_body_json: json,
     error: res.ok ? null : 'Activate failed: ' + res.status,
   });
-  if (!res.ok) throw new Error('Activate failed ' + res.status + ': ' + responseText.slice(0, 300));
+  if (!res.ok) {
+    if (/address.*verif|verif.*address/i.test(responseText)) {
+      await markAddressVerifyFailure(env, addr.id, `Helix activate rejected address: ${responseText.slice(0, 200)}`);
+    }
+    throw new Error('Activate failed ' + res.status + ': ' + responseText.slice(0, 300));
+  }
   if (json && json.mobilitySubscriptionId) return json;
   const match = responseText.match(/"mobilitySubscriptionId"\s*:\s*"?(\d+)"?/);
   if (match) return { mobilitySubscriptionId: match[1], _raw: responseText };
@@ -3434,7 +3438,7 @@ function relayFetch(env, url, init) {
 }
 
 async function retryActivateViaAtomic(env, iccid, imei, runId) {
-  const addr = pickRandomAddress();
+  const addr = await pickNextPpuAddress(env, {});
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
   const requestBody = {
     wholeSaleApi: {
@@ -3453,9 +3457,9 @@ async function retryActivateViaAtomic(env, iccid, imei, runId) {
         BAN: '',
         firstName: 'SUB',
         lastName: 'NINE',
-        streetNumber: addr.address1.split(' ')[0],
-        streetDirection: '',
-        streetName: addr.address1.split(' ').slice(1).join(' '),
+        streetNumber: addr.streetNumber,
+        streetDirection: addr.streetDirection || '',
+        streetName: addr.streetName,
         zip: addr.zipCode,
         plan: 'ATTNOVOICE',
         portMdn: '',
@@ -3478,6 +3482,11 @@ async function retryActivateViaAtomic(env, iccid, imei, runId) {
     error: res.ok ? null : 'ATOMIC retry activation failed: ' + res.status,
   });
   if (!res.ok) throw new Error('ATOMIC retry activation failed ' + res.status + ': ' + responseText.slice(0, 300));
+  // Quarantine the picked address if AT&T rejected it (so it won't be re-picked for 90d).
+  const respDesc = responseJson?.wholeSaleApi?.wholeSaleResponse?.description || '';
+  if (/address.*verif|verif.*address/i.test(respDesc)) {
+    await markAddressVerifyFailure(env, addr.id, `ATOMIC activate rejected address: ${respDesc.slice(0, 200)}`);
+  }
   const wr914 = responseJson?.wholeSaleApi?.wholeSaleResponse;
   if (wr914?.statusCode === '914') {
     // SIM already active with another MSISDN — run subsriberInquiry to get current MDN

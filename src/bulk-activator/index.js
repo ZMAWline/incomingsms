@@ -1,4 +1,4 @@
-import { pickRandomAddress } from '../shared/address-pool.mjs';
+import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -206,7 +206,7 @@ function relayFetch(env, url, init) {
 
 async function activateViaAtomic(env, iccid, imei, runId) {
   // ATOMIC activation - returns MSISDN immediately
-  const addr = pickRandomAddress();
+  const addr = await pickNextPpuAddress(env, {});
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
   const requestBody = {
     wholeSaleApi: {
@@ -225,9 +225,9 @@ async function activateViaAtomic(env, iccid, imei, runId) {
         BAN: '',
         firstName: 'SUB',
         lastName: 'NINE',
-        streetNumber: addr.address1.split(' ')[0],
-        streetDirection: '',
-        streetName: addr.address1.split(' ').slice(1).join(' '),
+        streetNumber: addr.streetNumber,
+        streetDirection: addr.streetDirection || '',
+        streetName: addr.streetName,
         zip: addr.zipCode,
         plan: 'ATTNOVOICE',
         portMdn: '',
@@ -263,6 +263,12 @@ async function activateViaAtomic(env, iccid, imei, runId) {
 
   if (!res.ok) {
     throw new Error(`ATOMIC activation failed ${res.status}: ${responseText.slice(0, 300)}`);
+  }
+
+  // Quarantine the picked address if AT&T rejected it (won't be re-picked for 90d).
+  const respDesc = responseJson?.wholeSaleApi?.wholeSaleResponse?.description || '';
+  if (/address.*verif|verif.*address/i.test(respDesc)) {
+    await markAddressVerifyFailure(env, addr.id, `ATOMIC activate rejected address: ${respDesc.slice(0, 200)}`);
   }
 
   const result = responseJson?.wholeSaleApi?.wholeSaleResponse?.Result;
@@ -359,7 +365,7 @@ async function hxGetBearerToken(env) {
 }
 
 async function hxActivate(env, token, iccid, imei, runId) {
-  const addr = pickRandomAddress();
+  const addr = await pickNextPpuAddress(env, {});
   const url = `${env.HX_API_BASE}/api/mobility-activation/activate`;
   const requestBody = {
     clientId: Number(env.HX_ACTIVATION_CLIENT_ID),
@@ -369,7 +375,7 @@ async function hxActivate(env, token, iccid, imei, runId) {
     activationType: 'new_activation',
     subscriber: { firstName: 'SUB', lastName: 'NINE' },
     address: {
-      address1: addr.address1,
+      address1: `${addr.streetNumber} ${addr.streetName}`,
       city: addr.city,
       state: addr.state,
       zipCode: addr.zipCode,
@@ -403,6 +409,9 @@ async function hxActivate(env, token, iccid, imei, runId) {
   }).catch(e => console.error(`[Helix Log] ${e}`));
 
   if (!res.ok) {
+    if (/address.*verif|verif.*address/i.test(responseText)) {
+      await markAddressVerifyFailure(env, addr.id, `Helix activate rejected address: ${responseText.slice(0, 200)}`);
+    }
     throw new Error(`Activation failed ${res.status}: ${responseText.slice(0, 300)}`);
   }
 
