@@ -4101,11 +4101,10 @@ async function handleSimWebhooks(env, corsHeaders, url) {
       });
     }
     // webhook_deliveries.payload is jsonb shaped like { data: { sim_id, iccid, number, ... } }
-    // PostgREST supports nested JSON path filtering: payload->data->>sim_id=eq.<id>
-    // `cs` = 'contains' — matches any row whose payload jsonb contains the given
-    // subobject. More robust than json-path filtering through PostgREST URL parsing.
-    const jsonFilter = encodeURIComponent(JSON.stringify({ data: { sim_id: simId } }));
-    const q = `webhook_deliveries?select=id,event_type,reseller_id,webhook_url,payload,status,attempts,last_attempt_at,delivered_at,created_at,response_body&event_type=eq.number.online&payload=cs.${jsonFilter}&order=created_at.desc&limit=50`;
+    // Use PostgREST nested JSON path filter. The `cs.{json}` containment form
+    // (previously tried) silently returned 0 rows here, even though the
+    // equivalent SQL `payload @> jsonb` matches — see /api/sim-webhooks 2026-05-21.
+    const q = `webhook_deliveries?select=id,event_type,reseller_id,webhook_url,payload,status,attempts,last_attempt_at,delivered_at,created_at,response_body&event_type=eq.number.online&payload->data->>sim_id=eq.${simId}&order=created_at.desc&limit=50`;
     const res = await supabaseGet(env, q);
     const rows = await res.json().catch(() => []);
     const deliveries = Array.isArray(rows) ? rows : [];
