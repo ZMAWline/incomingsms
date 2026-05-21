@@ -572,10 +572,19 @@ async function rotateTeltikSims(env) {
   //    we just shortlist candidates here. Status must be active OR provisioning
   //    (latter covers SIMs stuck mid-rotation that the stuck-state sweeper flipped
   //    to rotation_status='failed' but never restored status to 'active').
-  const retryCandidates = await supabaseGetArray(
-    env,
-    `sims?vendor=eq.teltik&status=in.(active,provisioning)&rotation_status=eq.failed&rotation_eligible=eq.true&reseller_sims!inner(reseller_id,active)&reseller_sims.active=eq.true&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
-  );
+  // Defensive try/catch: a malformed retry query must not abort the main
+  // rotation pass. The embed `reseller_sims!inner(...)` MUST live inside
+  // `select=` or PostgREST throws PGRST108 (mistake that hid in PR-B for hours
+  // and silently killed tonight's entire cron window — see session 58).
+  let retryCandidates = [];
+  try {
+    retryCandidates = await supabaseGetArray(
+      env,
+      `sims?vendor=eq.teltik&status=in.(active,provisioning)&rotation_status=eq.failed&rotation_eligible=eq.true&reseller_sims.active=eq.true&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours,reseller_sims!inner(reseller_id,active)&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
+    );
+  } catch (err) {
+    console.error(`[Rotate] retry-candidates query failed (continuing with main pass): ${err}`);
+  }
 
   // Dedup: a SIM might appear in both `due` (never-rotated edge) and `retryCandidates`;
   // prefer the normal-due path so it goes through claim_rotation_slot, not the retry RPC.
