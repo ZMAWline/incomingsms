@@ -10,6 +10,7 @@
 // =========================================================
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
+import { PLAYBOOK, classifyFailure, UNCLASSIFIED_BUCKET } from '../shared/rotation-playbook.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
@@ -1062,20 +1063,22 @@ async function runAtomicFinalizer(env, limit) {
 
 /* ── Rotation Review (daily 12:30 UTC) ────────────────────────────────────── */
 // Called by CCR routine after the cron window closes. Produces a markdown
-// report summarizing tonight's rotation health and auto-fixes recoverable
-// failure patterns we learned about the hard way in session 58.
+// report summarizing rotation health and auto-fixes recoverable failure
+// patterns. Bounded by:
+//   - Run-lock (one active rotation_review at a time, via cron_runs)
+//   - Per-SIM 3-attempts-per-NY-day budget for force_rotate (via
+//     remediation_attempts + attempts_today RPC)
+//   - Per-vendor 5xx circuit breaker (5 consecutive 5xx → skip vendor)
+// Sends email via Resend if RESEND_API_KEY is set; otherwise returns the
+// markdown only (CCR routine commits it to the repo as a fallback).
 
 function pad2(n) { return String(n).padStart(2, '0'); }
 function ymdUtc(d = new Date()) { return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`; }
 function nyMidnightUtcIso(d = new Date()) {
-  // Start of today's NY calendar date as a UTC ISO timestamp. Same logic as
-  // the SQL helper in claim_rotation_slot (and getNYMidnightISO in mdn-rotator).
+  // Start of today's NY calendar date as a UTC ISO timestamp.
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
   }).formatToParts(d).reduce((acc, p) => (p.type !== 'literal' && (acc[p.type] = p.value), acc), {});
-  // 04:00 UTC is NY midnight in EDT; 05:00 in EST. Pick whichever falls inside
-  // the NY day boundary by computing both candidates and using the one that
-  // round-trips to the same NY date.
   for (const offset of [4, 5]) {
     const candidate = `${parts.year}-${parts.month}-${parts.day}T${pad2(offset)}:00:00Z`;
     const back = new Intl.DateTimeFormat('en-CA', {
@@ -1089,8 +1092,6 @@ function nyMidnightUtcIso(d = new Date()) {
 }
 
 async function rotationReviewQuery(env, fragment) {
-  // Wrapper for read-only queries that returns the array (uses Range header
-  // to bypass the 1000-cap when needed; review queries are bounded anyway).
   const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${fragment}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1101,156 +1102,512 @@ async function rotationReviewQuery(env, fragment) {
   return res.json();
 }
 
+// Lock acquire: INSERT into cron_runs with status='running'. The partial
+// unique index `cron_runs_one_active_per_kind` prevents a second active row.
+// Also marks any prior 'running' rows older than 30 min as 'stale' first
+// (covers crashed/killed prior runs).
+async function acquireReviewLock(env, kind = 'rotation_review') {
+  // Mark stale runs first
+  await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs?kind=eq.${kind}&status=eq.running&started_at=lt.${encodeURIComponent(new Date(Date.now() - 30 * 60 * 1000).toISOString())}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify({ status: 'stale', ended_at: new Date().toISOString() }),
+  }).catch(() => {});
+
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify([{ kind, status: 'running' }]),
+  });
+  if (res.status === 409 || res.status === 23505) return { acquired: false, reason: 'another_run_active' };
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    if (/duplicate key|cron_runs_one_active_per_kind/i.test(t)) return { acquired: false, reason: 'another_run_active' };
+    throw new Error(`acquireReviewLock: ${res.status} ${t}`);
+  }
+  const rows = await res.json().catch(() => []);
+  return { acquired: true, run: Array.isArray(rows) ? rows[0] : rows };
+}
+
+async function releaseReviewLock(env, runDbId, status, summary) {
+  await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs?id=eq.${runDbId}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify({ status, ended_at: new Date().toISOString(), summary }),
+  }).catch(() => {});
+}
+
+async function recordAttempt(env, simId, runId, action, result, error) {
+  await fetch(`${env.SUPABASE_URL}/rest/v1/remediation_attempts`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify([{ sim_id: simId, run_id: runId, action, result, error: error ? String(error).slice(0, 500) : null }]),
+  }).catch(() => {});
+}
+
+async function attemptsToday(env, simId, action) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/attempts_today`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ p_sim_id: simId, p_action: action }),
+  });
+  if (!res.ok) return 0;
+  const n = await res.json().catch(() => 0);
+  return typeof n === 'number' ? n : 0;
+}
+
+// Force-rotate one SIM via the appropriate worker (service binding — CF blocks
+// worker→public-.workers.dev fetches which is what tripped the first version).
+async function forceRotateSim(env, sim) {
+  const worker = sim.vendor === 'teltik' ? env.TELTIK_WORKER : env.MDN_ROTATOR;
+  if (!worker) return { ok: false, status: 0, error: `no service binding for vendor=${sim.vendor}` };
+  const base = sim.vendor === 'teltik' ? 'https://teltik-worker' : 'https://mdn-rotator';
+  const url = `${base}/rotate-sim?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET || '')}&iccid=${encodeURIComponent(sim.iccid)}&force=true`;
+  try {
+    const res = await worker.fetch(url, { method: 'POST', signal: AbortSignal.timeout(75000) });
+    const text = await res.text().catch(() => '');
+    let body = {};
+    try { body = JSON.parse(text); } catch { body = { raw: text.slice(0, 200) }; }
+    return { ok: res.ok && body.ok === true, status: res.status, response: body };
+  } catch (err) {
+    return { ok: false, status: 0, error: String(err) };
+  }
+}
+
+// Second-read verification for atomic: after force-rotate, ask AT&T what the
+// SIM's current MSISDN is. If it changed from the pre-rotate value, success.
+async function atomicSecondRead(env, sim) {
+  if (!env.MDN_ROTATOR) return { verified: null, error: 'no MDN_ROTATOR binding' };
+  try {
+    const url = `https://mdn-rotator/atomic-inquiry?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET || '')}&iccid=${encodeURIComponent(sim.iccid)}`;
+    const res = await env.MDN_ROTATOR.fetch(url, { method: 'GET', signal: AbortSignal.timeout(30000) });
+    if (!res.ok) return { verified: null, error: `http ${res.status}` };
+    const body = await res.json().catch(() => ({}));
+    if (!body.ok) return { verified: null, error: body.description || `statusCode=${body.statusCode}` };
+    const newMsisdn = body.msisdn || null;
+    if (!newMsisdn) return { verified: null, error: 'no msisdn in response' };
+    return { verified: newMsisdn !== sim.msisdn, new_msisdn: newMsisdn, prior_msisdn: sim.msisdn };
+  } catch (err) {
+    return { verified: null, error: String(err) };
+  }
+}
+
+// Detect SIMs that have failed N or more consecutive review-run days.
+async function detectMultiDayFailures(env, minStreak = 3) {
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const rows = await rotationReviewQuery(env,
+    `remediation_attempts?select=sim_id,result,created_at&action=eq.force_rotate&created_at=gt.${encodeURIComponent(since)}&order=sim_id.asc,created_at.desc&limit=5000`);
+  const bySim = new Map();
+  for (const r of rows) {
+    if (!bySim.has(r.sim_id)) bySim.set(r.sim_id, []);
+    bySim.get(r.sim_id).push(r);
+  }
+  const streaks = [];
+  for (const [simId, attempts] of bySim) {
+    // attempts already DESC by created_at; group by NY date
+    const days = new Map();
+    for (const a of attempts) {
+      const day = ymdUtc(new Date(a.created_at));
+      if (!days.has(day)) days.set(day, []);
+      days.get(day).push(a);
+    }
+    // Walk back from today; count consecutive days where the LAST attempt of
+    // the day was 'fail'.
+    const dayList = [...days.keys()].sort().reverse();
+    let streak = 0;
+    for (const day of dayList) {
+      const lastOfDay = days.get(day)[0]; // already DESC
+      if (lastOfDay.result === 'fail') streak++;
+      else break;
+    }
+    if (streak >= minStreak) streaks.push({ sim_id: simId, days_failed: streak });
+  }
+  streaks.sort((a, b) => b.days_failed - a.days_failed);
+  return streaks.slice(0, 50);
+}
+
+// Send the report as HTML email via Resend. Gated on RESEND_API_KEY.
+async function sendReportEmail(env, subject, markdown) {
+  if (!env.RESEND_API_KEY || !env.REPORT_EMAIL_TO) {
+    return { sent: false, reason: 'RESEND_API_KEY or REPORT_EMAIL_TO not set' };
+  }
+  // Minimal markdown → HTML conversion (the report uses a tiny subset)
+  const html = markdownToHtml(markdown);
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: env.REPORT_EMAIL_FROM || 'rotation-review@incoming-sms.com',
+      to: env.REPORT_EMAIL_TO,
+      subject,
+      html,
+      text: markdown,
+    }),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    return { sent: false, reason: `Resend ${res.status}: ${t.slice(0, 200)}` };
+  }
+  const body = await res.json().catch(() => ({}));
+  return { sent: true, id: body.id };
+}
+
+function markdownToHtml(md) {
+  const esc = (s) => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const lines = md.split('\n');
+  const out = ['<!DOCTYPE html><html><head><meta charset="utf-8"><style>',
+    'body{font:14px -apple-system,BlinkMacSystemFont,sans-serif;color:#222;max-width:760px;margin:24px auto;padding:0 16px}',
+    'h1{font-size:22px;border-bottom:2px solid #333;padding-bottom:6px}',
+    'h2{font-size:16px;margin-top:24px;color:#333}',
+    'table{border-collapse:collapse;margin:8px 0}',
+    'th,td{border:1px solid #ddd;padding:6px 10px;font-size:13px}',
+    'th{background:#f4f4f4;text-align:left}',
+    'code{background:#f4f4f4;padding:1px 4px;border-radius:3px;font-size:12px}',
+    'hr{border:none;border-top:1px solid #ccc;margin:24px 0}',
+    'li{margin:4px 0}',
+    '</style></head><body>'];
+  let inTable = false;
+  let inList = false;
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+    if (/^# /.test(line))       { if (inList) { out.push('</ul>'); inList = false; } out.push(`<h1>${esc(line.slice(2))}</h1>`); continue; }
+    if (/^## /.test(line))      { if (inList) { out.push('</ul>'); inList = false; } out.push(`<h2>${esc(line.slice(3))}</h2>`); continue; }
+    if (/^---$/.test(line))     { if (inList) { out.push('</ul>'); inList = false; } out.push('<hr>'); continue; }
+    if (/^\|.*\|$/.test(line)) {
+      const cells = line.slice(1, -1).split('|').map(c => c.trim());
+      if (/^[-:\s|]+$/.test(line.replace(/[|]/g, ''))) continue; // separator row
+      if (!inTable) { out.push('<table>'); inTable = true; }
+      const tag = i > 0 && /^\|.*\|$/.test(lines[i+1] || '') && /^[-:\s|]+$/.test((lines[i+1]||'').replace(/[|]/g, '')) ? 'th' : 'td';
+      out.push('<tr>' + cells.map(c => `<${tag}>${esc(c)}</${tag}>`).join('') + '</tr>');
+      continue;
+    }
+    if (inTable) { out.push('</table>'); inTable = false; }
+    if (/^- /.test(line)) {
+      if (!inList) { out.push('<ul>'); inList = true; }
+      const content = esc(line.slice(2)).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+      out.push(`<li>${content}</li>`);
+      continue;
+    }
+    if (inList) { out.push('</ul>'); inList = false; }
+    if (line.trim() === '') { out.push('<br>'); continue; }
+    const content = esc(line).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+    out.push(`<p>${content}</p>`);
+  }
+  if (inList)  out.push('</ul>');
+  if (inTable) out.push('</table>');
+  out.push('</body></html>');
+  return out.join('');
+}
+
+// Vendor circuit breaker. Tracks consecutive 5xx per-vendor. If we see 5
+// in a row from a vendor, skip that vendor for the rest of the run.
+function newCircuitBreaker() {
+  const counts = new Map();
+  const tripped = new Set();
+  return {
+    record(vendor, ok, status) {
+      if (tripped.has(vendor)) return;
+      if (ok || (status >= 0 && status < 500)) { counts.set(vendor, 0); return; }
+      const c = (counts.get(vendor) || 0) + 1;
+      counts.set(vendor, c);
+      if (c >= 5) tripped.add(vendor);
+    },
+    isTripped(vendor) { return tripped.has(vendor); },
+    trippedVendors() { return [...tripped]; },
+  };
+}
+
 async function runRotationReview(env, opts = {}) {
   const dryRun = opts.dryRun === true;
   const tonightStart = nyMidnightUtcIso() || new Date(Date.now() - 12 * 3600 * 1000).toISOString();
   const today = ymdUtc();
+  const startedAt = Date.now();
 
-  // ── 1. Tally last night's rotations by vendor ──────────────────────────────
-  const tally = {};
-  for (const v of ['atomic', 'helix', 'wing_iot', 'teltik']) {
-    const rows = await rotationReviewQuery(env,
-      `sims?select=rotation_status,status,last_mdn_rotated_at,last_rotation_at,last_notified_at&vendor=eq.${v}&last_mdn_rotated_at=gt.${encodeURIComponent(tonightStart)}&limit=5000`);
-    const stats = { rotated: rows.length, success: 0, mdn_pending: 0, rotating: 0, failed: 0, notified: 0 };
-    for (const r of rows) {
-      if (r.rotation_status === 'success') stats.success++;
-      else if (r.rotation_status === 'mdn_pending') stats.mdn_pending++;
-      else if (r.rotation_status === 'rotating')   stats.rotating++;
-      else if (r.rotation_status === 'failed')     stats.failed++;
-      if (r.last_notified_at && r.last_mdn_rotated_at && r.last_notified_at >= r.last_mdn_rotated_at) stats.notified++;
-    }
-    tally[v] = stats;
-  }
-
-  // ── 2. Identify failure patterns ───────────────────────────────────────────
-  const failedRows = await rotationReviewQuery(env,
-    `sims?select=id,iccid,vendor,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error&rotation_status=eq.failed&last_mdn_rotated_at=gt.${encodeURIComponent(tonightStart)}&limit=5000`);
-  const patterns = { teltik_already_rotated: [], teltik_body_failed: [], stuck_sweeper: [], atomic_ppu_exhausted: [], atomic_pre_swap: [], swap_zip_rejected: [], other: [] };
-  for (const r of failedRows) {
-    const err = String(r.last_rotation_error || '');
-    if (/Only 1 number change allowed/i.test(err))                       patterns.teltik_already_rotated.push(r);
-    else if (/change-number body status=FAILED/i.test(err))              patterns.teltik_body_failed.push(r);
-    else if (/^stuck in rotating/.test(err))                             patterns.stuck_sweeper.push(r);
-    else if (/PPU exhausted/i.test(err))                                 patterns.atomic_ppu_exhausted.push(r);
-    else if (/pre-swap inquiry failed/i.test(err))                       patterns.atomic_pre_swap.push(r);
-    else if (/zipCode Not Supported/i.test(err) || /zipCode.*not.*support/i.test(err)) patterns.swap_zip_rejected.push(r);
-    else patterns.other.push(r);
-  }
-
-  // ── 3. Auto-fixes ──────────────────────────────────────────────────────────
-  const actions = { flipped_to_mdn_pending: 0, finalizer_drained: { helix: 0, wing: 0, teltik: 0, atomic: 0 } };
-
-  // 3a. Flip "Only 1 number change allowed" failures to mdn_pending so the
-  //     Teltik finalizer picks them up, calls get-phone-number, syncs the
-  //     new MDN, and fires number.online. Safe because we KNOW Teltik
-  //     rotated them — its own "1 per 48h" guard proves it.
-  if (!dryRun && patterns.teltik_already_rotated.length > 0) {
-    const ids = patterns.teltik_already_rotated.map(r => r.id).join(',');
-    const url = `${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`;
-    const flipRes = await fetch(url, {
-      method: 'PATCH',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
-      },
-      body: JSON.stringify({ status: 'provisioning', rotation_status: 'mdn_pending' }),
-    });
-    if (flipRes.ok) actions.flipped_to_mdn_pending = patterns.teltik_already_rotated.length;
-  }
-
-  // 3b. Drain pending finalizer work (covers mdn_pending from normal cron AND
-  //     the SIMs we just flipped in 3a). Each runner is bounded by its limit,
-  //     so the wall-clock impact is predictable.
+  // ── 0. Acquire run-lock ────────────────────────────────────────────────────
+  let lockHandle = null;
+  let runId = null;
   if (!dryRun) {
-    try { actions.finalizer_drained.helix  = (await runHelixFinalizer (env, 200))?.activated ?? 0; } catch (e) { console.error('[Review] helix drain:',  e); }
-    try { actions.finalizer_drained.wing   = (await runWingIotFinalizer(env, 200))?.activated ?? 0; } catch (e) { console.error('[Review] wing drain:',   e); }
-    try { actions.finalizer_drained.teltik = (await runTeltikFinalizer (env, 500))?.synced    ?? 0; } catch (e) { console.error('[Review] teltik drain:', e); }
-    try { actions.finalizer_drained.atomic = (await runAtomicFinalizer (env, 200))?.synced    ?? 0; } catch (e) { console.error('[Review] atomic drain:', e); }
+    lockHandle = await acquireReviewLock(env, 'rotation_review');
+    if (!lockHandle.acquired) {
+      return `# Rotation Review — ${today}\n\nAnother review run is currently active (${lockHandle.reason}). Aborting to avoid concurrent runs. Try again after the active run finishes (max 30 min lock).\n`;
+    }
+    runId = lockHandle.run?.run_id || null;
   }
 
-  // ── 4. Pool health (count=exact bypasses the 1000-row cap) ─────────────────
-  async function poolCount(filter) {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/address_pool_usage?${filter}&select=address_id&limit=1`, {
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        Prefer: 'count=exact',
-      },
-    });
-    const cr = res.headers.get('content-range') || '';
-    const m = cr.match(/\/(\d+|\*)$/);
-    return m && m[1] !== '*' ? parseInt(m[1], 10) : 0;
-  }
-  const poolStats = {
-    total:              await poolCount(''),
-    quarantined:        await poolCount('verify_failed_at=not.is.null'),
-    quarantined_tonight:await poolCount(`verify_failed_at=gt.${encodeURIComponent(tonightStart)}`),
-  };
+  const breaker = newCircuitBreaker();
+  let report = '';
 
-  // ── 5. Render markdown ─────────────────────────────────────────────────────
-  const lines = [];
-  lines.push(`# Rotation Review — ${today}`);
-  lines.push(`Generated: ${new Date().toISOString()} (NY-night started ${tonightStart}, dryRun=${dryRun})`);
-  lines.push('');
-  lines.push('## Tally by vendor');
-  lines.push('');
-  lines.push('| Vendor | Rotated | Success | mdn_pending | rotating | Failed | Notified |');
-  lines.push('|--------|--------:|--------:|------------:|---------:|-------:|---------:|');
-  for (const v of ['atomic', 'helix', 'wing_iot', 'teltik']) {
-    const s = tally[v];
-    lines.push(`| ${v} | ${s.rotated} | ${s.success} | ${s.mdn_pending} | ${s.rotating} | ${s.failed} | ${s.notified} |`);
-  }
-  lines.push('');
+  try {
+    // ── 1. Tally last night's rotations by vendor ─────────────────────────────
+    const tally = {};
+    for (const v of ['atomic', 'helix', 'wing_iot', 'teltik']) {
+      const rows = await rotationReviewQuery(env,
+        `sims?select=rotation_status,status,last_mdn_rotated_at,last_rotation_at,last_notified_at&vendor=eq.${v}&last_mdn_rotated_at=gt.${encodeURIComponent(tonightStart)}&limit=5000`);
+      const stats = { rotated: rows.length, success: 0, mdn_pending: 0, rotating: 0, failed: 0, notified: 0 };
+      for (const r of rows) {
+        if (r.rotation_status === 'success') stats.success++;
+        else if (r.rotation_status === 'mdn_pending') stats.mdn_pending++;
+        else if (r.rotation_status === 'rotating')   stats.rotating++;
+        else if (r.rotation_status === 'failed')     stats.failed++;
+        if (r.last_notified_at && r.last_mdn_rotated_at && r.last_notified_at >= r.last_mdn_rotated_at) stats.notified++;
+      }
+      tally[v] = stats;
+    }
 
-  lines.push('## Failure patterns');
-  lines.push('');
-  for (const [k, v] of Object.entries(patterns)) {
-    if (v.length === 0) continue;
-    lines.push(`- **${k}** (${v.length}): ${v.slice(0, 3).map(r => `#${r.id}`).join(', ')}${v.length > 3 ? ` …+${v.length - 3} more` : ''}`);
-  }
-  if (Object.values(patterns).every(v => v.length === 0)) lines.push('_No failures tonight — clean run._');
-  lines.push('');
+    // ── 2. Classify failed SIMs via the playbook ─────────────────────────────
+    const failedRows = await rotationReviewQuery(env,
+      `sims?select=id,iccid,vendor,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error&rotation_status=eq.failed&last_mdn_rotated_at=gt.${encodeURIComponent(tonightStart)}&limit=5000`);
+    const buckets = {}; // bucketId → { entry, sims: [] }
+    const unclassified = [];
+    for (const sim of failedRows) {
+      const entry = classifyFailure(sim);
+      if (!entry) { unclassified.push(sim); continue; }
+      if (!buckets[entry.id]) buckets[entry.id] = { entry, sims: [] };
+      buckets[entry.id].sims.push(sim);
+    }
 
-  lines.push('## Auto-fixes applied');
-  lines.push('');
-  lines.push(`- Flipped "Only 1 per 48h" Teltik failures → mdn_pending: **${actions.flipped_to_mdn_pending}**`);
-  lines.push(`- Finalizer drain: helix=${actions.finalizer_drained.helix}, wing=${actions.finalizer_drained.wing}, teltik=${actions.finalizer_drained.teltik}, atomic=${actions.finalizer_drained.atomic}`);
-  lines.push('');
+    // ── 3. Apply playbook auto-fixes ─────────────────────────────────────────
+    const actions = {
+      flipped_to_mdn_pending: 0,
+      force_rotated: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0 },
+      finalizer_drained: { helix: 0, wing: 0, teltik: 0, atomic: 0 },
+      second_read_verified: 0,
+      second_read_failed: 0,
+    };
+    const breakerEvents = [];
 
-  lines.push('## Address pool');
-  lines.push('');
-  lines.push(`- Total: ${poolStats.total} | Quarantined: ${poolStats.quarantined} | Quarantined tonight: ${poolStats.quarantined_tonight}`);
-  lines.push('');
+    for (const { entry, sims } of Object.values(buckets)) {
+      if (entry.action === 'flip_to_mdn_pending') {
+        if (!dryRun && sims.length > 0) {
+          const ids = sims.map(s => s.id).join(',');
+          const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
+            method: 'PATCH',
+            headers: {
+              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({ status: 'provisioning', rotation_status: 'mdn_pending' }),
+          });
+          if (flipRes.ok) {
+            actions.flipped_to_mdn_pending += sims.length;
+            await Promise.all(sims.map(s => recordAttempt(env, s.id, runId, 'flip_to_mdn_pending', 'ok', null)));
+          }
+        }
+      } else if (entry.action === 'force_rotate' && !dryRun) {
+        const maxThisRun = Math.min(entry.maxAttempts || 1, sims.length);
+        for (const sim of sims.slice(0, maxThisRun)) {
+          if (breaker.isTripped(sim.vendor)) {
+            actions.force_rotated.skipped_breaker++;
+            continue;
+          }
+          const used = await attemptsToday(env, sim.id, 'force_rotate');
+          if (used >= 3) {
+            actions.force_rotated.skipped_budget++;
+            await recordAttempt(env, sim.id, runId, 'force_rotate', 'fail', `budget exhausted (${used}/3 today)`);
+            continue;
+          }
+          actions.force_rotated.attempted++;
+          const r = await forceRotateSim(env, sim);
+          breaker.record(sim.vendor, r.ok, r.status || 0);
+          if (breaker.isTripped(sim.vendor)) {
+            breakerEvents.push(`${sim.vendor}: 5 consecutive 5xx, skipping remaining ${sim.vendor} SIMs for this run`);
+          }
+          if (r.ok) {
+            // Second-read verification (atomic only — confirms msisdn changed)
+            if (sim.vendor === 'atomic') {
+              const verify = await atomicSecondRead(env, sim);
+              if (verify.verified === true) actions.second_read_verified++;
+              else if (verify.verified === false) actions.second_read_failed++;
+            }
+            actions.force_rotated.ok++;
+            await recordAttempt(env, sim.id, runId, 'force_rotate', 'ok', null);
+          } else {
+            actions.force_rotated.fail++;
+            await recordAttempt(env, sim.id, runId, 'force_rotate', 'fail', r.error || `status=${r.status}`);
+          }
+          await new Promise(res => setTimeout(res, 2000)); // polite gap between rotations
+        }
+      }
+    }
 
-  // Specific failures with detail (capped to avoid 100-row noise)
-  if (patterns.other.length > 0 || patterns.atomic_pre_swap.length > 0 || patterns.swap_zip_rejected.length > 0 || patterns.teltik_body_failed.length > 0) {
-    lines.push('## Failures needing human review');
+    // ── 4. Drain pending finalizer work ──────────────────────────────────────
+    if (!dryRun) {
+      try { actions.finalizer_drained.helix  = (await runHelixFinalizer (env, 200))?.activated ?? 0; } catch (e) { console.error('[Review] helix drain:',  e); }
+      try { actions.finalizer_drained.wing   = (await runWingIotFinalizer(env, 200))?.activated ?? 0; } catch (e) { console.error('[Review] wing drain:',   e); }
+      try { actions.finalizer_drained.teltik = (await runTeltikFinalizer (env, 500))?.synced    ?? 0; } catch (e) { console.error('[Review] teltik drain:', e); }
+      try { actions.finalizer_drained.atomic = (await runAtomicFinalizer (env, 200))?.synced    ?? 0; } catch (e) { console.error('[Review] atomic drain:', e); }
+    }
+
+    // ── 5. Pool health ───────────────────────────────────────────────────────
+    async function poolCount(filter) {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/address_pool_usage?${filter}&select=address_id&limit=1`, {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          Prefer: 'count=exact',
+        },
+      });
+      const cr = res.headers.get('content-range') || '';
+      const m = cr.match(/\/(\d+|\*)$/);
+      return m && m[1] !== '*' ? parseInt(m[1], 10) : 0;
+    }
+    const poolStats = {
+      total:               await poolCount(''),
+      quarantined:         await poolCount('verify_failed_at=not.is.null'),
+      quarantined_tonight: await poolCount(`verify_failed_at=gt.${encodeURIComponent(tonightStart)}`),
+    };
+
+    // ── 6. Multi-day pattern detection ───────────────────────────────────────
+    const multiDayFailures = await detectMultiDayFailures(env, 3);
+
+    // ── 7. Render markdown report ────────────────────────────────────────────
+    const lines = [];
+    lines.push(`# Rotation Review — ${today}`);
+    lines.push(`Generated: ${new Date().toISOString()} (NY-night started ${tonightStart}, dryRun=${dryRun}, run_id=${runId || 'n/a'})`);
     lines.push('');
-    for (const cat of ['atomic_pre_swap', 'swap_zip_rejected', 'teltik_body_failed', 'other']) {
-      for (const r of patterns[cat].slice(0, 10)) {
-        const err = String(r.last_rotation_error || '').slice(0, 140);
-        lines.push(`- **${cat}** SIM #${r.id} (${r.vendor}, msisdn=${r.msisdn || '—'}): ${err}`);
+
+    lines.push('## Tally by vendor');
+    lines.push('');
+    lines.push('| Vendor | Rotated | Success | mdn_pending | rotating | Failed | Notified |');
+    lines.push('|--------|--------:|--------:|------------:|---------:|-------:|---------:|');
+    for (const v of ['atomic', 'helix', 'wing_iot', 'teltik']) {
+      const s = tally[v];
+      lines.push(`| ${v} | ${s.rotated} | ${s.success} | ${s.mdn_pending} | ${s.rotating} | ${s.failed} | ${s.notified} |`);
+    }
+    lines.push('');
+
+    lines.push('## Failure breakdown (playbook classified)');
+    lines.push('');
+    if (Object.keys(buckets).length === 0 && unclassified.length === 0) {
+      lines.push('_No failures tonight — clean run._');
+    } else {
+      for (const { entry, sims } of Object.values(buckets)) {
+        const exampleIds = sims.slice(0, 3).map(s => `#${s.id}`).join(', ');
+        const more = sims.length > 3 ? ` …+${sims.length - 3} more` : '';
+        const safe = entry.safe ? '🤖 auto-fix' : '👤 human review';
+        lines.push(`- **${entry.id}** (${entry.vendor}, ${sims.length} SIMs) — ${safe}: ${exampleIds}${more}`);
+      }
+      if (unclassified.length > 0) {
+        const ids = unclassified.slice(0, 3).map(s => `#${s.id}`).join(', ');
+        const more = unclassified.length > 3 ? ` …+${unclassified.length - 3} more` : '';
+        lines.push(`- **${UNCLASSIFIED_BUCKET}** (${unclassified.length} SIMs) — 👤 human review (no playbook match): ${ids}${more}`);
       }
     }
     lines.push('');
-  }
 
-  // Stuck-sweeper failures usually mean Teltik DID rotate but our worker died
-  // mid-flight. The auto-fix above handles the "Only 1 per 48h" variant; pure
-  // stuck-sweeper rows without that error message need manual recovery.
-  if (patterns.stuck_sweeper.length > 0) {
-    lines.push('## Stuck-sweeper failures (worker died mid-rotation)');
+    lines.push('## Auto-fixes applied');
     lines.push('');
-    lines.push(`${patterns.stuck_sweeper.length} SIMs. Force-rotate to retry; if Teltik returns "Only 1 per 48h", flip to mdn_pending instead.`);
+    lines.push(`- Flipped to mdn_pending: **${actions.flipped_to_mdn_pending}**`);
+    lines.push(`- Force-rotated: **${actions.force_rotated.attempted}** attempted (${actions.force_rotated.ok} ok, ${actions.force_rotated.fail} fail, ${actions.force_rotated.skipped_budget} skipped-budget, ${actions.force_rotated.skipped_breaker} skipped-breaker)`);
+    if (actions.second_read_verified + actions.second_read_failed > 0) {
+      lines.push(`- Atomic second-read verification: ${actions.second_read_verified} confirmed new MDN, ${actions.second_read_failed} MDN unchanged after force-rotate`);
+    }
+    lines.push(`- Finalizer drain: helix=${actions.finalizer_drained.helix}, wing=${actions.finalizer_drained.wing}, teltik=${actions.finalizer_drained.teltik}, atomic=${actions.finalizer_drained.atomic}`);
+    if (breakerEvents.length > 0) {
+      lines.push('');
+      lines.push('### Circuit breaker tripped');
+      for (const e of breakerEvents) lines.push(`- ${e}`);
+    }
     lines.push('');
+
+    lines.push('## Address pool');
+    lines.push('');
+    lines.push(`- Total: ${poolStats.total} | Quarantined: ${poolStats.quarantined} | Quarantined tonight: ${poolStats.quarantined_tonight}`);
+    if (poolStats.quarantined_tonight > 30) {
+      lines.push(`- ⚠️ Quarantine spike (${poolStats.quarantined_tonight} tonight). Consider running \`/refill-pool?max=20\` once or twice.`);
+    }
+    lines.push('');
+
+    // Unclassified + human-review failures with detail
+    const humanReviewBuckets = Object.values(buckets).filter(({ entry }) => !entry.safe);
+    if (humanReviewBuckets.length > 0 || unclassified.length > 0) {
+      lines.push('## Failures needing human review');
+      lines.push('');
+      for (const { entry, sims } of humanReviewBuckets) {
+        for (const s of sims.slice(0, 10)) {
+          const err = String(s.last_rotation_error || '').slice(0, 140);
+          lines.push(`- **${entry.id}** SIM #${s.id} (${s.vendor}, msisdn=${s.msisdn || '—'}): ${err}`);
+        }
+        if (sims.length > 10) lines.push(`  …+${sims.length - 10} more in this bucket`);
+      }
+      for (const s of unclassified.slice(0, 10)) {
+        const err = String(s.last_rotation_error || '').slice(0, 140);
+        lines.push(`- **${UNCLASSIFIED_BUCKET}** SIM #${s.id} (${s.vendor}, msisdn=${s.msisdn || '—'}): ${err}`);
+      }
+      if (unclassified.length > 10) lines.push(`  …+${unclassified.length - 10} more unclassified`);
+      lines.push('');
+    }
+
+    if (multiDayFailures.length > 0) {
+      lines.push('## SIMs failing multiple days in a row');
+      lines.push('');
+      lines.push(`${multiDayFailures.length} SIMs have failed force_rotate on ${multiDayFailures[0].days_failed} or more consecutive days. Likely needs manual investigation:`);
+      lines.push('');
+      for (const s of multiDayFailures.slice(0, 20)) {
+        lines.push(`- SIM #${s.sim_id}: ${s.days_failed} consecutive day(s)`);
+      }
+      lines.push('');
+    }
+
+    lines.push('---');
+    lines.push(`_Generated by details-finalizer /rotation-review in ${(Date.now() - startedAt) / 1000}s. Source: src/details-finalizer/index.js runRotationReview(). Playbook: src/shared/rotation-playbook.mjs (${PLAYBOOK.length} entries)._`);
+
+    report = lines.join('\n');
+
+    // ── 8. Send email if configured ──────────────────────────────────────────
+    if (!dryRun) {
+      const urgent = (Object.values(buckets).some(({ entry }) => !entry.safe))
+        || unclassified.length > 0
+        || multiDayFailures.length > 0
+        || breakerEvents.length > 0;
+      const subject = urgent
+        ? `🔧 Rotation Review ${today} — ${unclassified.length + humanReviewBuckets.reduce((n, b) => n + b.sims.length, 0)} need review`
+        : `✅ Rotation Review ${today} — all clear`;
+      const emailResult = await sendReportEmail(env, subject, report);
+      report += `\n_Email: ${emailResult.sent ? 'sent (id=' + emailResult.id + ')' : 'skipped — ' + emailResult.reason}_\n`;
+    }
+
+    if (!dryRun && lockHandle?.run?.id) {
+      await releaseReviewLock(env, lockHandle.run.id, 'completed', {
+        tally, actions, pool: poolStats, multi_day_count: multiDayFailures.length, breaker: breaker.trippedVendors(),
+      });
+    }
+    return report;
+  } catch (err) {
+    if (!dryRun && lockHandle?.run?.id) {
+      await releaseReviewLock(env, lockHandle.run.id, 'aborted', { error: String(err) });
+    }
+    throw err;
   }
-
-  lines.push('---');
-  lines.push('_Generated by details-finalizer /rotation-review. Source: src/details-finalizer/index.js runRotationReview()._');
-
-  return lines.join('\n');
 }
 
 /* ── Address Pool Refill ──────────────────────────────────────────────────── */

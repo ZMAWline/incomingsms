@@ -28,6 +28,12 @@ service = "skyline-gateway"
 binding = "MDN_ROTATOR"
 service = "mdn-rotator"
 
+# teltik-worker holds Teltik API key; rotation-review calls /rotate-sim via this
+# binding instead of the public URL (CF blocks worker→public-workers.dev fetches).
+[[services]]
+binding = "TELTIK_WORKER"
+service = "teltik-worker"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "details-finalizer-test"
@@ -43,6 +49,10 @@ service = "skyline-gateway-test"
 [[env.test.services]]
 binding = "MDN_ROTATOR"
 service = "mdn-rotator-test"
+
+[[env.test.services]]
+binding = "TELTIK_WORKER"
+service = "teltik-worker-test"
 
 [env.test.observability.logs]
 enabled = true
