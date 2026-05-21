@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-21 (session 57 cont. — Apex PPU-then-MDN Phase 4 shipped; canary expanded to 26 ATOMIC SIMs for tonight's NY-midnight cron)
+> Last updated: 2026-05-21 (session 57 cont. — Apex PPU-then-MDN Phase 4 shipped; canary expanded to ALL 292 active ATOMIC SIMs for tonight's NY-midnight cron)
 
 ---
 
@@ -62,18 +62,29 @@
 - Inserted apex flow in `rotateSingleSim`'s helix branch just before `hxMdnChange`. Same gating as the atomic path (`APEX_PPU_THEN_MDN_ENABLED='true'` AND (`APEX_PPU_CANARY_ONLY!='true'` OR `sim.canary_apex_ppu===true`)). Flow: `hxSubscriberDetails` (pull current state+zip+subscriberNumber) → `pickNextPpuAddress(excludeState, excludeZip)` → `hxUpdateSubscriberDetails` → patch `sims.activation_zip` → continue to existing `hxMdnChange`. PPU call wrapped in try/catch that calls `markAddressVerifyFailure` on failure.
 - **All 625 helix SIMs are `status != 'active'`** as of 2026-05-21 (migration to ATOMIC completed weeks ago) so this code is dormant in practice. Shipped for completeness + symmetry; will activate if helix activations ever resume.
 
-**Canary expanded for tonight's production validation (2026-05-21):**
-- `UPDATE sims SET canary_apex_ppu=true WHERE id IN (...)` flipped 25 additional ATOMIC SIMs (the 25 oldest-rotated active+rotation_eligible after SIM 2619). All belong to reseller_id=3 (the only reseller with active atomic SIMs). Total canary count is now **26 SIMs** spread across 16 distinct activation_zips.
-- Tonight's `*/5 4-11 UTC` cron will exercise apex on all 26. Expected outcome: 26 successful PPU+swap pairs in `carrier_api_logs`. Self-heal will quarantine any address AT&T rejects (90-day cooldown).
-- **Morning-after check** (2026-05-21 ~13:00 UTC / 09:00 NY or later): `SELECT count(*) FILTER (WHERE step='ppu_update' AND error IS NULL) AS apex_ok, count(*) FILTER (WHERE step='ppu_update' AND error IS NOT NULL) AS apex_err, count(*) FILTER (WHERE verify_failed_at > now() - interval '12 hours') AS new_quarantines FROM carrier_api_logs CROSS JOIN address_pool_usage WHERE created_at > now() - interval '12 hours'`. Hope: `apex_ok=26+, apex_err=0, new_quarantines=0`.
+**Canary expanded to full ATOMIC fleet for tonight's production validation (2026-05-21):**
+- `UPDATE sims SET canary_apex_ppu=true WHERE vendor='atomic' AND status IN ('active','provisioning')` — flipped all 292 active ATOMIC SIMs in one shot (went 1 → 26 → 292 over the course of the session as confidence grew). 6 canceled atomic SIMs were excluded (cron doesn't rotate them anyway). All 292 belong to reseller_id=3.
+- Tonight's `*/5 4-11 UTC` cron will rotate every active ATOMIC SIM through the full 4-step apex flow. Expected outcome: ~292 successful PPU+swap pairs in `carrier_api_logs`. Self-heal will quarantine any address AT&T rejects (90-day cooldown); affected SIMs will land in `rotation_status='failed'` for the night and drain on subsequent cron windows.
+- **Morning-after query** (2026-05-21 ~14:00 UTC or later, after the cron window closes):
+  ```sql
+  SELECT
+    count(*) FILTER (WHERE step='ppu_update' AND error IS NULL)     AS apex_ok,
+    count(*) FILTER (WHERE step='ppu_update' AND error IS NOT NULL) AS apex_err,
+    count(*) FILTER (WHERE step='mdn_change' AND vendor='atomic' AND error IS NULL)     AS swap_ok,
+    count(*) FILTER (WHERE step='mdn_change' AND vendor='atomic' AND error IS NOT NULL) AS swap_err
+  FROM carrier_api_logs
+  WHERE created_at > '2026-05-21 04:00:00+00';
+  ```
+  Plus `SELECT count(*) FROM address_pool_usage WHERE verify_failed_at > '2026-05-21 04:00:00+00'` for quarantine rate. Targets: `apex_ok ≈ 292, apex_err small (<10), swap_err ≈ 0, new quarantines extrapolatable to < 10% of pool`.
 
 **To finish (Phase 5):**
 - **Phase 5** — expand canary to full atomic fleet after 24h+48h stability checks; then (if helix reactivates) helix; then remove the canary gate; drop deprecated `pickRandomAddress` from `src/shared/address-pool.mjs`; update `.claude/skills/atomic-api/SKILL.md` with Rule 5 (PPU before swap); append `agent/constraints.md` §<N>.
 
 **Hot starts for the next session:**
-- First: check the morning-after stats (see query above). If `apex_ok=26 / apex_err=0`, proceed to Phase 5.1 (`UPDATE sims SET canary_apex_ppu=true WHERE vendor='atomic' AND status IN ('active','provisioning')`) to expand to the full fleet — no redeploy needed since the flag check reads the column on each rotation.
-- If apex_err > 0, query `SELECT iccid, error FROM carrier_api_logs WHERE step='ppu_update' AND error IS NOT NULL AND created_at > now() - interval '12 hours'` to inspect failure shapes. Likely cause is either an OSM address AT&T rejects (which the self-heal already quarantined for 90 days — no further action) or a transient AT&T 5xx.
-- Production state: mdn-rotator at version `ac1a10a7`, bulk-activator at version `ad5cc18f`. `APEX_PPU_THEN_MDN_ENABLED=true` secret on mdn-rotator. Pool at 1529 OSM-sourced entries with self-heal active. 26 SIMs have `canary_apex_ppu=true`.
+- First: run the morning-after queries above. If `apex_ok ≈ 292 / apex_err small / swap_err ≈ 0`, the fleet has successfully transitioned to apex mode — proceed to Phase 5 cleanup (5.5 remove canary gate + 5.6 drop deprecated `pickRandomAddress` from `src/shared/address-pool.mjs`).
+- If `apex_err` is high (>30 ≈ 10% of fleet), inspect failure shapes via `SELECT count(*), substring(error, 1, 80) AS err_prefix FROM carrier_api_logs WHERE step='ppu_update' AND error IS NOT NULL AND created_at > '2026-05-21 04:00:00+00' GROUP BY err_prefix ORDER BY count DESC`. Likely either OSM addresses AT&T rejects (self-heal already quarantined; nothing to do beyond watching the rate trend down each night) or transient AT&T 5xx.
+- If a meaningful chunk of SIMs landed in `rotation_status='failed'` overnight, they'll naturally retry on subsequent cron windows; no manual intervention unless the cohort doesn't drain within 2-3 nights.
+- Production state: mdn-rotator at version `ac1a10a7`, bulk-activator at version `ad5cc18f`. `APEX_PPU_THEN_MDN_ENABLED=true` secret on mdn-rotator. Pool at 1529 OSM-sourced entries with self-heal active. **ALL 292 active ATOMIC SIMs have `canary_apex_ppu=true`.**
 - Plan references say `address-pool.js` / `address-picker.js` in many places — translate every such reference to `.mjs` when reading the plan tasks (still applies).
 
 ---

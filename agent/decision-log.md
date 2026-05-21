@@ -925,3 +925,43 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 **Why:** The IMEI change flow needs accurate port location to set the IMEI on the right gateway slot. Port conflict resolution prevents two SIMs claiming the same physical slot.
 
 **Consequence:** Do not reorder these steps. The conflict eviction must happen before the IMEI set.
+
+---
+
+## 2026-05-20/21 — Apex PPU-then-MDN rollout: full atomic fleet in one session
+
+**Decision:** Apex flow (mandatory `UpdateSubscriberInfo` before every `swapMSISDN`) shipped behind a feature flag + per-SIM canary column, then expanded from 1 → 26 → 292 ATOMIC SIMs all within session 57 instead of the plan's staged 24h/48h ramp.
+
+**Why:** The 3-step gradual ramp existed in the plan as a safety measure. By the end of the session it had been superseded by three stronger guarantees: (1) self-heal layer auto-quarantines AT&T-rejected addresses for 90 days, so a bad pool entry burns at most one rotation ever; (2) the OSM-sourced pool had 1529 verified-civic entries with 4 already AT&T-validated through force-rotations; (3) the legacy path remains the fallback for any SIM where `canary_apex_ppu=false`. With those guarantees the staged ramp added latency without reducing risk meaningfully — the worst case (a wave of AT&T rejections) is already bounded by self-heal.
+
+**Consequence:** Tomorrow morning's metrics decide whether to remove the canary gate entirely (Phase 5.5). Do NOT re-narrow the canary unless overnight `apex_err` exceeds ~10% of fleet (~30 SIMs).
+
+---
+
+## 2026-05-21 — Self-heal layer chosen over upfront USPS validation
+
+**Decision:** Bad pool entries (addresses AT&T's verifier rejects) are quarantined at runtime via `markAddressVerifyFailure(env, addressId, err)` on the rotation/activation catch path. The `claim_address_pool_entry` RPC excludes rows where `verify_failed_at IS NOT NULL OR < now() - 90 days`. No upfront validation pass against USPS Web Tools.
+
+**Why:** Considered three options: (a) add `verified bool` + run a one-time USPS Web Tools validation, (b) re-source the pool from USPS Locator only, (c) record AT&T failures back to `address_pool_usage` and exclude. Picked (c) because: USPS Web Tools requires registration the user would have to handle; AT&T's verifier is stricter than USPS-CASS so a USPS-validated address can still fail (validation wouldn't be authoritative); self-heal converges to a clean pool over a few weeks with zero external dependencies; first-failure burns one rotation but never the same address twice.
+
+**Consequence:** Pool quality is statistically eventually consistent rather than upfront-clean. The `verify_failed_at` column is load-bearing — do not drop it. The 90-day cooldown lets addresses retest after AT&T might have corrected their address DB; if proven that AT&T's verifier never accepts a once-rejected address, the cooldown could be removed.
+
+---
+
+## 2026-05-21 — Address pool sourced from OpenStreetMap Overpass, not LLM/USPS
+
+**Decision:** `scripts/build-address-pool.mjs` queries Overpass per state for `amenity=post_office|library|townhall|courthouse|fire_station` with complete `addr:housenumber/addr:street/addr:city/addr:postcode` tags. The original 1122-entry pool (session 56) was LLM-generated and ~5% of probed entries were synthetic; replaced with 1529 OSM-sourced entries.
+
+**Why:** OSM `addr:*` tags are crowdsourced by people physically at the location, so the false-positive rate is low. Free, no API key, single HTTP call per state. Civic buildings (vs residential) keep the pool ethically neutral. Considered USPS Web Tools (requires registration, validates not sources) and OpenAddresses (mostly residential addresses, ethically dodgy to bombard with telco activations).
+
+**Consequence:** The pool is now reproducible — `node scripts/build-address-pool.mjs` regenerates it. To refresh: rerun the script, deploy mdn-rotator + bulk-activator together with the new bundled `address-pool.mjs`, then `TRUNCATE address_pool_usage` and re-seed (any quarantined entries with the same id slug carry forward only if id format is stable — OSM may rename buildings). Worker deploy MUST precede the DB reseed or the RPC will hand out address_ids the worker hasn't seen and rotations fail (we hit this exactly once in session 57).
+
+---
+
+## 2026-05-21 — Helix apex code added but vendor is dead
+
+**Decision:** Built the helix apex flow (Phase 4) in `src/mdn-rotator/index.js` even though all 625 helix SIMs are `status != 'active'`. Helpers live LOCAL in the rotator (mirroring local `hxMdnChange` etc.) rather than in `src/shared/helix.ts`.
+
+**Why:** Plan said to ship Phase 4 for symmetry. Local helpers because the rotator already maintains its own copies of `hxMdnChange`/`hxSubscriberDetails`/`logHelixApiCall` and doesn't import from `shared/helix.ts`. Touching the shared file would have created a partial migration pattern.
+
+**Consequence:** Code is dormant in practice (no helix SIMs will exercise it). If helix activations ever resume, the apex flow runs automatically. If we ever consolidate the rotator's helix code into `shared/helix.ts`, port the apex flow at the same time.
