@@ -7,10 +7,11 @@ workers_dev = true
 [triggers]
 # */5 * * * * — regular finalizer (Helix/Wing/Teltik/ATOMIC) every 5 min.
 # 30 10 * * * — daily reconciliation at UTC 10:30 (NY 6:30 EDT / 5:30 EST), 30
-# min after rotation window closes. Gated on RECONCILIATION_ENABLED secret;
-# scheduled() branches on event.cron so reconciliation never runs alongside
-# the regular finalizers.
-crons = ["*/5 * * * *", "30 10 * * *"]
+# min after rotation window closes. Gated on RECONCILIATION_ENABLED secret.
+# 0 */6 * * * — address-pool refill every 6h: replace quarantined PPU addresses
+# with fresh OSM-sourced civic-building addresses in the same zip.
+# scheduled() branches on event.cron so the three paths never run together.
+crons = ["*/5 * * * *", "30 10 * * *", "0 */6 * * *"]
 
 [observability.logs]
 enabled = true

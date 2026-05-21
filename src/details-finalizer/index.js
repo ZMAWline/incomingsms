@@ -70,8 +70,22 @@ export default {
       const result = await runOfflineTestBatch(env, { resellerId, limit, dryRun, force });
       return json(result);
     }
+    if (url.pathname === '/refill-pool') {
+      // Manual trigger for the address-pool refill cron. Replaces quarantined
+      // PPU addresses with new OSM-sourced civic-building addresses in the
+      // same zip. Bounded by maxZips (default 5, max 20). Use ?dry=1 to query
+      // OSM without inserting.
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const maxZips = parseInt(url.searchParams.get('max') || '5', 10) || 5;
+      const dryRun  = url.searchParams.get('dry') === '1';
+      const result = await runAddressPoolRefill(env, { maxZips, dryRun });
+      return json(result);
+    }
     if (url.pathname !== '/run') {
-      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0 or /reconcile-rotations?secret=...[&dry=1][&force=1] or /test-offline?secret=...&reseller_id=N&limit=10[&dry=1]', { status: 200 });
+      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0 or /reconcile-rotations?secret=...[&dry=1][&force=1] or /test-offline?secret=...&reseller_id=N&limit=10[&dry=1] or /refill-pool?secret=...[&max=5][&dry=1]', { status: 200 });
     }
     const secret = url.searchParams.get('secret') || '';
     if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
@@ -96,6 +110,14 @@ export default {
         return;
       }
       ctx.waitUntil(runReconciliationSweep(env, { trigger: 'cron', dryRun: false }));
+      return;
+    }
+    if (event.cron === '0 */6 * * *') {
+      // Address-pool refill every 6h. Picks ≤5 zips whose only address is
+      // quarantined and inserts a fresh OSM replacement so the pool keeps
+      // coverage even as AT&T verifier rejects addresses.
+      ctx.waitUntil(runAddressPoolRefill(env, {}).catch(err =>
+        console.error(`[Refill] cron error: ${err}`)));
       return;
     }
     ctx.waitUntil(runHelixFinalizer(env, 25));
@@ -1021,6 +1043,167 @@ async function runAtomicFinalizer(env, limit) {
   }
 
   return { ok: true, processed, synced, errors, failed, results };
+}
+
+/* ── Address Pool Refill ──────────────────────────────────────────────────── */
+// Every 6h cron picks ≤5 zips where the sole address is quarantined, queries
+// OpenStreetMap Overpass for a different civic-building address at that zip,
+// and INSERTs the replacement into address_pool_usage. The quarantined row
+// stays (90d cooldown is preserved as history); the new row becomes the LRU
+// pick on next rotation since last_used_at is NULL.
+
+const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+const REFILL_DEFAULT_MAX_ZIPS = 5;
+const REFILL_QUERY_DELAY_MS   = 5000; // polite delay between Overpass queries
+
+function refillSlug(s) {
+  return String(s || '').trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function normalizeOsmAddress(tags) {
+  const norm = (k) => String(tags[k] || '').trim().replace(/\s+/g, ' ');
+  const housenumber = norm('addr:housenumber');
+  const street      = norm('addr:street');
+  const city        = norm('addr:city');
+  const zip         = norm('addr:postcode').slice(0, 5); // strip ZIP+4
+  if (!housenumber || !street || !city || !zip) return null;
+  if (!/^\d+[a-zA-Z]?$/.test(housenumber)) return null;  // skip "13-15", etc.
+  if (!/^\d{5}$/.test(zip))               return null;   // skip non-5-digit
+  return { housenumber, street, city, zip };
+}
+
+async function overpassFetchByZip(env, state, zip) {
+  // Scope to state area or Overpass does a full-planet postcode scan and 504s.
+  // Postcode matched both exactly and as a ZIP+4 prefix.
+  const amenities = ['post_office', 'library', 'townhall', 'courthouse', 'fire_station'];
+  const filters = amenities.flatMap(a => [
+    `nwr["amenity"="${a}"]["addr:postcode"="${zip}"](area.searchArea);`,
+    `nwr["amenity"="${a}"]["addr:postcode"~"^${zip}-"](area.searchArea);`,
+  ]).join('\n  ');
+  const query = `[out:json][timeout:60];\narea["ISO3166-2"="US-${state}"]->.searchArea;\n(\n  ${filters}\n);\nout tags center;`;
+  // Single retry on 429/504 — Overpass is famously transient under load.
+  let lastErr;
+  for (const attempt of [1, 2]) {
+    try {
+      // Direct fetch, NOT relayFetch: Overpass is a public unauthenticated OSM
+      // mirror — relay routing adds latency without value and the relay appears
+      // to time out on long-running Overpass queries. Relay exists for AT&T /
+      // Helix IP allowlist needs, not for public APIs like OSM.
+      const res = await fetch(OVERPASS_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent':   'incomingsms address-pool refill (https://github.com/ZMAWline/incomingsms)',
+        },
+        body: `data=${encodeURIComponent(query)}`,
+      });
+      if (!res.ok) {
+        const text = (await res.text().catch(() => '')).slice(0, 200);
+        if ((res.status === 429 || res.status === 504) && attempt === 1) {
+          lastErr = new Error(`Overpass HTTP ${res.status}: ${text}`);
+          await new Promise(r => setTimeout(r, 30000)); // 30s backoff before retry
+          continue;
+        }
+        throw new Error(`Overpass HTTP ${res.status}: ${text}`);
+      }
+      const data = await res.json();
+      const elements = Array.isArray(data.elements) ? data.elements : [];
+      const candidates = [];
+      for (const el of elements) {
+        const norm = normalizeOsmAddress(el.tags || {});
+        if (!norm) continue;
+        if (norm.zip !== zip) continue;
+        candidates.push(norm);
+      }
+      return candidates;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 2) throw err;
+    }
+  }
+  throw lastErr;
+}
+
+async function supabaseRpc(env, fn, body) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: {
+      apikey:        env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok) throw new Error(`Supabase RPC ${fn} ${res.status}: ${await res.text().catch(() => '')}`);
+  return res.json();
+}
+
+async function runAddressPoolRefill(env, opts = {}) {
+  const maxZips = Math.min(Math.max(parseInt(opts.maxZips, 10) || REFILL_DEFAULT_MAX_ZIPS, 1), 20);
+  const dryRun  = opts.dryRun === true;
+
+  const targets = await supabaseRpc(env, 'list_zips_needing_refill', { p_limit: maxZips });
+  if (!Array.isArray(targets) || targets.length === 0) {
+    console.log('[Refill] no zips needing refill');
+    return { ok: true, attempted: 0, results: [] };
+  }
+  console.log(`[Refill] processing ${targets.length} zip(s), dry=${dryRun}`);
+
+  const results = [];
+  for (const target of targets) {
+    if (results.length > 0) await new Promise(r => setTimeout(r, REFILL_QUERY_DELAY_MS));
+    let outcome;
+    try {
+      const candidates = await overpassFetchByZip(env, target.state, target.zip_code);
+      const excludeKey = `${target.street_number}|${target.street_name}`.toLowerCase();
+      const fresh = candidates.find(c =>
+        `${c.housenumber}|${c.street}`.toLowerCase() !== excludeKey
+      );
+      if (!fresh) {
+        outcome = {
+          zip: target.zip_code, state: target.state, status: 'no_alternative',
+          osm_candidates: candidates.length, quarantined_id: target.address_id,
+        };
+      } else {
+        const newId = `${target.state.toLowerCase()}-${target.zip_code}-${fresh.housenumber}-${refillSlug(fresh.street)}`;
+        if (!dryRun) {
+          // Use ON CONFLICT DO NOTHING via Prefer header to swallow rare slug collisions.
+          const insRes = await fetch(`${env.SUPABASE_URL}/rest/v1/address_pool_usage?on_conflict=address_id`, {
+            method: 'POST',
+            headers: {
+              apikey:          env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization:   `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type':  'application/json',
+              Prefer:          'resolution=ignore-duplicates,return=minimal',
+            },
+            body: JSON.stringify([{
+              address_id:       newId,
+              state:            target.state,
+              zip_code:         target.zip_code,
+              street_number:    fresh.housenumber,
+              street_name:      fresh.street,
+              street_direction: '',
+              city:             fresh.city,
+            }]),
+          });
+          if (!insRes.ok) throw new Error(`INSERT HTTP ${insRes.status}: ${await insRes.text().catch(() => '')}`);
+        }
+        outcome = {
+          zip: target.zip_code, state: target.state, status: dryRun ? 'would_replace' : 'replaced',
+          new_id: newId, replaced_id: target.address_id,
+        };
+      }
+    } catch (err) {
+      outcome = {
+        zip: target.zip_code, state: target.state, status: 'error',
+        error: String(err).slice(0, 200), quarantined_id: target.address_id,
+      };
+    }
+    results.push(outcome);
+    console.log(`[Refill] ${target.state} ${target.zip_code}: ${outcome.status}`);
+  }
+  return { ok: true, attempted: targets.length, results };
 }
 
 /* ── Relay ────────────────────────────────────────────────────────────────── */

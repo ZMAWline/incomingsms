@@ -1917,24 +1917,52 @@ async function rotateAtomicSim(env, sim, opts = {}) {
 
   let zipCode;
   if (useApexFlow) {
-    const newAddr = await pickNextPpuAddress(env, {
-      excludeState: currentState,
-      excludeZip:   currentZip,
-    });
-    console.log(`SIM ${iccid}: apex flow — picked PPU ${newAddr.id} (${newAddr.state} ${newAddr.zipCode})`);
-    try {
-      await atomicUpdateSubscriberInfo(env, {
-        session, msisdn: currentMsisdn, address: newAddr,
-      }, runId, iccid);
-    } catch (ppuErr) {
-      // AT&T rejected this address — quarantine it in address_pool_usage so
-      // the picker won't choose it again for 90 days (see claim_address_pool_entry).
-      await markAddressVerifyFailure(env, newAddr.id, String(ppuErr));
-      throw ppuErr;
+    // Up to 3 PPU attempts: first try excludes current state+zip so the new MDN
+    // lands in a different area; retries drop exclusions and just take the next
+    // LRU pool entry. Each AT&T verify rejection quarantines the address for 90d.
+    // If all attempts fail, restore last_mdn_rotated_at to its pre-claim value so
+    // the next cron tick re-attempts this SIM — otherwise claim_rotation_slot's
+    // "< NY midnight" gate locks the SIM out until tomorrow night.
+    const MAX_PPU_ATTEMPTS = 3;
+    const priorRotatedAt = sim.last_mdn_rotated_at ?? null;
+    let ppuSuccessAddr = null;
+    let lastPpuErr = null;
+    const triedAddrIds = new Set();
+    for (let attempt = 1; attempt <= MAX_PPU_ATTEMPTS; attempt++) {
+      const pickOpts = (attempt === 1)
+        ? { excludeState: currentState, excludeZip: currentZip }
+        : {};
+      let newAddr;
+      try {
+        newAddr = await pickNextPpuAddress(env, pickOpts);
+      } catch (pickErr) {
+        lastPpuErr = pickErr;
+        break;
+      }
+      if (triedAddrIds.has(newAddr.id)) break;
+      triedAddrIds.add(newAddr.id);
+      console.log(`SIM ${iccid}: apex flow attempt ${attempt}/${MAX_PPU_ATTEMPTS} — picked PPU ${newAddr.id} (${newAddr.state} ${newAddr.zipCode})`);
+      try {
+        await atomicUpdateSubscriberInfo(env, {
+          session, msisdn: currentMsisdn, address: newAddr,
+        }, runId, iccid);
+        ppuSuccessAddr = newAddr;
+        break;
+      } catch (ppuErr) {
+        await markAddressVerifyFailure(env, newAddr.id, String(ppuErr));
+        lastPpuErr = ppuErr;
+        console.log(`SIM ${iccid}: PPU attempt ${attempt} verify failed — trying another address`);
+      }
     }
-    zipCode = newAddr.zipCode;
+    if (!ppuSuccessAddr) {
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        last_mdn_rotated_at: priorRotatedAt,
+      }).catch(() => {});
+      throw lastPpuErr || new Error(`SIM ${iccid}: PPU exhausted ${MAX_PPU_ATTEMPTS} attempts`);
+    }
+    zipCode = ppuSuccessAddr.zipCode;
     await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-      activation_zip: newAddr.zipCode,
+      activation_zip: ppuSuccessAddr.zipCode,
     }).catch(() => {});
   } else {
     zipCode = currentZip || env.HX_ZIP || '11238';
@@ -2121,27 +2149,55 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
     if (!subscriberNumber) {
       throw new Error(`SIM ${iccid}: cannot run helix apex PPU update — no subscriberNumber`);
     }
-    const newAddr = await pickNextPpuAddress(env, { excludeState: curState, excludeZip: curZip });
-    const { type: streetType } = splitStreetSuffix(newAddr.streetName);
-    console.log(`SIM ${iccid}: helix apex flow — picked PPU ${newAddr.id} (${newAddr.state} ${newAddr.zipCode})`);
-    try {
-      await hxUpdateSubscriberDetails(env, token, {
-        subscriberNumber,
-        firstName:    'EZ',
-        lastName:     'Biz',
-        streetNumber: newAddr.streetNumber,
-        streetName:   newAddr.streetName,
-        streetType,
-        city:         newAddr.city,
-        state:        newAddr.state,
-        zipCode:      newAddr.zipCode,
-      }, runId, iccid);
-    } catch (ppuErr) {
-      await markAddressVerifyFailure(env, newAddr.id, String(ppuErr));
-      throw ppuErr;
+    // Up to 3 PPU attempts (see rotateAtomicSim apex block for rationale).
+    const MAX_PPU_ATTEMPTS = 3;
+    const priorRotatedAt = sim.last_mdn_rotated_at ?? null;
+    let ppuSuccessAddr = null;
+    let lastPpuErr = null;
+    const triedAddrIds = new Set();
+    for (let attempt = 1; attempt <= MAX_PPU_ATTEMPTS; attempt++) {
+      const pickOpts = (attempt === 1)
+        ? { excludeState: curState, excludeZip: curZip }
+        : {};
+      let newAddr;
+      try {
+        newAddr = await pickNextPpuAddress(env, pickOpts);
+      } catch (pickErr) {
+        lastPpuErr = pickErr;
+        break;
+      }
+      if (triedAddrIds.has(newAddr.id)) break;
+      triedAddrIds.add(newAddr.id);
+      const { type: streetType } = splitStreetSuffix(newAddr.streetName);
+      console.log(`SIM ${iccid}: helix apex flow attempt ${attempt}/${MAX_PPU_ATTEMPTS} — picked PPU ${newAddr.id} (${newAddr.state} ${newAddr.zipCode})`);
+      try {
+        await hxUpdateSubscriberDetails(env, token, {
+          subscriberNumber,
+          firstName:    'EZ',
+          lastName:     'Biz',
+          streetNumber: newAddr.streetNumber,
+          streetName:   newAddr.streetName,
+          streetType,
+          city:         newAddr.city,
+          state:        newAddr.state,
+          zipCode:      newAddr.zipCode,
+        }, runId, iccid);
+        ppuSuccessAddr = newAddr;
+        break;
+      } catch (ppuErr) {
+        await markAddressVerifyFailure(env, newAddr.id, String(ppuErr));
+        lastPpuErr = ppuErr;
+        console.log(`SIM ${iccid}: helix PPU attempt ${attempt} verify failed — trying another address`);
+      }
+    }
+    if (!ppuSuccessAddr) {
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        last_mdn_rotated_at: priorRotatedAt,
+      }).catch(() => {});
+      throw lastPpuErr || new Error(`SIM ${iccid}: helix PPU exhausted ${MAX_PPU_ATTEMPTS} attempts`);
     }
     await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-      activation_zip: newAddr.zipCode,
+      activation_zip: ppuSuccessAddr.zipCode,
     }).catch(() => {});
   }
 
