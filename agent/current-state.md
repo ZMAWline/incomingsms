@@ -1,7 +1,22 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-21 (session 57 cont. — Apex PPU-then-MDN Phase 4 shipped; canary expanded to ALL 292 active ATOMIC SIMs for tonight's NY-midnight cron)
+> Last updated: 2026-05-21 (session 58 — PR-B shipped + PPU retry loop + DB-driven address pool + 6h refill cron)
+
+---
+
+## Session 58 (2026-05-21) — PPU retry + DB-driven pool
+
+**Apex PPU retry loop (mdn-rotator `1646b5cd`):** rotateAtomicSim + rotateSingleSim helix mirror now wrap the PPU step in a 3-attempt loop. First pick excludes current state+zip; retries drop exclusions for any-zip LRU. If all attempts fail, `last_mdn_rotated_at` is restored to its pre-claim value so the next cron tick re-attempts the SIM instead of locking it out via the "< NY midnight" gate. Diagnosed via SIM 652: tonight's apex flow stamped `last_mdn_rotated_at=NOW()` on claim but PPU failed → SIM was effectively stuck until tomorrow night. Now self-recovers.
+
+**Address pool → DB-driven (migration `address_pool_usage_add_address_fields`):** added `street_number, street_name, street_direction, city` columns to `address_pool_usage`, backfilled all 1529 rows from the static `src/shared/address-pool.mjs`, replaced `claim_address_pool_entry` RPC to return the full address row as JSONB. `pickNextPpuAddress` in `src/shared/address-picker.mjs` no longer imports `ADDRESS_POOL` — the JSONB shape from the RPC maps directly to `{id, streetNumber, streetName, streetDirection, city, state, zipCode}`. Dropped `seedAddressPoolUsage` helper + `scripts/seed-address-pool.mjs` (obsolete; backfill done via SQL). Static `src/shared/address-pool.mjs` kept as the original seed reference; runtime never imports it. Deployed: mdn-rotator `abd5d316`, bulk-activator `27cf893c`.
+
+**Address-pool refill cron (details-finalizer `3dce46f2`):** new `0 */6 * * *` cron runs `runAddressPoolRefill(env)` which calls new RPC `list_zips_needing_refill(p_limit)` (returns ≤5 zips where every entry is quarantined), queries OSM Overpass per zip (state-scoped via `area["ISO3166-2"="US-XX"]` for performance — global postcode regex 504s), picks first valid civic-building address that differs from the quarantined one, INSERTs into `address_pool_usage`. Quarantined row preserved as history; new row has `last_used_at=NULL` so it's first LRU pick. Manual trigger: `GET /refill-pool?secret=...[&max=N][&dry=1]`. Direct fetch (not relayFetch) for Overpass — public unauthenticated API, relay routing was timing out. Smoke-tested: ak-99587-250-egloff-road quarantined → ak-99587-186-egloff-road inserted as replacement. Backlog this morning: 38 orphan zips remaining (was 39, one refilled in smoke test); drains at 20/day with the 6h cron.
+
+**Hot starts for next session:**
+- 04:25 UTC cron tick (and subsequent ones in the `*/5 4-11 UTC` window) should exercise the new PPU retry loop on any SIM that failed tonight. Expected: ~39 SIMs that failed at 04:16 will get re-attempted; address quarantine means they'll pick a different (likely good) OSM address.
+- 06:00 UTC will be the first refill-cron tick. Watch CF logs for `[Refill] processing N zip(s)` and `[Refill] <STATE> <ZIP>: replaced|no_alternative|error`. Self-paced — only 5 per run, with 5s polite delay between OSM queries.
+- Monitor address_pool_usage growth: each refill adds one row; over weeks/months the pool will grow beyond 1529 entries naturally as addresses get rejected and refilled.
 
 ---
 
