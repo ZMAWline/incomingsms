@@ -2103,6 +2103,48 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
   // Generate unique run_id for this rotation operation
   const runId = `rotate_${iccid}_${Date.now()}`;
 
+  // Apex flow (helix mirror of rotateAtomicSim): when enabled + canary, pull
+  // current PPU via hxSubscriberDetails, pick a new LRU address from a
+  // different state+zip, push it via hxUpdateSubscriberDetails (4.4), then
+  // let the existing hxMdnChange run. AT&T-side rejection of the address
+  // self-heals via markAddressVerifyFailure (90-day quarantine).
+  const apexEnabled = String(env.APEX_PPU_THEN_MDN_ENABLED || '').toLowerCase() === 'true';
+  const canaryOnly  = String(env.APEX_PPU_CANARY_ONLY || 'true').toLowerCase() === 'true';
+  const useApexFlow = apexEnabled && (!canaryOnly || sim.canary_apex_ppu === true);
+
+  if (useApexFlow) {
+    const preDetails = await hxSubscriberDetails(env, token, subId, runId, iccid);
+    const preD = Array.isArray(preDetails) ? preDetails[0] : null;
+    const curState = preD?.address?.state || null;
+    const curZip   = preD?.address?.zipCode || sim.activation_zip || null;
+    const subscriberNumber = preD?.phoneNumber || sim.msisdn;
+    if (!subscriberNumber) {
+      throw new Error(`SIM ${iccid}: cannot run helix apex PPU update — no subscriberNumber`);
+    }
+    const newAddr = await pickNextPpuAddress(env, { excludeState: curState, excludeZip: curZip });
+    const { type: streetType } = splitStreetSuffix(newAddr.streetName);
+    console.log(`SIM ${iccid}: helix apex flow — picked PPU ${newAddr.id} (${newAddr.state} ${newAddr.zipCode})`);
+    try {
+      await hxUpdateSubscriberDetails(env, token, {
+        subscriberNumber,
+        firstName:    'EZ',
+        lastName:     'Biz',
+        streetNumber: newAddr.streetNumber,
+        streetName:   newAddr.streetName,
+        streetType,
+        city:         newAddr.city,
+        state:        newAddr.state,
+        zipCode:      newAddr.zipCode,
+      }, runId, iccid);
+    } catch (ppuErr) {
+      await markAddressVerifyFailure(env, newAddr.id, String(ppuErr));
+      throw ppuErr;
+    }
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      activation_zip: newAddr.zipCode,
+    }).catch(() => {});
+  }
+
   // 1) MDN change - request new number from carrier
   let mdnChange;
   try {
@@ -2341,6 +2383,66 @@ async function hxGetBearerToken(env) {
     throw new Error(`Token failed: ${res.status} ${JSON.stringify(json)}`);
   }
   return json.access_token;
+}
+
+// Split a street name like "Maple Ave" into base + suffix. Helix's 4.4
+// endpoint accepts `streetType` separately. If the name has only one
+// token (e.g. "Broadway"), the suffix is empty.
+function splitStreetSuffix(streetName) {
+  const tokens = String(streetName || '').trim().split(/\s+/);
+  if (tokens.length < 2) return { name: streetName || '', type: '' };
+  return { name: tokens.slice(0, -1).join(' '), type: tokens[tokens.length - 1] };
+}
+
+// Helix 4.4: PATCH /api/mobility-subscriber/details — update PPU address
+// for an apex-backed subscriber. Mirrors the local hxMdnChange shape and
+// logs step='ppu_update' via the same logHelixApiCall path.
+async function hxUpdateSubscriberDetails(env, token, data, runId, iccid) {
+  const url = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
+  const method = "PATCH";
+  const requestBody = [{
+    subscriberNumber: data.subscriberNumber,
+    firstName:        data.firstName,
+    lastName:         data.lastName,
+    address: {
+      address1: `${data.streetNumber} ${data.streetName}`,
+      address2: '',
+      city:     data.city,
+      state:    data.state,
+      zipCode:  data.zipCode,
+    },
+    streetNumber: data.streetNumber,
+    streetName:   data.streetName,
+    streetType:   data.streetType || '',
+  }];
+  const res = await relayFetch(env, url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(requestBody),
+  });
+  const responseText = await res.text();
+  let json = {};
+  try { json = JSON.parse(responseText); } catch {}
+  await logHelixApiCall(env, {
+    run_id: runId,
+    step: "ppu_update",
+    iccid,
+    request_url: url,
+    request_method: method,
+    request_body: requestBody,
+    response_status: res.status,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: json,
+    error: res.ok ? null : `Update subscriber details failed: ${res.status}`,
+  });
+  if (!res.ok) {
+    throw new Error(`Update subscriber details failed: ${res.status} ${JSON.stringify(json)}`);
+  }
+  return json;
 }
 
 async function hxMdnChange(env, token, mobilitySubscriptionId, runId, iccid) {
