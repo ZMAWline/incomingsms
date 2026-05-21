@@ -89,10 +89,10 @@
 
 ---
 
-### PR-B: in-window retry for failed Teltik rotations — code staged, migration not applied (session 55, 2026-05-20)
-**Status: code on disk in `src/teltik-worker/index.js`, NOT deployed. Migration file at `supabase/migrations/20260520_claim_rotation_retry_slot.sql`, NOT applied to Supabase.**
+### PR-B: in-window retry for failed Teltik rotations — SHIPPED 2026-05-21 (session 58)
+**Status: migration applied (MCP, name `claim_rotation_retry_slot`, function visible in `pg_proc`); teltik-worker deployed to prod as version `8560d111-7803-4445-86b1-6a1b60c5034a`. Awaiting first cron-fired exercise.**
 
-PR-B adds a new sibling RPC `claim_rotation_retry_slot(p_sim_id bigint)` and a second query+branch in `rotateTeltikSims` to pick up SIMs that failed earlier the same NY-night and retry them within the 12–6am window (with a 15-min per-attempt backoff). Designed to land without touching `claim_rotation_slot` or any non-Teltik vendor path — full revert is `DROP FUNCTION claim_rotation_retry_slot(bigint);` + `wrangler rollback teltik-worker`.
+PR-B adds a sibling RPC `claim_rotation_retry_slot(p_sim_id bigint)` and a second query+branch in `rotateTeltikSims` that picks up SIMs which failed earlier the same NY-night and retries them within the `10,40 4-11 UTC` cron window (with a 15-min per-attempt backoff). Does NOT touch `claim_rotation_slot` or any non-Teltik vendor path. Full revert: `DROP FUNCTION claim_rotation_retry_slot(bigint);` + `wrangler rollback teltik-worker` (previous version `47cf46ef`).
 
 Predicate enforced inside the new RPC:
 - `vendor = 'teltik'`
@@ -102,12 +102,16 @@ Predicate enforced inside the new RPC:
 - `last_mdn_rotated_at >= today's NY midnight` (failed-today only — protects against Teltik's own 48h server-side cooldown)
 - `last_mdn_rotated_at < NOW() - INTERVAL '15 minutes'` (backoff)
 
-**To finish:**
-1. Apply migration `supabase/migrations/20260520_claim_rotation_retry_slot.sql` — either via Supabase MCP (`mcp__supabase__apply_migration`, available after `/clear` or restart since the server was added this session) or via Supabase Studio SQL editor.
-2. Deploy `cd src/teltik-worker && npx wrangler deploy --env=""` (PR-B code is already in the file from this session — same deploy carries Fix #1 forward, no regression).
-3. Verify: next cron tick `10,40 4-11 UTC` should log `[Rotate] ... N eligible for in-window retry` and try them with `claim_rotation_retry_slot`. Watch for the new `retry_eligible`/`retried`/`retry_skipped` fields in the response from `/rotate`.
+**Pre-deploy sanity (01:36 UTC):** 5 Teltik SIMs matched the predicate at deploy time (all failed during the wrapping NY day). Those will roll off at 04:00 UTC (NY midnight) before the cron window opens. The first real production exercise happens when a SIM fails *during* tonight's `10,40 4-11 UTC` window and gets re-picked 30 min later by the same cron.
 
-**Note:** while the migration is unapplied, deploying teltik-worker would cause the new retry branch to log PGRST 404 errors per failed-today SIM per cron tick. Main rotation path is unaffected. Safer to apply migration first.
+**Morning-after verification (run after 11:40 UTC = end of cron window):**
+```sql
+SELECT
+  count(*) FILTER (WHERE rotation_status='success' AND last_mdn_rotated_at > NOW() - INTERVAL '12 hours') AS rotated_overnight,
+  count(*) FILTER (WHERE rotation_status='failed'  AND last_mdn_rotated_at > NOW() - INTERVAL '12 hours') AS still_failed
+FROM sims WHERE vendor='teltik';
+```
+Plus Cloudflare logs: `npx wrangler tail teltik-worker --search "in-window retry" --since 8h` should show `[Rotate] ... N eligible for in-window retry` lines. Watch for any `PGRST404` for `claim_rotation_retry_slot` (should be zero — migration is applied).
 
 ### Mastercard-inspired dashboard redesign — Test env only, awaiting user review (session 52, 2026-05-12)
 Full visual reskin of `src/dashboard/index.js` per `DESIGN.md` (Mastercard editorial system: Canvas Cream `#F3F0EE` canvas, Ink Black `#141413` pill CTAs at 20px radius, Sofia Sans typography at weight 450 body / 500 headings with -2% tracking, oversized radii — 20/24/40/999px — eyebrow labels with signal-orange accent dot, soft 48px-spread shadows). Achieved by remapping the existing `--dark-N` CSS variable scale to cream tones (so all existing `bg-dark-*` / `text-dark-*` Tailwind class usages auto-style with zero per-element edits) plus an aggressive override layer that translates `bg-blue-*`/`bg-green-*`/`bg-red-*`/`bg-yellow-*`/`bg-orange-*` to Mastercard equivalents (blue→ink, green→forest, red preserved, yellow/orange→Signal Orange `#CF4500`). Page header rebuilt as eyebrow + dynamic title + subtitle, fed by a new `PAGE_HEADERS` map in `switchTab()` (Overview/Inventory/Inbox/Hardware/Identity/Incidents/Billing/Analytics/Reference/Tools). Sidebar brand: circular ink logo + "SMS Gateway / OPERATOR" eyebrow. Top-right `<span>` pill replaces the bare pulse dot for the "Connected" indicator. Theme-toggle hidden (single cream theme; legacy localStorage `theme` removed on load). +432 / −70 lines, only `src/dashboard/index.js` touched. **Deployed to `dashboard-test.zalmen-531.workers.dev` (version `e4c764b3-bea6-4dc7-97fe-1f335a0c93a2`). Prod (`dashboard.zalmen-531.workers.dev`) is unchanged.** User explicitly asked for "no commit yet" pending review; `src/dashboard/index.js` has the redesigned content uncommitted in the working tree. `DESIGN.md` (the reference doc) is untracked in repo root.
