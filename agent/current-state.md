@@ -1,7 +1,39 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-21 (session 58 cont.cont. — rotation-review tooling + dashboard tab + CCR routine + Resend email path)
+> Last updated: 2026-05-23 (session 59 — diagnostic only, no code changes)
+
+---
+
+## Session 59 (2026-05-23 evening) — Maxim's "they did not come" diagnosis
+
+**No code changes. Pure investigation triggered by Maxim/TrustOTP message: "They did not come. We had 1300-1400 numbers active all the time."**
+
+**Findings:**
+
+1. **His report is correct.** His daily $1.60 (Teltik) row crashed from 728 (5/21) → **92 (5/22)** → 676 (5/23). Maps 1:1 to our `carrier_api_logs vendor=teltik step=change_number_initiate` and matches rotation-review run #5 (`teltik.rotated=92, success=92`). ATT side (~520/day, $1.10 tier) unaffected.
+
+2. **Root cause already known.** The 5/22 dip is **residual fallout from the PR-B incident** (already in session 58 cont. notes). Timeline:
+   - 5/20 18:06 UTC — PR-B deployed with malformed PostgREST query, aborted whole rotation function (PGRST108).
+   - 5/20→5/21 night cron — 0 SIMs rotated.
+   - 5/21 13:11 UTC — fix deployed (`da7f55c`).
+   - 5/21 09:11 ET — manual catch-up rotated 714 SIMs at midday.
+   - 5/21→5/22 night cron — only ~92 SIMs were genuinely due (the 714 manual SIMs were 15h post-rotation, not yet eligible).
+   - 5/22→5/23 night cron — 676 rotated (the cohort that should have rotated 5/20 night, ~2.5 days overdue, finally cleared).
+   - **No bug remaining**, but ~600 rentals worth of customer revenue on 5/22 are permanently lost.
+
+3. **Secondary effect — drift from manual catch-up.** The 714 manual-batch SIMs got `last_mdn_rotated_at` stamped at 09:11 ET. With 48h interval they next become due at 09:11 ET on 5/23 — **outside the 0-5 ET cron window**. Their next rotation slips to 0:10 ET on 5/24 (~63h since last rotation). One night of drift then realigns. Maxim may see another small dip on 5/24 morning.
+
+4. **Rotation-review has a structural gap (deferred for now).** `runRotationReview()` only tallies SIMs that *did* rotate. It has no expected-vs-actual baseline, so a night with 92/750 emails `✅ all clear`. Captured as memory `project_rotation_review_under_rotation_gap.md` to review later — user explicitly said don't implement now.
+
+5. **Reseller-side notification was healthy throughout.** `webhook_deliveries event_type=number.online status=delivered` returned 200 + valid `rentalId` on every 5/22 and 5/23 rotation (1248 + 1965 respectively). Maxim's system accepted every rental we created — the deficit is rotations we never made, not notifications we lost.
+
+**Architectural fragility flagged (also deferred):**
+- teltik-worker `rotateTeltikSims` iterates serially in a single cron invocation with no resumable batch / per-tick run record. If any tick throws past the inner try/catch, all remaining SIMs are silently dropped. `cron_runs` only tracks `rotation_review`, never the cron itself.
+- No daytime catch-up tick — a SIM that becomes due at 09:00 ET waits 15h for the next 0-5 ET window.
+- No `MDN_QUEUE`-style retry; teltik runs purely inline.
+
+**No commits, no deploys this session.** Findings only.
 
 ---
 
