@@ -609,7 +609,7 @@ async function handleResyncAll(auth, env) {
     failed: result.failed || 0,
     // Don't return the full per-SIM results array to the client — it can be 1300+ entries for TrustOTP
     // and the portal only needs aggregate counts. Operators can query webhook_deliveries directly.
-  }, 200);
+  }, result.ok ? 200 : 502);
 }
 
 async function handleOnlineHistory(simId, auth, env) {
