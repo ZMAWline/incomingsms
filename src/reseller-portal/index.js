@@ -524,6 +524,55 @@ async function handleSimLifetime(simId, auth, env) {
   });
 }
 
+async function handleResendOnline(simId, auth, env) {
+  // 1. Ownership check — reseller must own this SIM and it must currently be active.
+  const ownResp = await sbGet(env,
+    'reseller_sims?select=sim_id,active' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&active=eq.true' +
+    '&limit=1'
+  );
+  if (!ownResp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const ownRows = await ownResp.json();
+  if (!Array.isArray(ownRows) || ownRows.length === 0) {
+    return jsonResp({ error: 'SIM not owned by this reseller or not currently active' }, 404);
+  }
+
+  // 2. Rate-limit check. Reject BEFORE calling reseller-sync (and before logging).
+  const rl = await checkRateLimit(env, auth.resellerId, 'portal_resend', simId);
+  if (!rl.allowed) {
+    return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
+  }
+
+  // 3. Service-binding call to reseller-sync. Defense-in-depth header per Task 4's auth check.
+  if (!env.RESELLER_SYNC) return jsonResp({ error: 'RESELLER_SYNC binding not configured' }, 500);
+  let result;
+  try {
+    const upstream = await env.RESELLER_SYNC.fetch('https://reseller-sync.internal/resend-online', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Caller': 'reseller-portal' },
+      body: JSON.stringify({ simId: Number(simId), source: 'portal_resend' }),
+    });
+    result = await upstream.json().catch(() => ({ ok: false, error: 'Non-JSON response from reseller-sync' }));
+    if (!upstream.ok && !result.error) result.error = 'reseller-sync HTTP ' + upstream.status;
+  } catch (e) {
+    return jsonResp({ error: 'Resend pipeline unavailable: ' + String(e) }, 502);
+  }
+
+  // 4. Log the accepted action (whether or not the webhook delivered — the *attempt* counts).
+  await logAction(env, auth.resellerId, 'portal_resend', simId);
+
+  return jsonResp({
+    ok: !!result.ok,
+    delivered: !!result.ok,
+    http_status: result.status || 0,
+    rental_id: result.rental_id || null,
+    error: result.error || null,
+    note: 'Your system may return the same rental ID (replay) or a new one (treated as a fresh rental). We record whichever you return.',
+  }, result.ok ? 200 : 502);
+}
+
 function loginHtml() {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reseller Portal</title>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -931,6 +980,7 @@ export default {
       let m;
       if ((m = url.pathname.match(/^\/api\/invoices\/(\d+)$/))) return handleInvoiceDetail(m[1], auth, env);
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/lifetime$/))) return handleSimLifetime(m[1], auth, env);
+      if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/resend-online$/)) && request.method === 'POST') return handleResendOnline(m[1], auth, env);
       return notFound();
     }
 
