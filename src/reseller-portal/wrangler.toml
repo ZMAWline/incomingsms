@@ -14,6 +14,11 @@ routes = [
 enabled = true
 invocation_logs = true
 
+# Service binding so portal can call reseller-sync without going over public HTTP.
+[[services]]
+binding = "RESELLER_SYNC"
+service = "reseller-sync"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "reseller-portal-test"
@@ -21,3 +26,7 @@ name = "reseller-portal-test"
 [env.test.observability.logs]
 enabled = true
 invocation_logs = true
+
+[[env.test.services]]
+binding = "RESELLER_SYNC"
+service = "reseller-sync-test"
