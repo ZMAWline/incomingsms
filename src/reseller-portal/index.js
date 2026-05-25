@@ -1176,8 +1176,37 @@ async function openInvoice(id) {
 
 async function openLifetime(simId) {
   showModal('<div class="text-slate-400">Loading…</div>');
-  const d = await api('/api/sims/' + simId + '/lifetime');
+  // Fire both in parallel; lifetime is cheap, history is small.
+  const [d, history] = await Promise.all([
+    api('/api/sims/' + simId + '/lifetime'),
+    api('/api/sims/' + simId + '/online-history').catch(() => []),
+  ]);
   if (!d) return;
+
+  const histRows = Array.isArray(history) ? history : [];
+  const historyTable = histRows.length === 0
+    ? '<div class="text-slate-500 text-sm italic">No number.online events recorded yet for this SIM.</div>'
+    : '<div class="overflow-x-auto rounded border border-slate-700"><table class="w-full text-xs"><thead class="bg-slate-900 text-slate-400 uppercase">' +
+      '<tr><th class="px-3 py-2 text-left">When</th><th class="px-3 py-2 text-left">MDN</th><th class="px-3 py-2 text-left">Rental ID</th><th class="px-3 py-2 text-left">Source</th><th class="px-3 py-2 text-left">Status</th></tr>' +
+      '</thead><tbody class="divide-y divide-slate-800">' +
+      histRows.map(h => {
+        const statusBadge = h.delivered
+          ? '<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">delivered</span>'
+          : '<span class="px-2 py-0.5 rounded bg-red-500/20 text-red-300">failed</span>';
+        const sourceLabel = h.source === 'portal_resend' ? 'manual (single)'
+                          : h.source === 'portal_resync' ? 'manual (bulk)'
+                          : h.source === 'pipeline'      ? 'rotation'
+                                                         : 'cron';
+        return '<tr>' +
+          '<td class="px-3 py-2 text-slate-300">' + esc(fmtDateTime(h.delivered_at)) + '</td>' +
+          '<td class="px-3 py-2 text-slate-200 font-mono">' + esc(h.msisdn_at_send || '—') + '</td>' +
+          '<td class="px-3 py-2 text-cyan-300 font-mono">' + (h.rental_id != null ? '#' + esc(h.rental_id) : '<span class="text-slate-600">—</span>') + '</td>' +
+          '<td class="px-3 py-2 text-slate-400">' + esc(sourceLabel) + '</td>' +
+          '<td class="px-3 py-2">' + statusBadge + '</td>' +
+        '</tr>';
+      }).join('') +
+      '</tbody></table></div>';
+
   showModal(
     '<h2 class="text-lg font-semibold mb-1">SIM ' + esc(d.iccid) + '</h2>' +
     '<div class="text-slate-500 text-xs mb-4">Carrier ' + esc(d.carrier || '—') + ' · Status ' + esc(d.status) + ' · ' + (d.currently_active ? 'Currently active' : 'Previously assigned') + '</div>' +
@@ -1185,11 +1214,13 @@ async function openLifetime(simId) {
       '<div class="bg-slate-900 rounded p-4"><div class="text-slate-500 text-xs uppercase mb-1">Total SMS lifetime</div><div class="text-2xl font-semibold text-cyan-300">' + esc(d.total_sms_lifetime) + '</div></div>' +
       '<div class="bg-slate-900 rounded p-4"><div class="text-slate-500 text-xs uppercase mb-1">Billable ' + esc(d.unit_label) + ' lifetime</div><div class="text-2xl font-semibold text-cyan-300">' + esc(d.billable_units_lifetime) + '</div></div>' +
     '</div>' +
-    '<dl class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">' +
+    '<dl class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm mb-6">' +
       '<dt class="text-slate-500">MSISDN (current)</dt><dd class="text-slate-200 font-mono">' + esc(d.current_msisdn || '—') + '</dd>' +
       '<dt class="text-slate-500">Activated</dt><dd class="text-slate-200">' + fmtDate(d.activated_at) + '</dd>' +
       '<dt class="text-slate-500">Assigned to you</dt><dd class="text-slate-200">' + fmtDate(d.assigned_at) + '</dd>' +
     '</dl>' +
+    '<h3 class="text-sm font-semibold text-slate-300 uppercase tracking-wide mb-2">Number.online history (last 20)</h3>' +
+    historyTable +
     '<div class="text-xs text-slate-500 mt-4 italic">Lifetime totals are computed from the date this SIM was assigned to your account onward.</div>'
   );
 }
