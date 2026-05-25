@@ -573,6 +573,45 @@ async function handleResendOnline(simId, auth, env) {
   }, result.ok ? 200 : 502);
 }
 
+async function handleResyncAll(auth, env) {
+  // Rate-limit first. Bulk is the more dangerous call; reject early.
+  const rl = await checkRateLimit(env, auth.resellerId, 'portal_resync');
+  if (!rl.allowed) {
+    return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
+  }
+
+  if (!env.RESELLER_SYNC) return jsonResp({ error: 'RESELLER_SYNC binding not configured' }, 500);
+
+  let result;
+  try {
+    const upstream = await env.RESELLER_SYNC.fetch('https://reseller-sync.internal/resync-reseller', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Caller': 'reseller-portal' },
+      body: JSON.stringify({ resellerId: Number(auth.resellerId) }),
+    });
+    result = await upstream.json().catch(() => ({ ok: false, error: 'Non-JSON response from reseller-sync' }));
+    if (!upstream.ok && !result.error) result.error = 'reseller-sync HTTP ' + upstream.status;
+  } catch (e) {
+    return jsonResp({ error: 'Resync pipeline unavailable: ' + String(e) }, 502);
+  }
+
+  // Log AFTER the upstream call returns so a 502 doesn't burn the user's 10-minute window.
+  // The cost is a small race: two simultaneous resyncs could both reach reseller-sync before
+  // either logs. Acceptable: bulk-resync is idempotent on the reseller's side (TrustOTP dedups
+  // by rentalId/MDN), and a true panic-double-click is rare and rate-bounded by the upstream
+  // worker's wall-clock anyway.
+  await logAction(env, auth.resellerId, 'portal_resync', null);
+
+  return jsonResp({
+    ok: !!result.ok,
+    queued: result.queued || 0,
+    succeeded: result.succeeded || 0,
+    failed: result.failed || 0,
+    // Don't return the full per-SIM results array to the client — it can be 1300+ entries for TrustOTP
+    // and the portal only needs aggregate counts. Operators can query webhook_deliveries directly.
+  }, 200);
+}
+
 function loginHtml() {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reseller Portal</title>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -976,6 +1015,7 @@ export default {
       if (url.pathname === '/api/me') return handleMe(auth, env);
       if (url.pathname === '/api/credentials') return handleCredentials(auth, env);
       if (url.pathname === '/api/sims') return handleSims(auth, env, url);
+      if (url.pathname === '/api/sims/resync-all' && request.method === 'POST') return handleResyncAll(auth, env);
       if (url.pathname === '/api/invoices') return handleInvoices(auth, env);
       let m;
       if ((m = url.pathname.match(/^\/api\/invoices\/(\d+)$/))) return handleInvoiceDetail(m[1], auth, env);
