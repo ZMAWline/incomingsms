@@ -128,6 +128,8 @@ async function runResellerSync(env, limit, force = false) {
           number: currentNumber,
         },
         resellerId,
+        simId,
+        source: 'cron',
         force,
       });
 
@@ -342,6 +344,19 @@ async function wasWebhookDelivered(env, messageId) {
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts } = delivery;
 
+  // source: who triggered this delivery. Defaults to 'cron' for backward compat with callers
+  // that haven't been updated. Callers from the resend pipeline pass 'portal_resend' or 'portal_resync'.
+  // The rotation pipeline (mdn-rotator, teltik-worker, details-finalizer) should pass 'pipeline'.
+  const source = delivery.source || 'cron';
+
+  // sim_id: extracted from payload.data.sim_id when present so the per-SIM history endpoint
+  // can filter via a real indexed column instead of jsonb-path (which hits PostgREST 3s timeout).
+  let simId = delivery.simId;
+  if (simId == null && payload && payload.data && payload.data.sim_id != null) {
+    const n = Number(payload.data.sim_id);
+    simId = Number.isFinite(n) ? n : null;
+  }
+
   await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
@@ -358,6 +373,8 @@ async function recordWebhookDelivery(env, delivery) {
       payload,
       status,
       attempts,
+      source,
+      sim_id: simId,
       last_attempt_at: new Date().toISOString(),
       delivered_at: status === 'delivered' ? new Date().toISOString() : null,
       response_body: delivery.responseBody ? String(delivery.responseBody).slice(0, 2000) : null,
@@ -456,6 +473,8 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
       messageId,
       eventType: payload.event_type,
       resellerId: options.resellerId,
+      simId: options.simId,
+      source: options.source,
       webhookUrl,
       payload,
       status: result.ok ? 'delivered' : 'failed',
