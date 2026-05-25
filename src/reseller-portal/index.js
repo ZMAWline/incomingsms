@@ -44,6 +44,75 @@ async function sbGetAll(env, pathWithoutLimit) {
   return out;
 }
 
+async function sbPost(env, path, body) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error('PostgREST POST ' + res.status + ': ' + t);
+  }
+}
+
+// --- Rate limits ---
+// All windows expressed in seconds; counts are read from reseller_actions_log.
+// Per spec §5.6:
+//   portal_resync : 1 per reseller per 600s
+//   portal_resend : 1 per (reseller, sim_id) per 300s AND 100 per reseller per 3600s
+// On violation we return a structured object that the caller turns into HTTP 429.
+
+async function countActionsSince(env, resellerId, action, sinceIsoSeconds, simId = null) {
+  const since = new Date(Date.now() - sinceIsoSeconds * 1000).toISOString();
+  let path =
+    'reseller_actions_log?select=id' +
+    '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+    '&action=eq.' + encodeURIComponent(action) +
+    '&created_at=gte.' + encodeURIComponent(since);
+  if (simId != null) path += '&sim_id=eq.' + encodeURIComponent(simId);
+  path += '&limit=1000';
+  const resp = await sbGet(env, path);
+  if (!resp.ok) return 0;
+  const rows = await resp.json();
+  return Array.isArray(rows) ? rows.length : 0;
+}
+
+async function checkRateLimit(env, resellerId, action, simId = null) {
+  if (action === 'portal_resync') {
+    const recent = await countActionsSince(env, resellerId, 'portal_resync', 600);
+    if (recent >= 1) return { allowed: false, retryAfter: 600, reason: 'Bulk resync allowed once per 10 minutes' };
+    return { allowed: true };
+  }
+  if (action === 'portal_resend') {
+    if (simId != null) {
+      const perSim = await countActionsSince(env, resellerId, 'portal_resend', 300, simId);
+      if (perSim >= 1) return { allowed: false, retryAfter: 300, reason: 'This SIM was resent within the last 5 minutes' };
+    }
+    const perHour = await countActionsSince(env, resellerId, 'portal_resend', 3600);
+    if (perHour >= 100) return { allowed: false, retryAfter: 3600, reason: 'Per-reseller resend cap (100/hour) reached' };
+    return { allowed: true };
+  }
+  return { allowed: true };
+}
+
+async function logAction(env, resellerId, action, simId = null) {
+  try {
+    await sbPost(env, 'reseller_actions_log', {
+      reseller_id: Number(resellerId),
+      action,
+      sim_id: simId != null ? Number(simId) : null,
+    });
+  } catch (e) {
+    console.log('[RateLimit] failed to log action: ' + e);
+  }
+}
+
 function getCredFromRequest(request) {
   const auth = request.headers.get('Authorization') || '';
   if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
