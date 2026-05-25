@@ -7,23 +7,58 @@
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const internalCaller = request.headers.get('X-Internal-Caller') || '';
 
-    if (url.pathname !== "/run") {
-      return new Response("reseller-sync ok. Use /run?secret=...&limit=2000&force=false", { status: 200 });
+    // --- Public-ish endpoint: secret-guarded daily backstop trigger. Unchanged from prior behavior. ---
+    if (url.pathname === "/run") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const limitParam = url.searchParams.get("limit");
+      const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 2000, 1) : 2000;
+      const force = url.searchParams.get("force") === "true";
+      const online = await runResellerSync(env, limit, force);
+      const offline = await runOfflineRetrySweep(env);
+      return json({ ok: true, online, offline }, 200);
     }
 
+    // --- Service-binding-only endpoints. ---
+    // Either internal-caller header OR FINALIZER_RUN_SECRET (for direct curl smoke tests).
     const secret = url.searchParams.get("secret") || "";
-    if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
-      return new Response("Unauthorized", { status: 401 });
+    const internalOk = internalCaller === 'reseller-portal' || (env.FINALIZER_RUN_SECRET && secret === env.FINALIZER_RUN_SECRET);
+
+    if (url.pathname === "/resend-online" && request.method === 'POST') {
+      if (!internalOk) return new Response("Unauthorized", { status: 401 });
+      let body;
+      try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
+      const simId = body && body.simId;
+      const source = body && body.source;
+      if (!simId || !Number.isFinite(Number(simId))) return json({ ok: false, error: 'simId required' }, 400);
+      if (source !== 'portal_resend' && source !== 'portal_resync') return json({ ok: false, error: 'source must be portal_resend or portal_resync' }, 400);
+      try {
+        const result = await resendOneSim(env, Number(simId), source);
+        return json(result, result.ok ? 200 : (result.status === 404 ? 404 : 500));
+      } catch (e) {
+        return json({ ok: false, error: String(e) }, 500);
+      }
     }
 
-    const limitParam = url.searchParams.get("limit");
-    const limit = limitParam ? Math.max(parseInt(limitParam, 10) || 2000, 1) : 2000;
-    const force = url.searchParams.get("force") === "true";
+    if (url.pathname === "/resync-reseller" && request.method === 'POST') {
+      if (!internalOk) return new Response("Unauthorized", { status: 401 });
+      let body;
+      try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
+      const resellerId = body && body.resellerId;
+      if (!resellerId || !Number.isFinite(Number(resellerId))) return json({ ok: false, error: 'resellerId required' }, 400);
+      try {
+        const result = await resyncReseller(env, Number(resellerId));
+        return json(result, 200);
+      } catch (e) {
+        return json({ ok: false, error: String(e) }, 500);
+      }
+    }
 
-    const online = await runResellerSync(env, limit, force);
-    const offline = await runOfflineRetrySweep(env);
-    return json({ ok: true, online, offline }, 200);
+    return new Response("reseller-sync ok. Use /run?secret=...&limit=2000&force=false", { status: 200 });
   },
 
   // Daily backstop cron: 15:00 UTC (10 AM EST / after all rotations complete)
@@ -301,6 +336,62 @@ async function resendOneSim(env, simId, source) {
     sim_id: sim.id,
     reseller_id: resellerId,
     number: currentNumber,
+  };
+}
+
+/**
+ * Re-emit number.online for every currently-active SIM owned by `resellerId`, in bounded-concurrency
+ * batches. Calls resendOneSim for each. Returns aggregate counts + per-SIM results.
+ *
+ * Concurrency cap (5) chosen so a 1300-SIM reseller (TrustOTP) completes in ~roughly 4-5 minutes
+ * worst case while keeping the CF Worker wall-clock + the reseller's endpoint load reasonable.
+ * If we ever exceed the 30s sub-request cap in practice, switch to ctx.waitUntil with a job table —
+ * see spec §12 open question.
+ */
+async function resyncReseller(env, resellerId) {
+  const startedAt = new Date().toISOString();
+
+  // Get every active sim_id this reseller currently owns.
+  const rows = await sbGetArray(
+    env,
+    `reseller_sims?select=sim_id&reseller_id=eq.${encodeURIComponent(resellerId)}&active=eq.true&order=sim_id.asc&limit=2000`
+  );
+  const simIds = rows.map(r => r.sim_id).filter(id => Number.isFinite(Number(id)));
+
+  let succeeded = 0;
+  let failed = 0;
+  const results = [];
+
+  const CONCURRENCY = 5;
+  for (let i = 0; i < simIds.length; i += CONCURRENCY) {
+    const slice = simIds.slice(i, i + CONCURRENCY);
+    const batch = await Promise.all(slice.map(async simId => {
+      try {
+        return await resendOneSim(env, simId, 'portal_resync');
+      } catch (e) {
+        return { ok: false, sim_id: simId, error: String(e) };
+      }
+    }));
+    for (const r of batch) {
+      if (r.ok) succeeded++; else failed++;
+      results.push({
+        sim_id: r.sim_id,
+        ok: r.ok,
+        status: r.status || 0,
+        error: r.error || null,
+        rental_id: r.rental_id || null,
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    startedAt,
+    reseller_id: resellerId,
+    queued: simIds.length,
+    succeeded,
+    failed,
+    results,
   };
 }
 
