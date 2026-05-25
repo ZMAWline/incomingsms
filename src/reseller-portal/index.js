@@ -760,7 +760,9 @@ function portalHtml() {
     <div class="mb-3 flex items-center gap-3">
       <input id="sim-filter" type="text" placeholder="Filter by Rental ID, MDN, or ICCID" class="bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm w-72">
       <span class="text-slate-500 text-xs" id="sim-summary"></span>
-      <a href="/logout" class="ml-auto text-xs text-slate-400 hover:text-slate-200">Sign out</a>
+      <button id="csv-btn" onclick="downloadCsv()" class="ml-auto px-3 py-2 text-xs bg-slate-700 hover:bg-slate-600 text-slate-200 rounded">Download CSV</button>
+      <button id="resync-btn" onclick="resyncAll()" class="px-3 py-2 text-xs bg-cyan-700 hover:bg-cyan-600 text-white rounded">Resync all</button>
+      <a href="/logout" class="text-xs text-slate-400 hover:text-slate-200">Sign out</a>
     </div>
     <div id="sims-active"></div>
     <h3 class="mt-8 mb-2 text-slate-400 text-sm font-medium uppercase tracking-wide">Previously assigned</h3>
@@ -988,6 +990,80 @@ async function resendOne(simId, btn) {
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Resend'; }
   }
+}
+
+async function resyncAll() {
+  const active = allSims.filter(s => s.active);
+  const confirmed = await showConfirm({
+    title: 'Resync all ' + active.length + ' active rentals?',
+    body: 'This re-fires the number.online webhook for every SIM currently assigned to your account. ' +
+          'Your endpoint will receive ' + active.length + ' events over the next few minutes. ' +
+          'If your billing/accounting counts events rather than rental IDs, that is your system to manage. ' +
+          'You can only run this once per 10 minutes.',
+    confirmText: 'Resync ' + active.length + ' rentals',
+    danger: true,
+  });
+  if (!confirmed) return;
+  const btn = document.getElementById('resync-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Resyncing…'; }
+  try {
+    const r = await fetch('/api/sims/resync-all', { method: 'POST', credentials: 'include' });
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 429) {
+      showToast('Rate limited: ' + (data.error || 'try again later'), 'error');
+    } else if (r.ok && data.ok) {
+      showToast('Resync complete: ' + data.succeeded + ' succeeded, ' + data.failed + ' failed (of ' + data.queued + ').',
+                data.failed === 0 ? 'success' : 'info');
+      loadSims();
+    } else {
+      showToast('Resync failed: ' + (data.error || ('HTTP ' + r.status)), 'error');
+    }
+  } catch (e) {
+    showToast('Resync failed: ' + (e.message || String(e)), 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Resync all'; }
+  }
+}
+
+function downloadCsv() {
+  // Snapshot the currently filtered list (matches what's on screen).
+  const q = document.getElementById('sim-filter').value.trim().toLowerCase();
+  const list = q ? allSims.filter(s =>
+    String(s.rental_id||'').toLowerCase().includes(q) ||
+    (s.msisdn||'').toLowerCase().includes(q) ||
+    (s.iccid||'').toLowerCase().includes(q)
+  ) : allSims;
+  const _CR = String.fromCharCode(13);
+  const _LF = String.fromCharCode(10);
+  const csvEscape = v => {
+    if (v == null) return '';
+    const s = String(v);
+    return (s.indexOf('"') >= 0 || s.indexOf(',') >= 0 || s.indexOf(_CR) >= 0 || s.indexOf(_LF) >= 0)
+      ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const header = ['Rental ID','MDN','Status','Start (UTC)','Expires (UTC)','ICCID','Carrier','Active'];
+  const rows = list.map(s => [
+    s.rental_id != null ? s.rental_id : '',
+    s.msisdn || '',
+    s.status || '',
+    s.start_at || '',
+    s.online_until || '',
+    s.iccid || '',
+    s.carrier || '',
+    s.active ? 'true' : 'false',
+  ].map(csvEscape).join(','));
+  const csv = [header.join(','), ...rows].join('\\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  a.download = 'rentals-' + stamp + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  showToast('Downloaded ' + list.length + ' rows.', 'success');
 }
 
 document.getElementById('sim-filter').addEventListener('input', applySimFilter);
