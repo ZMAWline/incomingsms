@@ -839,6 +839,40 @@ function closeModal() {
 }
 document.getElementById('modal-root').addEventListener('click', e => { if (e.target.id === 'modal-root') closeModal(); });
 
+function showToast(message, kind) {
+  // kind: 'success' | 'error' | 'info'
+  const colorClass = kind === 'success' ? 'bg-emerald-600'
+                   : kind === 'error'   ? 'bg-red-600'
+                                        : 'bg-slate-700';
+  const t = document.createElement('div');
+  t.className = 'fixed bottom-6 right-6 z-50 px-4 py-3 rounded shadow-lg text-white text-sm ' + colorClass;
+  t.textContent = message;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity 300ms'; }, 3500);
+  setTimeout(() => { t.remove(); }, 4000);
+}
+
+function showConfirm(opts) {
+  // opts: { title, body, confirmText, cancelText, danger }
+  return new Promise(resolve => {
+    const confirmText = opts.confirmText || 'Confirm';
+    const cancelText  = opts.cancelText  || 'Cancel';
+    const btnClass = opts.danger
+      ? 'bg-red-600 hover:bg-red-500'
+      : 'bg-cyan-600 hover:bg-cyan-500';
+    showModal(
+      '<h2 class="text-lg font-semibold mb-2">' + esc(opts.title) + '</h2>' +
+      '<div class="text-slate-300 text-sm mb-5">' + opts.body + '</div>' +
+      '<div class="flex justify-end gap-2">' +
+        '<button id="rp-confirm-cancel" class="px-4 py-2 text-sm bg-slate-700 hover:bg-slate-600 text-slate-200 rounded">' + esc(cancelText) + '</button>' +
+        '<button id="rp-confirm-ok" class="px-4 py-2 text-sm text-white rounded ' + btnClass + '">' + esc(confirmText) + '</button>' +
+      '</div>'
+    );
+    document.getElementById('rp-confirm-cancel').addEventListener('click', () => { closeModal(); resolve(false); });
+    document.getElementById('rp-confirm-ok').addEventListener('click', () => { closeModal(); resolve(true); });
+  });
+}
+
 function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach(b => {
     if (b.dataset.tab === name) {
@@ -876,20 +910,29 @@ const fmtDateTime = s => {
 function renderSimTable(sims, container, opts) {
   opts = opts || {};
   if (!sims.length) { container.innerHTML = '<div class="text-slate-500 text-sm py-4">None</div>'; return; }
-  const rows = sims.map(s => '<tr class="hover:bg-slate-800 cursor-pointer" onclick="openLifetime(' + s.sim_id + ')">' +
-    '<td class="px-3 py-2 text-slate-200 font-mono">' + (s.rental_id != null ? '#' + esc(s.rental_id) : '<span class="text-slate-600">—</span>') + '</td>' +
-    '<td class="px-3 py-2 text-slate-200 font-mono">' + esc(s.msisdn || '—') + '</td>' +
-    '<td class="px-3 py-2 text-slate-300">' + esc(s.status) + '</td>' +
-    '<td class="px-3 py-2 text-slate-400 text-xs">' + (opts.showAssigned ? fmtDate(s.assigned_at) : esc(fmtDateTime(s.start_at))) + '</td>' +
-    '<td class="px-3 py-2 text-slate-400 text-xs">' + (opts.showAssigned ? '' : esc(fmtDateTime(s.online_until))) + '</td>' +
-    '</tr>').join('');
+  const showActions = !opts.showAssigned;
+  const rows = sims.map(s => {
+    const actionsCell = showActions
+      ? '<td class="px-3 py-2 text-right"><button onclick="event.stopPropagation(); resendOne(' + s.sim_id + ', this)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-cyan-600 text-slate-200 hover:text-white rounded">Resend</button></td>'
+      : '';
+    return '<tr class="hover:bg-slate-800 cursor-pointer" onclick="openLifetime(' + s.sim_id + ')">' +
+      '<td class="px-3 py-2 text-slate-200 font-mono">' + (s.rental_id != null ? '#' + esc(s.rental_id) : '<span class="text-slate-600">—</span>') + '</td>' +
+      '<td class="px-3 py-2 text-slate-200 font-mono">' + esc(s.msisdn || '—') + '</td>' +
+      '<td class="px-3 py-2 text-slate-300">' + esc(s.status) + '</td>' +
+      '<td class="px-3 py-2 text-slate-400 text-xs">' + (opts.showAssigned ? fmtDate(s.assigned_at) : esc(fmtDateTime(s.start_at))) + '</td>' +
+      '<td class="px-3 py-2 text-slate-400 text-xs">' + (opts.showAssigned ? '' : esc(fmtDateTime(s.online_until))) + '</td>' +
+      actionsCell +
+    '</tr>';
+  }).join('');
   const startLabel = opts.showAssigned ? 'Assigned' : 'Start';
   const expiresHeader = opts.showAssigned ? '' : '<th class="px-3 py-2 text-left">Expires</th>';
   const expiresPlaceholder = opts.showAssigned ? '<th class="px-3 py-2"></th>' : '';
+  const actionsHeader = showActions ? '<th class="px-3 py-2 text-right">Actions</th>' : '';
   container.innerHTML =
     '<div class="overflow-x-auto rounded-lg border border-slate-700"><table class="w-full text-sm"><thead class="bg-slate-800 text-slate-400 text-xs uppercase">' +
     '<tr><th class="px-3 py-2 text-left">Rental ID</th><th class="px-3 py-2 text-left">MDN</th><th class="px-3 py-2 text-left">Status</th><th class="px-3 py-2 text-left">' + startLabel + '</th>' +
     (opts.showAssigned ? expiresPlaceholder : expiresHeader) +
+    actionsHeader +
     '</tr>' +
     '</thead><tbody class="divide-y divide-slate-800">' + rows + '</tbody></table></div>';
 }
@@ -914,6 +957,39 @@ async function loadSims() {
   allSims = sims;
   applySimFilter();
 }
+
+async function resendOne(simId, btn) {
+  const sim = allSims.find(s => s.sim_id === simId);
+  const mdn = sim ? (sim.msisdn || 'unknown') : 'unknown';
+  const rental = sim && sim.rental_id != null ? ('#' + sim.rental_id) : '(no rental id yet)';
+  const confirmed = await showConfirm({
+    title: 'Resend number.online for ' + mdn + '?',
+    body: 'This re-fires the number.online webhook to your endpoint for this single SIM. ' +
+          'Your system may echo the current rental ID ' + rental + ' (replay) or return a new one (treated as a fresh rental). ' +
+          'We will record whichever you return. No MDN swap will occur.',
+    confirmText: 'Resend',
+  });
+  if (!confirmed) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  try {
+    const r = await fetch('/api/sims/' + simId + '/resend-online', { method: 'POST', credentials: 'include' });
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 429) {
+      showToast('Rate limited: ' + (data.error || 'try again later'), 'error');
+    } else if (r.ok && data.ok) {
+      showToast('Resent. ' + (data.rental_id != null ? 'Rental ID: ' + data.rental_id : 'No rental ID echoed.'), 'success');
+      // Refresh SIMs in the background so any rental_id change shows up.
+      loadSims();
+    } else {
+      showToast('Resend failed: ' + (data.error || ('HTTP ' + r.status)), 'error');
+    }
+  } catch (e) {
+    showToast('Resend failed: ' + (e.message || String(e)), 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Resend'; }
+  }
+}
+
 document.getElementById('sim-filter').addEventListener('input', applySimFilter);
 
 function copyApiText(elId) {
