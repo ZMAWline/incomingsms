@@ -4,6 +4,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-25 — Reseller self-service scoped to webhook resend only, never MDN rotation
+
+**Decision:** The reseller portal's new self-serve trigger (`/api/sims/:id/resend-online`, `/api/sims/resync-all`) re-fires the `number.online` webhook for the SIM's current MDN. It never calls Teltik/ATT/ATOMIC, never allocates a new MDN, never incurs vendor billing. Rejected during brainstorming: per-SIM force-rotate, bulk "rotate all stale", any path that touches the vendor APIs. Server-side rate limits enforced in `reseller_actions_log` (1 bulk/10 min; per-SIM 1/5min + 100/reseller/hour).
+
+**Why:** Session 59's "they did not come" diagnosis showed Maxim's real pain is webhook drift / under-rotation, not insufficient rotation capacity. If we gave him rotation triggers he could double-rotate, exhaust the AT&T PPU budget, or trip Teltik's "1 per 48h" guard — all expensive failure modes with no recourse on his side. Resend is operationally cost-free: TrustOTP's endpoint is idempotent (returns "End date updated for existing rental" with the same `rentalId` for a replay), so a 2000+ resync hits him as 2000+ no-op acknowledgements, not 2000+ new rentals.
+
+**Consequence:** Do NOT add a manual-rotation endpoint to the portal worker without explicit re-evaluation. If a future reseller's webhook handler is not idempotent on `number.online`, the bulk resync becomes a billing event on their side — the confirm modal warns about this but the responsibility chain is theirs. The 2000-SIM bulk completes well under CF's 30s wall-clock today; if a new reseller is onboarded with >3000 active SIMs, revisit `ctx.waitUntil` pattern flagged in spec §12.
+
+---
+
+## 2026-05-25 — `X-Internal-Caller` header is a tag, not a security boundary
+
+**Decision:** The reseller-sync endpoints `/resend-online` and `/resync-reseller` accept either `X-Internal-Caller: reseller-portal` OR `?secret=$FINALIZER_RUN_SECRET`. The header is set by the portal's service-binding caller and is documented in code as NOT providing real isolation — it's spoofable from the public `.workers.dev` URL. The `FINALIZER_RUN_SECRET` query param is the only hard credential.
+
+**Why:** Code review surfaced the spoofability. We left the header path in place because (a) it labels the caller for log triage, (b) the worst an attacker can do via spoofing is trigger a redundant `number.online` re-emit to the reseller's own pre-configured webhook URL (URL comes from DB, not the request) — which is rate-limit-protected at the portal layer and idempotent on the reseller side, (c) the alternative (binding-only access via an internal-only worker URL) would require restructuring the worker's HTTP surface.
+
+**Consequence:** Any future endpoint added to `src/reseller-sync/index.js` that has higher blast radius (sends arbitrary URLs, mutates SIMs, etc.) MUST NOT rely on the header alone — gate it behind FINALIZER_RUN_SECRET or move it to a separate worker without a public `.workers.dev` route.
+
+---
+
 ## 2026-05-21 — Rotation-review safety net built as the agreed subset of `sim-rotation-cron-spec.md`, not full spec
 
 **Decision:** The user shared `sim-rotation-cron-spec.md` (16 sections, ~320 lines) as the design target for a daily rotation verification cron. After review, only the high-value 80% was built; the enterprise-y 20% was explicitly skipped. What's in:
