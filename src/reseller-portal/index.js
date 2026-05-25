@@ -612,6 +612,72 @@ async function handleResyncAll(auth, env) {
   }, 200);
 }
 
+async function handleOnlineHistory(simId, auth, env) {
+  // Ownership check (historical: even if the SIM is no longer active, the reseller is allowed
+  // to see deliveries that happened while they owned it). We still require an active or past
+  // ownership row.
+  const ownResp = await sbGet(env,
+    'reseller_sims?select=sim_id' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&limit=1'
+  );
+  if (!ownResp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const ownRows = await ownResp.json();
+  if (!Array.isArray(ownRows) || ownRows.length === 0) {
+    return jsonResp({ error: 'SIM not owned by this reseller' }, 404);
+  }
+
+  // Filter via the real sim_id column (added in Task 1 migration). Also filter reseller_id as
+  // belt-and-suspenders so a backfill that misset sim_id can't leak cross-reseller rows.
+  const resp = await sbGet(env,
+    'webhook_deliveries?select=created_at,sim_id,reseller_id,status,response_body,source,payload' +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&event_type=eq.number.online' +
+    '&order=created_at.desc' +
+    '&limit=20'
+  );
+  if (!resp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const rows = await resp.json();
+
+  // Parse rentalId from response_body using the same helper logic as reseller-sync. Inline
+  // here rather than import — the shared module would be one function and complicate the worker
+  // dependency graph for very little gain.
+  function parseRentalId(body) {
+    if (!body) return null;
+    const s = String(body);
+    try {
+      const obj = JSON.parse(s);
+      const v = obj && (obj.rentalId ?? obj.rental_id ?? obj.id);
+      if (v != null) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+    } catch {}
+    const m = s.match(/"rental[_]?[Ii]d"\s*:\s*([0-9]+)/);
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return null;
+  }
+
+  const out = (Array.isArray(rows) ? rows : []).map(r => {
+    const rentalId = parseRentalId(r.response_body);
+    return {
+      delivered_at: r.created_at,
+      msisdn_at_send: r.payload?.data?.number || null,
+      http_status: r.status === 'delivered' ? 200 : 0,  // status is text ('delivered'|'failed'|'pending'); response_body holds the real numeric status only when present
+      rental_id: rentalId,
+      source: r.source || 'cron',
+      delivered: r.status === 'delivered' && rentalId != null,
+    };
+  });
+
+  return jsonResp(out);
+}
+
 function loginHtml() {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reseller Portal</title>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -1021,6 +1087,7 @@ export default {
       if ((m = url.pathname.match(/^\/api\/invoices\/(\d+)$/))) return handleInvoiceDetail(m[1], auth, env);
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/lifetime$/))) return handleSimLifetime(m[1], auth, env);
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/resend-online$/)) && request.method === 'POST') return handleResendOnline(m[1], auth, env);
+      if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/online-history$/))) return handleOnlineHistory(m[1], auth, env);
       return notFound();
     }
 
