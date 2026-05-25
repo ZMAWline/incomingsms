@@ -1,7 +1,46 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-23 (session 59 — diagnostic only, no code changes)
+> Last updated: 2026-05-25 (session 60 — reseller portal self-serve resend shipped)
+
+---
+
+## Session 60 (2026-05-25) — Reseller portal self-serve resend & visibility
+
+**Goal:** Give Maxim/TrustOTP recovery primitives after session-59's PR-B incident left him blind to under-rotation. Scope: webhook resend only, no manual MDN rotation, no vendor cost exposure.
+
+**Shipped:**
+
+- **Migration `reseller_portal_resend`** — added `webhook_deliveries.source` (`cron|pipeline|portal_resend|portal_resync`) and `webhook_deliveries.sim_id` (with 93,395-row backfill from `payload.data.sim_id`), plus indexes. New `reseller_actions_log` table for rate-limit accounting.
+
+- **`reseller-sync` worker** — new service-binding-only endpoints `POST /resend-online` and `POST /resync-reseller`. New `resendOneSim(env, simId, source)` helper (reuses `sendWebhookWithDeduplication` with `force: true` + timestamp-salted message_id). New `resyncReseller(env, resellerId)` with bounded concurrency (5 parallel) and offset pagination (no 1000-row PostgREST cap).
+
+- **`reseller-portal` worker** — new authenticated endpoints `POST /api/sims/:simId/resend-online`, `POST /api/sims/resync-all`, `GET /api/sims/:simId/online-history`. Service-binding `RESELLER_SYNC` added to wrangler.toml.
+
+- **Rate limits enforced server-side:** bulk resync 1/reseller/10min; per-SIM resend 1/SIM/5min AND 100/reseller/hour. Violations return HTTP 429 with `retry_after_seconds`.
+
+- **Portal UI** — per-row "Resend" button on active SIMs; top-bar "Resync all" + "Download CSV" buttons; new "Number.online history (last 20)" section in the SIM lifetime modal. Added `showConfirm`/`showToast` inline-modal helpers (no native dialogs per memory).
+
+**Production smoke test:** Fired `POST /api/sims/2175/resend-online` against prod (`portal.incoming-sms.com`). Got HTTP 200 `{"ok":true,"delivered":true,"http_status":200,"rental_id":1552214}`. `webhook_deliveries` row id=`8917240a-7298-4d34-8d44-2b25f1f28087` landed with `source=portal_resend, status=delivered, response_body={"success":true,"message":"End date updated for existing rental","rentalId":1552214}`. `reseller_actions_log` row id=8 landed with `reseller_id=3, action=portal_resend, sim_id=2175`. History endpoint returned JSON array with the just-fired `portal_resend` row at position 0.
+
+**Deployed:**
+- `reseller-sync` prod version `b9c5ee84-098b-4f6d-b680-f6cfd070bd77`
+- `reseller-portal` prod version `f62217e7-6020-4313-942a-5d223d257c7d`
+- Test env earlier versions in case rollback needed: reseller-sync-test `e801bc55`, reseller-portal-test `8dd48aa7`
+
+**Plan + spec on disk:**
+- Spec: `docs/superpowers/specs/2026-05-25-reseller-portal-resend-design.md`
+- Plan: `docs/superpowers/plans/2026-05-25-reseller-portal-resend.md`
+
+**Operator follow-up:**
+- Once Maxim confirms the new buttons work for him, document the feature in any reseller-facing doc.
+- Spot-check `webhook_deliveries` filtered by `source IN ('portal_resend', 'portal_resync')` over the next 24h to confirm normal usage patterns (no abuse, rate limits engaging when expected).
+- Known limitation (spec §12): a >2000-SIM bulk resync may exceed CF Worker 30s wall-clock; current TrustOTP at ~2057 SIMs completed comfortably under that during test. If a new larger reseller is onboarded, revisit `ctx.waitUntil` pattern.
+
+**Optional hardening deferred (from code reviews, not blockers):**
+- Wrap `rental` in `esc()` in resendOne confirm body (defense in depth)
+- Add `try/catch` to `openLifetime` Promise.all so a lifetime-API failure shows a toast instead of leaving "Loading…" stuck
+- TOCTOU race between rate-limit check and log insert (operationally benign — TrustOTP is idempotent)
 
 ---
 
