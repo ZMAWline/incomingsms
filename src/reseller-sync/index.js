@@ -24,7 +24,13 @@ export default {
     }
 
     // --- Service-binding-only endpoints. ---
-    // Either internal-caller header OR FINALIZER_RUN_SECRET (for direct curl smoke tests).
+    // Auth: the X-Internal-Caller header path is spoofable from the public .workers.dev URL
+    // and is NOT a real isolation boundary — its only purpose is to let the service-binding caller
+    // identify itself for logging. The FINALIZER_RUN_SECRET query param is the hard credential.
+    // Any future sensitive operation added here must not rely on the header alone.
+    // Today the worst an unauthenticated attacker can do is trigger redundant number.online
+    // re-emits to the reseller's own configured webhook URL (URL is read from DB, not the request),
+    // which is rate-limit-protected at the portal layer and idempotent on the reseller side.
     const secret = url.searchParams.get("secret") || "";
     const internalOk = internalCaller === 'reseller-portal' || (env.FINALIZER_RUN_SECRET && secret === env.FINALIZER_RUN_SECRET);
 
@@ -38,7 +44,13 @@ export default {
       if (source !== 'portal_resend' && source !== 'portal_resync') return json({ ok: false, error: 'source must be portal_resend or portal_resync' }, 400);
       try {
         const result = await resendOneSim(env, Number(simId), source);
-        return json(result, result.ok ? 200 : (result.status === 404 ? 404 : 500));
+        // Pass through specific not-ok statuses so the caller can distinguish 404 (SIM not found),
+        // 412 (reseller has no webhook configured) from 500 (genuine pipeline failure).
+        const httpStatus = result.ok ? 200
+                         : result.status === 404 ? 404
+                         : result.status === 412 ? 412
+                         : 500;
+        return json(result, httpStatus);
       } catch (e) {
         return json({ ok: false, error: String(e) }, 500);
       }
@@ -308,7 +320,8 @@ async function resendOneSim(env, simId, source) {
   });
 
   // Persist rentalId echoed back by the reseller (whether new or same as last) — matches the cron
-  // path at runResellerSync lines 149-160.
+  // path at runResellerSync lines 149-160. With force: true, sendWebhookWithDeduplication never
+  // sets skipped:true, so the !result.skipped guard is defensive parity with the cron path.
   let rentalId = null;
   if (result.ok && !result.skipped) {
     rentalId = parseRentalIdFromResponse(result.responseBody);
@@ -345,18 +358,26 @@ async function resendOneSim(env, simId, source) {
  *
  * Concurrency cap (5) chosen so a 1300-SIM reseller (TrustOTP) completes in ~roughly 4-5 minutes
  * worst case while keeping the CF Worker wall-clock + the reseller's endpoint load reasonable.
- * If we ever exceed the 30s sub-request cap in practice, switch to ctx.waitUntil with a job table —
- * see spec §12 open question.
+ * TODO: if we ever exceed the 30s sub-request cap in practice, switch to ctx.waitUntil with a job
+ * table — see spec §12 open question. ctx is not currently threaded into this function; doing so
+ * requires a small signature change at the route handler.
  */
 async function resyncReseller(env, resellerId) {
   const startedAt = new Date().toISOString();
 
-  // Get every active sim_id this reseller currently owns.
-  const rows = await sbGetArray(
-    env,
-    `reseller_sims?select=sim_id&reseller_id=eq.${encodeURIComponent(resellerId)}&active=eq.true&order=sim_id.asc&limit=2000`
-  );
-  const simIds = rows.map(r => r.sim_id).filter(id => Number.isFinite(Number(id)));
+  // Page through reseller_sims — PostgREST caps responses at 1000 rows regardless of &limit,
+  // and TrustOTP has 1300+ active SIMs (would silently lose ~300 with a single call).
+  const pageSize = 1000;
+  const allRows = [];
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await sbGetArray(
+      env,
+      `reseller_sims?select=sim_id&reseller_id=eq.${encodeURIComponent(resellerId)}&active=eq.true&order=sim_id.asc&limit=${pageSize}&offset=${offset}`
+    );
+    allRows.push(...page);
+    if (page.length < pageSize) break;
+  }
+  const simIds = allRows.map(r => r.sim_id).filter(id => Number.isFinite(Number(id)));
 
   let succeeded = 0;
   let failed = 0;
@@ -538,9 +559,10 @@ async function wasWebhookDelivered(env, messageId) {
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts } = delivery;
 
-  // source: who triggered this delivery. Defaults to 'cron' for backward compat with callers
-  // that haven't been updated. Callers from the resend pipeline pass 'portal_resend' or 'portal_resync'.
-  // The rotation pipeline (mdn-rotator, teltik-worker, details-finalizer) should pass 'pipeline'.
+  // source: who triggered this delivery. Defaults to 'cron' for backward compat — that label
+  // currently covers both the scheduled reseller-sync backstop AND the rotation pipeline
+  // (mdn-rotator, teltik-worker, details-finalizer), since those callers have not been updated
+  // to pass an explicit source. Callers from the portal pass 'portal_resend' or 'portal_resync'.
   const source = delivery.source || 'cron';
 
   // sim_id: extracted from payload.data.sim_id when present so the per-SIM history endpoint
