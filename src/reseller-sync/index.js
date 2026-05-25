@@ -201,6 +201,109 @@ async function runResellerSync(env, limit, force = false) {
   };
 }
 
+/**
+ * Re-emit number.online for a single SIM, identified by sim_id.
+ *
+ * Used by the portal-driven resend endpoints. Always passes force=true to sendWebhookWithDeduplication,
+ * so the dedup cache is bypassed and the webhook is re-fired even if we already delivered today.
+ * Does NOT update sims.last_notified_at (so the cron's natural cadence isn't perturbed); does update
+ * reseller_sims.last_rental_id if the reseller's response carries a rentalId — same as the cron path.
+ *
+ * Returns { ok, status, attempts, error, responseBody, rental_id }.
+ */
+async function resendOneSim(env, simId, source) {
+  // Source must be one of the portal_* tags; reject misuse so cron-side callers don't accidentally
+  // hit this helper.
+  if (source !== 'portal_resend' && source !== 'portal_resync') {
+    return { ok: false, status: 0, attempts: 0, error: `Invalid source: ${source}` };
+  }
+
+  // Fetch the SIM + its current number + reseller webhook in one query, mirroring runResellerSync's
+  // select shape (line 59-62) but constrained to a single sim_id.
+  const rows = await sbGetArray(
+    env,
+    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_mdn_rotated_at,last_rotation_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))` +
+    `&id=eq.${encodeURIComponent(simId)}` +
+    `&sim_numbers.valid_to=is.null` +
+    `&reseller_sims.active=eq.true` +
+    `&limit=1`
+  );
+
+  if (!rows.length) {
+    return { ok: false, status: 404, attempts: 0, error: 'SIM not found, not active, or has no current number' };
+  }
+
+  const sim = rows[0];
+  const currentNumber = sim.sim_numbers?.[0]?.e164;
+  const resellerId = sim.reseller_sims?.[0]?.reseller_id;
+  const webhook = sim.reseller_sims?.[0]?.resellers?.reseller_webhooks?.find(w => w.enabled);
+  const webhookUrl = webhook?.url;
+
+  if (!currentNumber) return { ok: false, status: 404, attempts: 0, error: 'No current number on this SIM' };
+  if (!resellerId)    return { ok: false, status: 404, attempts: 0, error: 'No reseller assigned to this SIM' };
+  if (!webhookUrl)    return { ok: false, status: 412, attempts: 0, error: 'Reseller has no enabled webhook configured' };
+
+  // Same payload shape as runResellerSync's cron path (lines 107-123) — keep these in sync.
+  const result = await sendWebhookWithDeduplication(env, webhookUrl, {
+    event_type: "number.online",
+    created_at: new Date().toISOString(),
+    data: {
+      sim_id: sim.id,
+      iccid: sim.iccid,
+      number: currentNumber,
+      status: sim.status,
+      online: true,
+      online_until: midnightNYAfterInterval(sim.last_rotation_at || sim.last_mdn_rotated_at, sim.rotation_interval_hours || 24),
+      carrier: sim.vendor === 'teltik' ? 'T-Mobile' : 'att',
+      verified: true,
+    },
+  }, {
+    idComponents: {
+      simId: sim.id,
+      iccid: sim.iccid,
+      number: currentNumber,
+      // Salt the dedup key with a timestamp so each manual resend gets a unique message_id;
+      // otherwise the per-day dedup would short-circuit before reaching the network.
+      from: `portal_${Date.now()}`,
+    },
+    resellerId,
+    simId: sim.id,
+    source,
+    force: true,
+  });
+
+  // Persist rentalId echoed back by the reseller (whether new or same as last) — matches the cron
+  // path at runResellerSync lines 149-160.
+  let rentalId = null;
+  if (result.ok && !result.skipped) {
+    rentalId = parseRentalIdFromResponse(result.responseBody);
+    if (rentalId != null) {
+      await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${sim.id}`, {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({ last_rental_id: rentalId }),
+      }).catch(err => console.log(`[Resend] Failed to write last_rental_id for sim ${sim.id}: ${err}`));
+    }
+  }
+
+  return {
+    ok: !!result.ok,
+    status: result.status || 0,
+    attempts: result.attempts || 0,
+    error: result.error || null,
+    responseBody: result.responseBody || null,
+    rental_id: rentalId,
+    sim_id: sim.id,
+    reseller_id: resellerId,
+    number: currentNumber,
+  };
+}
+
 /* ---------------- Relay ---------------- */
 
 function relayFetch(env, url, init) {
