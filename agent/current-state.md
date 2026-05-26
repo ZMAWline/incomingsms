@@ -14,7 +14,7 @@
 - **WING** — 228 SIMs stranded (failed at `pre_rotate_get`, no MDN burned). Force-rotated, 0 failures. NOTE: stuck-wing auto-remediation only runs inside the 00:00–06:00 NY window, so it would NOT have self-healed them mid-day — manual force was required.
 - **TELTIK** — 562 stuck in `provisioning`/`mdn_pending`. **No cleanup needed**: verified `last_mdn_rotated_at` was correctly stamped at the real change-number time (within ~6s; what lags is `last_rotation_at`, the finalizer-confirmation timestamp). The 5-min finalizer drained them automatically (each had its number changed → `number.online` fired). `teltik_stuck=0`.
 
-**Code shipped (commit `61e6b13`, both deployed):**
+**Code shipped (commit `b0fb661`, both deployed):**
 - **mdn-rotator** (prod `6bb49586`):
   - `rotateWingIotSim`: restore-on-failure wrapper (all wing throws are pre-202, so any throw restores `last_mdn_rotated_at` to pre-claim value).
   - `rotateAtomicSim`: `restoreRotationStamp()` helper applied at the 3 pre-swap-success throw sites (pre-swap inquiry, swap HTTP error, swap statusCode≠00); apex-PPU restore reuses it. Post-swap-success paths intentionally NOT restored (MDN already assigned).
