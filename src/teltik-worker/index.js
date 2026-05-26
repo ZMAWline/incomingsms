@@ -698,10 +698,48 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
     console.log(`[Rotate] SIM ${sim.iccid}: change-number response: ${changeText}`);
     const requestId = changeData.requestId || changeData.request_id || null;
 
-    // 3. Flip to provisioning. claim_rotation_slot already stamped last_mdn_rotated_at +
-    //    rotation_status='rotating'; we move to 'mdn_pending' so details-finalizer owns it.
-    //    sim.msisdn stays as the old number — finalizer uses that to detect when the new
-    //    one arrives from Teltik (msisdn !== current from get-phone-number).
+    // 3. Finalize inline. Teltik's change-number response is synchronous and carries
+    //    the new MDN (status=SUCCESS, new_msisdn=...). Use it directly instead of
+    //    flipping to provisioning and having details-finalizer re-poll get-phone-number
+    //    for a number we already hold. This also makes rotation immune to a later
+    //    get-phone-number failure (e.g. the relay outage that stranded 562 SIMs).
+    const rawNew = changeData.new_msisdn || changeData.new_mdn || '';
+    const newMdnBare = rawNew ? String(rawNew).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
+
+    if (newMdnBare) {
+      const nowIso = new Date().toISOString();
+      const newE164 = normalizeToE164(rawNew);
+      const rawOld = changeData.old_msisdn || '';
+      const oldBare = rawOld ? String(rawOld).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
+
+      // Close the prior number window, open the new one.
+      await supabasePatch(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`, { valid_to: nowIso }).catch(() => {});
+      await supabaseInsert(env, 'sim_numbers', [{
+        sim_id: sim.id, e164: newE164, valid_from: nowIso, verification_status: 'verified',
+      }]).catch((e) => console.error(`[Rotate] SIM ${sim.iccid}: sim_numbers insert failed: ${e}`));
+
+      await supabasePatch(env, `sims?id=eq.${sim.id}`, {
+        msisdn: newMdnBare,
+        status: 'active',
+        rotation_status: 'success',
+        last_rotation_at: nowIso,
+        last_rotation_error: null,
+        rotation_fail_count: 0,
+      });
+
+      // Reseller webhooks: old number offline, new number online.
+      try {
+        await sendTeltikSwapWebhooks(env, { ...sim, msisdn: oldBare }, sim.iccid, newE164, newMdnBare, nowIso);
+      } catch (err) {
+        console.error(`[Rotate] SIM ${sim.iccid}: reseller webhook err: ${err}`);
+      }
+
+      console.log(`[Rotate] SIM ${sim.iccid}: rotated inline ${oldBare || '?'} → ${newMdnBare} (synchronous change-number response, requestId=${requestId})`);
+      return { ok: true, iccid: sim.iccid, sim_id: sim.id, new_mdn: newE164, rotated: true };
+    }
+
+    // Fallback: response lacked a usable new_msisdn — flip to provisioning and let
+    // details-finalizer pick up the new MDN via get-phone-number (the old behavior).
     await supabasePatch(env, `sims?id=eq.${sim.id}`, {
       rotation_status: 'mdn_pending',
       status: 'provisioning',
@@ -709,7 +747,7 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
       rotation_fail_count: 0,
     });
 
-    console.log(`[Rotate] SIM ${sim.iccid}: change-number issued (requestId=${requestId}) — status=provisioning, details-finalizer will pick up new MDN`);
+    console.log(`[Rotate] SIM ${sim.iccid}: change-number issued (requestId=${requestId}) — no new_msisdn in response, status=provisioning, details-finalizer will pick up MDN`);
     return { ok: true, iccid: sim.iccid, sim_id: sim.id, pending: true, requestId };
 
   } catch (err) {

@@ -1584,8 +1584,28 @@ async function rotateSpecificSim(env, iccid, options = {}) {
 // Rotate a single Wing IoT SIM (plan swap: dialable → non-dialable → dialable)
 // AT&T assigns a new MDN when switching back to the dialable plan.
 // opts.force=true bypasses the 24h interval guard (manual operator override).
+//
+// Cadence-stamp safety wrapper: claim_rotation_slot stamps last_mdn_rotated_at up
+// front (the dedup lock). Every failure in the wing flow happens BEFORE the
+// dialable PUT returns its 202 — i.e. before AT&T assigns/commits a new MDN — so
+// on any throw we restore last_mdn_rotated_at to its pre-claim value. Otherwise a
+// transient failure (e.g. relay 530 at pre_rotate_get) burns the SIM's rotation
+// slot for the day with no MDN actually changed. Mirrors the apex-PPU restore in
+// rotateAtomicSim. (skipped/claim=false returns, not throws, so it never restores.)
 // ===========================
 async function rotateWingIotSim(env, sim, opts = {}) {
+  const priorRotatedAt = sim.last_mdn_rotated_at ?? null;
+  try {
+    return await rotateWingIotSimInner(env, sim, opts);
+  } catch (err) {
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      last_mdn_rotated_at: priorRotatedAt,
+    }).catch(() => {});
+    throw err;
+  }
+}
+
+async function rotateWingIotSimInner(env, sim, opts = {}) {
   const iccid = sim.iccid;
   const runId = `rotate_${iccid}_${Date.now()}`;
   const force = opts.force === true;
@@ -1861,6 +1881,17 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   }
   if (force) console.log(`SIM ${iccid}: atomic force=true — claimed with interval bypass`);
 
+  // Cadence-stamp safety: claim_rotation_slot stamped last_mdn_rotated_at (dedup
+  // lock). Any failure BEFORE swapMSISDN succeeds means no MDN was consumed, so we
+  // restore this prior value before throwing (otherwise a transient failure — e.g.
+  // relay 530 at the pre-swap inquiry — locks the SIM out of rotation for the day).
+  // After swapMSISDN returns statusCode '00' the MDN IS changed; we must NOT restore.
+  const priorRotatedAt = sim.last_mdn_rotated_at ?? null;
+  const restoreRotationStamp = () =>
+    supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      last_mdn_rotated_at: priorRotatedAt,
+    }).catch(() => {});
+
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
   const session = {
     userName: env.ATOMIC_USERNAME,
@@ -1893,6 +1924,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       `ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`,
   });
   if (!preInqRes.ok || preInqR?.statusCode !== '00') {
+    await restoreRotationStamp();
     throw new Error(`ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`);
   }
 
@@ -1916,6 +1948,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   const useApexFlow = apexEnabled && (!canaryOnly || sim.canary_apex_ppu === true);
 
   let zipCode;
+  let ppuAddr = null;  // the pool address whose zip is currently set as PPU (apex flow only)
   if (useApexFlow) {
     // Up to 3 PPU attempts: first try excludes current state+zip so the new MDN
     // lands in a different area; retries drop exclusions and just take the next
@@ -1924,7 +1957,6 @@ async function rotateAtomicSim(env, sim, opts = {}) {
     // the next cron tick re-attempts this SIM — otherwise claim_rotation_slot's
     // "< NY midnight" gate locks the SIM out until tomorrow night.
     const MAX_PPU_ATTEMPTS = 3;
-    const priorRotatedAt = sim.last_mdn_rotated_at ?? null;
     let ppuSuccessAddr = null;
     let lastPpuErr = null;
     const triedAddrIds = new Set();
@@ -1955,12 +1987,11 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       }
     }
     if (!ppuSuccessAddr) {
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-        last_mdn_rotated_at: priorRotatedAt,
-      }).catch(() => {});
+      await restoreRotationStamp();
       throw lastPpuErr || new Error(`SIM ${iccid}: PPU exhausted ${MAX_PPU_ATTEMPTS} attempts`);
     }
     zipCode = ppuSuccessAddr.zipCode;
+    ppuAddr = ppuSuccessAddr;
     await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       activation_zip: ppuSuccessAddr.zipCode,
     }).catch(() => {});
@@ -1968,54 +1999,90 @@ async function rotateAtomicSim(env, sim, opts = {}) {
     zipCode = currentZip || env.HX_ZIP || '11238';
   }
 
-  // 2) swapMSISDN
-  const swapBody = {
-    wholeSaleApi: {
-      session,
-      wholeSaleRequest: { requestType: 'swapMSISDN', MSISDN: currentMsisdn, zipCode },
-    },
-  };
-  let swapRes, swapText, swapJson = {}, swapNetworkError = null;
-  try {
-    swapRes = await relayFetch(env, url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(swapBody),
+  // 2) swapMSISDN — retried with a fresh PPU zip if AT&T rejects the current one.
+  // A "zipCode Not Supported" rejection means the swap did NOT happen (no MDN was
+  // assigned), so it is safe to quarantine that pool address, push a new PPU
+  // (different state/zip), and retry. Bounded so a streak of bad zips can't loop.
+  const MAX_SWAP_ATTEMPTS = useApexFlow ? 3 : 1;
+  let swapR = null;
+  for (let swapAttempt = 1; swapAttempt <= MAX_SWAP_ATTEMPTS; swapAttempt++) {
+    const swapBody = {
+      wholeSaleApi: {
+        session,
+        wholeSaleRequest: { requestType: 'swapMSISDN', MSISDN: currentMsisdn, zipCode },
+      },
+    };
+    let swapRes, swapText, swapJson = {}, swapNetworkError = null;
+    try {
+      swapRes = await relayFetch(env, url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(swapBody),
+      });
+      swapText = await swapRes.text();
+      try { swapJson = JSON.parse(swapText); } catch {}
+    } catch (err) {
+      swapNetworkError = err;
+      swapText = String(err);
+    }
+    swapR = swapJson?.wholeSaleApi?.wholeSaleResponse;
+    await logCarrierApiCall(env, {
+      run_id: runId, step: 'mdn_change', iccid, imei: null, vendor: 'atomic',
+      request_url: url, request_method: 'POST', request_body: swapBody,
+      response_status: swapRes?.status ?? 0, response_ok: swapRes?.ok ?? false,
+      response_body_text: swapText || '', response_body_json: swapJson,
+      error: swapNetworkError ? `ATOMIC swapMSISDN network error: ${swapNetworkError}`
+        : (swapRes.ok && swapR?.statusCode === '00') ? null
+        : `ATOMIC swapMSISDN failed: ${swapR?.description || swapRes.status}`,
     });
-    swapText = await swapRes.text();
-    try { swapJson = JSON.parse(swapText); } catch {}
-  } catch (err) {
-    swapNetworkError = err;
-    swapText = String(err);
-  }
-  const swapR = swapJson?.wholeSaleApi?.wholeSaleResponse;
-  await logCarrierApiCall(env, {
-    run_id: runId, step: 'mdn_change', iccid, imei: null, vendor: 'atomic',
-    request_url: url, request_method: 'POST', request_body: swapBody,
-    response_status: swapRes?.status ?? 0, response_ok: swapRes?.ok ?? false,
-    response_body_text: swapText || '', response_body_json: swapJson,
-    error: swapNetworkError ? `ATOMIC swapMSISDN network error: ${swapNetworkError}`
-      : (swapRes.ok && swapR?.statusCode === '00') ? null
-      : `ATOMIC swapMSISDN failed: ${swapR?.description || swapRes.status}`,
-  });
-  // Network error or 5xx from ATOMIC/relay: the swap may have succeeded at ATOMIC's
-  // side even though we didn't get a response. DO NOT fail the rotation — flip to
-  // provisioning so runAtomicFinalizer reconciles via subsriberInquiry on its next
-  // 5-min tick. Observed 2026-04-24: HTTP 504 caused 3-strikes failure while ATOMIC
-  // had actually assigned the new MDN, leaving DB stuck with stale msisdn.
-  if (swapNetworkError || (swapRes && swapRes.status >= 500)) {
-    console.log(`SIM ${iccid}: ATOMIC swap uncertain (${swapNetworkError ? 'network' : swapRes.status}) — flipping to provisioning for finalizer reconciliation`);
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-      rotation_status: 'mdn_pending',
-      status: 'provisioning',
-      last_rotation_error: swapNetworkError ? `swap uncertain: ${String(swapNetworkError).slice(0, 300)}` : `swap uncertain: HTTP ${swapRes.status}`,
-      rotation_fail_count: 0,
-    });
-    return;
-  }
-  if (!swapRes.ok) throw new Error(`ATOMIC swapMSISDN HTTP ${swapRes.status}: ${swapText.slice(0, 300)}`);
-  if (swapR?.statusCode !== '00') {
+
+    // Network error or 5xx from ATOMIC/relay: the swap may have succeeded at ATOMIC's
+    // side even though we didn't get a response. DO NOT fail the rotation — flip to
+    // provisioning so runAtomicFinalizer reconciles via subsriberInquiry on its next
+    // 5-min tick. Observed 2026-04-24: HTTP 504 caused 3-strikes failure while ATOMIC
+    // had actually assigned the new MDN, leaving DB stuck with stale msisdn.
+    if (swapNetworkError || (swapRes && swapRes.status >= 500)) {
+      console.log(`SIM ${iccid}: ATOMIC swap uncertain (${swapNetworkError ? 'network' : swapRes.status}) — flipping to provisioning for finalizer reconciliation`);
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        rotation_status: 'mdn_pending',
+        status: 'provisioning',
+        last_rotation_error: swapNetworkError ? `swap uncertain: ${String(swapNetworkError).slice(0, 300)}` : `swap uncertain: HTTP ${swapRes.status}`,
+        rotation_fail_count: 0,
+      });
+      return;
+    }
+    if (!swapRes.ok) {
+      await restoreRotationStamp();
+      throw new Error(`ATOMIC swapMSISDN HTTP ${swapRes.status}: ${swapText.slice(0, 300)}`);
+    }
+    if (swapR?.statusCode === '00') break;  // swap succeeded
+
     const desc = swapR?.description || 'Unknown';
+
+    // Cingular rejected the PPU zip ("zipCode Not Supported"): the address passed the
+    // verify step but cannot host an MDN. Quarantine it, push a fresh PPU from the
+    // pool, and retry the swap with the new zip (no MDN was burned on this attempt).
+    if (useApexFlow && ppuAddr && swapAttempt < MAX_SWAP_ATTEMPTS &&
+        /zip\s*code not supported|not support the zipcode/i.test(desc)) {
+      console.log(`SIM ${iccid}: swap rejected zip ${zipCode} ("${desc}") — quarantining PPU ${ppuAddr.id}, re-picking from pool`);
+      await markAddressVerifyFailure(env, ppuAddr.id, `swap zipCode not supported: ${desc}`);
+      let nextAddr = null;
+      try {
+        nextAddr = await pickNextPpuAddress(env, { excludeState: ppuAddr.state, excludeZip: ppuAddr.zipCode });
+        await atomicUpdateSubscriberInfo(env, { session, msisdn: currentMsisdn, address: nextAddr }, runId, iccid);
+      } catch (reErr) {
+        if (nextAddr?.id) await markAddressVerifyFailure(env, nextAddr.id, String(reErr));
+        await restoreRotationStamp();
+        throw new Error(`SIM ${iccid}: re-PPU after zip rejection failed: ${reErr}`);
+      }
+      ppuAddr = nextAddr;
+      zipCode = nextAddr.zipCode;
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        activation_zip: nextAddr.zipCode,
+      }).catch(() => {});
+      continue;  // retry swapMSISDN with the replacement zip
+    }
+
     if (/subscriber.*must.*be.*active|not.*active|status is not active/i.test(desc)) {
       console.log(`SIM ${iccid}: ATOMIC subscriber not active (statusCode ${swapR?.statusCode}) — marking suspended + queuing fix-sim`);
       // Reflect reality: AT&T says the subscriber is not active, so DB should show suspended.
@@ -2029,6 +2096,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
         );
       }
     }
+    await restoreRotationStamp();
     throw new Error(`ATOMIC swapMSISDN failed: ${desc}`);
   }
 
