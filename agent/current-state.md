@@ -1,7 +1,37 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-25 (session 60 — reseller portal self-serve resend shipped)
+> Last updated: 2026-05-26 (session 61 — relay-outage remediation + rotation hardening)
+
+---
+
+## Session 61 (2026-05-26) — Relay (530) outage remediation + rotation stamp hardening
+
+**Trigger:** A ~13h relay outage (2026-05-25 20:00 → 05-26 09:16 NY, HTTP 530, 12,150 failed carrier calls across all vendors) stranded rotations. Root cause of the *damage*: `claim_rotation_slot` stamps `last_mdn_rotated_at` BEFORE the carrier call (it doubles as the dedup lock); failures left that stamp in place, so SIMs looked "rotated today" with no rotation done → cadence-locked until the next NY window.
+
+**Remediation done (all buckets now 0):**
+- **ATOMIC** — 292 SIMs stranded (failed at `pre_swap_inquiry`, no MDN burned). Force-rotated all via `/rotate-sim?force=true` (concurrency 3). 289 first pass + 3 zip-rejected (see below). `atomic_failed_today=0`.
+- **WING** — 228 SIMs stranded (failed at `pre_rotate_get`, no MDN burned). Force-rotated, 0 failures. NOTE: stuck-wing auto-remediation only runs inside the 00:00–06:00 NY window, so it would NOT have self-healed them mid-day — manual force was required.
+- **TELTIK** — 562 stuck in `provisioning`/`mdn_pending`. **No cleanup needed**: verified `last_mdn_rotated_at` was correctly stamped at the real change-number time (within ~6s; what lags is `last_rotation_at`, the finalizer-confirmation timestamp). The 5-min finalizer drained them automatically (each had its number changed → `number.online` fired). `teltik_stuck=0`.
+
+**Code shipped (commit `61e6b13`, both deployed):**
+- **mdn-rotator** (prod `6bb49586`):
+  - `rotateWingIotSim`: restore-on-failure wrapper (all wing throws are pre-202, so any throw restores `last_mdn_rotated_at` to pre-claim value).
+  - `rotateAtomicSim`: `restoreRotationStamp()` helper applied at the 3 pre-swap-success throw sites (pre-swap inquiry, swap HTTP error, swap statusCode≠00); apex-PPU restore reuses it. Post-swap-success paths intentionally NOT restored (MDN already assigned).
+  - **swapMSISDN zip-retry loop** (`MAX_SWAP_ATTEMPTS=3`, apex only): on "zipCode Not Supported", quarantine the PPU address (`markAddressVerifyFailure`), pick a fresh pool zip, re-PPU, retry. Safe — a zip rejection means no MDN was assigned.
+  - Re-rotated the 3 zip-rejected SIMs (1101/645/1084) onto supported zips after deploy.
+- **teltik-worker** (prod `52c99402`):
+  - `rotateOneTeltikSim`: **inline finalize** from the synchronous change-number response (`status=SUCCESS` always carries `new_msisdn`, verified 1501/1501) — writes `sim_numbers`, sets `msisdn/active/success`, fires `number.offline`+`number.online`, and SKIPS `provisioning`. Provisioning kept only as fallback when `new_msisdn` is absent. Eliminates the redundant `get-phone-number` poll that the outage broke.
+
+**Data fix:** Quarantined Cingular-unsupported zips **83677, 83866, 95486** in `address_pool_usage` (set `verify_failed_at` + `last_verify_error`). Refill cron replaces within 6h.
+
+**Verified in prod:** all 3 re-rotated SIMs → `success`/`active` with new MDNs, `number.online` delivered. Final state query: `atomic_failed_today=0, wing_failed_today=0, teltik_stuck=0, zip_failed_remaining=0`.
+
+**Deliberately NOT done (flagged, not acted on):**
+- **`number.offline` does not fire on atomic re-rotations** — confirmed for SIMs 1101/645/1084 (only `number.online` sent, not even queued). Pre-existing in the atomic path; NOT introduced this session. Reseller still gets the new number online. Worth a separate investigation if offline notifications need to be reliable.
+- **`check:db-constraints` false-positive** at `dashboard/index.js:1898` — checker mis-reads an `errMsg` string (`'Teltik query: invalid JSON response'`) as a `status` column value. Pre-existing, unrelated to this session's work. Did not block the worker deploys.
+
+**Untracked artifacts left in place (not committed):** `scratch/force_rotate_atomic.sh`, `scratch/force_rotate_wing.sh`, the `*_iccids.txt` lists, and their `.log` files — the force-rotate tooling used this session.
 
 ---
 

@@ -4,6 +4,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-05-26 — `last_mdn_rotated_at` is restored on failure only when no MDN was consumed
+
+**Decision:** `claim_rotation_slot` still stamps `last_mdn_rotated_at` up front (it is the dedup lock — written before any carrier call so two cron ticks can't both rotate the same SIM). But the rotation functions now *restore* it to its pre-claim value when they fail **before the MDN actually changes**. Boundary per vendor: wing restores on ANY throw (all wing failures are before the dialable PUT's 202); atomic restores only at the 3 pre-swap-success throw sites (pre-swap inquiry, swap HTTP error, swap statusCode≠00) via `restoreRotationStamp()`. Atomic failures AFTER `swapMSISDN` returns `00` deliberately KEEP the stamp.
+
+**Why:** The 2026-05-25 relay outage threw before any number changed, but the up-front stamp made ~520 SIMs look "rotated today," cadence-locking them with no rotation done. Restoring the stamp on pre-MDN-change failures lets the next cron tick retry instead of waiting a full day. The cadence gate must stay on the *initiated* timestamp (not a success timestamp) precisely because it doubles as the dedup lock — see `last_rotation_at` for the completion timestamp.
+
+**Consequence:** Do NOT move the restore to atomic's post-swap paths — once `swapMSISDN` returns `00`, AT&T has burned a fresh MDN; restoring the stamp there would cause a second rotation on the next tick and burn another number. The post-swap bookkeeping (read MSISDN, DB write, webhook) is reconciled by `runAtomicFinalizer`, not by re-rotating. `last_mdn_rotated_at` = "rotation initiated/committed for cadence+dedup"; `last_rotation_at` = "rotation confirmed complete" (set by finalizer/success path). Keep both.
+
+---
+
+## 2026-05-26 — Teltik rotation finalizes inline; provisioning is only a fallback
+
+**Decision:** `rotateOneTeltikSim` now reads `new_msisdn` straight from the synchronous `change-number` response (`status=SUCCESS` carries it — verified 1501/1501 today) and finalizes inline: writes `sim_numbers`, sets `msisdn`/`active`/`success`/`last_rotation_at`, fires `number.offline`+`number.online`. It only flips to `status=provisioning`/`rotation_status=mdn_pending` (the old behavior, where details-finalizer polls `get-phone-number`) as a fallback when `new_msisdn` is absent. This reverses the session-58 decision to remove inline handling.
+
+**Why:** The session-58 design removed inline handling to kill a race — but that race was in a *blocking poll loop* (6 tries/62s on `get-phone-number`), NOT in reading the change-number response, which returns the number immediately every time. The old code discarded `new_msisdn` and made the finalizer re-fetch a number we already held. The relay outage exposed the cost: 562 teltik SIMs had already rotated (number in the response) but sat stranded for hours because the redundant second `get-phone-number` call was down.
+
+**Consequence:** Do NOT reintroduce an inline blocking poll on `get-phone-number` — that was the original race and it stays in details-finalizer's 5-min cron. Reading `new_msisdn` from the change-number response is poll-free and race-free. If Teltik ever changes `change-number` to return only a `request_id` (async), the `if (newMdnBare)` guard falls through to the provisioning fallback automatically — but watch for a spike of `provisioning` teltik SIMs as the signal that happened.
+
+---
+
 ## 2026-05-25 — Reseller self-service scoped to webhook resend only, never MDN rotation
 
 **Decision:** The reseller portal's new self-serve trigger (`/api/sims/:id/resend-online`, `/api/sims/resync-all`) re-fires the `number.online` webhook for the SIM's current MDN. It never calls Teltik/ATT/ATOMIC, never allocates a new MDN, never incurs vendor billing. Rejected during brainstorming: per-SIM force-rotate, bulk "rotate all stale", any path that touches the vendor APIs. Server-side rate limits enforced in `reseller_actions_log` (1 bulk/10 min; per-SIM 1/5min + 100/reseller/hour).
