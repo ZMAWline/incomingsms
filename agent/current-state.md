@@ -5,6 +5,16 @@
 
 ---
 
+## Session 62 (2026-05-27) — INC-2 rental billing: test enablement (gated, board-approved)
+
+- **Migration applied to PROD Supabase** (`20260527_rental_billing.sql`, via Management API — supabase MCP not available in this runtime): added tables `rentals` (UNIQUE `uq_rentals_reseller_sim_number` on `(reseller_id, sim_number_id)`, RLS on) and `reseller_rental_rates` (RLS on). Additive/dormant — no existing table altered; nothing reads them unless `billing_mode='rental'`.
+- **One-off seed data (TrustOTP, reseller_id=3), for dashboard-test rental testing only:**
+  - `reseller_rental_rates`: `att $1.10` + `tmobile $1.60`, both `effective_from=2026-05-22`, no end.
+  - `rentals`: 36 sample rows tagged `reseller_rental_id='TEST-SEED'` (24 att + 12 tmobile, dates 2026-05-22..27), FK'd to real post-cutover `sim_numbers` lifetimes. Removable: `DELETE FROM rentals WHERE reseller_rental_id='TEST-SEED';`
+  - NOT a full capture backfill — capture (`RENTAL_CAPTURE_ENABLED`) remains OFF.
+- **Dashboard:** `/api/billing/preview` now accepts `?billing_mode=rental` (commit `7df2dbd`); absent ⇒ legacy. Deployed to **dashboard-test only** (`ae12461b`). Prod dashboard/portal/sync NOT redeployed; QBO invoice path stays legacy.
+- Rental preview validated: total **$45.60** (24×$1.10 + 12×$1.60), `rate_fallback_used=false`.
+
 ## Session 61 (2026-05-26) — Relay (530) outage remediation + rotation stamp hardening
 
 **Trigger:** A ~13h relay outage (2026-05-25 20:00 → 05-26 09:16 NY, HTTP 530, 12,150 failed carrier calls across all vendors) stranded rotations. Root cause of the *damage*: `claim_rotation_slot` stamps `last_mdn_rotated_at` BEFORE the carrier call (it doubles as the dedup lock); failures left that stamp in place, so SIMs looked "rotated today" with no rotation done → cadence-locked until the next NY window.
