@@ -4437,7 +4437,10 @@ async function handleBillingPreview(url, env, corsHeaders) {
     if (!resellerId || !start || !end) {
       return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    const result = await computeBillingBreakdown(env, { resellerId, start, end });
+    // INC-2: optional billing_mode override for the preview (rental testing).
+    // Absent => undefined => legacy_simday. Only the exact string 'rental' diverts.
+    const billing_mode = url.searchParams.get('billing_mode') || undefined;
+    const result = await computeBillingBreakdown(env, { resellerId, start, end, billing_mode });
     return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
     return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
