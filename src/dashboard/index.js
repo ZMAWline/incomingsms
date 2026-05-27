@@ -7617,6 +7617,10 @@ function getHTML(helixEnabled) {
                             <label class="text-xs text-gray-500 uppercase">To</label>
                             <input type="date" id="invoice-end" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
                         </div>
+                        <div class="flex items-center gap-1" title="TEST ONLY: run the INC-2 rental billing engine with the audit cutover (2026-05-14). Leave off for legacy billing.">
+                            <input type="checkbox" id="invoice-rental-mode">
+                            <label for="invoice-rental-mode" class="text-xs text-yellow-400 uppercase">Rental mode (TEST)</label>
+                        </div>
                         <button onclick="previewInvoices()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Preview</button>
                         <button onclick="downloadInvoiceIIF()" id="download-invoice-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Download for QuickBooks</button>
                     </div>
@@ -15377,7 +15381,10 @@ async function sendSimOnline(simId, phoneNumber) {
             const end = document.getElementById("invoice-end").value;
             if (!resellerId || !start || !end) { showToast("Select reseller and date range", "error"); return; }
             try {
-                const resp = await fetch(\`\${API_BASE}/billing/preview?reseller_id=\${encodeURIComponent(resellerId)}&start=\${start}&end=\${end}\`);
+                let __previewQS = \`?reseller_id=\${encodeURIComponent(resellerId)}&start=\${start}&end=\${end}\`;
+                const __rentalEl = document.getElementById("invoice-rental-mode");
+                if (__rentalEl && __rentalEl.checked) { __previewQS += "&billing_mode=rental&cutover=2026-05-14"; }
+                const resp = await fetch(\`\${API_BASE}/billing/preview\${__previewQS}\`);
                 const data = await resp.json();
                 if (data.error) { showToast(data.error, "error"); return; }
                 invoicePreviewData = data;
