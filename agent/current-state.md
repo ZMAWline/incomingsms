@@ -8,10 +8,11 @@
 ## Session 62 (2026-05-27) — INC-2 rental billing: test enablement (gated, board-approved)
 
 - **Migration applied to PROD Supabase** (`20260527_rental_billing.sql`, via Management API — supabase MCP not available in this runtime): added tables `rentals` (UNIQUE `uq_rentals_reseller_sim_number` on `(reseller_id, sim_number_id)`, RLS on) and `reseller_rental_rates` (RLS on). Additive/dormant — no existing table altered; nothing reads them unless `billing_mode='rental'`.
-- **One-off seed data (TrustOTP, reseller_id=3), for dashboard-test rental testing only:**
+- **One-off seed/backfill (TrustOTP, reseller_id=3), for dashboard-test rental testing only:**
   - `reseller_rental_rates`: `att $1.10` + `tmobile $1.60`, both `effective_from=2026-05-22`, no end.
-  - `rentals`: 36 sample rows tagged `reseller_rental_id='TEST-SEED'` (24 att + 12 tmobile, dates 2026-05-22..27), FK'd to real post-cutover `sim_numbers` lifetimes. Removable: `DELETE FROM rentals WHERE reseller_rental_id='TEST-SEED';`
-  - NOT a full capture backfill — capture (`RENTAL_CAPTURE_ENABLED`) remains OFF.
+  - `rentals`: **full backfill of 7,112 rows** = every post-cutover `sim_numbers` lifetime (EST `valid_from` ≥ 2026-05-22) for the reseller's active sims. 3,266 att + 3,846 tmobile. `rental_date` = historical EST date of `valid_from` (not today). `reseller_rental_id` = `reseller_sims.last_rental_id` on each sim's latest lifetime only (2,057 rows), NULL otherwise. Idempotent via `ON CONFLICT (reseller_id, sim_number_id) DO NOTHING` — verified re-run inserts 0. Backfill SQL is in this session's transcript; criteria = `reseller_sims.active=true` (matches legacy billing's SIM filter).
+  - Rental-mode preview total over the window: **$9,746.20**.
+  - This is a test backfill, NOT live capture — `RENTAL_CAPTURE_ENABLED` remains OFF. Removable by `DELETE FROM rentals WHERE reseller_id=3;` (no production reader exists unless `billing_mode='rental'`).
 - **Dashboard:** `/api/billing/preview` now accepts `?billing_mode=rental` (commit `7df2dbd`); absent ⇒ legacy. Deployed to **dashboard-test only** (`ae12461b`). Prod dashboard/portal/sync NOT redeployed; QBO invoice path stays legacy.
 - Rental preview validated: total **$45.60** (24×$1.10 + 12×$1.60), `rate_fallback_used=false`.
 
