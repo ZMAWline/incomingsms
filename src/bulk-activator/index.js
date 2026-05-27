@@ -485,7 +485,7 @@ async function upsertSim(env, iccid, subId) {
 }
 
 async function upsertSimWithVendor(env, iccid, result, vendor) {
-  const existing = await supabaseSelect(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+  const existing = await supabaseSelect(env, `sims?select=id,activated_at&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
 
   // Build payload based on vendor
   const payload = {
@@ -508,6 +508,14 @@ async function upsertSimWithVendor(env, iccid, result, vendor) {
   } else if (vendor === 'helix') {
     payload.mobility_subscription_id = result.mobilitySubscriptionId;
     payload.status = 'provisioning'; // Helix needs finalizer to get MDN
+  }
+
+  // Stamp activation time. ATOMIC/Wing go straight to 'active' here, so unlike
+  // helix they never pass through the details-finalizer backfill that sets
+  // activated_at — without this they stay NULL until their first rotation.
+  // Only set on first activation (preserve the original date on re-activation).
+  if (payload.status === 'active' && !existing?.[0]?.activated_at) {
+    payload.activated_at = new Date().toISOString();
   }
 
   if (existing?.[0]?.id) {
