@@ -120,14 +120,17 @@ function resolveRate(rules, day, vendor, perVendorActive, allAttActive, fallback
 // for that bucket is chosen by tier (all-at-rate). AT&T vendors aggregate
 // into a single per-date entry when they all resolve to the same rate
 // (preserves legacy output shape for resellers with no rules).
-export async function computeBillingBreakdown(env, { resellerId, start, end, billing_mode }) {
+export async function computeBillingBreakdown(env, { resellerId, start, end, billing_mode, cutover }) {
   // INC-2: forward-only rental engine, dormant by default. Only the explicit
   // string 'rental' diverts here; anything else (including undefined) runs the
   // legacy EST-day / 48h-block engine below. Lazy import keeps the legacy path
   // free of any rentals.js dependency.
+  // `cutover` is an optional override of the forward-only floor (default
+  // RENTAL_CUTOVER_DATE). Absent => standard cutover; used only by the test
+  // dashboard to diff rental output against an earlier audit window.
   if (billing_mode === 'rental') {
     const { computeRentalBilling } = await import('./rentals.js');
-    return computeRentalBilling(env, { resellerId, start, end });
+    return computeRentalBilling(env, { resellerId, start, end, cutover });
   }
 
   const [resellerResp, mappingResp] = await Promise.all([

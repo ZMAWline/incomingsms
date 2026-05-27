@@ -4440,7 +4440,10 @@ async function handleBillingPreview(url, env, corsHeaders) {
     // INC-2: optional billing_mode override for the preview (rental testing).
     // Absent => undefined => legacy_simday. Only the exact string 'rental' diverts.
     const billing_mode = url.searchParams.get('billing_mode') || undefined;
-    const result = await computeBillingBreakdown(env, { resellerId, start, end, billing_mode });
+    // Optional forward-only cutover override (rental mode only). Absent => default
+    // RENTAL_CUTOVER_DATE. Used by dashboard-test to diff against an earlier audit window.
+    const cutover = url.searchParams.get('cutover') || undefined;
+    const result = await computeBillingBreakdown(env, { resellerId, start, end, billing_mode, cutover });
     return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
     return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
