@@ -110,7 +110,12 @@ function pickRentalRate(rules, day, carrier) {
 // independent of days or SMS volume. Output shape mirrors
 // computeBillingBreakdown so the dashboard/portal can render either engine.
 export async function computeRentalBilling(env, { resellerId, start, end, cutover }) {
-  const effectiveStart = (start && start > RENTAL_CUTOVER_DATE) ? start : (cutover || RENTAL_CUTOVER_DATE);
+  // The forward-only floor (default RENTAL_CUTOVER_DATE; `cutover` may lower it
+  // for an audit window). The effective window start is max(requested start,
+  // floor): the floor never expands the range before the user's selected start,
+  // it only clamps a too-early start up to the cutover.
+  const floor = cutover || RENTAL_CUTOVER_DATE;
+  const effectiveStart = (start && start > floor) ? start : floor;
 
   const [resellerArr, mappingArr] = await Promise.all([
     sbGetAll(env, 'resellers?select=id,name&id=eq.' + encodeURIComponent(resellerId)),

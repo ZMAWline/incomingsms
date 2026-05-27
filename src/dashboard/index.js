@@ -15411,8 +15411,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
                 html += '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2 pr-4">Date (EST)</th><th class="py-2 pr-4">Scope</th><th class="py-2 pr-4">Units</th><th class="py-2 pr-4">Rate</th><th class="py-2">Amount</th></tr></thead><tbody>';
                 data.days.forEach(d => {
-                    const scope = d.vendor ? d.vendor : 'AT&amp;T';
-                    const unit = d.vendor === 'teltik' ? '/block' : '/SIM-day';
+                    const scope = d.carrier ? (d.carrier === 'tmobile' ? 'T-Mobile' : 'AT&amp;T') : (d.vendor ? d.vendor : 'AT&amp;T');
+                    const unit = d.carrier ? '/rental' : (d.vendor === 'teltik' ? '/block' : '/SIM-day');
                     const tierTag = d.tier ? ' <span class="text-xs text-blue-400" title="Selected because reseller has ' + (d.tier_input_count != null ? d.tier_input_count : '?') + ' active SIMs in scope">[tier ' + d.tier.min_count + (d.tier.max_count == null ? '+' : '\u2013' + d.tier.max_count) + ']</span>' : '';
                     html += \`<tr class="border-b border-dark-700"><td class="py-2 pr-4 text-gray-300">\${d.date}</td><td class="py-2 pr-4 text-gray-400 text-xs">\${scope}</td><td class="py-2 pr-4 text-gray-300">\${d.sim_count}</td><td class="py-2 pr-4 text-gray-300 font-mono">$\${Number(d.rate).toFixed(4)}\${unit}\${tierTag}</td><td class="py-2 text-gray-300">$\${Number(d.amount).toFixed(2)}</td></tr>\`;
                 });
