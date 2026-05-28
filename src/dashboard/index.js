@@ -272,6 +272,10 @@ export default {
       return handleBillingPreview(url, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/billing/rental-export') {
+      return handleRentalExport(url, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/utilization') {
       return handleUtilization(url, env, corsHeaders);
     }
@@ -4449,6 +4453,38 @@ async function handleBillingPreview(url, env, corsHeaders) {
     return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
+async function handleRentalExport(url, env, corsHeaders) {
+  try {
+    const resellerId = url.searchParams.get('reseller_id');
+    const start = url.searchParams.get('start');
+    const end = url.searchParams.get('end');
+    if (!resellerId || !start || !end) {
+      return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const q = env.SUPABASE_URL + '/rest/v1/rentals?select=id,rental_date,carrier,sim_id,e164,reseller_rental_id'
+      + '&reseller_id=eq.' + encodeURIComponent(resellerId)
+      + '&rental_date=gte.' + encodeURIComponent(start)
+      + '&rental_date=lte.' + encodeURIComponent(end)
+      + '&order=rental_date.asc,carrier.asc,sim_id.asc';
+    const hdrs = { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY, Accept: 'application/json' };
+    const lines = ['internal_rental_id,rental_date,carrier,sim_id,mdn,trustotp_rental_id'];
+    const PAGE = 1000;
+    for (let offset = 0; ; offset += PAGE) {
+      const res = await fetch(q + '&limit=' + PAGE + '&offset=' + offset, { headers: hdrs });
+      const rows = await res.json();
+      if (!Array.isArray(rows) || rows.length === 0) break;
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        lines.push([r.id, r.rental_date, r.carrier, r.sim_id, r.e164, (r.reseller_rental_id == null ? '' : r.reseller_rental_id)].join(','));
+      }
+      if (rows.length < PAGE) break;
+    }
+    return new Response(lines.join('\n') + '\n', { headers: { ...corsHeaders, 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="rental_rows.csv"' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
 async function handleUtilization(url, env, corsHeaders) {
   try {
     const resellerId = url.searchParams.get('reseller_id');
@@ -15398,7 +15434,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     document.getElementById("download-invoice-btn").classList.add("hidden");
                     return;
                 }
-                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Default Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span>' + (data.rules_applied ? ' &nbsp;·&nbsp; <span class="text-blue-400">Volume Pricing rules active</span>' : '') + '</div>';
+                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Default Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span>' + (data.rules_applied ? ' &nbsp;·&nbsp; <span class="text-blue-400">Volume Pricing rules active</span>' : '') + '</div>' + (data.billing_mode === 'rental' ? ('<div class="mb-3 text-xs"><span class="text-yellow-400 font-semibold">RENTAL MODE (TEST)</span> TrustOTP-matched (authoritative): <span class="text-white">' + (data.total_with_trustotp_id||0) + '</span> of ' + (data.total_rentals||0) + ' &middot; unmatched: <span class="text-white">' + (data.total_without_trustotp_id||0) + '</span></div><div class="mb-3"><a href="' + API_BASE + '/billing/rental-export?reseller_id=' + encodeURIComponent(resellerId) + '&start=' + start + '&end=' + end + '" class="px-3 py-1 text-xs bg-dark-600 hover:bg-dark-500 text-gray-200 rounded">Export rental rows CSV (internal_rental_id + trustotp_rental_id)</a></div>') : '');
                 if (data.active_counts) {
                     const ac = data.active_counts;
                     const parts = [];

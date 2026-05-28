@@ -143,9 +143,14 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
   // group[date][carrier] = count
   const group = {};
   let missingRate = false;
+  // Authoritative reconciliation: how many billed rentals carry a TrustOTP
+  // rentalId (matched to a 'Rental created' webhook response) vs not.
+  let withTrustotpId = 0;
+  let withoutTrustotpId = 0;
   for (const r of (Array.isArray(rentals) ? rentals : [])) {
     if (!group[r.rental_date]) group[r.rental_date] = {};
     group[r.rental_date][r.carrier] = (group[r.rental_date][r.carrier] || 0) + 1;
+    if (r.reseller_rental_id) withTrustotpId++; else withoutTrustotpId++;
   }
 
   const days = [];
@@ -177,6 +182,9 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
     total_sim_days: totalRentals, // unit is rentals in this mode
     total_rentals: totalRentals,
     total_amount: totalAmount,
+    // Authoritative count = rentals matched to a TrustOTP 'Rental created' rentalId.
+    total_with_trustotp_id: withTrustotpId,
+    total_without_trustotp_id: withoutTrustotpId,
     rules_applied: Array.isArray(rules) && rules.length > 0,
     rate_fallback_used: missingRate,
   };
