@@ -477,8 +477,7 @@ async function handleStats(env, corsHeaders) {
     const broadcastBase = (vendor) => 'sims?select=id,reseller_sims!inner(active)&status=eq.active&vendor=eq.' + vendor + '&reseller_sims.active=eq.true&limit=1';
     const wingBroadcastSuffix = '&or=(rotation_status.is.null,rotation_status.neq.failed)';
 
-    const [totalRes, activeRes, provRes, msgRes, suspRes, errRes, atmRes, telRes, wingRes, helRes,
-           atmTotalRes, atmFreshRes, helTotalRes, helFreshRes, wingTotalRes, wingFreshRes, telTotalRes, telFreshRes] = await Promise.all([
+    const [totalRes, activeRes, provRes, msgRes, suspRes, errRes, atmRes, telRes, wingRes, helRes] = await Promise.all([
       fetch(base + 'sims?select=id&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&status=eq.active&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&status=eq.provisioning&limit=1', { headers: authHeaders }),
@@ -489,15 +488,26 @@ async function handleStats(env, corsHeaders) {
       fetch(base + 'sims?select=id&vendor=eq.teltik&status=neq.canceled&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&vendor=eq.wing_iot&status=neq.canceled&limit=1', { headers: authHeaders }),
       fetch(base + 'sims?select=id&vendor=eq.helix&status=neq.canceled&limit=1', { headers: authHeaders }),
-      fetch(base + broadcastBase('atomic'), { headers: authHeaders }),
-      fetch(base + broadcastBase('atomic') + '&last_notified_at=gte.' + encodeURIComponent(cutoff24hISO), { headers: authHeaders }),
-      fetch(base + broadcastBase('helix'), { headers: authHeaders }),
-      fetch(base + broadcastBase('helix') + '&last_notified_at=gte.' + encodeURIComponent(cutoff24hISO), { headers: authHeaders }),
-      fetch(base + broadcastBase('wing_iot') + wingBroadcastSuffix, { headers: authHeaders }),
-      fetch(base + broadcastBase('wing_iot') + wingBroadcastSuffix + '&last_notified_at=gte.' + encodeURIComponent(cutoff24hISO), { headers: authHeaders }),
-      fetch(base + broadcastBase('teltik'), { headers: authHeaders }),
-      fetch(base + broadcastBase('teltik') + '&last_notified_at=gte.' + encodeURIComponent(cutoff48hISO), { headers: authHeaders }),
     ]);
+
+    // Rotation freshness via RPC — see public.rotation_freshness().
+    // Counts client-assigned SIMs (any active reseller link, any sim status) whose
+    // CURRENT number has a client-confirmed rotation (number.online delivered with a
+    // rentalId) within the carrier window (att 24h / tmobile 48h).
+    let freshByVendor = {};
+    try {
+      const freshRes = await fetch(base + 'rpc/rotation_freshness', {
+        method: 'POST',
+        headers: Object.assign({}, authHeaders, { 'Content-Type': 'application/json' }),
+        body: '{}',
+      });
+      if (freshRes.ok) {
+        const freshRows = await freshRes.json();
+        for (const r of (Array.isArray(freshRows) ? freshRows : [])) {
+          freshByVendor[r.vendor] = { total: Number(r.total) || 0, fresh: Number(r.fresh) || 0, window_hours: Number(r.window_hours) || 24 };
+        }
+      }
+    } catch (e) { /* leave freshByVendor empty on RPC error */ }
 
     const getCount = res => {
       const cr = res.headers.get('content-range') || '';
@@ -515,12 +525,7 @@ async function handleStats(env, corsHeaders) {
       vendor_teltik: getCount(telRes),
       vendor_wing_iot: getCount(wingRes),
       vendor_helix: getCount(helRes),
-      freshness: {
-        atomic:   { total: getCount(atmTotalRes),  fresh: getCount(atmFreshRes),  window_hours: 24 },
-        helix:    { total: getCount(helTotalRes),  fresh: getCount(helFreshRes),  window_hours: 24 },
-        wing_iot: { total: getCount(wingTotalRes), fresh: getCount(wingFreshRes), window_hours: 24 },
-        teltik:   { total: getCount(telTotalRes),  fresh: getCount(telFreshRes),  window_hours: 48 },
-      },
+      freshness: freshByVendor,
     };
 
     return new Response(JSON.stringify(stats), {
@@ -6721,8 +6726,8 @@ function getHTML(helixEnabled) {
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <div class="flex items-center justify-between mb-4">
                         <div>
-                            <h3 class="text-sm font-medium text-gray-300">Notification Freshness</h3>
-                            <p class="text-xs text-gray-500 mt-0.5">AT&amp;T notified within 24h, T-Mobile within 48h</p>
+                            <h3 class="text-sm font-medium text-gray-300">Rotation Freshness</h3>
+                            <p class="text-xs text-gray-500 mt-0.5">Current number confirmed by client (rental ID) &mdash; AT&amp;T within 24h, T-Mobile within 48h</p>
                         </div>
                         <span id="freshness-summary" class="text-xs text-gray-500"></span>
                     </div>
@@ -10313,7 +10318,7 @@ function getHTML(helixEnabled) {
                 html +=
                     '<div class="flex items-center gap-3 py-1">' +
                         '<span class="w-40 text-gray-300">' + g.label +
-                            ' <span class="text-gray-600 text-xs ml-1">' + g.windowLabel + '</span>' +
+                            ' <span class="text-gray-600 text-xs ml-1">' + (v.window_hours ? v.window_hours + 'h' : g.windowLabel) + '</span>' +
                             (g.sub ? ' <span class="text-gray-600 text-xs">' + g.sub + '</span>' : '') +
                         '</span>' +
                         '<span class="text-emerald-400 tabular-nums w-16 text-right">' + v.fresh + '</span>' +
