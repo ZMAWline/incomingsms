@@ -4591,7 +4591,8 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    const breakdown = await computeBillingBreakdown(env, { resellerId, start, end });
+    const billing_mode = url.searchParams.get('billing_mode') || undefined;
+    const breakdown = await computeBillingBreakdown(env, { resellerId, start, end, billing_mode });
     if (!breakdown.mapping) {
       return new Response(JSON.stringify({ error: 'No customer rate configured for this reseller' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
@@ -7658,9 +7659,9 @@ function getHTML(helixEnabled) {
                             <label class="text-xs text-gray-500 uppercase">To</label>
                             <input type="date" id="invoice-end" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
                         </div>
-                        <div class="flex items-center gap-1" title="TEST ONLY: run the INC-2 rental billing engine with the audit cutover (2026-05-14). Leave off for legacy billing.">
-                            <input type="checkbox" id="invoice-rental-mode">
-                            <label for="invoice-rental-mode" class="text-xs text-yellow-400 uppercase">Rental mode (TEST)</label>
+                        <div class="flex items-center gap-1" title="New rental-based billing is the default. Check to bill with the legacy SIM-day / 48h-block engine instead (for comparison).">
+                            <input type="checkbox" id="invoice-legacy-mode">
+                            <label for="invoice-legacy-mode" class="text-xs text-gray-400 uppercase">Use legacy billing (compare)</label>
                         </div>
                         <button onclick="previewInvoices()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Preview</button>
                         <button onclick="downloadInvoiceIIF()" id="download-invoice-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Download for QuickBooks</button>
@@ -15423,8 +15424,8 @@ async function sendSimOnline(simId, phoneNumber) {
             if (!resellerId || !start || !end) { showToast("Select reseller and date range", "error"); return; }
             try {
                 let __previewQS = \`?reseller_id=\${encodeURIComponent(resellerId)}&start=\${start}&end=\${end}\`;
-                const __rentalEl = document.getElementById("invoice-rental-mode");
-                if (__rentalEl && __rentalEl.checked) { __previewQS += "&billing_mode=rental&cutover=2026-05-14"; }
+                const __legacyEl = document.getElementById("invoice-legacy-mode");
+                if (!(__legacyEl && __legacyEl.checked)) { __previewQS += "&billing_mode=rental"; }
                 const resp = await fetch(\`\${API_BASE}/billing/preview\${__previewQS}\`);
                 const data = await resp.json();
                 if (data.error) { showToast(data.error, "error"); return; }
@@ -15439,7 +15440,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     document.getElementById("download-invoice-btn").classList.add("hidden");
                     return;
                 }
-                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Default Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span>' + (data.rules_applied ? ' &nbsp;·&nbsp; <span class="text-blue-400">Volume Pricing rules active</span>' : '') + '</div>' + (data.billing_mode === 'rental' ? ('<div class="mb-3 text-xs"><span class="text-yellow-400 font-semibold">RENTAL MODE (TEST)</span> TrustOTP-matched (authoritative): <span class="text-white">' + (data.total_with_trustotp_id||0) + '</span> of ' + (data.total_rentals||0) + ' &middot; unmatched: <span class="text-white">' + (data.total_without_trustotp_id||0) + '</span></div><div class="mb-3"><a href="' + API_BASE + '/billing/rental-export?reseller_id=' + encodeURIComponent(resellerId) + '&start=' + start + '&end=' + end + '" class="px-3 py-1 text-xs bg-dark-600 hover:bg-dark-500 text-gray-200 rounded">Export rental rows CSV (internal_rental_id + trustotp_rental_id)</a></div>') : '');
+                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Default Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span>' + (data.rules_applied ? ' &nbsp;·&nbsp; <span class="text-blue-400">Volume Pricing rules active</span>' : '') + '</div>' + (data.billing_mode === 'rental' ? ('<div class="mb-3 text-xs"><span class="text-yellow-400 font-semibold">RENTAL (new billing)</span> TrustOTP-matched (authoritative): <span class="text-white">' + (data.total_with_trustotp_id||0) + '</span> of ' + (data.total_rentals||0) + ' &middot; unmatched: <span class="text-white">' + (data.total_without_trustotp_id||0) + '</span></div><div class="mb-3"><a href="' + API_BASE + '/billing/rental-export?reseller_id=' + encodeURIComponent(resellerId) + '&start=' + start + '&end=' + end + '" class="px-3 py-1 text-xs bg-dark-600 hover:bg-dark-500 text-gray-200 rounded">Export rental rows CSV (internal_rental_id + trustotp_rental_id)</a></div>') : '');
                 if (data.active_counts) {
                     const ac = data.active_counts;
                     const parts = [];
@@ -15472,7 +15473,9 @@ async function sendSimOnline(simId, phoneNumber) {
             const start = document.getElementById("invoice-start").value;
             const end = document.getElementById("invoice-end").value;
             try {
-                const resp = await fetch(\`\${API_BASE}/billing/download-invoice?reseller_id=\${encodeURIComponent(resellerId)}&start=\${start}&end=\${end}\`);
+                const __legacyEl = document.getElementById("invoice-legacy-mode");
+                const __modeQS = (__legacyEl && __legacyEl.checked) ? "" : "&billing_mode=rental";
+                const resp = await fetch(API_BASE + "/billing/download-invoice?reseller_id=" + encodeURIComponent(resellerId) + "&start=" + start + "&end=" + end + __modeQS);
                 if (!resp.ok) {
                     const err = await resp.json().catch(() => ({}));
                     showToast("Error: " + (err.error || resp.statusText), "error");
