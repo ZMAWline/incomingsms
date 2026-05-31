@@ -114,7 +114,7 @@ export default {
 
   async scheduled(event, env, ctx) {
     if (!isInsideRotationWindowNY()) {
-      console.log(`[Cron] teltik-worker outside NY rotation window (0-5); NY hour=${getNYHour()} — skipping`);
+      console.log(`[Cron] teltik-worker outside NY rotation window (0-8); NY hour=${getNYHour()} — skipping`);
       return;
     }
     console.log('[Cron] teltik-worker rotation starting');
@@ -128,7 +128,7 @@ export default {
 };
 
 // =========================================================
-// Scheduling window: 12 AM – 6 AM America/New_York (DST-aware via Intl)
+// Scheduling window: 12 AM – 9 AM America/New_York (DST-aware via Intl)
 // =========================================================
 function getNYHour() {
   const raw = Number(new Intl.DateTimeFormat('en-US', {
@@ -139,7 +139,19 @@ function getNYHour() {
 
 function isInsideRotationWindowNY() {
   const h = getNYHour();
-  return h >= 0 && h <= 5;
+  return h >= 0 && h <= 8;
+}
+
+// Returns ISO string for midnight in New York timezone (DST-aware). Used as
+// p_today_start for increment_rotation_fail (daily fail-count reset boundary).
+function getNYMidnightISO() {
+  const now = new Date();
+  const nyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
+  const tzPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', timeZoneName: 'shortOffset'
+  }).formatToParts(now).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-5';
+  const offsetHours = -parseInt(tzPart.replace('GMT', '') || '-5');
+  return new Date(`${nyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
 }
 
 // =========================================================
@@ -752,12 +764,16 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
 
   } catch (err) {
     console.error(`[Rotate] SIM ${sim.iccid}: error: ${err}`);
-    // Mark status=failed so stuck-state sweeper and dashboard don't show
-    // this SIM as perpetually 'rotating'. last_mdn_rotated_at stays (from
-    // claim_rotation_slot) so we don't retry and burn another MDN this cycle.
-    await supabasePatch(env, `sims?id=eq.${sim.id}`, {
-      rotation_status: 'failed',
-      last_rotation_error: String(err).slice(0, 500),
+    // Increment the daily fail counter via the shared RPC, which also flips
+    // status to 'rotation_failed' once the count hits 5 — dropping the SIM out
+    // of both the due query (status=active) and the in-window retry query
+    // (status in active/provisioning), so no further auto attempts occur.
+    // last_mdn_rotated_at is left untouched (claim_rotation_retry_slot's 15-min
+    // backoff keys off it) so we don't re-burn an MDN this cycle.
+    await supabaseRpc(env, 'increment_rotation_fail', {
+      p_sim_id: sim.id,
+      p_error: String(err).slice(0, 500),
+      p_today_start: getNYMidnightISO(),
     }).catch(() => {});
     return { ok: false, iccid: sim.iccid, error: String(err) };
   }
