@@ -1065,7 +1065,7 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
   },
 
   // Cron handler
-  // - Rotation runs ONLY 12:00-05:59 America/New_York (DST-aware via Intl).
+  // - Rotation runs ONLY 12:00-08:59 America/New_York (DST-aware via Intl).
   //   UTC cron fires wider than that; the gate below is the source of truth.
   // - 7am UTC: error summary to Slack (always runs, regardless of window).
   async scheduled(event, env, ctx) {
@@ -1076,7 +1076,7 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
       // Workers' paid 15-min scheduled-invocation limit.
       ctx.waitUntil(processRotationBatch(env, { limit: 60, concurrency: 3 }));
     } else {
-      console.log(`[Cron] outside NY rotation window (0-5); NY hour=${getNYHour()} — skipping rotation`);
+      console.log(`[Cron] outside NY rotation window (0-8); NY hour=${getNYHour()} — skipping rotation`);
     }
     // Wing IoT MDN sync moved to details-finalizer (runs every 5 min).
     // IMEI heartbeat: DISABLED — investigating gateway instability
@@ -1436,9 +1436,13 @@ async function processRotationBatch(env, options = {}) {
   // (typically marked by dashboard Query when AT&T reports the SIM on ABIR). These
   // bypass the daily dedup — we force-rotate via rotateWingIotSim, which detects
   // "already on ABIR" in pre_rotate_get and skips PUT-1 → goes straight to PUT-2.
+  // Capped at rotation_fail_count < 5: once a SIM has failed 5x it stays in
+  // rotation_failed for manual handling — no further auto attempts. (null =
+  // dashboard-marked SIM that hasn't auto-incremented yet, still eligible.)
   const stuckWingQuery =
     `sims?select=id,iccid,vendor,status,msisdn,last_mdn_rotated_at,activated_at,activation_zip,rotation_eligible` +
-    `&vendor=eq.wing_iot&rotation_status=eq.failed&status=neq.canceled&limit=${limit}`;
+    `&vendor=eq.wing_iot&rotation_status=eq.failed&status=neq.canceled` +
+    `&or=(rotation_fail_count.is.null,rotation_fail_count.lt.5)&limit=${limit}`;
   const stuckRaw = await supabaseSelect(env, stuckWingQuery).catch(() => []);
   const stuckCandidates = Array.isArray(stuckRaw) ? stuckRaw : [];
 
@@ -4118,11 +4122,11 @@ function getNYHour() {
   return ((raw % 24) + 24) % 24;
 }
 
-// Scheduled rotations only run between 12:00 AM and 6:00 AM NY (hours 0-5).
+// Scheduled rotations only run between 12:00 AM and 9:00 AM NY (hours 0-8).
 // Manual HTTP paths bypass this — they never pass through scheduled().
 function isInsideRotationWindowNY() {
   const h = getNYHour();
-  return h >= 0 && h <= 5;
+  return h >= 0 && h <= 8;
 }
 
 // Returns ISO string for midnight in New York timezone (DST-aware)
@@ -4303,10 +4307,10 @@ async function updateSimRotationError(env, simId, errorMessage) {
     body: JSON.stringify({ p_sim_id: simId, p_error: errorMessage, p_today_start: todayNY }),
   });
   const newCount = await res.json().catch(() => null);
-  if (newCount >= 3) {
-    console.log(`[DB] SIM ${simId}: rotation_fail_count=${newCount} → status=rotation_failed`);
+  if (newCount >= 5) {
+    console.log(`[DB] SIM ${simId}: rotation_fail_count=${newCount} → status=rotation_failed (cap reached, no further auto attempts)`);
   } else {
-    console.log(`[DB] SIM ${simId}: rotation_fail_count=${newCount} (attempt ${newCount}/3)`);
+    console.log(`[DB] SIM ${simId}: rotation_fail_count=${newCount} (attempt ${newCount}/5 — will retry next cron)`);
   }
 }
 
