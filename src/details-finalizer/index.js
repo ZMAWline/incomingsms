@@ -1044,7 +1044,7 @@ async function runAtomicFinalizer(env, limit) {
             kind: 'atomic_mdn_desync',
             summary: `ATOMIC SIM ${sim.iccid} attStatus=${data.attStatus} — not healable`,
             details_md: `SIM #${sim.id} (${sim.iccid})\n- our msisdn: ${sim.msisdn}\n- AT&T msisdn: ${attMsisdn || '—'}\n- AT&T attStatus: **${data.attStatus}**\n- last_rotation_error: ${(sim.last_rotation_error || '—').slice(0, 300)}\n\nReactivation must happen carrier-side (Wing Alpha). Rotation disabled until then.`,
-            run_id: `atomic_finalizer_${Date.now()}`,
+            run_id: null,
             sim_id: sim.id,
             status: 'open',
           });
@@ -1071,7 +1071,7 @@ async function runAtomicFinalizer(env, limit) {
               kind: 'atomic_mdn_collision',
               summary: `ATOMIC SIM ${sim.iccid}: AT&T MDN ${attMsisdn} already held by another SIM`,
               details_md: `SIM #${sim.id} (${sim.iccid}) — AT&T reports active MDN ${attMsisdn}, already assigned to another SIM in our DB. Manual review needed.`,
-              run_id: `atomic_finalizer_${Date.now()}`,
+              run_id: null,
               sim_id: sim.id, status: 'open',
             });
           }
