@@ -1866,7 +1866,7 @@ async function atomicUpdateSubscriberInfo(env, { session, msisdn, address }, run
 // ===========================
 async function rotateAtomicSim(env, sim, opts = {}) {
   const iccid = sim.iccid;
-  const currentMsisdn = sim.msisdn;
+  let currentMsisdn = sim.msisdn;
   const runId = `rotate_${iccid}_${Date.now()}`;
   const force = opts.force === true;
 
@@ -1941,6 +1941,22 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       activation_zip: preInqR.Result.address.zipCode,
     }).catch(() => {});
     console.log(`SIM ${iccid}: updated activation_zip ${sim.activation_zip} → ${preInqR.Result.address.zipCode}`);
+  }
+
+  // Self-heal DB↔carrier desync: AT&T's live MDN is the source of truth. If a
+  // prior swapMSISDN committed at AT&T but our DB kept the old number, the
+  // inquiry returns a DIFFERENT (Active) MDN. Adopt it as the swap-from so this
+  // rotation swaps from the live number instead of a dead one ("sim/MSISDN is
+  // Inactive"). Only writes msisdn (never last_mdn_rotated_at), so a later
+  // restoreRotationStamp() leaves the corrected number in place — AT&T's truth.
+  const attMdnBare = preInqR.Result?.msisdn
+    ? String(preInqR.Result.msisdn).replace(/^\+?1?/, '')
+    : (preInqR.Result?.MSISDN ? String(preInqR.Result.MSISDN).replace(/^\+?1?/, '') : null);
+  const preAttStatus = String(preInqR.Result?.attStatus || '').trim().toLowerCase();
+  if (attMdnBare && preAttStatus === 'active' && attMdnBare !== currentMsisdn) {
+    console.log(`SIM ${iccid}: DESYNC detected — DB msisdn=${currentMsisdn} but AT&T active MDN=${attMdnBare}; adopting AT&T number as swap-from`);
+    currentMsisdn = attMdnBare;
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: attMdnBare }).catch(() => {});
   }
 
   // Apex flow: pick a new PPU address (different state + zip) and update

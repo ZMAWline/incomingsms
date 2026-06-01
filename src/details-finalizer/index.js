@@ -977,24 +977,48 @@ async function runAtomicFinalizer(env, limit) {
     return { processed: 0, synced: 0, message: 'admin_run_secret_missing' };
   }
 
-  // Only reconcile post-rotation stuck ATOMIC SIMs; normal activation flow doesn't use
-  // provisioning for ATOMIC. mdn_pending is the signal that swapMSISDN returned 5xx or
-  // threw a network error and we don't know the final state.
-  const sims = await supabaseSelect(
+  // Bucket 1 (pending): post-rotation stuck ATOMIC SIMs — swapMSISDN returned 5xx or threw
+  // a network error and we don't know the final state. mdn_pending is the signal.
+  const pendingSims = (await supabaseSelect(
     env,
-    `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at&vendor=eq.atomic&status=eq.provisioning&rotation_status=eq.mdn_pending&limit=${limit}`
-  );
-  if (!sims || sims.length === 0) return { ok: true, processed: 0, synced: 0 };
+    `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error&vendor=eq.atomic&status=eq.provisioning&rotation_status=eq.mdn_pending&limit=${limit}`
+  )) || [];
+
+  // Bucket 2 (parked): DB↔carrier MDN desyncs. Rotation keeps failing "sim/MSISDN is
+  // Inactive" because our stored MDN is stale while AT&T has the subscriber Active under a
+  // DIFFERENT number. rotation_eligible=true excludes ones already escalated as non-healable.
+  const desyncCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  const parkedSims = (await supabaseSelect(
+    env,
+    `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error` +
+      `&vendor=eq.atomic&rotation_eligible=eq.true` +
+      `&or=(status.eq.rotation_failed,rotation_status.eq.failed)` +
+      `&last_rotation_error=ilike.*active*` +
+      `&last_mdn_rotated_at=gte.${encodeURIComponent(desyncCutoff)}` +
+      `&order=last_mdn_rotated_at.asc.nullsfirst&limit=${Math.min(limit, 40)}`
+  )) || [];
+
+  const seen = new Set();
+  const candidates = [];
+  for (const s of [...pendingSims, ...parkedSims]) {
+    if (seen.has(s.id)) continue;
+    seen.add(s.id);
+    candidates.push({ ...s, _parked: !(s.status === 'provisioning' && s.rotation_status === 'mdn_pending') });
+  }
+  if (candidates.length === 0) return { ok: true, processed: 0, synced: 0 };
 
   const STUCK_MINUTES = 30;
+  // AT&T attStatus values that mean the line cannot be rotated/healed from our side.
+  const DEAD = ['cancelled', 'canceled', 'suspended', 'deactivated', 'terminated'];
 
   let processed = 0;
   let synced = 0;
   let errors = 0;
   let failed = 0;
+  let escalated = 0;
   const results = [];
 
-  for (const sim of sims) {
+  for (const sim of candidates) {
     processed++;
     try {
       const inqUrl = `https://mdn-rotator/atomic-inquiry?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&iccid=${encodeURIComponent(sim.iccid)}`;
@@ -1005,18 +1029,106 @@ async function runAtomicFinalizer(env, limit) {
         continue;
       }
       const data = await res.json().catch(() => ({}));
-      const newMsisdn = data.msisdn ? String(data.msisdn).replace(/^\+?1?/, '') : null;
-
+      const attMsisdn = data.msisdn ? String(data.msisdn).replace(/^\+?1?/, '') : null;
+      const attStatus = String(data.attStatus || '').trim().toLowerCase();
       const startedAt = sim.last_mdn_rotated_at ? new Date(sim.last_mdn_rotated_at).getTime() : 0;
       const ageMin = startedAt ? (Date.now() - startedAt) / 60000 : 0;
+      const e164 = attMsisdn ? `+1${attMsisdn}` : null;
 
-      if (!data.ok || !newMsisdn || newMsisdn === sim.msisdn) {
+      // (a) Non-healable carrier state → flag + stop. Only the explicit dead set disables a
+      //     SIM; unknown/empty statuses fall through to skip so a novel string is safe.
+      if (DEAD.includes(attStatus)) {
+        const existing = await findOpenPendingForSim(env, sim.id, 'atomic_mdn_desync');
+        if (!existing) {
+          await insertPendingItem(env, {
+            kind: 'atomic_mdn_desync',
+            summary: `ATOMIC SIM ${sim.iccid} attStatus=${data.attStatus} — not healable`,
+            details_md: `SIM #${sim.id} (${sim.iccid})\n- our msisdn: ${sim.msisdn}\n- AT&T msisdn: ${attMsisdn || '—'}\n- AT&T attStatus: **${data.attStatus}**\n- last_rotation_error: ${(sim.last_rotation_error || '—').slice(0, 300)}\n\nReactivation must happen carrier-side (Wing Alpha). Rotation disabled until then.`,
+            run_id: `atomic_finalizer_${Date.now()}`,
+            sim_id: sim.id,
+            status: 'open',
+          });
+        }
+        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          rotation_eligible: false,
+          status: 'rotation_failed',
+          last_rotation_error: `ATOMIC attStatus=${data.attStatus} (not healable, escalated)`,
+        });
+        escalated++;
+        results.push({ iccid: sim.iccid, ok: false, escalated: true, attStatus: data.attStatus });
+        continue;
+      }
+
+      // (b) Active + DIFFERENT MDN → reconcile to AT&T's live number (the self-heal).
+      if (attStatus === 'active' && attMsisdn && attMsisdn !== sim.msisdn) {
+        // Collision guard: never adopt a number another SIM already holds.
+        const takenSim = await supabaseSelect(env, `sims?select=id&msisdn=eq.${encodeURIComponent(attMsisdn)}&id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
+        const takenNum = await supabaseSelect(env, `sim_numbers?select=sim_id&e164=eq.${encodeURIComponent(e164)}&valid_to=is.null&sim_id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
+        if ((Array.isArray(takenSim) && takenSim.length) || (Array.isArray(takenNum) && takenNum.length)) {
+          const ex = await findOpenPendingForSim(env, sim.id, 'atomic_mdn_collision');
+          if (!ex) {
+            await insertPendingItem(env, {
+              kind: 'atomic_mdn_collision',
+              summary: `ATOMIC SIM ${sim.iccid}: AT&T MDN ${attMsisdn} already held by another SIM`,
+              details_md: `SIM #${sim.id} (${sim.iccid}) — AT&T reports active MDN ${attMsisdn}, already assigned to another SIM in our DB. Manual review needed.`,
+              run_id: `atomic_finalizer_${Date.now()}`,
+              sim_id: sim.id, status: 'open',
+            });
+          }
+          results.push({ iccid: sim.iccid, ok: false, collision: true, attMsisdn });
+          continue;
+        }
+
+        // Offline for the old (stale) number the reseller was last told about.
+        if (sim.msisdn && sim.msisdn !== attMsisdn) {
+          try {
+            await sendNumberOfflineWebhook(env, sim.id, normalizeUS(sim.msisdn), sim.iccid, sim.msisdn, e164);
+          } catch (offErr) {
+            console.error(`[Finalizer/ATOMIC] SIM ${sim.id}: number.offline failed: ${offErr}`);
+          }
+        }
+        // Reconcile sim_numbers independently: only rewrite if the open row isn't already AT&T's number.
+        const openRows = await supabaseSelect(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&limit=1`);
+        const openE164 = Array.isArray(openRows) && openRows[0] ? openRows[0].e164 : null;
+        if (openE164 !== e164) {
+          await closeCurrentNumber(env, sim.id);
+          await insertNewNumber(env, sim.id, e164);
+        }
+        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          msisdn: attMsisdn,
+          status: 'active',
+          rotation_status: 'success',
+          rotation_fail_count: 0,
+          rotation_eligible: true,
+          last_rotation_at: new Date().toISOString(),
+          last_rotation_error: null,
+        });
+        await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, attMsisdn);
+
+        synced++;
+        results.push({ iccid: sim.iccid, ok: true, mdn: e164, kind: sim._parked ? 'desync-heal' : 'post-rotation-recovery' });
+        console.log(`[Finalizer/ATOMIC] SIM ${sim.iccid}: reconciled ${sim.msisdn} → ${attMsisdn} (${sim._parked ? 'parked' : 'pending'})`);
+        continue;
+      }
+
+      // (c) Active + SAME MDN → for a parked SIM, our DB already agrees with AT&T; un-park it
+      //     so the normal rotation batch picks it up (it was only stuck on the stale swap-from).
+      if (attStatus === 'active' && attMsisdn && attMsisdn === sim.msisdn && sim._parked) {
+        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          status: 'active', rotation_status: 'success', rotation_fail_count: 0, last_rotation_error: null,
+        });
+        results.push({ iccid: sim.iccid, ok: true, note: 'unparked (active, in sync)' });
+        continue;
+      }
+
+      // (d) Pending bucket with no usable change → existing stuck-timeout behavior.
+      if (!sim._parked) {
         if (ageMin >= STUCK_MINUTES) {
           failed++;
           await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
             rotation_status: 'failed',
             status: 'active',
-            last_rotation_error: `ATOMIC inquiry: MDN unchanged within ${STUCK_MINUTES}m (got ${newMsisdn || 'null'})`,
+            last_rotation_error: `ATOMIC inquiry: MDN unchanged within ${STUCK_MINUTES}m (got ${attMsisdn || 'null'})`,
           });
           results.push({ iccid: sim.iccid, ok: false, note: 'timeout' });
         } else {
@@ -1025,32 +1137,8 @@ async function runAtomicFinalizer(env, limit) {
         continue;
       }
 
-      const e164 = `+1${newMsisdn}`;
-
-      // Offline for old MDN (only on rotation, not first activation).
-      if (sim.msisdn && sim.msisdn !== newMsisdn) {
-        try {
-          await sendNumberOfflineWebhook(env, sim.id, normalizeUS(sim.msisdn), sim.iccid, sim.msisdn, e164);
-        } catch (offErr) {
-          console.error(`[Finalizer/ATOMIC] SIM ${sim.id}: number.offline failed: ${offErr}`);
-        }
-      }
-
-      await closeCurrentNumber(env, sim.id);
-      await insertNewNumber(env, sim.id, e164);
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-        msisdn: newMsisdn,
-        status: 'active',
-        rotation_status: 'success',
-        last_rotation_at: new Date().toISOString(),
-        last_rotation_error: null,
-      });
-
-      await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, newMsisdn);
-
-      synced++;
-      results.push({ iccid: sim.iccid, ok: true, mdn: e164, kind: 'post-rotation-recovery' });
-      console.log(`[Finalizer/ATOMIC] SIM ${sim.iccid}: reconciled ${sim.msisdn} → ${newMsisdn}`);
+      // (e) Parked bucket, inquiry not Active / null MDN → skip, retry next tick.
+      results.push({ iccid: sim.iccid, ok: false, note: `no-action (attStatus=${attStatus || 'unknown'}, mdn=${attMsisdn || 'null'})` });
     } catch (e) {
       errors++;
       results.push({ iccid: sim.iccid, ok: false, error: String(e) });
@@ -1058,7 +1146,7 @@ async function runAtomicFinalizer(env, limit) {
     }
   }
 
-  return { ok: true, processed, synced, errors, failed, results };
+  return { ok: true, processed, synced, escalated, errors, failed, results };
 }
 
 /* ── Rotation Review (daily 12:30 UTC) ────────────────────────────────────── */
