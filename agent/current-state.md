@@ -1,9 +1,45 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-26 (session 61 — relay-outage remediation + rotation hardening)
+> Last updated: 2026-06-01 (session 63 — INC-2 rental→PROD, rotation reliability, ATOMIC self-heal, carrier escalations)
 
 ---
+
+## Session 63 (2026-06-01) — INC-2 rental → PROD; rotation window/cap; ATOMIC desync self-heal; carrier escalations
+
+### INC-2 rental billing — CUT OVER TO PRODUCTION
+- **Dashboard invoice preview + "Download for QuickBooks" now DEFAULT to the rental engine.** Old "Rental mode (TEST)" checkbox → **"Use legacy billing (compare)"** (checked = legacy SIM-day/block engine). `downloadInvoiceIIF` + the `/billing/download-invoice` generate route now honor `billing_mode` (was always legacy). Legacy engine untouched = dormant fallback. Prod dashboard `98e379ce`.
+- **Rental capture LIVE in prod**: `RENTAL_CAPTURE_ENABLED=true` in `src/reseller-sync/wrangler.toml` (top-level=prod vars). reseller-sync `4146c1c1`. Mints one rental per sim_numbers lifetime on the cron sync path; resend path never mints; `UNIQUE(reseller_id, sim_number_id)` guards.
+- **Removed the forward-only cutover CLAMP** from `computeRentalBilling` (`src/shared/rentals.js`): `effectiveStart = start` (was `max(start, RENTAL_CUTOVER_DATE)`). The preview/calculator now bills the EXACT requested window in either engine — no date limit. Per user: the cutover is an operational choice (don't re-issue agreed invoices), NOT a calculator limit.
+- **Rentals backfill extended to 5/29** (reseller 3) from authoritative "Rental created" 200 responses (response_body has `rentalId`), dated by `payload.created_at` EST, mapped to sim_number lifetime. +2,786 rows → **20,215 total**. Filled the 5/28–5/29 capture gap (2,489 = **$3,488.90**) + 297 historical confirmed rentals the per-lifetime backfill missed. 0 unmapped, 0 dup lifetimes, all new rows carry trustotp_id.
+
+### Rotation reliability (separate PR → merged to main + deployed)
+- **Window 6am → 9am NY**: `isInsideRotationWindowNY()` h<=5 → h<=8 in **mdn-rotator AND teltik-worker**; crons `4-11` → `4-14` UTC (both wrangler.toml).
+- **5-strike fail cap** (was 3): migration `migrations/20260531_rotation_fail_cap_5.sql` (`increment_rotation_fail` threshold 3→5; at cap sets `status='rotation_failed'` → drops from the `status=active` batch). mdn-rotator wing stuck-remediation query now excludes `rotation_fail_count >= 5`. teltik failures now route through `increment_rotation_fail` (added `getNYMidnightISO` helper) for the same counted cap.
+- Deployed: mdn-rotator `3f39b528` then `f90de5e6`; teltik-worker `727d7ef8`.
+
+### Dashboard "Rotation Freshness" panel (rebuilt)
+- New DB function `public.rotation_freshness()` (per-vendor total/fresh/stale). **fresh** = client-assigned SIM whose CURRENT number has a `number.online` delivery returning 200 + rentalId within the carrier window (att 24h / tmobile 48h). **total** = any active reseller link, any sim status. Replaced the old `last_notified_at`-based count in dashboard `handleStats`.
+
+### ATOMIC DB↔carrier MDN desync AUTO-HEAL (new, deployed)
+- **Cause:** swapMSISDN errors on our side but commits at AT&T → DB holds stale MDN, AT&T has subscriber Active under a different number → rotation fails "sim/MSISDN is Inactive" forever → parks at the 5-strike cap.
+- **Fix A (preventive, mdn-rotator `rotateAtomicSim`):** pre_swap_inquiry already returns AT&T's live MDN + attStatus; now if attStatus=Active and AT&T MDN ≠ `sims.msisdn`, adopt it as swap-from (`currentMsisdn` is `let`) + persist. Next rotation self-corrects.
+- **Fix B (curative, details-finalizer `runAtomicFinalizer`):** added parked-desync candidate bucket + attStatus gate. Active+diff MDN → reconcile (offline/online webhooks, sim_numbers rewrite, status=active/success, rotation_fail_count=0) with collision guard; Active+same → un-park; Cancelled/Suspended/Deactivated → flag (`pending_review_items` kind `atomic_mdn_desync`) + `rotation_eligible=false`; inquiry error → skip. Closes a latent bug (old code would've "healed" a cancelled SIM to a stale number). details-finalizer `7860f657` then `472bfbd1` (bugfix: `pending_review_items.run_id` is **uuid** — pass `null`, not a string; insertPendingItem swallows the error).
+
+### Manual SIM fixes this session
+- **9697 / 9727** (atomic desync): reconciled DB to AT&T's live MDN + force-rotated → active/success.
+- **7 of 21 stuck Wing IoT SIMs** recovered via force-rotate (1119 + 6 from the sweep).
+
+### Carrier escalations (Slack drafts written, NOT auto-sent)
+- **ATOMIC → Wing Alpha (dan@wingalpha.com):** 6 SIMs the carrier cancelled/suspended, not API-recoverable: **1067/770/771/994/743 Cancelled, 688 Suspended**. AT&T records inconsistent (inquiry vs reconnect disagree on MDN). All `rotation_eligible=false` + open `pending_review_items` (kind atomic_mdn_desync). Triggered by ~5/29 AT&T swapMSISDN backend errors (TPESYSTEM/Jolt csChgSub00).
+- **Wing IoT → Wing Tel (SUBNINE):** **14 SIMs stuck** — AT&T plan-change PUT (→ABIR) intermittently 500s (`Unknown server error / 30000001`) or accepts-but-never-commits. ~1/3 succeed on retry. **Left PARKED pending Wing Tel response (user decision).** Still on working dialable numbers. ICCID/MDN list in the session transcript / Slack draft.
+
+### Prod deploy versions (all from `main`): dashboard `98e379ce`, reseller-sync `4146c1c1`, mdn-rotator `f90de5e6`, teltik-worker `727d7ef8`, details-finalizer `472bfbd1`.
+
+### PENDING / KNOWN ISSUES
+- **14 Wing IoT SIMs parked** pending Wing Tel fixing the intermittent plan-change endpoint. Re-sweep (`/rotate-sim?force=true`) or re-enable for nightly retry once confirmed.
+- **6 ATOMIC SIMs** (1067/770/771/994/743 cancelled, 688 suspended) pending Wing Alpha reactivation; `rotation_eligible=false` until then.
+- **`feat/inc-2-rental-billing` working tree has uncommitted WIP (NOT deployed):** a stuck-inventory report in `details-finalizer` `runRotationReview` + a circuit breaker on the mdn-rotator `/remediate-stuck-wing` HTTP handler. Plus now-redundant copies of the rotation window/cap edits (already in main/deployed). Decide whether to finish/commit or discard. Prod runs from `main`, which does NOT include this WIP.
 
 ## Session 62 (2026-05-27) — INC-2 rental billing: test enablement (gated, board-approved)
 

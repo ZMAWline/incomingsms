@@ -4,6 +4,36 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-06-01 — Rental billing calculator has NO cutover clamp; cutover is operational only
+
+**Decision:** `computeRentalBilling` (`src/shared/rentals.js`) uses `effectiveStart = start` — it no longer clamps the requested window up to `RENTAL_CUTOVER_DATE` (2026-05-22). The preview/calculator bills the exact `[start, end]` range in either engine, any date. The dashboard invoice preview + "Download for QuickBooks" generate route now DEFAULT to the rental engine; a **"Use legacy billing (compare)"** checkbox switches to legacy. Legacy engine/code is kept intact (dormant fallback), not removed.
+
+**Why:** Per the owner, the "cutover" only means "we don't re-issue already-agreed invoices" — a process choice, not a limit on what the calculator can compute. A 5/15–5/21 preview returning $0 (because the clamp pushed start past end) was a bug, not a feature. `RENTAL_CUTOVER_DATE` is now only a fallback when no `start` is supplied.
+
+**Consequence:** Do NOT re-add the `max(start, floor)` clamp to `computeRentalBilling`. Generating a rental invoice for an already-invoiced pre-5/22 period is now *possible*; the guardrail is procedural. Rental capture is LIVE in prod (`RENTAL_CAPTURE_ENABLED=true`), so the `rentals` table populates going forward; the calculator reads it directly.
+
+---
+
+## 2026-06-01 — ATOMIC rotation trusts AT&T's inquiry MDN over our DB (desync self-heal)
+
+**Decision:** Both the rotator (`rotateAtomicSim`, Fix A) and the finalizer (`runAtomicFinalizer`, Fix B) treat the AT&T `subsriberInquiry` result as the source of truth for an ATOMIC SIM's current MDN. If `attStatus=Active` and AT&T's MDN differs from `sims.msisdn`, adopt AT&T's number (rotator: as swap-from + persist; finalizer: full reconcile + reseller webhooks + `rotation_fail_count=0`). The finalizer reconcile is **gated on `attStatus=Active`** — Cancelled/Suspended/Deactivated are NOT healed; they're flagged (`pending_review_items` kind `atomic_mdn_desync`) and `rotation_eligible=false`.
+
+**Why:** An "uncertain swap" (swapMSISDN errors on our side but commits at AT&T) leaves our DB with a stale MDN; rotation then fails "sim/MSISDN is Inactive" forever and parks at the 5-strike cap. AT&T's inquiry already runs every rotation (Fix A is zero extra cost). The attStatus gate fixes a latent bug where the old finalizer would "heal" a cancelled SIM onto a stale number.
+
+**Consequence:** The attStatus gate is load-bearing — do not reconcile on MDN-difference alone. `pending_review_items.run_id` is a **uuid** column; pass `null` from the finalizer (no cron_runs row), not a synthetic string, or the insert is silently rejected. Carrier-cancelled ATOMIC SIMs are NOT auto-recoverable — they need a Wing Alpha (dan@wingalpha.com) reactivation, not an API retry.
+
+---
+
+## 2026-06-01 — Rotation parks a SIM after 5 fails; Wing IoT plan-switch flakiness left to escalation
+
+**Decision:** `increment_rotation_fail` threshold raised 3→5 (`migrations/20260531_rotation_fail_cap_5.sql`); rotation window extended to 9am NY (mdn-rotator + teltik; crons `4-11`→`4-14`). After 5 same-day fails a SIM parks at `status='rotation_failed'` (out of the `status=active` batch); the wing stuck-remediation query excludes `rotation_fail_count>=5`. teltik failures now route through `increment_rotation_fail` for the same cap. When AT&T's Wing Tel plan-change endpoint is intermittently failing (500 `30000001` / accept-but-no-commit), stuck SIMs are escalated to Wing Tel and left parked rather than mass-retried.
+
+**Why:** Before the cap, wing SIMs hit fail counts of 60–73 hammering a flaky AT&T endpoint. ~1/3 of plan-switches succeed on retry, so it's a carrier reliability problem. The owner chose to wait on Wing Tel rather than burn attempts.
+
+**Consequence:** Parked SIMs (rotation_failed) need a manual `/rotate-sim?force=true` sweep or a re-enable (`status=active, rotation_fail_count=0, rotation_eligible=true`) to retry — the normal batch won't pick them up. Verify-timeout wing failures leave the SIM on its original dialable number (AT&T didn't commit), so they're safe to re-attempt; don't assume a verify-failure left the SIM on ABIR without checking.
+
+---
+
 ## 2026-05-26 — `last_mdn_rotated_at` is restored on failure only when no MDN was consumed
 
 **Decision:** `claim_rotation_slot` still stamps `last_mdn_rotated_at` up front (it is the dedup lock — written before any carrier call so two cron ticks can't both rotate the same SIM). But the rotation functions now *restore* it to its pre-claim value when they fail **before the MDN actually changes**. Boundary per vendor: wing restores on ANY throw (all wing failures are before the dialable PUT's 202); atomic restores only at the 3 pre-swap-success throw sites (pre-swap inquiry, swap HTTP error, swap statusCode≠00) via `restoreRotationStamp()`. Atomic failures AFTER `swapMSISDN` returns `00` deliberately KEEP the stamp.
