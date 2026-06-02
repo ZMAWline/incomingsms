@@ -1,225 +1,241 @@
-# INC-3 — Failed-rental reporting/reset workflow (design)
+# INC-3 — Bad-rental reporting & remediation workflow (design, revised)
 
 Status: **proposal, awaiting board approval**
 Author: IncomingSMS CEO
-Date: 2026-06-02
-Related: INC-2 (rental billing capture, just enabled), reseller-portal-resend (2026-05-25)
+Date: 2026-06-02 (rev 2)
+Related: INC-2 (rental billing capture, in production), reseller-portal-resend (2026-05-25)
 
-## 1. Problem & business framing
+## Scope correction (2026-06-02)
 
-Reseller (TrustOTP/Maxim) reconciliation for the recent period:
+Earlier draft proposed *us-detecting* dead rentals and pushing to the reseller. Per operator clarification:
 
-- Their total: **$11,326**, our total: **$11,521**, delta **$195**.
-- Maxim's read: most of the remaining delta is **rentals/numbers that never worked** — rentals they paid for but received zero SMS on.
-- They counted **54 rentals in the period that never received any SMS**.
-- They want a way to **find these fast and reset the port / line** so they're not paying for dead inventory.
-- They proposed three shapes: outbound webhook from us, a queryable endpoint, or a reset endpoint they call. Suggested trigger: **3–5 send intents with no SMS received**.
+- **Do not chase the historical 54 rentals.** That invoice is closed; the reseller accepts it.
+- **Do not reopen INC-2.** Legacy billing math and the INC-2 capture stay untouched.
+- The actual ask: a **future-facing reporting channel** — the **reseller reports a bad rental/number to us** quickly during the rental period, so we can **fix/reset/remediate while it still matters**, instead of finding out during the next reconciliation.
+- This is operational hygiene, not invoice dispute infrastructure.
 
-Reconciliation math sanity-check: 54 rentals × ~$1.10–$1.60 (AT&T/T-Mobile flat rental rate) ≈ **$59–$86**. That alone does not close the $195 delta — but it explains a *meaningful slice* and gives them an operational fix path. The rest of the delta still needs the standard rental-by-rental diff (already in progress against the INC-2 capture). So this workstream is **partial reconciliation + operational hygiene**, not a closer of the whole delta.
+Everything below is rewritten against that scope.
 
-Why this matters now: per-rental flat-rate billing (INC-2) means a dead rental is a **full unit of billable revenue we cannot defend** if the reseller has evidence it never carried traffic. We need to surface dead inventory before they do.
+## 1. Goal & success criteria
 
-## 2. Definition of "non-working rental"
+When a rented number isn't working for the reseller, they should be able to **tell us in seconds** and **see what we did about it** before the rental period ends. Success looks like:
 
-A rental row in `rentals` (the INC-2 capture table) with all of:
+- Reseller has a single endpoint to POST "this rental is bad" with the rental id and a short reason.
+- We acknowledge immediately, queue a triage action, and post back a status (`received → in_triage → remediated{action} | unable_to_reproduce | replaced | refund_pending`).
+- Operator (Zalmen) sees a single "Bad Rental Reports" queue in the dashboard, with one-click remediation buttons that reuse existing tools (`/rotate-sim?force=true`, port reset, suspend).
+- The number of bad rentals that survive into the next reconciliation drops to ~0 — not because we hunt them, but because the reseller tells us first.
 
-| Field | Source | Definition |
-|---|---|---|
-| `rental_id` | `rentals.id` | INC-2 row, one per `(reseller_id, sim_number_id)` lifetime |
-| `e164` | `rentals.e164` | The MDN the reseller paid for |
-| `minted_at` | `rentals.minted_at` | When we acknowledged the rental |
-| `sms_count` | derived from `sms_messages` joined on `sim_number_id` (or e164 fallback) | Inbound SMS received on this number lifetime |
-| `first_sms_at` | derived | min(received_at) over the lifetime |
-| `age_minutes` | now − minted_at | |
+Non-goals: automatic credits, automatic invoice adjustments, automatic suspension. Operator decisions, recorded as evidence.
 
-Candidate flag: `sms_count = 0 AND age_minutes >= GRACE_MIN`.
+## 2. Intake contract (reseller → us)
 
-Two phases of "non-working" we will distinguish in output:
+**Endpoint:** `POST /api/v1/rentals/report-bad` on the **reseller-portal** worker (existing auth surface, same key the reseller already holds).
 
-- **`suspect`** — `sms_count = 0` and `age_minutes ∈ [GRACE_MIN, CONFIRM_MIN)`. May still recover; surface for monitoring only.
-- **`confirmed_dead`** — `sms_count = 0` and `age_minutes ≥ CONFIRM_MIN`. Eligible for credit/reset.
-
-Default thresholds (proposed, board-tunable as data, not code):
-
-- `GRACE_MIN = 60` (1h) — covers gateway/route bring-up latency.
-- `CONFIRM_MIN = 360` (6h) — a SIM that received zero SMS in 6 hours on an active OTP route is dead inventory by any reasonable read. Reseller asked for "3–5 send intents"; we don't see their intents, so we proxy on elapsed time on an active rental.
-
-Both thresholds are stored in `qbo_customer_map` or a new tiny `reseller_settings` row, not constants — so per-reseller tuning doesn't ship code.
-
-### False-positive guardrails
-
-1. **Exclude rentals whose `sim_numbers` row is no longer current** (already rotated): the new lifetime gets a new rental row, the old one is correctly "done", not "dead".
-2. **Exclude rentals on SIMs the reseller has already returned/cancelled** (assignment ended).
-3. **Exclude SIMs in `rotation_failed`, `barred`, or operator-known stuck cohorts** — surface separately so they don't pollute the dead list; we already know about those.
-4. **Exclude rentals minted in the last `GRACE_MIN`** unconditionally.
-5. **Cap per-call result size** at e.g. 500 to avoid runaway lists.
-
-## 3. API/webhook design — three shapes the reseller proposed
-
-### Option A — outbound webhook (us → them) — **recommended**
-
-Push the same way `number.online` already works for SMS notifications. New event type `rental.suspect` and `rental.dead` (two-stage notify) posted to a per-reseller URL.
-
-Payload:
-```
+**Body (one report per request):**
+```json
 {
-  "event": "rental.dead",
-  "rental_id": 123456,
-  "reseller_rental_id": "trustotp-xyz",     // when known
-  "e164": "+1...",
-  "carrier": "att",
-  "minted_at": "2026-06-01T18:22:00Z",
-  "age_minutes": 367,
-  "sms_count": 0,
-  "incomingsms_status": "active" | "rotation_failed" | "barred"
+  "rental_id": 123456,                 // OUR rentals.id, optional but preferred
+  "reseller_rental_id": "trustotp-xyz",// THEIR id; used if rental_id not given
+  "e164": "+15551234567",              // required if neither id is given
+  "reason_code": "no_sms_received",    // enum, see below
+  "reason_note": "3 send attempts, no SMS in 30 min", // optional, free text, <500 chars
+  "attempts": 3,                       // optional: their send-attempt count
+  "first_attempt_at": "2026-06-02T17:00:00Z",  // optional
+  "client_request_id": "<uuid>"        // optional, for their idempotency
 }
 ```
 
-Pros:
-- Same shape they already integrate (`number.online` webhooks).
-- Push = they react in seconds, not on a poll interval.
-- Idempotent: keyed on `(event, rental_id)`; we won't re-fire `rental.dead` for the same rental.
+**reason_code enum (v1):**
+- `no_sms_received` — most common: rental minted, no SMS arrived.
+- `wrong_number` — receiving SMS for a different account/service.
+- `delayed_sms` — SMS arrives too late to be useful.
+- `other` — free-text required in `reason_note`.
 
-Cons:
-- We have to track delivery (extend `webhook_deliveries` with the new event_type).
-- New customer-facing surface — needs partner sign-off before live.
+**Identification rule:** at least one of `rental_id`, `reseller_rental_id`, `e164` is required. Resolution order: `rental_id` → `reseller_rental_id` (lookup in `rentals`) → most recent active rental for `e164` belonging to that reseller. Ambiguous/missing → `400` with a clear error code.
 
-### Option B — queryable endpoint (they pull) — **recommended as Phase 1**
-
-`GET /api/resellers/{id}/non-working-rentals?status=dead&since=...` returning a JSON list. Reads cheaper, lower partner-integration risk than a webhook, lives behind the same auth they already use (reseller portal API key).
-
-Pros:
-- **No customer-facing push behavior to approve.** Same auth boundary as the existing portal — internal scope.
-- Lets us validate the detection logic against real data with zero coupling to their system.
-- Trivially also drives the dashboard view (Phase 1.5).
-
-Cons:
-- Pull cadence is theirs; "instant" depends on how often they poll.
-
-### Option C — reset endpoint we call — **defer**
-
-`POST /api/resellers/{id}/rentals/{rental_id}/reset` would mark the rental as dead, issue a credit, and either rotate the SIM or hand back the slot. This is **billing-affecting** and **operates on production inventory**. It should not be in v1.
-
-Phase-3 candidate if A+B prove the detection is accurate. Until then, the operator (Zalmen) handles resets manually using existing port-reset / `/rotate-sim?force=true` tools, informed by Option B's list.
-
-### Recommended sequencing
-
-1. **Phase 1 (this week):** Option B — read-only endpoint + dashboard tab + nightly counts in the rotation review. **No customer-facing behavior, can ship without partner approval.**
-2. **Phase 2:** Option A — outbound webhook to TrustOTP for `rental.dead`. Requires partner sign-off on payload + URL.
-3. **Phase 3 (later, separate approval):** Option C — reset action. Requires legal/billing review; touches credits.
-
-## 4. Auth, security, rate limits
-
-- Endpoint lives on the existing **reseller-portal** worker (already auth'd by reseller API key, already deployed at `portal.incoming-sms.com`).
-- Per-reseller scope enforced at query time — a reseller can only see their own rentals (same pattern as the resend endpoint).
-- Rate limit: 60 req/min/reseller via Cloudflare worker bindings; the list is small and cheap to compute.
-- No PII beyond MDN + rental id (data they already have).
-- Outbound webhook (Phase 2): HMAC-signed payload, retry with backoff, recorded in `webhook_deliveries` with new `event_type = 'rental.dead'`. Same delivery semantics as today.
-
-## 5. Detection logic — implementation sketch
-
-Single PostgREST view + RPC, called by both the dashboard and the new endpoint:
-
-```sql
-CREATE OR REPLACE VIEW rental_health AS
-SELECT
-  r.id              AS rental_id,
-  r.reseller_id,
-  r.sim_id,
-  r.sim_number_id,
-  r.e164,
-  r.carrier,
-  r.minted_at,
-  r.reseller_rental_id,
-  COALESCE(m.sms_count, 0)             AS sms_count,
-  m.first_sms_at,
-  EXTRACT(EPOCH FROM (now() - r.minted_at))/60 AS age_minutes,
-  s.status                              AS sim_status,
-  sn.is_current                         AS lifetime_is_current
-FROM rentals r
-JOIN sims s            ON s.id = r.sim_id
-JOIN sim_numbers sn    ON sn.id = r.sim_number_id
-LEFT JOIN LATERAL (
-  SELECT COUNT(*)::bigint AS sms_count, MIN(received_at) AS first_sms_at
-  FROM sms_messages
-  WHERE sim_number_id = r.sim_number_id     -- preferred join
-) m ON true;
+**Response (200):**
+```json
+{
+  "report_id": 4521,
+  "rental_id": 123456,
+  "e164": "+15551234567",
+  "status": "received",
+  "queued_at": "2026-06-02T17:32:01Z",
+  "expected_first_action_within_minutes": 60
+}
 ```
 
-(Exact column names verified against `sms_messages` before code; `sim_number_id` may need to be derived via e164+sim_id if not denormalized.)
+**Errors:** standard `4xx` with `{error_code, message}`. `409` on duplicate active report for the same `rental_id` within the last 24h — return the existing `report_id` (idempotent for the reseller's retries).
 
-Then a thin RPC `get_non_working_rentals(p_reseller_id, p_status, p_since)` applies the thresholds and the false-positive guardrails from §2.
+## 3. Status feedback (us → reseller)
 
-## 6. Dashboard / test-environment visibility
+Two channels, both off the same source of truth:
 
-New tab on the dashboard: **"Dead Inventory"** (gated to operator role).
+### 3.1 Pull (Phase 1)
+`GET /api/v1/rentals/reports?status=open|all&since=...` returns the reseller's own reports with current status. Same auth.
 
-- Default view: confirmed dead rentals for the last 7 days, by reseller.
-- Columns: rental_id, reseller_rental_id, e164, carrier, age, sim_status, last action (rotate / reset / credit).
-- Row actions (operator only): "rotate now" (uses existing `/rotate-sim?force=true`), "mark resolved" (writes a note to a new `rental_notes` row — does NOT mutate the rental itself).
-- All UI changes go through the `patch-dashboard` skill (hard rule).
+`GET /api/v1/rentals/reports/{report_id}` for a single report.
 
-Test environment first: `--env test` deploy of reseller-portal exposes the endpoint at the test domain; dashboard-test reads the same view. We will **not** wire the production endpoint until operator + reseller have validated the list against the 54-rental period.
+### 3.2 Push (Phase 2, separate approval — partner sign-off required)
+Optional outbound webhook on status transitions to a URL the reseller registers. Same delivery pipeline as `webhook_deliveries` (event_type `rental.report.status`). Defaults off; enabled per-reseller in `qbo_customer_map`.
 
-## 7. Tie-back to the $195 / 54-rental reconciliation
+### Status lifecycle
+```
+received
+   ↓ (operator picks up)
+in_triage
+   ↓                              ↓                              ↓
+remediated{action}        unable_to_reproduce            duplicate
+   action ∈ {rotated, port_reset, sim_replaced, mdn_swapped, other}
+```
 
-- Re-run the 54-rental list through the new view as the **first verification of detection accuracy**: any rental the reseller flagged as dead should appear `confirmed_dead` (or have a defensible reason it doesn't — e.g., rotated since, status changed).
-- Counted slice: 54 dead × per-carrier rate from `reseller_rental_rates` → expected $ impact. Compare to $195. The residual (≈$110–$135) likely lives in the same reconciliation buckets we're already chasing in the INC-2 forward-only window: rotation-timing edge cases, late notifications, and rentals minted on one side but not the other.
-- Outcome of this exercise becomes evidence in the next reseller bill discussion; it is **not** a basis for auto-credits in this phase.
+Each transition writes a `rental_report_events` row with `actor` (operator id or `system`), `note`, `evidence` (e.g., remediation_attempts.id, new sim_number_id). Reseller sees the latest status; not the operator's internal notes.
 
-## 8. Exact implementation steps & files
+## 4. Triage & remediation flow (internal)
 
-Phase 1 (read-only, the only phase this proposal asks approval for):
+1. Intake handler validates payload, resolves the rental, inserts `rental_reports` row with status `received`, returns `200`.
+2. Same handler **also** enqueues an `operator_inbox` notification (no automatic remediation in v1 — operator must approve every action).
+3. Operator opens the "Bad Rental Reports" dashboard tab → sees the new row at the top.
+4. One-click actions reuse existing endpoints (no new remediation primitives):
+   - **Rotate** → `POST /rotate-sim?sim_id=&force=true`
+   - **Port reset** → existing Teltik/Skyline port reset action per vendor
+   - **Replace SIM** → mark current sim_number for retirement; assign next from pool (existing pool-refill flow)
+   - **Mark unable to reproduce** → close report with that status + note
+   - **Mark duplicate** → link to an existing report
+5. Each action writes to the report's event log and updates status. The remediation itself uses the existing tools — no new code paths there, just wiring.
 
-1. **Schema (Supabase migration)** — `supabase/migrations/2026XXXX_rental_health.sql`:
-   - View `rental_health` (above).
-   - RPC `get_non_working_rentals(p_reseller_id bigint, p_status text, p_since timestamptz)`.
-   - Tiny `reseller_settings` row OR two new columns on `qbo_customer_map` for `dead_grace_min`, `dead_confirm_min` (default 60 / 360).
+**SLA target (advisory, not contractual in v1):** first action within 60 minutes during business hours, 8 hours overnight. Exposed as `expected_first_action_within_minutes` in the intake response so the reseller has a number to quote.
+
+## 5. Data model
+
+One small migration (`supabase/migrations/2026XXXX_rental_reports.sql`):
+
+```sql
+CREATE TABLE rental_reports (
+  id BIGSERIAL PRIMARY KEY,
+  reseller_id BIGINT NOT NULL REFERENCES resellers(id) ON DELETE CASCADE,
+  rental_id  BIGINT NULL REFERENCES rentals(id) ON DELETE SET NULL,
+  sim_id     BIGINT NULL REFERENCES sims(id)    ON DELETE SET NULL,
+  e164       TEXT NOT NULL,
+  reason_code TEXT NOT NULL CHECK (reason_code IN ('no_sms_received','wrong_number','delayed_sms','other')),
+  reason_note TEXT NULL,
+  attempts INT NULL,
+  first_attempt_at TIMESTAMPTZ NULL,
+  client_request_id TEXT NULL,
+  status TEXT NOT NULL DEFAULT 'received'
+    CHECK (status IN ('received','in_triage','remediated','unable_to_reproduce','duplicate')),
+  remediation_action TEXT NULL
+    CHECK (remediation_action IN ('rotated','port_reset','sim_replaced','mdn_swapped','other') OR remediation_action IS NULL),
+  duplicate_of BIGINT NULL REFERENCES rental_reports(id) ON DELETE SET NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  triaged_at TIMESTAMPTZ NULL,
+  closed_at TIMESTAMPTZ NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_rental_reports_open  ON rental_reports (reseller_id, status) WHERE status IN ('received','in_triage');
+CREATE INDEX idx_rental_reports_rental ON rental_reports (rental_id);
+CREATE INDEX idx_rental_reports_e164   ON rental_reports (e164);
+
+-- Idempotency: one open report per rental per reseller at a time.
+CREATE UNIQUE INDEX uq_rental_reports_open
+  ON rental_reports (reseller_id, rental_id)
+  WHERE status IN ('received','in_triage') AND rental_id IS NOT NULL;
+
+CREATE TABLE rental_report_events (
+  id BIGSERIAL PRIMARY KEY,
+  report_id BIGINT NOT NULL REFERENCES rental_reports(id) ON DELETE CASCADE,
+  from_status TEXT NULL,
+  to_status   TEXT NOT NULL,
+  actor       TEXT NOT NULL,   -- 'reseller' | 'operator:<id>' | 'system'
+  note        TEXT NULL,
+  evidence    JSONB NULL,      -- e.g. {"remediation_attempt_id": 123}
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Both tables get RLS enabled. No new columns on existing tables; INC-2 schema untouched.
+
+## 6. Auth, security, abuse controls
+
+- **Auth:** existing reseller portal API key (`portal.incoming-sms.com` middleware). Per-reseller scope enforced at query — a reseller can only read/write their own reports.
+- **Rate limit:** 60 reports/min/reseller, 1000/day. Plenty of headroom for a real outage; tight enough to flag a runaway client.
+- **Anti-abuse:** the `uq_rental_reports_open` index makes "report the same rental 100x" a no-op (returns the existing `report_id`). A reseller cannot use the endpoint to flood the queue against arbitrary numbers — they can only report rentals they own.
+- **Audit:** every status transition writes a `rental_report_events` row, including reseller-initiated reports (`actor='reseller'`). Full chain of custody.
+- **No PII** beyond MDN — already shared in the existing webhook stream.
+
+## 7. Dashboard tab — "Bad Rental Reports"
+
+Patched into `src/dashboard/index.js` via the **patch-dashboard** skill (required for any dashboard change).
+
+- Default view: open reports (status `received` or `in_triage`), reseller column, e164, reason, age, action buttons.
+- Filter by reseller, status, age.
+- Row-expand shows the event log and links to the underlying rental, SIM, and any remediation attempt rows.
+- Operator-only; uses the existing dashboard auth.
+
+Test-environment first: deploy via `--env test` (verify domain bindings — known footgun, see memory `wrangler-test-env-inherits-custom-domain`).
+
+## 8. Tie-back to billing — *how this prevents future discrepancies*
+
+This is the connective tissue, not a re-opening of INC-2:
+
+- Today, a bad rental is silently billed and surfaces weeks later as a reconciliation delta.
+- With this flow, a bad rental gets a **timestamped report + remediation record during the period**. Three downstream consequences (all gated, none automatic in v1):
+  1. **Operator can offer a same-period credit** if the remediation didn't help — decided per case, recorded as a note on the rental.
+  2. **Reconciliation has evidence**: at month-end, the rental_reports table is the single source of truth for "rentals the reseller flagged." No more back-and-forth on whether they reported it.
+  3. **Pattern detection (later):** clusters of reports on the same SIM/carrier/route surface inventory or vendor problems faster than they would from billing alone.
+
+Phase 1 builds the **evidence channel**. Auto-credit policy is a separate, later proposal.
+
+## 9. Phasing
+
+**Phase 1 (this proposal, asks approval):** intake endpoint, `rental_reports` + `rental_report_events` tables, status pull endpoints, dashboard tab, manual remediation only. **No customer-facing automation. No invoice changes.** Test-env first.
+
+**Phase 2 (separate approval):** outbound webhook for status transitions to the reseller (partner sign-off required on payload + URL).
+
+**Phase 3 (separate approval, billing review):** auto-credit policy for rentals whose reports closed `remediated` after >Xh, or `unable_to_reproduce` with operator concurrence.
+
+## 10. Exact implementation steps & files (Phase 1)
+
+1. **Migration** — `supabase/migrations/2026XXXX_rental_reports.sql` (schema above).
 2. **Worker** — `src/reseller-portal/index.js`:
-   - New route `GET /api/v1/non-working-rentals?status=dead|suspect|all&since=...`.
-   - Auth via existing reseller API key middleware.
-   - Calls the RPC, returns JSON.
-3. **Dashboard** — `src/dashboard/index.js` (via `patch-dashboard` skill):
-   - New "Dead Inventory" tab with the columns above.
-   - Hits the same RPC (via existing PostgREST bridge), not the reseller-portal worker — operator view is internal.
-4. **Rotation review tie-in** — `src/details-finalizer/index.js`:
-   - Add a `dead_inventory_today` count to the nightly report (this closes the rotation-review under-counting blind spot for this specific failure mode — a dead rental is not the same as a rotation failure, but the operator should see both).
-5. **Docs** — `agent/decision-log.md` entry on thresholds & why they're data not code; `agent/project-map.md` updates for the new view/RPC.
+   - `POST /api/v1/rentals/report-bad` — intake handler (validate, resolve rental, insert, idempotency on open report).
+   - `GET  /api/v1/rentals/reports[?status=&since=]` — list.
+   - `GET  /api/v1/rentals/reports/{id}` — detail.
+3. **Dashboard** — `src/dashboard/index.js` via **patch-dashboard** skill:
+   - "Bad Rental Reports" tab with the columns + actions described in §7.
+   - Action buttons call existing endpoints, write a `rental_report_events` row, update status.
+4. **Operator notifier (optional, tiny)** — `src/details-finalizer/index.js`: include `open_rental_reports` count in the nightly rotation review. Same channel operators already read.
+5. **Docs** — `agent/decision-log.md` entry on the SLA target, why operator-only in v1, and the explicit non-goal of auto-credits.
 
-Phase 2 (outbound webhook) — **separate approval**, scope-locked here:
-- Extend `webhook_deliveries.event_type` enum.
-- New scheduled cron in details-finalizer that diffs `rental_health` against an `outbound_dead_notifications` table and fires the webhook once per `(reseller_id, rental_id)`.
-- Partner sign-off on payload + URL.
+Nothing in `src/sms-ingest/`, no change to `rentals`/`reseller_rental_rates`/`webhook_deliveries`, no change to billing math, no flag flips, no production deploy until §11 verification passes.
 
-Phase 3 (reset endpoint) — **separate approval, billing review required**, scope-locked here.
+## 11. Verification plan
 
-## 9. Verification plan
+1. Apply migration to **dashboard-test** Supabase project only.
+2. Deploy `reseller-portal` and `dashboard` with `--env test` (verify custom domain bindings post-deploy).
+3. **Synthetic intake test:** post a fake report against a known test-env rental; confirm the row inserts, the dashboard surfaces it, and idempotency holds on retry.
+4. **Operator dry-run:** click each remediation action against a test-env SIM; confirm the action runs, the report status flips, and `rental_report_events` records correct evidence.
+5. **Auth fuzz:** verify a reseller cannot read another reseller's reports (RLS + handler check both).
+6. **Rate-limit smoke:** burst 100 requests; confirm the limiter trips and returns `429` with a clean error.
+7. Operator review of the dashboard tab on at least one day of synthetic traffic.
 
-Before any production deploy:
+Only after all six pass: production deploy of Phase 1, endpoint live but **not announced** to the reseller until the operator does a hand-off.
 
-1. Apply migration to **dashboard-test** Supabase project (test env), backfill `rental_health` view.
-2. Deploy `reseller-portal` and `dashboard` with `--env test` (verify domain bindings — known footgun, see memory).
-3. **Run the 54-rental list** through the test endpoint. Expected: ≥ 90% of the reseller's 54 show as `confirmed_dead` with `sms_count = 0` for the rental window. Investigate any miss before going further.
-4. Cross-check against `sms_messages`: spot-check 5 rentals manually with a direct PostgREST query to make sure the LEFT JOIN math is right.
-5. Operator review of the dashboard tab on at least 2 days of data.
-6. Only then: production deploy of Phase 1, with the endpoint live but **not yet shared with the reseller** until §7 step 1 results are accepted.
+## 12. Risks & non-goals
 
-## 10. Risks & non-goals
+- **Non-goal:** automatic credits, automatic invoice adjustments, automatic SIM actions. Operator-in-the-loop for every remediation.
+- **Non-goal:** changing INC-2 billing math, the legacy engine, the rentals schema, or anything in `sms-ingest`.
+- **Risk — noisy reports:** reseller could over-report. Mitigation: idempotent dedup per open rental, daily rate limit, and operator can mark `unable_to_reproduce` to close the loop without action.
+- **Risk — slow operator response harms the SLA promise:** mitigation in v1 is that the SLA is advisory, exposed in the response, and not contractual. Phase 3 could tighten this.
+- **Risk — Phase 2 webhook misfire** spamming the reseller: gated behind separate approval and per-reseller opt-in.
 
-- **Non-goal:** automatic credits, automatic rotation, automatic suspension of dead rentals. All three are the operator's call.
-- **Non-goal:** changing INC-2 billing math or invoicing behavior.
-- **Risk — false positives:** a working SIM that just had no OTP traffic in 6h would look "dead." Mitigation: thresholds are tunable, and Phase 1 is read-only — the worst case is a noisy list, not a customer impact. Phase 2 webhook will only fire on `confirmed_dead`, never `suspect`.
-- **Risk — webhook to reseller (Phase 2)** triggers their automation to reset/credit. Requires explicit partner approval; gated separately.
-- **Risk — `sms_messages` schema assumption:** the join on `sim_number_id` needs verification; if absent, fall back to `(sim_id, e164, received_at BETWEEN minted_at AND lifetime_ended_at)`. Caught in step 4 of verification.
-
-## 11. Approval requested
+## 13. Approval requested
 
 Approval to proceed **with Phase 1 only**:
 
-1. Migration for the view, RPC, and threshold storage (no data movement, no billing-touching).
-2. Read-only `GET /api/v1/non-working-rentals` route on `reseller-portal` (auth'd, internal scope until reseller is told).
-3. "Dead Inventory" tab on the dashboard (operator-only).
-4. Nightly count in the rotation review.
-5. Verification against the 54-rental list in test before any prod deploy.
-
-Phase 2 (outbound webhook to TrustOTP) and Phase 3 (reset endpoint) are explicitly **not** in this approval — separate proposals will follow if Phase 1 results justify them.
+1. Migration for `rental_reports` + `rental_report_events`.
+2. Intake `POST /api/v1/rentals/report-bad` and read endpoints on `reseller-portal`.
+3. "Bad Rental Reports" tab on the dashboard (operator-only), patched via the `patch-dashboard` skill.
+4. Nightly open-reports count in the rotation review.
+5. Full verification on `--env test` before any production deploy.
+6. **No outbound webhook, no auto-credits, no invoice changes** — those are Phase 2 and Phase 3, separately approved.
