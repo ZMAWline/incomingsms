@@ -6555,6 +6555,11 @@ function getHTML(helixEnabled) {
                     <span class="text-sm">Errors</span>
                     <span id="error-badge" class="hidden ml-auto min-w-[16px] h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center px-1">0</span>
                 </a>
+                <a href="/bad-rentals" onclick="event.preventDefault();switchTab('bad-rentals')" data-tab="bad-rentals" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Bad Rentals">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
+                    <span class="text-sm">Bad Rentals</span>
+                    <span id="bad-rentals-badge" class="hidden ml-auto min-w-[16px] h-4 bg-amber-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center px-1">0</span>
+                </a>
                 <a href="/rotation-reviews" onclick="event.preventDefault();switchTab('rotation-reviews')" data-tab="rotation-reviews" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Rotation Reviews">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>
                     <span class="text-sm font-medium">Rotation Reviews</span>
@@ -7405,6 +7410,39 @@ function getHTML(helixEnabled) {
                         <button onclick="submitPendingReply()" id="pending-reply-submit" class="px-4 py-1.5 text-xs bg-accent hover:bg-green-700 text-white rounded">Submit reply</button>
                     </div>
                 </div>
+            </div>
+
+
+            <!-- Bad Rentals Tab (INC-3 Phase 1) -->
+            <div id="tab-bad-rentals" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <div>
+                        <h1 class="text-2xl font-bold text-dark-100">Bad Rental Reports</h1>
+                        <p class="text-dark-400 text-sm mt-1">Open reports from resellers about non-working rentals. Operator-only view.</p>
+                    </div>
+                    <button onclick="loadBadRentals()" class="px-3 py-2 text-sm bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Refresh</button>
+                </div>
+                <div id="bad-rentals-status" class="text-dark-400 text-sm mb-4"></div>
+                <div id="bad-rentals-table-wrap" class="overflow-x-auto rounded-lg border border-dark-600">
+                    <table class="w-full text-sm text-left">
+                        <thead class="bg-dark-700 text-dark-300 text-xs uppercase">
+                            <tr>
+                                <th class="px-4 py-3 font-medium">Report ID</th>
+                                <th class="px-4 py-3 font-medium">Reseller</th>
+                                <th class="px-4 py-3 font-medium">MDN (E.164)</th>
+                                <th class="px-4 py-3 font-medium">Reason</th>
+                                <th class="px-4 py-3 font-medium">Status</th>
+                                <th class="px-4 py-3 font-medium">SIM ID</th>
+                                <th class="px-4 py-3 font-medium">Rental ID</th>
+                                <th class="px-4 py-3 font-medium">Received</th>
+                            </tr>
+                        </thead>
+                        <tbody id="bad-rentals-tbody" class="divide-y divide-dark-700 text-dark-200">
+                            <tr><td colspan="8" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <p class="text-xs text-dark-500 mt-4">To triage: use existing rotate/port-reset/replace tools. Status updates go in rental_report_events (operator notes coming in Phase 2).</p>
             </div>
 
 
@@ -9503,6 +9541,7 @@ function getHTML(helixEnabled) {
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
             if (tabName === 'errors') loadErrors();
+            if (tabName === 'bad-rentals') loadBadRentals();
             if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
@@ -12920,6 +12959,60 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         // ===== Errors Tab =====
+        async function loadBadRentals() {
+            const badge = document.getElementById('bad-rentals-badge');
+            const status = document.getElementById('bad-rentals-status');
+            const tbody = document.getElementById('bad-rentals-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>';
+            if (status) status.textContent = '';
+            try {
+                const url = SUPABASE_URL + '/rest/v1/rental_reports' +
+                    '?select=id,reseller_id,e164,reason_code,reason_note,status,sim_id,rental_id,received_at,triaged_at,resellers(name)' +
+                    '&status=in.(received,in_triage)&order=received_at.desc&limit=200';
+                const resp = await fetch(url, {
+                    headers: {
+                        apikey: SUPABASE_SERVICE_ROLE_KEY,
+                        Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY,
+                        Accept: 'application/json',
+                    }
+                });
+                if (!resp.ok) throw new Error('Supabase ' + resp.status);
+                const rows = await resp.json();
+                if (!Array.isArray(rows) || rows.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-8 text-center text-dark-400">No open bad-rental reports.</td></tr>';
+                    if (badge) { badge.textContent = '0'; badge.classList.add('hidden'); }
+                    if (status) status.textContent = '';
+                    return;
+                }
+                if (badge) { badge.textContent = rows.length; badge.classList.remove('hidden'); }
+                if (status) status.textContent = rows.length + ' open report' + (rows.length === 1 ? '' : 's') + ' (received or in triage)';
+                const fmtDt = s => s ? new Date(s).toLocaleString('en-US', {month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
+                tbody.innerHTML = rows.map(r => {
+                    const resellerName = (r.resellers && r.resellers.name) ? r.resellers.name : (r.reseller_id || '—');
+                    const statusBadge = r.status === 'in_triage'
+                        ? '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-blue-500/20 text-blue-300">In triage</span>'
+                        : '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-amber-500/20 text-amber-300">Received</span>';
+                    const simLink = r.sim_id
+                        ? '<a onclick="event.stopPropagation();switchTab(&quot;sims&quot;)" class="text-accent hover:text-green-400 cursor-pointer">' + r.sim_id + '</a>'
+                        : '—';
+                    return '<tr class="hover:bg-dark-700/40">' +
+                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + r.id + '</td>' +
+                        '<td class="px-4 py-3 text-dark-200">' + resellerName + '</td>' +
+                        '<td class="px-4 py-3 font-mono text-cyan-300">' + (r.e164 || '—') + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 text-xs" title="' + (r.reason_note || '') + '">' + (r.reason_code || '—') + '</td>' +
+                        '<td class="px-4 py-3">' + statusBadge + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + simLink + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + (r.rental_id != null ? r.rental_id : '—') + '</td>' +
+                        '<td class="px-4 py-3 text-dark-400 text-xs">' + fmtDt(r.received_at) + '</td>' +
+                    '</tr>';
+                }).join('');
+            } catch(e) {
+                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + e.message + '</td></tr>';
+                console.error('[loadBadRentals]', e);
+            }
+        }
+
         async function loadErrors() {
             try {
                 const statusFilter = document.getElementById('errors-status-filter')?.value || 'open';
