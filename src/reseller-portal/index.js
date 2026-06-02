@@ -360,6 +360,21 @@ async function handleSims(auth, env, url) {
     activeClause +
     '&order=active.desc,sim_id.asc'
   );
+
+  // INC-3: pull open bad-rental reports for this reseller in one shot, then map
+  // them onto SIM rows. Single query rather than per-row lookups so the SIMs
+  // tab doesn't fan out N times when there's nothing to show.
+  const openReports = await sbGet(env,
+    'rental_reports?select=id,sim_id,rental_id,reason_code,status,remediation_action,received_at' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&status=in.(received,in_triage)&limit=1000'
+  );
+  const openBySim = new Map();
+  if (openReports.ok) {
+    const arr = await openReports.json();
+    if (Array.isArray(arr)) for (const r of arr) if (r.sim_id != null && !openBySim.has(r.sim_id)) openBySim.set(r.sim_id, r);
+  }
+
   const out = (Array.isArray(rows) ? rows : []).map(r => {
     const sim = r.sims || {};
     const interval = sim.rotation_interval_hours || (sim.vendor === 'teltik' ? 48 : 24);
@@ -368,6 +383,7 @@ async function handleSims(auth, env, url) {
     const baseTs = sim.last_rotation_at || sim.last_mdn_rotated_at || null;
     const start = baseTs || sim.activated_at || null;
     const expires = baseTs ? midnightNYAfterInterval(baseTs, interval) : null;
+    const openReport = openBySim.get(r.sim_id) || null;
     return {
       sim_id: r.sim_id,
       active: r.active,
@@ -381,6 +397,7 @@ async function handleSims(auth, env, url) {
       start_at: start,
       online_until: expires,
       rotation_interval_hours: interval,
+      open_report: openReport,
     };
   });
   return jsonResp(out);
@@ -1156,6 +1173,46 @@ function portalHtml() {
         </div>
       </div>
     </div>
+
+    <div class="bg-slate-800 rounded-lg border border-slate-700 p-5">
+      <h2 class="text-lg font-semibold mb-1">Report a Bad Rental</h2>
+      <p class="text-slate-400 text-sm mb-4">
+        Tell us if a number isn't working — no SMS arriving, receiving the wrong account's traffic, etc. We surface
+        the report on our operations dashboard and a specialist will look at the SIM. Identify the rental by phone number (recommended),
+        your <code class="text-slate-300">rentalId</code>, our <code class="text-slate-300">rental_id</code>, or our <code class="text-slate-300">sim_id</code>.
+      </p>
+      <div class="space-y-3">
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">URL</div>
+          <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-cyan-200 font-mono break-all">POST https://portal.incoming-sms.com/api/rentals/report-bad</code>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Body (any one identifier required)</div>
+          <pre class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono whitespace-pre-wrap">{
+  "e164": "+15551234567",
+  "reason_code": "no_sms_received",
+  "reason_note": "3 send attempts, no SMS in 30 min"
+}</pre>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">cURL example</div>
+          <pre class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono whitespace-pre-wrap">curl -X POST -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"e164":"+15551234567","reason_code":"no_sms_received"}' \\
+  "https://portal.incoming-sms.com/api/rentals/report-bad"</pre>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Check report status</div>
+          <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono break-all">GET https://portal.incoming-sms.com/api/sims/{sim_id}/report-status</code>
+          <div class="text-xs text-slate-500 mt-1">Or list all your reports: <code class="text-slate-300">GET /api/sims/reports?status=open</code></div>
+        </div>
+        <div class="text-xs text-slate-500">
+          Identifier resolution order (most specific first): <code class="text-slate-300">rental_id</code> &rarr; <code class="text-slate-300">reseller_rental_id</code> &rarr; <code class="text-slate-300">sim_id</code> &rarr; <code class="text-slate-300">e164</code>.
+          Phone-number lookups are scoped to your account and the current rental lifetime; if two active rentals share that MDN
+          the response is <code class="text-slate-300">409</code> with the candidate <code class="text-slate-300">rental_id</code>s so you can disambiguate.
+          Rate limit: one report per SIM per hour, 200 reports per day per account.
+        </div>
+      </div>
+    </div>
   </section>
 </div>
 
@@ -1257,12 +1314,22 @@ function renderSimTable(sims, container, opts) {
   if (!sims.length) { container.innerHTML = '<div class="text-slate-500 text-sm py-4">None</div>'; return; }
   const showActions = !opts.showAssigned;
   const rows = sims.map(s => {
+    // INC-3 inline badge: shows when there's an open bad-rental report on this SIM.
+    let reportBadge = '';
+    if (s.open_report) {
+      const r = s.open_report;
+      const label = r.status === 'in_triage' ? 'In triage' : 'Reported';
+      reportBadge = ' <span class="ml-2 inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-amber-500/20 text-amber-300" title="' + esc(r.reason_code || '') + '">' + label + '</span>';
+    }
     const actionsCell = showActions
-      ? '<td class="px-3 py-2 text-right"><button onclick="event.stopPropagation(); resendOne(' + s.sim_id + ', this)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-cyan-600 text-slate-200 hover:text-white rounded">Resend</button></td>'
+      ? '<td class="px-3 py-2 text-right whitespace-nowrap">' +
+          '<button onclick="event.stopPropagation(); resendOne(' + s.sim_id + ', this)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-cyan-600 text-slate-200 hover:text-white rounded">Resend</button>' +
+          ' <button onclick="event.stopPropagation(); reportBad(' + s.sim_id + ', this)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-amber-600 text-slate-200 hover:text-white rounded"' + (s.open_report ? ' disabled title="A report is already open"' : '') + '>Report bad</button>' +
+        '</td>'
       : '';
     return '<tr class="hover:bg-slate-800 cursor-pointer" onclick="openLifetime(' + s.sim_id + ')">' +
       '<td class="px-3 py-2 text-slate-200 font-mono">' + (s.rental_id != null ? '#' + esc(s.rental_id) : '<span class="text-slate-600">—</span>') + '</td>' +
-      '<td class="px-3 py-2 text-slate-200 font-mono">' + esc(s.msisdn || '—') + '</td>' +
+      '<td class="px-3 py-2 text-slate-200 font-mono">' + esc(s.msisdn || '—') + reportBadge + '</td>' +
       '<td class="px-3 py-2 text-slate-300">' + esc(s.status) + '</td>' +
       '<td class="px-3 py-2 text-slate-400 text-xs">' + (opts.showAssigned ? fmtDate(s.assigned_at) : esc(fmtDateTime(s.start_at))) + '</td>' +
       '<td class="px-3 py-2 text-slate-400 text-xs">' + (opts.showAssigned ? '' : esc(fmtDateTime(s.online_until))) + '</td>' +
@@ -1333,6 +1400,68 @@ async function resendOne(simId, btn) {
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Resend'; }
   }
+}
+
+// INC-3 — open the reason modal for a single SIM and POST to /report-bad.
+// Same modal pattern as showConfirm; we just need a custom body with a
+// dropdown + textarea.
+async function reportBad(simId, btn) {
+  const sim = allSims.find(s => s.sim_id === simId);
+  const mdn = sim ? (sim.msisdn || 'unknown') : 'unknown';
+  // Build a small DOM-based reason form and reuse showModal for the shell.
+  const body = document.createElement('div');
+  body.innerHTML =
+    '<h2 class="text-xl font-semibold text-slate-100 mb-2">Report ' + esc(mdn) + ' as not working</h2>' +
+    '<p class="text-sm text-slate-400 mb-4">We will queue this for review. A specialist will look at the number; you can check status from this SIM\\'s row or via <code class="bg-slate-900 px-1 rounded">GET /api/sims/' + esc(simId) + '/report-status</code>.</p>' +
+    '<label class="block text-xs uppercase tracking-wide text-slate-400 mb-1">Reason</label>' +
+    '<select id="rp-rb-reason" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100 mb-3">' +
+      '<option value="no_sms_received">No SMS received</option>' +
+      '<option value="wrong_number">Receiving SMS for the wrong account</option>' +
+      '<option value="delayed_sms">SMS arriving too late</option>' +
+      '<option value="other">Other</option>' +
+    '</select>' +
+    '<label class="block text-xs uppercase tracking-wide text-slate-400 mb-1">Notes (optional)</label>' +
+    '<textarea id="rp-rb-note" rows="3" maxlength="500" placeholder="e.g. 3 send attempts, no SMS in 30 minutes"' +
+      ' class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100 mb-4"></textarea>' +
+    '<div class="flex justify-end gap-2">' +
+      '<button id="rp-rb-cancel" class="px-4 py-2 text-sm bg-slate-700 hover:bg-slate-600 text-slate-200 rounded">Cancel</button>' +
+      '<button id="rp-rb-submit" class="px-4 py-2 text-sm text-white rounded bg-amber-600 hover:bg-amber-500">Submit report</button>' +
+    '</div>';
+  showModal(body.outerHTML);
+  return new Promise(resolve => {
+    document.getElementById('rp-rb-cancel').addEventListener('click', () => { closeModal(); resolve(); });
+    document.getElementById('rp-rb-submit').addEventListener('click', async () => {
+      const reason_code = document.getElementById('rp-rb-reason').value;
+      const reason_note = document.getElementById('rp-rb-note').value.trim() || null;
+      closeModal();
+      if (btn) { btn.disabled = true; btn.textContent = 'Submitting…'; }
+      try {
+        const r = await fetch('/api/sims/' + simId + '/report-bad', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason_code, reason_note }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (r.status === 429) {
+          showToast('Rate limited: ' + (data.error || 'try again later'), 'error');
+        } else if (r.ok) {
+          if (data.deduped) {
+            showToast('A report for this SIM is already open (ID ' + data.report_id + ').', 'info');
+          } else {
+            showToast('Reported. Report ID ' + data.report_id + '.', 'success');
+          }
+          loadSims();
+        } else {
+          showToast('Report failed: ' + (data.error || ('HTTP ' + r.status)), 'error');
+        }
+      } catch (e) {
+        showToast('Report failed: ' + (e.message || String(e)), 'error');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Report bad'; }
+        resolve();
+      }
+    });
+  });
 }
 
 async function resyncAll() {
