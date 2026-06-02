@@ -98,6 +98,19 @@ async function checkRateLimit(env, resellerId, action, simId = null) {
     if (perHour >= 100) return { allowed: false, retryAfter: 3600, reason: 'Per-reseller resend cap (100/hour) reached' };
     return { allowed: true };
   }
+  if (action === 'portal_report_bad') {
+    // Per-SIM cooldown: one report per SIM per hour. The DB unique index on
+    // open reports already prevents true duplicates; this catches rapid
+    // re-reports across statuses (e.g. report → mark unable_to_reproduce →
+    // immediate re-report) and gives a clean 429 instead of a silent dedup.
+    if (simId != null) {
+      const perSim = await countActionsSince(env, resellerId, 'portal_report_bad', 3600, simId);
+      if (perSim >= 1) return { allowed: false, retryAfter: 3600, reason: 'This SIM was reported within the last hour' };
+    }
+    const perDay = await countActionsSince(env, resellerId, 'portal_report_bad', 86400);
+    if (perDay >= 200) return { allowed: false, retryAfter: 86400, reason: 'Per-reseller daily cap (200) reached' };
+    return { allowed: true };
+  }
   return { allowed: true };
 }
 
@@ -676,6 +689,336 @@ async function handleOnlineHistory(simId, auth, env) {
   });
 
   return jsonResp(out);
+}
+
+// ---------------------------------------------------------------------------
+// INC-3 Phase 1: bad-rental reporting.
+//
+// Intake: the reseller tells us a number isn't working. We record it, surface
+// it to the operator dashboard, and report status back. No automatic
+// remediation — operator triages from src/dashboard/index.js using existing
+// tools (rotate / port reset / replace). See
+// docs/superpowers/specs/2026-06-02-failed-rental-reporting-design.md (rev 5).
+// ---------------------------------------------------------------------------
+
+const REPORT_REASON_CODES = new Set(['no_sms_received','wrong_number','delayed_sms','other']);
+
+function normalizeE164(input) {
+  if (input == null) return null;
+  const digits = String(input).replace(/[^0-9]/g, '');
+  if (digits.length < 11 || digits.length > 15) return null;
+  return '+' + digits;
+}
+
+// Single resolver applied by both report-bad endpoints. Returns
+// { ok:true, rental_id, sim_id, sim_number_id, e164 } on success,
+// or { ok:false, code:'bad_request'|'not_found'|'ambiguous', message, candidates? }.
+// Specificity order: rental_id > reseller_rental_id > sim_id > e164.
+// All lookups are scoped to resellerId — cross-reseller leaks are not possible.
+async function resolveRentalForReport(env, resellerId, body) {
+  body = body || {};
+
+  // 1. rental_id (most specific)
+  if (body.rental_id != null) {
+    const n = Number(body.rental_id);
+    if (!Number.isFinite(n) || n <= 0) return { ok: false, code: 'bad_request', message: 'rental_id must be a positive integer' };
+    const resp = await sbGet(env,
+      'rentals?select=id,reseller_id,sim_id,sim_number_id,e164' +
+      '&id=eq.' + encodeURIComponent(n) +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+      '&limit=1'
+    );
+    if (!resp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
+    const rows = await resp.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return { ok: false, code: 'not_found', message: 'rental_id not found for this reseller' };
+    }
+    const r = rows[0];
+    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: r.e164 || null };
+  }
+
+  // 2. reseller_rental_id (their rentalId)
+  if (body.reseller_rental_id != null && String(body.reseller_rental_id).length > 0) {
+    const v = String(body.reseller_rental_id);
+    const resp = await sbGet(env,
+      'rentals?select=id,sim_id,sim_number_id,e164,minted_at' +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+      '&reseller_rental_id=eq.' + encodeURIComponent(v) +
+      '&order=minted_at.desc&limit=1'
+    );
+    if (!resp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
+    const rows = await resp.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return { ok: false, code: 'not_found', message: 'reseller_rental_id not found for this reseller' };
+    }
+    const r = rows[0];
+    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: r.e164 || null };
+  }
+
+  // 3. sim_id — pick the most recent rental for that SIM (current lifetime).
+  if (body.sim_id != null) {
+    const n = Number(body.sim_id);
+    if (!Number.isFinite(n) || n <= 0) return { ok: false, code: 'bad_request', message: 'sim_id must be a positive integer' };
+    // Ownership guard via reseller_sims (the canonical reseller↔sim membership).
+    const ownResp = await sbGet(env,
+      'reseller_sims?select=sim_id' +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+      '&sim_id=eq.' + encodeURIComponent(n) +
+      '&limit=1'
+    );
+    if (!ownResp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
+    const ownRows = await ownResp.json();
+    if (!Array.isArray(ownRows) || ownRows.length === 0) {
+      return { ok: false, code: 'not_found', message: 'sim_id not owned by this reseller' };
+    }
+    const resp = await sbGet(env,
+      'rentals?select=id,sim_id,sim_number_id,e164,minted_at' +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+      '&sim_id=eq.' + encodeURIComponent(n) +
+      '&order=minted_at.desc&limit=1'
+    );
+    if (!resp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
+    const rows = await resp.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return { ok: false, code: 'not_found', message: 'no rental for this SIM under your account' };
+    }
+    const r = rows[0];
+    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: r.e164 || null };
+  }
+
+  // 4. e164 (primary external identifier per design rev 5).
+  if (body.e164 != null) {
+    const norm = normalizeE164(body.e164);
+    if (!norm) return { ok: false, code: 'bad_request', message: 'e164 is not a plausible phone number' };
+    // Restrict to current lifetimes: sim_numbers.valid_to IS NULL.
+    // PostgREST embed filter: we join rentals → sim_numbers via sim_number_id.
+    const resp = await sbGet(env,
+      'rentals?select=id,sim_id,sim_number_id,e164,minted_at,sim_numbers!inner(valid_to)' +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+      '&e164=eq.' + encodeURIComponent(norm) +
+      '&sim_numbers.valid_to=is.null' +
+      '&order=minted_at.desc'
+    );
+    if (!resp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
+    const rows = await resp.json();
+    const list = Array.isArray(rows) ? rows : [];
+    if (list.length === 0) {
+      return { ok: false, code: 'not_found', message: 'no active rental for this number under your account (historical lifetimes require an exact rental_id or reseller_rental_id)' };
+    }
+    if (list.length > 1) {
+      return {
+        ok: false, code: 'ambiguous',
+        message: 'multiple active rentals match this number — resubmit with rental_id',
+        candidates: list.map(r => ({ rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, minted_at: r.minted_at })),
+      };
+    }
+    const r = list[0];
+    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: r.e164 || norm };
+  }
+
+  return { ok: false, code: 'bad_request', message: 'at least one of e164, reseller_rental_id, rental_id, or sim_id is required' };
+}
+
+// Insert (or return existing open) report row, log the action, return the
+// reseller-facing envelope. Shared by both report-bad endpoints once the
+// rental has been resolved.
+async function insertOrReturnExistingReport(env, resellerId, resolved, body) {
+  const reasonCode = body.reason_code && REPORT_REASON_CODES.has(body.reason_code) ? body.reason_code : 'no_sms_received';
+  const reasonNote = body.reason_note != null ? String(body.reason_note).slice(0, 500) : null;
+  const attempts = body.attempts != null && Number.isFinite(Number(body.attempts)) ? Number(body.attempts) : null;
+  const firstAttemptAt = body.first_attempt_at ? String(body.first_attempt_at) : null;
+  const clientRequestId = body.client_request_id != null ? String(body.client_request_id).slice(0, 128) : null;
+
+  // Dedup: if an open report exists for this (reseller_id, rental_id), return it.
+  if (resolved.rental_id != null) {
+    const existing = await sbGet(env,
+      'rental_reports?select=id,status,received_at,e164,sim_id,sim_number_id,rental_id' +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+      '&rental_id=eq.' + encodeURIComponent(resolved.rental_id) +
+      '&status=in.(received,in_triage)&limit=1'
+    );
+    if (existing.ok) {
+      const rows = await existing.json();
+      if (Array.isArray(rows) && rows.length > 0) {
+        const r = rows[0];
+        return jsonResp({
+          report_id: r.id,
+          rental_id: r.rental_id,
+          sim_id: r.sim_id,
+          sim_number_id: r.sim_number_id,
+          e164: r.e164,
+          status: r.status,
+          queued_at: r.received_at,
+          deduped: true,
+          note: 'A report for this rental is already open; returning the existing report_id.',
+        });
+      }
+    }
+  }
+
+  // Insert.
+  const row = {
+    reseller_id: Number(resellerId),
+    rental_id: resolved.rental_id || null,
+    sim_id: resolved.sim_id || null,
+    sim_number_id: resolved.sim_number_id || null,
+    e164: resolved.e164 || normalizeE164(body.e164) || '',
+    reason_code: reasonCode,
+    reason_note: reasonNote,
+    attempts,
+    first_attempt_at: firstAttemptAt,
+    client_request_id: clientRequestId,
+    status: 'received',
+  };
+  let insertResp;
+  try {
+    insertResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_reports`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify(row),
+    });
+  } catch (e) {
+    return jsonResp({ error: 'insert failed: ' + String(e) }, 502);
+  }
+  if (!insertResp.ok) {
+    const t = await insertResp.text().catch(() => '');
+    return jsonResp({ error: 'insert failed: ' + insertResp.status + ' ' + t }, 502);
+  }
+  const inserted = await insertResp.json();
+  const r = Array.isArray(inserted) ? inserted[0] : inserted;
+
+  // Append-only event row for the intake itself.
+  try {
+    await sbPost(env, 'rental_report_events', {
+      report_id: r.id,
+      from_status: null,
+      to_status: 'received',
+      actor: 'reseller',
+      note: reasonNote,
+      evidence: clientRequestId ? { client_request_id: clientRequestId } : null,
+    });
+  } catch (e) {
+    console.log('[ReportBad] event log insert failed: ' + e);
+  }
+
+  // Log to reseller_actions_log for rate-limit accounting and audit.
+  await logAction(env, resellerId, 'portal_report_bad', resolved.sim_id);
+
+  return jsonResp({
+    report_id: r.id,
+    rental_id: r.rental_id,
+    reseller_rental_id: body.reseller_rental_id || null,
+    sim_id: r.sim_id,
+    sim_number_id: r.sim_number_id,
+    e164: r.e164,
+    status: r.status,
+    queued_at: r.received_at,
+    expected_first_action_within_minutes: 60,
+  });
+}
+
+// POST /api/rentals/report-bad — primary, body-keyed.
+async function handleReportBadByRental(auth, env, request) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return badRequest('JSON body required');
+  }
+
+  const resolved = await resolveRentalForReport(env, auth.resellerId, body);
+  if (!resolved.ok) {
+    const status = resolved.code === 'not_found' ? 404
+                 : resolved.code === 'ambiguous' ? 409
+                 : 400;
+    return jsonResp({ error: resolved.message, code: resolved.code, candidates: resolved.candidates }, status);
+  }
+
+  const rl = await checkRateLimit(env, auth.resellerId, 'portal_report_bad', resolved.sim_id);
+  if (!rl.allowed) {
+    return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
+  }
+
+  return insertOrReturnExistingReport(env, auth.resellerId, resolved, body);
+}
+
+// POST /api/sims/:simId/report-bad — convenience for the portal UI.
+async function handleReportBadBySim(simId, auth, env, request) {
+  let body;
+  try {
+    body = await request.json().catch(() => ({}));
+  } catch {
+    body = {};
+  }
+  // Override identifier fields with the URL param; UI never passes its own.
+  body.sim_id = simId;
+  body.rental_id = undefined;
+  body.reseller_rental_id = undefined;
+  body.e164 = undefined;
+  const resolved = await resolveRentalForReport(env, auth.resellerId, body);
+  if (!resolved.ok) {
+    const status = resolved.code === 'not_found' ? 404 : 400;
+    return jsonResp({ error: resolved.message, code: resolved.code }, status);
+  }
+  const rl = await checkRateLimit(env, auth.resellerId, 'portal_report_bad', resolved.sim_id);
+  if (!rl.allowed) {
+    return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
+  }
+  return insertOrReturnExistingReport(env, auth.resellerId, resolved, body);
+}
+
+// GET /api/sims/:simId/report-status — most recent report for the SIM's
+// current lifetime + last 5 historical (any status).
+async function handleReportStatus(simId, auth, env) {
+  const ownResp = await sbGet(env,
+    'reseller_sims?select=sim_id' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&limit=1'
+  );
+  if (!ownResp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const ownRows = await ownResp.json();
+  if (!Array.isArray(ownRows) || ownRows.length === 0) return notFound();
+
+  const resp = await sbGet(env,
+    'rental_reports?select=id,rental_id,sim_number_id,e164,reason_code,reason_note,status,remediation_action,received_at,triaged_at,closed_at' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&order=received_at.desc&limit=6'
+  );
+  if (!resp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const rows = await resp.json();
+  const list = Array.isArray(rows) ? rows : [];
+  const open = list.find(r => r.status === 'received' || r.status === 'in_triage') || null;
+  return jsonResp({
+    sim_id: Number(simId),
+    open_report: open,
+    history: list.filter(r => r !== open).slice(0, 5),
+  });
+}
+
+// GET /api/sims/reports — all reports for the reseller, filterable.
+async function handleReportsList(auth, env, url) {
+  const status = url && url.searchParams ? url.searchParams.get('status') : null;
+  const since = url && url.searchParams ? url.searchParams.get('since') : null;
+  let path = 'rental_reports?select=id,rental_id,sim_id,sim_number_id,e164,reason_code,reason_note,status,remediation_action,received_at,triaged_at,closed_at' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId);
+  if (status === 'open') {
+    path += '&status=in.(received,in_triage)';
+  } else if (status && status !== 'all') {
+    path += '&status=eq.' + encodeURIComponent(status);
+  }
+  if (since) path += '&received_at=gte.' + encodeURIComponent(since);
+  path += '&order=received_at.desc&limit=500';
+  const resp = await sbGet(env, path);
+  if (!resp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const rows = await resp.json();
+  return jsonResp({ reports: Array.isArray(rows) ? rows : [] });
 }
 
 function loginHtml() {
@@ -1271,6 +1614,11 @@ export default {
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/lifetime$/))) return handleSimLifetime(m[1], auth, env);
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/resend-online$/)) && request.method === 'POST') return handleResendOnline(m[1], auth, env);
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/online-history$/))) return handleOnlineHistory(m[1], auth, env);
+      // INC-3 Phase 1 — bad-rental reporting (rev 5).
+      if (url.pathname === '/api/rentals/report-bad' && request.method === 'POST') return handleReportBadByRental(auth, env, request);
+      if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/report-bad$/)) && request.method === 'POST') return handleReportBadBySim(m[1], auth, env, request);
+      if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/report-status$/))) return handleReportStatus(m[1], auth, env);
+      if (url.pathname === '/api/sims/reports') return handleReportsList(auth, env, url);
       return notFound();
     }
 
