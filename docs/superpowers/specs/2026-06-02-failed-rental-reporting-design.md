@@ -1,20 +1,55 @@
-# INC-3 — Bad-rental reporting & remediation workflow (design, revised)
+# INC-3 — Bad-rental reporting & remediation workflow (design, revised rev 3)
 
-Status: **proposal, awaiting board approval**
+Status: **proposal, awaiting board approval (rev 3 — extends existing reseller portal)**
 Author: IncomingSMS CEO
-Date: 2026-06-02 (rev 2)
-Related: INC-2 (rental billing capture, in production), reseller-portal-resend (2026-05-25)
+Date: 2026-06-02 (rev 3)
+Related: INC-2 (rental billing capture, in production), reseller-portal-resend (2026-05-25, the live reseller portal this proposal extends)
 
-## Scope correction (2026-06-02)
+## Scope corrections so far
 
-Earlier draft proposed *us-detecting* dead rentals and pushing to the reseller. Per operator clarification:
+- **Rev 2 (earlier today):** flipped direction from *us-detecting* dead rentals to *reseller-reporting* a bad rental. Don't chase the closed 54 / $195. Don't reopen INC-2.
+- **Rev 3 (now):** **build on the existing reseller portal** (`src/reseller-portal/index.js`, deployed at `portal.incoming-sms.com`) rather than inventing a new `/api/v1/...` surface. Reuse its auth, rate-limit table, SIMs tab, modal pattern, and HTML/JS shell. Add the smallest possible delta on top.
 
-- **Do not chase the historical 54 rentals.** That invoice is closed; the reseller accepts it.
-- **Do not reopen INC-2.** Legacy billing math and the INC-2 capture stay untouched.
-- The actual ask: a **future-facing reporting channel** — the **reseller reports a bad rental/number to us** quickly during the rental period, so we can **fix/reset/remediate while it still matters**, instead of finding out during the next reconciliation.
-- This is operational hygiene, not invoice dispute infrastructure.
+## Existing reseller portal — what we already have (so we don't reinvent it)
 
-Everything below is rewritten against that scope.
+From `src/reseller-portal/index.js` (1287 lines, in production):
+
+- **Auth:** API key (`rsk_*` Bearer) **and** session cookie (`rp_session` / `rps_*`) — both resolve to a `reseller_id` via `getCredFromRequest()`/session middleware.
+- **Rate-limiting:** `reseller_actions_log` table + `checkRateLimit(env, resellerId, action, simId)` helper. Adding a new action is one entry in `checkRateLimit()`.
+- **Routes (relevant):**
+  - `GET /api/sims` — reseller's SIMs list.
+  - `GET /api/sims/:simId/lifetime` — current/most-recent lifetime, MDN, billing breakdown.
+  - `GET /api/sims/:simId/online-history` — history of `number.online` events.
+  - `POST /api/sims/:simId/resend-online` — already-present operator-style action initiated by the reseller, rate-limited (`portal_resend`).
+  - `POST /api/sims/resync-all` — bulk equivalent.
+- **UI:** SPA-ish HTML in `portalHtml()` with tabs (`SIMs`, `Invoices`, `API Access`), SIM-row buttons, a generic modal helper, a confirm dialog (`rp-confirm-*`), `jsonResp()` envelope.
+- **Upstream:** internal `RESELLER_SYNC` worker binding for actions that affect external state (used by `/resend-online`).
+
+The bad-rental flow **already has 80% of its surface area built**. The remaining 20% is one new SIM-row action + one new operator/admin worker doing the actual remediation, plus the small report-history table.
+
+## 1. Goal & success criteria
+
+When a rented number isn't working for the reseller, they should be able to **tell us in seconds from the SIM row in the existing portal** and **see what we did about it** before the rental period ends.
+
+- Reseller clicks "Report bad" on a SIM row (next to the existing "Resend" button) → reason modal → submitted.
+- We acknowledge immediately, write a report row, and the operator gets a queue entry in the dashboard.
+- The reseller's portal SIM row shows the current report status inline (no separate dashboard for them).
+- Operator triages from the IncomingSMS dashboard "Bad Rental Reports" tab using existing remediation tools.
+
+Non-goals: no automatic credits, no automatic SIM rotation, no invoice changes. Same as rev 2.
+
+## Architecture diff vs rev 2
+
+| Concern              | Rev 2 (standalone)                  | Rev 3 (extends portal)                                |
+|---------------------|-------------------------------------|-------------------------------------------------------|
+| Intake URL          | `POST /api/v1/rentals/report-bad`   | `POST /api/sims/:simId/report-bad` (matches existing) |
+| Auth                | New API-key middleware              | Reuse `getCredFromRequest()` + session                |
+| Rate limit          | New limiter                         | Reuse `reseller_actions_log` w/ action `portal_report_bad` |
+| Identification      | rental_id / reseller_rental_id / e164 | `simId` from URL (already keyed in portal UI)        |
+| Reseller UI         | None (API-only)                     | New "Report bad" button on existing SIMs tab + modal  |
+| Status visibility for reseller | New `GET /api/v1/rentals/reports` | `GET /api/sims/:simId/report-status` + inline badge on SIM row |
+| Operator dashboard  | New tab                              | New tab (unchanged from rev 2)                        |
+| New DB tables       | `rental_reports` + `rental_report_events` | Same                                              |
 
 ## 1. Goal & success criteria
 
@@ -29,19 +64,23 @@ Non-goals: automatic credits, automatic invoice adjustments, automatic suspensio
 
 ## 2. Intake contract (reseller → us)
 
-**Endpoint:** `POST /api/v1/rentals/report-bad` on the **reseller-portal** worker (existing auth surface, same key the reseller already holds).
+**Endpoint (extends existing portal pattern):**
+```
+POST /api/sims/:simId/report-bad
+```
+(same shape as the existing `POST /api/sims/:simId/resend-online` route — the URL **is** the identification mechanism, no body-level resolution needed.)
 
-**Body (one report per request):**
+The `simId` is the reseller's own sim id as already shown in their portal UI. The handler resolves it to the **current active rental** for that SIM via the existing `rentals` table (most recent `sim_number_id` for the SIM). If the reseller wants to report a *prior* lifetime (rotated-since), they can pass an explicit `sim_number_id` in the body — but the default and the UI button operate on the current lifetime.
+
+**Body (all fields optional):**
 ```json
 {
-  "rental_id": 123456,                 // OUR rentals.id, optional but preferred
-  "reseller_rental_id": "trustotp-xyz",// THEIR id; used if rental_id not given
-  "e164": "+15551234567",              // required if neither id is given
-  "reason_code": "no_sms_received",    // enum, see below
-  "reason_note": "3 send attempts, no SMS in 30 min", // optional, free text, <500 chars
-  "attempts": 3,                       // optional: their send-attempt count
-  "first_attempt_at": "2026-06-02T17:00:00Z",  // optional
-  "client_request_id": "<uuid>"        // optional, for their idempotency
+  "reason_code": "no_sms_received",         // enum (see below), default "no_sms_received"
+  "reason_note": "3 send attempts, no SMS in 30 min", // free text, <500 chars
+  "attempts": 3,                            // optional: their send-attempt count
+  "first_attempt_at": "2026-06-02T17:00:00Z",
+  "sim_number_id": 9876,                    // optional override; defaults to current lifetime
+  "client_request_id": "<uuid>"             // optional, for their idempotency
 }
 ```
 
@@ -51,30 +90,37 @@ Non-goals: automatic credits, automatic invoice adjustments, automatic suspensio
 - `delayed_sms` — SMS arrives too late to be useful.
 - `other` — free-text required in `reason_note`.
 
-**Identification rule:** at least one of `rental_id`, `reseller_rental_id`, `e164` is required. Resolution order: `rental_id` → `reseller_rental_id` (lookup in `rentals`) → most recent active rental for `e164` belonging to that reseller. Ambiguous/missing → `400` with a clear error code.
-
-**Response (200):**
+**Response (200, same `jsonResp` envelope the portal already uses):**
 ```json
 {
   "report_id": 4521,
-  "rental_id": 123456,
+  "sim_id": 4242,
+  "sim_number_id": 9876,
   "e164": "+15551234567",
   "status": "received",
   "queued_at": "2026-06-02T17:32:01Z",
-  "expected_first_action_within_minutes": 60
+  "expected_first_action_within_minutes": 60,
+  "rate_limit": { "retry_after": 0 }
 }
 ```
 
-**Errors:** standard `4xx` with `{error_code, message}`. `409` on duplicate active report for the same `rental_id` within the last 24h — return the existing `report_id` (idempotent for the reseller's retries).
+**Errors:** standard `4xx` returned via `jsonResp({error, ...}, status)` (the helper the portal already uses). `409` on a duplicate active report for the same `sim_number_id` within the last 24h — return the existing `report_id` (idempotent for retries).
 
-## 3. Status feedback (us → reseller)
+## 3. Status feedback (reseller-side)
 
-Two channels, both off the same source of truth:
+### 3.1 Inline in the existing portal — primary surface
+On the SIMs tab, the existing SIM row gets a small status badge when there's an open report:
+- ⏳ `Reported · in triage`
+- ✅ `Resolved · rotated 12m ago`
+- ❌ `Unable to reproduce` (last 24h only)
 
-### 3.1 Pull (Phase 1)
-`GET /api/v1/rentals/reports?status=open|all&since=...` returns the reseller's own reports with current status. Same auth.
+Driven by a new field returned in the existing `GET /api/sims` payload (`open_report` object, null when none).
 
-`GET /api/v1/rentals/reports/{report_id}` for a single report.
+### 3.2 Per-SIM status endpoint
+`GET /api/sims/:simId/report-status` → most recent report for the current lifetime + last 5 historical. Powers the SIM-detail modal.
+
+### 3.3 Pull-all (lightweight, for API consumers)
+`GET /api/sims/reports?status=open|all&since=...` returns the reseller's own reports. Documented on the existing **API Access** tab.
 
 ### 3.2 Push (Phase 2, separate approval — partner sign-off required)
 Optional outbound webhook on status transitions to a URL the reseller registers. Same delivery pipeline as `webhook_deliveries` (event_type `rental.report.status`). Defaults off; enabled per-reseller in `qbo_customer_map`.
@@ -155,17 +201,38 @@ CREATE TABLE rental_report_events (
 
 Both tables get RLS enabled. No new columns on existing tables; INC-2 schema untouched.
 
-## 6. Auth, security, abuse controls
+## 6. Auth, security, abuse controls (reuse what's already there)
 
-- **Auth:** existing reseller portal API key (`portal.incoming-sms.com` middleware). Per-reseller scope enforced at query — a reseller can only read/write their own reports.
-- **Rate limit:** 60 reports/min/reseller, 1000/day. Plenty of headroom for a real outage; tight enough to flag a runaway client.
-- **Anti-abuse:** the `uq_rental_reports_open` index makes "report the same rental 100x" a no-op (returns the existing `report_id`). A reseller cannot use the endpoint to flood the queue against arbitrary numbers — they can only report rentals they own.
-- **Audit:** every status transition writes a `rental_report_events` row, including reseller-initiated reports (`actor='reseller'`). Full chain of custody.
-- **No PII** beyond MDN — already shared in the existing webhook stream.
+- **Auth:** the existing portal's `getCredFromRequest()` (API key `rsk_*` or session cookie `rps_*`). Reseller scoping is already enforced — the `:simId` URL handler must verify the SIM belongs to the authenticated reseller (same `ownResp` check pattern used by `handleResendOnline`, `handleSimLifetime`).
+- **Rate limit:** one new action name in `checkRateLimit()`:
+  ```js
+  if (action === 'portal_report_bad') {
+    if (simId != null) {
+      const perSim = await countActionsSince(env, resellerId, 'portal_report_bad', 3600, simId);
+      if (perSim >= 1) return { allowed: false, retryAfter: 3600, reason: 'This SIM was reported within the last hour' };
+    }
+    const perDay = await countActionsSince(env, resellerId, 'portal_report_bad', 86400);
+    if (perDay >= 200) return { allowed: false, retryAfter: 86400, reason: 'Per-reseller daily cap (200) reached' };
+    return { allowed: true };
+  }
+  ```
+  Logged via the same `logAction(env, resellerId, 'portal_report_bad', simId)` helper.
+- **Anti-abuse:** `uq_rental_reports_open` index + the per-SIM 1h cooldown means flooding the same SIM is a no-op (returns the existing `report_id`).
+- **Audit:** every status transition writes a `rental_report_events` row (`actor='reseller'` for intake, `actor='operator:<id>'` for triage actions). Same audit pattern as existing portal actions.
 
-## 7. Dashboard tab — "Bad Rental Reports"
+## 7. Reseller portal UI changes (the minimal delta)
 
-Patched into `src/dashboard/index.js` via the **patch-dashboard** skill (required for any dashboard change).
+`src/reseller-portal/index.js` only — no separate UI worker. Touch points:
+
+1. **SIMs tab — new row action.** Add a "Report bad" button next to the existing "Resend" button in the SIM row template. Click → opens a modal (reuse the existing modal helper) with reason dropdown + note textarea + Submit.
+2. **SIMs tab — status badge.** After submit, the row shows the badge described in §3.1. The badge state comes from a new `open_report` field appended to each SIM row in `handleSims()`.
+3. **SIM detail modal — report history.** When the existing `handleSimLifetime` modal opens, a new section lists the most recent reports for the lifetime (calling `GET /api/sims/:simId/report-status`).
+4. **API Access tab — docs.** A new section documents `POST /api/sims/:simId/report-bad` and `GET /api/sims/:simId/report-status` next to the existing rental-list API docs.
+5. **No new tab needed** on the reseller side. The reseller's mental model stays "go to my SIMs and act on a row." This is the recommendation; happy to add a separate "Reports" tab later if usage data shows the inline view is insufficient.
+
+## 8. Operator dashboard tab — "Bad Rental Reports"
+
+(Unchanged from rev 2 — this is the IncomingSMS-side dashboard, not the reseller portal.) Patched into `src/dashboard/index.js` via the **patch-dashboard** skill (required for any dashboard change).
 
 - Default view: open reports (status `received` or `in_triage`), reseller column, e164, reason, age, action buttons.
 - Filter by reseller, status, age.
@@ -174,7 +241,7 @@ Patched into `src/dashboard/index.js` via the **patch-dashboard** skill (require
 
 Test-environment first: deploy via `--env test` (verify domain bindings — known footgun, see memory `wrangler-test-env-inherits-custom-domain`).
 
-## 8. Tie-back to billing — *how this prevents future discrepancies*
+## 9. Tie-back to billing — *how this prevents future discrepancies*
 
 This is the connective tissue, not a re-opening of INC-2:
 
@@ -186,7 +253,7 @@ This is the connective tissue, not a re-opening of INC-2:
 
 Phase 1 builds the **evidence channel**. Auto-credit policy is a separate, later proposal.
 
-## 9. Phasing
+## 10. Phasing
 
 **Phase 1 (this proposal, asks approval):** intake endpoint, `rental_reports` + `rental_report_events` tables, status pull endpoints, dashboard tab, manual remediation only. **No customer-facing automation. No invoice changes.** Test-env first.
 
@@ -194,22 +261,32 @@ Phase 1 builds the **evidence channel**. Auto-credit policy is a separate, later
 
 **Phase 3 (separate approval, billing review):** auto-credit policy for rentals whose reports closed `remediated` after >Xh, or `unable_to_reproduce` with operator concurrence.
 
-## 10. Exact implementation steps & files (Phase 1)
+## 11. Exact implementation steps & files (Phase 1, rev 3)
 
-1. **Migration** — `supabase/migrations/2026XXXX_rental_reports.sql` (schema above).
-2. **Worker** — `src/reseller-portal/index.js`:
-   - `POST /api/v1/rentals/report-bad` — intake handler (validate, resolve rental, insert, idempotency on open report).
-   - `GET  /api/v1/rentals/reports[?status=&since=]` — list.
-   - `GET  /api/v1/rentals/reports/{id}` — detail.
-3. **Dashboard** — `src/dashboard/index.js` via **patch-dashboard** skill:
-   - "Bad Rental Reports" tab with the columns + actions described in §7.
-   - Action buttons call existing endpoints, write a `rental_report_events` row, update status.
-4. **Operator notifier (optional, tiny)** — `src/details-finalizer/index.js`: include `open_rental_reports` count in the nightly rotation review. Same channel operators already read.
+1. **Migration** — `supabase/migrations/2026XXXX_rental_reports.sql` (schema in §5 above). No changes to existing tables.
+2. **Reseller portal worker** — `src/reseller-portal/index.js` (extend, don't fork):
+   - Add `handleReportBad(simId, auth, env, request)` — mirrors the shape of `handleResendOnline` (ownership check, rate-limit check via `checkRateLimit('portal_report_bad', simId)`, insert into `rental_reports`, log to `reseller_actions_log`, return `jsonResp`).
+   - Add `handleReportStatus(simId, auth, env)` — most recent reports + events for the SIM.
+   - Add `handleReportsList(auth, env, url)` — all reports for the reseller, filterable.
+   - Extend `handleSims()` to attach an `open_report` field per row (one extra query, grouped by `sim_id`).
+   - Route table additions (in `fetch()` near the existing sims routes):
+     ```js
+     if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/report-bad$/)) && request.method === 'POST') return handleReportBad(m[1], auth, env, request);
+     if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/report-status$/))) return handleReportStatus(m[1], auth, env);
+     if (url.pathname === '/api/sims/reports') return handleReportsList(auth, env, url);
+     ```
+   - Extend `checkRateLimit()` with the `portal_report_bad` branch (code shown in §6).
+   - Extend `portalHtml()`: "Report bad" button in the SIM row template, modal markup (reuse `rp-confirm-*` helpers), status badge slot, and the small JS handler to POST and refresh the row.
+   - Extend the **API Access** tab HTML with the two new endpoint snippets.
+3. **Operator dashboard** — `src/dashboard/index.js` via **patch-dashboard** skill (unchanged from rev 2):
+   - "Bad Rental Reports" tab with the columns + actions described in §8.
+   - Row-action buttons call existing remediation tools (rotate, port reset, replace), write a `rental_report_events` row, update report status.
+4. **Operator notifier (small)** — `src/details-finalizer/index.js`: include `open_rental_reports` count in the nightly rotation review.
 5. **Docs** — `agent/decision-log.md` entry on the SLA target, why operator-only in v1, and the explicit non-goal of auto-credits.
 
-Nothing in `src/sms-ingest/`, no change to `rentals`/`reseller_rental_rates`/`webhook_deliveries`, no change to billing math, no flag flips, no production deploy until §11 verification passes.
+Nothing in `src/sms-ingest/`, no change to `rentals`/`reseller_rental_rates`/`webhook_deliveries`, no change to billing math, no flag flips, no production deploy until §12 verification passes.
 
-## 11. Verification plan
+## 12. Verification plan
 
 1. Apply migration to **dashboard-test** Supabase project only.
 2. Deploy `reseller-portal` and `dashboard` with `--env test` (verify custom domain bindings post-deploy).
@@ -221,7 +298,7 @@ Nothing in `src/sms-ingest/`, no change to `rentals`/`reseller_rental_rates`/`we
 
 Only after all six pass: production deploy of Phase 1, endpoint live but **not announced** to the reseller until the operator does a hand-off.
 
-## 12. Risks & non-goals
+## 13. Risks & non-goals
 
 - **Non-goal:** automatic credits, automatic invoice adjustments, automatic SIM actions. Operator-in-the-loop for every remediation.
 - **Non-goal:** changing INC-2 billing math, the legacy engine, the rentals schema, or anything in `sms-ingest`.
@@ -229,13 +306,18 @@ Only after all six pass: production deploy of Phase 1, endpoint live but **not a
 - **Risk — slow operator response harms the SLA promise:** mitigation in v1 is that the SLA is advisory, exposed in the response, and not contractual. Phase 3 could tighten this.
 - **Risk — Phase 2 webhook misfire** spamming the reseller: gated behind separate approval and per-reseller opt-in.
 
-## 13. Approval requested
+## 14. Approval requested (rev 3)
 
-Approval to proceed **with Phase 1 only**:
+Approval to proceed **with Phase 1 only**, scoped to the existing reseller portal:
 
 1. Migration for `rental_reports` + `rental_report_events`.
-2. Intake `POST /api/v1/rentals/report-bad` and read endpoints on `reseller-portal`.
-3. "Bad Rental Reports" tab on the dashboard (operator-only), patched via the `patch-dashboard` skill.
-4. Nightly open-reports count in the rotation review.
-5. Full verification on `--env test` before any production deploy.
-6. **No outbound webhook, no auto-credits, no invoice changes** — those are Phase 2 and Phase 3, separately approved.
+2. New routes on the existing `reseller-portal` worker:
+   - `POST /api/sims/:simId/report-bad`
+   - `GET  /api/sims/:simId/report-status`
+   - `GET  /api/sims/reports`
+   plus extending `GET /api/sims` to attach `open_report` per row.
+3. UI additions inside the **existing** portal SPA: "Report bad" button + reason modal on the SIMs tab, status badge, SIM-detail modal history section, API Access tab docs. No new tab, no new worker.
+4. "Bad Rental Reports" tab on the **operator** dashboard (unchanged from rev 2), via the `patch-dashboard` skill.
+5. Nightly open-reports count in the rotation review.
+6. Full verification on `--env test` before any production deploy.
+7. **No outbound webhook, no auto-credits, no invoice changes** — those are Phase 2 and Phase 3, separately approved.
