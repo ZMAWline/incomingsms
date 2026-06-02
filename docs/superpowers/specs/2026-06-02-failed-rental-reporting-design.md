@@ -9,7 +9,8 @@ Related: INC-2 (rental billing capture, in production), reseller-portal-resend (
 
 - **Rev 2 (earlier today):** flipped direction from *us-detecting* dead rentals to *reseller-reporting* a bad rental. Don't chase the closed 54 / $195. Don't reopen INC-2.
 - **Rev 3 (earlier):** **build on the existing reseller portal** (`src/reseller-portal/index.js`, deployed at `portal.incoming-sms.com`) rather than inventing a new `/api/v1/...` surface. Reuse its auth, rate-limit table, SIMs tab, modal pattern, and HTML/JS shell.
-- **Rev 4 (now):** **the reseller's `rentalId` is the primary external identifier**, not our internal `sim_id`. Board flagged that resellers operate against the `rentalId` we capture in `rentals.reseller_rental_id` (the value they echoed back on `number.online`). Plan now accepts four identifiers — `reseller_rental_id` (primary), our `rental_id`, our `sim_id`, or `e164` (last-resort) — all resolved against the same `rentals` row. Portal UI button still operates per-SIM (the row already knows the SIM), so internally it just hits the same handler with `sim_id`.
+- **Rev 4 (earlier):** Picked `reseller_rental_id` as primary identifier with `rental_id` / `sim_id` / `e164` as fallbacks.
+- **Rev 5 (now):** **`e164` (phone number) is the primary identifier**, per board direction — the reseller's most natural reference is the MDN they typed into their OTP system. `reseller_rental_id`, `rental_id`, and `sim_id` are accepted fallbacks. The lookup is scoped to the authenticated reseller and defaults to the **current/active** lifetime; ambiguity only arises when the same MDN currently has more than one active rental for the same reseller (rare but possible — handled explicitly).
 
 ## Existing reseller portal — what we already have (so we don't reinvent it)
 
@@ -67,13 +68,32 @@ Non-goals: automatic credits, automatic invoice adjustments, automatic suspensio
 
 ### What identifier does the reseller send?
 
-The reseller's natural reference is **their own `rentalId`**, which they echoed to us on `number.online` and we stored as `rentals.reseller_rental_id`. That is the **primary, recommended external identifier**. Our internal `sim_id` is also sent on every `number.online` (`data.sim_id` in `src/details-finalizer/index.js` and `src/teltik-worker/index.js`), so it is accepted as a fallback for callers who hold it.
+The reseller's most natural reference is **the phone number** (E.164 MDN) — that is the value they typed into their OTP system and the one their operators will instinctively reach for when something stops working. That is the **primary, recommended external identifier**. `reseller_rental_id` (their `rentalId`, which they echoed to us on `number.online` and we stored as `rentals.reseller_rental_id`), `rental_id` (our `rentals.id`), and `sim_id` (our `sims.id`, sent on every `number.online` per `src/details-finalizer/index.js` and `src/teltik-worker/index.js`) are all accepted as fallbacks/alternatives.
 
 **Recommended identifier order for the reseller:**
-1. `reseller_rental_id` (their `rentalId`) — primary, what they track in their own system.
-2. `rental_id` — our `rentals.id`, returned in our `/api/sims/reports` responses and useful for follow-ups.
-3. `sim_id` — our `sims.id`, what the portal UI uses internally (already on every `number.online`).
-4. `e164` — last-resort if no id is available; resolves to the most recent active rental for the reseller on that MDN.
+1. `e164` — primary; the phone number that isn't receiving SMS.
+2. `reseller_rental_id` (their `rentalId`) — useful when they want to be precise about a specific lifetime.
+3. `rental_id` — our `rentals.id`, returned in our `/api/sims/reports` responses.
+4. `sim_id` — our `sims.id`, what the portal UI uses internally (already on every `number.online`).
+
+### Resolution order and ambiguity behavior
+
+When the request contains more than one identifier, the handler uses the **most specific** one and ignores the rest (no cross-checking — the caller is trusted to send consistent data; we just record what they sent). Specificity order:
+
+1. **`rental_id`** — exact `rentals.id`; verify it belongs to the authenticated reseller; reject `404`/`403` otherwise.
+2. **`reseller_rental_id`** — exact lookup on `rentals.reseller_rental_id` scoped to the reseller. If multiple rows (unlikely but possible — rentalIds are not globally unique across resellers, only within), pick the most-recent `minted_at`.
+3. **`sim_id`** — verify SIM belongs to the reseller, then pick the SIM's **most recent rental** (most recent `sim_number_id` for the SIM with a rental row).
+4. **`e164`** — described below.
+
+**Phone-number lookup (`e164`)**:
+- Always normalized first to a `+E164` form before query (strip spaces, dashes, parens, leading `+/00`; reject if not a plausible 11–15 digit E.164).
+- Scoped to the **authenticated reseller** via the `rentals.reseller_id` column — we never read another reseller's rentals on an unauth'd-by-them MDN. (This is the cross-reseller-leak guard.)
+- Returns the set of rentals for that reseller whose `e164` matches AND whose underlying `sim_numbers` row is the **current lifetime** — modeled in the existing schema as `sim_numbers.valid_to IS NULL` (the open-ended row; the rotator closes the prior lifetime by setting `valid_to` and inserts a new open-ended row). Sanity-check via existing usage in `src/sms-ingest/index.ts:43,73`, `src/phone-number-sync/index.js:73`, and `src/sim-status-changer/index.js:121`.
+- **0 results** → `404 {"error":"no active rental for this number under your account"}` with a small hint that prior lifetimes may be reportable via `reseller_rental_id` if they have one. No info about other resellers is leaked.
+- **1 result (the common case)** → resolved; proceed with the insert.
+- **2+ active results** (rare; only possible if a SIM swap left two lifetimes still flagged active, or two SIMs share a recently-recycled MDN inside the same reseller) → `409 {"error":"ambiguous", "candidates":[{rental_id, sim_id, sim_number_id, minted_at}, ...]}`. The caller resubmits with `rental_id` to disambiguate.
+
+Historical lifetimes are intentionally **not** matched by an `e164`-only request, because (a) the reseller's intent is "fix what's broken right now," not "annotate something rotated months ago," and (b) it prevents accidental reports against numbers that have since been recycled to a different reseller (no leak path). To report a historical lifetime they still need an exact id (`rental_id` or `reseller_rental_id`).
 
 ### Two endpoint shapes (both supported, same backend handler)
 
@@ -84,10 +104,10 @@ POST /api/rentals/report-bad
 Body:
 ```json
 {
-  "reseller_rental_id": "trustotp-xyz",   // PRIMARY: the rentalId we echoed back from their number.online response
-  "rental_id": 123456,                    // alt: our rentals.id
+  "e164": "+15551234567",                 // PRIMARY: the phone number that's not working
+  "reseller_rental_id": "trustotp-xyz",   // alt: their rentalId (precise)
+  "rental_id": 123456,                    // alt: our rentals.id (precise)
   "sim_id": 4242,                         // alt: our sims.id (data.sim_id on number.online)
-  "e164": "+15551234567",                 // alt: last-resort lookup
   "reason_code": "no_sms_received",       // enum, default "no_sms_received"
   "reason_note": "3 send attempts, no SMS in 30 min", // free text, <500 chars
   "attempts": 3,
@@ -95,7 +115,7 @@ Body:
   "client_request_id": "<uuid>"
 }
 ```
-At least one of `reseller_rental_id` / `rental_id` / `sim_id` / `e164` is required. Resolution order matches the list above. Ambiguous (`e164` matches >1 active rental) → `400` with the candidate `rental_id`s in the response so the caller can disambiguate.
+At least one of `e164` / `reseller_rental_id` / `rental_id` / `sim_id` is required. Resolution uses the **specificity order** described above (exact id wins over e164). Ambiguity (`e164` matches >1 active rental) → `409` with the candidate `rental_id`s in the response so the caller can disambiguate by resubmitting with a `rental_id`.
 
 **(b) SIM-keyed, URL-driven — used by the existing portal UI:**
 ```
@@ -282,11 +302,12 @@ Phase 1 builds the **evidence channel**. Auto-credit policy is a separate, later
 
 **Phase 3 (separate approval, billing review):** auto-credit policy for rentals whose reports closed `remediated` after >Xh, or `unable_to_reproduce` with operator concurrence.
 
-## 11. Exact implementation steps & files (Phase 1, rev 4)
+## 11. Exact implementation steps & files (Phase 1, rev 5)
 
 1. **Migration** — `supabase/migrations/2026XXXX_rental_reports.sql` (schema in §5 above). No changes to existing tables.
 2. **Reseller portal worker** — `src/reseller-portal/index.js` (extend, don't fork):
-   - Add `resolveRentalForReport(env, resellerId, body)` — single resolver that takes any of `reseller_rental_id` / `rental_id` / `sim_id` / `e164` and returns `{ rental_id, sim_id, sim_number_id, e164 }` or `{ error, candidates }`. Resolution order matches §2.
+   - Add `normalizeE164(input)` — strip non-digits, prepend `+`, validate 11–15 digits, return null on failure. Pure function, unit-testable.
+   - Add `resolveRentalForReport(env, resellerId, body)` — single resolver that applies the specificity order in §2 (`rental_id` → `reseller_rental_id` → `sim_id` → `e164`). Always scoped by `resellerId` (cross-reseller-leak guard). For `e164` lookups, filters to current/active lifetimes only and returns `{ ok:false, code:'ambiguous', candidates:[...] }` when >1 hit, `{ ok:false, code:'not_found' }` when 0 hit, `{ ok:true, rental_id, sim_id, sim_number_id, e164 }` when 1 hit.
    - Add `handleReportBadByRental(auth, env, request)` — primary handler. Reads JSON body, calls `resolveRentalForReport`, verifies the rental belongs to the authenticated reseller, runs `checkRateLimit('portal_report_bad', sim_id)`, inserts into `rental_reports`, logs to `reseller_actions_log`, returns `jsonResp` (echoing all identifiers).
    - Add `handleReportBadBySim(simId, auth, env, request)` — thin wrapper used by the portal UI: resolves `:simId` → current active rental, then delegates to the same insertion code path.
    - Add `handleReportStatus(simId, auth, env)` — most recent reports + events for the SIM.
@@ -330,13 +351,13 @@ Only after all six pass: production deploy of Phase 1, endpoint live but **not a
 - **Risk — slow operator response harms the SLA promise:** mitigation in v1 is that the SLA is advisory, exposed in the response, and not contractual. Phase 3 could tighten this.
 - **Risk — Phase 2 webhook misfire** spamming the reseller: gated behind separate approval and per-reseller opt-in.
 
-## 14. Approval requested (rev 4)
+## 14. Approval requested (rev 5)
 
 Approval to proceed **with Phase 1 only**, scoped to the existing reseller portal:
 
 1. Migration for `rental_reports` + `rental_report_events`.
 2. New routes on the existing `reseller-portal` worker:
-   - `POST /api/rentals/report-bad` — **primary**, body-keyed. Accepts `reseller_rental_id` (recommended), `rental_id`, `sim_id`, or `e164`.
+   - `POST /api/rentals/report-bad` — **primary**, body-keyed. Accepts `e164` (recommended), `reseller_rental_id`, `rental_id`, or `sim_id`. e164 lookups scoped to authenticated reseller, current-lifetime only; ambiguity returns 409 with candidates.
    - `POST /api/sims/:simId/report-bad` — convenience route used by the portal UI's "Report bad" button.
    - `GET  /api/sims/:simId/report-status` — per-SIM report history.
    - `GET  /api/sims/reports` — list of all reports for the reseller.
