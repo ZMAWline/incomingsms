@@ -12994,21 +12994,21 @@ async function sendSimOnline(simId, phoneNumber) {
                         ? '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-blue-500/20 text-blue-300">In triage</span>'
                         : '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-amber-500/20 text-amber-300">Received</span>';
                     const simLink = r.sim_id
-                        ? '<a onclick="event.stopPropagation();switchTab(&quot;sims&quot;)" class="text-accent hover:text-green-400 cursor-pointer">' + r.sim_id + '</a>'
+                        ? '<a onclick="event.stopPropagation();switchTab(&quot;sims&quot;)" class="text-accent hover:text-green-400 cursor-pointer">' + escapeHtml(r.sim_id) + '</a>'
                         : '—';
                     return '<tr class="hover:bg-dark-700/40">' +
-                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + r.id + '</td>' +
-                        '<td class="px-4 py-3 text-dark-200">' + resellerName + '</td>' +
-                        '<td class="px-4 py-3 font-mono text-cyan-300">' + (r.e164 || '—') + '</td>' +
-                        '<td class="px-4 py-3 text-dark-300 text-xs" title="' + (r.reason_note || '') + '">' + (r.reason_code || '—') + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + escapeHtml(r.id) + '</td>' +
+                        '<td class="px-4 py-3 text-dark-200">' + escapeHtml(resellerName) + '</td>' +
+                        '<td class="px-4 py-3 font-mono text-cyan-300">' + escapeHtml(r.e164 || '—') + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 text-xs" title="' + escapeHtml(r.reason_note || '') + '">' + escapeHtml(r.reason_code || '—') + '</td>' +
                         '<td class="px-4 py-3">' + statusBadge + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + simLink + '</td>' +
-                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + (r.rental_id != null ? r.rental_id : '—') + '</td>' +
-                        '<td class="px-4 py-3 text-dark-400 text-xs">' + fmtDt(r.received_at) + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + (r.rental_id != null ? escapeHtml(r.rental_id) : '—') + '</td>' +
+                        '<td class="px-4 py-3 text-dark-400 text-xs">' + escapeHtml(fmtDt(r.received_at)) + '</td>' +
                     '</tr>';
                 }).join('');
             } catch(e) {
-                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + e.message + '</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + escapeHtml(e.message) + '</td></tr>';
                 console.error('[loadBadRentals]', e);
             }
         }
