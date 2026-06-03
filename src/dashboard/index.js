@@ -3487,8 +3487,19 @@ async function handleBadRentals(env, corsHeaders, url) {
   try {
     const statusFilter = url.searchParams.get('status') || 'received,in_triage';
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10) || 200, 1000);
-    const query = 'rental_reports?select=id,reseller_id,e164,reason_code,reason_note,status,sim_id,rental_id,received_at,triaged_at,resellers(name)'
+    // Embed reseller_rental_id (from rentals) and the SIM's current MDN
+    // (sim_numbers row where valid_to IS NULL). The reported e164 stays on
+    // rental_reports; the join lets the UI surface "current vs stale".
+    const select = [
+      'id', 'reseller_id', 'e164', 'reason_code', 'reason_note', 'status',
+      'sim_id', 'rental_id', 'received_at', 'triaged_at',
+      'resellers(name)',
+      'rentals(reseller_rental_id)',
+      'sims(sim_numbers(e164,valid_to))',
+    ].join(',');
+    const query = 'rental_reports?select=' + encodeURIComponent(select)
       + '&status=in.(' + encodeURIComponent(statusFilter) + ')'
+      + '&sims.sim_numbers.valid_to=is.null'
       + '&order=received_at.desc&limit=' + limit;
     const resp = await supabaseGet(env, query);
     if (!resp.ok) {
@@ -3499,7 +3510,32 @@ async function handleBadRentals(env, corsHeaders, url) {
       });
     }
     const rows = await resp.json();
-    return new Response(JSON.stringify(Array.isArray(rows) ? rows : []), {
+    // Flatten the nested embeds so the frontend doesn't need to know the join
+    // shape. reseller_rental_id falls back to null when rentals row is gone
+    // (rental_id was SET NULL on rentals delete); current_e164 falls back to
+    // null when the SIM has no active sim_numbers row.
+    const flat = (Array.isArray(rows) ? rows : []).map(r => {
+      const currentE164 = r && r.sims && Array.isArray(r.sims.sim_numbers) && r.sims.sim_numbers[0]
+        ? r.sims.sim_numbers[0].e164
+        : null;
+      const resellerRentalId = r && r.rentals ? r.rentals.reseller_rental_id : null;
+      return {
+        id: r.id,
+        reseller_id: r.reseller_id,
+        e164: r.e164,
+        reason_code: r.reason_code,
+        reason_note: r.reason_note,
+        status: r.status,
+        sim_id: r.sim_id,
+        rental_id: r.rental_id,
+        received_at: r.received_at,
+        triaged_at: r.triaged_at,
+        resellers: r.resellers || null,
+        reseller_rental_id: resellerRentalId,
+        current_e164: currentE164,
+      };
+    });
+    return new Response(JSON.stringify(flat), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
@@ -7576,11 +7612,11 @@ function getHTML(helixEnabled) {
                             <tr>
                                 <th class="px-4 py-3 font-medium">Report ID</th>
                                 <th class="px-4 py-3 font-medium">Reseller</th>
-                                <th class="px-4 py-3 font-medium">MDN (E.164)</th>
+                                <th class="px-4 py-3 font-medium" title="Reported MDN is what the reseller submitted with the bad-rental report. Current MDN is the SIM's active number now — when they differ, the reported number has been rotated/swapped.">Reported / Current MDN</th>
                                 <th class="px-4 py-3 font-medium">Reason</th>
                                 <th class="px-4 py-3 font-medium">Status</th>
                                 <th class="px-4 py-3 font-medium">SIM ID</th>
-                                <th class="px-4 py-3 font-medium">Rental ID</th>
+                                <th class="px-4 py-3 font-medium" title="Reseller's own rental identifier (from rentals.reseller_rental_id). Falls back to internal rental_id when the reseller didn't echo one.">Reseller Rental ID</th>
                                 <th class="px-4 py-3 font-medium">Received</th>
                                 <th class="px-4 py-3 font-medium">Action</th>
                             </tr>
@@ -13135,18 +13171,45 @@ async function sendSimOnline(simId, phoneNumber) {
                     const simLink = r.sim_id
                         ? '<a onclick="event.stopPropagation();goToSimsBySearch(&quot;' + escapeHtml(r.sim_id) + '&quot;)" title="Open SIMs page filtered to this SIM ID" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(r.sim_id) + '</a>'
                         : '—';
-                    const mdnCell = r.e164
-                        ? '<span title="Reported phone — may be stale; use SIM ID to locate the SIM" class="text-dark-300">' + escapeHtml(r.e164) + '</span>'
-                        : '—';
+                    // MDN cell: when current differs from reported, highlight the reported one as stale (amber strike-through)
+                    // and the current one as live (emerald). When they match (or current is unknown), just show reported.
+                    const reported = r.e164 || null;
+                    const current = r.current_e164 || null;
+                    const isStale = !!(reported && current && reported !== current);
+                    let mdnCell;
+                    if (!reported && !current) {
+                        mdnCell = '—';
+                    } else if (isStale) {
+                        mdnCell =
+                            '<div class="flex flex-col gap-0.5">' +
+                              '<span title="Reported MDN — stale, the SIM has rotated/swapped since this report" class="text-amber-300 line-through decoration-amber-500/60">' + escapeHtml(reported) + '</span>' +
+                              '<span title="Current MDN — the SIM\\'s active number right now" class="text-emerald-300 font-semibold">' + escapeHtml(current) + ' <span class="text-[10px] uppercase tracking-wide text-emerald-400/80">current</span></span>' +
+                            '</div>';
+                    } else if (reported && current && reported === current) {
+                        mdnCell = '<span title="Reported and current MDN match — SIM has not rotated since report" class="text-dark-200">' + escapeHtml(reported) + '</span>';
+                    } else if (reported) {
+                        mdnCell = '<span title="Reported MDN; current MDN unknown (SIM has no active sim_numbers row)" class="text-dark-300">' + escapeHtml(reported) + '</span>';
+                    } else {
+                        mdnCell = '<span title="Current MDN; reported MDN missing on report" class="text-emerald-300">' + escapeHtml(current) + '</span>';
+                    }
+                    // Reseller's own rental id when present, fall back clearly to internal rental_id
+                    let rentalIdCell;
+                    if (r.reseller_rental_id) {
+                        rentalIdCell = '<span title="Reseller-supplied rental id (rentals.reseller_rental_id)" class="text-dark-200">' + escapeHtml(r.reseller_rental_id) + '</span>';
+                    } else if (r.rental_id != null) {
+                        rentalIdCell = '<span title="Reseller didn\\'t echo a rental id — showing internal rental_id as fallback" class="text-dark-400 italic">#' + escapeHtml(r.rental_id) + '</span>';
+                    } else {
+                        rentalIdCell = '—';
+                    }
                     const actionCell = '<button onclick="event.stopPropagation();markBadRentalFixed(' + escapeHtml(r.id) + ')" class="px-2 py-1 text-xs rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 transition">Mark fixed</button>';
-                    return '<tr class="hover:bg-dark-700/40">' +
+                    return '<tr class="hover:bg-dark-700/40" data-report-id="' + escapeHtml(r.id) + '" data-sim-id="' + escapeHtml(r.sim_id || '') + '" data-reported-e164="' + escapeHtml(reported || '') + '" data-current-e164="' + escapeHtml(current || '') + '">' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + escapeHtml(r.id) + '</td>' +
                         '<td class="px-4 py-3 text-dark-200">' + escapeHtml(resellerName) + '</td>' +
                         '<td class="px-4 py-3 font-mono">' + mdnCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 text-xs" title="' + escapeHtml(r.reason_note || '') + '">' + escapeHtml(r.reason_code || '—') + '</td>' +
                         '<td class="px-4 py-3">' + statusBadge + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + simLink + '</td>' +
-                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + (r.rental_id != null ? escapeHtml(r.rental_id) : '—') + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + rentalIdCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-400 text-xs">' + escapeHtml(fmtDt(r.received_at)) + '</td>' +
                         '<td class="px-4 py-3">' + actionCell + '</td>' +
                     '</tr>';
@@ -13177,15 +13240,31 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function markBadRentalFixed(reportId) {
-            const action = window.prompt('Remediation action (rotated | port_reset | sim_replaced | mdn_swapped | other):', 'other');
+            // Read the row to know whether reported MDN differs from current MDN.
+            // When they differ, default to mdn_swapped + a canned resolution note,
+            // and trigger /api/sim-online to refresh the reseller with the new MDN.
+            const row = document.querySelector('tr[data-report-id="' + String(reportId) + '"]');
+            const reported = row ? row.getAttribute('data-reported-e164') : '';
+            const current  = row ? row.getAttribute('data-current-e164') : '';
+            const simId    = row ? row.getAttribute('data-sim-id') : '';
+            const mdnDiffers = !!(reported && current && reported !== current);
+            const allowed = ['rotated','port_reset','sim_replaced','mdn_swapped','other'];
+            const defaultAction = mdnDiffers ? 'mdn_swapped' : 'other';
+            const defaultNote = mdnDiffers
+                ? 'New phone number for this SIM is ' + current + '.'
+                : '';
+            const action = window.prompt(
+                'Remediation action (rotated | port_reset | sim_replaced | mdn_swapped | other):'
+                + (mdnDiffers ? '\\n\\nReported ' + reported + ' differs from current ' + current + ' — defaulting to mdn_swapped.' : ''),
+                defaultAction
+            );
             if (action === null) return; // cancelled
             const trimmed = String(action || '').trim().toLowerCase();
-            const allowed = ['rotated','port_reset','sim_replaced','mdn_swapped','other'];
             if (!allowed.includes(trimmed)) {
                 alert('Invalid action. Choose one of: ' + allowed.join(', '));
                 return;
             }
-            const note = window.prompt('Optional note (≤500 chars):', '') || '';
+            const note = window.prompt('Resolution note (≤500 chars):', defaultNote) || '';
             try {
                 const resp = await fetch(API_BASE + '/bad-rentals/' + encodeURIComponent(reportId) + '/resolve', {
                     method: 'POST',
@@ -13196,6 +13275,29 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (!resp.ok) {
                     alert('Failed to mark fixed: ' + (data && data.error ? data.error : resp.status));
                     return;
+                }
+                // When the fix was an MDN swap and we know the current SIM, also push
+                // a number.online webhook so the reseller sees the new number live.
+                // /api/sim-online already ABIR-guards and skips when the SIM has no
+                // verified current MDN — safe to call here.
+                if (trimmed === 'mdn_swapped' && simId) {
+                    try {
+                        const online = await fetch(API_BASE + '/sim-online', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ sim_id: Number(simId) || simId }),
+                        });
+                        const onlineData = await online.json().catch(function(){ return {}; });
+                        if (online.ok && onlineData.ok) {
+                            if (typeof showToast === 'function') showToast('Marked fixed and sent number.online for ' + (current || 'SIM'), 'success');
+                        } else {
+                            console.warn('[markBadRentalFixed] sim-online refresh non-ok:', onlineData);
+                            if (typeof showToast === 'function') showToast('Marked fixed; number.online refresh failed: ' + (onlineData.error || online.status), 'warning');
+                        }
+                    } catch(e2) {
+                        console.warn('[markBadRentalFixed] sim-online refresh error:', e2);
+                        if (typeof showToast === 'function') showToast('Marked fixed; number.online refresh errored: ' + e2.message, 'warning');
+                    }
                 }
                 if (typeof loadBadRentals === 'function') loadBadRentals();
             } catch(e) {
