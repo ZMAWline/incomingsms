@@ -16,12 +16,12 @@ Board approved option 1 (deploy all INC-3 Phase 1 to prod for live testing).
 
 Smoke: portal 400 on /login (expects POST — alive), dashboard 401 (auth required — alive), details-finalizer 200.
 
-**BLOCKED on DB migration** `supabase/migrations/20260602_rental_reports.sql` — this heartbeat env has Cloudflare creds only, no Supabase. Until the table exists, the new endpoints will 500:
+**DB migration applied** via Supabase Management API (`SUPABASE_ACCESS_TOKEN` from `.dev.vars`, project ref `lzjqegxazqlktttyybth`). Both tables present in public schema: `rental_reports`, `rental_report_events`. RLS enabled per migration. All three new code paths are now backed by their tables:
 - portal `POST /api/sims/:id/report-bad`
 - dashboard `/api/bad-rentals*` (Bad Rentals tab)
 - details-finalizer nightly bad-rental count
 
-Migration is idempotent (`CREATE TABLE IF NOT EXISTS`) and additive — existing flows unaffected. Operator action required: apply migration via Supabase MCP or psql.
+INC-3 Phase 1 is fully live in production. Next: monitor for reseller intake, watch nightly count cron.
 
 ---
 
