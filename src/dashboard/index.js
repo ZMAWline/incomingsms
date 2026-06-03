@@ -15069,8 +15069,11 @@ async function sendSimOnline(simId, phoneNumber) {
                     const updCell = r.password_updated_at
                         ? '<span class="text-xs text-gray-400" title="' + rcEscape(r.password_updated_at) + '">' + rcEscape(rcRelativeTime(r.password_updated_at)) + '</span>'
                         : '<span class="text-gray-600">&mdash;</span>';
-                    const safeName = JSON.stringify(r.reseller_name);
-                    const safeUser = JSON.stringify(r.username || '');
+                    // The onclick attribute itself is double-quoted, so raw JSON.stringify output
+                    // (for example "Trust OTP") breaks the generated HTML into a no-op handler.
+                    // HTML-escape the JS string literal before inserting it into the attribute.
+                    const safeName = rcEscape(JSON.stringify(r.reseller_name || ''));
+                    const safeUser = rcEscape(JSON.stringify(r.username || ''));
                     const reseller = '<span class="text-gray-200">' + rcEscape(r.reseller_name) + '</span><span class="text-gray-600 ml-2 text-xs">#' + r.reseller_id + '</span>';
                     const actions =
                         '<button onclick="resetResellerCredentials(' + r.reseller_id + ', ' + safeName + ', ' + safeUser + ')" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition mr-1">Reset</button>' +
