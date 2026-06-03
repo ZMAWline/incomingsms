@@ -158,6 +158,10 @@ export default {
       return handleErrors(env, corsHeaders, url);
     }
 
+    if (url.pathname === '/api/bad-rentals') {
+      return handleBadRentals(env, corsHeaders, url);
+    }
+
     if (url.pathname === '/api/error-logs') {
       return handleErrorLogs(env, corsHeaders, url);
     }
@@ -3470,6 +3474,33 @@ async function handleErrorLogs(env, corsHeaders, url) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleBadRentals(env, corsHeaders, url) {
+  try {
+    const statusFilter = url.searchParams.get('status') || 'received,in_triage';
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10) || 200, 1000);
+    const query = 'rental_reports?select=id,reseller_id,e164,reason_code,reason_note,status,sim_id,rental_id,received_at,triaged_at,resellers(name)'
+      + '&status=in.(' + encodeURIComponent(statusFilter) + ')'
+      + '&order=received_at.desc&limit=' + limit;
+    const resp = await supabaseGet(env, query);
+    if (!resp.ok) {
+      const txt = await resp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + resp.status, detail: txt }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const rows = await resp.json();
+    return new Response(JSON.stringify(Array.isArray(rows) ? rows : []), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 }
@@ -12967,17 +12998,8 @@ async function sendSimOnline(simId, phoneNumber) {
             tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>';
             if (status) status.textContent = '';
             try {
-                const url = SUPABASE_URL + '/rest/v1/rental_reports' +
-                    '?select=id,reseller_id,e164,reason_code,reason_note,status,sim_id,rental_id,received_at,triaged_at,resellers(name)' +
-                    '&status=in.(received,in_triage)&order=received_at.desc&limit=200';
-                const resp = await fetch(url, {
-                    headers: {
-                        apikey: SUPABASE_SERVICE_ROLE_KEY,
-                        Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY,
-                        Accept: 'application/json',
-                    }
-                });
-                if (!resp.ok) throw new Error('Supabase ' + resp.status);
+                const resp = await fetch(API_BASE + '/bad-rentals');
+                if (!resp.ok) throw new Error('API ' + resp.status);
                 const rows = await resp.json();
                 if (!Array.isArray(rows) || rows.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-8 text-center text-dark-400">No open bad-rental reports.</td></tr>';
