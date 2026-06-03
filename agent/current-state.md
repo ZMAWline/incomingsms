@@ -1,7 +1,27 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-01 (session 63 — INC-2 rental→PROD, rotation reliability, ATOMIC self-heal, carrier escalations)
+> Last updated: 2026-06-03 (session 64 — INC-3 Phase 1 workers to PROD; DB migration pending)
+
+---
+
+## Session 64 (2026-06-03) — INC-3 Phase 1 deploy: workers to PROD, migration pending
+
+Board approved option 1 (deploy all INC-3 Phase 1 to prod for live testing).
+
+**Deployed from branch `feat/inc-2-rental-billing` HEAD (1565dbe):**
+- reseller-portal `27b1a7b4-8ca2-41d8-8f70-35d412552fdd` (portal.incoming-sms.com)
+- dashboard `eeb532da-e765-471d-aeac-907179ae020c`
+- details-finalizer `47fc0b58-be80-4571-b50d-bb6e185ac97b` (cron */5, 30 10, 0 */6)
+
+Smoke: portal 400 on /login (expects POST — alive), dashboard 401 (auth required — alive), details-finalizer 200.
+
+**BLOCKED on DB migration** `supabase/migrations/20260602_rental_reports.sql` — this heartbeat env has Cloudflare creds only, no Supabase. Until the table exists, the new endpoints will 500:
+- portal `POST /api/sims/:id/report-bad`
+- dashboard `/api/bad-rentals*` (Bad Rentals tab)
+- details-finalizer nightly bad-rental count
+
+Migration is idempotent (`CREATE TABLE IF NOT EXISTS`) and additive — existing flows unaffected. Operator action required: apply migration via Supabase MCP or psql.
 
 ---
 
