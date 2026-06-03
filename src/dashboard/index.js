@@ -172,6 +172,11 @@ export default {
       return handleResolveBadRental(id, request, env, corsHeaders);
     }
 
+    if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/report') && request.method === 'GET') {
+      const id = url.pathname.slice('/api/bad-rentals/'.length, -('/report'.length));
+      return handleBadRentalReport(id, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/error-logs') {
       return handleErrorLogs(env, corsHeaders, url);
     }
@@ -3833,6 +3838,69 @@ async function handleUpdateBadRental(id, request, env, corsHeaders) {
     }
 
     return new Response(JSON.stringify({ ok: true, report: updated[0] || null }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+// GET /api/bad-rentals/:id/report — returns the parsed report row +
+// event timeline that the reseller's bad-rental webhook produced. The raw
+// HTTP body is not stored (the intake at src/reseller-portal/index.js parses
+// it into discrete columns), so this is the most complete payload-equivalent
+// view we can offer. storage_note flags that gap to the operator.
+async function handleBadRentalReport(id, env, corsHeaders) {
+  try {
+    const reportId = parseInt(id, 10);
+    if (!Number.isFinite(reportId) || reportId <= 0) {
+      return new Response(JSON.stringify({ error: 'invalid report id' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const reportSelect = [
+      'id','reseller_id','rental_id','sim_id','sim_number_id','e164',
+      'reason_code','reason_note','attempts','first_attempt_at','client_request_id',
+      'status','remediation_action','duplicate_of',
+      'received_at','triaged_at','closed_at','updated_at',
+      'resellers(name)',
+      'rentals(reseller_rental_id)',
+    ].join(',');
+    const repResp = await supabaseGet(env, 'rental_reports?id=eq.' + reportId + '&select=' + encodeURIComponent(reportSelect));
+    if (!repResp.ok) {
+      const txt = await repResp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + repResp.status, detail: txt }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const reps = await repResp.json();
+    if (!Array.isArray(reps) || reps.length === 0) {
+      return new Response(JSON.stringify({ error: 'report not found' }), {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const report = reps[0];
+
+    const evResp = await supabaseGet(env,
+      'rental_report_events?report_id=eq.' + reportId +
+      '&select=id,from_status,to_status,actor,note,evidence,created_at' +
+      '&order=created_at.asc&limit=200');
+    let events = [];
+    if (evResp.ok) {
+      const j = await evResp.json();
+      if (Array.isArray(j)) events = j;
+    }
+
+    const storageNote = 'The raw HTTP webhook body is not stored. The reseller-portal intake parses the request into the discrete report columns shown below; the audit timeline preserves status transitions and operator notes.';
+
+    return new Response(JSON.stringify({ report, events, storage_note: storageNote }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
@@ -7868,6 +7936,20 @@ function getHTML(helixEnabled) {
                     <div class="flex items-center justify-end gap-2 mt-5">
                         <button onclick="closeBadRentalEdit()" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Cancel</button>
                         <button onclick="submitBadRentalEdit()" id="bad-rentals-edit-submit" class="px-4 py-1.5 text-xs bg-accent hover:bg-green-700 text-white rounded">Save</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bad Rentals — Report payload modal (read-only) -->
+            <div id="bad-rentals-report-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+                <div class="bg-dark-800 border border-dark-600 rounded-xl p-6 w-full max-w-2xl max-h-[85vh] overflow-y-auto">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-semibold text-white">Report payload <span id="bad-rentals-report-id" class="text-dark-400 font-mono text-sm"></span></h3>
+                        <button onclick="closeBadRentalReport()" class="text-dark-400 hover:text-white text-2xl leading-none">&times;</button>
+                    </div>
+                    <div id="bad-rentals-report-body" class="text-xs text-dark-200">Loading…</div>
+                    <div class="flex items-center justify-end gap-2 mt-5">
+                        <button onclick="closeBadRentalReport()" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Close</button>
                     </div>
                 </div>
             </div>
@@ -13475,7 +13557,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         : '';
                     const actionCell = '<div class="flex items-center gap-1">' + fixBtn + editBtn + '</div>';
                     return '<tr class="hover:bg-dark-700/40" data-report-id="' + escapeHtml(r.id) + '" data-sim-id="' + escapeHtml(r.sim_id || '') + '" data-reported-e164="' + escapeHtml(reported || '') + '" data-current-e164="' + escapeHtml(current || '') + '">' +
-                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + escapeHtml(r.id) + '</td>' +
+                        '<td class="px-4 py-3 font-mono text-xs"><a onclick="event.stopPropagation();openBadRentalReport(' + escapeHtml(r.id) + ')" title="Show the report payload the reseller submitted" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(r.id) + '</a></td>' +
                         '<td class="px-4 py-3 text-dark-200">' + escapeHtml(resellerName) + '</td>' +
                         '<td class="px-4 py-3 font-mono">' + mdnCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 text-xs" title="' + escapeHtml(r.reason_note || '') + '">' + escapeHtml(r.reason_code || '—') + '</td>' +
@@ -13564,6 +13646,124 @@ async function sendSimOnline(simId, phoneNumber) {
             } finally {
                 if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
             }
+        }
+
+        async function openBadRentalReport(reportId) {
+            const modal = document.getElementById('bad-rentals-report-modal');
+            const idEl = document.getElementById('bad-rentals-report-id');
+            const body = document.getElementById('bad-rentals-report-body');
+            if (!modal || !body) return;
+            if (idEl) idEl.textContent = '#' + reportId;
+            body.innerHTML = '<div class="text-dark-400">Loading\u2026</div>';
+            modal.classList.remove('hidden');
+            try {
+                const resp = await fetch(API_BASE + '/bad-rentals/' + encodeURIComponent(reportId) + '/report');
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) {
+                    body.innerHTML = '<div class="text-red-400">Failed to load report: ' + escapeHtml((data && data.error) || ('HTTP ' + resp.status)) + '</div>';
+                    return;
+                }
+                body.innerHTML = renderBadRentalReportBody(data);
+            } catch(e) {
+                body.innerHTML = '<div class="text-red-400">Network error: ' + escapeHtml(e.message) + '</div>';
+                console.error('[openBadRentalReport]', e);
+            }
+        }
+
+        function closeBadRentalReport() {
+            const modal = document.getElementById('bad-rentals-report-modal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        function renderBadRentalReportBody(data) {
+            const r = (data && data.report) || {};
+            const events = (data && Array.isArray(data.events)) ? data.events : [];
+            const storageNote = data && data.storage_note ? data.storage_note : '';
+            const fmt = function(s) { return s ? new Date(s).toLocaleString() : '\u2014'; };
+            const val = function(v) {
+                if (v === null || v === undefined || v === '') return '<span class="text-dark-500">\u2014</span>';
+                return escapeHtml(String(v));
+            };
+            const resellerName = (r.resellers && r.resellers.name) ? r.resellers.name : ('reseller #' + (r.reseller_id || '?'));
+            const resellerRentalId = (r.rentals && r.rentals.reseller_rental_id) ? r.rentals.reseller_rental_id : null;
+            const fields = [
+                ['Report ID',           r.id],
+                ['Reseller',            resellerName],
+                ['Reported MDN',        r.e164],
+                ['Reason code',         r.reason_code],
+                ['Reason note',         r.reason_note],
+                ['Attempts',            r.attempts],
+                ['First attempt at',    r.first_attempt_at ? fmt(r.first_attempt_at) : null],
+                ['Client request ID',   r.client_request_id],
+                ['Reseller rental ID',  resellerRentalId],
+                ['Internal rental ID',  r.rental_id],
+                ['SIM ID',              r.sim_id],
+                ['SIM number ID',       r.sim_number_id],
+                ['Status',              r.status],
+                ['Remediation action',  r.remediation_action],
+                ['Duplicate of',        r.duplicate_of],
+                ['Received at',         fmt(r.received_at)],
+                ['Triaged at',          r.triaged_at ? fmt(r.triaged_at) : null],
+                ['Closed at',           r.closed_at ? fmt(r.closed_at) : null],
+                ['Updated at',          fmt(r.updated_at)],
+            ];
+            let fieldsHtml = '<dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">';
+            for (let i = 0; i < fields.length; i++) {
+                const k = fields[i][0];
+                const v = fields[i][1];
+                fieldsHtml += '<dt class="text-dark-400 uppercase tracking-wide text-[10px] py-0.5">' + escapeHtml(k) + '</dt>'
+                    + '<dd class="text-dark-100 break-all py-0.5">' + val(v) + '</dd>';
+            }
+            fieldsHtml += '</dl>';
+
+            let eventsHtml;
+            if (!events.length) {
+                eventsHtml = '<div class="text-dark-500">No events logged.</div>';
+            } else {
+                eventsHtml = '<ul class="space-y-2">';
+                for (let i = 0; i < events.length; i++) {
+                    const ev = events[i];
+                    const from = ev.from_status ? escapeHtml(ev.from_status) : '\u2014';
+                    const to = escapeHtml(ev.to_status || '?');
+                    const actor = escapeHtml(ev.actor || '?');
+                    const when = escapeHtml(fmt(ev.created_at));
+                    const note = ev.note ? '<div class="mt-0.5 text-dark-200">' + escapeHtml(ev.note) + '</div>' : '';
+                    let evidence = '';
+                    if (ev.evidence && typeof ev.evidence === 'object') {
+                        try {
+                            evidence = '<pre class="mt-1 p-2 bg-dark-900 border border-dark-700 rounded text-[10px] text-dark-300 overflow-x-auto">'
+                                + escapeHtml(JSON.stringify(ev.evidence, null, 2)) + '</pre>';
+                        } catch(_) { evidence = ''; }
+                    }
+                    eventsHtml += '<li class="border-l-2 border-dark-600 pl-3 py-1">'
+                        + '<div class="text-[10px] text-dark-400">' + when + ' \u00b7 ' + actor + '</div>'
+                        + '<div class="text-dark-100">' + from + ' \u2192 <span class="font-semibold">' + to + '</span></div>'
+                        + note + evidence
+                        + '</li>';
+                }
+                eventsHtml += '</ul>';
+            }
+
+            let rawJson = '';
+            try { rawJson = JSON.stringify(r, null, 2); } catch(_) { rawJson = '(unserialisable)'; }
+
+            return ''
+                + '<div class="mb-4 p-3 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200">'
+                +   '<div class="text-[10px] uppercase tracking-wide font-semibold mb-1">Storage gap</div>'
+                +   '<div class="text-xs">' + escapeHtml(storageNote) + '</div>'
+                + '</div>'
+                + '<div class="mb-4">'
+                +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Parsed report fields</div>'
+                +   fieldsHtml
+                + '</div>'
+                + '<div class="mb-4">'
+                +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Audit timeline (rental_report_events)</div>'
+                +   eventsHtml
+                + '</div>'
+                + '<details class="mt-2">'
+                +   '<summary class="cursor-pointer text-[10px] uppercase tracking-wide text-dark-400 hover:text-dark-200">Raw row JSON</summary>'
+                +   '<pre class="mt-2 p-3 bg-dark-900 border border-dark-700 rounded text-[10px] text-dark-300 overflow-x-auto">' + escapeHtml(rawJson) + '</pre>'
+                + '</details>';
         }
 
         function goToSimsBySearch(query) {
