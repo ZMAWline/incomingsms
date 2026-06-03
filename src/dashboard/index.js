@@ -13133,10 +13133,10 @@ async function sendSimOnline(simId, phoneNumber) {
                         ? '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-blue-500/20 text-blue-300">In triage</span>'
                         : '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-amber-500/20 text-amber-300">Received</span>';
                     const simLink = r.sim_id
-                        ? '<a onclick="event.stopPropagation();switchTab(&quot;sims&quot;)" class="text-accent hover:text-green-400 cursor-pointer">' + escapeHtml(r.sim_id) + '</a>'
+                        ? '<a onclick="event.stopPropagation();goToSimsBySearch(&quot;' + escapeHtml(r.sim_id) + '&quot;)" title="Open SIMs page filtered to this SIM ID" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(r.sim_id) + '</a>'
                         : '—';
                     const mdnCell = r.e164
-                        ? '<a onclick="event.stopPropagation();goToSimsByMdn(&quot;' + escapeHtml(r.e164) + '&quot;)" title="Open SIMs page filtered to this MDN" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(r.e164) + '</a>'
+                        ? '<span title="Reported phone — may be stale; use SIM ID to locate the SIM" class="text-dark-300">' + escapeHtml(r.e164) + '</span>'
                         : '—';
                     const actionCell = '<button onclick="event.stopPropagation();markBadRentalFixed(' + escapeHtml(r.id) + ')" class="px-2 py-1 text-xs rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 transition">Mark fixed</button>';
                     return '<tr class="hover:bg-dark-700/40">' +
@@ -13157,9 +13157,9 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
-        function goToSimsByMdn(mdn) {
+        function goToSimsBySearch(query) {
             try {
-                const q = String(mdn || '').trim();
+                const q = String(query || '').trim();
                 if (typeof switchTab === 'function') switchTab('sims');
                 history.replaceState(null, '', '/sims' + (q ? ('?search=' + encodeURIComponent(q)) : ''));
                 setTimeout(function(){
@@ -13171,9 +13171,9 @@ async function sendSimOnline(simId, phoneNumber) {
                         const sa = document.getElementById('sims-search');
                         if (sa) sa.value = q;
                         if (typeof renderSims === 'function') renderSims();
-                    } catch(inner) { console.error('goToSimsByMdn hydrate failed', inner); }
+                    } catch(inner) { console.error('goToSimsBySearch hydrate failed', inner); }
                 }, 50);
-            } catch(e) { console.error('goToSimsByMdn failed', e); }
+            } catch(e) { console.error('goToSimsBySearch failed', e); }
         }
 
         async function markBadRentalFixed(reportId) {
