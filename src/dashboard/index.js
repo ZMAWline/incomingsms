@@ -162,6 +162,11 @@ export default {
       return handleBadRentals(env, corsHeaders, url);
     }
 
+    if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/resolve') && request.method === 'POST') {
+      const id = url.pathname.slice('/api/bad-rentals/'.length, -('/resolve'.length));
+      return handleResolveBadRental(id, request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/error-logs') {
       return handleErrorLogs(env, corsHeaders, url);
     }
@@ -3499,6 +3504,117 @@ async function handleBadRentals(env, corsHeaders, url) {
     }
     const rows = await resp.json();
     return new Response(JSON.stringify(Array.isArray(rows) ? rows : []), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+async function handleResolveBadRental(id, request, env, corsHeaders) {
+  try {
+    const reportId = parseInt(id, 10);
+    if (!Number.isFinite(reportId) || reportId <= 0) {
+      return new Response(JSON.stringify({ error: 'invalid report id' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    let body = {};
+    try { body = await request.json(); } catch (_) { body = {}; }
+
+    const ALLOWED_ACTIONS = ['rotated', 'port_reset', 'sim_replaced', 'mdn_swapped', 'other'];
+    const remediationAction = String(body.remediation_action || 'other').toLowerCase();
+    if (!ALLOWED_ACTIONS.includes(remediationAction)) {
+      return new Response(JSON.stringify({ error: 'remediation_action must be one of ' + ALLOWED_ACTIONS.join(',') }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const note = body.note ? String(body.note).slice(0, 500) : null;
+    const actor = body.actor ? String(body.actor).slice(0, 120) : 'operator';
+
+    // Fetch current report so we have from_status for the audit row and can refuse
+    // to reopen-then-close already-closed reports.
+    const curResp = await supabaseGet(env, 'rental_reports?id=eq.' + reportId + '&select=id,status');
+    if (!curResp.ok) {
+      const txt = await curResp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + curResp.status, detail: txt }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const curRows = await curResp.json();
+    if (!Array.isArray(curRows) || curRows.length === 0) {
+      return new Response(JSON.stringify({ error: 'report not found' }), {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const fromStatus = curRows[0].status;
+    if (fromStatus !== 'received' && fromStatus !== 'in_triage') {
+      return new Response(JSON.stringify({ error: 'report is not open (status=' + fromStatus + ')' }), {
+        status: 409,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    const patch = {
+      status: 'remediated',
+      remediation_action: remediationAction,
+      closed_at: nowIso,
+      updated_at: nowIso,
+    };
+    if (fromStatus === 'received') patch.triaged_at = nowIso;
+
+    const patchResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_reports?id=eq.${reportId}`, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify(patch),
+    });
+    if (!patchResp.ok) {
+      const txt = await patchResp.text();
+      return new Response(JSON.stringify({ error: 'patch_failed', detail: txt }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const updated = await patchResp.json();
+
+    // Append-only audit event. Best-effort; log but don't fail the request.
+    try {
+      await fetch(`${env.SUPABASE_URL}/rest/v1/rental_report_events`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          report_id: reportId,
+          from_status: fromStatus,
+          to_status: 'remediated',
+          actor: actor,
+          note: note,
+          evidence: { remediation_action: remediationAction },
+        }),
+      });
+    } catch (e) {
+      console.log('[ResolveBadRental] event log insert failed: ' + e);
+    }
+
+    return new Response(JSON.stringify({ ok: true, report: updated[0] || null }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
@@ -7509,10 +7625,11 @@ function getHTML(helixEnabled) {
                                 <th class="px-4 py-3 font-medium">SIM ID</th>
                                 <th class="px-4 py-3 font-medium">Rental ID</th>
                                 <th class="px-4 py-3 font-medium">Received</th>
+                                <th class="px-4 py-3 font-medium">Action</th>
                             </tr>
                         </thead>
                         <tbody id="bad-rentals-tbody" class="divide-y divide-dark-700 text-dark-200">
-                            <tr><td colspan="8" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>
+                            <tr><td colspan="9" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -13049,7 +13166,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (!resp.ok) throw new Error('API ' + resp.status);
                 const rows = await resp.json();
                 if (!Array.isArray(rows) || rows.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-8 text-center text-dark-400">No open bad-rental reports.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-8 text-center text-dark-400">No open bad-rental reports.</td></tr>';
                     if (badge) { badge.textContent = '0'; badge.classList.add('hidden'); }
                     if (status) status.textContent = '';
                     return;
@@ -13065,20 +13182,72 @@ async function sendSimOnline(simId, phoneNumber) {
                     const simLink = r.sim_id
                         ? '<a onclick="event.stopPropagation();switchTab(&quot;sims&quot;)" class="text-accent hover:text-green-400 cursor-pointer">' + escapeHtml(r.sim_id) + '</a>'
                         : '—';
+                    const mdnCell = r.e164
+                        ? '<a onclick="event.stopPropagation();goToSimsByMdn(&quot;' + escapeHtml(r.e164) + '&quot;)" title="Open SIMs page filtered to this MDN" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(r.e164) + '</a>'
+                        : '—';
+                    const actionCell = '<button onclick="event.stopPropagation();markBadRentalFixed(' + escapeHtml(r.id) + ')" class="px-2 py-1 text-xs rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 transition">Mark fixed</button>';
                     return '<tr class="hover:bg-dark-700/40">' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + escapeHtml(r.id) + '</td>' +
                         '<td class="px-4 py-3 text-dark-200">' + escapeHtml(resellerName) + '</td>' +
-                        '<td class="px-4 py-3 font-mono text-cyan-300">' + escapeHtml(r.e164 || '—') + '</td>' +
+                        '<td class="px-4 py-3 font-mono">' + mdnCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 text-xs" title="' + escapeHtml(r.reason_note || '') + '">' + escapeHtml(r.reason_code || '—') + '</td>' +
                         '<td class="px-4 py-3">' + statusBadge + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + simLink + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + (r.rental_id != null ? escapeHtml(r.rental_id) : '—') + '</td>' +
                         '<td class="px-4 py-3 text-dark-400 text-xs">' + escapeHtml(fmtDt(r.received_at)) + '</td>' +
+                        '<td class="px-4 py-3">' + actionCell + '</td>' +
                     '</tr>';
                 }).join('');
             } catch(e) {
-                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + escapeHtml(e.message) + '</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + escapeHtml(e.message) + '</td></tr>';
                 console.error('[loadBadRentals]', e);
+            }
+        }
+
+        function goToSimsByMdn(mdn) {
+            try {
+                const q = String(mdn || '').trim();
+                if (typeof switchTab === 'function') switchTab('sims');
+                history.replaceState(null, '', '/sims' + (q ? ('?search=' + encodeURIComponent(q)) : ''));
+                setTimeout(function(){
+                    try {
+                        if (typeof simsFilterState !== 'undefined') {
+                            simsFilterState.search = q;
+                            if (typeof tableState !== 'undefined' && tableState.sims) tableState.sims.page = 1;
+                        }
+                        const sa = document.getElementById('sims-search');
+                        if (sa) sa.value = q;
+                        if (typeof renderSims === 'function') renderSims();
+                    } catch(inner) { console.error('goToSimsByMdn hydrate failed', inner); }
+                }, 50);
+            } catch(e) { console.error('goToSimsByMdn failed', e); }
+        }
+
+        async function markBadRentalFixed(reportId) {
+            const action = window.prompt('Remediation action (rotated | port_reset | sim_replaced | mdn_swapped | other):', 'other');
+            if (action === null) return; // cancelled
+            const trimmed = String(action || '').trim().toLowerCase();
+            const allowed = ['rotated','port_reset','sim_replaced','mdn_swapped','other'];
+            if (!allowed.includes(trimmed)) {
+                alert('Invalid action. Choose one of: ' + allowed.join(', '));
+                return;
+            }
+            const note = window.prompt('Optional note (≤500 chars):', '') || '';
+            try {
+                const resp = await fetch(API_BASE + '/bad-rentals/' + encodeURIComponent(reportId) + '/resolve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ remediation_action: trimmed, note: note || null }),
+                });
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) {
+                    alert('Failed to mark fixed: ' + (data && data.error ? data.error : resp.status));
+                    return;
+                }
+                if (typeof loadBadRentals === 'function') loadBadRentals();
+            } catch(e) {
+                alert('Network error: ' + e.message);
+                console.error('[markBadRentalFixed]', e);
             }
         }
 
