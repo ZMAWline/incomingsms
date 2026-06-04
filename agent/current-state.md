@@ -1,7 +1,32 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-05-26 (session 61 — relay-outage remediation + rotation hardening)
+> Last updated: 2026-06-04 (sessions 64–67 — INC-3 Phase 1 live, report-bad contract locked down, dashboard deep-link)
+
+---
+
+## Session 67 close (2026-06-04 18:03 UTC) — INC-3 wrapped, all live
+
+> Note: this session's work commits (`62ac186`, `6454df9`, `9ae460f`) landed on `feat/inc-2-rental-billing`; the equivalent code is in prod via worker deploys but those commits are not yet visible on `main`.
+
+All four pieces of INC-3 Phase 1 are live in prod and verified:
+
+1. **Backend + dashboard tab** — `rental_reports`, `rental_report_events`, `rental_report_rejections` schema applied via Supabase Management API; Bad Rentals operator tab + Mark-fixed/Edit actions.
+2. **Contract lockdown** — report-bad accepts only `reseller_rental_id` or current-MDN `e164`; `sim_id`/`iccid`/internal `rental_id`/historical MDN all return 400 with explicit messages. Resolver at `src/shared/report-bad-resolver.js` + 13 contract tests + 14 status-normalization tests.
+3. **`?status=` normalization** — `open` / `resolved` / `all` aliases plus literal DB values; `garbage` → 400.
+4. **Dashboard deep-link** — `dashboard.zalmen-531.workers.dev/bad-rentals` lands directly on the Bad Rentals tab via the `TAB_ROUTES` entry.
+
+**Latent follow-up (NOT shipped, captured for next session):** the e164 path of `resolveRentalForReport` returns the rental's mint-time `sim_number_id`, not the SIM's current sim_number matching the input e164. The dashboard renders correctly (gates on `e164` vs `current_e164`, which match), so this is not a user-visible bug today, but every recent report has `sim_number_id` pointing at a retired sim_numbers row. Sample: report id=1 stores e164=+17015786268 but linked sim_numbers.e164=+17859569074 (retired 2026-05-31). Pure backend cleanup — no contract change.
+
+**Deployed versions at session close:**
+
+| Worker | Version |
+|---|---|
+| reseller-portal | `36049cd7-d464-4f53-9b4f-3e8fe16de01e` |
+| dashboard | `b9b24424-fc40-4afb-84f8-dcd26c5a79ba` |
+| details-finalizer | `47fc0b58-be80-4571-b50d-bb6e185ac97b` |
+
+DB state: `rental_reports` has Maxime's live probes (1+ rows) — diagnostic-only, can be left in place.
 
 ---
 
