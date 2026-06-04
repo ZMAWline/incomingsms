@@ -272,6 +272,13 @@ async function importTeltikLines(env) {
         console.log(`[Import] sim_numbers insert failed for ${mdn}: ${insRes.status}`);
       }
 
+      // INC-5: keep sims.msisdn in lockstep with sim_numbers so the rotator
+      // and other consumers don't drift if they fall back to sims.msisdn.
+      const bare10 = String(mdn).replace(/^\+?1?/, '');
+      if (/^\d{10}$/.test(bare10)) {
+        await supabasePatch(env, `sims?id=eq.${simId}`, { msisdn: bare10 }).catch(() => {});
+      }
+
       if (existing) {
         updated++;
       } else {
@@ -431,6 +438,11 @@ async function syncTeltikMdns(env) {
         console.log(`[SyncMDN] SIM ${sim.iccid}: insert failed ${insRes.status}`);
         errors++;
       } else {
+        // INC-5: keep sims.msisdn in lockstep with sim_numbers.
+        const bare10 = String(teltikMdn).replace(/^\+?1?/, '');
+        if (/^\d{10}$/.test(bare10)) {
+          await supabasePatch(env, `sims?id=eq.${sim.id}`, { msisdn: bare10 }).catch(() => {});
+        }
         updated++;
       }
     } catch (err) {
