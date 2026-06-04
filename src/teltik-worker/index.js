@@ -16,8 +16,10 @@ export default {
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
         return new Response('Unauthorized', { status: 401 });
       }
+      const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
+      const limit = Math.max(1, Math.min(500, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
       try {
-        const result = await importTeltikLines(env);
+        const result = await importTeltikLines(env, { offset, limit });
         return jsonResponse(result, 200);
       } catch (err) {
         return jsonResponse({ ok: false, error: String(err) }, 500);
@@ -157,10 +159,15 @@ function getNYMidnightISO() {
 // =========================================================
 // IMPORT — fetch all Teltik lines and upsert into DB
 // =========================================================
-async function importTeltikLines(env) {
+async function importTeltikLines(env, opts = {}) {
   const apiKey = env.TELTIK_API_KEY;
+  const offset = opts.offset || 0;
+  const limit = opts.limit || 200;
 
-  // 1. Fetch all lines
+  // Fetch the full Teltik line list, then slice — the unpaginated /import used
+  // to walk every line in one Worker invocation and burst past Cloudflare's
+  // 1000-subrequest cap around 250–500 SIMs in (INC-10). Callers loop with
+  // ?offset=N&limit=K so each Worker run stays well under the cap.
   const allLinesRes = await relayFetch(env, `${TELTIK_BASE}/v1/all-lines/?apikey=${apiKey}`);
   if (!allLinesRes.ok) {
     throw new Error(`Teltik all-lines failed: ${allLinesRes.status} ${await allLinesRes.text()}`);
@@ -168,30 +175,47 @@ async function importTeltikLines(env) {
   const allLines = await allLinesRes.json();
 
   if (!Array.isArray(allLines) || allLines.length === 0) {
-    return { ok: true, imported: 0, updated: 0, unchanged: 0, message: 'No lines returned from Teltik' };
+    return {
+      ok: true, total: 0, processed: 0, offset, limit,
+      imported: 0, updated: 0, unchanged: 0, skipped: 0,
+      next_offset: null, has_more: false,
+      message: 'No lines returned from Teltik',
+    };
   }
 
-  let imported = 0, updated = 0, unchanged = 0;
+  const total = allLines.length;
+  const slice = allLines.slice(offset, offset + limit);
 
-  for (const line of allLines) {
+  // Precompute existing ICCID → sim_id once per chunk so unchanged rows skip
+  // the post-upsert SELECT (saves one subrequest per existing SIM).
+  const existingDbRows = await supabaseGetAllArray(env, `sims?vendor=eq.teltik&select=id,iccid`);
+  const iccidToSimId = new Map();
+  for (const r of existingDbRows) iccidToSimId.set(String(r.iccid), r.id);
+
+  let imported = 0, updated = 0, unchanged = 0, skipped = 0;
+
+  for (const line of slice) {
     // Extract MDN from line object (try common field names)
     const rawMdn = line.mdn || line.phone_number || line.number || line.phonenumber || '';
     if (!rawMdn) {
       console.log(`[Import] Skipping line with no MDN: ${JSON.stringify(line)}`);
+      skipped++;
       continue;
     }
     const mdn = normalizeToE164(rawMdn);
     if (!mdn) {
       console.log(`[Import] Could not normalize MDN: ${rawMdn}`);
+      skipped++;
       continue;
     }
 
-    await sleep(100); // Rate limit: 100ms between calls
-
-    // 2. Get ICCID via get-info (MDN without + prefix)
+    // Prefer the iccid that came back in all-lines; only call get-info as a
+    // fallback. Eliminating this per-SIM Teltik hit is what halves the
+    // subrequest budget in the common case.
     let iccid = line.iccid || '';
     if (!iccid) {
-      const mdnDigits = mdn.replace('+', ''); // Teltik uses 11-digit format without +
+      await sleep(100); // rate-limit only the slow path
+      const mdnDigits = mdn.replace('+', '');
       const infoRes = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${apiKey}&mdn=${encodeURIComponent(mdnDigits)}`);
       if (infoRes.ok) {
         const info = await infoRes.json();
@@ -203,11 +227,13 @@ async function importTeltikLines(env) {
 
     if (!iccid) {
       console.log(`[Import] Could not get ICCID for MDN ${mdn}, skipping`);
+      skipped++;
       continue;
     }
 
-    // 3. Check if SIM already exists
-    const existing = await supabaseGetOne(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`);
+    // Existence lookup served from the precomputed map (no DB call here).
+    const existingSimId = iccidToSimId.get(String(iccid)) || null;
+    const existing = existingSimId ? { id: existingSimId } : null;
 
     // 4. Upsert SIM record (gateway_id/port/slot/imei null — Teltik has no physical gateway)
     const simData = {
@@ -237,13 +263,18 @@ async function importTeltikLines(env) {
       continue;
     }
 
-    // 5. Get SIM ID after upsert
-    const simRows = await supabaseGetArray(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`);
-    if (!Array.isArray(simRows) || simRows.length === 0) {
-      console.log(`[Import] Could not find SIM after upsert for ICCID ${iccid}`);
-      continue;
+    // Reuse the simId from the precomputed map for existing rows; only query
+    // the DB for brand-new ones (one subrequest saved per existing SIM).
+    let simId = existingSimId;
+    if (!simId) {
+      const simRows = await supabaseGetArray(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`);
+      if (!Array.isArray(simRows) || simRows.length === 0) {
+        console.log(`[Import] Could not find SIM after upsert for ICCID ${iccid}`);
+        skipped++;
+        continue;
+      }
+      simId = simRows[0].id;
     }
-    const simId = simRows[0].id;
 
     // 6. Sync sim_numbers — close old if different, insert new
     const currentNumbers = await supabaseGetArray(
@@ -287,7 +318,22 @@ async function importTeltikLines(env) {
     }
   }
 
-  return { ok: true, imported, updated, unchanged };
+  const processed = slice.length;
+  const nextOffset = offset + processed;
+  const hasMore = nextOffset < total;
+  return {
+    ok: true,
+    total,
+    offset,
+    limit,
+    processed,
+    imported,
+    updated,
+    unchanged,
+    skipped,
+    next_offset: hasMore ? nextOffset : null,
+    has_more: hasMore,
+  };
 }
 
 // =========================================================
