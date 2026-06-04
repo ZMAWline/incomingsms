@@ -3513,7 +3513,7 @@ async function handleBadRentals(env, corsHeaders, url) {
       'received_at', 'triaged_at', 'closed_at', 'updated_at',
       'resellers(name)',
       'rentals(reseller_rental_id)',
-      'sims(sim_numbers(e164,valid_to))',
+      'sims(iccid,sim_numbers(e164,valid_to))',
       'report_sim_number:sim_numbers!rental_reports_sim_number_id_fkey(e164,valid_from,valid_to)',
     ].join(',');
     let query = 'rental_reports?select=' + encodeURIComponent(select);
@@ -3554,6 +3554,7 @@ async function handleBadRentals(env, corsHeaders, url) {
         closed_at: r.closed_at,
         updated_at: r.updated_at,
         resellers: r.resellers || null,
+        iccid: r && r.sims ? r.sims.iccid : null,
         reseller_rental_id: resellerRentalId,
         current_e164: currentE164,
         report_sim_number_e164: rsn ? rsn.e164 : null,
@@ -13565,7 +13566,9 @@ async function sendSimOnline(simId, phoneNumber) {
                     const resellerName = (r.resellers && r.resellers.name) ? r.resellers.name : (r.reseller_id || '—');
                     const statusBadge = STATUS_BADGES[r.status] || ('<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-dark-700 text-dark-200">' + escapeHtml(r.status || '—') + '</span>');
                     const simLink = r.sim_id
-                        ? '<a onclick="event.stopPropagation();goToSimsBySearch(&quot;' + escapeHtml(r.sim_id) + '&quot;)" title="Open SIMs page filtered to this SIM ID" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(r.sim_id) + '</a>'
+                        ? (r.iccid
+                            ? '<a href="/sims?search=' + encodeURIComponent(r.iccid) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();" title="Open SIMs page filtered to ICCID ' + escapeHtml(r.iccid) + ' (new tab)" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted">' + escapeHtml(r.sim_id) + '</a>'
+                            : '<span title="ICCID unknown for this SIM — open SIMs page manually" class="text-dark-300">' + escapeHtml(r.sim_id) + '</span>')
                         : '—';
                     const reported = r.e164 || null;
                     const current = r.current_e164 || null;
