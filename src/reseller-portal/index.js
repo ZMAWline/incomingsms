@@ -126,6 +126,28 @@ async function logAction(env, resellerId, action, simId = null) {
   }
 }
 
+// Fire-and-forget diagnostic logger for bad-rental intake. Stores the parsed
+// JSON (when available) and the raw body text (capped) so an operator can see
+// exactly what the reseller sent when a payload was rejected. Never throws.
+async function logReportRejection(env, info) {
+  try {
+    const MAX_RAW = 8192;
+    const rawText = info.rawBodyText == null ? null
+      : String(info.rawBodyText).slice(0, MAX_RAW);
+    await sbPost(env, 'rental_report_rejections', {
+      reseller_id: info.resellerId != null ? Number(info.resellerId) : null,
+      source: String(info.source || 'unknown'),
+      rejection_code: String(info.code || 'bad_request'),
+      rejection_message: info.message != null ? String(info.message).slice(0, 1000) : null,
+      raw_payload: info.body !== undefined ? info.body : null,
+      raw_body_text: rawText,
+      http_status: info.status != null ? Number(info.status) : null,
+    });
+  } catch (e) {
+    console.log('[ReportBad] failed to log rejection: ' + e);
+  }
+}
+
 function getCredFromRequest(request) {
   const auth = request.headers.get('Authorization') || '';
   if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
@@ -838,8 +860,10 @@ async function resolveRentalForReport(env, resellerId, body) {
 
 // Insert (or return existing open) report row, log the action, return the
 // reseller-facing envelope. Shared by both report-bad endpoints once the
-// rental has been resolved.
-async function insertOrReturnExistingReport(env, resellerId, resolved, body) {
+// rental has been resolved. `source` is the route tag used both on the
+// inserted row and on any rejection record so the operator can attribute
+// payloads to a handler.
+async function insertOrReturnExistingReport(env, resellerId, resolved, body, source) {
   const reasonCode = body.reason_code && REPORT_REASON_CODES.has(body.reason_code) ? body.reason_code : 'no_sms_received';
   const reasonNote = body.reason_note != null ? String(body.reason_note).slice(0, 500) : null;
   const attempts = body.attempts != null && Number.isFinite(Number(body.attempts)) ? Number(body.attempts) : null;
@@ -886,6 +910,8 @@ async function insertOrReturnExistingReport(env, resellerId, resolved, body) {
     first_attempt_at: firstAttemptAt,
     client_request_id: clientRequestId,
     status: 'received',
+    raw_payload: body,
+    source: source || null,
   };
   let insertResp;
   try {
@@ -941,11 +967,24 @@ async function insertOrReturnExistingReport(env, resellerId, resolved, body) {
 
 // POST /api/rentals/report-bad — primary, body-keyed.
 async function handleReportBadByRental(auth, env, request) {
+  const source = 'api/rentals/report-bad';
+  let bodyText = '';
+  try { bodyText = await request.text(); } catch { bodyText = ''; }
   let body;
   try {
-    body = await request.json();
+    body = bodyText ? JSON.parse(bodyText) : {};
   } catch {
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: 'parse_error', message: 'request body was not valid JSON',
+      rawBodyText: bodyText, status: 400 });
     return badRequest('JSON body required');
+  }
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) {
+    const shape = Array.isArray(body) ? 'array' : (body === null ? 'null' : typeof body);
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: 'bad_request', message: 'body must be a JSON object (got ' + shape + ')',
+      body: body, rawBodyText: bodyText, status: 400 });
+    return badRequest('JSON object body required');
   }
 
   const resolved = await resolveRentalForReport(env, auth.resellerId, body);
@@ -953,24 +992,47 @@ async function handleReportBadByRental(auth, env, request) {
     const status = resolved.code === 'not_found' ? 404
                  : resolved.code === 'ambiguous' ? 409
                  : 400;
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: resolved.code, message: resolved.message, body, rawBodyText: bodyText, status });
     return jsonResp({ error: resolved.message, code: resolved.code, candidates: resolved.candidates }, status);
   }
 
   const rl = await checkRateLimit(env, auth.resellerId, 'portal_report_bad', resolved.sim_id);
   if (!rl.allowed) {
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: 'rate_limited', message: rl.reason, body, rawBodyText: bodyText, status: 429 });
     return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
   }
 
-  return insertOrReturnExistingReport(env, auth.resellerId, resolved, body);
+  return insertOrReturnExistingReport(env, auth.resellerId, resolved, body, source);
 }
 
 // POST /api/sims/:simId/report-bad — convenience for the portal UI.
 async function handleReportBadBySim(simId, auth, env, request) {
+  const source = 'api/sims/:simId/report-bad';
+  let bodyText = '';
+  try { bodyText = await request.text(); } catch { bodyText = ''; }
   let body;
-  try {
-    body = await request.json().catch(() => ({}));
-  } catch {
+  if (!bodyText) {
     body = {};
+  } else {
+    try { body = JSON.parse(bodyText); }
+    catch {
+      // UI is supposed to send JSON or nothing; record the malformed attempt
+      // but still proceed with an empty body so the URL-keyed SIM still
+      // resolves (intentional UI convenience).
+      await logReportRejection(env, { resellerId: auth.resellerId, source,
+        code: 'parse_error', message: 'request body was not valid JSON; proceeded with empty body',
+        rawBodyText: bodyText, status: null });
+      body = {};
+    }
+  }
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) {
+    const shape = Array.isArray(body) ? 'array' : (body === null ? 'null' : typeof body);
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: 'bad_request', message: 'body must be a JSON object (got ' + shape + ')',
+      body, rawBodyText: bodyText, status: 400 });
+    return badRequest('JSON object body required');
   }
   // Override identifier fields with the URL param; UI never passes its own.
   body.sim_id = simId;
@@ -980,13 +1042,17 @@ async function handleReportBadBySim(simId, auth, env, request) {
   const resolved = await resolveRentalForReport(env, auth.resellerId, body);
   if (!resolved.ok) {
     const status = resolved.code === 'not_found' ? 404 : 400;
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: resolved.code, message: resolved.message, body, rawBodyText: bodyText, status });
     return jsonResp({ error: resolved.message, code: resolved.code }, status);
   }
   const rl = await checkRateLimit(env, auth.resellerId, 'portal_report_bad', resolved.sim_id);
   if (!rl.allowed) {
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: 'rate_limited', message: rl.reason, body, rawBodyText: bodyText, status: 429 });
     return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
   }
-  return insertOrReturnExistingReport(env, auth.resellerId, resolved, body);
+  return insertOrReturnExistingReport(env, auth.resellerId, resolved, body, source);
 }
 
 // GET /api/sims/:simId/report-status — most recent report for the SIM's
