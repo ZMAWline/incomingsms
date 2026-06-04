@@ -1,4 +1,5 @@
 import { computeBillingBreakdown, computeResellerUtilization } from '../shared/billing.js';
+import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateChanging } from './api-tester-presets.js';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -405,6 +406,14 @@ export default {
       return handleDeleteSim(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/api-tester/presets' && request.method === 'GET') {
+      return handleApiTesterPresetsList(corsHeaders);
+    }
+
+    if (url.pathname === '/api/api-tester/run' && request.method === 'POST') {
+      return handleApiTesterRun(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/relay-test' && request.method === 'POST') {
       return handleRelayTest(request, env, corsHeaders);
     }
@@ -472,6 +481,139 @@ function relayFetch(env, url, init) {
   }
   return fetch(url, init);
 }
+
+// ── API Tester: shared Helix token (in-memory, single-flight) ───────────────
+let __hxTokenCache = { token: null, expiresAt: 0, inflight: null };
+async function getHelixToken(env, opts) {
+  const force = opts && opts.force;
+  const now = Date.now();
+  if (!force && __hxTokenCache.token && __hxTokenCache.expiresAt > now + 30_000) return __hxTokenCache.token;
+  if (__hxTokenCache.inflight && !force) return __hxTokenCache.inflight;
+  __hxTokenCache.inflight = (async () => {
+    const res = await relayFetch(env, env.HX_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'password',
+        client_id: env.HX_CLIENT_ID,
+        audience: env.HX_AUDIENCE,
+        username: env.HX_GRANT_USERNAME,
+        password: env.HX_GRANT_PASSWORD,
+      }),
+    });
+    const text = await res.text();
+    let parsed = null; try { parsed = JSON.parse(text); } catch {}
+    if (!res.ok || !parsed || !parsed.access_token) {
+      __hxTokenCache.inflight = null;
+      throw new Error('Helix token fetch failed: ' + res.status + ' ' + text.slice(0, 200));
+    }
+    const ttl = (parsed.expires_in ? Number(parsed.expires_in) : 3600) * 1000;
+    __hxTokenCache = { token: parsed.access_token, expiresAt: Date.now() + ttl, inflight: null };
+    return parsed.access_token;
+  })();
+  try { return await __hxTokenCache.inflight; }
+  finally { if (__hxTokenCache.inflight) __hxTokenCache.inflight = null; }
+}
+
+// ── API Tester: redaction allow-list ──────────────────────────────────────
+const REDACTED_HEADER_KEYS = ['authorization', 'x-relay-key'];
+const REDACTED_BODY_FIELDS = new Set(['userName', 'token', 'pin', 'password']);
+function redactHeaders(h) {
+  const out = {};
+  Object.keys(h || {}).forEach((k) => {
+    out[k] = REDACTED_HEADER_KEYS.includes(k.toLowerCase()) ? '[REDACTED]' : h[k];
+  });
+  return out;
+}
+function redactBody(b) {
+  if (b == null) return b;
+  if (typeof b === 'string') {
+    return b.replace(/(password=)[^&]+/gi, '$1[REDACTED]');
+  }
+  if (Array.isArray(b)) return b.map(redactBody);
+  if (typeof b === 'object') {
+    const out = {};
+    Object.keys(b).forEach((k) => {
+      out[k] = REDACTED_BODY_FIELDS.has(k) ? '[REDACTED]' : redactBody(b[k]);
+    });
+    return out;
+  }
+  return b;
+}
+function redactUrl(u) {
+  try { return String(u).replace(/(password=)[^&#]+/gi, '$1[REDACTED]'); }
+  catch { return u; }
+}
+
+function handleApiTesterPresetsList(corsHeaders) {
+  return new Response(JSON.stringify(listPresetsForClient()), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+async function handleApiTesterRun(request, env, corsHeaders) {
+  const respond = (status, payload) => new Response(JSON.stringify(payload), {
+    status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+  let body;
+  try { body = await request.json(); } catch { return respond(400, { ok: false, error: 'invalid JSON' }); }
+  const presetKey = body && body.presetKey;
+  const inputs = (body && body.inputs) || {};
+  const preset = presetKey && API_TESTER_PRESETS_REGISTRY[presetKey];
+  if (!preset) return respond(400, { ok: false, error: 'unknown preset: ' + presetKey });
+
+  const missing = (preset.inputs || []).filter((i) => i.required && (inputs[i.name] === undefined || inputs[i.name] === null || inputs[i.name] === ''));
+  if (missing.length) return respond(400, { ok: false, error: 'missing required inputs: ' + missing.map((m) => m.name).join(', ') });
+
+  let gateway = null;
+  if ((preset.inputs || []).some((i) => i.source === 'gateways')) {
+    const gid = inputs.gateway_id;
+    if (!gid) return respond(400, { ok: false, error: 'gateway_id is required' });
+    try {
+      const gres = await supabaseGet(env, 'gateways?select=id,code,name,host,api_port,username,password,active&id=eq.' + encodeURIComponent(gid) + '&active=eq.true&limit=1');
+      const rows = await gres.json();
+      gateway = rows && rows[0];
+    } catch (e) { return respond(500, { ok: false, error: 'gateway lookup failed: ' + String(e) }); }
+    if (!gateway) return respond(400, { ok: false, error: 'gateway not found or inactive' });
+  }
+
+  const runOnce = async (helixToken) => {
+    const built = preset.build({ env, inputs, gateway, helixToken });
+    const init = { method: built.method, headers: built.headers || {} };
+    if (built.body !== null && built.body !== undefined && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(built.method.toUpperCase())) {
+      init.body = typeof built.body === 'string' ? built.body : JSON.stringify(built.body);
+    }
+    const resp = await relayFetch(env, built.url, init);
+    const respText = await resp.text();
+    const respHeaders = {}; resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+    return { built, init, status: resp.status, headers: respHeaders, bodyText: respText };
+  };
+
+  try {
+    let helixToken = null;
+    if (preset.needsHelixToken) helixToken = await getHelixToken(env);
+    let result = await runOnce(helixToken);
+    if (preset.needsHelixToken && result.status === 401) {
+      helixToken = await getHelixToken(env, { force: true });
+      result = await runOnce(helixToken);
+    }
+    return respond(200, {
+      ok: true,
+      status: result.status,
+      headers: result.headers,
+      body: result.bodyText,
+      request: {
+        method: result.built.method,
+        url: redactUrl(result.built.url),
+        redactedHeaders: redactHeaders(result.built.headers || {}),
+        body: redactBody(result.built.body == null ? null : (typeof result.built.body === 'string' ? result.built.body : JSON.parse(JSON.stringify(result.built.body)))),
+      },
+    });
+  } catch (err) {
+    return respond(200, { ok: false, error: String((err && err.message) || err) });
+  }
+}
+
 
 async function handleStats(env, corsHeaders) {
   try {
@@ -9395,78 +9537,36 @@ function getHTML(helixEnabled) {
                         <div class="mb-4">
                             <label class="text-xs text-gray-500 mb-1 block">Preset</label>
                             <select id="api-tester-preset" onchange="applyApiPreset()" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
-                                <option value="">&#8212; Custom &#8212;</option>
-                                <optgroup label="ATOMIC (AT&amp;T)">
-                                    <option value="atomic.activate">Activate</option>
-                                    <option value="atomic.subscriberInquiry">Subscriber Inquiry</option>
-                                    <option value="atomic.suspend">Suspend Subscriber</option>
-                                    <option value="atomic.restore">Restore Subscriber</option>
-                                    <option value="atomic.deactivate">Deactivate Subscriber</option>
-                                    <option value="atomic.reconnect">Reconnect Subscriber</option>
-                                    <option value="atomic.swapMsisdn">Swap MSISDN (MDN rotation)</option>
-                                    <option value="atomic.updateSubscriberInfo">Update Subscriber Info</option>
-                                    <option value="atomic.resendOta">Resend OTA Profile</option>
-                                </optgroup>
-                                <optgroup label="Wing IoT (AT&amp;T)">
-                                    <option value="wing.getDevice">Get Device (status/inquiry)</option>
-                                    <option value="wing.activate">Activate Device</option>
-                                    <option value="wing.changePlanDialable">Change Plan &rarr; Dialable</option>
-                                    <option value="wing.changePlanNonDialable">Change Plan &rarr; Non-Dialable</option>
-                                </optgroup>
-                                <optgroup label="Teltik (T-Mobile)">
-                                    <option value="teltik.allLines">Get All Lines</option>
-                                    <option value="teltik.getInfo">Get Info (by MDN)</option>
-                                    <option value="teltik.getPhoneNumber">Get Phone Number (by ICCID)</option>
-                                    <option value="teltik.changeNumber">Change Number (MDN rotation)</option>
-                                    <option value="teltik.setForwardUrl">Set Forward URL (webhook)</option>
-                                </optgroup>
-                                <optgroup label="Helix (legacy)">
-                                    <option value="helix.token">Get Bearer Token</option>
-                                    <option value="helix.activate">Activate</option>
-                                    <option value="helix.details">Subscriber Details</option>
-                                    <option value="helix.suspend">Status &rarr; Suspend</option>
-                                    <option value="helix.unsuspend">Status &rarr; Unsuspend</option>
-                                    <option value="helix.cancel">Status &rarr; Cancel</option>
-                                    <option value="helix.resumeOnCancel">Status &rarr; Resume On Cancel</option>
-                                    <option value="helix.ctn">CTN Swap (MDN rotation)</option>
-                                    <option value="helix.resetOta">OTA Refresh</option>
-                                    <option value="helix.plansByImei">Plans by IMEI</option>
-                                    <option value="helix.imeiPlan">IMEI Plan (sub-ops)</option>
-                                </optgroup>
-                                <optgroup label="Skyline Gateway">
-                                    <option value="skyline.smsStat">SMS Stats / Handshake</option>
-                                    <option value="skyline.status">Port Status (ICCID/IMEI/signal)</option>
-                                    <option value="skyline.sendSms">Send SMS</option>
-                                    <option value="skyline.switchSim">Switch SIM (slot)</option>
-                                    <option value="skyline.setImei">Set IMEI</option>
-                                    <option value="skyline.saveConfig">Save Config (flash)</option>
-                                    <option value="skyline.lock">Port: Lock</option>
-                                    <option value="skyline.unlock">Port: Unlock</option>
-                                    <option value="skyline.reboot">Port: Reboot</option>
-                                    <option value="skyline.reset">Port: Reset</option>
-                                </optgroup>
+                                <option value="">Loading…</option>
                             </select>
+                            <p class="text-xs text-gray-500 mt-2">Presets are filled with credentials server-side; only the variable inputs below are sent.</p>
                         </div>
-                        <div class="flex gap-2 mb-4">
-                            <select id="api-tester-method" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-28">
-                                <option>GET</option>
-                                <option selected>POST</option>
-                                <option>PUT</option>
-                                <option>PATCH</option>
-                                <option>DELETE</option>
-                            </select>
-                            <input id="api-tester-url" type="text" placeholder="https://..." class="flex-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 font-mono focus:outline-none focus:border-accent">
+                        <div id="api-tester-preset-wrap" class="mb-4 hidden">
+                            <h4 class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Inputs</h4>
+                            <div id="api-tester-preset-inputs"></div>
                         </div>
-                        <div class="mb-4">
-                            <div class="flex items-center justify-between mb-2">
-                                <span class="text-xs text-gray-500">Headers</span>
-                                <button onclick="addRelayHeader()" class="text-xs text-accent hover:text-green-400 transition">+ Add</button>
+                        <div id="api-tester-custom-wrap">
+                            <div class="flex gap-2 mb-4">
+                                <select id="api-tester-method" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-28">
+                                    <option>GET</option>
+                                    <option selected>POST</option>
+                                    <option>PUT</option>
+                                    <option>PATCH</option>
+                                    <option>DELETE</option>
+                                </select>
+                                <input id="api-tester-url" type="text" placeholder="https://..." class="flex-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 font-mono focus:outline-none focus:border-accent">
                             </div>
-                            <div id="api-tester-headers" class="space-y-2"></div>
-                        </div>
-                        <div class="mb-5">
-                            <label class="text-xs text-gray-500 mb-1 block">Body (raw)</label>
-                            <textarea id="api-tester-body" rows="8" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 font-mono focus:outline-none focus:border-accent" placeholder="Raw JSON or text body"></textarea>
+                            <div class="mb-4">
+                                <div class="flex items-center justify-between mb-2">
+                                    <span class="text-xs text-gray-500">Headers</span>
+                                    <button onclick="addRelayHeader()" class="text-xs text-accent hover:text-green-400 transition">+ Add</button>
+                                </div>
+                                <div id="api-tester-headers" class="space-y-2"></div>
+                            </div>
+                            <div class="mb-5">
+                                <label class="text-xs text-gray-500 mb-1 block">Body (raw)</label>
+                                <textarea id="api-tester-body" rows="8" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 font-mono focus:outline-none focus:border-accent" placeholder="Raw JSON or text body"></textarea>
+                            </div>
                         </div>
                         <button onclick="sendRelayTest()" id="api-tester-send" class="w-full py-2 bg-accent hover:bg-green-600 text-white rounded-lg text-sm font-medium transition">Send via Relay</button>
                     </div>
@@ -9480,6 +9580,12 @@ function getHTML(helixEnabled) {
                             <details class="group">
                                 <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300 mb-1">Response Headers</summary>
                                 <pre id="api-tester-resp-headers-body" class="text-xs text-gray-400 font-mono bg-dark-900 rounded p-2 mt-1 overflow-x-auto border border-dark-600"></pre>
+                            </details>
+                        </div>
+                        <div id="api-tester-request-wrap" class="mb-3 hidden">
+                            <details class="group">
+                                <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300 mb-1">Request sent (redacted)</summary>
+                                <pre id="api-tester-request-echo" class="text-xs text-gray-400 font-mono bg-dark-900 rounded p-2 mt-1 overflow-x-auto border border-dark-600"></pre>
                             </details>
                         </div>
                         <pre id="api-tester-response" class="flex-1 bg-dark-900 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-auto max-h-96 border border-dark-600 whitespace-pre-wrap break-all">Response will appear here...</pre>
@@ -16870,56 +16976,139 @@ async function sendSimOnline(simId, phoneNumber) {
 
         loadGatewayDropdown();
         loadResellers();
-        // ── API Tester ────────────────────────────────────────────────────────
-        var API_TESTER_PRESETS = {"atomic.activate":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"Activate","partnerTransactionId":"tx_<timestamp>","imei":"<IMEI>","sim":"<ICCID>","eSim":"N","EID":"","BAN":"","firstName":"SUB","lastName":"NINE","streetNumber":"123","streetDirection":"","streetName":"Main St","zip":"10001","plan":"ATTNOVOICE","portMdn":""}}}},"atomic.subscriberInquiry":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"subsriberInquiry","partnerTransactionId":"tx_<timestamp>","MSISDN":"<MSISDN>","sim":"<ICCID>"}}}},"atomic.suspend":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"suspendSubscriber","partnerTransactionId":"tx_<timestamp>","MSISDN":"<MSISDN>","reasonCode":"NPG"}}}},"atomic.restore":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"restoreSubscriber","partnerTransactionId":"tx_<timestamp>","MSISDN":"<MSISDN>","reasonCode":"CR"}}}},"atomic.deactivate":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"deactivateSubscriber","partnerTransactionId":"tx_<timestamp>","MSISDN":"<MSISDN>","reasonCode":"DD"}}}},"atomic.reconnect":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"reconnectSubscriber","partnerTransactionId":"tx_<timestamp>","MSISDN":"<MSISDN>","reasonCode":""}}}},"atomic.swapMsisdn":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"swapMSISDN","partnerTransactionId":"tx_<timestamp>","MSISDN":"<MSISDN>","zipCode":"10001"}}}},"atomic.updateSubscriberInfo":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"UpdateSubscriberInfo","partnerTransactionId":"tx_<timestamp>","MSISDN":"<MSISDN>","firstName":"SUB","lastName":"NINE","address":{"streetNumber":"123","streetName":"Main St","streetDirection":"","zipCode":"10001"}}}}},"atomic.resendOta":{"method":"POST","url":"https://solutionsatt-atomic.telgoo5.com:22712/","headers":[["Content-Type","application/json"]],"body":{"wholeSaleApi":{"session":{"userName":"<ATOMIC_USERNAME>","token":"<ATOMIC_TOKEN>","pin":"<ATOMIC_PIN>"},"wholeSaleRequest":{"requestType":"resendOtaProfile","partnerTransactionId":"tx_<timestamp>","MSISDN":"<MSISDN>","sim":"<ICCID>"}}}},"wing.getDevice":{"method":"GET","url":"https://restapi19.att.com/rws/api/v1/devices/<ICCID>","headers":[["Authorization","Basic <base64(WING_IOT_USERNAME:WING_IOT_API_KEY)>"],["Accept","application/json"]],"body":""},"wing.activate":{"method":"PUT","url":"https://restapi19.att.com/rws/api/v1/devices/<ICCID>","headers":[["Authorization","Basic <base64(WING_IOT_USERNAME:WING_IOT_API_KEY)>"],["Content-Type","application/json"],["Accept","application/json"]],"body":{"communicationPlan":"Wing Tel Inc - NON ABIR SMS MO/MT US","status":"Activated"}},"wing.changePlanDialable":{"method":"PUT","url":"https://restapi19.att.com/rws/api/v1/devices/<ICCID>","headers":[["Authorization","Basic <base64(WING_IOT_USERNAME:WING_IOT_API_KEY)>"],["Content-Type","application/json"]],"body":{"communicationPlan":"Wing Tel Inc - DIALABLE SMS MO/MT US"}},"wing.changePlanNonDialable":{"method":"PUT","url":"https://restapi19.att.com/rws/api/v1/devices/<ICCID>","headers":[["Authorization","Basic <base64(WING_IOT_USERNAME:WING_IOT_API_KEY)>"],["Content-Type","application/json"]],"body":{"communicationPlan":"Wing Tel Inc - NON ABIR SMS MO/MT US"}},"teltik.allLines":{"method":"GET","url":"https://api.smsgateway.xyz/v1/all-lines/?apikey=<TELTIK_API_KEY>","headers":[],"body":""},"teltik.getInfo":{"method":"GET","url":"https://api.smsgateway.xyz/v1/get-info?apikey=<TELTIK_API_KEY>&mdn=<MDN>","headers":[],"body":""},"teltik.getPhoneNumber":{"method":"GET","url":"https://api.smsgateway.xyz/v1/get-phone-number/?apikey=<TELTIK_API_KEY>&iccid=<ICCID>","headers":[],"body":""},"teltik.changeNumber":{"method":"GET","url":"https://api.smsgateway.xyz/v1/change-number/?apikey=<TELTIK_API_KEY>&iccid=<ICCID>","headers":[],"body":""},"teltik.setForwardUrl":{"method":"POST","url":"https://api.smsgateway.xyz/v1/forward-url?apikey=<TELTIK_API_KEY>","headers":[["Content-Type","application/json"]],"body":{"forward_url":"https://<your-worker>/lifecycle-webhook"}},"helix.token":{"method":"POST","url":"<HX_TOKEN_URL>","headers":[["Content-Type","application/json"]],"body":{"grant_type":"password","client_id":"<HX_CLIENT_ID>","audience":"<HX_AUDIENCE>","username":"<HX_GRANT_USERNAME>","password":"<HX_GRANT_PASSWORD>"}},"helix.activate":{"method":"POST","url":"<HX_API_BASE>/api/mobility-activation/activate","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":{"clientId":0,"plan":{"id":0},"BAN":"<BAN>","FAN":"<FAN>","activationType":"new_activation","subscriber":{"firstName":"SUB","lastName":"NINE"},"address":{"address1":"123 Main St","city":"New York","state":"NY","zipCode":"10001"},"service":{"iccid":"<ICCID>","imei":"<IMEI>"}}},"helix.details":{"method":"POST","url":"<HX_API_BASE>/api/mobility-subscriber/details","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":{"mobilitySubscriptionId":"<SUB_ID>"}},"helix.suspend":{"method":"PATCH","url":"<HX_API_BASE>/api/mobility-subscriber/status","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":[{"subscriberNumber":"<MDN>","subscriberState":"Suspend","reasonCode":"NPG","reasonCodeId":0,"mobilitySubscriptionId":"<SUB_ID>"}]},"helix.unsuspend":{"method":"PATCH","url":"<HX_API_BASE>/api/mobility-subscriber/status","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":[{"subscriberNumber":"<MDN>","subscriberState":"Unsuspend","reasonCode":"CR","reasonCodeId":0,"mobilitySubscriptionId":"<SUB_ID>"}]},"helix.cancel":{"method":"PATCH","url":"<HX_API_BASE>/api/mobility-subscriber/status","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":[{"subscriberNumber":"<MDN>","subscriberState":"Cancel","reasonCode":"DD","reasonCodeId":0,"mobilitySubscriptionId":"<SUB_ID>"}]},"helix.resumeOnCancel":{"method":"PATCH","url":"<HX_API_BASE>/api/mobility-subscriber/status","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":[{"subscriberNumber":"<MDN>","subscriberState":"Resume On Cancel","reasonCode":"","reasonCodeId":0,"mobilitySubscriptionId":"<SUB_ID>"}]},"helix.ctn":{"method":"PATCH","url":"<HX_API_BASE>/api/mobility-subscriber/ctn","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":{"mobilitySubscriptionId":"<SUB_ID>"}},"helix.resetOta":{"method":"PATCH","url":"<HX_API_BASE>/api/mobility-subscriber/reset-ota","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":[{"ban":"<BAN>","subscriberNumber":"<MDN>","iccid":"<ICCID>"}]},"helix.plansByImei":{"method":"GET","url":"<HX_API_BASE>/api/plans-by-imei/<IMEI>?skuId=3&resellerId=<HX_ACTIVATION_CLIENT_ID>","headers":[["Authorization","Bearer <HX_TOKEN>"]],"body":""},"helix.imeiPlan":{"method":"POST","url":"<HX_API_BASE>/api/mobility-sub-ops/imei-plan","headers":[["Authorization","Bearer <HX_TOKEN>"],["Content-Type","application/json"]],"body":{"mobilitySubscriptionId":"<SUB_ID>","imei":"<IMEI>","planId":0}},"skyline.smsStat":{"method":"GET","url":"http://<GATEWAY_HOST>:<PORT>/goip_get_sms_stat.html?version=1.1&username=<USER>&password=<PASS>&ports=all&type=3","headers":[],"body":""},"skyline.status":{"method":"GET","url":"http://<GATEWAY_HOST>:<PORT>/goip_get_status.html?version=1.1&username=<USER>&password=<PASS>&ports=all&all_slots=1","headers":[],"body":""},"skyline.sendSms":{"method":"POST","url":"http://<GATEWAY_HOST>:<PORT>/goip_post_sms.html?username=<USER>&password=<PASS>","headers":[["Content-Type","application/json"]],"body":{"type":"send-sms","task_num":1,"tasks":[{"tid":1,"port":"<PORT_NUM>","to":"<DEST_MDN>","sms":"Hello","smstype":0,"coding":0}]}},"skyline.switchSim":{"method":"POST","url":"http://<GATEWAY_HOST>:<PORT>/goip_send_cmd.html?username=<USER>&password=<PASS>","headers":[["Content-Type","application/json"]],"body":{"type":"command","op":"switch","ports":"<PORT_NUM>"}},"skyline.setImei":{"method":"POST","url":"http://<GATEWAY_HOST>:<PORT>/goip_send_cmd.html?username=<USER>&password=<PASS>&op=set","headers":[["Content-Type","text/plain"]],"body":"sim_imei(<N>)=<IMEI>"},"skyline.saveConfig":{"method":"POST","url":"http://<GATEWAY_HOST>:<PORT>/goip_send_cmd.html?username=<USER>&password=<PASS>","headers":[["Content-Type","application/json"]],"body":{"type":"command","op":"save"}},"skyline.lock":{"method":"POST","url":"http://<GATEWAY_HOST>:<PORT>/goip_send_cmd.html?username=<USER>&password=<PASS>","headers":[["Content-Type","application/json"]],"body":{"type":"command","op":"lock","ports":"<PORT_NUM>"}},"skyline.unlock":{"method":"POST","url":"http://<GATEWAY_HOST>:<PORT>/goip_send_cmd.html?username=<USER>&password=<PASS>","headers":[["Content-Type","application/json"]],"body":{"type":"command","op":"unlock","ports":"<PORT_NUM>"}},"skyline.reboot":{"method":"POST","url":"http://<GATEWAY_HOST>:<PORT>/goip_send_cmd.html?username=<USER>&password=<PASS>","headers":[["Content-Type","application/json"]],"body":{"type":"command","op":"reboot","ports":"<PORT_NUM>"}},"skyline.reset":{"method":"POST","url":"http://<GATEWAY_HOST>:<PORT>/goip_send_cmd.html?username=<USER>&password=<PASS>","headers":[["Content-Type","application/json"]],"body":{"type":"command","op":"reset","ports":"<PORT_NUM>"}}};
+        // ── API Tester (server-driven preset runner) ─────────────────────────
+        var API_TESTER_PRESET_CACHE = null;
+        var API_TESTER_GATEWAY_CACHE = null;
+        var API_TESTER_CURRENT_PRESET = null;
+
+        async function ensureApiTesterPresets() {
+            if (API_TESTER_PRESET_CACHE) return API_TESTER_PRESET_CACHE;
+            var res = await fetch(API_BASE + '/api-tester/presets');
+            API_TESTER_PRESET_CACHE = await res.json();
+            return API_TESTER_PRESET_CACHE;
+        }
+        async function ensureApiTesterGateways() {
+            if (API_TESTER_GATEWAY_CACHE) return API_TESTER_GATEWAY_CACHE;
+            var res = await fetch(API_BASE + '/gateways');
+            var rows = await res.json();
+            API_TESTER_GATEWAY_CACHE = (rows || []).filter(function(g) { return g.active !== false; });
+            return API_TESTER_GATEWAY_CACHE;
+        }
 
         function addRelayHeader(key, val) {
-            key = key || '';
-            val = val || '';
+            key = key || ''; val = val || '';
             var container = document.getElementById('api-tester-headers');
             var row = document.createElement('div');
             row.className = 'flex gap-2 items-center';
             var keyIn = document.createElement('input');
-            keyIn.type = 'text';
-            keyIn.placeholder = 'Header name';
-            keyIn.value = key;
+            keyIn.type = 'text'; keyIn.placeholder = 'Header name'; keyIn.value = key;
             keyIn.className = 'flex-1 text-xs bg-dark-900 border border-dark-500 rounded px-2 py-1 text-gray-300 font-mono focus:outline-none focus:border-accent';
             var valIn = document.createElement('input');
-            valIn.type = 'text';
-            valIn.placeholder = 'Value';
-            valIn.value = val;
+            valIn.type = 'text'; valIn.placeholder = 'Value'; valIn.value = val;
             valIn.className = 'flex-1 text-xs bg-dark-900 border border-dark-500 rounded px-2 py-1 text-gray-300 font-mono focus:outline-none focus:border-accent';
             var btn = document.createElement('button');
             btn.innerHTML = '&times;';
             btn.className = 'text-red-400 hover:text-red-300 text-lg leading-none px-1 transition';
             btn.onclick = function() { row.remove(); };
-            row.appendChild(keyIn);
-            row.appendChild(valIn);
-            row.appendChild(btn);
+            row.appendChild(keyIn); row.appendChild(valIn); row.appendChild(btn);
             container.appendChild(row);
         }
 
-        function applyApiPreset() {
-            var val = document.getElementById('api-tester-preset').value;
-            var p = val ? API_TESTER_PRESETS[val] : null;
-            if (!p) return;
-            document.getElementById('api-tester-method').value = p.method;
-            document.getElementById('api-tester-url').value = p.url;
-            document.getElementById('api-tester-headers').innerHTML = '';
-            (p.headers || []).forEach(function(h) { addRelayHeader(h[0], h[1]); });
-            var body = (p.body === undefined || p.body === null) ? '' : p.body;
-            if (typeof body === 'object') { body = JSON.stringify(body, null, 2); }
-            document.getElementById('api-tester-body').value = body;
+        async function populateApiTesterDropdown() {
+            var sel = document.getElementById('api-tester-preset');
+            if (!sel || sel.dataset.loaded === '1') return;
+            try {
+                var presets = await ensureApiTesterPresets();
+                var groups = {};
+                presets.forEach(function(p) { (groups[p.vendor] = groups[p.vendor] || []).push(p); });
+                var html = '<option value="">— Custom (raw) —</option>';
+                Object.keys(groups).sort().forEach(function(vendor) {
+                    html += \`<optgroup label="\${vendor.toUpperCase()}">\`;
+                    groups[vendor].forEach(function(p) {
+                        html += \`<option value="\${p.key}">\${p.label}</option>\`;
+                    });
+                    html += '</optgroup>';
+                });
+                sel.innerHTML = html;
+                sel.dataset.loaded = '1';
+            } catch (e) {
+                console.error('preset load failed', e);
+            }
+        }
+
+        async function applyApiPreset() {
+            var key = document.getElementById('api-tester-preset').value;
+            var customWrap = document.getElementById('api-tester-custom-wrap');
+            var presetWrap = document.getElementById('api-tester-preset-wrap');
+            var sendBtn = document.getElementById('api-tester-send');
+            if (!key) {
+                API_TESTER_CURRENT_PRESET = null;
+                customWrap.classList.remove('hidden');
+                presetWrap.classList.add('hidden');
+                sendBtn.textContent = 'Send via Relay';
+                return;
+            }
+            var presets = await ensureApiTesterPresets();
+            var preset = presets.find(function(p) { return p.key === key; });
+            if (!preset) return;
+            API_TESTER_CURRENT_PRESET = preset;
+            customWrap.classList.add('hidden');
+            presetWrap.classList.remove('hidden');
+            sendBtn.textContent = preset.stateChanging ? 'Send (confirm)…' : 'Send';
+            var formHost = document.getElementById('api-tester-preset-inputs');
+            formHost.innerHTML = '';
+            if (!preset.inputs.length) {
+                formHost.innerHTML = '<p class="text-xs text-gray-500">No inputs required.</p>';
+                return;
+            }
+            for (var idx = 0; idx < preset.inputs.length; idx++) {
+                var spec = preset.inputs[idx];
+                var wrap = document.createElement('div');
+                wrap.className = 'mb-3';
+                var label = document.createElement('label');
+                label.className = 'text-xs text-gray-500 mb-1 block';
+                label.textContent = spec.label + (spec.required ? ' *' : '');
+                wrap.appendChild(label);
+                var field;
+                if (spec.type === 'select' && spec.source === 'gateways') {
+                    field = document.createElement('select');
+                    field.className = 'w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent';
+                    field.innerHTML = '<option value="">Loading gateways…</option>';
+                    (async function(selEl) {
+                        var gws = await ensureApiTesterGateways();
+                        selEl.innerHTML = '<option value="">— Select gateway —</option>' + gws.map(function(g) {
+                            return \`<option value="\${g.id}">\${g.code || g.name || g.id} — \${g.host || "?"}</option>\`;
+                        }).join('');
+                    })(field);
+                } else {
+                    field = document.createElement('input');
+                    field.type = 'text';
+                    field.value = spec.default || '';
+                    field.placeholder = spec.label;
+                    field.className = 'w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 font-mono focus:outline-none focus:border-accent';
+                }
+                field.dataset.inputName = spec.name;
+                wrap.appendChild(field);
+                formHost.appendChild(wrap);
+            }
+        }
+
+        function collectPresetInputs() {
+            var out = {};
+            document.querySelectorAll('#api-tester-preset-inputs [data-input-name]').forEach(function(el) {
+                out[el.dataset.inputName] = el.value;
+            });
+            return out;
         }
 
         async function sendRelayTest() {
+            if (API_TESTER_CURRENT_PRESET) return sendPresetCall();
+            return sendCustomCall();
+        }
+
+        async function sendCustomCall() {
             var method = document.getElementById('api-tester-method').value;
             var url = (document.getElementById('api-tester-url').value || '').trim();
-            var statusEl = document.getElementById('api-tester-status');
-            var responseEl = document.getElementById('api-tester-response');
-            var respHeadersEl = document.getElementById('api-tester-resp-headers-body');
-            var respHeadersWrap = document.getElementById('api-tester-response-headers');
-            var sendBtn = document.getElementById('api-tester-send');
             if (!url) { showToast('URL is required', 'error'); return; }
             var headers = {};
             document.querySelectorAll('#api-tester-headers > div').forEach(function(row) {
@@ -16929,17 +17118,50 @@ async function sendSimOnline(simId, phoneNumber) {
             });
             var hasBody = ['POST', 'PUT', 'PATCH'].includes(method);
             var body = hasBody ? (document.getElementById('api-tester-body').value || '') : null;
-            sendBtn.textContent = 'Sending...';
-            sendBtn.disabled = true;
-            statusEl.innerHTML = '';
-            responseEl.textContent = '...';
-            respHeadersWrap.classList.add('hidden');
-            try {
-                var res = await fetch(API_BASE + '/relay-test', {
+            await runApiTesterRequest(function() {
+                return fetch(API_BASE + '/relay-test', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ method: method, url: url, headers: headers, body: body })
+                    body: JSON.stringify({ method: method, url: url, headers: headers, body: body }),
                 });
+            });
+        }
+
+        async function sendPresetCall() {
+            var preset = API_TESTER_CURRENT_PRESET;
+            var inputs = collectPresetInputs();
+            var missing = (preset.inputs || []).filter(function(i) { return i.required && !inputs[i.name]; });
+            if (missing.length) { showToast('Missing: ' + missing.map(function(m){return m.label;}).join(', '), 'error'); return; }
+            if (preset.stateChanging) {
+                var NL = String.fromCharCode(10); var msg = 'STATE-CHANGING call: ' + preset.key + NL + NL + 'Inputs:' + NL + Object.keys(inputs).map(function(k){return '  '+k+' = '+inputs[k];}).join(NL) + NL + NL + 'Proceed?';
+                if (!window.confirm(msg)) return;
+            }
+            await runApiTesterRequest(function() {
+                return fetch(API_BASE + '/api-tester/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ presetKey: preset.key, inputs: inputs }),
+                });
+            });
+        }
+
+        async function runApiTesterRequest(fetchFn) {
+            var statusEl = document.getElementById('api-tester-status');
+            var responseEl = document.getElementById('api-tester-response');
+            var respHeadersEl = document.getElementById('api-tester-resp-headers-body');
+            var respHeadersWrap = document.getElementById('api-tester-response-headers');
+            var reqEchoEl = document.getElementById('api-tester-request-echo');
+            var reqEchoWrap = document.getElementById('api-tester-request-wrap');
+            var sendBtn = document.getElementById('api-tester-send');
+            var origLabel = sendBtn.textContent;
+            sendBtn.textContent = 'Sending…';
+            sendBtn.disabled = true;
+            statusEl.innerHTML = '';
+            responseEl.textContent = '…';
+            respHeadersWrap.classList.add('hidden');
+            if (reqEchoWrap) reqEchoWrap.classList.add('hidden');
+            try {
+                var res = await fetchFn();
                 var data = await res.json();
                 if (!data.ok) {
                     statusEl.innerHTML = '<span class="text-red-400">Error</span>';
@@ -16954,17 +17176,24 @@ async function sendSimOnline(simId, phoneNumber) {
                         respHeadersEl.textContent = JSON.stringify(data.headers, null, 2);
                         respHeadersWrap.classList.remove('hidden');
                     }
+                    if (data.request && reqEchoEl && reqEchoWrap) {
+                        reqEchoEl.textContent = JSON.stringify(data.request, null, 2);
+                        reqEchoWrap.classList.remove('hidden');
+                    }
                 }
             } catch (err) {
                 statusEl.innerHTML = '<span class="text-red-400">Error</span>';
                 responseEl.textContent = 'Fetch failed: ' + err;
             } finally {
-                sendBtn.textContent = 'Send via Relay';
+                sendBtn.textContent = origLabel;
                 sendBtn.disabled = false;
             }
         }
 
-        loadData();
+        // Lazy-populate when the tab is opened.
+        populateApiTesterDropdown();
+
+                loadData();
         setInterval(loadData, 3600000);
         initTabFromUrl();
 
