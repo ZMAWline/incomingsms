@@ -1866,9 +1866,24 @@ async function atomicUpdateSubscriberInfo(env, { session, msisdn, address }, run
 // ===========================
 async function rotateAtomicSim(env, sim, opts = {}) {
   const iccid = sim.iccid;
-  let currentMsisdn = sim.msisdn;
   const runId = `rotate_${iccid}_${Date.now()}`;
   const force = opts.force === true;
+
+  // sim_numbers is the source of truth — every dashboard/webhook/finalizer
+  // reads from there. sims.msisdn is a denormalized mirror that can drift on
+  // partial-failure paths, so prefer sim_numbers.e164 (valid_to IS NULL) and
+  // fall back to sim.msisdn only if no current row exists.
+  const curNumRows = await supabaseSelect(
+    env,
+    `sim_numbers?sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&select=e164&limit=1`,
+  ).catch(() => []);
+  const curE164 = Array.isArray(curNumRows) && curNumRows[0]?.e164 ? String(curNumRows[0].e164) : null;
+  const curBare = curE164 ? curE164.replace(/^\+?1?/, '') : null;
+  let currentMsisdn = curBare || sim.msisdn;
+  if (curBare && sim.msisdn && curBare !== sim.msisdn) {
+    console.log(`SIM ${iccid}: sims.msisdn=${sim.msisdn} drift vs sim_numbers.e164=${curE164}; using sim_numbers and healing sims.msisdn`);
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: curBare }).catch(() => {});
+  }
 
   if (!currentMsisdn) throw new Error(`SIM ${iccid}: no msisdn for ATOMIC rotation`);
   if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
@@ -1952,9 +1967,12 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   const attMdnBare = preInqR.Result?.msisdn
     ? String(preInqR.Result.msisdn).replace(/^\+?1?/, '')
     : (preInqR.Result?.MSISDN ? String(preInqR.Result.MSISDN).replace(/^\+?1?/, '') : null);
-  const preAttStatus = String(preInqR.Result?.attStatus || '').trim().toLowerCase();
-  if (attMdnBare && preAttStatus === 'active' && attMdnBare !== currentMsisdn) {
-    console.log(`SIM ${iccid}: DESYNC detected — DB msisdn=${currentMsisdn} but AT&T active MDN=${attMdnBare}; adopting AT&T number as swap-from`);
+  if (attMdnBare && attMdnBare !== currentMsisdn) {
+    // No attStatus gate: AT&T's MSISDN is what swapMSISDN/ppu_update look up
+    // by, so even a Cancelled/Suspended subscriber's number is the right value
+    // to send. INC-5: SIM 1067 returned attStatus=Cancelled and the gated
+    // self-heal silently skipped, leaving the stale DB number in the request.
+    console.log(`SIM ${iccid}: DESYNC detected — DB msisdn=${currentMsisdn} but AT&T MDN=${attMdnBare} (attStatus=${preInqR.Result?.attStatus || 'n/a'}); adopting AT&T number as swap-from`);
     currentMsisdn = attMdnBare;
     await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: attMdnBare }).catch(() => {});
   }
