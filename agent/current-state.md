@@ -42,6 +42,19 @@ Resolver moved to `src/shared/report-bad-resolver.js` (was `src/reseller-portal/
 | GET /api/reports?status=open | 200 (1 report) |
 | Legacy `portal.incoming-sms.com/api/rentals/report-bad` | 200 (unchanged) |
 
+## Session 66 (2026-06-04) — INC-3 Bad Rentals dashboard deep-link (reversed subdomain)
+
+User clarified that "unique URL" meant a dashboard deep-link (`dashboard.zalmen-531.workers.dev/bad-rentals`), not a separate worker. Reversed the earlier `bad-rentals.incoming-sms.com` worker and added the SPA route mapping instead.
+
+- `wrangler delete bad-rentals --env=""` → worker removed from Cloudflare.
+- Deleted `src/bad-rentals/` + `tests/bad-rentals-worker.test.mjs` + `test:bad-rentals` script.
+- Resolver stays at `src/shared/report-bad-resolver.js` (clean refactor, used by reseller-portal).
+- Reseller-portal docs reverted to `portal.incoming-sms.com` URLs (legacy `/api/sims/{sim_id}/report-status` etc.).
+- Dashboard `TAB_ROUTES` adds `'bad-rentals': '/bad-rentals'` so the sidebar link + URL deep-link both land on the Bad Rentals tab.
+- Deployed: dashboard `b9b24424-fc40-4afb-84f8-dcd26c5a79ba`, reseller-portal `ca48643f-2161-4786-b8b2-b691f936c146`.
+- Tests: `npm run test:report-bad` 13/13.
+- Verified: `bad-rentals.incoming-sms.com` no longer resolves; `dashboard.zalmen-531.workers.dev/bad-rentals` returns 200 with the dashboard SPA.
+
 ## Session 65 (2026-06-04) — INC-3 report-bad contract lockdown deployed
 
 Per board directive: reseller-facing report-bad now accepts ONLY `reseller_rental_id` or current-MDN `e164`. `sim_id`, `iccid`, internal `rental_id`, and historical/original MDNs are all rejected with a 400 + explicit message. The convenience route `POST /api/sims/:simId/report-bad` is removed; the portal Submit button posts the SIM's current MDN to `/api/rentals/report-bad`.

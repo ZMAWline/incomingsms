@@ -9671,6 +9671,7 @@ function getHTML(helixEnabled) {
         
         const TAB_ROUTES = {
             'dashboard': '/',
+            'bad-rentals': '/bad-rentals',
             'sims': '/sims',
             'messages': '/messages',
             'workers': '/workers',
