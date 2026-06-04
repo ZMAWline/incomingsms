@@ -3848,11 +3848,11 @@ async function handleUpdateBadRental(id, request, env, corsHeaders) {
   }
 }
 
-// GET /api/bad-rentals/:id/report — returns the parsed report row +
-// event timeline that the reseller's bad-rental webhook produced. The raw
-// HTTP body is not stored (the intake at src/reseller-portal/index.js parses
-// it into discrete columns), so this is the most complete payload-equivalent
-// view we can offer. storage_note flags that gap to the operator.
+// GET /api/bad-rentals/:id/report — returns the parsed report row, the
+// raw JSON body the reseller sent (rental_reports.raw_payload, captured
+// since the 2026-06-04 diagnostics migration) and the audit timeline.
+// For rows that predate the migration raw_payload is NULL and storage_note
+// carries a legacy-row explanation for the operator UI.
 async function handleBadRentalReport(id, env, corsHeaders) {
   try {
     const reportId = parseInt(id, 10);
@@ -3868,6 +3868,7 @@ async function handleBadRentalReport(id, env, corsHeaders) {
       'reason_code','reason_note','attempts','first_attempt_at','client_request_id',
       'status','remediation_action','duplicate_of',
       'received_at','triaged_at','closed_at','updated_at',
+      'raw_payload','source',
       'resellers(name)',
       'rentals(reseller_rental_id)',
     ].join(',');
@@ -3898,7 +3899,12 @@ async function handleBadRentalReport(id, env, corsHeaders) {
       if (Array.isArray(j)) events = j;
     }
 
-    const storageNote = 'The raw HTTP webhook body is not stored. The reseller-portal intake parses the request into the discrete report columns shown below; the audit timeline preserves status transitions and operator notes.';
+    // raw_payload was added by the 2026-06-04 diagnostics migration. Older
+    // reports inserted before that column existed will have NULL — surface a
+    // precise legacy note for those rows only.
+    const hasRawPayload = report && report.raw_payload != null;
+    const storageNote = hasRawPayload ? null
+      : 'Raw HTTP webhook body was not captured for this report (received before the 2026-06-04 diagnostics migration). The parsed report columns and audit timeline below are the most complete record available.';
 
     return new Response(JSON.stringify({ report, events, storage_note: storageNote }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -13747,11 +13753,36 @@ async function sendSimOnline(simId, phoneNumber) {
             let rawJson = '';
             try { rawJson = JSON.stringify(r, null, 2); } catch(_) { rawJson = '(unserialisable)'; }
 
+            const hasRawPayload = r && r.raw_payload != null;
+            let rawPayloadJson = '';
+            if (hasRawPayload) {
+                try { rawPayloadJson = JSON.stringify(r.raw_payload, null, 2); }
+                catch(_) { rawPayloadJson = String(r.raw_payload); }
+            }
+            const sourceLabel = (r && r.source) ? r.source : '';
+
+            const legacyBanner = (!hasRawPayload && storageNote)
+                ? '<div class="mb-4 p-3 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200">'
+                    + '<div class="text-[10px] uppercase tracking-wide font-semibold mb-1">Legacy report \u2014 raw payload not captured</div>'
+                    + '<div class="text-xs">' + escapeHtml(storageNote) + '</div>'
+                  + '</div>'
+                : '';
+
+            const rawPayloadBlock = hasRawPayload
+                ? '<div class="mt-4 mb-2">'
+                    + '<div class="flex items-center justify-between mb-2">'
+                      + '<div class="text-[10px] uppercase tracking-wide font-semibold text-emerald-300">Raw payload (exactly as received from reseller)</div>'
+                      + (sourceLabel ? '<div class="text-[10px] text-dark-400">source: ' + escapeHtml(sourceLabel) + '</div>' : '')
+                    + '</div>'
+                    + '<pre class="p-3 bg-dark-900 border border-emerald-700/40 rounded text-[11px] text-emerald-100 overflow-x-auto whitespace-pre-wrap">' + escapeHtml(rawPayloadJson) + '</pre>'
+                  + '</div>'
+                : '<div class="mt-4 mb-2">'
+                    + '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-400 mb-2">Raw payload</div>'
+                    + '<div class="text-xs text-dark-500">Not captured for this report (legacy row).</div>'
+                  + '</div>';
+
             return ''
-                + '<div class="mb-4 p-3 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200">'
-                +   '<div class="text-[10px] uppercase tracking-wide font-semibold mb-1">Storage gap</div>'
-                +   '<div class="text-xs">' + escapeHtml(storageNote) + '</div>'
-                + '</div>'
+                + legacyBanner
                 + '<div class="mb-4">'
                 +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Parsed report fields</div>'
                 +   fieldsHtml
@@ -13760,8 +13791,9 @@ async function sendSimOnline(simId, phoneNumber) {
                 +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Audit timeline (rental_report_events)</div>'
                 +   eventsHtml
                 + '</div>'
+                + rawPayloadBlock
                 + '<details class="mt-2">'
-                +   '<summary class="cursor-pointer text-[10px] uppercase tracking-wide text-dark-400 hover:text-dark-200">Raw row JSON</summary>'
+                +   '<summary class="cursor-pointer text-[10px] uppercase tracking-wide text-dark-400 hover:text-dark-200">Raw row JSON (parsed columns)</summary>'
                 +   '<pre class="mt-2 p-3 bg-dark-900 border border-dark-700 rounded text-[10px] text-dark-300 overflow-x-auto">' + escapeHtml(rawJson) + '</pre>'
                 + '</details>';
         }
