@@ -1,9 +1,46 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-03 (session 64 — INC-3 Phase 1 workers to PROD; DB migration pending)
+> Last updated: 2026-06-04 (session 66 — Bad Rentals gets its own subdomain/worker)
 
 ---
+
+## Session 66 (2026-06-04) — INC-3 follow-up: Bad Rentals first-class surface
+
+Board directive (2026-06-04 14:28 UTC): "Bad Rental doesn't have a unique domain/route/surface — implement the appropriate unique domain/route/surface." Chose **subdomain** over path-group per Single Responsibility constraint #2 and the existing `portal.incoming-sms.com` precedent.
+
+**New worker:** `src/bad-rentals/` (index.js + wrangler.toml).
+**New surface:** `https://bad-rentals.incoming-sms.com` — landing page + 3 API routes.
+
+- `GET  /` — public landing with the contract, curl examples, and an inline "Check status" form.
+- `GET  /healthz` — liveness.
+- `POST /api/rentals/report-bad` — primary intake (same Bearer rsk_* auth, same dedup, same rate-limits as portal).
+- `GET  /api/rentals/report-bad/status?reseller_rental_id=…|e164=…` — most-recent report for one of your rentals.
+- `GET  /api/reports?status=open` — list this reseller's reports.
+
+Resolver moved to `src/shared/report-bad-resolver.js` (was `src/reseller-portal/`); imported by both workers. 13 contract tests still pass; 8 new worker routing/auth tests added (`tests/bad-rentals-worker.test.mjs`, `npm run test:bad-rentals`).
+
+**Backward compatibility:** the old portal routes (`/api/rentals/report-bad`, `/api/sims/:id/report-status`, `/api/sims/reports`) are deliberately left in place so Maxime's existing integration keeps working unchanged. Portal HTML docs updated to recommend the new dedicated surface.
+
+**Deployed:**
+- bad-rentals `ca8612b0-fcd7-4202-8b37-555504b4b5d7` (bad-rentals.incoming-sms.com custom domain auto-provisioned).
+- reseller-portal `cd5f0a46-0315-4a37-8b32-677ce970f98c` (HTML docs only; routes unchanged).
+
+**Probes (Maxime's key, prod):**
+| Probe | Result |
+|---|---|
+| `GET /` landing | 200, 6588 bytes HTML |
+| `GET /healthz` | 200 `{ok:true}` |
+| `GET /api/reports` no auth | 401 |
+| POST `sim_id` | 400 bad_request |
+| POST `iccid` | 400 bad_request |
+| POST internal `rental_id` | 400 bad_request |
+| POST historical MDN | 404 not_found |
+| POST `reseller_rental_id` | 200 (new) → second call 200 deduped |
+| POST current `e164` | 200 deduped |
+| GET status by reseller_rental_id | 200 |
+| GET /api/reports?status=open | 200 (1 report) |
+| Legacy `portal.incoming-sms.com/api/rentals/report-bad` | 200 (unchanged) |
 
 ## Session 65 (2026-06-04) — INC-3 report-bad contract lockdown deployed
 

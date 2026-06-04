@@ -3,7 +3,7 @@ import {
   resolveRentalForReport,
   normalizeE164,
   REPORT_REASON_CODES,
-} from './report-bad-resolver.js';
+} from '../shared/report-bad-resolver.js';
 
 const COOKIE_NAME = 'rp_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
@@ -1093,7 +1093,8 @@ function portalHtml() {
       <div class="space-y-3">
         <div>
           <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">URL</div>
-          <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-cyan-200 font-mono break-all">POST https://portal.incoming-sms.com/api/rentals/report-bad</code>
+          <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-cyan-200 font-mono break-all">POST https://bad-rentals.incoming-sms.com/api/rentals/report-bad</code>
+          <div class="text-xs text-slate-500 mt-1">Dedicated surface: <a href="https://bad-rentals.incoming-sms.com" target="_blank" class="text-cyan-300 underline">bad-rentals.incoming-sms.com</a>. The legacy <code class="text-slate-300">portal.incoming-sms.com/api/rentals/report-bad</code> route still works for backward compatibility.</div>
         </div>
         <div>
           <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Body — either identifier (not both required)</div>
@@ -1113,12 +1114,12 @@ function portalHtml() {
           <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">cURL example</div>
           <pre class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono whitespace-pre-wrap">curl -X POST -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" \\
   -d '{"e164":"+15551234567","reason_code":"no_sms_received"}' \\
-  "https://portal.incoming-sms.com/api/rentals/report-bad"</pre>
+  "https://bad-rentals.incoming-sms.com/api/rentals/report-bad"</pre>
         </div>
         <div>
           <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Check report status</div>
-          <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono break-all">GET https://portal.incoming-sms.com/api/sims/{sim_id}/report-status</code>
-          <div class="text-xs text-slate-500 mt-1">Or list all your reports: <code class="text-slate-300">GET /api/sims/reports?status=open</code></div>
+          <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono break-all">GET https://bad-rentals.incoming-sms.com/api/rentals/report-bad/status?reseller_rental_id=…</code>
+          <div class="text-xs text-slate-500 mt-1">Or list all your reports: <code class="text-slate-300">GET https://bad-rentals.incoming-sms.com/api/reports?status=open</code>. Legacy portal endpoints <code class="text-slate-300">/api/sims/{sim_id}/report-status</code> and <code class="text-slate-300">/api/sims/reports</code> remain available.</div>
         </div>
         <div class="text-xs text-slate-500">
           Accepted identifiers: <code class="text-slate-300">reseller_rental_id</code> or

@@ -17,7 +17,7 @@ const repo = path.resolve(here, '..');
 const bundle = '/tmp/report-bad-resolver.bundle.test.mjs';
 
 execFileSync('npx', ['--yes', 'esbuild',
-  'src/reseller-portal/report-bad-resolver.js',
+  'src/shared/report-bad-resolver.js',
   '--bundle', '--format=esm', '--outfile=' + bundle, '--log-level=error',
 ], { cwd: repo });
 
