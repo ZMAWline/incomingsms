@@ -4,6 +4,24 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-06-04 — INC-3 report-bad accepts only `reseller_rental_id` and current-MDN `e164`
+
+**Decision:** The reseller-facing `POST /api/rentals/report-bad` accepts exactly two identifiers: `reseller_rental_id` (the reseller's own string id) and `e164` (the SIM's CURRENT MDN — `sim_numbers.e164 WHERE valid_to IS NULL`). It explicitly rejects `sim_id`, `iccid`, our internal `rental_id`, and any historical/rotated MDN. Logic lives in `src/shared/report-bad-resolver.js` as a pure module, imported by `src/reseller-portal/index.js`; the convenience route `POST /api/sims/:simId/report-bad` and its handler were removed.
+
+**Why:** The first two iterations of INC-3 accepted four identifiers (rental_id, reseller_rental_id, sim_id, e164) which let the partner (TrustOTP) silently target the wrong rental. SIM-keyed reports are ambiguous because SIMs span multiple MDNs/rentals over their lifetime. Internal `rental_id` is not reseller-facing (Maxime sent his own external id in our field name, got 404s). Historical MDNs resolve to no current rental. A stable rental-specific identifier (reseller_rental_id) plus a stable current-state identifier (current MDN) are the only two that pin to a single, current rental from the reseller's perspective.
+
+**Consequence:** Do NOT reintroduce `sim_id`/`iccid`/internal `rental_id`/historical-MDN as reseller-facing identifiers without an explicit board-level revisit — the contract is a security/billing surface, not an internal convenience. The portal UI's Submit-bad button posts the SIM's `msisdn` as `e164`, never `sim_id`. Operator UI may still display sim_id (it's not a reseller-facing API identifier).
+
+---
+
+## 2026-06-04 — Bad Rental gets a dashboard deep-link (`/bad-rentals`), NOT a separate subdomain
+
+**Decision:** The Bad Rentals product surface is the existing operator dashboard at `dashboard.zalmen-531.workers.dev/bad-rentals` — added via a `TAB_ROUTES` entry in the SPA. An earlier attempt created a dedicated `bad-rentals.incoming-sms.com` worker; that was reversed.
+
+**Why:** The board's "unique URL" requirement was for an operator-facing bookmark-able tab, not a new customer-facing surface. Splitting Bad Rental into its own worker added DNS surface, deploy-pipeline weight, and a second auth path without operator benefit. The reseller-facing API (`/api/rentals/report-bad`) already lives on `portal.incoming-sms.com`; that's the public surface. The dashboard is the operator surface.
+
+**Consequence:** Do NOT recreate `src/bad-rentals/` as a separate worker. New Bad Rental operator features (filters, batch actions, export) belong inside `src/dashboard/index.js`. The resolver was kept in `src/shared/` because that move is independently useful for cross-worker imports.
+
 ## 2026-05-26 — `last_mdn_rotated_at` is restored on failure only when no MDN was consumed
 
 **Decision:** `claim_rotation_slot` still stamps `last_mdn_rotated_at` up front (it is the dedup lock — written before any carrier call so two cron ticks can't both rotate the same SIM). But the rotation functions now *restore* it to its pre-claim value when they fail **before the MDN actually changes**. Boundary per vendor: wing restores on ANY throw (all wing failures are before the dialable PUT's 202); atomic restores only at the 3 pre-swap-success throw sites (pre-swap inquiry, swap HTTP error, swap statusCode≠00) via `restoreRotationStamp()`. Atomic failures AFTER `swapMSISDN` returns `00` deliberately KEEP the stamp.
