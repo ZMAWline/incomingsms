@@ -1,4 +1,9 @@
 import { computeBillingBreakdown, estDateFromDate } from '../shared/billing.js';
+import {
+  resolveRentalForReport,
+  normalizeE164,
+  REPORT_REASON_CODES,
+} from './report-bad-resolver.js';
 
 const COOKIE_NAME = 'rp_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
@@ -740,124 +745,6 @@ async function handleOnlineHistory(simId, auth, env) {
 // docs/superpowers/specs/2026-06-02-failed-rental-reporting-design.md (rev 5).
 // ---------------------------------------------------------------------------
 
-const REPORT_REASON_CODES = new Set(['no_sms_received','wrong_number','delayed_sms','other']);
-
-function normalizeE164(input) {
-  if (input == null) return null;
-  const digits = String(input).replace(/[^0-9]/g, '');
-  if (digits.length < 11 || digits.length > 15) return null;
-  return '+' + digits;
-}
-
-// Single resolver applied by both report-bad endpoints. Returns
-// { ok:true, rental_id, sim_id, sim_number_id, e164 } on success,
-// or { ok:false, code:'bad_request'|'not_found'|'ambiguous', message, candidates? }.
-// Specificity order: rental_id > reseller_rental_id > sim_id > e164.
-// All lookups are scoped to resellerId — cross-reseller leaks are not possible.
-async function resolveRentalForReport(env, resellerId, body) {
-  body = body || {};
-
-  // 1. rental_id (most specific)
-  if (body.rental_id != null) {
-    const n = Number(body.rental_id);
-    if (!Number.isFinite(n) || n <= 0) return { ok: false, code: 'bad_request', message: 'rental_id must be a positive integer' };
-    const resp = await sbGet(env,
-      'rentals?select=id,reseller_id,sim_id,sim_number_id,e164' +
-      '&id=eq.' + encodeURIComponent(n) +
-      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&limit=1'
-    );
-    if (!resp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
-    const rows = await resp.json();
-    if (!Array.isArray(rows) || rows.length === 0) {
-      return { ok: false, code: 'not_found', message: 'rental_id not found for this reseller' };
-    }
-    const r = rows[0];
-    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: r.e164 || null };
-  }
-
-  // 2. reseller_rental_id (their rentalId)
-  if (body.reseller_rental_id != null && String(body.reseller_rental_id).length > 0) {
-    const v = String(body.reseller_rental_id);
-    const resp = await sbGet(env,
-      'rentals?select=id,sim_id,sim_number_id,e164,minted_at' +
-      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&reseller_rental_id=eq.' + encodeURIComponent(v) +
-      '&order=minted_at.desc&limit=1'
-    );
-    if (!resp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
-    const rows = await resp.json();
-    if (!Array.isArray(rows) || rows.length === 0) {
-      return { ok: false, code: 'not_found', message: 'reseller_rental_id not found for this reseller' };
-    }
-    const r = rows[0];
-    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: r.e164 || null };
-  }
-
-  // 3. sim_id — pick the most recent rental for that SIM (current lifetime).
-  if (body.sim_id != null) {
-    const n = Number(body.sim_id);
-    if (!Number.isFinite(n) || n <= 0) return { ok: false, code: 'bad_request', message: 'sim_id must be a positive integer' };
-    // Ownership guard via reseller_sims (the canonical reseller↔sim membership).
-    const ownResp = await sbGet(env,
-      'reseller_sims?select=sim_id' +
-      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&sim_id=eq.' + encodeURIComponent(n) +
-      '&limit=1'
-    );
-    if (!ownResp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
-    const ownRows = await ownResp.json();
-    if (!Array.isArray(ownRows) || ownRows.length === 0) {
-      return { ok: false, code: 'not_found', message: 'sim_id not owned by this reseller' };
-    }
-    const resp = await sbGet(env,
-      'rentals?select=id,sim_id,sim_number_id,e164,minted_at' +
-      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&sim_id=eq.' + encodeURIComponent(n) +
-      '&order=minted_at.desc&limit=1'
-    );
-    if (!resp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
-    const rows = await resp.json();
-    if (!Array.isArray(rows) || rows.length === 0) {
-      return { ok: false, code: 'not_found', message: 'no rental for this SIM under your account' };
-    }
-    const r = rows[0];
-    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: r.e164 || null };
-  }
-
-  // 4. e164 (primary external identifier per design rev 5).
-  if (body.e164 != null) {
-    const norm = normalizeE164(body.e164);
-    if (!norm) return { ok: false, code: 'bad_request', message: 'e164 is not a plausible phone number' };
-    // Restrict to current lifetimes: sim_numbers.valid_to IS NULL.
-    // PostgREST embed filter: we join rentals → sim_numbers via sim_number_id.
-    const resp = await sbGet(env,
-      'rentals?select=id,sim_id,sim_number_id,e164,minted_at,sim_numbers!inner(valid_to)' +
-      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-      '&e164=eq.' + encodeURIComponent(norm) +
-      '&sim_numbers.valid_to=is.null' +
-      '&order=minted_at.desc'
-    );
-    if (!resp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
-    const rows = await resp.json();
-    const list = Array.isArray(rows) ? rows : [];
-    if (list.length === 0) {
-      return { ok: false, code: 'not_found', message: 'no active rental for this number under your account (historical lifetimes require an exact rental_id or reseller_rental_id)' };
-    }
-    if (list.length > 1) {
-      return {
-        ok: false, code: 'ambiguous',
-        message: 'multiple active rentals match this number — resubmit with rental_id',
-        candidates: list.map(r => ({ rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, minted_at: r.minted_at })),
-      };
-    }
-    const r = list[0];
-    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: r.e164 || norm };
-  }
-
-  return { ok: false, code: 'bad_request', message: 'at least one of e164, reseller_rental_id, rental_id, or sim_id is required' };
-}
-
 // Insert (or return existing open) report row, log the action, return the
 // reseller-facing envelope. Shared by both report-bad endpoints once the
 // rental has been resolved. `source` is the route tag used both on the
@@ -987,7 +874,7 @@ async function handleReportBadByRental(auth, env, request) {
     return badRequest('JSON object body required');
   }
 
-  const resolved = await resolveRentalForReport(env, auth.resellerId, body);
+  const resolved = await resolveRentalForReport(env, auth.resellerId, body, sbGet);
   if (!resolved.ok) {
     const status = resolved.code === 'not_found' ? 404
                  : resolved.code === 'ambiguous' ? 409
@@ -1004,54 +891,6 @@ async function handleReportBadByRental(auth, env, request) {
     return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
   }
 
-  return insertOrReturnExistingReport(env, auth.resellerId, resolved, body, source);
-}
-
-// POST /api/sims/:simId/report-bad — convenience for the portal UI.
-async function handleReportBadBySim(simId, auth, env, request) {
-  const source = 'api/sims/:simId/report-bad';
-  let bodyText = '';
-  try { bodyText = await request.text(); } catch { bodyText = ''; }
-  let body;
-  if (!bodyText) {
-    body = {};
-  } else {
-    try { body = JSON.parse(bodyText); }
-    catch {
-      // UI is supposed to send JSON or nothing; record the malformed attempt
-      // but still proceed with an empty body so the URL-keyed SIM still
-      // resolves (intentional UI convenience).
-      await logReportRejection(env, { resellerId: auth.resellerId, source,
-        code: 'parse_error', message: 'request body was not valid JSON; proceeded with empty body',
-        rawBodyText: bodyText, status: null });
-      body = {};
-    }
-  }
-  if (body == null || typeof body !== 'object' || Array.isArray(body)) {
-    const shape = Array.isArray(body) ? 'array' : (body === null ? 'null' : typeof body);
-    await logReportRejection(env, { resellerId: auth.resellerId, source,
-      code: 'bad_request', message: 'body must be a JSON object (got ' + shape + ')',
-      body, rawBodyText: bodyText, status: 400 });
-    return badRequest('JSON object body required');
-  }
-  // Override identifier fields with the URL param; UI never passes its own.
-  body.sim_id = simId;
-  body.rental_id = undefined;
-  body.reseller_rental_id = undefined;
-  body.e164 = undefined;
-  const resolved = await resolveRentalForReport(env, auth.resellerId, body);
-  if (!resolved.ok) {
-    const status = resolved.code === 'not_found' ? 404 : 400;
-    await logReportRejection(env, { resellerId: auth.resellerId, source,
-      code: resolved.code, message: resolved.message, body, rawBodyText: bodyText, status });
-    return jsonResp({ error: resolved.message, code: resolved.code }, status);
-  }
-  const rl = await checkRateLimit(env, auth.resellerId, 'portal_report_bad', resolved.sim_id);
-  if (!rl.allowed) {
-    await logReportRejection(env, { resellerId: auth.resellerId, source,
-      code: 'rate_limited', message: rl.reason, body, rawBodyText: bodyText, status: 429 });
-    return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
-  }
   return insertOrReturnExistingReport(env, auth.resellerId, resolved, body, source);
 }
 
@@ -1244,8 +1083,12 @@ function portalHtml() {
       <h2 class="text-lg font-semibold mb-1">Report a Bad Rental</h2>
       <p class="text-slate-400 text-sm mb-4">
         Tell us if a number isn't working — no SMS arriving, receiving the wrong account's traffic, etc. We surface
-        the report on our operations dashboard and a specialist will look at the SIM. Identify the rental by phone number (recommended),
-        your <code class="text-slate-300">rentalId</code>, our <code class="text-slate-300">rental_id</code>, or our <code class="text-slate-300">sim_id</code>.
+        the report on our operations dashboard and a specialist will look at the SIM. Identify the rental by either
+        <code class="text-slate-300">reseller_rental_id</code> (your own rental id) or
+        <code class="text-slate-300">e164</code> (the rental's current phone number, in E.164 form). No other
+        identifiers are accepted — <code class="text-slate-300">sim_id</code>, <code class="text-slate-300">iccid</code>,
+        and our internal <code class="text-slate-300">rental_id</code> are rejected because they don't pin to a single
+        current rental.
       </p>
       <div class="space-y-3">
         <div>
@@ -1253,11 +1096,17 @@ function portalHtml() {
           <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-cyan-200 font-mono break-all">POST https://portal.incoming-sms.com/api/rentals/report-bad</code>
         </div>
         <div>
-          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Body (any one identifier required)</div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Body — either identifier (not both required)</div>
           <pre class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono whitespace-pre-wrap">{
-  "e164": "+15551234567",
+  "reseller_rental_id": "1693795",
   "reason_code": "no_sms_received",
   "reason_note": "3 send attempts, no SMS in 30 min"
+}
+
+// or, equivalently:
+{
+  "e164": "+15551234567",
+  "reason_code": "no_sms_received"
 }</pre>
         </div>
         <div>
@@ -1272,10 +1121,12 @@ function portalHtml() {
           <div class="text-xs text-slate-500 mt-1">Or list all your reports: <code class="text-slate-300">GET /api/sims/reports?status=open</code></div>
         </div>
         <div class="text-xs text-slate-500">
-          Identifier resolution order (most specific first): <code class="text-slate-300">rental_id</code> &rarr; <code class="text-slate-300">reseller_rental_id</code> &rarr; <code class="text-slate-300">sim_id</code> &rarr; <code class="text-slate-300">e164</code>.
-          Phone-number lookups are scoped to your account and the current rental lifetime; if two active rentals share that MDN
-          the response is <code class="text-slate-300">409</code> with the candidate <code class="text-slate-300">rental_id</code>s so you can disambiguate.
-          Rate limit: one report per SIM per hour, 200 reports per day per account.
+          Accepted identifiers: <code class="text-slate-300">reseller_rental_id</code> or
+          <code class="text-slate-300">e164</code> (current MDN). Phone-number lookups match the SIM's
+          <em>current</em> MDN only — historical/rotated MDNs do not resolve. If two of your SIMs share the same current
+          number, the response is <code class="text-slate-300">409 ambiguous</code> and you should resubmit with
+          <code class="text-slate-300">reseller_rental_id</code>. Rate limit: one report per SIM per hour, 200 reports per
+          day per account.
         </div>
       </div>
     </div>
@@ -1502,10 +1353,20 @@ async function reportBad(simId, btn) {
       closeModal();
       if (btn) { btn.disabled = true; btn.textContent = 'Submitting…'; }
       try {
-        const r = await fetch('/api/sims/' + simId + '/report-bad', {
+        // INC-3 contract: report-bad accepts only reseller_rental_id or
+        // current-MDN e164. The Submit button sends the SIM current MDN
+        // (sim.msisdn), which the resolver maps to the current rental for this
+        // reseller. sim_id/iccid are no longer accepted.
+        const sim = allSims.find(s => s.sim_id === simId);
+        const currentMdn = sim ? sim.msisdn : null;
+        if (!currentMdn) {
+          showToast('This SIM has no current phone number; cannot file a report.', 'error');
+          return;
+        }
+        const r = await fetch('/api/rentals/report-bad', {
           method: 'POST', credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ reason_code, reason_note }),
+          body: JSON.stringify({ e164: currentMdn, reason_code, reason_note }),
         });
         const data = await r.json().catch(() => ({}));
         if (r.status === 429) {
@@ -1811,7 +1672,6 @@ export default {
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/online-history$/))) return handleOnlineHistory(m[1], auth, env);
       // INC-3 Phase 1 — bad-rental reporting (rev 5).
       if (url.pathname === '/api/rentals/report-bad' && request.method === 'POST') return handleReportBadByRental(auth, env, request);
-      if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/report-bad$/)) && request.method === 'POST') return handleReportBadBySim(m[1], auth, env, request);
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/report-status$/))) return handleReportStatus(m[1], auth, env);
       if (url.pathname === '/api/sims/reports') return handleReportsList(auth, env, url);
       return notFound();
