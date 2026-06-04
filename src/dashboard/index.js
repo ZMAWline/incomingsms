@@ -13542,9 +13542,9 @@ async function sendSimOnline(simId, phoneNumber) {
                               '<span title="Current MDN — the SIM\\'s active number right now" class="text-emerald-300 font-semibold">' + escapeHtml(current) + ' <span class="text-[10px] uppercase tracking-wide text-emerald-400/80">current</span></span>' +
                             '</div>';
                     } else if (reported && current && reported === current) {
-                        mdnCell = '<span title="Reported and current MDN match — SIM has not rotated since report" class="text-dark-200">' + escapeHtml(reported) + '</span>' + retiredLine;
+                        mdnCell = '<span title="Reported and current MDN match — SIM has not rotated since report" class="text-dark-200">' + escapeHtml(reported) + '</span>';
                     } else if (reported) {
-                        mdnCell = '<span title="Reported MDN; current MDN unknown (SIM has no active sim_numbers row)" class="text-dark-300">' + escapeHtml(reported) + '</span>' + retiredLine;
+                        mdnCell = '<span title="Reported MDN; current MDN unknown (SIM has no active sim_numbers row)" class="text-dark-300">' + escapeHtml(reported) + '</span>';
                     } else {
                         mdnCell = '<span title="Current MDN; reported MDN missing on report" class="text-emerald-300">' + escapeHtml(current) + '</span>';
                     }
