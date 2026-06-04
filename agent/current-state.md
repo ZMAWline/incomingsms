@@ -5,6 +5,16 @@
 
 ---
 
+## Session 65 (2026-06-04) — INC-3 report-bad contract lockdown deployed
+
+Per board directive: reseller-facing report-bad now accepts ONLY `reseller_rental_id` or current-MDN `e164`. `sim_id`, `iccid`, internal `rental_id`, and historical/original MDNs are all rejected with a 400 + explicit message. The convenience route `POST /api/sims/:simId/report-bad` is removed; the portal Submit button posts the SIM's current MDN to `/api/rentals/report-bad`.
+
+- Resolver extracted to `src/reseller-portal/report-bad-resolver.js` (pure module, 13 contract tests in `tests/report-bad-resolver.test.mjs`).
+- reseller-portal redeployed prod `dd7997f3-3b50-4ece-bb5c-f8d9f04deb31`.
+- Live probes (Maxime's API key, prod): sim_id/iccid/rental_id → 400 bad_request; original MDN → 404; current MDN + reseller_rental_id → 200 dedup; removed route → 404.
+
+Migration note for partner: tell Maxime to switch his payload field from `rental_id` to `reseller_rental_id` (same value, different key).
+
 ## Session 64 (2026-06-03) — INC-3 Phase 1 deploy: workers to PROD, migration pending
 
 Board approved option 1 (deploy all INC-3 Phase 1 to prod for live testing).
