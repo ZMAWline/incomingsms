@@ -4,6 +4,7 @@ import {
   normalizeE164,
   REPORT_REASON_CODES,
 } from '../shared/report-bad-resolver.js';
+import { buildStatusFilter } from '../shared/rental-report-status.js';
 
 const COOKIE_NAME = 'rp_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
@@ -926,15 +927,19 @@ async function handleReportStatus(simId, auth, env) {
 
 // GET /api/sims/reports — all reports for the reseller, filterable.
 async function handleReportsList(auth, env, url) {
-  const status = url && url.searchParams ? url.searchParams.get('status') : null;
+  const rawStatus = url && url.searchParams ? url.searchParams.get('status') : null;
   const since = url && url.searchParams ? url.searchParams.get('since') : null;
+  const norm = buildStatusFilter(rawStatus);
+  if (!norm.ok) {
+    return jsonResp({
+      error: norm.error,
+      message: 'unsupported status; accepted values: ' + norm.accepted.join(', '),
+      accepted: norm.accepted,
+    }, 400);
+  }
   let path = 'rental_reports?select=id,rental_id,sim_id,sim_number_id,e164,reason_code,reason_note,status,remediation_action,received_at,triaged_at,closed_at' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId);
-  if (status === 'open') {
-    path += '&status=in.(received,in_triage)';
-  } else if (status && status !== 'all') {
-    path += '&status=eq.' + encodeURIComponent(status);
-  }
+  if (norm.filter) path += norm.filter;
   if (since) path += '&received_at=gte.' + encodeURIComponent(since);
   path += '&order=received_at.desc&limit=500';
   const resp = await sbGet(env, path);

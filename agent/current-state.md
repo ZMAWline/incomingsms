@@ -1,9 +1,35 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-04 (session 66 — Bad Rentals gets its own subdomain/worker)
+> Last updated: 2026-06-04 (session 67 — reports list `?status=resolved` alias fix)
 
 ---
+
+## Session 67 (2026-06-04) — INC-3 follow-up: `?status=resolved` alias fix
+
+Board bug report: `GET /api/sims/reports?status=resolved` returned `[]` even though resolved reports exist. Root cause confirmed: the `rental_reports.status` CHECK constraint only allows `received|in_triage|remediated|unable_to_reproduce|duplicate` — there is no `resolved` literal in the DB. The handler was passing `status=eq.resolved` through to PostgREST, which legitimately matched zero rows.
+
+**Fix:** added `src/shared/rental-report-status.js` with `buildStatusFilter(raw)` that expands the user-facing aliases into PostgREST filter fragments:
+- `open` → `&status=in.(received,in_triage)` (already supported; preserved)
+- `resolved` → `&status=in.(remediated,unable_to_reproduce,duplicate)` (new)
+- `all` → no filter
+- literal enum values → `&status=eq.<value>` pass-through
+- anything else → `{ok:false}` so the handler returns 400 with the accepted list
+- missing/empty → defaults to `open` (preserves prior behaviour)
+
+Trim + lower-case normalization included. `handleReportsList` in `src/reseller-portal/index.js` now uses the helper and returns a 400 `bad_request` payload listing accepted values for unknown statuses.
+
+**Tests:** new `tests/reports-list-status.test.mjs` (14 cases) covering every alias, every literal, garbage, missing, case-insensitivity, and whitespace. `npm run test:reports-list-status`. Existing `npm run test:report-bad` still 13/13 — resolver contract untouched.
+
+**Deployed:** reseller-portal `36049cd7-d464-4f53-9b4f-3e8fe16de01e`. Dashboard not redeployed (its `?status=` filter is on `sims.status`, unrelated).
+
+**Probes (Maxime's key, prod):**
+| Probe | Result |
+|---|---|
+| `GET /api/sims/reports?status=resolved` | 200, 1 row (id=1, `remediated`) |
+| `GET /api/sims/reports?status=open` | 200, `[]` (no currently open reports) |
+| `GET /api/sims/reports?status=garbage` | 400 `bad_request` + accepted list |
+| `GET /api/sims/reports?status=all` | 200, 1 row |
 
 ## Session 66 (2026-06-04) — INC-3 follow-up: Bad Rentals first-class surface
 
