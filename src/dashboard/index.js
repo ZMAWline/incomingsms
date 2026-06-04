@@ -9997,6 +9997,7 @@ function getHTML(helixEnabled) {
             'gateways': '/gateways',
             'imei-pool': '/imei-pool',
             'errors': '/errors',
+            'bad-rentals': '/bad-rentals',
             'rotation-reviews': '/rotation-reviews',
             'invoicing': '/invoicing',
             'billing': '/billing',
@@ -10027,7 +10028,7 @@ function getHTML(helixEnabled) {
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'rotation-reviews': 'Rotation Reviews', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'bad-rentals': 'Bad Rentals', 'rotation-reviews': 'Rotation Reviews', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
             const PAGE_HEADERS = {
                 dashboard:   ['Overview',       'Dashboard',          'Monitor SIMs, messages, and system status.'],
                 sims:        ['Inventory',      'SIMs',               'Browse, filter, and manage every SIM card in the fleet.'],
@@ -10036,6 +10037,7 @@ function getHTML(helixEnabled) {
                 gateways:    ['Hardware',       'Gateways',           'SkyLine gateway health, port status, and slot capacity.'],
                 'imei-pool': ['Identity',       'IMEI Pool',          'Pool of device identifiers available for assignment.'],
                 errors:      ['Incidents',      'Errors',             'Recent worker errors and activation failures.'],
+                'bad-rentals': ['Incidents',     'Bad Rentals',        'Reseller-reported broken rentals awaiting review or remediation.'],
                 'rotation-reviews': ['Automation',  'Rotation Reviews',   'Daily agent review of recent rotation runs.'],
                 invoicing:   ['Billing',        'Invoicing',          'Reseller plans, QuickBooks mappings, and invoices.'],
                 billing:     ['Billing',        'Reseller Billing',   'Charging audit, billing ledger, and plan rates.'],
