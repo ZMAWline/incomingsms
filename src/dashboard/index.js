@@ -2812,7 +2812,7 @@ async function handleFixSim(request, env, corsHeaders) {
 async function handleImeiPoolGet(env, corsHeaders) {
   try {
     // Supabase enforces PGRST_MAX_ROWS=1000 server-side, so we must paginate
-    const baseUrl = `${env.SUPABASE_URL}/rest/v1/imei_pool?select=id,imei,status,sim_id,assigned_at,previous_sim_id,notes,created_at,gateway_id,port,sims!imei_pool_sim_id_fkey(iccid,port)&order=id.desc`;
+    const baseUrl = `${env.SUPABASE_URL}/rest/v1/imei_pool?select=id,imei,status,device_type,sim_id,assigned_at,previous_sim_id,notes,created_at,gateway_id,port,sims!imei_pool_sim_id_fkey(iccid,port)&order=id.desc`;
     const batchSize = 1000;
     let allRows = [];
     let offset = 0;
@@ -2844,6 +2844,14 @@ async function handleImeiPoolGet(env, corsHeaders) {
       in_use: allRows.filter(e => e.status === 'in_use').length,
       retired: allRows.filter(e => e.status === 'retired').length,
       slots: totalSlots,
+      by_type: {
+        phone: allRows.filter(e => (e.device_type || 'phone') === 'phone').length,
+        router: allRows.filter(e => e.device_type === 'router').length,
+      },
+      available_by_type: {
+        phone: allRows.filter(e => e.status === 'available' && (e.device_type || 'phone') === 'phone').length,
+        router: allRows.filter(e => e.status === 'available' && e.device_type === 'router').length,
+      },
     };
 
     return new Response(JSON.stringify({ pool: allRows, stats }), {
@@ -2894,6 +2902,8 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
 
     if (action === 'add') {
       const imeis = body.imeis || [];
+      // INC-13: device_type tagging (phone|router). Default phone for back-compat.
+      const deviceType = (body.device_type === 'router') ? 'router' : 'phone';
       if (!Array.isArray(imeis) || imeis.length === 0) {
         return new Response(JSON.stringify({ error: 'imeis array is required' }), {
           status: 400,
@@ -2907,7 +2917,7 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
       for (const imei of imeis) {
         const trimmed = imei.trim();
         if (/^\d{15}$/.test(trimmed)) {
-          valid.push({ imei: trimmed, status: 'available' });
+          valid.push({ imei: trimmed, status: 'available', device_type: deviceType });
         } else if (trimmed) {
           invalid.push(trimmed);
         }
@@ -7681,6 +7691,11 @@ function getHTML(helixEnabled) {
                             <option value="available">Available (Stock)</option>
                             <option value="retired">Retired (Rejected)</option>
                         </select>
+                        <select id="imei-type-filter" onchange="renderImeiPool()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent" title="Filter by device type">
+                            <option value="">All Types</option>
+                            <option value="phone">Phone</option>
+                            <option value="router">Router</option>
+                        </select>
                         <button onclick="syncAllGatewayImeis()" id="sync-gateways-btn" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Sync from Gateways</button>
                         <button onclick="showAddImeiModal()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add IMEIs</button>
                         <button onclick="showCheckImeisModal()" class="px-4 py-2 text-sm bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition">Check IMEIs</button>
@@ -7720,6 +7735,7 @@ function getHTML(helixEnabled) {
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','id')">ID <span class="sort-arrow" data-table="imei" data-col="id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','imei')">IMEI <span class="sort-arrow" data-table="imei" data-col="imei"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','status')">Status <span class="sort-arrow" data-table="imei" data-col="status"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','device_type')">Type <span class="sort-arrow" data-table="imei" data-col="device_type"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','sim_id')">Assigned SIM <span class="sort-arrow" data-table="imei" data-col="sim_id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','gateway_id')">Gateway <span class="sort-arrow" data-table="imei" data-col="gateway_id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','port')">Port <span class="sort-arrow" data-table="imei" data-col="port"></span></th>
@@ -7728,7 +7744,7 @@ function getHTML(helixEnabled) {
                                 </tr>
                             </thead>
                             <tbody id="imei-pool-table" class="text-sm">
-                                <tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="9" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     <div id="imei-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
@@ -9559,6 +9575,14 @@ function getHTML(helixEnabled) {
                 <h3 class="text-lg font-semibold text-white">Add IMEIs to Pool</h3>
             </div>
             <div class="p-5">
+                <div class="mb-3">
+                    <label class="text-sm text-gray-400 block mb-1">Device type</label>
+                    <select id="add-imei-device-type" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">
+                        <option value="phone">Phone (AT&amp;T / ATOMIC / Helix)</option>
+                        <option value="router">Router (Wing IoT)</option>
+                    </select>
+                    <p class="text-xs text-gray-500 mt-1">Wing IoT needs router IMEIs; AT&amp;T needs phone IMEIs.</p>
+                </div>
                 <p class="text-sm text-gray-400 mb-3">Enter IMEIs to add (one per line, 15 digits each):</p>
                 <textarea id="add-imei-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="123456789012345"></textarea>
                 <p class="text-xs text-gray-500 mt-2">Duplicates will be ignored automatically</p>
@@ -13287,6 +13311,8 @@ async function sendSimOnline(simId, phoneNumber) {
         function showAddImeiModal() {
             document.getElementById('add-imei-modal').classList.remove('hidden');
             document.getElementById('add-imei-input').value = '';
+            const dt = document.getElementById('add-imei-device-type');
+            if (dt) dt.value = 'phone';
         }
 
         function hideAddImeiModal() {
@@ -13306,10 +13332,11 @@ async function sendSimOnline(simId, phoneNumber) {
             btn.textContent = 'Adding...';
 
             try {
+                const deviceType = (document.getElementById('add-imei-device-type')?.value === 'router') ? 'router' : 'phone';
                 const response = await fetch(\`\${API_BASE}/imei-pool\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'add', imeis })
+                    body: JSON.stringify({ action: 'add', imeis, device_type: deviceType })
                 });
                 const result = await response.json();
 
@@ -13447,6 +13474,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const stats = state.stats || {};
             const search = (document.getElementById('imei-search')?.value || '').trim();
             const statusFilter = (document.getElementById('imei-status-filter')?.value || '');
+            const typeFilter = (document.getElementById('imei-type-filter')?.value || '');
 
             document.getElementById('imei-slots').textContent = stats.slots || 0;
             document.getElementById('imei-in-use').textContent = stats.in_use || 0;
@@ -13456,6 +13484,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
             let data = state.data;
             if (statusFilter) data = data.filter(e => e.status === statusFilter);
+            if (typeFilter) data = data.filter(e => (e.device_type || 'phone') === typeFilter);
             if (search) data = data.filter(e => matchesSearch(e, search));
             data = genericSort(data, state.sortKey, state.sortDir);
 
@@ -13465,7 +13494,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
             const tbody = document.getElementById('imei-pool-table');
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No IMEIs match filters</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-gray-500">No IMEIs match filters</td></tr>';
                 return;
             }
 
@@ -13483,6 +13512,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     <td class="px-4 py-3 text-gray-400">\${entry.id}</td>
                     <td class="px-4 py-3 font-mono text-sm text-gray-200">\${entry.imei}</td>
                     <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${entry.status}</span></td>
+                    <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${(entry.device_type === 'router') ? 'bg-purple-500/20 text-purple-300' : 'bg-cyan-500/20 text-cyan-300'}">\${entry.device_type || 'phone'}</span></td>
                     <td class="px-4 py-3 text-gray-400 text-xs">\${simInfo}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${entry.gateway_id || '-'}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${entry.port || '-'}</td>

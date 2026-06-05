@@ -519,8 +519,10 @@ export default {
 
           try {
             if (autoImei) {
+              // INC-13: vendor-aware allocation. Wing IoT needs router IMEIs, AT&T needs phone IMEIs.
+              const vendorDeviceType = sim.vendor === 'wing_iot' ? 'router' : 'phone';
               // Allocate from pool — temporarily attach to sim_id
-              allocatedEntry = await allocateImeiFromPool(env, sim_id);
+              allocatedEntry = await allocateImeiFromPool(env, sim_id, vendorDeviceType);
               targetImei = allocatedEntry.imei;
               console.log(`[ChangeImei] SIM ${iccid}: auto-allocated IMEI ${targetImei}`);
             }
@@ -561,6 +563,7 @@ export default {
                 body: JSON.stringify([{
                   imei: targetImei,
                   status: 'in_use',
+                  device_type: sim.vendor === 'wing_iot' ? 'router' : 'phone',
                   gateway_id: sim.gateway_id,
                   port: sim.port,
                   sim_id,
@@ -3195,20 +3198,25 @@ async function logImeiPoolConflict(env, message, details) {
   }
 }
 
-async function allocateImeiFromPool(env, simId) {
-  // Find first available IMEI
+async function allocateImeiFromPool(env, simId, deviceType = 'phone') {
+  // INC-13: Wing IoT requires ROUTER IMEIs; AT&T (atomic/helix) requires PHONE IMEIs.
+  // Callers MUST pass the correct device_type for the SIM's vendor.
+  if (deviceType !== 'phone' && deviceType !== 'router') {
+    throw new Error(`allocateImeiFromPool: invalid deviceType ${deviceType}`);
+  }
+  // Find first available IMEI of the requested device type
   const available = await supabaseSelect(
     env,
-    `imei_pool?select=id,imei&status=eq.available&order=id.asc&limit=1`
+    `imei_pool?select=id,imei&status=eq.available&device_type=eq.${deviceType}&order=id.asc&limit=1`
   );
   if (!Array.isArray(available) || available.length === 0) {
-    throw new Error("No available IMEIs in pool");
+    throw new Error(`No available ${deviceType} IMEIs in pool`);
   }
 
   const entry = available[0];
 
   // Claim it with status filter for safety (prevents double-allocation)
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry.id}&status=eq.available`, {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry.id}&status=eq.available&device_type=eq.${deviceType}`, {
     method: "PATCH",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3240,13 +3248,13 @@ async function allocateImeiFromPool(env, simId) {
     console.warn(`[IMEI Pool] Race condition on entry ${entry.id}, retrying with next available`);
     const available2 = await supabaseSelect(
       env,
-      `imei_pool?select=id,imei&status=eq.available&order=id.asc&limit=1`
+      `imei_pool?select=id,imei&status=eq.available&device_type=eq.${deviceType}&order=id.asc&limit=1`
     );
     if (!Array.isArray(available2) || available2.length === 0) {
-      throw new Error("No available IMEIs in pool (retry after race condition)");
+      throw new Error(`No available ${deviceType} IMEIs in pool (retry after race condition)`);
     }
     const entry2 = available2[0];
-    const res2 = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry2.id}&status=eq.available`, {
+    const res2 = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry2.id}&status=eq.available&device_type=eq.${deviceType}`, {
       method: "PATCH",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
