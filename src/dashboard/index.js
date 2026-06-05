@@ -228,11 +228,45 @@ export default {
     }
 
     if (url.pathname === '/api/import-teltik' && request.method === 'POST') {
-      const res = await env.TELTIK_WORKER.fetch(
-        new Request('https://teltik-worker/import?secret=' + env.ADMIN_RUN_SECRET, { method: 'POST' })
-      );
-      return new Response(await res.text(), { status: res.status,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      // INC-10: walk the Teltik line list in chunks. The worker enforces the
+      // page size; we loop until has_more=false so a single button click drains
+      // a 1500+ line activation batch without tripping Cloudflare's
+      // 1000-subrequest cap inside any one Worker invocation.
+      const CHUNK = 200;
+      const MAX_CHUNKS = 50; // safety stop = 10k SIMs
+      let offset = 0;
+      let totals = { imported: 0, updated: 0, unchanged: 0, skipped: 0, processed: 0 };
+      let chunks = 0;
+      let total = null;
+      let lastChunk = null;
+      while (chunks < MAX_CHUNKS) {
+        const res = await env.TELTIK_WORKER.fetch(
+          new Request(`https://teltik-worker/import?secret=${env.ADMIN_RUN_SECRET}&offset=${offset}&limit=${CHUNK}`, { method: 'POST' })
+        );
+        const text = await res.text();
+        let chunk;
+        try { chunk = JSON.parse(text); } catch {
+          return new Response(JSON.stringify({ ok: false, error: 'worker returned non-JSON', body: text, chunks }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        if (!res.ok || chunk.ok === false) {
+          return new Response(JSON.stringify({ ok: false, error: chunk.error || `worker ${res.status}`, chunks, totals, last: chunk }),
+            { status: res.status || 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        lastChunk = chunk;
+        total = chunk.total ?? total;
+        totals.imported += chunk.imported || 0;
+        totals.updated += chunk.updated || 0;
+        totals.unchanged += chunk.unchanged || 0;
+        totals.skipped += chunk.skipped || 0;
+        totals.processed += chunk.processed || 0;
+        chunks++;
+        if (!chunk.has_more || chunk.next_offset == null) break;
+        offset = chunk.next_offset;
+      }
+      const truncated = chunks >= MAX_CHUNKS && lastChunk && lastChunk.has_more;
+      return new Response(JSON.stringify({ ok: true, total, chunks, truncated, ...totals }, null, 2),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
     if (url.pathname === '/api/teltik-reconcile' && request.method === 'POST') {
