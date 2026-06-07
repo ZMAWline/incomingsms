@@ -10934,7 +10934,21 @@ function getHTML(helixEnabled) {
               return [base];
             });
             const lowerStrings = strings.map(s => s.toLowerCase());
-            return terms.some(term => lowerStrings.some(s => s.includes(term)));
+            const digitsOnlyStrings = strings.map(s => s.replace(/\\D/g, '')).filter(Boolean);
+            function phoneVariants(term) {
+              const d = term.replace(/\\D/g, '');
+              if (d.length < 10 || d.length > 15) return null;
+              const out = [d];
+              if (d.length === 11 && d.charAt(0) === '1') out.push(d.slice(1));
+              else if (d.length === 10) out.push('1' + d);
+              return out;
+            }
+            return terms.some(term => {
+              if (lowerStrings.some(s => s.includes(term))) return true;
+              const variants = phoneVariants(term);
+              if (!variants) return false;
+              return variants.some(v => digitsOnlyStrings.some(s => s.includes(v)));
+            });
         }
 
 
