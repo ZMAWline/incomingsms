@@ -1941,9 +1941,11 @@ async function handleTeltikQuery(request, env, corsHeaders) {
     });
 
     let db_update = null;
+    let resolvedMdn = null;
     if (res.ok && json) {
       const rawMdn = json.msisdn || json.mdn || json.phone_number || '';
       if (rawMdn) {
+        resolvedMdn = rawMdn;
         db_update = await syncActiveSim(env, iccid, { mdn: rawMdn, activatedAt: null });
       } else {
         await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
@@ -1961,12 +1963,53 @@ async function handleTeltikQuery(request, env, corsHeaders) {
       }).catch(() => {});
     }
 
+    // Operator UI expects Query to also surface /v1/port-status so an offline port is
+    // visible. Only attempt when we resolved an MDN; failure here is non-fatal — the
+    // MDN result still gets returned.
+    let port_status = null;
+    if (resolvedMdn) {
+      const mdnDigits = String(resolvedMdn).replace(/\D/g, '');
+      try {
+        const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
+        const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
+        const psHeaders = {};
+        if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
+        const psRes = await fetch(psFetchUrl, { method: 'GET', headers: psHeaders });
+        const psText = await psRes.text();
+        let psJson = null; try { psJson = JSON.parse(psText); } catch {}
+        await logCarrierApiCall(env, {
+          run_id: 'teltik_port_status_' + iccid + '_' + Date.now(),
+          step: 'port_status',
+          iccid,
+          imei: null,
+          vendor: 'teltik',
+          request_url: 'https://api.smsgateway.xyz/v1/port-status?mdn=' + encodeURIComponent(mdnDigits),
+          request_method: 'GET',
+          request_body: null,
+          response_status: psRes.status,
+          response_ok: psRes.ok,
+          response_body_text: psText,
+          response_body_json: psJson,
+          error: psRes.ok ? null : 'Teltik port-status HTTP ' + psRes.status,
+        });
+        port_status = {
+          ok: psRes.ok,
+          http_status: psRes.status,
+          mdn: mdnDigits,
+          response: psJson || psText,
+        };
+      } catch (e) {
+        port_status = { ok: false, error: 'port-status exception: ' + (e && e.message ? e.message : String(e)) };
+      }
+    }
+
     return new Response(JSON.stringify({
       ok: res.ok,
       status: res.status,
       iccid,
       response: json || text,
       db_update,
+      port_status,
     }, null, 2), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -4468,9 +4511,37 @@ async function handleSimAction(request, env, corsHeaders) {
       if (row && row.vendor === 'teltik') {
         const apiKey = env.TELTIK_API_KEY;
         if (!apiKey) return new Response(JSON.stringify({ ok: false, error: 'TELTIK_API_KEY not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        const rawMdn = row.sim_numbers && row.sim_numbers[0] && row.sim_numbers[0].e164;
-        if (!rawMdn) return new Response(JSON.stringify({ ok: false, error: `No MDN for Teltik SIM ${row.iccid}, cannot reset port` }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+        // Resolve MDN: prefer DB, fall back to live Teltik /v1/get-phone-number lookup
+        // by ICCID so a stale or missing sim_numbers row doesn't break the operator action.
+        let rawMdn = row.sim_numbers && row.sim_numbers[0] && row.sim_numbers[0].e164;
+        let mdnSource = 'db';
+        let mdnLookupError = null;
+        if (!rawMdn && row.iccid) {
+          try {
+            const gpUrl = `https://api.smsgateway.xyz/v1/get-phone-number/?apikey=${encodeURIComponent(apiKey)}&iccid=${encodeURIComponent(row.iccid)}`;
+            const gpFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + gpUrl : gpUrl;
+            const gpHeaders = {};
+            if (env.RELAY_KEY) gpHeaders['x-relay-key'] = env.RELAY_KEY;
+            const gpRes = await fetch(gpFetchUrl, { method: 'GET', headers: gpHeaders });
+            const gpText = await gpRes.text();
+            let gpJson = null; try { gpJson = JSON.parse(gpText); } catch {}
+            if (gpRes.ok && gpJson) {
+              rawMdn = gpJson.msisdn || gpJson.mdn || gpJson.phone_number || null;
+              if (rawMdn) mdnSource = 'teltik_live';
+            } else {
+              mdnLookupError = `get-phone-number HTTP ${gpRes.status}: ${(gpJson && (gpJson.message || gpJson.error)) || gpText.slice(0, 120)}`;
+            }
+          } catch (e) {
+            mdnLookupError = `get-phone-number exception: ${e && e.message ? e.message : String(e)}`;
+          }
+        }
+        if (!rawMdn) {
+          const err = `No MDN for Teltik SIM ${row.iccid}, cannot reset port` + (mdnLookupError ? ` (${mdnLookupError})` : '');
+          return new Response(JSON.stringify({ ok: false, error: err, action, sim_id, iccid: row.iccid, vendor: 'teltik' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
         const mdnDigits = String(rawMdn).replace(/\D/g, '');
+
         const teltikUrl = `https://api.smsgateway.xyz/v1/reset-port?apikey=${encodeURIComponent(apiKey)}&mdn=${encodeURIComponent(mdnDigits)}`;
         const fetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + teltikUrl : teltikUrl;
         const fetchHeaders = {};
@@ -4478,6 +4549,10 @@ async function handleSimAction(request, env, corsHeaders) {
         const tRes = await fetch(fetchUrl, { method: 'GET', headers: fetchHeaders });
         const tText = await tRes.text();
         let tJson = null; try { tJson = JSON.parse(tText); } catch {}
+        // Teltik can return 200 with { success: false, message: ... } so check both HTTP and body.
+        const bodySuccess = !tJson || tJson.success !== false;
+        const ok = tRes.ok && bodySuccess;
+        const teltikMsg = (tJson && (tJson.message || tJson.error)) || (!tRes.ok ? `HTTP ${tRes.status}` : null) || (tText ? tText.slice(0, 200) : null);
         await logCarrierApiCall(env, {
           run_id: `teltik_reset_port_${row.iccid}_${Date.now()}`,
           step: 'reset_port',
@@ -4491,12 +4566,15 @@ async function handleSimAction(request, env, corsHeaders) {
           response_ok: tRes.ok,
           response_body_text: tText,
           response_body_json: tJson,
-          error: tRes.ok ? null : `Teltik reset-port HTTP ${tRes.status}`,
+          error: ok ? null : `Teltik reset-port failed: ${teltikMsg || 'unknown'}`,
         });
-        if (!tRes.ok) {
-          await logSystemError(env, { source: 'dashboard', action: 'ota_refresh', sim_id, error_message: `Teltik reset-port HTTP ${tRes.status}`, error_details: { vendor: 'teltik', response: tJson || tText, status: tRes.status } });
+        if (!ok) {
+          await logSystemError(env, { source: 'dashboard', action: 'ota_refresh', sim_id, error_message: `Teltik reset-port: ${teltikMsg || 'unknown'}`, error_details: { vendor: 'teltik', response: tJson || tText, status: tRes.status, mdn_source: mdnSource } });
         }
-        return new Response(JSON.stringify({ ok: tRes.ok, action, sim_id, iccid: row.iccid, mdn: mdnDigits, vendor: 'teltik', detail: tJson || tText }, null, 2), { status: tRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const respBody = { ok, action, sim_id, iccid: row.iccid, mdn: mdnDigits, mdn_source: mdnSource, vendor: 'teltik', http_status: tRes.status, detail: tJson || tText };
+        if (!ok) respBody.error = `Teltik reset-port: ${teltikMsg || 'unknown'}`;
+        if (ok && tJson && tJson.message) respBody.message = tJson.message;
+        return new Response(JSON.stringify(respBody, null, 2), { status: ok ? 200 : (tRes.status >= 400 ? tRes.status : 502), headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
     }
 
@@ -12226,8 +12304,29 @@ async function sendSimOnline(simId, phoneNumber) {
                         let fmtd = '<span class="text-green-400 font-bold">Teltik MDN Found</span>\\n\\n';
                         fmtd += '<span class="text-blue-400">iccid:</span> ' + (d.iccid || result.iccid) + '\\n';
                         fmtd += '<span class="text-blue-400">msisdn:</span> ' + (d.msisdn || d.mdn || 'N/A') + '\\n';
+                        const ps = result.port_status;
+                        if (ps) {
+                            const psBody = ps.response || {};
+                            const onlineRaw = (psBody && (psBody.online ?? psBody.is_online ?? psBody.registered ?? psBody.status));
+                            const onlineStr = typeof onlineRaw === 'boolean' ? (onlineRaw ? 'online' : 'offline')
+                                : (onlineRaw == null ? 'unknown' : String(onlineRaw));
+                            const onlineColor = /^(online|true|registered|active|ok)$/i.test(onlineStr) ? 'text-accent'
+                                : /^(offline|false|unregistered|inactive|error)$/i.test(onlineStr) ? 'text-red-400'
+                                : 'text-orange-400';
+                            fmtd += '\\n<span class="text-blue-400">port status:</span> <span class="' + onlineColor + ' font-bold">' + onlineStr + '</span>';
+                            if (!ps.ok) {
+                                fmtd += ' <span class="text-red-400">(lookup failed: ' + (ps.error || ('HTTP ' + ps.http_status)) + ')</span>';
+                            }
+                            fmtd += '\\n';
+                        } else {
+                            fmtd += '\\n<span class="text-gray-500">port status:</span> <span class="text-gray-500">not checked</span>\\n';
+                        }
                         fmtd += '\\n<span class="text-gray-500">--- Full Response ---</span>\\n';
                         fmtd += JSON.stringify(d, null, 2);
+                        if (ps && ps.response) {
+                            fmtd += '\\n\\n<span class="text-gray-500">--- Port Status ---</span>\\n';
+                            fmtd += JSON.stringify(ps.response, null, 2);
+                        }
                         outputEl.innerHTML = fmtd;
                     }
                     const du = result.db_update;
