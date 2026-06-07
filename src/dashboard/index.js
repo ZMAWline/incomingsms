@@ -4458,6 +4458,48 @@ async function handleSimAction(request, env, corsHeaders) {
       }
     }
 
+    // Teltik "OTA refresh" maps to Teltik /v1/reset-port (operator label only; on the
+    // wire it is a gateway port reset, not a carrier OTA). Non-Teltik SIMs fall through
+    // to the existing mdn-rotator ota_refresh path.
+    if (action === 'ota_refresh') {
+      const vendorRes = await supabaseGet(env, `sims?select=iccid,vendor,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`);
+      const vendorRows = await vendorRes.json().catch(() => []);
+      const row = Array.isArray(vendorRows) && vendorRows[0] ? vendorRows[0] : null;
+      if (row && row.vendor === 'teltik') {
+        const apiKey = env.TELTIK_API_KEY;
+        if (!apiKey) return new Response(JSON.stringify({ ok: false, error: 'TELTIK_API_KEY not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const rawMdn = row.sim_numbers && row.sim_numbers[0] && row.sim_numbers[0].e164;
+        if (!rawMdn) return new Response(JSON.stringify({ ok: false, error: `No MDN for Teltik SIM ${row.iccid}, cannot reset port` }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const mdnDigits = String(rawMdn).replace(/\D/g, '');
+        const teltikUrl = `https://api.smsgateway.xyz/v1/reset-port?apikey=${encodeURIComponent(apiKey)}&mdn=${encodeURIComponent(mdnDigits)}`;
+        const fetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + teltikUrl : teltikUrl;
+        const fetchHeaders = {};
+        if (env.RELAY_KEY) fetchHeaders['x-relay-key'] = env.RELAY_KEY;
+        const tRes = await fetch(fetchUrl, { method: 'GET', headers: fetchHeaders });
+        const tText = await tRes.text();
+        let tJson = null; try { tJson = JSON.parse(tText); } catch {}
+        await logCarrierApiCall(env, {
+          run_id: `teltik_reset_port_${row.iccid}_${Date.now()}`,
+          step: 'reset_port',
+          iccid: row.iccid,
+          imei: null,
+          vendor: 'teltik',
+          request_url: `https://api.smsgateway.xyz/v1/reset-port?mdn=${encodeURIComponent(mdnDigits)}`,
+          request_method: 'GET',
+          request_body: null,
+          response_status: tRes.status,
+          response_ok: tRes.ok,
+          response_body_text: tText,
+          response_body_json: tJson,
+          error: tRes.ok ? null : `Teltik reset-port HTTP ${tRes.status}`,
+        });
+        if (!tRes.ok) {
+          await logSystemError(env, { source: 'dashboard', action: 'ota_refresh', sim_id, error_message: `Teltik reset-port HTTP ${tRes.status}`, error_details: { vendor: 'teltik', response: tJson || tText, status: tRes.status } });
+        }
+        return new Response(JSON.stringify({ ok: tRes.ok, action, sim_id, iccid: row.iccid, mdn: mdnDigits, vendor: 'teltik', detail: tJson || tText }, null, 2), { status: tRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+
     if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
     const workerUrl = `https://mdn-rotator/sim-action?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
