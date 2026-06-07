@@ -497,6 +497,17 @@ function checkAuth(authHeader, env) {
   return decoded === env.DASHBOARD_AUTH; // Format: "username:password"
 }
 
+// Normalize an MDN to the exact format Teltik expects for /v1/reset-port and
+// /v1/port-status: 10 digit US, no country code, no '+'. Anything else (E.164,
+// "+1XXXXXXXXXX", "13044123064", "(304) 412-3064") collapses to the 10-digit
+// subscriber number. Non-US 11+ digit inputs that do not start with '1' are
+// returned digits-only and left to Teltik to reject explicitly.
+function toTeltik10Digit(raw) {
+  const digits = String(raw == null ? '' : raw).replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('1')) return digits.slice(1);
+  return digits;
+}
+
 function relayFetch(env, url, init) {
   if (env.RELAY_URL && env.RELAY_KEY) {
     return fetch(env.RELAY_URL + '/' + url, {
@@ -1968,7 +1979,8 @@ async function handleTeltikQuery(request, env, corsHeaders) {
     // MDN result still gets returned.
     let port_status = null;
     if (resolvedMdn) {
-      const mdnDigits = String(resolvedMdn).replace(/\D/g, '');
+      // Teltik /v1/port-status uses the same MDN format as /reset-port: 10 digits, US.
+      const mdnDigits = toTeltik10Digit(resolvedMdn);
       try {
         const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
         const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
@@ -4540,7 +4552,10 @@ async function handleSimAction(request, env, corsHeaders) {
           const err = `No MDN for Teltik SIM ${row.iccid}, cannot reset port` + (mdnLookupError ? ` (${mdnLookupError})` : '');
           return new Response(JSON.stringify({ ok: false, error: err, action, sim_id, iccid: row.iccid, vendor: 'teltik' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         }
-        const mdnDigits = String(rawMdn).replace(/\D/g, '');
+        // Teltik /reset-port requires the bare 10-digit US number — not +1XXXXXXXXXX
+        // and not 11 digits with the country code. Strip non-digits, then drop a
+        // leading '1' when it produces an 11-digit US MDN.
+        const mdnDigits = toTeltik10Digit(rawMdn);
 
         const teltikUrl = `https://api.smsgateway.xyz/v1/reset-port?apikey=${encodeURIComponent(apiKey)}&mdn=${encodeURIComponent(mdnDigits)}`;
         const fetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + teltikUrl : teltikUrl;
