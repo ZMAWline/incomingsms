@@ -12316,31 +12316,35 @@ async function sendSimOnline(simId, phoneNumber) {
                         outputEl.innerHTML = '<span class="text-red-400">Error: ' + (result.error || 'Unknown') + '</span>';
                     } else {
                         const d = result.response;
+                        const ps = result.port_status;
+                        const psBody = (ps && ps.response && typeof ps.response === 'object') ? ps.response : {};
+                        const onlineRaw = psBody && (psBody.online ?? psBody.is_online ?? psBody.registered ?? psBody.status);
+                        const onlineStr = typeof onlineRaw === 'boolean' ? (onlineRaw ? 'online' : 'offline')
+                            : (onlineRaw == null ? 'unknown' : String(onlineRaw));
+                        const onlineColor = /^(online|true|registered|active|ok)$/i.test(onlineStr) ? 'text-accent'
+                            : /^(offline|false|unregistered|inactive|error)$/i.test(onlineStr) ? 'text-red-400'
+                            : 'text-orange-400';
+
                         let fmtd = '<span class="text-green-400 font-bold">Teltik MDN Found</span>\\n\\n';
                         fmtd += '<span class="text-blue-400">iccid:</span> ' + (d.iccid || result.iccid) + '\\n';
                         fmtd += '<span class="text-blue-400">msisdn:</span> ' + (d.msisdn || d.mdn || 'N/A') + '\\n';
-                        const ps = result.port_status;
                         if (ps) {
-                            const psBody = ps.response || {};
-                            const onlineRaw = (psBody && (psBody.online ?? psBody.is_online ?? psBody.registered ?? psBody.status));
-                            const onlineStr = typeof onlineRaw === 'boolean' ? (onlineRaw ? 'online' : 'offline')
-                                : (onlineRaw == null ? 'unknown' : String(onlineRaw));
-                            const onlineColor = /^(online|true|registered|active|ok)$/i.test(onlineStr) ? 'text-accent'
-                                : /^(offline|false|unregistered|inactive|error)$/i.test(onlineStr) ? 'text-red-400'
-                                : 'text-orange-400';
-                            fmtd += '\\n<span class="text-blue-400">port status:</span> <span class="' + onlineColor + ' font-bold">' + onlineStr + '</span>';
-                            if (!ps.ok) {
-                                fmtd += ' <span class="text-red-400">(lookup failed: ' + (ps.error || ('HTTP ' + ps.http_status)) + ')</span>';
-                            }
+                            fmtd += '<span class="text-blue-400">port status:</span> <span class="' + onlineColor + ' font-bold">' + onlineStr + '</span>';
+                            if (ps.mdn) fmtd += ' <span class="text-gray-500">(mdn=' + ps.mdn + ')</span>';
+                            if (!ps.ok) fmtd += ' <span class="text-red-400">[lookup failed: ' + (ps.error || ('HTTP ' + ps.http_status)) + ']</span>';
                             fmtd += '\\n';
                         } else {
-                            fmtd += '\\n<span class="text-gray-500">port status:</span> <span class="text-gray-500">not checked</span>\\n';
+                            fmtd += '<span class="text-gray-500">port status: not checked (no MDN resolved)</span>\\n';
                         }
-                        fmtd += '\\n<span class="text-gray-500">--- Full Response ---</span>\\n';
+                        fmtd += '\\n<span class="text-gray-500">--- get-phone-number response ---</span>\\n';
                         fmtd += JSON.stringify(d, null, 2);
-                        if (ps && ps.response) {
-                            fmtd += '\\n\\n<span class="text-gray-500">--- Port Status ---</span>\\n';
-                            fmtd += JSON.stringify(ps.response, null, 2);
+                        fmtd += '\\n\\n<span class="text-gray-500">--- port-status response ---</span>\\n';
+                        if (ps) {
+                            const psDump = { ok: ps.ok, http_status: ps.http_status, mdn: ps.mdn, response: ps.response };
+                            if (ps.error) psDump.error = ps.error;
+                            fmtd += JSON.stringify(psDump, null, 2);
+                        } else {
+                            fmtd += '(not called — no MDN was resolved by get-phone-number)';
                         }
                         outputEl.innerHTML = fmtd;
                     }
@@ -14645,7 +14649,15 @@ async function sendSimOnline(simId, phoneNumber) {
                             okCount++;
                             const tMdn = r.response && (r.response.msisdn || r.response.mdn) ? (r.response.msisdn || r.response.mdn) : 'OK';
                             const tNote = r.db_update && r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '';
-                            lines.push(label + ' [teltik]: ' + tMdn + tNote);
+                            let psTag = '';
+                            if (r.port_status) {
+                                const psb = (r.port_status.response && typeof r.port_status.response === 'object') ? r.port_status.response : {};
+                                const psRaw = psb.online ?? psb.is_online ?? psb.registered ?? psb.status;
+                                const psStr = typeof psRaw === 'boolean' ? (psRaw ? 'online' : 'offline')
+                                    : (psRaw == null ? 'unknown' : String(psRaw));
+                                psTag = ' [port=' + psStr + (r.port_status.ok ? '' : ':lookup_failed') + ']';
+                            }
+                            lines.push(label + ' [teltik]: ' + tMdn + tNote + psTag);
                         } else {
                             failCount++;
                             lines.push(label + ' [teltik]: ERROR — ' + (r.error || 'unknown'));
