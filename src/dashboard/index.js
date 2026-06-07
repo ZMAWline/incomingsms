@@ -10921,7 +10921,13 @@ function getHTML(helixEnabled) {
 
         function matchesSearch(obj, query) {
             if (!query) return true;
-            const terms = query.split(/[,;\\n\\r]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+            let terms = query.split(/[,;\\n\\r]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+            // Mobile <input> strips newlines from pasted text to spaces; if the whole query is
+            // a whitespace-separated list of phone-shaped tokens, treat each token as a term.
+            const wsParts = query.split(/[\\s,;]+/).map(t => t.trim()).filter(Boolean);
+            if (wsParts.length > terms.length && wsParts.every(p => /^\\+?\\d{10,15}$/.test(p))) {
+              terms = wsParts.map(p => p.toLowerCase());
+            }
             if (!terms.length) return true;
             const DATE_FIELDS = ['activated_at','last_sms_received','last_mdn_rotated_at','last_rotation_at','last_notified_at','created_at','updated_at'];
             const strings = Object.entries(obj).flatMap(([k, v]) => {
