@@ -18,7 +18,8 @@
 // here and arrive on later branches.
 // =========================================================
 
-import { runVerifyPoll } from './verify-runner.mjs';
+import { runVerifyPoll, preResolveGate } from './verify-runner.mjs';
+import { executeAction } from './actions.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const TICK_BUDGET_MS = 55_000; // §G: 60s tick budget, leave headroom.
@@ -128,25 +129,162 @@ async function processReport(env, report) {
   const classification = await classifyShared(env, report, evidence);
 
   const attemptNo = (evidence.priorAttempts || 0) + 1;
+
+  // INC-16d: execute the safe action returned by the classifier (if any).
+  // Forbidden actions are rejected inside executeAction so a classifier bug
+  // that emits one can never reach a vendor surface.
+  const exec = await maybeExecuteAction(env, {
+    report, evidence, classification, attemptNo,
+  });
+
   await insertAttempt(env, {
     report_id: report.id,
     attempt_no: attemptNo,
     mode: classification.mode,
     action: classification.action,
-    outcome: classification.outcome,
-    evidence: classification.evidenceSummary || {},
-    error_message: classification.errorMessage || null,
+    outcome: exec.outcome || classification.outcome,
+    evidence: mergeEvidence(classification.evidenceSummary, exec.evidence),
+    error_message: exec.errorMessage || classification.errorMessage || null,
     next_review_at: classification.nextReviewAt || null,
   });
 
-  // Update report-level auto state per classification.
-  await applyClassificationState(env, report, classification);
+  // Update report-level auto state per classification + executor result.
+  await applyClassificationState(env, report, classification, exec);
 
   return {
-    outcome: classification.outcome,
+    outcome: exec.outcome || classification.outcome,
     mode: classification.mode,
     attemptInserted: true,
   };
+}
+
+// ---------------------------------------------------------
+// INC-16d action dispatcher
+//
+// Decides whether to invoke a safe action executor based on the classification,
+// runs the §C pre-resolve gate when a `remediated` close is in play, and
+// returns the outcome the worker should record. Forbidden actions are NEVER
+// executed; the worker records `classify_only` and escalates instead.
+// ---------------------------------------------------------
+
+async function maybeExecuteAction(env, args) {
+  const { report, evidence, classification, attemptNo } = args;
+  const action = classification.action;
+
+  // No-op cases — classification carries the truth, no executor needed.
+  if (!action || action === 'escalate') {
+    return { outcome: classification.outcome, evidence: null, errorMessage: null };
+  }
+
+  // For S1 the worker has already cleared §E cancel-guard.
+  const ctx = {
+    action,
+    report,
+    sim: evidence.sim,
+    situationId: classification.mode,
+    evidenceBundle: classification.evidenceSummary,
+    attemptNo,
+  };
+
+  // For db_sync_upsert we don't have vendor reads yet (INC-16e). The executor
+  // accepts targets so once vendor reads land we just feed them in.
+  if (action === 'db_sync_upsert') {
+    ctx.targets = classification.targets || {};
+  }
+
+  const res = await executeAction(env, ctx);
+
+  // close_duplicate is exempt from §C (per §C/§E). It's the only safe action
+  // that writes a terminal `remediated`-shaped close (here: 'duplicate').
+  if (action === 'close_duplicate') {
+    if (res.ok) {
+      return {
+        outcome: 'duplicate',
+        evidence: { exec_status: res.status, ...(res.evidence || {}) },
+        errorMessage: null,
+        terminalReport: res.terminalReport || null,
+        execStatus: res.status,
+      };
+    }
+    return {
+      outcome: 'failed',
+      evidence: { exec_status: res.status, ...(res.evidence || {}) },
+      errorMessage: res.errorMessage || 'close_duplicate_failed',
+      execStatus: res.status,
+    };
+  }
+
+  // classify_only — record-only.
+  if (action === 'classify_only') {
+    return {
+      outcome: classification.outcome || 'no_change',
+      evidence: { exec_status: res.status, ...(res.evidence || {}) },
+      errorMessage: null,
+      execStatus: res.status,
+    };
+  }
+
+  // db_sync_upsert / resend_online — both are pre-resolve actions whose
+  // terminal close requires §C SMS verification. We run the executor first
+  // (so a vendor-side change is in place) then invoke preResolveGate.
+  //
+  // Until vendor reads (INC-16e) wire in, vendorRead is null and the gate
+  // returns predicate_failed → no `remediated` write. That's intentional:
+  // the action is recorded, evidence is captured, and the next tick will
+  // re-evaluate once vendor reads exist.
+  if (!res.ok && res.status !== 'noop') {
+    return {
+      outcome: 'failed',
+      evidence: { exec_status: res.status, ...(res.evidence || {}) },
+      errorMessage: res.errorMessage || (action + '_failed'),
+      execStatus: res.status,
+    };
+  }
+
+  const gate = await preResolveGate(env, {
+    report,
+    sim: evidence.sim,
+    vendorRead: classification.vendorReadHealth || null,
+    autoAction: { completed: true, error: null },
+    webhookDelivered: !!(evidence.webhook && evidence.webhook.delivered),
+    situationExtras: classification.situationExtras || null,
+    attemptNo,
+  });
+
+  if (gate.passed) {
+    return {
+      outcome: 'remediated',
+      evidence: {
+        exec_status: res.status,
+        gate_status: gate.status,
+        ...(res.evidence || {}),
+      },
+      errorMessage: null,
+      terminalReport: { status: 'remediated', remediation_action: 'other' },
+      execStatus: res.status,
+    };
+  }
+
+  // Gate not passed — keep the report in flight, no terminal write.
+  return {
+    outcome: gate.status === 'verify_pending' ? 'verify_pending' : (classification.outcome || 'no_change'),
+    evidence: {
+      exec_status: res.status,
+      gate_status: gate.status,
+      gate_reason: gate.reason || null,
+      ...(res.evidence || {}),
+    },
+    errorMessage: null,
+    execStatus: res.status,
+    gateStatus: gate.status,
+  };
+}
+
+function mergeEvidence(a, b) {
+  if (!a && !b) return {};
+  if (!a) return b;
+  if (!b) return a;
+  return { ...a, ...b };
 }
 
 // ---------------------------------------------------------
@@ -441,23 +579,35 @@ async function claimReport(env, report) {
   return Array.isArray(rows) && rows.length === 1;
 }
 
-async function applyClassificationState(env, report, classification) {
+async function applyClassificationState(env, report, classification, exec) {
   const patch = { last_auto_attempt_at: new Date().toISOString() };
+  const execOk = exec && (exec.execStatus === 'ok' || exec.execStatus === 'noop');
   if (classification.terminal) {
     if (classification.outcome === 'escalate') {
       patch.auto_remediation_state = 'escalated';
       if (classification.escalationReason) patch.escalation_reason = classification.escalationReason;
     } else if (classification.outcome === 'duplicate') {
-      // Mark report as remediated/duplicate via the existing dashboard write path?
-      // Per §D, the worker uses the existing status write path. For this scaffold
-      // we mark the auto state and let the dashboard mirror the report status
-      // when the worker calls the update endpoint. Until INC-16d wires the
-      // status write, leave rental_reports.status untouched and only set
-      // auto_remediation_state='done'. The attempt row preserves the decision.
-      patch.auto_remediation_state = 'done';
+      // INC-16d: close_duplicate executor already wrote rental_reports.status
+      // = 'duplicate' and inserted the rental_report_events row matching the
+      // dashboard's manual-close shape. Just mirror auto_remediation_state.
+      patch.auto_remediation_state = execOk ? 'done' : 'queued';
+      if (exec && exec.execStatus && !execOk) {
+        patch.escalation_reason = exec.execStatus;
+      }
     } else {
       patch.auto_remediation_state = 'done';
     }
+  } else if (exec && exec.gateStatus === 'verify_pending') {
+    // §C is in flight — verify-runner already set state=verify_pending and
+    // populated verify_pending_*. Do not stomp those columns.
+    return;
+  } else if (exec && exec.outcome === 'remediated') {
+    patch.auto_remediation_state = 'done';
+    // Mirror the dashboard write path. remediation_action='other' is the
+    // conservative default — A1/A6 etc. can refine in INC-16e.
+    patch.status = 'remediated';
+    patch.remediation_action = exec.terminalReport && exec.terminalReport.remediation_action || 'other';
+    patch.closed_at = patch.last_auto_attempt_at;
   } else {
     // Leave queued so next tick picks it up.
     patch.auto_remediation_state = 'queued';
@@ -469,6 +619,33 @@ async function applyClassificationState(env, report, classification) {
   });
   if (!resp.ok) {
     console.log('[Remediator] state PATCH failed for report ' + report.id + ': ' + resp.status);
+    return;
+  }
+  // Mirror the dashboard's rental_report_events row for the auto-remediated
+  // terminal close so the timeline matches a manual close.
+  if (patch.status === 'remediated') {
+    try {
+      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+        method: 'POST',
+        headers: supabaseHeaders(env, false),
+        body: JSON.stringify({
+          report_id: report.id,
+          from_status: report.status || null,
+          to_status: 'remediated',
+          actor: 'auto-remediator',
+          note: 'auto-remediator §C verified',
+          evidence: {
+            source: 'auto_remediator',
+            mode: classification.mode,
+            action: classification.action,
+            exec_status: exec && exec.execStatus,
+            gate_status: exec && exec.gateStatus,
+          },
+        }),
+      });
+    } catch (e) {
+      console.log('[Remediator] remediated event log insert failed: ' + e);
+    }
   }
 }
 
