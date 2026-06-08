@@ -9,7 +9,8 @@ workers_dev = true
 # ship; until then the worker only classifies into shared situations and returns
 # no_change for everything else.
 [triggers]
-crons = ["0 */2 * * *"]
+# 2h intake (§G) + 1-min §C receive-poll for verify_pending reports (INC-19).
+crons = ["0 */2 * * *", "*/1 * * * *"]
 
 # Kill-switch + cooldown state. Same KV namespace as token cache for now to
 # avoid bootstrapping a new namespace; the keyspace is namespaced by prefix

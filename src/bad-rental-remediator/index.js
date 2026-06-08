@@ -18,6 +18,8 @@
 // here and arrive on later branches.
 // =========================================================
 
+import { runVerifyPoll } from './verify-runner.mjs';
+
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const TICK_BUDGET_MS = 55_000; // §G: 60s tick budget, leave headroom.
 const CONCURRENCY = 5;         // §G concurrency cap.
@@ -41,11 +43,30 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    // Two cron expressions are registered (§G):
+    //   - '*/1 * * * *'  → §C receive-poll: walk verify_pending reports, look
+    //                      for the nonce in inbound_sms, timeout-then-escalate.
+    //   - '0 */2 * * *'  → main intake tick (S1..S6 + vendor classifier).
+    // event.cron is the literal expression the trigger fired on.
+    const cron = (event && event.cron) || '';
+    if (cron === '*/1 * * * *') {
+      ctx.waitUntil(runVerifyPoll(env).then(r => {
+        console.log('[Remediator] verify-poll done ' + JSON.stringify(r));
+      }).catch(err => {
+        console.log('[Remediator] verify-poll error: ' + err);
+      }));
+      return;
+    }
     ctx.waitUntil(runTick(env).catch(err => {
       console.log('[Remediator] scheduled error: ' + err);
     }));
   },
 };
+
+// Re-export the universal §C gate so 16d (per-vendor flows) can consume it
+// without reaching into the runner module path.
+export { preResolveGate, runVerifyPoll, startVerify, resolvePendingVerify } from './verify-runner.mjs';
+export { cleanRecheckPredicate, mintNonce, buildVerifyBody } from './verify.mjs';
 
 // ---------------------------------------------------------
 // Top-level tick
