@@ -1,0 +1,57 @@
+name = "bad-rental-remediator"
+main = "index.js"
+compatibility_date = "2024-01-01"
+account_id = "5313f8b98e20a8915418b2683ad7278c"
+workers_dev = true
+
+# Cron every 2h per Plan v4 §G. The kill-switch KV `bad_rental_remediator_enabled`
+# defaults missing/false until the classifier (INC-16b) and SMS verify (INC-16c)
+# ship; until then the worker only classifies into shared situations and returns
+# no_change for everything else.
+[triggers]
+crons = ["0 */2 * * *"]
+
+# Kill-switch + cooldown state. Same KV namespace as token cache for now to
+# avoid bootstrapping a new namespace; the keyspace is namespaced by prefix
+# (`bad_rental_remediator_*`).
+[[kv_namespaces]]
+binding = "REMEDIATOR_KV"
+id = "edaf2c8828b14badb3037600635f8a7f"
+
+# Service bindings used during shared-situation classification.
+# RESELLER_SYNC: resend webhook + check rental status (cancel-guard §E).
+# SKYLINE_GATEWAY: gateway port-status for S5; /send-sms wired in INC-16c.
+[[services]]
+binding = "RESELLER_SYNC"
+service = "reseller-sync"
+
+[[services]]
+binding = "SKYLINE_GATEWAY"
+service = "skyline-gateway"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# ============ TEST ENVIRONMENT ============
+[env.test]
+name = "bad-rental-remediator-test"
+
+[env.test.triggers]
+crons = []
+
+[[env.test.kv_namespaces]]
+binding = "REMEDIATOR_KV"
+id = "689e9a6ec8c849cfb32bc5154cf8d680"
+
+[[env.test.services]]
+binding = "RESELLER_SYNC"
+service = "reseller-sync-test"
+
+[[env.test.services]]
+binding = "SKYLINE_GATEWAY"
+service = "skyline-gateway-test"
+
+[env.test.observability.logs]
+enabled = true
+invocation_logs = true

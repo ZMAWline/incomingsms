@@ -82,6 +82,20 @@ https://api.smsgateway.xyz
 | `ERROR_PORT_RESET` | Error during reset |
 | `FLUSHED` | Removed from queue |
 
+## Operator UI Mapping (IncomingSMS Dashboard)
+
+Per operator (Zalmen, 2026-06-07), the dashboard's Teltik action buttons map to Teltik API calls as follows:
+
+| Dashboard button | Teltik API calls | Purpose |
+|------------------|------------------|---------|
+| **Query** | `GET /v1/get-phone-number/?iccid=...` **and** `GET /v1/port-status` | Resolve current MDN for the ICCID AND verify the gateway port is online/registered |
+| **Reset OTA** (per-SIM) | `GET /v1/reset-port?mdn=...` | Trigger a gateway port reset to force the SIM to re-register |
+| **OTA Refresh** (SIM-page bulk action) | For each selected Teltik SIM: `GET /v1/reset-port?mdn=...` | Same wire call as Reset OTA, fanned out per SIM. Non-Teltik SIMs in the selection still go through the carrier OTA refresh path (mdn-rotator). |
+
+Notes:
+- The "Query" action is expected to combine MDN lookup with a `/port-status` health check so an offline port shows up immediately instead of being misread as a missing-MDN error.
+- "Reset OTA" is the operator-visible label; on the wire it is a port reset (`/v1/reset-port`), not a carrier OTA refresh. Follow it with `/v1/sms-lookup` polling if an inbound SMS is expected (see workflow below).
+
 ## Key Workflow: Port Reset + SMS Intercept
 
 ```

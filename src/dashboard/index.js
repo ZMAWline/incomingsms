@@ -178,6 +178,16 @@ export default {
       return handleBadRentalReport(id, env, corsHeaders);
     }
 
+    if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/pause-auto') && request.method === 'POST') {
+      const id = url.pathname.slice('/api/bad-rentals/'.length, -('/pause-auto'.length));
+      return handleBadRentalAutoLock(id, 'operator_locked', request, env, corsHeaders);
+    }
+
+    if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/resume-auto') && request.method === 'POST') {
+      const id = url.pathname.slice('/api/bad-rentals/'.length, -('/resume-auto'.length));
+      return handleBadRentalAutoLock(id, null, request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/error-logs') {
       return handleErrorLogs(env, corsHeaders, url);
     }
@@ -228,11 +238,45 @@ export default {
     }
 
     if (url.pathname === '/api/import-teltik' && request.method === 'POST') {
-      const res = await env.TELTIK_WORKER.fetch(
-        new Request('https://teltik-worker/import?secret=' + env.ADMIN_RUN_SECRET, { method: 'POST' })
-      );
-      return new Response(await res.text(), { status: res.status,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      // INC-10: walk the Teltik line list in chunks. The worker enforces the
+      // page size; we loop until has_more=false so a single button click drains
+      // a 1500+ line activation batch without tripping Cloudflare's
+      // 1000-subrequest cap inside any one Worker invocation.
+      const CHUNK = 200;
+      const MAX_CHUNKS = 50; // safety stop = 10k SIMs
+      let offset = 0;
+      let totals = { imported: 0, updated: 0, unchanged: 0, skipped: 0, processed: 0 };
+      let chunks = 0;
+      let total = null;
+      let lastChunk = null;
+      while (chunks < MAX_CHUNKS) {
+        const res = await env.TELTIK_WORKER.fetch(
+          new Request(`https://teltik-worker/import?secret=${env.ADMIN_RUN_SECRET}&offset=${offset}&limit=${CHUNK}`, { method: 'POST' })
+        );
+        const text = await res.text();
+        let chunk;
+        try { chunk = JSON.parse(text); } catch {
+          return new Response(JSON.stringify({ ok: false, error: 'worker returned non-JSON', body: text, chunks }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        if (!res.ok || chunk.ok === false) {
+          return new Response(JSON.stringify({ ok: false, error: chunk.error || `worker ${res.status}`, chunks, totals, last: chunk }),
+            { status: res.status || 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        lastChunk = chunk;
+        total = chunk.total ?? total;
+        totals.imported += chunk.imported || 0;
+        totals.updated += chunk.updated || 0;
+        totals.unchanged += chunk.unchanged || 0;
+        totals.skipped += chunk.skipped || 0;
+        totals.processed += chunk.processed || 0;
+        chunks++;
+        if (!chunk.has_more || chunk.next_offset == null) break;
+        offset = chunk.next_offset;
+      }
+      const truncated = chunks >= MAX_CHUNKS && lastChunk && lastChunk.has_more;
+      return new Response(JSON.stringify({ ok: true, total, chunks, truncated, ...totals }, null, 2),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
     if (url.pathname === '/api/teltik-reconcile' && request.method === 'POST') {
@@ -470,6 +514,17 @@ function checkAuth(authHeader, env) {
 
   const decoded = atob(credentials);
   return decoded === env.DASHBOARD_AUTH; // Format: "username:password"
+}
+
+// Normalize an MDN to the exact format Teltik expects for /v1/reset-port and
+// /v1/port-status: 10 digit US, no country code, no '+'. Anything else (E.164,
+// "+1XXXXXXXXXX", "13044123064", "(304) 412-3064") collapses to the 10-digit
+// subscriber number. Non-US 11+ digit inputs that do not start with '1' are
+// returned digits-only and left to Teltik to reject explicitly.
+function toTeltik10Digit(raw) {
+  const digits = String(raw == null ? '' : raw).replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('1')) return digits.slice(1);
+  return digits;
 }
 
 function relayFetch(env, url, init) {
@@ -2049,9 +2104,11 @@ async function handleTeltikQuery(request, env, corsHeaders) {
     });
 
     let db_update = null;
+    let resolvedMdn = null;
     if (res.ok && json) {
       const rawMdn = json.msisdn || json.mdn || json.phone_number || '';
       if (rawMdn) {
+        resolvedMdn = rawMdn;
         db_update = await syncActiveSim(env, iccid, { mdn: rawMdn, activatedAt: null });
       } else {
         await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
@@ -2069,12 +2126,54 @@ async function handleTeltikQuery(request, env, corsHeaders) {
       }).catch(() => {});
     }
 
+    // Operator UI expects Query to also surface /v1/port-status so an offline port is
+    // visible. Only attempt when we resolved an MDN; failure here is non-fatal — the
+    // MDN result still gets returned.
+    let port_status = null;
+    if (resolvedMdn) {
+      // Teltik /v1/port-status uses the same MDN format as /reset-port: 10 digits, US.
+      const mdnDigits = toTeltik10Digit(resolvedMdn);
+      try {
+        const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
+        const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
+        const psHeaders = {};
+        if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
+        const psRes = await fetch(psFetchUrl, { method: 'GET', headers: psHeaders });
+        const psText = await psRes.text();
+        let psJson = null; try { psJson = JSON.parse(psText); } catch {}
+        await logCarrierApiCall(env, {
+          run_id: 'teltik_port_status_' + iccid + '_' + Date.now(),
+          step: 'port_status',
+          iccid,
+          imei: null,
+          vendor: 'teltik',
+          request_url: 'https://api.smsgateway.xyz/v1/port-status?mdn=' + encodeURIComponent(mdnDigits),
+          request_method: 'GET',
+          request_body: null,
+          response_status: psRes.status,
+          response_ok: psRes.ok,
+          response_body_text: psText,
+          response_body_json: psJson,
+          error: psRes.ok ? null : 'Teltik port-status HTTP ' + psRes.status,
+        });
+        port_status = {
+          ok: psRes.ok,
+          http_status: psRes.status,
+          mdn: mdnDigits,
+          response: psJson || psText,
+        };
+      } catch (e) {
+        port_status = { ok: false, error: 'port-status exception: ' + (e && e.message ? e.message : String(e)) };
+      }
+    }
+
     return new Response(JSON.stringify({
       ok: res.ok,
       status: res.status,
       iccid,
       response: json || text,
       db_update,
+      port_status,
     }, null, 2), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -2920,7 +3019,7 @@ async function handleFixSim(request, env, corsHeaders) {
 async function handleImeiPoolGet(env, corsHeaders) {
   try {
     // Supabase enforces PGRST_MAX_ROWS=1000 server-side, so we must paginate
-    const baseUrl = `${env.SUPABASE_URL}/rest/v1/imei_pool?select=id,imei,status,sim_id,assigned_at,previous_sim_id,notes,created_at,gateway_id,port,sims!imei_pool_sim_id_fkey(iccid,port)&order=id.desc`;
+    const baseUrl = `${env.SUPABASE_URL}/rest/v1/imei_pool?select=id,imei,status,device_type,sim_id,assigned_at,previous_sim_id,notes,created_at,gateway_id,port,sims!imei_pool_sim_id_fkey(iccid,port)&order=id.desc`;
     const batchSize = 1000;
     let allRows = [];
     let offset = 0;
@@ -2952,6 +3051,14 @@ async function handleImeiPoolGet(env, corsHeaders) {
       in_use: allRows.filter(e => e.status === 'in_use').length,
       retired: allRows.filter(e => e.status === 'retired').length,
       slots: totalSlots,
+      by_type: {
+        phone: allRows.filter(e => (e.device_type || 'phone') === 'phone').length,
+        router: allRows.filter(e => e.device_type === 'router').length,
+      },
+      available_by_type: {
+        phone: allRows.filter(e => e.status === 'available' && (e.device_type || 'phone') === 'phone').length,
+        router: allRows.filter(e => e.status === 'available' && e.device_type === 'router').length,
+      },
     };
 
     return new Response(JSON.stringify({ pool: allRows, stats }), {
@@ -3002,6 +3109,8 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
 
     if (action === 'add') {
       const imeis = body.imeis || [];
+      // INC-13: device_type tagging (phone|router). Default phone for back-compat.
+      const deviceType = (body.device_type === 'router') ? 'router' : 'phone';
       if (!Array.isArray(imeis) || imeis.length === 0) {
         return new Response(JSON.stringify({ error: 'imeis array is required' }), {
           status: 400,
@@ -3015,7 +3124,7 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
       for (const imei of imeis) {
         const trimmed = imei.trim();
         if (/^\d{15}$/.test(trimmed)) {
-          valid.push({ imei: trimmed, status: 'available' });
+          valid.push({ imei: trimmed, status: 'available', device_type: deviceType });
         } else if (trimmed) {
           invalid.push(trimmed);
         }
@@ -3653,6 +3762,7 @@ async function handleBadRentals(env, corsHeaders, url) {
       'sim_id', 'sim_number_id', 'rental_id',
       'remediation_action', 'duplicate_of',
       'received_at', 'triaged_at', 'closed_at', 'updated_at',
+      'auto_remediation_state', 'last_auto_attempt_at', 'escalation_reason',
       'resellers(name)',
       'rentals(reseller_rental_id)',
       'sims(iccid,sim_numbers(e164,valid_to))',
@@ -3695,6 +3805,9 @@ async function handleBadRentals(env, corsHeaders, url) {
         triaged_at: r.triaged_at,
         closed_at: r.closed_at,
         updated_at: r.updated_at,
+        auto_remediation_state: r.auto_remediation_state || null,
+        last_auto_attempt_at: r.last_auto_attempt_at || null,
+        escalation_reason: r.escalation_reason || null,
         resellers: r.resellers || null,
         iccid: r && r.sims ? r.sims.iccid : null,
         reseller_rental_id: resellerRentalId,
@@ -3711,6 +3824,89 @@ async function handleBadRentals(env, corsHeaders, url) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+// INC-17 / INC-16a — operator pause/resume of the bad-rental auto-remediator.
+// targetState = 'operator_locked' to take over, or null to resume auto.
+// Writes a rental_report_events audit row so the timeline shows the lock change.
+async function handleBadRentalAutoLock(id, targetState, request, env, corsHeaders) {
+  try {
+    const reportId = parseInt(id, 10);
+    if (!Number.isFinite(reportId) || reportId <= 0) {
+      return new Response(JSON.stringify({ error: 'invalid report id' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    let body = {};
+    try { body = await request.json(); } catch (_) { body = {}; }
+    const actor = body.actor ? String(body.actor).slice(0, 120) : 'operator';
+    const note = body.note ? String(body.note).slice(0, 500) : null;
+
+    const curResp = await supabaseGet(env, 'rental_reports?id=eq.' + reportId + '&select=id,status,auto_remediation_state');
+    if (!curResp.ok) {
+      const txt = await curResp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + curResp.status, detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const curRows = await curResp.json();
+    if (!Array.isArray(curRows) || curRows.length === 0) {
+      return new Response(JSON.stringify({ error: 'report not found' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const prev = curRows[0].auto_remediation_state || null;
+    const nowIso = new Date().toISOString();
+    const patch = { auto_remediation_state: targetState, updated_at: nowIso };
+
+    const patchResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_reports?id=eq.${reportId}`, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify(patch),
+    });
+    if (!patchResp.ok) {
+      const txt = await patchResp.text();
+      return new Response(JSON.stringify({ error: 'patch_failed', detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const updated = await patchResp.json();
+
+    try {
+      await fetch(`${env.SUPABASE_URL}/rest/v1/rental_report_events`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          report_id: reportId,
+          from_status: curRows[0].status,
+          to_status: curRows[0].status,
+          actor: actor,
+          note: note,
+          evidence: { auto_remediation_state_from: prev, auto_remediation_state_to: targetState },
+        }),
+      });
+    } catch (e) {
+      console.log('[BadRentalAutoLock] event log insert failed: ' + e);
+    }
+    return new Response(JSON.stringify({ ok: true, report: updated[0] || null }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 }
@@ -4553,6 +4749,86 @@ async function handleSimAction(request, env, corsHeaders) {
           await logSystemError(env, { source: 'dashboard', action: 'rotate', sim_id, error_message: tResult.error, error_details: { vendor: 'teltik', response: tResult, status: tRes.status } });
         }
         return new Response(JSON.stringify({ ok: tResult.ok, action, sim_id, iccid: row.iccid, forced: body.force === true, vendor: 'teltik', detail: tResult }, null, 2), { status: tRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // Teltik "OTA refresh" maps to Teltik /v1/reset-port (operator label only; on the
+    // wire it is a gateway port reset, not a carrier OTA). Non-Teltik SIMs fall through
+    // to the existing mdn-rotator ota_refresh path.
+    if (action === 'ota_refresh') {
+      const vendorRes = await supabaseGet(env, `sims?select=iccid,vendor,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`);
+      const vendorRows = await vendorRes.json().catch(() => []);
+      const row = Array.isArray(vendorRows) && vendorRows[0] ? vendorRows[0] : null;
+      if (row && row.vendor === 'teltik') {
+        const apiKey = env.TELTIK_API_KEY;
+        if (!apiKey) return new Response(JSON.stringify({ ok: false, error: 'TELTIK_API_KEY not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+        // Resolve MDN: prefer DB, fall back to live Teltik /v1/get-phone-number lookup
+        // by ICCID so a stale or missing sim_numbers row doesn't break the operator action.
+        let rawMdn = row.sim_numbers && row.sim_numbers[0] && row.sim_numbers[0].e164;
+        let mdnSource = 'db';
+        let mdnLookupError = null;
+        if (!rawMdn && row.iccid) {
+          try {
+            const gpUrl = `https://api.smsgateway.xyz/v1/get-phone-number/?apikey=${encodeURIComponent(apiKey)}&iccid=${encodeURIComponent(row.iccid)}`;
+            const gpFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + gpUrl : gpUrl;
+            const gpHeaders = {};
+            if (env.RELAY_KEY) gpHeaders['x-relay-key'] = env.RELAY_KEY;
+            const gpRes = await fetch(gpFetchUrl, { method: 'GET', headers: gpHeaders });
+            const gpText = await gpRes.text();
+            let gpJson = null; try { gpJson = JSON.parse(gpText); } catch {}
+            if (gpRes.ok && gpJson) {
+              rawMdn = gpJson.msisdn || gpJson.mdn || gpJson.phone_number || null;
+              if (rawMdn) mdnSource = 'teltik_live';
+            } else {
+              mdnLookupError = `get-phone-number HTTP ${gpRes.status}: ${(gpJson && (gpJson.message || gpJson.error)) || gpText.slice(0, 120)}`;
+            }
+          } catch (e) {
+            mdnLookupError = `get-phone-number exception: ${e && e.message ? e.message : String(e)}`;
+          }
+        }
+        if (!rawMdn) {
+          const err = `No MDN for Teltik SIM ${row.iccid}, cannot reset port` + (mdnLookupError ? ` (${mdnLookupError})` : '');
+          return new Response(JSON.stringify({ ok: false, error: err, action, sim_id, iccid: row.iccid, vendor: 'teltik' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        // Teltik /reset-port requires the bare 10-digit US number — not +1XXXXXXXXXX
+        // and not 11 digits with the country code. Strip non-digits, then drop a
+        // leading '1' when it produces an 11-digit US MDN.
+        const mdnDigits = toTeltik10Digit(rawMdn);
+
+        const teltikUrl = `https://api.smsgateway.xyz/v1/reset-port?apikey=${encodeURIComponent(apiKey)}&mdn=${encodeURIComponent(mdnDigits)}`;
+        const fetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + teltikUrl : teltikUrl;
+        const fetchHeaders = {};
+        if (env.RELAY_KEY) fetchHeaders['x-relay-key'] = env.RELAY_KEY;
+        const tRes = await fetch(fetchUrl, { method: 'GET', headers: fetchHeaders });
+        const tText = await tRes.text();
+        let tJson = null; try { tJson = JSON.parse(tText); } catch {}
+        // Teltik can return 200 with { success: false, message: ... } so check both HTTP and body.
+        const bodySuccess = !tJson || tJson.success !== false;
+        const ok = tRes.ok && bodySuccess;
+        const teltikMsg = (tJson && (tJson.message || tJson.error)) || (!tRes.ok ? `HTTP ${tRes.status}` : null) || (tText ? tText.slice(0, 200) : null);
+        await logCarrierApiCall(env, {
+          run_id: `teltik_reset_port_${row.iccid}_${Date.now()}`,
+          step: 'reset_port',
+          iccid: row.iccid,
+          imei: null,
+          vendor: 'teltik',
+          request_url: `https://api.smsgateway.xyz/v1/reset-port?mdn=${encodeURIComponent(mdnDigits)}`,
+          request_method: 'GET',
+          request_body: null,
+          response_status: tRes.status,
+          response_ok: tRes.ok,
+          response_body_text: tText,
+          response_body_json: tJson,
+          error: ok ? null : `Teltik reset-port failed: ${teltikMsg || 'unknown'}`,
+        });
+        if (!ok) {
+          await logSystemError(env, { source: 'dashboard', action: 'ota_refresh', sim_id, error_message: `Teltik reset-port: ${teltikMsg || 'unknown'}`, error_details: { vendor: 'teltik', response: tJson || tText, status: tRes.status, mdn_source: mdnSource } });
+        }
+        const respBody = { ok, action, sim_id, iccid: row.iccid, mdn: mdnDigits, mdn_source: mdnSource, vendor: 'teltik', http_status: tRes.status, detail: tJson || tText };
+        if (!ok) respBody.error = `Teltik reset-port: ${teltikMsg || 'unknown'}`;
+        if (ok && tJson && tJson.message) respBody.message = tJson.message;
+        return new Response(JSON.stringify(respBody, null, 2), { status: ok ? 200 : (tRes.status >= 400 ? tRes.status : 502), headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
     }
 
@@ -7789,6 +8065,11 @@ function getHTML(helixEnabled) {
                             <option value="available">Available (Stock)</option>
                             <option value="retired">Retired (Rejected)</option>
                         </select>
+                        <select id="imei-type-filter" onchange="renderImeiPool()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent" title="Filter by device type">
+                            <option value="">All Types</option>
+                            <option value="phone">Phone</option>
+                            <option value="router">Router</option>
+                        </select>
                         <button onclick="syncAllGatewayImeis()" id="sync-gateways-btn" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Sync from Gateways</button>
                         <button onclick="showAddImeiModal()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add IMEIs</button>
                         <button onclick="showCheckImeisModal()" class="px-4 py-2 text-sm bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition">Check IMEIs</button>
@@ -7828,6 +8109,7 @@ function getHTML(helixEnabled) {
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','id')">ID <span class="sort-arrow" data-table="imei" data-col="id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','imei')">IMEI <span class="sort-arrow" data-table="imei" data-col="imei"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','status')">Status <span class="sort-arrow" data-table="imei" data-col="status"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','device_type')">Type <span class="sort-arrow" data-table="imei" data-col="device_type"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','sim_id')">Assigned SIM <span class="sort-arrow" data-table="imei" data-col="sim_id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','gateway_id')">Gateway <span class="sort-arrow" data-table="imei" data-col="gateway_id"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('imei','port')">Port <span class="sort-arrow" data-table="imei" data-col="port"></span></th>
@@ -7836,7 +8118,7 @@ function getHTML(helixEnabled) {
                                 </tr>
                             </thead>
                             <tbody id="imei-pool-table" class="text-sm">
-                                <tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="9" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     <div id="imei-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
@@ -8081,6 +8363,14 @@ function getHTML(helixEnabled) {
                             <textarea id="bad-rentals-edit-note" rows="3" maxlength="500" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-200"></textarea>
                         </div>
                         <div id="bad-rentals-edit-error" class="hidden text-xs text-red-400"></div>
+                        <div class="border-t border-dark-600 pt-3 mt-1">
+                            <div class="text-[11px] text-dark-400 uppercase mb-1">Auto-remediator</div>
+                            <div id="bad-rentals-edit-auto-state" class="text-xs text-dark-300 mb-2">state: —</div>
+                            <div class="flex items-center gap-2">
+                                <button onclick="badRentalsTakeOver()" id="bad-rentals-edit-take-over" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-500 text-white rounded">Take over</button>
+                                <button onclick="badRentalsResumeAuto()" id="bad-rentals-edit-resume-auto" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Resume auto</button>
+                            </div>
+                        </div>
                     </div>
                     <div class="flex items-center justify-end gap-2 mt-5">
                         <button onclick="closeBadRentalEdit()" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Cancel</button>
@@ -9631,6 +9921,14 @@ function getHTML(helixEnabled) {
                 <h3 class="text-lg font-semibold text-white">Add IMEIs to Pool</h3>
             </div>
             <div class="p-5">
+                <div class="mb-3">
+                    <label class="text-sm text-gray-400 block mb-1">Device type</label>
+                    <select id="add-imei-device-type" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">
+                        <option value="phone">Phone (AT&amp;T / ATOMIC / Helix)</option>
+                        <option value="router">Router (Wing IoT)</option>
+                    </select>
+                    <p class="text-xs text-gray-500 mt-1">Wing IoT needs router IMEIs; AT&amp;T needs phone IMEIs.</p>
+                </div>
                 <p class="text-sm text-gray-400 mb-3">Enter IMEIs to add (one per line, 15 digits each):</p>
                 <textarea id="add-imei-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="123456789012345"></textarea>
                 <p class="text-xs text-gray-500 mt-2">Duplicates will be ignored automatically</p>
@@ -10834,7 +11132,13 @@ function getHTML(helixEnabled) {
 
         function matchesSearch(obj, query) {
             if (!query) return true;
-            const terms = query.split(/[,;\\n\\r]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+            let terms = query.split(/[,;\\n\\r]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+            // Mobile <input> strips newlines from pasted text to spaces; if the whole query is
+            // a whitespace-separated list of phone-shaped tokens, treat each token as a term.
+            const wsParts = query.split(/[\\s,;]+/).map(t => t.trim()).filter(Boolean);
+            if (wsParts.length > terms.length && wsParts.every(p => /^\\+?\\d{10,15}$/.test(p))) {
+              terms = wsParts.map(p => p.toLowerCase());
+            }
             if (!terms.length) return true;
             const DATE_FIELDS = ['activated_at','last_sms_received','last_mdn_rotated_at','last_rotation_at','last_notified_at','created_at','updated_at'];
             const strings = Object.entries(obj).flatMap(([k, v]) => {
@@ -10847,7 +11151,21 @@ function getHTML(helixEnabled) {
               return [base];
             });
             const lowerStrings = strings.map(s => s.toLowerCase());
-            return terms.some(term => lowerStrings.some(s => s.includes(term)));
+            const digitsOnlyStrings = strings.map(s => s.replace(/\\D/g, '')).filter(Boolean);
+            function phoneVariants(term) {
+              const d = term.replace(/\\D/g, '');
+              if (d.length < 10 || d.length > 15) return null;
+              const out = [d];
+              if (d.length === 11 && d.charAt(0) === '1') out.push(d.slice(1));
+              else if (d.length === 10) out.push('1' + d);
+              return out;
+            }
+            return terms.some(term => {
+              if (lowerStrings.some(s => s.includes(term))) return true;
+              const variants = phoneVariants(term);
+              if (!variants) return false;
+              return variants.some(v => digitsOnlyStrings.some(s => s.includes(v)));
+            });
         }
 
 
@@ -12229,11 +12547,36 @@ async function sendSimOnline(simId, phoneNumber) {
                         outputEl.innerHTML = '<span class="text-red-400">Error: ' + (result.error || 'Unknown') + '</span>';
                     } else {
                         const d = result.response;
+                        const ps = result.port_status;
+                        const psBody = (ps && ps.response && typeof ps.response === 'object') ? ps.response : {};
+                        const onlineRaw = psBody && (psBody.online ?? psBody.is_online ?? psBody.registered ?? psBody.status);
+                        const onlineStr = typeof onlineRaw === 'boolean' ? (onlineRaw ? 'online' : 'offline')
+                            : (onlineRaw == null ? 'unknown' : String(onlineRaw));
+                        const onlineColor = /^(online|true|registered|active|ok)$/i.test(onlineStr) ? 'text-accent'
+                            : /^(offline|false|unregistered|inactive|error)$/i.test(onlineStr) ? 'text-red-400'
+                            : 'text-orange-400';
+
                         let fmtd = '<span class="text-green-400 font-bold">Teltik MDN Found</span>\\n\\n';
                         fmtd += '<span class="text-blue-400">iccid:</span> ' + (d.iccid || result.iccid) + '\\n';
                         fmtd += '<span class="text-blue-400">msisdn:</span> ' + (d.msisdn || d.mdn || 'N/A') + '\\n';
-                        fmtd += '\\n<span class="text-gray-500">--- Full Response ---</span>\\n';
+                        if (ps) {
+                            fmtd += '<span class="text-blue-400">port status:</span> <span class="' + onlineColor + ' font-bold">' + onlineStr + '</span>';
+                            if (ps.mdn) fmtd += ' <span class="text-gray-500">(mdn=' + ps.mdn + ')</span>';
+                            if (!ps.ok) fmtd += ' <span class="text-red-400">[lookup failed: ' + (ps.error || ('HTTP ' + ps.http_status)) + ']</span>';
+                            fmtd += '\\n';
+                        } else {
+                            fmtd += '<span class="text-gray-500">port status: not checked (no MDN resolved)</span>\\n';
+                        }
+                        fmtd += '\\n<span class="text-gray-500">--- get-phone-number response ---</span>\\n';
                         fmtd += JSON.stringify(d, null, 2);
+                        fmtd += '\\n\\n<span class="text-gray-500">--- port-status response ---</span>\\n';
+                        if (ps) {
+                            const psDump = { ok: ps.ok, http_status: ps.http_status, mdn: ps.mdn, response: ps.response };
+                            if (ps.error) psDump.error = ps.error;
+                            fmtd += JSON.stringify(psDump, null, 2);
+                        } else {
+                            fmtd += '(not called — no MDN was resolved by get-phone-number)';
+                        }
                         outputEl.innerHTML = fmtd;
                     }
                     const du = result.db_update;
@@ -13359,6 +13702,8 @@ async function sendSimOnline(simId, phoneNumber) {
         function showAddImeiModal() {
             document.getElementById('add-imei-modal').classList.remove('hidden');
             document.getElementById('add-imei-input').value = '';
+            const dt = document.getElementById('add-imei-device-type');
+            if (dt) dt.value = 'phone';
         }
 
         function hideAddImeiModal() {
@@ -13378,10 +13723,11 @@ async function sendSimOnline(simId, phoneNumber) {
             btn.textContent = 'Adding...';
 
             try {
+                const deviceType = (document.getElementById('add-imei-device-type')?.value === 'router') ? 'router' : 'phone';
                 const response = await fetch(\`\${API_BASE}/imei-pool\`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'add', imeis })
+                    body: JSON.stringify({ action: 'add', imeis, device_type: deviceType })
                 });
                 const result = await response.json();
 
@@ -13519,6 +13865,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const stats = state.stats || {};
             const search = (document.getElementById('imei-search')?.value || '').trim();
             const statusFilter = (document.getElementById('imei-status-filter')?.value || '');
+            const typeFilter = (document.getElementById('imei-type-filter')?.value || '');
 
             document.getElementById('imei-slots').textContent = stats.slots || 0;
             document.getElementById('imei-in-use').textContent = stats.in_use || 0;
@@ -13528,6 +13875,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
             let data = state.data;
             if (statusFilter) data = data.filter(e => e.status === statusFilter);
+            if (typeFilter) data = data.filter(e => (e.device_type || 'phone') === typeFilter);
             if (search) data = data.filter(e => matchesSearch(e, search));
             data = genericSort(data, state.sortKey, state.sortDir);
 
@@ -13537,7 +13885,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
             const tbody = document.getElementById('imei-pool-table');
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-4 text-center text-gray-500">No IMEIs match filters</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-gray-500">No IMEIs match filters</td></tr>';
                 return;
             }
 
@@ -13555,6 +13903,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     <td class="px-4 py-3 text-gray-400">\${entry.id}</td>
                     <td class="px-4 py-3 font-mono text-sm text-gray-200">\${entry.imei}</td>
                     <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${statusClass}">\${entry.status}</span></td>
+                    <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full \${(entry.device_type === 'router') ? 'bg-purple-500/20 text-purple-300' : 'bg-cyan-500/20 text-cyan-300'}">\${entry.device_type || 'phone'}</span></td>
                     <td class="px-4 py-3 text-gray-400 text-xs">\${simInfo}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${entry.gateway_id || '-'}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">\${entry.port || '-'}</td>
@@ -13755,8 +14104,42 @@ async function sendSimOnline(simId, phoneNumber) {
                 summary.textContent = reseller + ' · reported ' + mdn + ' · current status: ' + (r.status || '?');
             }
             modal.dataset.reportId = String(reportId);
+            const autoEl = document.getElementById('bad-rentals-edit-auto-state');
+            if (autoEl) {
+                const st = r.auto_remediation_state || 'queued';
+                const last = r.last_auto_attempt_at ? new Date(r.last_auto_attempt_at).toLocaleString() : 'never';
+                autoEl.textContent = 'state: ' + st + ' · last attempt: ' + last + (r.escalation_reason ? ' · esc: ' + r.escalation_reason : '');
+            }
             modal.classList.remove('hidden');
             renderBadRentalEditConditional();
+        }
+
+        async function badRentalsTakeOver()    { return badRentalsAutoLockCall('pause-auto',  'Take over'); }
+        async function badRentalsResumeAuto()  { return badRentalsAutoLockCall('resume-auto', 'Resume auto'); }
+        async function badRentalsAutoLockCall(suffix, label) {
+            const modal = document.getElementById('bad-rentals-edit-modal');
+            const reportId = modal ? modal.dataset.reportId : null;
+            const errEl = document.getElementById('bad-rentals-edit-error');
+            if (!reportId) { return; }
+            if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
+            try {
+                const resp = await fetch(API_BASE + '/bad-rentals/' + encodeURIComponent(reportId) + '/' + suffix, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                });
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) {
+                    if (errEl) { errEl.textContent = (data && data.error) ? data.error : ('HTTP ' + resp.status); errEl.classList.remove('hidden'); }
+                    return;
+                }
+                if (typeof showToast === 'function') showToast(label + ' applied to report ' + reportId, 'success');
+                closeBadRentalEdit();
+                if (typeof loadBadRentals === 'function') loadBadRentals();
+            } catch(e) {
+                if (errEl) { errEl.textContent = 'Network error: ' + e.message; errEl.classList.remove('hidden'); }
+                console.error('[badRentalsAutoLockCall]', e);
+            }
         }
 
         function closeBadRentalEdit() {
@@ -14531,7 +14914,15 @@ async function sendSimOnline(simId, phoneNumber) {
                             okCount++;
                             const tMdn = r.response && (r.response.msisdn || r.response.mdn) ? (r.response.msisdn || r.response.mdn) : 'OK';
                             const tNote = r.db_update && r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '';
-                            lines.push(label + ' [teltik]: ' + tMdn + tNote);
+                            let psTag = '';
+                            if (r.port_status) {
+                                const psb = (r.port_status.response && typeof r.port_status.response === 'object') ? r.port_status.response : {};
+                                const psRaw = psb.online ?? psb.is_online ?? psb.registered ?? psb.status;
+                                const psStr = typeof psRaw === 'boolean' ? (psRaw ? 'online' : 'offline')
+                                    : (psRaw == null ? 'unknown' : String(psRaw));
+                                psTag = ' [port=' + psStr + (r.port_status.ok ? '' : ':lookup_failed') + ']';
+                            }
+                            lines.push(label + ' [teltik]: ' + tMdn + tNote + psTag);
                         } else {
                             failCount++;
                             lines.push(label + ' [teltik]: ERROR — ' + (r.error || 'unknown'));
