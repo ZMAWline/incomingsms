@@ -274,7 +274,7 @@ async function maybeExecuteAction(env, args) {
     };
   }
 
-  const gate = await preResolveGate(env, {
+  const resolveGate = await preResolveGate(env, {
     report,
     sim: evidence.sim,
     vendorRead: classification.vendorReadHealth || null,
@@ -284,12 +284,12 @@ async function maybeExecuteAction(env, args) {
     attemptNo,
   });
 
-  if (gate.passed) {
+  if (resolveGate.passed) {
     return {
       outcome: 'remediated',
       evidence: {
         exec_status: res.status,
-        gate_status: gate.status,
+        gate_status: resolveGate.status,
         ...(res.evidence || {}),
       },
       errorMessage: null,
@@ -300,16 +300,16 @@ async function maybeExecuteAction(env, args) {
 
   // Gate not passed — keep the report in flight, no terminal write.
   return {
-    outcome: gate.status === 'verify_pending' ? 'verify_pending' : (classification.outcome || 'no_change'),
+    outcome: resolveGate.status === 'verify_pending' ? 'verify_pending' : (classification.outcome || 'no_change'),
     evidence: {
       exec_status: res.status,
-      gate_status: gate.status,
-      gate_reason: gate.reason || null,
+      gate_status: resolveGate.status,
+      gate_reason: resolveGate.reason || null,
       ...(res.evidence || {}),
     },
     errorMessage: null,
     execStatus: res.status,
-    gateStatus: gate.status,
+    gateStatus: resolveGate.status,
   };
 }
 
