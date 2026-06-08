@@ -216,12 +216,37 @@ async function classifyShared(env, report, evidence) {
     }, 'insufficient_evidence');
   }
 
-  // Nothing shared fired — vendor classifier (INC-16b) will own this on the
-  // next tick. Record a no_change and leave the report queued.
-  return nonTerminal('pending_vendor_classifier', 'classify_only', 'no_change', {
-    reason: 'awaiting_vendor_classifier',
-    vendor,
+  // Nothing shared fired — hand off to the vendor classifier (INC-16b).
+  // Vendor read + IMEI check are wired in 16d/16e; for now we pass nulls so the
+  // classifier returns the pending_vendor_read situation and the worker records
+  // a classify_only attempt. Cooldown engine schedules the next review.
+  const { classifyVendor } = await import('./classifier.mjs');
+  const { nextReviewAt }   = await import('./cooldown.mjs');
+  const situation = classifyVendor({
+    sim: evidence.sim,
+    vendorView: null,
+    imeiCheck: null,
+    webhook: { delivered: false },
+    report,
+    priorAttempts: evidence.priorAttempts || 0,
+    cancelGuard: { activeRentalExists: false, evidence: {} },
+    recentResellerBadSignal: false,
   });
+  if (!situation) {
+    return terminal('S6', 'escalate', 'escalate', {
+      reason: 'insufficient_evidence_unknown_vendor',
+      vendor,
+    }, 'insufficient_evidence');
+  }
+  const nra = nextReviewAt({ action: situation.auto_action, now: new Date() });
+  return {
+    mode: situation.id,
+    action: situation.auto_action,
+    outcome: situation.auto_action === 'classify_only' ? 'no_change' : 'classify_only',
+    evidenceSummary: { situation_id: situation.id, vendor, situation_evidence: situation.evidence_bundle },
+    terminal: false,
+    nextReviewAt: nra,
+  };
 }
 
 // ---------------------------------------------------------
