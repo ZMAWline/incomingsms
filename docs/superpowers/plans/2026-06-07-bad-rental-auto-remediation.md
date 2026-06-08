@@ -1,353 +1,330 @@
 # Plan — Automated Bad-Rental Review & Remediation (INC-16)
 
-**Status:** Draft v2 (planning only — no code).
-**Author:** IncomingSMS CEO, 2026-06-07.
-**Approval gate:** Operator (Zalmen) sign-off via Paperclip `request_confirmation` before any implementation child issues are opened.
+**Status:** Draft v4 (planning only — no code).
+**Author:** IncomingSMS CEO, 2026-06-08.
+**Approval gate:** Operator (Zalmen) sign-off via Paperclip `request_confirmation` before any implementation child issues open.
 
-v2 changes vs v1: dropped the "shadow week" framing as the dominant structure. Plan is now a complete operational design intended to be live once approved, organized as **intake flow → per-vendor playbooks → per-branch decisions**. A pre-go-live dry-run verification step remains, but it is one step, not the spine of the plan.
-
----
-
-## 1. Goal & invariants
-
-Every 2 hours, an automated worker reviews every open bad-rental report, attempts the safest applicable fix, and either resolves the report on strong evidence or escalates with a complete evidence bundle.
-
-Invariants (carried from prior decisions — these constrain every branch below):
-
-1. **Reseller-facing identifiers are locked**: only `reseller_rental_id` or current MDN (e164) are accepted. Never SIM ID, ICCID, internal rental ID, or stale/original MDN.
-2. **`verified:true` is hardcoded** — automation must not reintroduce verification gates.
-3. **Rotation is sacred** — automation must not touch `last_mdn_rotated_at`, must not trigger rotation, must not call `mdn-rotator`.
-4. **No destructive actions** ever automatic: no SIM cancel/deactivate, no SIM replacement, no MDN swap, no rotation, no reseller-facing message beyond the existing `number.online` webhook.
-5. **All external calls via `relayFetch`** — no direct origin hits.
-6. **Single-job-per-worker** — this ships as a new worker `bad-rental-remediator`, never bolted onto an existing one.
-7. **No secrets in comments, logs, or escalation bundles.**
+**v4 changes vs prior:**
+- Added §A Carrier capability matrix (researched from existing skills + code).
+- Added §B Standardised IMEI correctness check (Wing IoT → router IMEI; Atomic/Helix → phone IMEI).
+- **Removed** the DB-sync-only auto-resolve path. Every terminal `remediated` now requires SMS verification (§C).
+- Defined §C SMS verification protocol via dashboard send-SMS / SKYLINE_GATEWAY `/send-sms`, polling `inbound_sms` with retry/escalation.
+- Locked "notify reseller" to two operations only: resend `number.online` webhook + mark report status to terminal (no freeform reseller-facing message).
+- Wing W7 (mode wrong): retry dialable PUT then verify via GET + SMS check before resolving.
+- Cancelled/deactivated SIMs (S1/A4/H4/W4/T6): verify no active reseller rental before closing duplicate; if still rented → escalate as `vendor_cancelled_active_rental`.
+- Escalation batching is now by `(vendor, failure_type)` per tick.
+- Added operator-lock / manual-work state (`auto_remediation_state='operator_locked'`).
+- Exact clean-recheck criteria defined in §C.4.
+- Teltik 10-digit MDN enforced at API client boundary (§A.4).
 
 ---
 
-## 2. Existing assets the worker will reuse (do not rebuild)
+## §A. Carrier capability matrix — what each vendor actually exposes
 
-| Asset | Where | Used for |
+Researched from: `.claude/skills/atomic-api/SKILL.md`, `.claude/skills/wing-iot/SKILL.md`, `.claude/skills/helix-api/SKILL.md`, `.claude/skills/teltik-api/SKILL.md`, `src/mdn-rotator/index.{js,ts}`, `src/dashboard/index.js`.
+
+### §A.1. Atomic (AT&T ATOMIC, ezbiz account)
+
+Single POST endpoint `https://solutionsatt-atomic.telgoo5.com:22712` with `requestType`:
+
+| Capability | `requestType` | Inputs | Notes / use in remediation |
+|---|---|---|---|
+| Read SIM/MDN state | `subsriberInquiry` | `MSISDN` and/or `sim` (ICCID) | Returns `attStatus`, `BAN`, plan, `BLIMEI` / `NWIMEI`, address, SOC codes. Always safe; used as evidence before and after any fix. |
+| OTA refresh | `resendOtaProfile` | `MSISDN` + `sim` | Idempotent; no state change. Auto-allowed. |
+| Restore from suspend | `restoreSubscriber` | `MSISDN`, `reasonCode='CR'` | Auto-allowed under §D safety table only when prior `attStatus ∈ {suspended}` and `fixAtomicSim`-style flow applies. |
+| Reconnect from cancel | `reconnectSubscriber` | `MSISDN`, `reasonCode=''` | Auto-allowed only when (a) cancellation evidence shows it happened by mistake or by suspension cycle AND (b) S1-cancel-with-active-rental check (§E.1) passes AND operator hasn't locked it. |
+| Suspend / Deactivate / Swap MSISDN / Update Subscriber Info | `suspendSubscriber` / `deactivateSubscriber` / `swapMSISDN` / `UpdateSubscriberInfo` | various | **Forbidden for auto.** Operator-only. |
+| Carrier-side IMEI change | n/a — endpoint not exposed | — | ATOMIC does **not** expose an IMEI change endpoint. IMEI correctness is enforced **gateway-side** only (existing `fixAtomicSim` allocates a fresh IMEI then sets it on the gateway). Inquiry returns `BLIMEI`/`NWIMEI` — used as evidence for DB/gateway alignment, not as a target to write. |
+
+### §A.2. Wing IoT (AT&T IoT / Wing Tel, SUBNINE Basic Auth)
+
+REST on `https://restapi19.att.com/rws/api/api/v1/devices/{iccid}`:
+
+| Capability | Method | Body / params | Notes |
+|---|---|---|---|
+| Read device state | `GET /api/v1/devices/{iccid}` | — | Returns `status`, `communicationPlan`, MDN, `customer`. Authoritative. |
+| Restore dialable mode (PUT) | `PUT /api/v1/devices/{iccid}` | `{ "communicationPlan": "Wing Tel Inc - NON ABIR SMS MO/MT US" }` | Sets line to dialable. Used in W7 ("mode wrong" — expected dialable, currently non-dialable). |
+| Set non-dialable (rotation only) | `PUT /api/v1/devices/{iccid}` | `{ "communicationPlan": "Wing Tel Inc - ABIR 25Mbps SMS MO/MT US" }` | **NOT a bad-rental remediation action.** Only used inside rotation flow. Remediator never PUTs the ABIR plan. |
+| Activation (new) | `PUT /api/v1/devices/{iccid}` | `{ "communicationPlan": "...", "status": "Activated" }` | **Operator-only** for bad-rental scope. Worker does not activate. |
+| OTA refresh equivalent | n/a | — | Wing does **not** expose an OTA refresh endpoint. The only "fix" is: GET → if dialable plan wrong, PUT dialable plan → GET verify → SMS verify (§C). |
+| Status change (suspend/cancel) | n/a in this account | — | Wing IoT skill describes only activation + plan swap. Suspension/cancellation handled by AT&T side; we only observe via GET. |
+| IMEI | not via Wing API | — | IMEI lives gateway-side only; vendor doesn't validate it. |
+
+### §A.3. Helix (T-Mobile via SOLO Mobility, OAuth Bearer)
+
+Wider surface than the other vendors. The remediator uses a deliberately narrow subset:
+
+| Capability | Endpoint | Use in remediation |
 |---|---|---|
-| `rental_reports`, `rental_report_events`, `rental_report_rejections` | Supabase | Source of truth for reports + audit |
-| `resolveRentalForReport` | `src/shared/report-bad-resolver.js` | Maps reseller identifier → internal rental/SIM |
-| `/api/bad-rentals/*` | dashboard worker | Operator UI (read-only from worker side) |
-| `reseller-sync /resend-online` | service binding | Re-fires `number.online` webhook (idempotent, dedup'd) |
-| `sims`, `sim_numbers`, `webhook_deliveries` | Supabase | Fresh evidence sources |
-| Carrier APIs | atomic-api, wing-iot, helix-api, teltik-api skills | Authoritative vendor state |
-| SkyLine port-status | SkyLine-API skill | Gateway-side health |
+| Get subscriber details | 4.7 (`GET`) | Evidence. Returns `attBan`, `subscriberNumber`, `iccid`, IMEI, status. |
+| OTA refresh | 4.11 (`PATCH`) `{ban, subscriberNumber, iccid}` | Idempotent. Auto-allowed. |
+| Status change | 4.6 (`PATCH`) | Remediator only allowed `Unsuspend` (reasonCode CR/35) and `Resume On Cancel` (reasonCode BBL/20). **Suspend** and **Cancel** are forbidden for auto. |
+| Check IMEI eligibility | 4.1 | Used before any IMEI change. |
+| Change IMEI | 4.8 | Auto-allowed **only** as part of the gated repair flow §F.3: cancel→resume is forbidden; existing `fixSim` does cancel→resume→IMEI change inside rotation, which is rotation-domain. For the remediator we **do not** call Change IMEI; if IMEI mismatch is the root cause, escalate to operator (the existing rotation/repair flow owns it). |
+| Change ICCID / Change Plan / Update CTN/MDN / Cancel / Reset VM PIN | 4.9 / 4.10 / 4.16 / 4.6-Cancel / 4.12 | **Forbidden for auto.** |
 
-Existing report state machine (locked):
+### §A.4. Teltik (gateway-side; T-Mobile-style lines through SkyLine)
 
-```
-received → in_triage → remediated         (terminal)
-                    → unable_to_reproduce (terminal)
-                    → duplicate           (terminal)
-```
+REST on `https://api.smsgateway.xyz`; auth = `apikey` query param:
 
-`remediation_action ∈ { rotated, port_reset, sim_replaced, mdn_swapped, other }`.
+| Capability | Endpoint | Use in remediation |
+|---|---|---|
+| Get MDN for ICCID | `GET /v1/get-phone-number/?iccid=...` | Evidence + confirms ICCID known to Teltik. |
+| Get line info for MDN | `GET /v1/get-info?mdn=10digit` | Returns ICCID, gateway_id, port. |
+| Port status | `GET /v1/port-status?mdn=10digit` | Evidence (online/offline/registered). |
+| Reset port | `GET /v1/reset-port?mdn=10digit` | Idempotent (treats duplicate as 409 = already in flight). Auto-allowed for T4/T5. |
+| Reset network | `GET /v1/reset-network?mdn=10digit` | Lower-impact retry; allowed as a softer alternative before `/reset-port` in some branches (TBD per situation in §F.4). |
+| Send wake-up SMS | `GET /v1/send-wake-up-message?mdn=10digit` | NOT used as the SMS-verification path (that path uses SKYLINE_GATEWAY `/send-sms` per §C). Wake-up is a Teltik-internal signal. |
+| Change number / SIM swap / Forward URL change / Send freeform SMS | `/v1/change-number/` / `/v1/sim-swap/` / `POST /v1/forward-url` / `POST /v1/send-message` | **Forbidden for auto** in the remediator. |
 
-The worker writes only inside this contract.
+**MDN format rule at API boundary:** every Teltik client call that takes an MDN must strip `+1` and pass 10 digits. The boundary function `teltik.mdn10(e164)` is the only place E.164→10-digit conversion happens; classifier code never hand-strips digits. Tests assert no caller passes an E.164 to Teltik.
 
----
+### §A.5. SkyLine gateway (gateway / port health + send-SMS)
 
-## 3. Intake flow — what happens the moment a report arrives in scope
-
-This is the universal pipeline every report passes through before vendor-specific logic kicks in. It is the same for every carrier.
-
-```
-Step 0  Report appears (status received or in_triage, not paused, not in cooldown).
-Step 1  Resolve identifier → internal rental + SIM
-        Input: reseller_rental_id OR current e164 (only these two are accepted).
-        Output: { sim_id, iccid, current_mdn_e164, vendor, reseller_rental_id, sim.status, last_mdn_rotated_at }.
-        Failure: classify as mode J (insufficient evidence), record attempt, exit.
-
-Step 2  Gather DB evidence (single Supabase round-trip)
-        - sims row (status, vendor, iccid, current_mdn_e164, replaced_by_sim_id, cancelled_at)
-        - newest sim_numbers row for this rental
-        - latest webhook_deliveries row for this SIM's most recent number.online
-        - any other open rental_reports for the same reseller_rental_id within 24h
-        - rental_report_remediation_attempts history for this report (attempt_no, last action, cooldowns)
-
-Step 3  Decide current vendor/carrier
-        - sims.vendor is authoritative (atomic | wing_iot | helix | teltik | other).
-        - If sims.vendor is missing/unknown: classify as mode J, escalate.
-
-Step 4  Decide current rental identity
-        - reseller_rental_id from the report (locked, never changes).
-        - current MDN = sims.current_mdn_e164 (this can change over rental lifetime).
-        - If the report's submitted MDN differs from sims.current_mdn_e164: do NOT treat that as a mismatch error;
-          the resolver already accepts the rental's current MDN. Just log both for the evidence bundle.
-
-Step 5  Branch to vendor playbook (§5)
-        The chosen playbook owns: querying the vendor, classifying into a situation, picking the action,
-        applying retry/cooldown rules, deciding terminal disposition, and producing the evidence bundle.
-
-Step 6  Record outcome
-        - Always write one rental_report_remediation_attempts row (even classify-only).
-        - Always write one rental_report_events row (event_type='auto_remediation').
-        - On terminal disposition: update rental_reports.status + remediation_action via the same path
-          /api/bad-rentals/:id/update uses, so the dashboard timeline stays consistent.
-
-Step 7  Schedule next review
-        - Set rental_reports.next_review_at based on cooldown (§7).
-        - If escalation criteria met (§8), open or update the escalation Paperclip child issue.
-```
-
-Step 1's "first thing checked" is identifier resolution. Step 2's "what evidence" is the five sources above. Step 3 picks the playbook. The vendor playbook in §5 owns everything from "did we contact the vendor" onward.
+- `POST /send-sms` (via `SKYLINE_GATEWAY` service binding + `SKYLINE_SECRET`) — used for §C SMS verification.
+- `GET /port-status` — used for S5 gateway-port-offline detection.
+- IMEI on a port is read from gateway via existing SkyLine helpers (see `src/dashboard/index.js` lines 2452–2470 + 3131–3151).
 
 ---
 
-## 4. Shared situations (vendor-agnostic — checked before vendor playbook)
+## §B. IMEI correctness check (cross-vendor invariant)
 
-These are evaluated immediately after intake §3 step 4. They short-circuit before the worker contacts any vendor.
+Per operator: each SIM must have an IMEI matching its product type.
 
-| # | Situation | Detection (DB only) | Auto action | Terminal? |
-|---|---|---|---|---|
-| S1 | **Already cancelled** | `sims.status` ∈ (`cancelled`,`deactivated`,`retired`) and `sims.cancelled_at` ≤ report.created_at | Close `duplicate`, note "SIM cancelled at <ts>" | yes |
-| S2 | **Already replaced** | `sims.replaced_by_sim_id` set, OR a newer `sims` row for same `reseller_rental_id` | Close `duplicate` pointing at current SIM | yes |
-| S3 | **Duplicate report** | Another open report for same `reseller_rental_id` exists within 24h, equal or newer evidence | Close `duplicate` of canonical report | yes |
-| S4 | **Contract rejection already recorded** | Row exists in `rental_report_rejections` for this report | No action; system already rejected | yes |
-| S5 | **Gateway port offline** | SkyLine port-status: IMEI present, port `offline` | No auto-fix; escalate to operator (gateway power is operator domain) | escalate |
-| S6 | **Insufficient evidence** | Resolver fails OR no vendor inferable OR no DB row found | Classify-only this tick; retry up to 3 ticks; then escalate `unable_to_reproduce` | escalate after 3 ticks |
+- `vendor='wing_iot'` → IMEI must be a **router IMEI** (`device_type='router'` from the IMEI pool).
+- `vendor='atomic'` or `vendor='helix'` (phone SIMs) → IMEI must be a **phone IMEI** (`device_type='phone'`).
 
-If none of S1–S6 fires, intake hands off to the vendor playbook.
+Where the IMEI lives:
+- Gateway-side: SkyLine port reports current `imei` per slot.
+- DB-side: `sims.imei` (canonical for our records).
+- Vendor-side: Atomic inquiry returns `BLIMEI`/`NWIMEI`. Helix subscriber details return IMEI. Wing IoT does not store IMEI carrier-side.
+
+Check (`checkImeiCorrectness(sim)`):
+1. Resolve expected `device_type` from `sims.vendor`.
+2. Lookup IMEI pool row for `sims.imei`; assert its `device_type` matches.
+3. If gateway port reports a different IMEI than `sims.imei` → record `imei_drift_gateway`.
+4. For Atomic/Helix, compare `sims.imei` to vendor-reported IMEI; record `imei_drift_vendor`.
+
+Outcomes:
+- All match → ✅, no action.
+- Mismatch only in `device_type` (e.g. phone IMEI on a Wing SIM) → escalate operator with `imei_wrong_type` (worker does **not** auto-fix; existing rotation/repair flow owns IMEI rewrites).
+- Mismatch between DB and gateway, but both match expected type → record evidence and escalate; do not auto-fix.
+- Mismatch between DB and vendor-reported (Atomic/Helix) → record evidence; if all other signals are clean **and** the vendor IMEI is correct type, do a DB-only sync of `sims.imei` to vendor truth (no vendor write, no gateway write). Then still require SMS verification (§C) before resolving.
+
+Forbidden for auto: changing IMEI on the gateway, calling Helix 4.8, allocating new IMEIs.
 
 ---
 
-## 5. Vendor playbooks
+## §C. SMS verification — mandatory before every `remediated` close
 
-Each playbook has the same shape: situations → action → retry/cooldown/cap → evidence required to auto-resolve → escalation rules → vendor-contact rules.
+Every situation whose `auto_resolve_when` predicate fires must pass §C before the worker writes a terminal `remediated`. There is **no DB-sync-only resolve path** anymore.
 
-The "situations" set is intentionally similar across vendors so operators only need to memorize the shape once.
+### §C.1. Send
 
-### 5a. Atomic (AT&T ATOMIC API)
+1. Mint a unique payload: `body = "IncomingSMS test " + report_id + " " + sim_id + " " + nonce8` (≤ 160 chars; `nonce8` = 8 hex chars from a worker-side counter, not Math.random so it's resumable in workflow journals — uses the report id and attempt number salt).
+2. Send via dashboard's send-SMS path (`SKYLINE_GATEWAY` `/send-sms`) targeted at the SIM's current MDN.
+3. Record `verify_send_attempt` row in `rental_report_remediation_attempts` with `evidence = { nonce, body, send_request_id }`.
 
-**Read action:** `subscriber inquiry` by ICCID (authoritative SIM/MDN state).
-**Idempotent write actions allowed:** OTA refresh.
-**Forbidden actions (operator-only):** restore from suspend, deactivate, MDN swap, status changes.
+### §C.2. Send-side retry policy
 
-| # | Situation | Detection signal | Auto action | Retry / cooldown / cap | Evidence to auto-resolve | If still bad → notify |
+- If send returns 5xx, network error, or SkyLine rejects (non-2xx): wait **60 seconds**, retry.
+- Max **3 send attempts** in total.
+- All 3 fail → escalate to operator with `verify_send_failed`; do **not** mark the report fixed.
+
+### §C.3. Receive poll
+
+After a successful send:
+- Poll `inbound_sms` for any row where `to_number = sim.current_mdn_e164` (or 10-digit equivalent depending on storage convention) AND `body` contains `nonce8` AND `received_at > send_attempted_at`.
+- Polling cadence: every 10s for up to 5 minutes (30 polls). The remediator yields between polls; per-tick budget already accommodates this (§G).
+- On match: record `verify_received` evidence with the inbound_sms row id.
+- On timeout (no match in 5 minutes): record `verify_receive_timeout`; escalate to operator. Do **not** mark fixed.
+
+### §C.4. Clean-recheck criteria — what "fixed" means
+
+The worker only writes `status='remediated'` when **all** of the following are true in the same tick:
+
+1. Vendor read (Atomic inquiry / Wing GET / Helix details / Teltik port-status) reports the SIM in its expected healthy state for its vendor.
+2. The applied auto-action (or no-op for "vendor already healthy" cases) completed without vendor error.
+3. `webhook_deliveries` shows a delivered `number.online` for the SIM, either pre-existing or written within this tick by `reseller-sync /resend-online`.
+4. `inbound_sms` shows the §C.1 nonce SMS received from the SIM's current MDN within the §C.3 window.
+5. (Optional, situation-specific) for Teltik T4/T5: `/port-status` reports the port `online`/`registered` after reset.
+
+Any condition false → outcome `no_change` or `failed`, attempt counted, escalation per §6 (renumbered below to §G).
+
+### §C.5. Operator escalation triggers from §C
+
+- `verify_send_failed` after 3 attempts (60s gap each).
+- `verify_receive_timeout` after a successful send.
+- Any inconsistency between vendor-read (1) and SMS-receive (4) (e.g. vendor says active but SMS never arrives) → escalate as `vendor_active_no_sms`.
+
+---
+
+## §D. Notify-reseller — exactly two operations, nothing else
+
+When the worker decides a report is `remediated` or `duplicate`, the only reseller-facing effects are:
+
+1. **Resend `number.online` webhook** for the SIM (via `reseller-sync /resend-online`) — idempotent and already dedup'd by `sendWebhookWithDeduplication`.
+2. **Update the report status** via the existing dashboard write path (`/api/bad-rentals/:id/update`) so the reseller sees status changed in their view.
+
+No freeform message, no email, no SMS to the reseller, no portal banner, no new payload field. Anything beyond these two is operator-only.
+
+---
+
+## §E. Pre-close guard for cancelled/deactivated SIMs
+
+Applies to: S1 (already cancelled), A4 (Atomic deactivated), H4 (Helix cancelled), W4 (Wing inactive/suspended), T6 (Teltik suspended/cancelled). Before closing as `duplicate`:
+
+1. Query `rental_reports` and the source rental table for any rental that:
+   - References this SIM (by `sim_id`) OR this `reseller_rental_id`, AND
+   - Has not been ended/cancelled/expired in the reseller's system.
+2. If an active rental exists → **do not** close as duplicate. Classify as `vendor_cancelled_active_rental`, escalate to operator with full evidence bundle. This is its own escalation type for batching (§H).
+3. If no active rental → close as `duplicate` with note "SIM cancelled at <ts>; no active reseller rental remained".
+
+§C SMS verification does **not** apply to `duplicate` closures (we are not asserting the SIM works — we are asserting it's no longer in service AND no reseller is currently renting it).
+
+---
+
+## §F. Vendor playbooks (revised)
+
+All situations are subject to: §B IMEI check, §E cancel guard, §C SMS verification before any `remediated` close.
+
+### §F.1. Atomic (AT&T ATOMIC) — situations A1–A10
+
+| # | Situation | Detection | Auto action | Retry / cooldown / cap | Resolve when | If still bad |
 |---|---|---|---|---|---|---|
-| A1 | Vendor reports **active**, our DB says active, webhook delivered | inquiry: active; `webhook_deliveries.status=delivered`; reseller still reports bad | None vendor-side. Resend `number.online` (idempotent, via reseller-sync) | 2 attempts, 1h cooldown | new delivered webhook row appears within 30s of attempt | operator after 2nd fail |
-| A2 | Vendor reports **active**, our DB stale | inquiry: active; `sims.status` ≠ active | Sync `sims` row (UPSERT) | 1 attempt (idempotent) | DB row matches vendor | resolve `remediated` action=`other` same tick |
-| A3 | Vendor reports **suspended / barred / quota** | inquiry: status in suspended/barred/restricted | None vendor-side; classify, hold for batch | 0 attempts | n/a | escalate operator; if ≥5 same-account in 24h, queue for §8b batch ticket (vendor contact stays off by default) |
-| A4 | Vendor reports **deactivated / cancelled** | inquiry: cancelled / terminated | Mark our DB cancelled (sync only, no vendor call) | 1 attempt | DB matches vendor | close `duplicate` of cancellation |
-| A5 | **ICCID not found** at vendor | inquiry returns not-found | None automatic — possible data drift | 0 attempts | n/a | escalate operator with full ICCID + sim_id |
-| A6 | Vendor active **but webhook never delivered** | inquiry: active; no `webhook_deliveries` row with `status=delivered` for the latest `number.online` event | `reseller-sync /resend-online` (force:true, salted message_id) | 2 attempts, 1h cooldown | new delivered row within 30s | operator after 2nd fail |
-| A7 | Vendor active, webhook delivered, **reseller still reports bad** | A1 conditions + reseller reported within last 2h | OTA refresh via atomic-api (idempotent, vendor `request_id` recorded) | 1 attempt, 24h cooldown | OTA returns success AND next reseller check is clean | operator with OTA request_id + vendor response |
-| A8 | Vendor active but **current DB MDN differs from vendor MDN** | inquiry MDN ≠ `sims.current_mdn_e164` | Update `sims.current_mdn_e164` to vendor truth (sync only) + record divergence in evidence | 1 attempt (idempotent) | DB matches vendor | resolve `remediated` action=`other` |
-| A9 | **Unable to reproduce** (everything looks fine, no failure signal anywhere) | inquiry active, webhook delivered, no recent reseller report after report time | Classify-only | 3 ticks, 2h apart | n/a | escalate `unable_to_reproduce` after 3rd tick |
+| A1 | Vendor active, DB active, webhook delivered, reseller still reports bad | inquiry `attStatus=Active`; webhook delivered; recent reseller report | OTA refresh (`resendOtaProfile`) | 1 try, 24h cooldown | §C.4 1–4 all pass | operator |
+| A2 | Vendor active, DB stale | inquiry Active; `sims.status≠active` | DB UPSERT to vendor truth | 1 idempotent | §C.4 1–4 all pass (DB sync is not sufficient on its own) | operator |
+| A3 | Vendor suspended | inquiry `Suspended` | `restoreSubscriber` (reasonCode CR) | 1 try, 24h cooldown | inquiry returns Active AND §C.4 1–4 pass | operator |
+| A4 | Vendor deactivated/cancelled | inquiry `Cancelled`/`Deactivated` | §E pre-close guard; if no active rental → close `duplicate`; otherwise escalate `vendor_cancelled_active_rental` | 0 fix attempts | §E.3 | escalate per §E |
+| A5 | ICCID not found at vendor | inquiry `not-found` | none | 0 | n/a | escalate `vendor_iccid_not_found` |
+| A6 | Vendor active, webhook missing | inquiry Active; no delivered webhook for latest `number.online` | `reseller-sync /resend-online` (force, salted id) | 2 tries, 1h cooldown | delivered row appears AND §C.4 1–4 pass | operator after 2nd fail |
+| A7 | Vendor active, IMEI drift (vendor IMEI ≠ DB IMEI but both correct type) | inquiry returns BLIMEI/NWIMEI; differs from `sims.imei` | DB UPSERT `sims.imei` to vendor IMEI | 1 idempotent | §C.4 1–4 pass (with §B re-check clean) | operator |
+| A8 | Vendor active, IMEI wrong type (phone SIM has router IMEI etc.) | §B check fails on `device_type` | none — operator-only | 0 | n/a | escalate `imei_wrong_type` |
+| A9 | Vendor active, MDN differs DB vs vendor | inquiry MDN ≠ `sims.current_mdn_e164` | DB UPSERT to vendor MDN | 1 idempotent | §C.4 1–4 pass (verify SMS at vendor MDN) | operator |
+| A10 | Unable to reproduce | inquiry Active; webhook delivered; §C SMS verifies OK; no recent reseller failure signal | classify-only | 3 ticks @ 2h | n/a — terminal goes to `unable_to_reproduce` on 3rd | terminal after 3 |
 
-Vendor contact (Atomic support): off by default. Only enabled via per-carrier operator toggle and only for A3 batch (≥5 same-account suspended/barred in 24h). Message bundle template in §8b. Never sends reseller name, reseller_rental_id, or internal sim_id.
+### §F.2. Wing IoT — W1–W9
 
-### 5b. Wing IoT (AT&T IoT, Wing Tel)
-
-**Read action:** device status by ICCID.
-**Idempotent write actions allowed:** OTA refresh, MDN-mode change is **operator-only** (changes between dialable/non-dialable affect billing).
-**Forbidden actions (operator-only):** MDN-mode change, deactivation, plan change.
-
-| # | Situation | Detection | Auto action | Retry/cooldown/cap | Evidence to auto-resolve | If still bad → notify |
+| # | Situation | Detection | Auto action | Retry / cooldown / cap | Resolve when | If still bad |
 |---|---|---|---|---|---|---|
-| W1 | Vendor active, DB stale | device active; `sims.status` ≠ active | DB UPSERT | 1 idempotent attempt | DB matches | resolve `remediated`/`other` |
-| W2 | Vendor active, webhook missing | active; no delivered webhook | resend_online | 2 attempts, 1h cooldown | delivered row appears | operator after 2nd fail |
-| W3 | Vendor active, webhook delivered, reseller still bad | active + delivered + recent report | wing-iot refresh | 1 attempt, 24h cooldown | refresh OK + clean recheck | operator |
-| W4 | Vendor inactive/suspended | device suspended/quota | none vendor-side | 0 | n/a | escalate operator; queue for batch if ≥5 in 24h |
-| W5 | ICCID not found | not-found | none | 0 | n/a | escalate operator |
-| W6 | Vendor active, MDN differs from DB | device MDN ≠ DB MDN | DB UPSERT to vendor truth | 1 idempotent | DB matches | resolve `remediated`/`other` |
-| W7 | Wing reports device active but mode wrong (e.g. non-dialable when expected dialable) | mode mismatch with rental contract | none — operator-only | 0 | n/a | escalate operator with mode evidence |
-| W8 | Unable to reproduce | all clean, no recent reseller failure signal | classify-only | 3 ticks @ 2h | n/a | escalate `unable_to_reproduce` |
+| W1 | Vendor active dialable, DB stale | GET Activated + dialable plan; `sims.status≠active` | DB UPSERT | 1 idempotent | §C.4 1–4 pass | operator |
+| W2 | Vendor active, webhook missing | Activated + dialable; no delivered webhook | resend_online | 2 tries, 1h cooldown | delivered + §C.4 1–4 pass | operator |
+| W3 | Vendor active dialable, reseller still bad | Activated + dialable + recent report | (no OTA exists for Wing) — `resend_online` + §C SMS | 1 try, 24h cooldown | §C.4 1–4 pass | operator |
+| W4 | Vendor inactive/suspended | GET `status≠Activated` | none vendor-side | 0 | n/a | escalate; §E if cancellation suspected |
+| W5 | ICCID not found | GET 404 | none | 0 | n/a | escalate `vendor_iccid_not_found` |
+| W6 | DB MDN differs from vendor MDN | GET MDN ≠ DB MDN | DB UPSERT | 1 idempotent | §C.4 1–4 pass (verify SMS at vendor MDN) | operator |
+| W7 | Mode wrong — expected dialable, currently non-dialable (ABIR) | GET `communicationPlan = "ABIR 25Mbps"` while rental expects dialable | PUT `NON ABIR SMS MO/MT US` (dialable plan) | 1 try, 24h cooldown | GET shows NON ABIR plan + dialable MDN AND §C.4 1–4 all pass | operator (do not mark fixed without GET-verify + SMS-verify per §C) |
+| W8 | IMEI wrong type (phone IMEI on Wing SIM) | §B check | none — operator-only | 0 | n/a | escalate `imei_wrong_type` |
+| W9 | Unable to reproduce | all clean + §C SMS verifies | classify-only | 3 ticks @ 2h | n/a | `unable_to_reproduce` after 3 |
 
-Vendor contact: off by default. Toggle-gated batch ticket for W4 only.
+### §F.3. Helix (T-Mobile via SOLO) — H1–H9
 
-### 5c. T-Mobile via Helix (activation API)
-
-**Read action:** subscriber state by ICCID.
-**Idempotent write actions allowed:** OTA refresh.
-**Forbidden actions:** activation/deactivation/status changes — operator-only. Helix is primarily activation-side; ongoing state lives in Teltik (see 5d) for SMS lines.
-
-| # | Situation | Detection | Auto action | Retry/cooldown/cap | Evidence to auto-resolve | If still bad → notify |
+| # | Situation | Detection | Auto action | Retry / cooldown / cap | Resolve when | If still bad |
 |---|---|---|---|---|---|---|
-| H1 | Helix says subscriber active, DB stale | active; DB ≠ active | DB UPSERT | 1 idempotent | DB matches | resolve `remediated`/`other` |
-| H2 | Helix says active, webhook missing | active; no delivered webhook | resend_online | 2 attempts, 1h cooldown | delivered row appears | operator |
-| H3 | Helix says active, webhook delivered, reseller still bad | active + delivered + recent report | helix OTA refresh | 1 attempt, 24h cooldown | OTA success + clean recheck | operator |
-| H4 | Helix says inactive/suspended | suspended/cancelled | none vendor-side | 0 | n/a | escalate operator; batch if ≥5 |
-| H5 | ICCID not found in Helix | not-found | none | 0 | n/a | escalate operator |
-| H6 | DB MDN differs from Helix MDN | mismatch | DB UPSERT to vendor truth | 1 idempotent | DB matches | resolve `remediated`/`other` |
-| H7 | Activation stuck mid-flow | Helix status in pending/provisioning state for >6h | none — operator-only (activation finalisation) | 0 | n/a | escalate operator with Helix request id |
-| H8 | Unable to reproduce | all clean | classify-only | 3 ticks @ 2h | n/a | escalate `unable_to_reproduce` |
+| H1 | Active, DB stale | 4.7 details Active; DB ≠ active | DB UPSERT | 1 idempotent | §C.4 1–4 pass | operator |
+| H2 | Active, webhook missing | Active; no delivered | resend_online | 2 tries, 1h cooldown | delivered + §C.4 1–4 pass | operator |
+| H3 | Active, reseller still bad | Active + delivered + recent report | OTA refresh (4.11) | 1 try, 24h cooldown | §C.4 1–4 pass | operator |
+| H4 | Suspended | 4.7 state `Suspended` | 4.6 `Unsuspend` (reasonCode CR/35) | 1 try, 24h cooldown | 4.7 Active AND §C.4 1–4 pass | operator |
+| H5 | Cancelled | 4.7 state `Cancelled` | §E pre-close guard; if active rental → escalate `vendor_cancelled_active_rental`; else close `duplicate`. Worker does **not** call Resume On Cancel automatically (operator domain — too easy to revive a SIM the reseller already moved on from). | 0 auto-fix | §E | per §E |
+| H6 | ICCID not in Helix | 4.7 returns not-found | none | 0 | n/a | escalate |
+| H7 | DB MDN differs from Helix MDN | mismatch | DB UPSERT | 1 idempotent | §C.4 1–4 pass | operator |
+| H8 | IMEI wrong / drift | §B check fails (type or drift) | none — operator-only (4.8 Change IMEI is forbidden for auto) | 0 | n/a | escalate `imei_wrong_type` or `imei_drift_vendor` |
+| H9 | Unable to reproduce | all clean + §C SMS verifies | classify-only | 3 ticks @ 2h | n/a | `unable_to_reproduce` after 3 |
 
-Vendor contact: off by default.
+### §F.4. Teltik — T1–T11
 
-### 5d. Teltik (T-Mobile SMS gateway)
-
-**Read action:** line status by ICCID/MDN, port status, last SMS receive.
-**Idempotent write actions allowed:** `/reset-port`, `/port-status`, OTA-style refresh.
-**Forbidden actions:** SIM swap, line cancel, forward URL change — operator-only.
-
-| # | Situation | Detection | Auto action | Retry/cooldown/cap | Evidence to auto-resolve | If still bad → notify |
+| # | Situation | Detection | Auto action | Retry / cooldown / cap | Resolve when | If still bad |
 |---|---|---|---|---|---|---|
-| T1 | Teltik active, DB stale | active; DB ≠ active | DB UPSERT | 1 idempotent | DB matches | resolve `remediated`/`other` |
-| T2 | Teltik active, webhook missing | active; no delivered webhook | resend_online | 2 attempts, 1h cooldown | delivered row appears | operator |
-| T3 | Teltik active, webhook delivered, reseller still bad | active + delivered + recent report | OTA refresh + port-status check | 1 attempt, 24h cooldown | refresh OK + port reports healthy + clean recheck | operator |
-| T4 | Teltik port **stuck pending** > 6h | port-status: state in pending/in-progress > 6h | `/reset-port` (10-digit MDN, idempotent; 409 = already in flight = treat as success) | 1 attempt, 24h cooldown | port-status flips to active within 30 min OR next reseller check clean | operator with reset request id |
-| T5 | Teltik port offline / not responding | port-status: offline | `/reset-port` | 1 attempt, 24h cooldown | port-status flips to active | operator |
-| T6 | Teltik says inactive/suspended | suspended/cancelled | none vendor-side | 0 | n/a | escalate operator; batch if ≥5 in 24h |
-| T7 | ICCID/MDN not found in Teltik | not-found | none | 0 | n/a | escalate operator |
-| T8 | DB MDN differs from Teltik MDN | mismatch | DB UPSERT to vendor truth | 1 idempotent | DB matches | resolve `remediated`/`other` |
-| T9 | Forward URL missing/wrong | port-status returns no forward URL or wrong URL | none — operator-only (URL change is config) | 0 | n/a | escalate operator with current URL |
-| T10 | Unable to reproduce | all clean | classify-only | 3 ticks @ 2h | n/a | escalate `unable_to_reproduce` |
+| T1 | Active, DB stale | `/get-phone-number` + `/port-status` healthy; DB ≠ active | DB UPSERT | 1 idempotent | §C.4 1–4 pass | operator |
+| T2 | Active, webhook missing | healthy; no delivered | resend_online | 2 tries, 1h cooldown | delivered + §C.4 1–4 pass | operator |
+| T3 | Active, reseller still bad | healthy + delivered + recent report | `/reset-network` then re-check; if still bad → `/reset-port` | 1 try each, 24h cooldown | port online + §C.4 1–4 pass | operator |
+| T4 | Port stuck pending > 6h | `/port-status` state pending/in-progress > 6h | `/reset-port` (10-digit MDN; 409 = success) | 1 try, 24h cooldown | port flips to active + §C.4 1–4 pass | operator |
+| T5 | Port offline | `/port-status` offline | `/reset-port` | 1 try, 24h cooldown | port online + §C.4 1–4 pass | operator |
+| T6 | Teltik suspended/cancelled | `/get-info` returns terminal | §E pre-close guard | 0 fix | §E | per §E |
+| T7 | ICCID/MDN not in Teltik | not-found | none | 0 | n/a | escalate |
+| T8 | DB MDN differs from Teltik MDN | mismatch | DB UPSERT to Teltik truth | 1 idempotent | §C.4 1–4 pass | operator |
+| T9 | Forward URL missing/wrong | `/forward-url` GET returns absent/wrong | none — operator-only (URL change is config) | 0 | n/a | escalate `teltik_forward_url_misconfigured` |
+| T10 | IMEI check fails | §B | none — operator-only | 0 | n/a | escalate |
+| T11 | Unable to reproduce | all clean + §C SMS verifies | classify-only | 3 ticks @ 2h | n/a | `unable_to_reproduce` after 3 |
 
-Vendor contact: off by default.
-
-### 5e. Other / unknown vendor
-
-If `sims.vendor` is null or not in the set above: classify as S6 (insufficient evidence), escalate to operator after 3 ticks with full DB dump for that SIM. Worker never invents a vendor.
+### §F.5. Other / unknown vendor — falls to S6 (insufficient evidence).
 
 ---
 
-## 6. Per-branch decision rules (the contract every situation must satisfy)
+## §G. Scheduler, idempotency, attempt caps
 
-Every row in the vendor tables above is bound to the same five-field contract. Implementation must enforce this at the type level (classifier returns a discriminated union; one branch per situation).
+(Unchanged from v2 except for cooldown/budget bumps to fit §C polling.)
 
-```
-Situation := {
-  id: 'A1' | 'A2' | ... | 'T10' | 'S1' | ... | 'S6',
-  auto_action: 'none' | 'resend_online' | 'db_sync_upsert' | 'atomic_ota'
-              | 'wing_iot_refresh' | 'helix_ota' | 'teltik_ota' | 'teltik_reset_port'
-              | 'close_duplicate' | 'classify_only',
-  retry: { max_attempts: int, cooldown_minutes: int },
-  auto_resolve_when: <predicate over evidence>,    // exactly what must be true to mark terminal
-  on_failure: 'operator_escalate' | 'vendor_batch_queue' | 'classify_again',
-  evidence_bundle: <list of fields the escalation includes>
-}
-```
+- Cron `0 */2 * * *`. Per-tick budget 60s (was 25s — raised to accommodate §C SMS poll up to 5 min only when needed; the poll runs in a Durable Object–style continuation rather than blocking the cron tick. For Workers Cron, the 5-minute poll runs via `setTimeout`/queued `waitUntil` chained off the initial tick; if Workers cron's hard limit prevents that, the worker schedules a single follow-up via a 1-min cron checking the `verify_pending` table — design decision deferred to INC-16a).
+- Concurrency cap: 5 reports in flight per tick.
+- `auto_remediation_state` machine:
+  - `queued` → `in_progress` → terminal close OR `escalated` OR `verify_pending` OR `paused`/`operator_locked`.
+  - **`operator_locked`** is new: set by the dashboard "Take over" action. Worker skips locked reports entirely.
+- Kill-switch KV `bad_rental_remediator_enabled=false` halts the worker before any vendor write call.
+- Per-report row lock CAS on `auto_remediation_state='in_progress'`.
 
-Terminal mappings (these are the only terminal outcomes the worker may write):
+Cooldown table (revised):
 
-- `remediated` + `remediation_action='other'` — used for db_sync_upsert and OTA-refresh-succeeded paths.
-- `remediated` + `remediation_action='port_reset'` — used only for teltik_reset_port success.
-- `duplicate` — used for S1/S2/S3 and A4 (already cancelled at vendor).
-- `unable_to_reproduce` — used only after the configured classify-only ticks exhaust.
-
-`remediation_action` values `rotated`, `sim_replaced`, `mdn_swapped` are **never** written by the worker (those are operator-only actions reported via existing dashboard endpoints).
-
----
-
-## 7. Idempotency, cooldowns, attempt caps
-
-| Auto action | Max attempts | Cooldown | Idempotency key | Notes |
-|---|---|---|---|---|
-| `db_sync_upsert` | 1 | n/a | `(sim_id)` natural | UPSERT on sims by sim_id; safe to re-run |
-| `resend_online` | 2 | 1h | `(report_id, sim_id, attempt_no)` salted into webhook message_id | `sendWebhookWithDeduplication` already dedupes on receiver side |
-| `atomic_ota` | 1 | 24h | vendor request_id recorded | Atomic OTA returns same request_id if called twice within window |
-| `wing_iot_refresh` | 1 | 24h | vendor request_id | idempotent by ICCID |
-| `helix_ota` | 1 | 24h | vendor request_id | idempotent by ICCID |
-| `teltik_ota` | 1 | 24h | vendor request_id | idempotent by ICCID |
-| `teltik_reset_port` | 1 | 24h | Teltik treats duplicate as 409 (success) | 10-digit MDN, not E.164 |
-| `close_duplicate` | 1 | n/a | terminal | one-shot |
-| `classify_only` | 3 ticks | 2h | per `(report_id, mode)` | exhausts to `unable_to_reproduce` |
-
-Worker concurrency:
-
-- Cron: `0 */2 * * *`.
-- Per tick: process up to 100 reports; concurrency cap of 5 in flight via `relayFetch` batching (mirrors `reseller-sync`).
-- Per-report row lock via `auto_remediation_state='in_progress'` CAS before any work; reset to prior state on exit. Operator dashboard edits during a tick cannot collide.
-- 25s wall-clock budget; remaining reports carry to next tick via `next_review_at` cursor.
-- Kill-switch KV `bad_rental_remediator_enabled=false` halts the worker before any vendor call.
+| Action | Max attempts | Cooldown | Idempotency key |
+|---|---|---|---|
+| `db_sync_upsert` | 1 | n/a | `(sim_id)` |
+| `resend_online` | 2 | 1h | `(report_id, sim_id, attempt_no)` salted into message_id |
+| `atomic_ota` (`resendOtaProfile`) | 1 | 24h | vendor request_id |
+| `atomic_restore` (`restoreSubscriber CR`) | 1 | 24h | (MSISDN) idempotent at vendor |
+| `wing_put_dialable` | 1 | 24h | (ICCID) |
+| `helix_ota` (4.11) | 1 | 24h | vendor request_id |
+| `helix_unsuspend` (4.6 CR) | 1 | 24h | vendor request_id |
+| `teltik_reset_network` | 1 | 24h | (MDN10) |
+| `teltik_reset_port` | 1 | 24h | (MDN10) — 409 = success |
+| `verify_send_sms` (§C) | 3 | 60s between sends | (report_id, attempt_no, nonce) |
+| `classify_only` | 3 ticks | 2h | (report_id, mode) |
 
 ---
 
-## 8. Safety gates & escalation
+## §H. Safety gates & escalation
 
-### 8a. What can run fully automatic
+### §H.1. Auto-allowed actions
+Reading vendor state; DB UPSERT to vendor truth; `resend_online`; OTA refresh (Atomic/Helix); `restoreSubscriber` (Atomic, with §C verify); `unsuspend` (Helix 4.6 CR, with §C verify); Wing PUT dialable plan; Teltik `/reset-network`, `/reset-port`; close `duplicate` per §E; `unable_to_reproduce` after exhausted classify-only ticks; §C `verify_send_sms`.
 
-- Reading vendor state (always allowed).
-- DB sync UPSERT (always allowed).
-- `resend_online` webhook (always allowed; reseller-side dedup'd).
-- OTA refresh (Atomic / Wing IoT / Helix / Teltik) — allowed once per 24h per SIM, idempotent.
-- Teltik `/reset-port` — allowed once per 24h per port, idempotent.
-- Close as `duplicate` for S1/S2/S3/A4 — allowed.
-- Mark `unable_to_reproduce` after exhausted classify-only ticks — allowed.
+### §H.2. Always operator-only
+Rotation / MDN swap / SIM swap / replacement / cancel / deactivate; Wing mode change to non-dialable; Helix `Cancel`, `Resume On Cancel`, `Change IMEI`, `Change ICCID`, `Change Plan`, `Update CTN/MDN`; Atomic `swapMSISDN`, `suspendSubscriber`, `deactivateSubscriber`; Teltik SIM swap / forward URL change / `/change-number`; any reseller-facing message beyond §D's two operations; any IMEI write on gateway or vendor side.
 
-### 8b. What requires operator approval (always)
+### §H.3. Operator escalation (Paperclip)
+- Channel: Paperclip child issue per `(vendor, failure_type, tick)` batch (so 12 H4-suspended Helix SIMs in one tick = one child issue with 12 line items, not 12 issues).
+- Failure types used in batching: `verify_send_failed`, `verify_receive_timeout`, `vendor_active_no_sms`, `vendor_iccid_not_found`, `imei_wrong_type`, `imei_drift_vendor`, `vendor_cancelled_active_rental`, `wing_w7_dialable_retry_failed`, `helix_unsuspend_failed`, `atomic_restore_failed`, `teltik_reset_failed`, `teltik_forward_url_misconfigured`, `unable_to_reproduce_recommendation`, plus a fallback `generic`.
+- Body fields per line item: `report_id`, `reseller_rental_id`, current MDN, vendor, situation id, attempts table (action / outcome / vendor request_id), latest vendor state, latest webhook delivery state, §C verify-state (sent? received?), suggested next operator action.
+- No secrets. ICCID is allowed in operator-facing escalations because operators see it in the dashboard already; never in reseller-facing surfaces.
 
-- Rotation / MDN swap / SIM swap / replacement / cancel — never auto.
-- Wing IoT MDN-mode change (dialable ↔ non-dialable).
-- Helix activation finalisation / state changes.
-- Teltik forward URL / SIM swap / cancel.
-- Any reseller-facing message beyond the webhook resend.
-- Any vendor support ticket / batch contact.
-
-### 8c. Operator escalation — Paperclip child issue
-
-Triggered by any `on_failure: 'operator_escalate'`. Worker opens one issue per tick that batches the day's escalations (recommendation pending operator answer to open question 2 in §11).
-
-Body fields (no secrets):
-
-```
-Report: <rental_reports.id> (reseller_rental_id <…>, current MDN <…>)
-Vendor: <atomic|wing_iot|helix|teltik|other>
-Situation: <A1|A7|T4|…> — <human description>
-Auto attempts:
-  - attempt 1 at <ts>: action=<…> outcome=<…> evidence=<vendor request_id|webhook delivery id|…>
-  - attempt 2 at <ts>: …
-Latest vendor state: <suspended|active|barred|not_found|…>
-Latest webhook state: <delivered <ts> | none >
-Suggested next operator action: <"rotate by hand"|"open carrier ticket"|"replace SIM"|"check gateway power"|…>
-```
-
-### 8d. Vendor contact (batched ticket)
-
-Default off per carrier. Operator must flip a per-carrier toggle in the dashboard (admin panel) before the worker is allowed to open any vendor-directed ticket.
-
-Trigger condition (when toggle is on):
-- ≥5 SIMs in the same vendor account hit `*4` situations (A3/W4/H4/T6) within 24h.
-
-Message template (vendor-side, never includes reseller-facing identifiers):
-
-```
-Subject: <Vendor> activation issue — batch of <N> SIMs (account <X>)
-Body:
-  Account: <X>
-  N affected SIMs: <count>
-  Representative ICCIDs: <iccid1>, <iccid2>, <iccid3>   (vendor-side identifiers only)
-  Current vendor-reported state: <suspended/barred/…>
-  Last known active: <date>
-  Reference: bad-rental batch <UUID>
-  Request: please review activation/state for the listed ICCIDs.
-```
-
-No reseller name, no `reseller_rental_id`, no internal `sim_id`, no MDN, no contact information beyond the operator's standard support channel.
+### §H.4. Vendor batched ticket (still toggle-gated, default off)
+Same template as v2 §8d. Trigger: ≥5 SIMs in same vendor account with terminal-suspended/barred situation in 24h, AND per-carrier operator toggle = on. Until toggle on, those SIMs only go to §H.3 batch.
 
 ---
 
-## 9. Audit trail
+## §I. Audit trail & dashboard surfacing
 
-Every tick, for every report touched:
-
-1. One row in `rental_report_remediation_attempts`:
-   - `report_id`, `attempt_no`, `mode` (A1/W3/T4/S1/…), `action`, `outcome` (`success`/`failed`/`no_change`/`skipped_cooldown`), `evidence` jsonb (vendor request_id, webhook delivery id, port-status snapshot — never secrets), `error_message`, `next_review_at`.
-2. One row in `rental_report_events` with `event_type='auto_remediation'`, payload matching attempt evidence.
-3. On terminal close, the existing `/api/bad-rentals/:id/update` write path is invoked (server-side, not via HTTP) so the dashboard timeline reflects auto closures with the same row shape as manual closures.
-
-Daily summary appended to `agent/current-state.md` by the worker (or filed as a Paperclip issue — see open question 1 in §11).
+- Every tick writes one `rental_report_remediation_attempts` row per attempted action (including `verify_send_sms` and `verify_received` evidence rows).
+- Every tick writes one `rental_report_events` row with `event_type='auto_remediation'`, payload `{mode, action, attempt_no, outcome, evidence_summary}`. No secrets.
+- Terminal close writes status update via existing dashboard write path so the timeline matches manual closures.
+- Dashboard additions (in INC-16e):
+  - "Auto attempts: N (last: <action> <outcome>)" sub-row on the Bad Rentals list.
+  - "Take over" button → sets `auto_remediation_state='operator_locked'` and reassigns ownership to the operator.
+  - "Resume auto" button → clears the lock.
+  - Guide-tab HTML decision tree (§K).
 
 ---
 
-## 10. Data model additions
-
-Single new table + three additive columns on `rental_reports`. Migration file: `migrations/2026-06-07_bad_rental_remediation_attempts.sql`. Apply via `mcp__supabase__apply_migration` per [constraints.md].
+## §J. Data model additions
 
 ```sql
 create table if not exists rental_report_remediation_attempts (
   id               bigserial primary key,
   report_id        bigint not null references rental_reports(id) on delete cascade,
   attempt_no       int    not null,
-  mode             text   not null,             -- 'A1'..'T10' | 'S1'..'S6'
-  action           text   not null,             -- enum from §6 auto_action set
+  mode             text   not null,                   -- 'A1'..'T11' | 'S1'..'S6' | 'verify_send' | 'verify_received'
+  action           text   not null,                   -- enum from §G table
   attempted_at     timestamptz not null default now(),
-  outcome          text   not null,             -- 'success'|'failed'|'no_change'|'skipped_cooldown'
-  evidence         jsonb,
+  outcome          text   not null,                   -- 'success'|'failed'|'no_change'|'skipped_cooldown'|'verify_pending'
+  evidence         jsonb,                             -- vendor request ids, webhook ids, nonces (NO secrets)
   error_message    text,
   next_review_at   timestamptz
 );
@@ -358,135 +335,122 @@ create index if not exists rrra_next_review_idx
   where next_review_at is not null;
 
 alter table rental_reports
-  add column if not exists auto_remediation_state text,    -- 'queued'|'in_progress'|'paused'|'escalated'|'done'
+  add column if not exists auto_remediation_state text,   -- 'queued'|'in_progress'|'verify_pending'|'paused'|'operator_locked'|'escalated'|'done'
   add column if not exists last_auto_attempt_at timestamptz,
-  add column if not exists escalation_reason text;
+  add column if not exists escalation_reason text,
+  add column if not exists verify_pending_nonce text,
+  add column if not exists verify_pending_sent_at timestamptz;
 ```
 
-No change to `rental_reports.status` enum or `remediation_action` enum. No change to the resolver contract. No change to existing dashboard endpoints (a new endpoint `POST /api/bad-rentals/:id/pause-auto` is added in the dashboard worker, but that is a small additive surface, not a contract change).
+No change to `rental_reports.status` enum or `remediation_action` enum.
 
 ---
 
-## 11. Open questions for operator (must be answered before go-live)
+## §K. Operator decision tree (vendor-aware, SMS-verify-everywhere)
 
-1. **Daily summary destination** — append to `agent/current-state.md` (existing convention) or open one Paperclip child issue per day?
-2. **Operator escalation grouping** — one child issue per escalated report, or one batch issue per tick listing all escalations? (Recommendation: one batch issue per tick.)
-3. **Vendor contact toggle granularity** — global, per-carrier, or per-carrier-and-situation? (Recommendation: per-carrier.)
-4. **Pre-go-live dry-run threshold** — what classifier accuracy bar must be met before the worker is allowed to take any vendor write action? (Recommendation: ≥90% agreement on terminal classification against the last 200 operator-closed reports, computed offline before deploy.)
+```
+                  ┌───────────────────────────┐
+                  │  2h cron tick             │
+                  └────────────┬──────────────┘
+                               ▼
+        Fetch open reports (status received|in_triage,
+        auto_remediation_state NOT IN paused|operator_locked|verify_pending)
+                               │
+                               ▼
+                §intake: resolve id, gather evidence, decide vendor
+                               │
+                               ▼
+                §B IMEI correctness check
+                  ├─ wrong type ──► escalate imei_wrong_type
+                  └─ ok ──┐
+                          ▼
+                §E cancel-guard (if vendor reports cancelled/deactivated)
+                  ├─ active rental remains ──► escalate vendor_cancelled_active_rental
+                  └─ no active rental ──► close duplicate
+                          │ (cancel-guard didn't fire)
+                          ▼
+                §4 shared situations S1–S6
+                          │ (none fired)
+                          ▼
+                Branch on sims.vendor:
+                ├ atomic   → §F.1 (A1..A10)
+                ├ wing_iot → §F.2 (W1..W9)
+                ├ helix    → §F.3 (H1..H9)
+                ├ teltik   → §F.4 (T1..T11)
+                └ other    → S6 (insufficient evidence)
+                          │
+                          ▼
+                Apply auto_action per situation (if cooldown allows)
+                          │
+                          ▼
+                Re-query vendor → §C.4 conditions 1, 2, 3 satisfied?
+                          ├─ no  ──► record outcome, escalate per situation
+                          └─ yes ──┐
+                                   ▼
+                §C.1 send unique SMS
+                  ├─ send fail ──► §C.2 retry up to 3×60s
+                  │                  └─ all fail ──► escalate verify_send_failed
+                  └─ send ok ──┐
+                               ▼
+                set verify_pending; schedule §C.3 poll
+                               │
+                               ▼
+                §C.3 inbound_sms match within 5 min?
+                  ├─ no  ──► escalate verify_receive_timeout
+                  └─ yes ──► §D notify-reseller (resend webhook + status update)
+                                                       ──► remediated
+```
+
+Renders in dashboard Guide tab — no new tab.
 
 ---
 
-## 12. Operator decision tree (full, vendor-aware)
+## §L. Tests & verification
 
-```
-                 ┌─────────────────────┐
-                 │  2h cron tick       │
-                 └──────────┬──────────┘
-                            ▼
-        ┌────────────────────────────────────────┐
-        │ Fetch open reports (received|in_triage)│
-        │ not paused, not in cooldown             │
-        └──────────────────┬─────────────────────┘
-                           ▼
-        ┌─────────────────────────────────┐
-        │ Intake (§3)                     │
-        │  resolve identifier             │
-        │  pull DB evidence               │
-        │  decide vendor                  │
-        └──────────┬──────────────────────┘
-                   ▼
-        ┌─────────────────────────────────┐
-        │ Shared situations (§4)          │
-        │ S1 already cancelled?           │ → close duplicate
-        │ S2 already replaced?            │ → close duplicate
-        │ S3 duplicate report?            │ → close duplicate
-        │ S4 contract rejected?           │ → no action
-        │ S5 gateway port offline?        │ → escalate operator
-        │ S6 insufficient evidence?       │ → 3 ticks then unable_to_reproduce
-        └──────────┬──────────────────────┘
-                   ▼ none fired
-        ┌─────────────────────────────────┐
-        │ Branch on sims.vendor           │
-        └──┬───────────┬───────────┬───────┬───────┐
-           ▼           ▼           ▼       ▼       ▼
-        atomic     wing_iot      helix   teltik  other
-         (5a)       (5b)         (5c)    (5d)    (5e=S6)
-           │           │           │       │
-           ▼           ▼           ▼       ▼
-        situation classifier (A1..A9 / W1..W8 / H1..H8 / T1..T10)
-           │
-           ▼
-        ┌────────────────────────────────────────────────────┐
-        │ Per-branch contract (§6):                          │
-        │   pick auto_action, retry, cooldown, cap           │
-        │   apply auto_action if allowed and not in cooldown │
-        │   re-query evidence                                │
-        │   does evidence satisfy auto_resolve_when?         │
-        └──────────────┬────────────────────────┬────────────┘
-                       │ YES                    │ NO
-                       ▼                        ▼
-              close terminal           on_failure rule:
-              (remediated / dup /         operator_escalate (§8c)
-               unable_to_reproduce)       vendor_batch_queue (§8d, toggle-gated)
-                                          classify_again (next tick)
-                       │                        │
-                       └──────────┬─────────────┘
-                                  ▼
-                       record attempt + event,
-                       set next_review_at
-```
-
-An HTML rendering of this tree ships in the dashboard's existing **Guide** tab so the operator can click any node and jump to the situation row in §5. No new dashboard tab.
-
----
-
-## 13. Tests & verification
-
-Pre-merge (contract tests — must pass before any deploy):
-
-- Classifier: one fixture per situation across §4 + §5 (≈35 fixtures). Exact-match assertion on (situation_id, auto_action, retry, on_failure).
-- Forbidden-action guard: a property test that runs the full classifier across a generated state space and asserts `auto_action ∉ {rotation, swap, cancel, replace, reseller_message_non_webhook}`. Construction-time invariant.
-- Idempotency: same report through 3 ticks → exactly the configured attempt count; no duplicate webhook sends; no duplicate event rows.
-- Cooldown clock: simulated clock advance honors per-action cooldowns.
-- Resolver contract: only accepts `reseller_rental_id` or current MDN. Rejecting SIM ID / ICCID / stale MDN remains tested.
+Pre-merge:
+- Classifier fixture per situation (S1–S6, A1–A10, W1–W9, H1–H9, T1–T11).
+- Property test: classifier outputs never include forbidden actions from §H.2.
+- §C send/poll fixtures (success, send-fail-then-success, send-fail-3x, receive-timeout, receive-match).
+- §E cancel-guard fixtures: cancelled+no-rental, cancelled+active-rental.
+- §B IMEI correctness fixtures per `(vendor, device_type)` combination.
+- Teltik MDN boundary test: any classifier path that hits Teltik passes 10-digit, never E.164.
+- Idempotency: 3 ticks → exact attempt counts, no duplicate webhook resends, no duplicate `verify_send` rows.
 
 Pre-deploy:
-
-- `node _check_relay.js` per [constraints.md].
-- **Offline dry-run** (not a phase — a single verification step): replay the last 200 operator-closed reports through the classifier with `AUTO_REMEDIATOR_DRY_RUN=1`. Compare classifier terminal disposition vs operator's actual terminal disposition. Bar: ≥90% agreement on `remediated`/`duplicate`/`unable_to_reproduce` (recommendation; operator confirms in open question 4). Result attached to the deploy PR.
+- `node _check_relay.js`.
+- Offline dry-run replay of last 200 operator-closed reports through the classifier. Compare classifier terminal disposition vs operator's actual terminal disposition; bar ≥90% agreement (open question 4 — operator may revise).
+- §C SMS verification dry-run on a small set of known-good live SIMs in a paused mode before flipping the kill-switch on.
 
 Post-deploy (continuous):
-
-- Worker writes a one-line tick summary to `agent/current-state.md` (or daily Paperclip child issue per open question 1): open count, auto-resolved count, escalations count, forbidden-action attempts (must be 0).
-- Alarm: if forbidden-action count > 0, KV kill-switch flips to false, P0 Paperclip child issue opened, the worker halts before next tick.
-
----
-
-## 14. Out of scope (do NOT design for)
-
-- Rotation cadence changes.
-- Any revenue-affecting vendor operation (cancels, billing changes, plan changes).
-- New reseller-facing UI beyond existing portal resend.
-- New identifier surfaces for resellers.
-- Reintroducing verification gates.
-- Auto-replacement of SIMs.
-- Sending reseller messages outside the existing `number.online` webhook.
+- Daily summary (open question 1) listing: open count, auto-resolved, verify-pending, escalated by failure-type, forbidden-action attempts (must be 0).
+- Alarm: forbidden-action count > 0 → KV kill-switch off, P0 child issue.
 
 ---
 
-## 15. If approved — implementation child issues
+## §M. Open questions for operator (must be answered before go-live)
 
-Plan is designed to ship as a single coherent system. After approval, open these child issues (all `adapterType: claude_local`, sequenced):
+1. Daily summary destination — `agent/current-state.md` (existing convention) vs daily Paperclip child issue?
+2. §H.3 escalation grouping — recommend per-tick per-`(vendor, failure_type)` batch (now the default in this plan). Confirm?
+3. Vendor-contact toggle granularity (§H.4) — per-carrier (recommended) vs global vs per-carrier-and-situation?
+4. Dry-run accuracy bar (§L) — ≥90% on last 200 operator-closed reports? Higher? Different sample?
+5. §C poll wall-clock budget — 5 minutes per SIM. If a single tick processes 100 reports, total bounded by concurrency cap (5) × 5 min = ≤ 25 minutes of poll wall-clock per tick. Confirm this is acceptable, or shrink poll window.
 
-1. **INC-16a — DB migration + worker scaffold + intake (§3) + shared situations (§4).**
-   Includes kill-switch KV, cron, row-lock CAS, `next_review_at` cursor, audit-row writes. No vendor calls yet.
-2. **INC-16b — Vendor classifiers (§5a–5e) + per-branch contract (§6) + forbidden-action guard.**
-   Pure logic + full unit-test coverage. No external calls.
-3. **INC-16c — Wire shared actions: `db_sync_upsert`, `resend_online`, `close_duplicate`, `classify_only`.**
-   Live for S1/S2/S3, A1/A2/A6/A8, W1/W2/W6, H1/H2/H6, T1/T2/T8 — every read+DB+webhook situation, no vendor write yet. Run the §13 offline dry-run before this PR merges.
-4. **INC-16d — Wire vendor OTA refreshes + Teltik `/reset-port`.**
-   Live for A7, W3, H3, T3, T4, T5. Per-carrier KV toggle for emergency-disable.
-5. **INC-16e — Dashboard surfacing (Bad Rentals list "Auto attempts" sub-row, "Pause auto-remediation" button, Guide-tab HTML decision tree).**
-6. **INC-16f — Vendor batch escalation (§8d).** Toggle defaults to off per carrier.
+---
 
-Issues 1–4 are the operational core and ship in close sequence. Issues 5–6 are additive and can ship in parallel after 4.
+## §N. Out of scope
+
+Rotation cadence changes; cancel/swap/replacement; freeform reseller messaging; reintroducing verification gates; auto IMEI rewrites; new reseller-facing identifier surfaces; activation of new SIMs; Wing mode swap to non-dialable from the remediator.
+
+---
+
+## §O. If approved — implementation child issues (sequenced)
+
+1. **INC-16a** — DB migration, worker scaffold (`bad-rental-remediator`), §intake (§3-style), shared situations S1–S6, §E cancel-guard, kill-switch KV, `operator_locked` state, dashboard "Take over"/"Resume auto" buttons. No vendor calls yet.
+2. **INC-16b** — Classifier (§F.1–F.4), §B IMEI check, §G cooldown engine, forbidden-action property test. Pure logic; no external calls.
+3. **INC-16c** — §C SMS verification subsystem (send via SKYLINE_GATEWAY `/send-sms`, poll `inbound_sms`, `verify_pending` state, 3×60s retry, 5-min poll). Wire it as the universal pre-resolve gate.
+4. **INC-16d** — Wire safe vendor actions: `db_sync_upsert`, `resend_online`, `close_duplicate`, classify_only. Live for S1–S6, A2/A6/A7/A9, W1/W2/W6, H1/H2/H7, T1/T2/T8 — but every `remediated` still gates through §C from INC-16c.
+5. **INC-16e** — Wire vendor restore/refresh actions: Atomic `resendOtaProfile`, `restoreSubscriber`; Wing `PUT dialable`; Helix 4.11 `OTA`, 4.6 `Unsuspend`; Teltik `/reset-network`, `/reset-port`. Per-action KV emergency disable.
+6. **INC-16f** — §H.3 batched operator escalation issues; §H.4 toggle-gated vendor-batch ticket (defaults off).
+7. **INC-16g** — Dashboard surfacing (Auto-attempts sub-row, Guide-tab decision tree HTML, escalation viewer).
+
+1–5 are the operational core, shipped in sequence (each PR ≤ 1 day). 6 and 7 ship in parallel after 5.
