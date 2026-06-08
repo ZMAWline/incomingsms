@@ -177,6 +177,16 @@ export default {
       return handleBadRentalReport(id, env, corsHeaders);
     }
 
+    if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/pause-auto') && request.method === 'POST') {
+      const id = url.pathname.slice('/api/bad-rentals/'.length, -('/pause-auto'.length));
+      return handleBadRentalAutoLock(id, 'operator_locked', request, env, corsHeaders);
+    }
+
+    if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/resume-auto') && request.method === 'POST') {
+      const id = url.pathname.slice('/api/bad-rentals/'.length, -('/resume-auto'.length));
+      return handleBadRentalAutoLock(id, null, request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/error-logs') {
       return handleErrorLogs(env, corsHeaders, url);
     }
@@ -3610,6 +3620,7 @@ async function handleBadRentals(env, corsHeaders, url) {
       'sim_id', 'sim_number_id', 'rental_id',
       'remediation_action', 'duplicate_of',
       'received_at', 'triaged_at', 'closed_at', 'updated_at',
+      'auto_remediation_state', 'last_auto_attempt_at', 'escalation_reason',
       'resellers(name)',
       'rentals(reseller_rental_id)',
       'sims(iccid,sim_numbers(e164,valid_to))',
@@ -3652,6 +3663,9 @@ async function handleBadRentals(env, corsHeaders, url) {
         triaged_at: r.triaged_at,
         closed_at: r.closed_at,
         updated_at: r.updated_at,
+        auto_remediation_state: r.auto_remediation_state || null,
+        last_auto_attempt_at: r.last_auto_attempt_at || null,
+        escalation_reason: r.escalation_reason || null,
         resellers: r.resellers || null,
         iccid: r && r.sims ? r.sims.iccid : null,
         reseller_rental_id: resellerRentalId,
@@ -3668,6 +3682,89 @@ async function handleBadRentals(env, corsHeaders, url) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+// INC-17 / INC-16a — operator pause/resume of the bad-rental auto-remediator.
+// targetState = 'operator_locked' to take over, or null to resume auto.
+// Writes a rental_report_events audit row so the timeline shows the lock change.
+async function handleBadRentalAutoLock(id, targetState, request, env, corsHeaders) {
+  try {
+    const reportId = parseInt(id, 10);
+    if (!Number.isFinite(reportId) || reportId <= 0) {
+      return new Response(JSON.stringify({ error: 'invalid report id' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    let body = {};
+    try { body = await request.json(); } catch (_) { body = {}; }
+    const actor = body.actor ? String(body.actor).slice(0, 120) : 'operator';
+    const note = body.note ? String(body.note).slice(0, 500) : null;
+
+    const curResp = await supabaseGet(env, 'rental_reports?id=eq.' + reportId + '&select=id,status,auto_remediation_state');
+    if (!curResp.ok) {
+      const txt = await curResp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + curResp.status, detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const curRows = await curResp.json();
+    if (!Array.isArray(curRows) || curRows.length === 0) {
+      return new Response(JSON.stringify({ error: 'report not found' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const prev = curRows[0].auto_remediation_state || null;
+    const nowIso = new Date().toISOString();
+    const patch = { auto_remediation_state: targetState, updated_at: nowIso };
+
+    const patchResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_reports?id=eq.${reportId}`, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify(patch),
+    });
+    if (!patchResp.ok) {
+      const txt = await patchResp.text();
+      return new Response(JSON.stringify({ error: 'patch_failed', detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const updated = await patchResp.json();
+
+    try {
+      await fetch(`${env.SUPABASE_URL}/rest/v1/rental_report_events`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          report_id: reportId,
+          from_status: curRows[0].status,
+          to_status: curRows[0].status,
+          actor: actor,
+          note: note,
+          evidence: { auto_remediation_state_from: prev, auto_remediation_state_to: targetState },
+        }),
+      });
+    } catch (e) {
+      console.log('[BadRentalAutoLock] event log insert failed: ' + e);
+    }
+    return new Response(JSON.stringify({ ok: true, report: updated[0] || null }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 }
@@ -8124,6 +8221,14 @@ function getHTML(helixEnabled) {
                             <textarea id="bad-rentals-edit-note" rows="3" maxlength="500" class="w-full text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-200"></textarea>
                         </div>
                         <div id="bad-rentals-edit-error" class="hidden text-xs text-red-400"></div>
+                        <div class="border-t border-dark-600 pt-3 mt-1">
+                            <div class="text-[11px] text-dark-400 uppercase mb-1">Auto-remediator</div>
+                            <div id="bad-rentals-edit-auto-state" class="text-xs text-dark-300 mb-2">state: —</div>
+                            <div class="flex items-center gap-2">
+                                <button onclick="badRentalsTakeOver()" id="bad-rentals-edit-take-over" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-500 text-white rounded">Take over</button>
+                                <button onclick="badRentalsResumeAuto()" id="bad-rentals-edit-resume-auto" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Resume auto</button>
+                            </div>
+                        </div>
                     </div>
                     <div class="flex items-center justify-end gap-2 mt-5">
                         <button onclick="closeBadRentalEdit()" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Cancel</button>
@@ -13893,8 +13998,42 @@ async function sendSimOnline(simId, phoneNumber) {
                 summary.textContent = reseller + ' · reported ' + mdn + ' · current status: ' + (r.status || '?');
             }
             modal.dataset.reportId = String(reportId);
+            const autoEl = document.getElementById('bad-rentals-edit-auto-state');
+            if (autoEl) {
+                const st = r.auto_remediation_state || 'queued';
+                const last = r.last_auto_attempt_at ? new Date(r.last_auto_attempt_at).toLocaleString() : 'never';
+                autoEl.textContent = 'state: ' + st + ' · last attempt: ' + last + (r.escalation_reason ? ' · esc: ' + r.escalation_reason : '');
+            }
             modal.classList.remove('hidden');
             renderBadRentalEditConditional();
+        }
+
+        async function badRentalsTakeOver()    { return badRentalsAutoLockCall('pause-auto',  'Take over'); }
+        async function badRentalsResumeAuto()  { return badRentalsAutoLockCall('resume-auto', 'Resume auto'); }
+        async function badRentalsAutoLockCall(suffix, label) {
+            const modal = document.getElementById('bad-rentals-edit-modal');
+            const reportId = modal ? modal.dataset.reportId : null;
+            const errEl = document.getElementById('bad-rentals-edit-error');
+            if (!reportId) { return; }
+            if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
+            try {
+                const resp = await fetch(API_BASE + '/bad-rentals/' + encodeURIComponent(reportId) + '/' + suffix, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                });
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) {
+                    if (errEl) { errEl.textContent = (data && data.error) ? data.error : ('HTTP ' + resp.status); errEl.classList.remove('hidden'); }
+                    return;
+                }
+                if (typeof showToast === 'function') showToast(label + ' applied to report ' + reportId, 'success');
+                closeBadRentalEdit();
+                if (typeof loadBadRentals === 'function') loadBadRentals();
+            } catch(e) {
+                if (errEl) { errEl.textContent = 'Network error: ' + e.message; errEl.classList.remove('hidden'); }
+                console.error('[badRentalsAutoLockCall]', e);
+            }
         }
 
         function closeBadRentalEdit() {
