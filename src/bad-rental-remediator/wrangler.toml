@@ -19,6 +19,19 @@ crons = ["0 */2 * * *", "*/1 * * * *"]
 binding = "REMEDIATOR_KV"
 id = "edaf2c8828b14badb3037600635f8a7f"
 
+# Vendor restore/refresh credentials (INC-21 / INC-16e) — set via
+# `wrangler secret put ...`. Without them, the matching executor returns
+# status='bad_input' with errorMessage '<vendor>_credentials_missing' and the
+# tick continues. Required for live vendor calls:
+#   ATOMIC_USERNAME, ATOMIC_TOKEN, ATOMIC_PIN          (A1 / A3)
+#   ATOMIC_API_URL                                      (optional override)
+#   WING_IOT_USERNAME, WING_IOT_API_KEY                 (W7)
+#   WING_IOT_BASE_URL                                   (optional override)
+#   HX_API_BASE, HX_TOKEN_URL, HX_CLIENT_ID, HX_AUDIENCE,
+#   HX_GRANT_USERNAME, HX_GRANT_PASSWORD                (H3 / H4)
+#   TELTIK_API_KEY                                      (T3 / T4 / T5)
+#   RELAY_URL, RELAY_KEY                                (optional egress relay)
+#
 # Service bindings used during shared-situation classification.
 # RESELLER_SYNC: resend webhook + check rental status (cancel-guard §E).
 # SKYLINE_GATEWAY: gateway port-status for S5; /send-sms wired in INC-16c.

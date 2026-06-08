@@ -1,27 +1,35 @@
 // =========================================================
-// BAD-RENTAL REMEDIATOR — Safe vendor action executors (INC-20 / INC-16d).
+// BAD-RENTAL REMEDIATOR — Safe vendor action executors
+// (INC-20 / INC-16d  +  INC-21 / INC-16e).
 //
-// Scope per Plan v4 §F + §H.1 + the INC-20 issue:
-//   - db_sync_upsert  → A2, A7, A9, W1, W6, H1, H7, T1, T8.
-//   - resend_online   → A6, W2, H2, T2 (calls reseller-sync /resend-online).
-//   - close_duplicate → S1, S2, S3 (rental_reports → status='duplicate'
-//                       via the same write shape as /api/bad-rentals/:id/update).
-//   - classify_only   → A10, W9, H9, T11 (record-only; cooldown handles cadence).
+// Scope per Plan v4 §F + §H.1:
+//   - db_sync_upsert       → A2, A7, A9, W1, W6, H1, H7, T1, T8.  (16d)
+//   - resend_online        → A6, W2, H2, T2.                       (16d)
+//   - close_duplicate      → S1, S2, S3.                           (16d)
+//   - classify_only        → A10, W9, H9, T11.                     (16d)
+//   - atomic_ota           → A1.  resendOtaProfile.                 (16e)
+//   - atomic_restore       → A3.  restoreSubscriber reasonCode=CR.  (16e)
+//   - wing_put_dialable    → W7.  PUT NON-ABIR dialable plan.       (16e)
+//   - helix_ota            → H3.  endpoint 4.11 reset-ota.          (16e)
+//   - helix_unsuspend      → H4.  4.6 Unsuspend reasonCode CR/35.   (16e)
+//   - teltik_reset_network → T3.  /v1/reset-network (10-digit MDN). (16e)
+//   - teltik_reset_port    → T3/T4/T5. /v1/reset-port; 409=success. (16e)
 //
 // Every executor returns:
-//   { ok, status, evidence?, errorMessage?, terminalReport? }
+//   { ok, status, evidence?, errorMessage?, terminalReport?, vendorRequestId? }
 //
 // - `ok` is true iff the side-effect succeeded.
 // - `status` is one of:
 //     'ok' | 'disabled_by_kv' | 'unsupported_action' | 'bad_input' |
-//     'service_binding_missing' | 'vendor_error' | 'db_error' | 'noop'
+//     'service_binding_missing' | 'vendor_error' | 'db_error' | 'noop' |
+//     'cached'  (idempotent re-call within cooldown returns the prior
+//                vendor request_id without double-doing)
 // - `terminalReport` (when set) carries { status, remediation_action?, duplicate_of? }
-//   which the worker mirrors into rental_reports so the dashboard timeline
-//   matches a manual close. Currently only `close_duplicate` sets this.
 //
 // §C SMS verification is NOT performed inside an executor. The worker invokes
-// `preResolveGate` (verify-runner.mjs) around `db_sync_upsert` / `resend_online`
-// before any `status='remediated'` close. `close_duplicate` is exempt per §C/§E.
+// `preResolveGate` (verify-runner.mjs) around every pre-resolve action (db_sync,
+// resend, OTA, restore/unsuspend, wing PUT dialable, teltik reset_*) before any
+// `status='remediated'` close. `close_duplicate` is exempt per §C/§E.
 //
 // Per-action KV emergency disable: a key
 //   `bad_rental_remediator_action_${action}_disabled`
@@ -29,12 +37,28 @@
 // =========================================================
 
 import { ALLOWED_ACTIONS, FORBIDDEN_ACTIONS } from './classifier.mjs';
+import { COOLDOWN_TABLE, idempotencyKey } from './cooldown.mjs';
+import {
+  atomicResendOta, atomicRestoreSubscriber,
+  wingPutDialable,
+  helixOtaRefresh, helixUnsuspend,
+  teltikResetNetwork, teltikResetPort,
+} from './vendor.mjs';
+import { mdn10 } from './teltik.mjs';
 
 export const SAFE_ACTIONS = Object.freeze([
   'db_sync_upsert',
   'resend_online',
   'close_duplicate',
   'classify_only',
+  // INC-21 / INC-16e
+  'atomic_ota',
+  'atomic_restore',
+  'wing_put_dialable',
+  'helix_ota',
+  'helix_unsuspend',
+  'teltik_reset_network',
+  'teltik_reset_port',
 ]);
 
 const FORBIDDEN_SET = new Set(FORBIDDEN_ACTIONS);
@@ -62,12 +86,87 @@ export async function executeAction(env, ctx) {
     return { ok: false, status: 'disabled_by_kv', errorMessage: 'kv_emergency_disable' };
   }
   switch (action) {
-    case 'db_sync_upsert':  return execDbSyncUpsert(env, ctx);
-    case 'resend_online':   return execResendOnline(env, ctx);
-    case 'close_duplicate': return execCloseDuplicate(env, ctx);
-    case 'classify_only':   return execClassifyOnly(env, ctx);
-    default:                return { ok: false, status: 'unsupported_action' };
+    case 'db_sync_upsert':       return execDbSyncUpsert(env, ctx);
+    case 'resend_online':        return execResendOnline(env, ctx);
+    case 'close_duplicate':      return execCloseDuplicate(env, ctx);
+    case 'classify_only':        return execClassifyOnly(env, ctx);
+    case 'atomic_ota':           return execAtomicOta(env, ctx);
+    case 'atomic_restore':       return execAtomicRestore(env, ctx);
+    case 'wing_put_dialable':    return execWingPutDialable(env, ctx);
+    case 'helix_ota':            return execHelixOta(env, ctx);
+    case 'helix_unsuspend':      return execHelixUnsuspend(env, ctx);
+    case 'teltik_reset_network': return execTeltikReset(env, ctx, 'teltik_reset_network');
+    case 'teltik_reset_port':    return execTeltikReset(env, ctx, 'teltik_reset_port');
+    default:                     return { ok: false, status: 'unsupported_action' };
   }
+}
+
+// ---------------------------------------------------------
+// Vendor-action idempotency cache (Plan §G).
+//
+// Re-invoking the same vendor action within its cooldown returns the cached
+// vendor request_id with status='cached' — no second HTTP call to the vendor.
+// Key shape: bad_rental_remediator_idem:<idempotencyKey(action, ctx)>.
+// TTL = action cooldownMs (seconds, capped to 60s minimum).
+//
+// Why cache here AND check cooldown in the worker? Two layers:
+//   - worker-side cooldown skips the executor entirely when prior attempts
+//     are still inside the cooldown window (avoids work).
+//   - this cache makes the executor idempotent in case it does run again —
+//     e.g. a retried tick, a manual /run, or future parallelization.
+// ---------------------------------------------------------
+
+function idemKvKey(key) { return 'bad_rental_remediator_idem:' + key; }
+
+async function loadIdem(env, key) {
+  if (!env || !env.REMEDIATOR_KV) return null;
+  try {
+    const raw = await env.REMEDIATOR_KV.get(idemKvKey(key));
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  } catch (err) {
+    console.log('[Actions] idem cache read failed for ' + key + ': ' + err);
+    return null;
+  }
+}
+
+async function saveIdem(env, action, key, payload) {
+  if (!env || !env.REMEDIATOR_KV) return;
+  const cd = COOLDOWN_TABLE[action];
+  if (!cd || !cd.cooldownMs) return;
+  const ttl = Math.max(60, Math.floor(cd.cooldownMs / 1000));
+  try {
+    await env.REMEDIATOR_KV.put(idemKvKey(key), JSON.stringify(payload),
+      { expirationTtl: ttl });
+  } catch (err) {
+    console.log('[Actions] idem cache write failed for ' + key + ': ' + err);
+  }
+}
+
+// withIdempotency — wraps a vendor call. If a prior successful invocation
+// for the same idempotency key is cached, returns it as status='cached'
+// without calling fn. Otherwise runs fn and caches a successful result.
+async function withIdempotency(env, action, idemCtx, fn) {
+  let key;
+  try { key = idempotencyKey(action, idemCtx); } catch (err) {
+    return { ok: false, status: 'bad_input', errorMessage: String(err && err.message || err) };
+  }
+  const prior = await loadIdem(env, key);
+  if (prior && prior.ok) {
+    return {
+      ok: true,
+      status: 'cached',
+      vendorRequestId: prior.vendorRequestId || null,
+      evidence: { idempotency_key: key, cached_vendor_request_id: prior.vendorRequestId || null, cached_at: prior.ts || null },
+    };
+  }
+  const res = await fn();
+  if (res && res.ok) {
+    await saveIdem(env, action, key, {
+      ok: true, vendorRequestId: res.vendorRequestId || null, ts: nowIso(),
+    });
+  }
+  return res;
 }
 
 export function actionKvKey(action) {
@@ -263,6 +362,174 @@ async function execClassifyOnly(_env, ctx) {
     evidence: { mode: ctx.situationId || null, reason: 'classify_only_tick' },
   };
 }
+
+// ---------------------------------------------------------
+// INC-16e — Atomic OTA refresh (A1 / resendOtaProfile)
+// ---------------------------------------------------------
+
+async function execAtomicOta(env, ctx) {
+  const sim = ctx.sim;
+  if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
+  const msisdn = ctx.msisdn || sim.current_mdn_e164;
+  const iccid  = ctx.iccid  || sim.iccid;
+  if (!msisdn || !iccid) {
+    return { ok: false, status: 'bad_input', errorMessage: 'atomic_ota_missing_msisdn_or_iccid' };
+  }
+  return withIdempotency(env, 'atomic_ota',
+    { report_id: ctx.report && ctx.report.id, attempt_no: ctx.attemptNo || 1 },
+    async () => {
+      const r = await atomicResendOta(env, { msisdn, iccid });
+      return mapVendorResult(r, { msisdn, iccid });
+    });
+}
+
+// ---------------------------------------------------------
+// INC-16e — Atomic restoreSubscriber CR (A3)
+// ---------------------------------------------------------
+
+async function execAtomicRestore(env, ctx) {
+  const sim = ctx.sim;
+  if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
+  const msisdn = ctx.msisdn || sim.current_mdn_e164;
+  if (!msisdn) {
+    return { ok: false, status: 'bad_input', errorMessage: 'atomic_restore_missing_msisdn' };
+  }
+  return withIdempotency(env, 'atomic_restore', { msisdn }, async () => {
+    const r = await atomicRestoreSubscriber(env, { msisdn });
+    return mapVendorResult(r, { msisdn });
+  });
+}
+
+// ---------------------------------------------------------
+// INC-16e — Wing PUT NON-ABIR dialable plan (W7).
+// NEVER PUTs the ABIR (non-dialable) plan.
+// ---------------------------------------------------------
+
+async function execWingPutDialable(env, ctx) {
+  const sim = ctx.sim;
+  if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
+  const iccid = ctx.iccid || sim.iccid;
+  if (!iccid) return { ok: false, status: 'bad_input', errorMessage: 'wing_put_dialable_missing_iccid' };
+  return withIdempotency(env, 'wing_put_dialable', { iccid }, async () => {
+    const r = await wingPutDialable(env, { iccid });
+    return mapVendorResult(r, { iccid });
+  });
+}
+
+// ---------------------------------------------------------
+// INC-16e — Helix 4.11 OTA refresh (H3)
+// ---------------------------------------------------------
+
+async function execHelixOta(env, ctx) {
+  const sim = ctx.sim;
+  if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
+  const ban              = ctx.ban || sim.att_ban || sim.helix_ban;
+  const subscriberNumber = ctx.subscriberNumber || ctx.msisdn || sim.current_mdn_e164;
+  const iccid            = ctx.iccid || sim.iccid;
+  if (!ban || !subscriberNumber || !iccid) {
+    return { ok: false, status: 'bad_input', errorMessage: 'helix_ota_missing_ban_subscriber_or_iccid' };
+  }
+  return withIdempotency(env, 'helix_ota',
+    { report_id: ctx.report && ctx.report.id, attempt_no: ctx.attemptNo || 1 },
+    async () => {
+      const r = await helixOtaRefresh(env, { ban, subscriberNumber, iccid });
+      return mapVendorResult(r, { ban, subscriberNumber, iccid });
+    });
+}
+
+// ---------------------------------------------------------
+// INC-16e — Helix 4.6 Unsuspend reasonCode CR/35 (H4)
+// ---------------------------------------------------------
+
+async function execHelixUnsuspend(env, ctx) {
+  const sim = ctx.sim;
+  if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
+  const subscriberNumber = ctx.subscriberNumber || ctx.msisdn || sim.current_mdn_e164;
+  if (!subscriberNumber) {
+    return { ok: false, status: 'bad_input', errorMessage: 'helix_unsuspend_missing_subscriber_number' };
+  }
+  return withIdempotency(env, 'helix_unsuspend',
+    { report_id: ctx.report && ctx.report.id, attempt_no: ctx.attemptNo || 1 },
+    async () => {
+      const r = await helixUnsuspend(env, {
+        subscriberNumber,
+        mobilitySubscriptionId: ctx.mobilitySubscriptionId,
+      });
+      return mapVendorResult(r, { subscriberNumber });
+    });
+}
+
+// ---------------------------------------------------------
+// INC-16e — Teltik /v1/reset-network and /v1/reset-port.
+// 10-digit MDN enforced at the teltik.mjs boundary (mdn10).
+// 409 on /reset-port is treated as success (already in flight).
+// ---------------------------------------------------------
+
+async function execTeltikReset(env, ctx, action) {
+  const sim = ctx.sim;
+  if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
+  const raw = ctx.mdn || sim.current_mdn_e164;
+  if (!raw) return { ok: false, status: 'bad_input', errorMessage: 'teltik_reset_missing_mdn' };
+  const m10 = mdn10(raw);
+  if (!m10 || m10.length !== 10) {
+    return { ok: false, status: 'bad_input', errorMessage: 'teltik_reset_invalid_mdn:' + m10 };
+  }
+  return withIdempotency(env, action, { mdn10: m10 }, async () => {
+    const r = action === 'teltik_reset_port'
+      ? await teltikResetPort(env, { mdn: m10 })
+      : await teltikResetNetwork(env, { mdn: m10 });
+    // Teltik /reset-port 409 = already in flight → treat as success.
+    if (action === 'teltik_reset_port' && r.status === 409) {
+      return {
+        ok: true, status: 'ok',
+        vendorRequestId: r.requestId || null,
+        evidence: { mdn10: m10, vendor_status: r.status, treated_as: 'already_in_flight', vendor_body: r.body },
+      };
+    }
+    return mapVendorResult(r, { mdn10: m10 });
+  });
+}
+
+// ---------------------------------------------------------
+// Vendor result → executor result projection.
+// ---------------------------------------------------------
+
+function mapVendorResult(r, ctxEvidence) {
+  if (!r) return { ok: false, status: 'vendor_error', errorMessage: 'vendor_empty_response' };
+  if (r.ok) {
+    return {
+      ok: true, status: 'ok',
+      vendorRequestId: r.requestId || null,
+      evidence: { ...(ctxEvidence || {}), vendor_status: r.status, vendor_request_id: r.requestId || null, vendor_body: redact(r.body) },
+    };
+  }
+  // Distinguish missing-credentials/bad-input vs vendor HTTP errors.
+  const errStr = String(r.error || '');
+  if (errStr.endsWith('_credentials_missing') || errStr === 'missing_iccid'
+      || errStr.startsWith('teltik_mdn_invalid')) {
+    return { ok: false, status: 'bad_input', errorMessage: errStr };
+  }
+  return {
+    ok: false, status: 'vendor_error',
+    errorMessage: errStr || 'vendor_error',
+    evidence: { ...(ctxEvidence || {}), vendor_status: r.status, vendor_body: redact(r.body) },
+  };
+}
+
+// Strip anything credential-shaped from vendor bodies before persistence.
+function redact(body) {
+  if (!body || typeof body !== 'object') return body;
+  const drop = new Set(['session', 'token', 'pin', 'password', 'apikey', 'authorization']);
+  const out = Array.isArray(body) ? [] : {};
+  for (const [k, v] of Object.entries(body)) {
+    if (drop.has(String(k).toLowerCase())) continue;
+    if (v && typeof v === 'object') out[k] = redact(v);
+    else out[k] = v;
+  }
+  return out;
+}
+
+function nowIso() { return new Date().toISOString(); }
 
 // ---------------------------------------------------------
 // Plumbing
