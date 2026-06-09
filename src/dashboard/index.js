@@ -188,6 +188,18 @@ export default {
       return handleBadRentalAutoLock(id, null, request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/remediator/status' && request.method === 'GET') {
+      return handleRemediatorStatus(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/remediator/run-now' && request.method === 'POST') {
+      return handleRemediatorRunNow(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/remediator/kill-switch' && request.method === 'POST') {
+      return handleRemediatorKillSwitch(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/error-logs') {
       return handleErrorLogs(env, corsHeaders, url);
     }
@@ -3948,6 +3960,73 @@ async function handleBadRentalAutoLock(id, targetState, request, env, corsHeader
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
+}
+
+async function callRemediator(env, path, init) {
+  if (!env.BAD_RENTAL_REMEDIATOR) {
+    return { ok: false, status: 500, body: { error: 'no_service_binding' } };
+  }
+  const url = 'https://bad-rental-remediator' + path;
+  try {
+    const resp = await env.BAD_RENTAL_REMEDIATOR.fetch(url, init);
+    let body = null;
+    try { body = await resp.json(); } catch (_) { body = null; }
+    return { ok: resp.ok, status: resp.status, body };
+  } catch (err) {
+    return { ok: false, status: 502, body: { error: String(err) } };
+  }
+}
+
+function remediatorSecret(env) {
+  return env.BAD_RENTAL_REMEDIATOR_ADMIN_SECRET || env.ADMIN_RUN_SECRET || '';
+}
+
+async function logRemediatorControl(env, control, fromState, toState, actor) {
+  // Audit to console only; rental_report_events.report_id is NOT NULL so it
+  // cannot host worker-level control events. A dedicated audit table is
+  // tracked as follow-up (INC §I.2 implementation note).
+  console.log('[RemediatorControl] ' + JSON.stringify({ control, from: fromState, to: toState, actor: (actor || 'operator').slice(0, 120), at: new Date().toISOString() }));
+}
+
+async function handleRemediatorStatus(env, corsHeaders) {
+  const secret = remediatorSecret(env);
+  const r = await callRemediator(env, '/status?secret=' + encodeURIComponent(secret), { method: 'GET' });
+  return new Response(JSON.stringify(r.body || { error: 'unknown' }), {
+    status: r.ok ? 200 : r.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+async function handleRemediatorRunNow(request, env, corsHeaders) {
+  let body = {};
+  try { body = await request.json(); } catch (_) { body = {}; }
+  const actor = body && body.actor ? String(body.actor).slice(0, 120) : 'operator';
+  const secret = remediatorSecret(env);
+  const r = await callRemediator(env, '/run?secret=' + encodeURIComponent(secret), { method: 'GET' });
+  await logRemediatorControl(env, 'run_now', null, null, actor);
+  return new Response(JSON.stringify(r.body || { error: 'unknown' }), {
+    status: r.ok ? 200 : r.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+async function handleRemediatorKillSwitch(request, env, corsHeaders) {
+  let body = {};
+  try { body = await request.json(); } catch (_) { body = {}; }
+  const enabled = body && body.enabled === true;
+  const actor = body && body.actor ? String(body.actor).slice(0, 120) : 'operator';
+  const secret = remediatorSecret(env);
+  const before = await callRemediator(env, '/status?secret=' + encodeURIComponent(secret), { method: 'GET' });
+  const fromState = before && before.body && before.body.status && before.body.status.kill_switch;
+  const r = await callRemediator(env, '/kill-switch?secret=' + encodeURIComponent(secret), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  if (r.ok) {
+    await logRemediatorControl(env, 'kill_switch', fromState || null, enabled ? 'enabled' : 'disabled', actor);
+  }
+  return new Response(JSON.stringify(r.body || { error: 'unknown' }), {
+    status: r.ok ? 200 : r.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
 }
 
 async function handleResolveBadRental(id, request, env, corsHeaders) {
@@ -8368,6 +8447,63 @@ function getHTML(helixEnabled) {
                     </div>
                     <button onclick="loadBadRentals()" class="px-3 py-2 text-sm bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Refresh</button>
                 </div>
+
+                <!-- Auto-Remediator Reviewer Panel (INC-23 §I.2) -->
+                <div id="remediator-panel" class="mb-6 p-4 bg-dark-800 border border-dark-600 rounded-xl">
+                    <div class="flex items-center justify-between mb-3">
+                        <div class="flex items-center gap-3">
+                            <h2 class="text-base font-semibold text-white">Auto-Remediator</h2>
+                            <span id="remediator-killswitch-chip" class="px-2 py-0.5 text-xs rounded-full bg-dark-700 text-dark-300">&hellip;</span>
+                            <span id="remediator-dormancy-chip" class="hidden px-2 py-0.5 text-xs rounded-full bg-yellow-900/40 text-yellow-300"></span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <button onclick="remediatorRunNow()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-700 text-white rounded">Run review now</button>
+                            <button onclick="remediatorToggleKillSwitch(false)" id="remediator-pause-btn" class="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 text-white rounded">Pause reviewer</button>
+                            <button onclick="remediatorToggleKillSwitch(true)" id="remediator-resume-btn" class="hidden px-3 py-1.5 text-xs bg-emerald-700 hover:bg-emerald-600 text-white rounded">Resume reviewer</button>
+                            <button onclick="loadRemediatorStatus()" class="px-3 py-1.5 text-xs bg-dark-700 border border-dark-500 text-gray-300 hover:bg-dark-600 rounded">Refresh</button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
+                        <div class="p-3 bg-dark-900/40 rounded">
+                            <div class="text-dark-400 uppercase mb-1">Last main tick (2h cron)</div>
+                            <div id="remediator-main-tick" class="text-gray-200">&mdash;</div>
+                        </div>
+                        <div class="p-3 bg-dark-900/40 rounded">
+                            <div class="text-dark-400 uppercase mb-1">Last verify poll (1m cron)</div>
+                            <div id="remediator-verify-poll" class="text-gray-200">&mdash;</div>
+                        </div>
+                        <div class="p-3 bg-dark-900/40 rounded">
+                            <div class="text-dark-400 uppercase mb-1">Open counts</div>
+                            <div id="remediator-open-counts" class="text-gray-200">&mdash;</div>
+                        </div>
+                        <div class="p-3 bg-dark-900/40 rounded">
+                            <div class="text-dark-400 uppercase mb-1">Action disables</div>
+                            <div id="remediator-action-disables" class="text-gray-200">&mdash;</div>
+                        </div>
+                    </div>
+                    <details class="mt-3 text-xs text-dark-400">
+                        <summary class="cursor-pointer hover:text-gray-300">Schedule &amp; limits</summary>
+                        <div class="mt-2 pl-4 space-y-1">
+                            <div>Main review: <code class="text-emerald-300">0 */2 * * *</code> (every 2 hours, top of even hour UTC).</div>
+                            <div>SMS verify poll: <code class="text-emerald-300">*/1 * * * *</code> (every minute).</div>
+                            <div>Per-run limits: 50 reports max, concurrency 5, ~55 s tick budget.</div>
+                            <div>Kill switch: KV <code>bad_rental_remediator_enabled</code>. Per-action disables: <code>bad_rental_remediator_action_{action}_disabled</code>.</div>
+                        </div>
+                    </details>
+                    <div id="remediator-run-result" class="hidden mt-3 p-2 bg-dark-900/60 border border-dark-600 rounded text-xs text-gray-300"></div>
+                </div>
+
+                <!-- Auto state filter chips (INC-23 §I.2 work queue) -->
+                <div class="flex flex-wrap items-center gap-2 mb-4 text-xs">
+                    <span class="text-dark-400 uppercase">Auto state</span>
+                    <button data-auto-filter="all"             class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">All</button>
+                    <button data-auto-filter="open"            class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Open (no auto state)</button>
+                    <button data-auto-filter="verify_pending"  class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Verify pending</button>
+                    <button data-auto-filter="operator_locked" class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Operator locked</button>
+                    <button data-auto-filter="escalated"       class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Escalated</button>
+                    <button data-auto-filter="done"            class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Done (auto)</button>
+                    <button data-auto-filter="error"           class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Last attempt errored</button>
+                </div>
                 <div class="flex items-center gap-3 mb-4">
                     <label class="text-xs text-dark-400 uppercase" for="bad-rentals-status-filter">Status</label>
                     <select id="bad-rentals-status-filter" onchange="loadBadRentals()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
@@ -10754,7 +10890,7 @@ set verify_pending; schedule §C.3 poll
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'bad-rentals') loadBadRentals();
+            if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); }
             if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
@@ -14367,7 +14503,183 @@ async function sendSimOnline(simId, phoneNumber) {
                 tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + escapeHtml(e.message) + '</td></tr>';
                 console.error('[loadBadRentals]', e);
             }
+            applyAutoFilterFromActiveChip();
         }
+
+        // ===== Auto-Remediator Reviewer Panel (INC-23 §I.2) =====
+        function fmtTickAgo(iso) {
+            if (!iso) return 'never';
+            const t = new Date(iso).getTime();
+            if (!Number.isFinite(t)) return 'never';
+            const diff = Math.max(0, Date.now() - t);
+            const m = Math.floor(diff / 60000);
+            if (m < 1) return 'just now';
+            if (m < 60) return m + 'm ago';
+            const h = Math.floor(m / 60);
+            if (h < 24) return h + 'h ' + (m % 60) + 'm ago';
+            return Math.floor(h / 24) + 'd ago';
+        }
+
+        async function loadRemediatorStatus() {
+            const ksChip = document.getElementById('remediator-killswitch-chip');
+            const dormChip = document.getElementById('remediator-dormancy-chip');
+            const mainEl = document.getElementById('remediator-main-tick');
+            const verifyEl = document.getElementById('remediator-verify-poll');
+            const countsEl = document.getElementById('remediator-open-counts');
+            const disablesEl = document.getElementById('remediator-action-disables');
+            const pauseBtn = document.getElementById('remediator-pause-btn');
+            const resumeBtn = document.getElementById('remediator-resume-btn');
+            if (!ksChip) return;
+            try {
+                const resp = await fetch(API_BASE + '/remediator/status');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                const status = (data && data.status) ? data.status : null;
+                if (!status) throw new Error('no_status');
+                const enabled = status.kill_switch === 'enabled';
+                ksChip.textContent = enabled ? 'Reviewer ENABLED' : 'Reviewer DISABLED';
+                ksChip.className = 'px-2 py-0.5 text-xs rounded-full ' + (enabled
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : 'bg-rose-500/20 text-rose-300');
+                if (pauseBtn) pauseBtn.classList.toggle('hidden', !enabled);
+                if (resumeBtn) resumeBtn.classList.toggle('hidden', enabled);
+                const mt = status.last_main_tick;
+                if (mt) {
+                    const outcomes = mt.outcomes ? Object.entries(mt.outcomes).map(function(kv){return kv[0]+':'+kv[1];}).join(', ') : '';
+                    mainEl.innerHTML =
+                        '<div>' + escapeHtml(fmtTickAgo(mt.completed_at)) + '</div>' +
+                        '<div class="text-dark-400 text-[10px] mt-0.5">processed=' + (mt.processed||0) + ' attempted=' + (mt.attempted||0) + ' ms=' + (mt.ms||0) + '</div>' +
+                        (outcomes ? '<div class="text-dark-400 text-[10px]">' + escapeHtml(outcomes) + '</div>' : '') +
+                        (mt.error ? '<div class="text-rose-300 text-[10px]">error: ' + escapeHtml(mt.error) + '</div>' : '');
+                } else {
+                    mainEl.textContent = 'no tick recorded yet';
+                }
+                const vp = status.last_verify_poll;
+                if (vp) {
+                    verifyEl.innerHTML =
+                        '<div>' + escapeHtml(fmtTickAgo(vp.completed_at)) + '</div>' +
+                        '<div class="text-dark-400 text-[10px] mt-0.5">polled=' + (vp.polled||0) + ' matched=' + (vp.matched||0) + ' timed_out=' + (vp.timed_out||0) + ' still=' + (vp.still_pending||0) + '</div>' +
+                        (vp.error ? '<div class="text-rose-300 text-[10px]">error: ' + escapeHtml(vp.error) + '</div>' : '');
+                } else {
+                    verifyEl.textContent = 'no poll recorded yet';
+                }
+                const oc = status.open_counts || {};
+                countsEl.innerHTML =
+                    '<div>queued: <span class="text-gray-100">' + (oc.queued||0) + '</span></div>' +
+                    '<div>in_progress: <span class="text-gray-100">' + (oc.in_progress||0) + '</span></div>' +
+                    '<div>verify_pending: <span class="text-gray-100">' + (oc.verify_pending||0) + '</span></div>' +
+                    '<div>operator_locked: <span class="text-gray-100">' + (oc.operator_locked||0) + '</span></div>' +
+                    '<div>escalated: <span class="text-gray-100">' + (oc.escalated||0) + '</span></div>';
+                const dis = Array.isArray(status.action_disables) ? status.action_disables : [];
+                disablesEl.innerHTML = dis.length === 0
+                    ? '<span class="text-dark-400">none</span>'
+                    : dis.map(function(a){return '<span class="inline-block mr-1 mb-1 px-1.5 py-0.5 text-[10px] rounded bg-rose-900/40 text-rose-200">' + escapeHtml(a) + '</span>';}).join('');
+                let dormancy = mt && mt.dormancy_reason;
+                if (!enabled) dormancy = 'kill_switch_off';
+                if (dormancy) {
+                    dormChip.textContent = 'dormant: ' + dormancy;
+                    dormChip.classList.remove('hidden');
+                } else {
+                    dormChip.classList.add('hidden');
+                }
+            } catch (e) {
+                ksChip.textContent = 'status error';
+                ksChip.className = 'px-2 py-0.5 text-xs rounded-full bg-rose-500/20 text-rose-300';
+                console.error('[loadRemediatorStatus]', e);
+            }
+        }
+
+        async function remediatorRunNow() {
+            if (!confirm('Trigger an immediate Auto-Remediator main tick now?\\n\\nThis runs the same logic as the 2-hour cron once. Reviewer kill-switch must be enabled or the tick will short-circuit.')) return;
+            const out = document.getElementById('remediator-run-result');
+            if (out) { out.classList.remove('hidden'); out.textContent = 'Running…'; }
+            try {
+                const resp = await fetch(API_BASE + '/remediator/run-now', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ actor: 'dashboard' }),
+                });
+                const data = await resp.json();
+                if (out) out.textContent = JSON.stringify(data, null, 2);
+                loadRemediatorStatus();
+                loadBadRentals();
+            } catch (e) {
+                if (out) out.textContent = 'Error: ' + (e && e.message ? e.message : String(e));
+            }
+        }
+
+        async function remediatorToggleKillSwitch(enabled) {
+            const verb = enabled ? 'RESUME' : 'PAUSE';
+            if (!confirm(verb + ' the Auto-Remediator?\\n\\n' + (enabled
+                ? 'This re-enables the 2-hour cron. The next scheduled tick will process queued bad rentals.'
+                : 'This disables the 2-hour cron. Already-running attempts finish; no new actions will be taken until you resume.'))) return;
+            try {
+                const resp = await fetch(API_BASE + '/remediator/kill-switch', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ enabled, actor: 'dashboard' }),
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                await loadRemediatorStatus();
+            } catch (e) {
+                alert('Toggle failed: ' + (e && e.message ? e.message : String(e)));
+            }
+        }
+
+        function applyAutoFilterFromActiveChip() {
+            const chips = document.querySelectorAll('.auto-filter-chip');
+            let active = 'all';
+            chips.forEach(function(c){ if (c.classList.contains('ring-2')) active = c.dataset.autoFilter; });
+            applyAutoFilter(active);
+        }
+
+        function applyAutoFilter(which) {
+            const tbody = document.getElementById('bad-rentals-tbody');
+            if (!tbody) return;
+            const rowsById = window._badRentalRowsById || {};
+            const trs = tbody.querySelectorAll('tr');
+            trs.forEach(function(tr){
+                // sub-rows have no .dataset; primary rows we left without dataset too — match on innerHTML
+                tr.style.display = '';
+            });
+            if (which === 'all') return;
+            // Filter via known map
+            const ids = Object.keys(rowsById);
+            const keep = new Set();
+            ids.forEach(function(id){
+                const r = rowsById[id];
+                const s = r.auto_remediation_state || null;
+                const lastOutcome = r.auto_attempts_last_outcome || null;
+                let match = false;
+                if (which === 'open')            match = !s;
+                else if (which === 'verify_pending')  match = s === 'verify_pending';
+                else if (which === 'operator_locked') match = s === 'operator_locked';
+                else if (which === 'escalated')       match = s === 'escalated';
+                else if (which === 'done')            match = s === 'done';
+                else if (which === 'error')           match = lastOutcome === 'failed' || lastOutcome === 'error';
+                if (match) keep.add(String(id));
+            });
+            // Re-render via the existing rows we already have in memory — hide non-matching.
+            // Each rendered <tr> begins with "<td>#<id>" — find the report id by parsing.
+            const rendered = tbody.querySelectorAll('tr');
+            rendered.forEach(function(tr){
+                const m = tr.innerHTML.match(/#(\\d+)/);
+                if (!m) { tr.style.display = 'none'; return; }
+                tr.style.display = keep.has(m[1]) ? '' : 'none';
+            });
+        }
+
+        document.addEventListener('click', function(ev){
+            const chip = ev.target && ev.target.closest && ev.target.closest('.auto-filter-chip');
+            if (!chip) return;
+            document.querySelectorAll('.auto-filter-chip').forEach(function(c){
+                c.classList.remove('ring-2','ring-accent','bg-accent','text-white');
+                c.classList.add('bg-dark-700','text-gray-300');
+            });
+            chip.classList.remove('bg-dark-700','text-gray-300');
+            chip.classList.add('ring-2','ring-accent','bg-accent','text-white');
+            applyAutoFilter(chip.dataset.autoFilter);
+        });
 
         function openBadRentalEdit(reportId) {
             const r = (window._badRentalRowsById || {})[reportId];
