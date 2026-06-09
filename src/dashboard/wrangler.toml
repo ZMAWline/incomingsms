@@ -56,6 +56,10 @@ service = "teltik-worker"
 binding = "KASA_CONTROL"
 service = "kasa-control"
 
+[[services]]
+binding = "BAD_RENTAL_REMEDIATOR"
+service = "bad-rental-remediator"
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "dashboard-test"
@@ -111,3 +115,7 @@ service = "teltik-worker-test"
 [[env.test.services]]
 binding = "KASA_CONTROL"
 service = "kasa-control-test"
+
+[[env.test.services]]
+binding = "BAD_RENTAL_REMEDIATOR"
+service = "bad-rental-remediator-test"
