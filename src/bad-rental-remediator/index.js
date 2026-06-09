@@ -20,6 +20,9 @@
 
 import { runVerifyPoll, preResolveGate } from './verify-runner.mjs';
 import { executeAction } from './actions.mjs';
+import { canAttempt } from './cooldown.mjs';
+import { teltikPortStatus } from './vendor.mjs';
+import { mdn10 } from './teltik.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const TICK_BUDGET_MS = 55_000; // §G: 60s tick budget, leave headroom.
@@ -176,6 +179,23 @@ async function maybeExecuteAction(env, args) {
     return { outcome: classification.outcome, evidence: null, errorMessage: null };
   }
 
+  // 24h cooldown gate (§G). canAttempt rejects when prior attempts for this
+  // action are still inside the cooldown window OR the action's max-attempts
+  // cap is reached. classify_only / close_duplicate / db_sync_upsert have
+  // cooldownMs=0 so they always pass here; the vendor restore/refresh actions
+  // (INC-16e) are the ones this actually gates.
+  const priorActionAttempts = (evidence.priorActionAttempts && evidence.priorActionAttempts[action]) || 0;
+  const lastActionAttemptAt = evidence.lastActionAttemptAt && evidence.lastActionAttemptAt[action] || null;
+  const gate = canAttempt({ action, priorAttempts: priorActionAttempts, lastAttemptAt: lastActionAttemptAt, now: new Date() });
+  if (!gate.ok) {
+    return {
+      outcome: 'skipped_cooldown',
+      evidence: { cooldown_gate: gate, action, prior_attempts: priorActionAttempts },
+      errorMessage: null,
+      execStatus: 'cooldown_active',
+    };
+  }
+
   // For S1 the worker has already cleared §E cancel-guard.
   const ctx = {
     action,
@@ -186,10 +206,23 @@ async function maybeExecuteAction(env, args) {
     attemptNo,
   };
 
-  // For db_sync_upsert we don't have vendor reads yet (INC-16e). The executor
-  // accepts targets so once vendor reads land we just feed them in.
+  // Per-action ctx enrichment for the INC-16e vendor calls. The executors
+  // also derive these from sim.* as fallback but passing them explicitly
+  // documents the intent at the call site.
   if (action === 'db_sync_upsert') {
     ctx.targets = classification.targets || {};
+  } else if (action === 'atomic_ota' || action === 'atomic_restore' || action === 'helix_unsuspend') {
+    ctx.msisdn = (evidence.sim && evidence.sim.current_mdn_e164) || null;
+    if (action !== 'atomic_restore') ctx.iccid = (evidence.sim && evidence.sim.iccid) || null;
+  } else if (action === 'helix_ota') {
+    ctx.msisdn = (evidence.sim && evidence.sim.current_mdn_e164) || null;
+    ctx.iccid  = (evidence.sim && evidence.sim.iccid) || null;
+    ctx.ban    = (evidence.sim && (evidence.sim.att_ban || evidence.sim.helix_ban)) || null;
+    ctx.subscriberNumber = ctx.msisdn;
+  } else if (action === 'wing_put_dialable') {
+    ctx.iccid = (evidence.sim && evidence.sim.iccid) || null;
+  } else if (action === 'teltik_reset_network' || action === 'teltik_reset_port') {
+    ctx.mdn = (evidence.sim && evidence.sim.current_mdn_e164) || null;
   }
 
   const res = await executeAction(env, ctx);
@@ -241,7 +274,7 @@ async function maybeExecuteAction(env, args) {
     };
   }
 
-  const gate = await preResolveGate(env, {
+  const resolveGate = await preResolveGate(env, {
     report,
     sim: evidence.sim,
     vendorRead: classification.vendorReadHealth || null,
@@ -251,12 +284,12 @@ async function maybeExecuteAction(env, args) {
     attemptNo,
   });
 
-  if (gate.passed) {
+  if (resolveGate.passed) {
     return {
       outcome: 'remediated',
       evidence: {
         exec_status: res.status,
-        gate_status: gate.status,
+        gate_status: resolveGate.status,
         ...(res.evidence || {}),
       },
       errorMessage: null,
@@ -267,16 +300,16 @@ async function maybeExecuteAction(env, args) {
 
   // Gate not passed — keep the report in flight, no terminal write.
   return {
-    outcome: gate.status === 'verify_pending' ? 'verify_pending' : (classification.outcome || 'no_change'),
+    outcome: resolveGate.status === 'verify_pending' ? 'verify_pending' : (classification.outcome || 'no_change'),
     evidence: {
       exec_status: res.status,
-      gate_status: gate.status,
-      gate_reason: gate.reason || null,
+      gate_status: resolveGate.status,
+      gate_reason: resolveGate.reason || null,
       ...(res.evidence || {}),
     },
     errorMessage: null,
     execStatus: res.status,
-    gateStatus: gate.status,
+    gateStatus: resolveGate.status,
   };
 }
 
