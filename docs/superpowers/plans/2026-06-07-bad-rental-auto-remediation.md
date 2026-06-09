@@ -311,6 +311,77 @@ Same template as v2 §8d. Trigger: ≥5 SIMs in same vendor account with termina
   - "Resume auto" button → clears the lock.
   - Guide-tab HTML decision tree (§K).
 
+### §I.2. Reviewer surfacing & operator controls (added 2026-06-09, scope expansion under INC-23)
+
+Operator requested a live view of the auto-remediator inside the existing Bad Rentals/Guide area (no new tab). Everything below lands in `src/dashboard/index.js` (Bad Rentals tab section, lines ~8362–8473) plus a small surface added to `src/bad-rental-remediator/index.js`.
+
+**Reviewer Status Panel** (new card pinned at the top of the Bad Rentals tab)
+
+Reads live status from the remediator worker. Shows:
+
+- **Kill-switch state** — `enabled` / `disabled` chip from KV `bad_rental_remediator_enabled`.
+- **Next scheduled main review** — derived from cron `0 */2 * * *` (display next top-of-even-hour UTC + relative).
+- **Last successful main tick** — `last_main_tick.completed_at`, `processed`, `attempted`, `outcomes` map, `ms`, `error?`.
+- **1-minute SMS verify poll** — surfaced separately: `last_verify_poll.completed_at`, `polled`, `delivered`, `still_pending`, `error?`.
+- **Dormancy reason** when applicable: `kill_switch_off` / `no_open_reports` / `cooldown_only` / `all_operator_locked` / `missing_credentials`. Derived from last tick result + open-report counts.
+- **Per-action disable chips** (e.g. `atomic_ota disabled`) when corresponding `bad_rental_remediator_action_*_disabled` KV keys are set.
+
+**Control buttons** (in the same panel, each behind a JS `confirm()` dialog)
+
+- **Run review now** → `POST /api/remediator/run-now` (dashboard) → remediator `/run` (admin-secret-gated). Returns tick result inline.
+- **Pause reviewer** → `POST /api/remediator/kill-switch` body `{enabled:false}`. Writes KV. Audit row in `rental_report_events` with `actor='operator', evidence={control:'kill_switch', from:'enabled', to:'disabled', via:'dashboard'}`.
+- **Resume reviewer** → `POST /api/remediator/kill-switch` body `{enabled:true}`. Same audit shape.
+- **Per-report Take over / Resume auto** — already wired in INC-23 (`/pause-auto`, `/resume-auto`); kept as-is.
+
+No dangerous one-click vendor actions are added. All vendor-mutating buttons stay where they are today (existing modal action endpoints, all behind §C SMS-verify gates from INC-19).
+
+**Work queue / activity feed** (extension of existing Bad Rentals list)
+
+- New filter chip row above the table: `Open`, `Verify pending`, `Operator locked`, `Escalated`, `Remediated`, `Errored (last attempt)`. Maps to `auto_remediation_state` ∈ {null, 'in_progress'} / 'verify_pending' / 'operator_locked' / 'escalated' / 'done' / (last attempt outcome='failed').
+- Per-row identifiers: **reseller-facing only** — current phone number (`e164`) and `reseller_rental_id`. SIM ID, ICCID, internal rental ID, first/original MDN are excluded from columns. (Already documented in §K; reinforced here because the new filter view is more prominent.)
+- Latest attempt summary per row: `action`, `outcome`, `attempt_no`, `next_review_at`, `error_message?`, `timestamp` — pulled from the attempts summary already added in INC-23.
+
+**Evidence / detail drawer** (extension of the existing report modal)
+
+- Existing report modal already shows the attempts table. Add an "Operator-friendly summary" block per attempt that renders selected `evidence` keys in prose (e.g. `vendor read returned status=ACTIVE`, `webhook delivered (uuid …)`, `SMS verify nonce received at 2026-06-09T15:02Z`).
+- Add `escalation_reason` next to the existing escalation banner.
+- **Redaction**: evidence rendering passes through a key-allowlist before display. Allowed keys include `situation_id`, `vendor`, `reason`, `gate_status`, `gate_reason`, `nonce`, `received_at`, `next_review_at`, `attempt_no`, `cooldown_gate`. Anything not on the list is rendered as a raw JSON blob inside a collapsed `<details>` (so operator can still inspect, but secrets/tokens never auto-render). Keys whose names match `/key|secret|token|password|auth/i` are stripped entirely.
+
+**Schedule explainer** (new collapsible block inside the reviewer panel)
+
+Static prose:
+- Main bad-rental review: `0 */2 * * *` (every 2 hours top of even hour UTC).
+- SMS verification poll: `*/1 * * * *` (every minute).
+- Per-run limits: 50 reports max, concurrency 5, ~55-second tick budget.
+- Kill switch and per-action disables documented with their KV keys.
+
+**Backend changes**
+
+In `src/bad-rental-remediator/index.js`:
+
+- Persist `last_main_tick` and `last_verify_poll` summaries to KV (`REMEDIATOR_KV`) at end of `runTick` / `runVerifyPoll`. Shape: `{completed_at, processed, attempted, outcomes, ms, error?, dormancy_reason?}`.
+- New endpoint `GET /status?secret={ADMIN_RUN_SECRET}` → returns `{kill_switch:'enabled'|'disabled', last_main_tick, last_verify_poll, action_disables:[…], open_counts:{queued, in_progress, verify_pending, operator_locked, escalated}}`. Open counts come from a single grouped query against `rental_reports`.
+- New endpoint `POST /kill-switch?secret={ADMIN_RUN_SECRET}` body `{enabled:boolean}` → writes KV; returns new state. Does **not** trigger a tick.
+
+In `src/dashboard/index.js`:
+
+- Add `REMEDIATOR_SVC` service binding (wrangler.toml) or, simpler, add `BAD_RENTAL_REMEDIATOR_URL` + `BAD_RENTAL_REMEDIATOR_ADMIN_SECRET` env vars and use `fetch()` server-side. Pick service binding to avoid putting the admin secret in dashboard env.
+- New routes:
+  - `GET /api/remediator/status` — proxies remediator `/status`. Behind `DASHBOARD_AUTH`.
+  - `POST /api/remediator/run-now` — proxies remediator `/run`. Behind `DASHBOARD_AUTH`. Writes an `rental_report_events`-style audit row to a new lightweight table `dashboard_control_events` (or reuses `rental_report_events` with `report_id=null` if the schema allows; otherwise add the new table — decision deferred to implementation).
+  - `POST /api/remediator/kill-switch` — proxies remediator `/kill-switch`. Behind `DASHBOARD_AUTH`. Writes the same audit row.
+- `GET /api/bad-rentals` already returns enough to build the queue filter; no new endpoint needed for the activity feed.
+
+**Tests / verification**
+
+- `node --check` on outer worker + extracted frontend JS (mirror INC-23 workflow).
+- Smoke against `dashboard-test` and `bad-rental-remediator` test env: hit `/api/remediator/status`, toggle kill switch, run-now (dry by setting kill switch off first then on), confirm reviewer panel renders.
+- Confirm `portal.incoming-sms.com` integrity post-deploy.
+
+**Identifier discipline**
+
+Reinforced: reseller-facing rows show only `e164` (current phone number) and `reseller_rental_id`. SIM ID, ICCID, internal rental ID, and first/original MDN remain operator-internal — visible inside the detail drawer (operator-side) but never as primary identifiers in rows, headers, or the activity feed. Aligns with the existing rule in §K.
+
 ---
 
 ## §J. Data model additions
