@@ -188,6 +188,18 @@ export default {
       return handleBadRentalAutoLock(id, null, request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/remediator/status' && request.method === 'GET') {
+      return handleRemediatorStatus(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/remediator/run-now' && request.method === 'POST') {
+      return handleRemediatorRunNow(request, env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/remediator/kill-switch' && request.method === 'POST') {
+      return handleRemediatorKillSwitch(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/error-logs') {
       return handleErrorLogs(env, corsHeaders, url);
     }
@@ -3783,7 +3795,41 @@ async function handleBadRentals(env, corsHeaders, url) {
       });
     }
     const rows = await resp.json();
+    // INC-23 — pull a compact attempts summary per report so the Bad Rentals
+    // list can show "Auto attempts: N (last: <action> <outcome>)".
+    const reportIds = (Array.isArray(rows) ? rows : []).map(r => r && r.id).filter(x => x != null);
+    const attemptSummary = {};
+    if (reportIds.length > 0) {
+      try {
+        const idIn = encodeURIComponent('(' + reportIds.join(',') + ')');
+        const aResp = await supabaseGet(env,
+          'rental_report_remediation_attempts?report_id=in.' + idIn
+          + '&select=report_id,action,outcome,attempted_at,attempt_no,mode'
+          + '&order=attempted_at.desc&limit=2000');
+        if (aResp.ok) {
+          const attempts = await aResp.json();
+          if (Array.isArray(attempts)) {
+            for (const a of attempts) {
+              const k = a.report_id;
+              if (!attemptSummary[k]) {
+                attemptSummary[k] = {
+                  count: 0,
+                  last_action: a.action || null,
+                  last_outcome: a.outcome || null,
+                  last_attempted_at: a.attempted_at || null,
+                  last_mode: a.mode || null,
+                };
+              }
+              attemptSummary[k].count += 1;
+            }
+          }
+        }
+      } catch (e) {
+        console.log('[handleBadRentals] attempts summary fetch failed: ' + e);
+      }
+    }
     const flat = (Array.isArray(rows) ? rows : []).map(r => {
+      const s = attemptSummary[r.id] || null;
       const currentE164 = r && r.sims && Array.isArray(r.sims.sim_numbers) && r.sims.sim_numbers[0]
         ? r.sims.sim_numbers[0].e164
         : null;
@@ -3808,6 +3854,11 @@ async function handleBadRentals(env, corsHeaders, url) {
         auto_remediation_state: r.auto_remediation_state || null,
         last_auto_attempt_at: r.last_auto_attempt_at || null,
         escalation_reason: r.escalation_reason || null,
+        auto_attempts_count: s ? s.count : 0,
+        auto_attempts_last_action: s ? s.last_action : null,
+        auto_attempts_last_outcome: s ? s.last_outcome : null,
+        auto_attempts_last_attempted_at: s ? s.last_attempted_at : null,
+        auto_attempts_last_mode: s ? s.last_mode : null,
         resellers: r.resellers || null,
         iccid: r && r.sims ? r.sims.iccid : null,
         reseller_rental_id: resellerRentalId,
@@ -3909,6 +3960,73 @@ async function handleBadRentalAutoLock(id, targetState, request, env, corsHeader
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
+}
+
+async function callRemediator(env, path, init) {
+  if (!env.BAD_RENTAL_REMEDIATOR) {
+    return { ok: false, status: 500, body: { error: 'no_service_binding' } };
+  }
+  const url = 'https://bad-rental-remediator' + path;
+  try {
+    const resp = await env.BAD_RENTAL_REMEDIATOR.fetch(url, init);
+    let body = null;
+    try { body = await resp.json(); } catch (_) { body = null; }
+    return { ok: resp.ok, status: resp.status, body };
+  } catch (err) {
+    return { ok: false, status: 502, body: { error: String(err) } };
+  }
+}
+
+function remediatorSecret(env) {
+  return env.BAD_RENTAL_REMEDIATOR_ADMIN_SECRET || env.ADMIN_RUN_SECRET || '';
+}
+
+async function logRemediatorControl(env, control, fromState, toState, actor) {
+  // Audit to console only; rental_report_events.report_id is NOT NULL so it
+  // cannot host worker-level control events. A dedicated audit table is
+  // tracked as follow-up (INC §I.2 implementation note).
+  console.log('[RemediatorControl] ' + JSON.stringify({ control, from: fromState, to: toState, actor: (actor || 'operator').slice(0, 120), at: new Date().toISOString() }));
+}
+
+async function handleRemediatorStatus(env, corsHeaders) {
+  const secret = remediatorSecret(env);
+  const r = await callRemediator(env, '/status?secret=' + encodeURIComponent(secret), { method: 'GET' });
+  return new Response(JSON.stringify(r.body || { error: 'unknown' }), {
+    status: r.ok ? 200 : r.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+async function handleRemediatorRunNow(request, env, corsHeaders) {
+  let body = {};
+  try { body = await request.json(); } catch (_) { body = {}; }
+  const actor = body && body.actor ? String(body.actor).slice(0, 120) : 'operator';
+  const secret = remediatorSecret(env);
+  const r = await callRemediator(env, '/run?secret=' + encodeURIComponent(secret), { method: 'GET' });
+  await logRemediatorControl(env, 'run_now', null, null, actor);
+  return new Response(JSON.stringify(r.body || { error: 'unknown' }), {
+    status: r.ok ? 200 : r.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+async function handleRemediatorKillSwitch(request, env, corsHeaders) {
+  let body = {};
+  try { body = await request.json(); } catch (_) { body = {}; }
+  const enabled = body && body.enabled === true;
+  const actor = body && body.actor ? String(body.actor).slice(0, 120) : 'operator';
+  const secret = remediatorSecret(env);
+  const before = await callRemediator(env, '/status?secret=' + encodeURIComponent(secret), { method: 'GET' });
+  const fromState = before && before.body && before.body.status && before.body.status.kill_switch;
+  const r = await callRemediator(env, '/kill-switch?secret=' + encodeURIComponent(secret), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  if (r.ok) {
+    await logRemediatorControl(env, 'kill_switch', fromState || null, enabled ? 'enabled' : 'disabled', actor);
+  }
+  return new Response(JSON.stringify(r.body || { error: 'unknown' }), {
+    status: r.ok ? 200 : r.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
 }
 
 async function handleResolveBadRental(id, request, env, corsHeaders) {
@@ -4208,6 +4326,7 @@ async function handleBadRentalReport(id, env, corsHeaders) {
       'status','remediation_action','duplicate_of',
       'received_at','triaged_at','closed_at','updated_at',
       'raw_payload','source',
+      'auto_remediation_state','last_auto_attempt_at','escalation_reason',
       'resellers(name)',
       'rentals(reseller_rental_id)',
     ].join(',');
@@ -4245,7 +4364,46 @@ async function handleBadRentalReport(id, env, corsHeaders) {
     const storageNote = hasRawPayload ? null
       : 'Raw HTTP webhook body was not captured for this report (received before the 2026-06-04 diagnostics migration). The parsed report columns and audit timeline below are the most complete record available.';
 
-    return new Response(JSON.stringify({ report, events, storage_note: storageNote }), {
+    // INC-23 — auto-remediation attempts table (one row per attempted action).
+    let attempts = [];
+    try {
+      const aResp = await supabaseGet(env,
+        'rental_report_remediation_attempts?report_id=eq.' + reportId
+        + '&select=id,attempt_no,mode,action,attempted_at,outcome,evidence,error_message,next_review_at'
+        + '&order=attempted_at.desc&limit=200');
+      if (aResp.ok) {
+        const j = await aResp.json();
+        if (Array.isArray(j)) attempts = j;
+      }
+    } catch (e) {
+      console.log('[handleBadRentalReport] attempts fetch failed: ' + e);
+    }
+
+    // INC-23 — surface a Paperclip escalation link if any event evidence carries it.
+    // Wired forward-compatibly: INC-16f will populate one of these keys.
+    let escalation = null;
+    try {
+      for (const ev of events) {
+        const ev_e = ev && ev.evidence;
+        if (!ev_e || typeof ev_e !== 'object') continue;
+        const url = ev_e.escalation_issue_url || ev_e.paperclip_issue_url || null;
+        const issueId = ev_e.escalation_issue_id || ev_e.paperclip_issue_id || null;
+        if (url || issueId) {
+          escalation = {
+            url: url || null,
+            issue_id: issueId || null,
+            reason: ev_e.escalation_reason || report.escalation_reason || null,
+            event_at: ev.created_at || null,
+          };
+          break;
+        }
+      }
+      if (!escalation && report.escalation_reason) {
+        escalation = { url: null, issue_id: null, reason: report.escalation_reason, event_at: null };
+      }
+    } catch (_) { /* tolerate any shape */ }
+
+    return new Response(JSON.stringify({ report, events, attempts, escalation, storage_note: storageNote }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
@@ -8289,6 +8447,63 @@ function getHTML(helixEnabled) {
                     </div>
                     <button onclick="loadBadRentals()" class="px-3 py-2 text-sm bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Refresh</button>
                 </div>
+
+                <!-- Auto-Remediator Reviewer Panel (INC-23 §I.2) -->
+                <div id="remediator-panel" class="mb-6 p-4 bg-dark-800 border border-dark-600 rounded-xl">
+                    <div class="flex items-center justify-between mb-3">
+                        <div class="flex items-center gap-3">
+                            <h2 class="text-base font-semibold text-white">Auto-Remediator</h2>
+                            <span id="remediator-killswitch-chip" class="px-2 py-0.5 text-xs rounded-full bg-dark-700 text-dark-300">&hellip;</span>
+                            <span id="remediator-dormancy-chip" class="hidden px-2 py-0.5 text-xs rounded-full bg-yellow-900/40 text-yellow-300"></span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <button onclick="remediatorRunNow()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-700 text-white rounded">Run review now</button>
+                            <button onclick="remediatorToggleKillSwitch(false)" id="remediator-pause-btn" class="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-600 text-white rounded">Pause reviewer</button>
+                            <button onclick="remediatorToggleKillSwitch(true)" id="remediator-resume-btn" class="hidden px-3 py-1.5 text-xs bg-emerald-700 hover:bg-emerald-600 text-white rounded">Resume reviewer</button>
+                            <button onclick="loadRemediatorStatus()" class="px-3 py-1.5 text-xs bg-dark-700 border border-dark-500 text-gray-300 hover:bg-dark-600 rounded">Refresh</button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
+                        <div class="p-3 bg-dark-900/40 rounded">
+                            <div class="text-dark-400 uppercase mb-1">Last main tick (2h cron)</div>
+                            <div id="remediator-main-tick" class="text-gray-200">&mdash;</div>
+                        </div>
+                        <div class="p-3 bg-dark-900/40 rounded">
+                            <div class="text-dark-400 uppercase mb-1">Last verify poll (1m cron)</div>
+                            <div id="remediator-verify-poll" class="text-gray-200">&mdash;</div>
+                        </div>
+                        <div class="p-3 bg-dark-900/40 rounded">
+                            <div class="text-dark-400 uppercase mb-1">Open counts</div>
+                            <div id="remediator-open-counts" class="text-gray-200">&mdash;</div>
+                        </div>
+                        <div class="p-3 bg-dark-900/40 rounded">
+                            <div class="text-dark-400 uppercase mb-1">Action disables</div>
+                            <div id="remediator-action-disables" class="text-gray-200">&mdash;</div>
+                        </div>
+                    </div>
+                    <details class="mt-3 text-xs text-dark-400">
+                        <summary class="cursor-pointer hover:text-gray-300">Schedule &amp; limits</summary>
+                        <div class="mt-2 pl-4 space-y-1">
+                            <div>Main review: <code class="text-emerald-300">0 */2 * * *</code> (every 2 hours, top of even hour UTC).</div>
+                            <div>SMS verify poll: <code class="text-emerald-300">*/1 * * * *</code> (every minute).</div>
+                            <div>Per-run limits: 50 reports max, concurrency 5, ~55 s tick budget.</div>
+                            <div>Kill switch: KV <code>bad_rental_remediator_enabled</code>. Per-action disables: <code>bad_rental_remediator_action_{action}_disabled</code>.</div>
+                        </div>
+                    </details>
+                    <div id="remediator-run-result" class="hidden mt-3 p-2 bg-dark-900/60 border border-dark-600 rounded text-xs text-gray-300"></div>
+                </div>
+
+                <!-- Auto state filter chips (INC-23 §I.2 work queue) -->
+                <div class="flex flex-wrap items-center gap-2 mb-4 text-xs">
+                    <span class="text-dark-400 uppercase">Auto state</span>
+                    <button data-auto-filter="all"             class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">All</button>
+                    <button data-auto-filter="open"            class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Open (no auto state)</button>
+                    <button data-auto-filter="verify_pending"  class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Verify pending</button>
+                    <button data-auto-filter="operator_locked" class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Operator locked</button>
+                    <button data-auto-filter="escalated"       class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Escalated</button>
+                    <button data-auto-filter="done"            class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Done (auto)</button>
+                    <button data-auto-filter="error"           class="auto-filter-chip px-2 py-1 rounded bg-dark-700 text-gray-300 hover:bg-dark-600">Last attempt errored</button>
+                </div>
                 <div class="flex items-center gap-3 mb-4">
                     <label class="text-xs text-dark-400 uppercase" for="bad-rentals-status-filter">Status</label>
                     <select id="bad-rentals-status-filter" onchange="loadBadRentals()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
@@ -9026,6 +9241,7 @@ function getHTML(helixEnabled) {
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-reseller-webhooks').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Reseller Webhooks</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-statuses').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">SIM Status Reference</a>
                         <a href="#" onclick="event.preventDefault();document.getElementById('guide-auto-imei-att').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Auto IMEI Change (AT&amp;T)</a>
+                        <a href="#" onclick="event.preventDefault();document.getElementById('guide-bad-rental-auto-remediation').scrollIntoView({behavior:'smooth'})" class="text-accent hover:underline">Bad-Rental Auto-Remediation (§K + §F)</a>
                     </div>
                 </div>
 
@@ -9813,6 +10029,172 @@ function getHTML(helixEnabled) {
                     </div>
                 </div>
 
+                <div id="guide-bad-rental-auto-remediation" class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Bad-Rental Auto-Remediation (§K decision tree + §F vendor playbooks)</h3>
+                    <p class="text-sm text-gray-400 mb-4">Driven by the <code class="text-accent">bad-rental-remediator</code> worker (cron 0 */2 * * *). Click any node to jump to the matching situation row. From the Bad Rentals report modal, attempt rows link back into this guide.</p>
+
+                    <div class="text-xs text-gray-300 space-y-3 mb-5">
+                        <p class="text-white font-medium">Decision tree (§K)</p>
+                        <div class="rounded-lg border border-dark-600 bg-dark-900/60 p-4 overflow-x-auto">
+                            <pre class="text-[12px] leading-snug text-dark-100 whitespace-pre">2h cron tick
+   |
+   v
+[intake] resolve id, gather evidence, decide vendor
+   |
+   v
+[§B] IMEI correctness check
+   +-- wrong type -----------------> escalate imei_wrong_type
+   +-- ok
+        |
+        v
+[§E] cancel-guard (vendor cancelled/deactivated)
+   +-- active rental remains -----> escalate vendor_cancelled_active_rental
+   +-- no active rental ----------> close duplicate
+   +-- (didn’t fire)
+        |
+        v
+[shared situations] S1..S6
+        |
+        v
+[branch on sims.vendor]</pre>
+                            <div class="grid grid-cols-1 md:grid-cols-4 gap-2 mt-3 text-[12px]">
+                                <button onclick="gotoAutoRemSituation('A1')" class="text-left px-3 py-2 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-100">Atomic (AT&amp;T) → A1–A10</button>
+                                <button onclick="gotoAutoRemSituation('W1')" class="text-left px-3 py-2 rounded border border-sky-500/40 bg-sky-500/10 hover:bg-sky-500/20 text-sky-100">Wing IoT → W1–W9</button>
+                                <button onclick="gotoAutoRemSituation('H1')" class="text-left px-3 py-2 rounded border border-fuchsia-500/40 bg-fuchsia-500/10 hover:bg-fuchsia-500/20 text-fuchsia-100">Helix (T-Mobile) → H1–H9</button>
+                                <button onclick="gotoAutoRemSituation('T1')" class="text-left px-3 py-2 rounded border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-100">Teltik → T1–T11</button>
+                            </div>
+                            <pre class="text-[12px] leading-snug text-dark-100 whitespace-pre mt-3">[apply auto_action] per situation (if cooldown allows)
+   |
+   v
+[re-query vendor] §C.4 conditions 1,2,3 satisfied?
+   +-- no  -----> record outcome, escalate per situation
+   +-- yes
+        |
+        v
+[§C.1] send unique SMS
+   +-- send fail -> §C.2 retry up to 3x60s
+   |                +-- all fail -> escalate verify_send_failed
+   +-- send ok
+        |
+        v
+set verify_pending; schedule §C.3 poll
+        |
+        v
+[§C.3] inbound_sms match within 5 min?
+   +-- no  -----> escalate verify_receive_timeout
+   +-- yes -----> [§D] notify-reseller (resend webhook + status update) -> remediated</pre>
+                        </div>
+                    </div>
+
+                    <p class="text-white font-medium text-sm mb-2">Shared situations S1–S6</p>
+                    <div class="overflow-x-auto mb-5">
+                        <table class="w-full text-[12px]">
+                            <thead class="bg-dark-900 text-dark-400 uppercase tracking-wide text-[10px]">
+                                <tr>
+                                    <th class="px-2 py-1.5 text-left">#</th>
+                                    <th class="px-2 py-1.5 text-left">Situation</th>
+                                    <th class="px-2 py-1.5 text-left">Auto action</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-dark-700 text-dark-200">
+                                <tr id="auto-rem-S1" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">S1</td><td class="px-2 py-1.5">Vendor reachable, webhook delivery missing</td><td class="px-2 py-1.5"><code class="text-accent">resend_online</code></td></tr>
+                                <tr id="auto-rem-S2" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">S2</td><td class="px-2 py-1.5">DB stale vs vendor truth</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code></td></tr>
+                                <tr id="auto-rem-S3" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">S3</td><td class="px-2 py-1.5">Duplicate of an earlier open report</td><td class="px-2 py-1.5"><code class="text-accent">close_duplicate</code></td></tr>
+                                <tr id="auto-rem-S4" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">S4</td><td class="px-2 py-1.5">Recent rotation/swap explains reseller complaint</td><td class="px-2 py-1.5"><code class="text-accent">classify_only</code> → close after notify</td></tr>
+                                <tr id="auto-rem-S5" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">S5</td><td class="px-2 py-1.5">Operator already taking over (locked)</td><td class="px-2 py-1.5">skip (operator_locked)</td></tr>
+                                <tr id="auto-rem-S6" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">S6</td><td class="px-2 py-1.5">Insufficient evidence to act</td><td class="px-2 py-1.5">escalate — operator</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <p class="text-white font-medium text-sm mb-2">§F.1 Atomic (AT&amp;T ATOMIC) — A1–A10</p>
+                    <div class="overflow-x-auto mb-5">
+                        <table class="w-full text-[12px]">
+                            <thead class="bg-dark-900 text-dark-400 uppercase tracking-wide text-[10px]">
+                                <tr><th class="px-2 py-1.5 text-left">#</th><th class="px-2 py-1.5 text-left">Detection</th><th class="px-2 py-1.5 text-left">Auto action</th><th class="px-2 py-1.5 text-left">Cooldown / cap</th></tr>
+                            </thead>
+                            <tbody class="divide-y divide-dark-700 text-dark-200">
+                                <tr id="auto-rem-A1"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A1</td><td class="px-2 py-1.5">inquiry Active + webhook delivered + reseller still bad</td><td class="px-2 py-1.5"><code class="text-accent">atomic_ota</code> (resendOtaProfile)</td><td class="px-2 py-1.5">1 try / 24h</td></tr>
+                                <tr id="auto-rem-A2"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A2</td><td class="px-2 py-1.5">inquiry Active; sims.status ≠ active</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code></td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-A3"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A3</td><td class="px-2 py-1.5">inquiry Suspended</td><td class="px-2 py-1.5"><code class="text-accent">atomic_restore</code> (CR)</td><td class="px-2 py-1.5">1 try / 24h</td></tr>
+                                <tr id="auto-rem-A4"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A4</td><td class="px-2 py-1.5">inquiry Cancelled / Deactivated</td><td class="px-2 py-1.5">§E guard → close duplicate or escalate</td><td class="px-2 py-1.5">0 fix</td></tr>
+                                <tr id="auto-rem-A5"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A5</td><td class="px-2 py-1.5">ICCID not found at vendor</td><td class="px-2 py-1.5">escalate — operator</td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-A6"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A6</td><td class="px-2 py-1.5">Active; no delivered webhook for latest number.online</td><td class="px-2 py-1.5"><code class="text-accent">resend_online</code> (force)</td><td class="px-2 py-1.5">2 tries / 1h</td></tr>
+                                <tr id="auto-rem-A7"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A7</td><td class="px-2 py-1.5">Vendor IMEI ≠ DB IMEI but both correct type</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code> (sims.imei)</td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-A8"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A8</td><td class="px-2 py-1.5">IMEI wrong type (phone IMEI on router etc.)</td><td class="px-2 py-1.5">escalate <code class="text-accent">imei_wrong_type</code></td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-A9"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A9</td><td class="px-2 py-1.5">Active; inquiry MDN ≠ sims.current_mdn_e164</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code> (sims.current_mdn)</td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-A10" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-amber-300">A10</td><td class="px-2 py-1.5">Unable to reproduce after §C SMS verify</td><td class="px-2 py-1.5"><code class="text-accent">classify_only</code></td><td class="px-2 py-1.5">3 ticks / 2h</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <p class="text-white font-medium text-sm mb-2">§F.2 Wing IoT — W1–W9</p>
+                    <div class="overflow-x-auto mb-5">
+                        <table class="w-full text-[12px]">
+                            <thead class="bg-dark-900 text-dark-400 uppercase tracking-wide text-[10px]">
+                                <tr><th class="px-2 py-1.5 text-left">#</th><th class="px-2 py-1.5 text-left">Detection</th><th class="px-2 py-1.5 text-left">Auto action</th><th class="px-2 py-1.5 text-left">Cooldown / cap</th></tr>
+                            </thead>
+                            <tbody class="divide-y divide-dark-700 text-dark-200">
+                                <tr id="auto-rem-W1" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W1</td><td class="px-2 py-1.5">GET Activated + dialable plan; sims.status ≠ active</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code></td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-W2" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W2</td><td class="px-2 py-1.5">Active dialable; no delivered webhook</td><td class="px-2 py-1.5"><code class="text-accent">resend_online</code></td><td class="px-2 py-1.5">2 tries / 1h</td></tr>
+                                <tr id="auto-rem-W3" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W3</td><td class="px-2 py-1.5">Active dialable + recent reseller report</td><td class="px-2 py-1.5"><code class="text-accent">resend_online</code> + §C SMS (no OTA exists for Wing)</td><td class="px-2 py-1.5">1 try / 24h</td></tr>
+                                <tr id="auto-rem-W4" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W4</td><td class="px-2 py-1.5">GET status ≠ Activated</td><td class="px-2 py-1.5">escalate; §E if cancellation suspected</td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-W5" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W5</td><td class="px-2 py-1.5">GET 404 (ICCID not at vendor)</td><td class="px-2 py-1.5">escalate <code class="text-accent">vendor_iccid_not_found</code></td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-W6" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W6</td><td class="px-2 py-1.5">GET MDN ≠ DB MDN</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code> (verify SMS at vendor MDN)</td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-W7" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W7</td><td class="px-2 py-1.5">Mode wrong: ABIR while rental needs dialable</td><td class="px-2 py-1.5"><code class="text-accent">wing_put_dialable</code> (NON ABIR SMS MO/MT US)</td><td class="px-2 py-1.5">1 try / 24h</td></tr>
+                                <tr id="auto-rem-W8" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W8</td><td class="px-2 py-1.5">IMEI wrong type (phone IMEI on Wing SIM)</td><td class="px-2 py-1.5">escalate — operator</td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-W9" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-sky-300">W9</td><td class="px-2 py-1.5">All clean + §C SMS verifies</td><td class="px-2 py-1.5"><code class="text-accent">classify_only</code> → unable_to_reproduce</td><td class="px-2 py-1.5">3 ticks / 2h</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <p class="text-white font-medium text-sm mb-2">§F.3 Helix (T-Mobile via SOLO) — H1–H9</p>
+                    <div class="overflow-x-auto mb-5">
+                        <table class="w-full text-[12px]">
+                            <thead class="bg-dark-900 text-dark-400 uppercase tracking-wide text-[10px]">
+                                <tr><th class="px-2 py-1.5 text-left">#</th><th class="px-2 py-1.5 text-left">Detection</th><th class="px-2 py-1.5 text-left">Auto action</th><th class="px-2 py-1.5 text-left">Cooldown / cap</th></tr>
+                            </thead>
+                            <tbody class="divide-y divide-dark-700 text-dark-200">
+                                <tr id="auto-rem-H1" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H1</td><td class="px-2 py-1.5">4.7 details Active; DB ≠ active</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code></td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-H2" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H2</td><td class="px-2 py-1.5">Active; no delivered webhook</td><td class="px-2 py-1.5"><code class="text-accent">resend_online</code></td><td class="px-2 py-1.5">2 tries / 1h</td></tr>
+                                <tr id="auto-rem-H3" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H3</td><td class="px-2 py-1.5">Active + delivered + recent reseller report</td><td class="px-2 py-1.5"><code class="text-accent">helix_ota</code> (4.11)</td><td class="px-2 py-1.5">1 try / 24h</td></tr>
+                                <tr id="auto-rem-H4" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H4</td><td class="px-2 py-1.5">4.7 state Suspended</td><td class="px-2 py-1.5"><code class="text-accent">helix_unsuspend</code> (4.6 CR/35)</td><td class="px-2 py-1.5">1 try / 24h</td></tr>
+                                <tr id="auto-rem-H5" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H5</td><td class="px-2 py-1.5">4.7 state Cancelled</td><td class="px-2 py-1.5">§E guard → close duplicate or escalate</td><td class="px-2 py-1.5">0 auto-fix</td></tr>
+                                <tr id="auto-rem-H6" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H6</td><td class="px-2 py-1.5">4.7 returns not-found</td><td class="px-2 py-1.5">escalate</td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-H7" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H7</td><td class="px-2 py-1.5">DB MDN ≠ Helix MDN</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code></td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-H8" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H8</td><td class="px-2 py-1.5">IMEI wrong / drift</td><td class="px-2 py-1.5">escalate (4.8 IMEI write is operator-only)</td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-H9" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-fuchsia-300">H9</td><td class="px-2 py-1.5">All clean + §C SMS verifies</td><td class="px-2 py-1.5"><code class="text-accent">classify_only</code> → unable_to_reproduce</td><td class="px-2 py-1.5">3 ticks / 2h</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <p class="text-white font-medium text-sm mb-2">§F.4 Teltik — T1–T11</p>
+                    <div class="overflow-x-auto mb-5">
+                        <table class="w-full text-[12px]">
+                            <thead class="bg-dark-900 text-dark-400 uppercase tracking-wide text-[10px]">
+                                <tr><th class="px-2 py-1.5 text-left">#</th><th class="px-2 py-1.5 text-left">Detection</th><th class="px-2 py-1.5 text-left">Auto action</th><th class="px-2 py-1.5 text-left">Cooldown / cap</th></tr>
+                            </thead>
+                            <tbody class="divide-y divide-dark-700 text-dark-200">
+                                <tr id="auto-rem-T1"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T1</td><td class="px-2 py-1.5">/get-phone-number + /port-status healthy; DB ≠ active</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code></td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-T2"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T2</td><td class="px-2 py-1.5">Healthy; no delivered webhook</td><td class="px-2 py-1.5"><code class="text-accent">resend_online</code></td><td class="px-2 py-1.5">2 tries / 1h</td></tr>
+                                <tr id="auto-rem-T3"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T3</td><td class="px-2 py-1.5">Healthy + delivered + recent reseller report</td><td class="px-2 py-1.5"><code class="text-accent">teltik_reset_network</code> → <code class="text-accent">teltik_reset_port</code></td><td class="px-2 py-1.5">1 try each / 24h</td></tr>
+                                <tr id="auto-rem-T4"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T4</td><td class="px-2 py-1.5">/port-status pending/in-progress &gt; 6h</td><td class="px-2 py-1.5"><code class="text-accent">teltik_reset_port</code></td><td class="px-2 py-1.5">1 try / 24h</td></tr>
+                                <tr id="auto-rem-T5"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T5</td><td class="px-2 py-1.5">/port-status offline</td><td class="px-2 py-1.5"><code class="text-accent">teltik_reset_port</code></td><td class="px-2 py-1.5">1 try / 24h</td></tr>
+                                <tr id="auto-rem-T6"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T6</td><td class="px-2 py-1.5">/get-info returns terminal (suspended/cancelled)</td><td class="px-2 py-1.5">§E guard</td><td class="px-2 py-1.5">0 fix</td></tr>
+                                <tr id="auto-rem-T7"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T7</td><td class="px-2 py-1.5">ICCID/MDN not in Teltik</td><td class="px-2 py-1.5">escalate</td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-T8"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T8</td><td class="px-2 py-1.5">DB MDN ≠ Teltik MDN</td><td class="px-2 py-1.5"><code class="text-accent">db_sync_upsert</code></td><td class="px-2 py-1.5">1 idempotent</td></tr>
+                                <tr id="auto-rem-T9"  class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T9</td><td class="px-2 py-1.5">/forward-url GET absent/wrong</td><td class="px-2 py-1.5">escalate <code class="text-accent">teltik_forward_url_misconfigured</code></td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-T10" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T10</td><td class="px-2 py-1.5">§B IMEI check fails</td><td class="px-2 py-1.5">escalate — operator</td><td class="px-2 py-1.5">0</td></tr>
+                                <tr id="auto-rem-T11" class="hover:bg-dark-700/40"><td class="px-2 py-1.5 font-mono text-emerald-300">T11</td><td class="px-2 py-1.5">All clean + §C SMS verifies</td><td class="px-2 py-1.5"><code class="text-accent">classify_only</code> → unable_to_reproduce</td><td class="px-2 py-1.5">3 ticks / 2h</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="text-[11px] text-dark-400 mt-3">
+                        Spec: <code class="text-accent">docs/superpowers/plans/2026-06-07-bad-rental-auto-remediation.md</code> (§K + §F.1–§F.4). Worker: <code class="text-accent">src/bad-rental-remediator/</code>. Audit tables: <code class="text-accent">rental_report_remediation_attempts</code>, <code class="text-accent">rental_report_events</code>.
+                    </div>
+                </div>
+
             </div>
 
             <div id="tab-api-tester" class="tab-content hidden">
@@ -10508,7 +10890,7 @@ function getHTML(helixEnabled) {
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'bad-rentals') loadBadRentals();
+            if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); }
             if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
@@ -14067,6 +14449,44 @@ async function sendSimOnline(simId, phoneNumber) {
                         ? '<button onclick="event.stopPropagation();markBadRentalFixed(' + escapeHtml(r.id) + ')" class="px-2 py-1 text-xs rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 transition">Mark fixed</button>'
                         : '';
                     const actionCell = '<div class="flex items-center gap-1">' + fixBtn + editBtn + '</div>';
+                    // INC-23 — auto-remediation sub-row.
+                    const autoState = r.auto_remediation_state || null;
+                    const autoCount = r.auto_attempts_count || 0;
+                    const autoLastAction  = r.auto_attempts_last_action  || null;
+                    const autoLastOutcome = r.auto_attempts_last_outcome || null;
+                    const autoLastAt      = r.auto_attempts_last_attempted_at || r.last_auto_attempt_at || null;
+                    const autoLastMode    = r.auto_attempts_last_mode || null;
+                    let autoSubRow = '';
+                    if (autoCount > 0 || autoState) {
+                        const stateBadgeColor = (function(){
+                            switch (autoState) {
+                                case 'operator_locked': return 'bg-amber-500/20 text-amber-200';
+                                case 'escalated':       return 'bg-rose-500/20 text-rose-200';
+                                case 'verify_pending':  return 'bg-sky-500/20 text-sky-200';
+                                case 'paused':          return 'bg-slate-500/20 text-slate-200';
+                                case 'in_progress':     return 'bg-blue-500/20 text-blue-200';
+                                case 'done':            return 'bg-emerald-500/20 text-emerald-200';
+                                default:                return 'bg-dark-700 text-dark-200';
+                            }
+                        })();
+                        const stateChip = autoState
+                            ? '<span class="inline-block px-1.5 py-0.5 text-[10px] font-medium rounded ' + stateBadgeColor + '" title="auto_remediation_state">' + escapeHtml(autoState) + '</span>'
+                            : '';
+                        const lastTxt = autoCount > 0
+                            ? 'last: ' + escapeHtml(autoLastAction || '?') + ' → ' + escapeHtml(autoLastOutcome || '?')
+                                + (autoLastMode ? ' (' + escapeHtml(autoLastMode) + ')' : '')
+                                + (autoLastAt ? ' · ' + escapeHtml(fmtDt(autoLastAt)) : '')
+                            : 'no attempts yet';
+                        autoSubRow = '<tr class="bg-dark-900/40 border-t-0" data-auto-sub-for="' + escapeHtml(r.id) + '">'
+                            + '<td></td>'
+                            + '<td colspan="8" class="px-4 py-1.5 text-[11px] text-dark-300">'
+                            +   '<span class="text-dark-400 uppercase tracking-wide mr-2">Auto attempts:</span>'
+                            +   '<span class="font-mono text-dark-200 mr-2">' + escapeHtml(String(autoCount)) + '</span>'
+                            +   stateChip
+                            +   '<span class="ml-2">' + lastTxt + '</span>'
+                            + '</td>'
+                            + '</tr>';
+                    }
                     return '<tr class="hover:bg-dark-700/40" data-report-id="' + escapeHtml(r.id) + '" data-sim-id="' + escapeHtml(r.sim_id || '') + '" data-reported-e164="' + escapeHtml(reported || '') + '" data-current-e164="' + escapeHtml(current || '') + '">' +
                         '<td class="px-4 py-3 font-mono text-xs"><a onclick="event.stopPropagation();openBadRentalReport(' + escapeHtml(r.id) + ')" title="Show the report payload the reseller submitted" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(r.id) + '</a></td>' +
                         '<td class="px-4 py-3 text-dark-200">' + escapeHtml(resellerName) + '</td>' +
@@ -14077,13 +14497,189 @@ async function sendSimOnline(simId, phoneNumber) {
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + rentalIdCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-400 text-xs">' + escapeHtml(fmtDt(r.received_at)) + '</td>' +
                         '<td class="px-4 py-3">' + actionCell + '</td>' +
-                    '</tr>';
+                    '</tr>' + autoSubRow;
                 }).join('');
             } catch(e) {
                 tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + escapeHtml(e.message) + '</td></tr>';
                 console.error('[loadBadRentals]', e);
             }
+            applyAutoFilterFromActiveChip();
         }
+
+        // ===== Auto-Remediator Reviewer Panel (INC-23 §I.2) =====
+        function fmtTickAgo(iso) {
+            if (!iso) return 'never';
+            const t = new Date(iso).getTime();
+            if (!Number.isFinite(t)) return 'never';
+            const diff = Math.max(0, Date.now() - t);
+            const m = Math.floor(diff / 60000);
+            if (m < 1) return 'just now';
+            if (m < 60) return m + 'm ago';
+            const h = Math.floor(m / 60);
+            if (h < 24) return h + 'h ' + (m % 60) + 'm ago';
+            return Math.floor(h / 24) + 'd ago';
+        }
+
+        async function loadRemediatorStatus() {
+            const ksChip = document.getElementById('remediator-killswitch-chip');
+            const dormChip = document.getElementById('remediator-dormancy-chip');
+            const mainEl = document.getElementById('remediator-main-tick');
+            const verifyEl = document.getElementById('remediator-verify-poll');
+            const countsEl = document.getElementById('remediator-open-counts');
+            const disablesEl = document.getElementById('remediator-action-disables');
+            const pauseBtn = document.getElementById('remediator-pause-btn');
+            const resumeBtn = document.getElementById('remediator-resume-btn');
+            if (!ksChip) return;
+            try {
+                const resp = await fetch(API_BASE + '/remediator/status');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                const status = (data && data.status) ? data.status : null;
+                if (!status) throw new Error('no_status');
+                const enabled = status.kill_switch === 'enabled';
+                ksChip.textContent = enabled ? 'Reviewer ENABLED' : 'Reviewer DISABLED';
+                ksChip.className = 'px-2 py-0.5 text-xs rounded-full ' + (enabled
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : 'bg-rose-500/20 text-rose-300');
+                if (pauseBtn) pauseBtn.classList.toggle('hidden', !enabled);
+                if (resumeBtn) resumeBtn.classList.toggle('hidden', enabled);
+                const mt = status.last_main_tick;
+                if (mt) {
+                    const outcomes = mt.outcomes ? Object.entries(mt.outcomes).map(function(kv){return kv[0]+':'+kv[1];}).join(', ') : '';
+                    mainEl.innerHTML =
+                        '<div>' + escapeHtml(fmtTickAgo(mt.completed_at)) + '</div>' +
+                        '<div class="text-dark-400 text-[10px] mt-0.5">processed=' + (mt.processed||0) + ' attempted=' + (mt.attempted||0) + ' stale_recovered=' + (mt.stale_recovered||0) + ' ms=' + (mt.ms||0) + '</div>' +
+                        (outcomes ? '<div class="text-dark-400 text-[10px]">' + escapeHtml(outcomes) + '</div>' : '') +
+                        (mt.error ? '<div class="text-rose-300 text-[10px]">error: ' + escapeHtml(mt.error) + '</div>' : '');
+                } else {
+                    mainEl.textContent = 'no tick recorded yet';
+                }
+                const vp = status.last_verify_poll;
+                if (vp) {
+                    verifyEl.innerHTML =
+                        '<div>' + escapeHtml(fmtTickAgo(vp.completed_at)) + '</div>' +
+                        '<div class="text-dark-400 text-[10px] mt-0.5">polled=' + (vp.polled||0) + ' matched=' + (vp.matched||0) + ' timed_out=' + (vp.timed_out||0) + ' still=' + (vp.still_pending||0) + '</div>' +
+                        (vp.error ? '<div class="text-rose-300 text-[10px]">error: ' + escapeHtml(vp.error) + '</div>' : '');
+                } else {
+                    verifyEl.textContent = 'no poll recorded yet';
+                }
+                const oc = status.open_counts || {};
+                countsEl.innerHTML =
+                    '<div>queued: <span class="text-gray-100">' + (oc.queued||0) + '</span></div>' +
+                    '<div>in_progress: <span class="text-gray-100">' + (oc.in_progress||0) + '</span></div>' +
+                    '<div>verify_pending: <span class="text-gray-100">' + (oc.verify_pending||0) + '</span></div>' +
+                    '<div>operator_locked: <span class="text-gray-100">' + (oc.operator_locked||0) + '</span></div>' +
+                    '<div>escalated: <span class="text-gray-100">' + (oc.escalated||0) + '</span></div>';
+                const dis = Array.isArray(status.action_disables) ? status.action_disables : [];
+                disablesEl.innerHTML = dis.length === 0
+                    ? '<span class="text-dark-400">none</span>'
+                    : dis.map(function(a){return '<span class="inline-block mr-1 mb-1 px-1.5 py-0.5 text-[10px] rounded bg-rose-900/40 text-rose-200">' + escapeHtml(a) + '</span>';}).join('');
+                let dormancy = mt && mt.dormancy_reason;
+                if (!enabled) dormancy = 'kill_switch_off';
+                if (dormancy) {
+                    dormChip.textContent = 'dormant: ' + dormancy;
+                    dormChip.classList.remove('hidden');
+                } else {
+                    dormChip.classList.add('hidden');
+                }
+            } catch (e) {
+                ksChip.textContent = 'status error';
+                ksChip.className = 'px-2 py-0.5 text-xs rounded-full bg-rose-500/20 text-rose-300';
+                console.error('[loadRemediatorStatus]', e);
+            }
+        }
+
+        async function remediatorRunNow() {
+            if (!confirm('Trigger an immediate Auto-Remediator main tick now?\\n\\nThis runs the same logic as the 2-hour cron once. Reviewer kill-switch must be enabled or the tick will short-circuit.')) return;
+            const out = document.getElementById('remediator-run-result');
+            if (out) { out.classList.remove('hidden'); out.textContent = 'Running…'; }
+            try {
+                const resp = await fetch(API_BASE + '/remediator/run-now', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ actor: 'dashboard' }),
+                });
+                const data = await resp.json();
+                if (out) out.textContent = JSON.stringify(data, null, 2);
+                loadRemediatorStatus();
+                loadBadRentals();
+            } catch (e) {
+                if (out) out.textContent = 'Error: ' + (e && e.message ? e.message : String(e));
+            }
+        }
+
+        async function remediatorToggleKillSwitch(enabled) {
+            const verb = enabled ? 'RESUME' : 'PAUSE';
+            if (!confirm(verb + ' the Auto-Remediator?\\n\\n' + (enabled
+                ? 'This re-enables the 2-hour cron. The next scheduled tick will process queued bad rentals.'
+                : 'This disables the 2-hour cron. Already-running attempts finish; no new actions will be taken until you resume.'))) return;
+            try {
+                const resp = await fetch(API_BASE + '/remediator/kill-switch', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({ enabled, actor: 'dashboard' }),
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                await loadRemediatorStatus();
+            } catch (e) {
+                alert('Toggle failed: ' + (e && e.message ? e.message : String(e)));
+            }
+        }
+
+        function applyAutoFilterFromActiveChip() {
+            const chips = document.querySelectorAll('.auto-filter-chip');
+            let active = 'all';
+            chips.forEach(function(c){ if (c.classList.contains('ring-2')) active = c.dataset.autoFilter; });
+            applyAutoFilter(active);
+        }
+
+        function applyAutoFilter(which) {
+            const tbody = document.getElementById('bad-rentals-tbody');
+            if (!tbody) return;
+            const rowsById = window._badRentalRowsById || {};
+            const trs = tbody.querySelectorAll('tr');
+            trs.forEach(function(tr){
+                // sub-rows have no .dataset; primary rows we left without dataset too — match on innerHTML
+                tr.style.display = '';
+            });
+            if (which === 'all') return;
+            // Filter via known map
+            const ids = Object.keys(rowsById);
+            const keep = new Set();
+            ids.forEach(function(id){
+                const r = rowsById[id];
+                const s = r.auto_remediation_state || null;
+                const lastOutcome = r.auto_attempts_last_outcome || null;
+                let match = false;
+                if (which === 'open')            match = !s;
+                else if (which === 'verify_pending')  match = s === 'verify_pending';
+                else if (which === 'operator_locked') match = s === 'operator_locked';
+                else if (which === 'escalated')       match = s === 'escalated';
+                else if (which === 'done')            match = s === 'done';
+                else if (which === 'error')           match = lastOutcome === 'failed' || lastOutcome === 'error';
+                if (match) keep.add(String(id));
+            });
+            // Re-render via the existing rows we already have in memory — hide non-matching.
+            // Each rendered <tr> begins with "<td>#<id>" — find the report id by parsing.
+            const rendered = tbody.querySelectorAll('tr');
+            rendered.forEach(function(tr){
+                const m = tr.innerHTML.match(/#(\\d+)/);
+                if (!m) { tr.style.display = 'none'; return; }
+                tr.style.display = keep.has(m[1]) ? '' : 'none';
+            });
+        }
+
+        document.addEventListener('click', function(ev){
+            const chip = ev.target && ev.target.closest && ev.target.closest('.auto-filter-chip');
+            if (!chip) return;
+            document.querySelectorAll('.auto-filter-chip').forEach(function(c){
+                c.classList.remove('ring-2','ring-accent','bg-accent','text-white');
+                c.classList.add('bg-dark-700','text-gray-300');
+            });
+            chip.classList.remove('bg-dark-700','text-gray-300');
+            chip.classList.add('ring-2','ring-accent','bg-accent','text-white');
+            applyAutoFilter(chip.dataset.autoFilter);
+        });
 
         function openBadRentalEdit(reportId) {
             const r = (window._badRentalRowsById || {})[reportId];
@@ -14320,8 +14916,124 @@ async function sendSimOnline(simId, phoneNumber) {
                     + '<div class="text-xs text-dark-500">Not captured for this report (legacy row).</div>'
                   + '</div>';
 
+            // INC-23 — Auto-remediation attempts table.
+            const attempts = (data && Array.isArray(data.attempts)) ? data.attempts : [];
+            let attemptsHtml;
+            if (!attempts.length) {
+                attemptsHtml = '<div class="text-dark-500">No auto-remediation attempts recorded.</div>';
+            } else {
+                attemptsHtml = '<div class="overflow-x-auto rounded border border-dark-700">'
+                    + '<table class="w-full text-[11px]">'
+                    +   '<thead class="bg-dark-900 text-dark-400 uppercase tracking-wide text-[10px]">'
+                    +     '<tr>'
+                    +       '<th class="px-2 py-1.5 text-left">#</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Mode</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Action</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Outcome</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Attempted at</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Next review</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Error</th>'
+                    +     '</tr>'
+                    +   '</thead>'
+                    +   '<tbody class="divide-y divide-dark-700">';
+                for (let i = 0; i < attempts.length; i++) {
+                    const a = attempts[i];
+                    const outcomeColor = (function(o){
+                        switch (o) {
+                            case 'success':          return 'text-emerald-300';
+                            case 'failed':           return 'text-rose-300';
+                            case 'no_change':        return 'text-dark-300';
+                            case 'skipped_cooldown': return 'text-amber-300';
+                            case 'verify_pending':   return 'text-sky-300';
+                            default:                 return 'text-dark-200';
+                        }
+                    })(a.outcome);
+                    const modeAnchor = a.mode
+                        ? '<a href="#auto-rem-' + escapeHtml(a.mode) + '" data-auto-rem-jump="' + escapeHtml(a.mode) + '" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(a.mode) + '</a>'
+                        : '—';
+                    let evidenceTip = '';
+                    if (a.evidence && typeof a.evidence === 'object') {
+                        try { evidenceTip = JSON.stringify(a.evidence); } catch(_) { evidenceTip = ''; }
+                    }
+                    const actionCell = '<span title="' + escapeHtml(evidenceTip) + '">' + escapeHtml(a.action || '—') + '</span>';
+                    attemptsHtml += '<tr class="hover:bg-dark-700/30">'
+                        + '<td class="px-2 py-1.5 font-mono text-dark-400">' + escapeHtml(String(a.attempt_no != null ? a.attempt_no : '—')) + '</td>'
+                        + '<td class="px-2 py-1.5 font-mono text-dark-200">' + modeAnchor + '</td>'
+                        + '<td class="px-2 py-1.5 text-dark-100">' + actionCell + '</td>'
+                        + '<td class="px-2 py-1.5 font-semibold ' + outcomeColor + '">' + escapeHtml(a.outcome || '—') + '</td>'
+                        + '<td class="px-2 py-1.5 text-dark-300">' + escapeHtml(fmt(a.attempted_at)) + '</td>'
+                        + '<td class="px-2 py-1.5 text-dark-400">' + (a.next_review_at ? escapeHtml(fmt(a.next_review_at)) : '<span class="text-dark-600">—</span>') + '</td>'
+                        + '<td class="px-2 py-1.5 text-rose-300/90">' + (a.error_message ? escapeHtml(String(a.error_message).slice(0, 200)) : '<span class="text-dark-600">—</span>') + '</td>'
+                        + '</tr>';
+                }
+                attemptsHtml += '</tbody></table></div>';
+            }
+
+            // INC-23 — Auto-remediation state + Take over / Resume auto controls.
+            const autoState = r.auto_remediation_state || null;
+            const autoLast  = r.last_auto_attempt_at
+                ? fmt(r.last_auto_attempt_at)
+                : 'never';
+            const stateChipColor = (function(s){
+                switch (s) {
+                    case 'operator_locked': return 'bg-amber-500/20 text-amber-200';
+                    case 'escalated':       return 'bg-rose-500/20 text-rose-200';
+                    case 'verify_pending':  return 'bg-sky-500/20 text-sky-200';
+                    case 'paused':          return 'bg-slate-500/20 text-slate-200';
+                    case 'in_progress':     return 'bg-blue-500/20 text-blue-200';
+                    case 'done':            return 'bg-emerald-500/20 text-emerald-200';
+                    default:                return 'bg-dark-700 text-dark-200';
+                }
+            })(autoState);
+            const stateChip = autoState
+                ? '<span class="inline-block px-2 py-0.5 text-[10px] font-medium rounded ' + stateChipColor + '">' + escapeHtml(autoState) + '</span>'
+                : '<span class="text-dark-500 text-[10px]">no state</span>';
+            const reportIdAttr = escapeHtml(String(r.id || ''));
+            const takeOverBtn = autoState !== 'operator_locked'
+                ? '<button onclick="badRentalsReportTakeOver(' + reportIdAttr + ')" class="px-2.5 py-1 text-[11px] bg-amber-600 hover:bg-amber-500 text-white rounded" title="Set auto_remediation_state=operator_locked">Take over</button>'
+                : '';
+            const resumeBtn = autoState === 'operator_locked'
+                ? '<button onclick="badRentalsReportResumeAuto(' + reportIdAttr + ')" class="px-2.5 py-1 text-[11px] bg-dark-700 hover:bg-dark-600 text-gray-200 rounded" title="Clear operator_locked so auto-remediation resumes">Resume auto</button>'
+                : '';
+            const autoControls = '<div class="flex items-center gap-3 flex-wrap">'
+                + '<div class="text-[11px] text-dark-300">'
+                +   '<span class="text-dark-400 uppercase tracking-wide mr-1">state:</span>' + stateChip
+                +   '<span class="ml-3 text-dark-400 uppercase tracking-wide">last attempt:</span> <span class="text-dark-200">' + escapeHtml(autoLast) + '</span>'
+                + '</div>'
+                + '<div class="flex items-center gap-2">' + takeOverBtn + resumeBtn + '</div>'
+                + '<div id="bad-rentals-report-auto-error" class="hidden text-[11px] text-rose-300"></div>'
+                + '</div>';
+
+            // INC-23 — Escalation link (Paperclip child issue) when one exists.
+            const escalation = data && data.escalation ? data.escalation : null;
+            let escalationBlock = '';
+            if (escalation) {
+                const url = escalation.url || null;
+                const idTxt = escalation.issue_id ? String(escalation.issue_id) : null;
+                const reason = escalation.reason || null;
+                const link = url
+                    ? '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer" class="text-rose-200 hover:text-rose-100 underline">' + escapeHtml(idTxt || url) + '</a>'
+                    : (idTxt ? '<span class="text-rose-200 font-mono">' + escapeHtml(idTxt) + '</span>' : '<span class="text-dark-400">no link captured</span>');
+                escalationBlock = '<div class="mb-4 p-3 rounded border border-rose-500/40 bg-rose-500/10">'
+                    + '<div class="text-[10px] uppercase tracking-wide font-semibold text-rose-200 mb-1">Operator escalation</div>'
+                    + '<div class="text-xs text-rose-100">'
+                    +   (reason ? '<span class="font-semibold">' + escapeHtml(reason) + '</span> · ' : '')
+                    +   'issue: ' + link
+                    + '</div>'
+                    + '</div>';
+            }
+
             return ''
                 + legacyBanner
+                + escalationBlock
+                + '<div class="mb-4 p-3 rounded border border-dark-700 bg-dark-900/40">'
+                +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Auto-remediation</div>'
+                +   autoControls
+                + '</div>'
+                + '<div class="mb-4">'
+                +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Auto-remediation attempts (rental_report_remediation_attempts)</div>'
+                +   attemptsHtml
+                + '</div>'
                 + '<div class="mb-4">'
                 +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Parsed report fields</div>'
                 +   fieldsHtml
@@ -14335,6 +15047,65 @@ async function sendSimOnline(simId, phoneNumber) {
                 +   '<summary class="cursor-pointer text-[10px] uppercase tracking-wide text-dark-400 hover:text-dark-200">Raw row JSON (parsed columns)</summary>'
                 +   '<pre class="mt-2 p-3 bg-dark-900 border border-dark-700 rounded text-[10px] text-dark-300 overflow-x-auto">' + escapeHtml(rawJson) + '</pre>'
                 + '</details>';
+        }
+
+        // INC-23 — Take over / Resume auto from the report modal (mirrors the
+        // edit-modal handlers but operates on a passed-in reportId).
+        async function badRentalsReportTakeOver(reportId)   { return badRentalsReportAutoLockCall(reportId, 'pause-auto',  'Take over'); }
+        async function badRentalsReportResumeAuto(reportId) { return badRentalsReportAutoLockCall(reportId, 'resume-auto', 'Resume auto'); }
+        async function badRentalsReportAutoLockCall(reportId, suffix, label) {
+            const errEl = document.getElementById('bad-rentals-report-auto-error');
+            if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
+            try {
+                const resp = await fetch(API_BASE + '/bad-rentals/' + encodeURIComponent(reportId) + '/' + suffix, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                });
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) {
+                    if (errEl) { errEl.textContent = (data && data.error) ? data.error : ('HTTP ' + resp.status); errEl.classList.remove('hidden'); }
+                    return;
+                }
+                if (typeof showToast === 'function') showToast(label + ' applied to report ' + reportId, 'success');
+                // Re-render the modal body with fresh state.
+                if (typeof openBadRentalReport === 'function') openBadRentalReport(reportId);
+                if (typeof loadBadRentals === 'function') loadBadRentals();
+            } catch(e) {
+                if (errEl) { errEl.textContent = 'Network error: ' + e.message; errEl.classList.remove('hidden'); }
+                console.error('[badRentalsReportAutoLockCall]', e);
+            }
+        }
+
+        // INC-23 — Delegated click handler for attempts-table mode anchors
+        // (registered once; idempotent across re-renders).
+        if (!window._autoRemJumpHandlerInstalled) {
+            window._autoRemJumpHandlerInstalled = true;
+            document.addEventListener('click', function(ev) {
+                const t = ev.target && ev.target.closest ? ev.target.closest('[data-auto-rem-jump]') : null;
+                if (!t) return;
+                ev.preventDefault();
+                const mode = t.getAttribute('data-auto-rem-jump');
+                if (mode) gotoAutoRemSituation(mode);
+            });
+        }
+
+        // INC-23 — Click a §K decision tree node or an attempts-row mode → jump
+        // to the matching situation row in the Guide tab's §F tables.
+        function gotoAutoRemSituation(mode) {
+            try {
+                if (typeof switchTab === 'function') switchTab('guide');
+                // Close any open Bad Rentals modal first so the scroll lands on Guide.
+                if (typeof closeBadRentalReport === 'function') closeBadRentalReport();
+                setTimeout(function(){
+                    const el = document.getElementById('auto-rem-' + mode);
+                    if (el && el.scrollIntoView) {
+                        el.scrollIntoView({behavior:'smooth', block:'center'});
+                        el.classList.add('ring-2','ring-amber-400');
+                        setTimeout(function(){ el.classList.remove('ring-2','ring-amber-400'); }, 2500);
+                    }
+                }, 100);
+            } catch(e) { console.error('gotoAutoRemSituation failed', e); }
         }
 
         function goToSimsBySearch(query) {
