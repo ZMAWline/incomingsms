@@ -925,20 +925,35 @@ function nonTerminal(mode, action, outcome, evidenceSummary) {
 async function claimReport(env, report) {
   // CAS: only claim if current auto_remediation_state is NULL or 'queued'.
   // PostgREST treats `is.null` for null match. We chain two filters with `or`.
+  //
+  // NOTE: `Prefer: return=representation` alone re-applies the WHERE filter
+  // to the response body, so a PATCH that mutates the filter column (here
+  // queued → in_progress) returns `[]` even when the row WAS updated. That
+  // made claimReport report `skipped_not_claimed` while the row sat stuck
+  // in `in_progress` — the exact symptom that drove INC-25. Use
+  // `count=exact` + Content-Range instead; the count reflects the actual
+  // affected-row count and is unaffected by the post-image filter quirk.
   const filter = '?id=eq.' + encodeURIComponent(report.id)
     + '&or=(auto_remediation_state.is.null,auto_remediation_state.eq.queued)';
   const patch = { auto_remediation_state: 'in_progress', last_auto_attempt_at: new Date().toISOString() };
   const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
     method: 'PATCH',
-    headers: supabaseHeaders(env, true),
+    headers: { ...supabaseHeaders(env, false), Prefer: 'return=minimal, count=exact' },
     body: JSON.stringify(patch),
   });
   if (!resp.ok) {
     console.log('[Remediator] claim PATCH failed for report ' + report.id + ': ' + resp.status);
     return false;
   }
-  const rows = await resp.json().catch(() => []);
-  return Array.isArray(rows) && rows.length === 1;
+  return parseAffectedCount(resp) === 1;
+}
+
+function parseAffectedCount(resp) {
+  const cr = resp.headers.get('content-range') || '';
+  const m = cr.match(/\/(\d+|\*)$/);
+  if (!m) return 0;
+  if (m[1] === '*') return 0;
+  return parseInt(m[1], 10) || 0;
 }
 
 async function applyClassificationState(env, report, classification, exec) {
