@@ -32,6 +32,13 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 #   TELTIK_API_KEY                                      (T3 / T4 / T5)
 #   RELAY_URL, RELAY_KEY                                (optional egress relay)
 #
+# INC-22 / INC-16f — Paperclip escalation API. When absent, escalation rows
+# are still written to operator_escalations (status='queued', last_error=
+# 'paperclip_credentials_missing') so an out-of-band drainer can post them.
+#   PAPERCLIP_API_URL          base URL of the Paperclip control-plane API
+#   PAPERCLIP_API_KEY          bearer token
+#   ESCALATION_PARENT_ISSUE_ID optional INC-XX parent for the auto-generated batch issues
+#
 # Service bindings used during shared-situation classification.
 # RESELLER_SYNC: resend webhook + check rental status (cancel-guard §E).
 # SKYLINE_GATEWAY: gateway port-status for S5; /send-sms wired in INC-16c.
