@@ -684,20 +684,19 @@ async function classifyShared(env, report, evidence) {
     });
   }
 
+  // INC-25 Phase B: stale-context / lookup-error decisions BEFORE S1/S4/S6.
+  // Catches the four cases the prior code conflated into S4 `no_rental_row`:
+  //   - rentals DB lookup errored (HTTP 400, etc.)
+  //   - sims DB lookup errored
+  //   - report attached to a historical sim_number with current MDN mismatch
+  //     (old rental complaint, close as duplicate, NO vendor action)
+  //   - report attached to a historical sim_number but report.e164 == current
+  //     SIM MDN (stale intake mapping, escalate, NO vendor action).
+  const { classifyStaleContext } = await import('./stale-classifier.mjs');
+  const staleVerdict = classifyStaleContext({ report, evidence });
+  if (staleVerdict) return staleVerdict;
+
   // S4 — contract rejected / no active rental row at the time of report.
-  // INC-25 followup: distinguish a true "no rental row" from a DB lookup error.
-  // Previously a non-ok rentals GET (e.g. column-name mismatch causing HTTP 400)
-  // left evidence.rental=null and closed the report as duplicate. Escalate
-  // instead so an operator sees the masked failure.
-  if (!evidence.rental && evidence.rentalLookupError && report.rental_id) {
-    return terminal('S6', 'escalate', 'escalate', {
-      reason: 'evidence_lookup_failed',
-      lookup: 'rental',
-      rental_id: report.rental_id,
-      http_status: evidence.rentalLookupError.http_status,
-      body: evidence.rentalLookupError.body,
-    }, 'evidence_lookup_failed');
-  }
   if (!evidence.rental) {
     return terminal('S4', 'close_duplicate', 'duplicate', {
       reason: 'no_rental_row',
@@ -717,7 +716,6 @@ async function classifyShared(env, report, evidence) {
     return terminal('S1', 'close_duplicate', 'duplicate', {
       reason: 'sim_cancelled_no_active_rental',
       sim_status: evidence.sim.status || null,
-      cancelled_at: evidence.sim.deactivated_at || evidence.sim.retired_at || null,
     });
   }
 
@@ -835,18 +833,41 @@ async function gatherEvidence(env, report) {
     rental: null,
     rentalEndedBeforeReport: false,
     rentalLookupError: null,
+    simLookupError: null,
+    simNumber: null,
+    currentSimNumberE164: null,
     newerOpenReportId: null,
     gatewayOffline: false,
     priorAttempts: 0,
   };
 
   if (report.sim_id) {
+    // INC-25 Phase A: `sims` has no `deactivated_at`/`retired_at`/`current_mdn_e164`
+    // columns (schema: msisdn, status, activated_at, ...). Selecting them
+    // returned HTTP 400 silently, leaving evidence.sim=null and falsely
+    // escalating reports as `insufficient_evidence_no_vendor`. Synthesize
+    // `current_mdn_e164` from `msisdn` (US national → +1XXXXXXXXXX) so
+    // downstream code that reads `sim.current_mdn_e164` continues to work
+    // without a coordinated cross-worker rewrite.
     const r = await supabaseGet(env,
       'sims?id=eq.' + encodeURIComponent(report.sim_id)
-      + '&select=id,iccid,vendor,status,deactivated_at,retired_at,gateway_id,port,current_mdn_e164&limit=1');
+      + '&select=id,iccid,vendor,status,msisdn,activated_at,gateway_id,port&limit=1');
     if (r.ok) {
       const rows = await r.json();
-      if (Array.isArray(rows) && rows.length > 0) evidence.sim = rows[0];
+      if (Array.isArray(rows) && rows.length > 0) {
+        const s = rows[0];
+        s.current_mdn_e164 = s.msisdn ? msisdnToE164(s.msisdn) : null;
+        evidence.sim = s;
+      }
+    } else {
+      let body = '';
+      try { body = await r.text(); } catch { body = ''; }
+      evidence.simLookupError = {
+        http_status: r.status,
+        body: (body || '').slice(0, 240),
+      };
+      console.log('[Remediator] sim lookup failed for report ' + report.id
+        + ' sim_id=' + report.sim_id + ' status=' + r.status + ' body=' + body.slice(0, 240));
     }
   }
   if (report.rental_id) {
@@ -872,6 +893,36 @@ async function gatherEvidence(env, report) {
       };
       console.log('[Remediator] rental lookup failed for report ' + report.id
         + ' rental_id=' + report.rental_id + ' status=' + r.status + ' body=' + body.slice(0, 240));
+    }
+  }
+  // INC-25 Phase A: sim_number context. Lets the classifier distinguish a
+  // historical attachment (sim_number.valid_to set) from a current one, and
+  // know what the SIM's current MDN is so we can compare against report.e164.
+  if (report.sim_number_id) {
+    const r = await supabaseGet(env,
+      'sim_numbers?id=eq.' + encodeURIComponent(report.sim_number_id)
+      + '&select=id,sim_id,e164,valid_from,valid_to&limit=1');
+    if (r.ok) {
+      const rows = await r.json();
+      if (Array.isArray(rows) && rows.length > 0) {
+        evidence.simNumber = {
+          id: rows[0].id,
+          sim_id: rows[0].sim_id,
+          e164: rows[0].e164,
+          valid_from: rows[0].valid_from,
+          valid_to: rows[0].valid_to,
+          isHistorical: rows[0].valid_to != null,
+        };
+      }
+    }
+  }
+  if (report.sim_id) {
+    const r = await supabaseGet(env,
+      'sim_numbers?sim_id=eq.' + encodeURIComponent(report.sim_id)
+      + '&valid_to=is.null&select=e164&order=valid_from.desc&limit=1');
+    if (r.ok) {
+      const rows = await r.json();
+      if (Array.isArray(rows) && rows.length > 0) evidence.currentSimNumberE164 = rows[0].e164;
     }
   }
   // Newer open report for same sim_id?
@@ -910,6 +961,17 @@ function simIsCancelledOrRetired(sim) {
   const s = String(sim.status || '').toLowerCase();
   return s === 'cancelled' || s === 'canceled' || s === 'deactivated'
       || s === 'retired'   || s === 'terminated';
+}
+
+// INC-25 Phase A: convert US national msisdn ("3073845304") to e164
+// ("+13073845304"). Returns null for empty/non-conforming input.
+function msisdnToE164(msisdn) {
+  if (msisdn == null) return null;
+  const s = String(msisdn).trim().replace(/[^\d]/g, '');
+  if (!s) return null;
+  if (s.length === 10) return '+1' + s;
+  if (s.length === 11 && s.startsWith('1')) return '+' + s;
+  return s.startsWith('+') ? s : null;
 }
 
 async function skylinePortStatus(env, gatewayId, port) {
