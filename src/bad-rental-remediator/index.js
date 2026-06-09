@@ -685,15 +685,22 @@ async function classifyShared(env, report, evidence) {
   }
 
   // S4 — contract rejected / no active rental row at the time of report.
+  // INC-25 followup: distinguish a true "no rental row" from a DB lookup error.
+  // Previously a non-ok rentals GET (e.g. column-name mismatch causing HTTP 400)
+  // left evidence.rental=null and closed the report as duplicate. Escalate
+  // instead so an operator sees the masked failure.
+  if (!evidence.rental && evidence.rentalLookupError && report.rental_id) {
+    return terminal('S6', 'escalate', 'escalate', {
+      reason: 'evidence_lookup_failed',
+      lookup: 'rental',
+      rental_id: report.rental_id,
+      http_status: evidence.rentalLookupError.http_status,
+      body: evidence.rentalLookupError.body,
+    }, 'evidence_lookup_failed');
+  }
   if (!evidence.rental) {
     return terminal('S4', 'close_duplicate', 'duplicate', {
       reason: 'no_rental_row',
-    });
-  }
-  if (evidence.rentalEndedBeforeReport) {
-    return terminal('S4', 'close_duplicate', 'duplicate', {
-      reason: 'rental_ended_before_report',
-      ended_at: evidence.rental.ended_at || null,
     });
   }
 
@@ -781,11 +788,14 @@ async function classifyShared(env, report, evidence) {
 
 async function cancelGuardCheck(env, report, evidence) {
   const out = { activeRentalExists: false, evidence: {} };
-  // (a) Any open rental referencing this sim_id.
+  // INC-25 followup: `rentals` has no started_at/ended_at columns, so we
+  // can't filter for "open" rentals by lifecycle timestamp. Any existing
+  // rental row referencing this sim_id / reseller_rental_id is treated as
+  // potentially active — this is conservative (it errs toward escalation
+  // rather than silent close-as-duplicate).
   if (report.sim_id) {
     const q = 'rentals?sim_id=eq.' + encodeURIComponent(report.sim_id)
-      + '&or=(ended_at.is.null,ended_at.gt.now())'
-      + '&select=id,reseller_rental_id,started_at,ended_at&limit=5';
+      + '&select=id,reseller_rental_id,rental_date,minted_at&limit=5';
     const r = await supabaseGet(env, q);
     if (r.ok) {
       const rows = await r.json();
@@ -793,18 +803,16 @@ async function cancelGuardCheck(env, report, evidence) {
         out.activeRentalExists = true;
         out.evidence.open_rentals_by_sim_id = rows.map(x => ({
           rental_id: x.id, reseller_rental_id: x.reseller_rental_id,
-          started_at: x.started_at, ended_at: x.ended_at,
+          rental_date: x.rental_date, minted_at: x.minted_at,
         }));
       }
     }
   }
-  // (b) Any open rental referencing this reseller_rental_id (same reseller).
   const rid = evidence.rental && evidence.rental.reseller_rental_id;
   if (rid && report.reseller_id) {
     const q = 'rentals?reseller_id=eq.' + encodeURIComponent(report.reseller_id)
       + '&reseller_rental_id=eq.' + encodeURIComponent(rid)
-      + '&or=(ended_at.is.null,ended_at.gt.now())'
-      + '&select=id,sim_id,reseller_rental_id,ended_at&limit=5';
+      + '&select=id,sim_id,reseller_rental_id,rental_date,minted_at&limit=5';
     const r = await supabaseGet(env, q);
     if (r.ok) {
       const rows = await r.json();
@@ -826,6 +834,7 @@ async function gatherEvidence(env, report) {
     sim: null,
     rental: null,
     rentalEndedBeforeReport: false,
+    rentalLookupError: null,
     newerOpenReportId: null,
     gatewayOffline: false,
     priorAttempts: 0,
@@ -841,18 +850,28 @@ async function gatherEvidence(env, report) {
     }
   }
   if (report.rental_id) {
+    // INC-25 followup: `rentals` has no started_at/ended_at columns
+    // (schema: rental_date, minted_at). Selecting them returned HTTP 400 and the
+    // swallowed error was being mis-classified as `no_rental_row` (false S4
+    // duplicate). Capture lookup failures explicitly so classifyShared can
+    // escalate instead of closing as duplicate.
     const r = await supabaseGet(env,
       'rentals?id=eq.' + encodeURIComponent(report.rental_id)
-      + '&select=id,sim_id,reseller_id,reseller_rental_id,started_at,ended_at&limit=1');
+      + '&select=id,sim_id,reseller_id,reseller_rental_id,rental_date,minted_at&limit=1');
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) {
         evidence.rental = rows[0];
-        if (rows[0].ended_at && report.received_at
-            && new Date(rows[0].ended_at).getTime() < new Date(report.received_at).getTime()) {
-          evidence.rentalEndedBeforeReport = true;
-        }
       }
+    } else {
+      let body = '';
+      try { body = await r.text(); } catch { body = ''; }
+      evidence.rentalLookupError = {
+        http_status: r.status,
+        body: (body || '').slice(0, 240),
+      };
+      console.log('[Remediator] rental lookup failed for report ' + report.id
+        + ' rental_id=' + report.rental_id + ' status=' + r.status + ' body=' + body.slice(0, 240));
     }
   }
   // Newer open report for same sim_id?
