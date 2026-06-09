@@ -82,24 +82,41 @@ export default {
     const cron = (event && event.cron) || '';
     if (cron === '*/1 * * * *') {
       const startedAt = Date.now();
-      ctx.waitUntil(runVerifyPoll(env).then(r => {
-        console.log('[Remediator] verify-poll done ' + JSON.stringify(r));
-        return recordLastTick(env, LAST_VERIFY_POLL_KEY, {
-          completed_at: new Date().toISOString(),
-          polled: (r && r.polled) || 0,
-          matched: (r && r.matched) || 0,
-          timed_out: (r && r.timedOut) || 0,
-          still_pending: (r && r.stillPending) || 0,
-          ms: Date.now() - startedAt,
-        });
-      }).catch(err => {
-        console.log('[Remediator] verify-poll error: ' + err);
-        return recordLastTick(env, LAST_VERIFY_POLL_KEY, {
-          completed_at: new Date().toISOString(),
-          error: String(err),
-          ms: Date.now() - startedAt,
-        });
-      }));
+      ctx.waitUntil((async () => {
+        // INC-24: short-circuit if dormant (kill-switch off or missing creds) so
+        // a misconfigured worker doesn't throw `undefined/rest/v1/...` once a
+        // minute. Mirror what runTick does for the main cron.
+        const dormancy = await verifyPollDormancyReason(env);
+        if (dormancy) {
+          console.log('[Remediator] verify-poll skipped: ' + dormancy);
+          return recordLastTick(env, LAST_VERIFY_POLL_KEY, {
+            completed_at: new Date().toISOString(),
+            skipped: dormancy,
+            dormancy_reason: dormancy,
+            polled: 0, matched: 0, timed_out: 0, still_pending: 0,
+            ms: Date.now() - startedAt,
+          });
+        }
+        try {
+          const r = await runVerifyPoll(env);
+          console.log('[Remediator] verify-poll done ' + JSON.stringify(r));
+          return recordLastTick(env, LAST_VERIFY_POLL_KEY, {
+            completed_at: new Date().toISOString(),
+            polled: (r && r.polled) || 0,
+            matched: (r && r.matched) || 0,
+            timed_out: (r && r.timedOut) || 0,
+            still_pending: (r && r.stillPending) || 0,
+            ms: Date.now() - startedAt,
+          });
+        } catch (err) {
+          console.log('[Remediator] verify-poll error: ' + err);
+          return recordLastTick(env, LAST_VERIFY_POLL_KEY, {
+            completed_at: new Date().toISOString(),
+            error: String(err),
+            ms: Date.now() - startedAt,
+          });
+        }
+      })());
       return;
     }
     ctx.waitUntil(runTick(env).catch(err => {
@@ -123,6 +140,15 @@ async function runTick(env) {
     console.log('[Remediator] kill-switch disabled; skipping tick.');
     const out = { skipped: 'kill_switch_off', processed: 0 };
     await recordLastTick(env, LAST_MAIN_TICK_KEY, { ...out, completed_at: new Date(startedAt).toISOString(), ms: 0, dormancy_reason: 'kill_switch_off' });
+    return out;
+  }
+  if (!hasSupabaseCredentials(env)) {
+    // INC-24: if a future SUPABASE_URL/SERVICE_ROLE_KEY outage strips the env,
+    // emit a single missing_credentials dormancy summary instead of letting
+    // every fetch throw `undefined/rest/v1/...`.
+    console.log('[Remediator] missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY; skipping tick.');
+    const out = { skipped: 'missing_credentials', processed: 0 };
+    await recordLastTick(env, LAST_MAIN_TICK_KEY, { ...out, completed_at: new Date(startedAt).toISOString(), ms: 0, dormancy_reason: 'missing_credentials' });
     return out;
   }
   const reports = await fetchOpenReports(env, INTAKE_LIMIT);
@@ -976,6 +1002,16 @@ async function fetchOpenReports(env, limit) {
 // ---------------------------------------------------------
 // Plumbing
 // ---------------------------------------------------------
+
+function hasSupabaseCredentials(env) {
+  return !!(env && env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
+async function verifyPollDormancyReason(env) {
+  if (!hasSupabaseCredentials(env)) return 'missing_credentials';
+  if (!(await killSwitchEnabled(env))) return 'kill_switch_off';
+  return null;
+}
 
 async function killSwitchEnabled(env) {
   if (!env.REMEDIATOR_KV) return false;
