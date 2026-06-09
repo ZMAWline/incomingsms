@@ -23,6 +23,7 @@ import { executeAction } from './actions.mjs';
 import { canAttempt } from './cooldown.mjs';
 import { teltikPortStatus } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
+import { flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType } from './escalations.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const TICK_BUDGET_MS = 55_000; // §G: 60s tick budget, leave headroom.
@@ -87,6 +88,7 @@ async function runTick(env) {
 
   let processed = 0, attempted = 0;
   const outcomes = {};
+  const escalationCandidates = [];
 
   for (let i = 0; i < reports.length; i += CONCURRENCY) {
     if (Date.now() - startedAt > TICK_BUDGET_MS) {
@@ -101,11 +103,39 @@ async function runTick(env) {
         outcomes[res.outcome] = (outcomes[res.outcome] || 0) + 1;
         if (res.attemptInserted) attempted++;
       }
+      if (res && res.escalationCandidate) escalationCandidates.push(res.escalationCandidate);
     }
   }
+
+  // §H.3 — batched operator escalations for everything that escalated this tick.
+  let escalationsResult = { batches: 0, posted: 0, reserved: 0, skipped_dedup: 0 };
+  try {
+    escalationsResult = await flushEscalations(env, {
+      now: new Date(),
+      candidates: escalationCandidates,
+      parentIssueId: env.ESCALATION_PARENT_ISSUE_ID || null,
+    });
+  } catch (err) {
+    console.log('[Remediator] flushEscalations error: ' + err);
+  }
+
+  // §H.4 — vendor batch tickets (toggle-gated per carrier, default off).
+  let vendorBatch = { vendors: [], opened: 0 };
+  try {
+    vendorBatch = await maybeOpenVendorBatchTickets(env, {
+      now: new Date(),
+      parentIssueId: env.ESCALATION_PARENT_ISSUE_ID || null,
+    });
+  } catch (err) {
+    console.log('[Remediator] vendor-batch error: ' + err);
+  }
+
   const ms = Date.now() - startedAt;
-  console.log('[Remediator] tick done in ' + ms + 'ms; processed=' + processed + ' outcomes=' + JSON.stringify(outcomes));
-  return { processed, attempted, outcomes, ms };
+  console.log('[Remediator] tick done in ' + ms + 'ms; processed=' + processed
+    + ' outcomes=' + JSON.stringify(outcomes)
+    + ' escalations=' + JSON.stringify(escalationsResult)
+    + ' vendor_batch=' + JSON.stringify(vendorBatch));
+  return { processed, attempted, outcomes, escalations: escalationsResult, vendorBatch, ms };
 }
 
 async function processReportSafe(env, report) {
@@ -154,11 +184,94 @@ async function processReport(env, report) {
   // Update report-level auto state per classification + executor result.
   await applyClassificationState(env, report, classification, exec);
 
+  const escalationCandidate = buildEscalationCandidate(report, evidence, classification, exec, attemptNo);
+
   return {
     outcome: exec.outcome || classification.outcome,
     mode: classification.mode,
     attemptInserted: true,
+    escalationCandidate,
   };
+}
+
+// ---------------------------------------------------------
+// §H.3 escalation candidate
+//
+// Emits a candidate when the classifier or executor signals an operator
+// escalation. The batcher groups by (vendor, failure_type, tick) and dedups
+// against the operator_escalations table.
+// ---------------------------------------------------------
+
+function buildEscalationCandidate(report, evidence, classification, exec, attemptNo) {
+  const classifierEsc = classification && classification.terminal && classification.outcome === 'escalate';
+  const execFailed = exec && (exec.outcome === 'failed' || exec.outcome === 'verify_pending');
+  const verifyTerm = exec && (exec.gateStatus === 'verify_send_failed' || exec.gateStatus === 'verify_receive_timeout');
+  if (!classifierEsc && !verifyTerm && !(execFailed && classification.escalationReason)) {
+    return null;
+  }
+  const sim = evidence && evidence.sim || {};
+  const rental = evidence && evidence.rental || {};
+  const reason = (classification && classification.escalationReason)
+    || (exec && exec.gateStatus)
+    || (exec && exec.execStatus)
+    || 'generic';
+  const vendor = String(sim.vendor || 'unknown').toLowerCase();
+  const failure_type = normalizeFailureType(reason);
+  return {
+    vendor,
+    failure_type,
+    escalation_reason: reason,
+    line_item: {
+      report_id: report.id,
+      reseller_rental_id: rental.reseller_rental_id || null,
+      current_mdn: sim.current_mdn_e164 || null,
+      iccid: sim.iccid || null,                       // operator-facing → OK per §H.3.
+      vendor,
+      situation_id: classification && classification.mode || null,
+      attempts: buildAttemptsTable(exec, classification, attemptNo),
+      latest_vendor_state: (classification && classification.evidenceSummary && classification.evidenceSummary.situation_evidence) || null,
+      latest_webhook: (evidence && evidence.webhook) || null,
+      verify_state: {
+        sent: !!(exec && exec.gateStatus && exec.gateStatus !== 'verify_send_failed'),
+        received: !!(exec && exec.gateStatus === 'verify_received'),
+      },
+      suggested_next: suggestNextAction(failure_type),
+    },
+  };
+}
+
+function buildAttemptsTable(exec, classification, attemptNo) {
+  const out = [];
+  if (classification) {
+    out.push({ action: classification.action, outcome: classification.outcome });
+  }
+  if (exec && exec.execStatus) {
+    out.push({
+      action: classification && classification.action,
+      outcome: exec.outcome || exec.execStatus,
+      vendor_request_id: exec.evidence && (exec.evidence.vendor_request_id || exec.evidence.requestId) || null,
+    });
+  }
+  return out;
+}
+
+function suggestNextAction(failure_type) {
+  switch (failure_type) {
+    case 'helix_unsuspend_failed':         return 'Manually unsuspend in Helix portal, then re-run remediator.';
+    case 'atomic_restore_failed':          return 'Manually run ATOMIC restoreSubscriber via dashboard, then re-run remediator.';
+    case 'wing_w7_dialable_retry_failed':  return 'Manually swap Wing line to dialable plan; verify activation.';
+    case 'teltik_reset_failed':            return 'Run /reset-network and /reset-port via Teltik dashboard.';
+    case 'teltik_forward_url_misconfigured':return 'Re-set forward URL via Teltik /set-forward, then verify.';
+    case 'imei_wrong_type':                return 'Verify gateway IMEI matches vendor device_type (router vs phone).';
+    case 'imei_drift_vendor':              return 'Reconcile vendor IMEI with on-port IMEI; consider re-OTA.';
+    case 'vendor_iccid_not_found':         return 'Confirm ICCID is provisioned at vendor; may require re-activation.';
+    case 'vendor_active_no_sms':           return 'SIM is active at vendor but not receiving SMS — inspect gateway logs.';
+    case 'vendor_cancelled_active_rental': return 'Active reseller rental exists; do NOT close. Investigate cancellation.';
+    case 'verify_send_failed':             return 'Gateway /send-sms failed 3×; check gateway connectivity and port.';
+    case 'verify_receive_timeout':         return 'No inbound nonce within 5 min; inspect inbound path / vendor SMS.';
+    case 'unable_to_reproduce_recommendation': return 'Exhausted 3 classify-only ticks; operator decision needed.';
+    default: return 'Operator review required.';
+  }
 }
 
 // ---------------------------------------------------------
