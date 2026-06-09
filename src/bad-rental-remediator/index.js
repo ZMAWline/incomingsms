@@ -33,6 +33,16 @@ const ACTION_DISABLE_SUFFIX = '_disabled';
 const TICK_BUDGET_MS = 55_000; // §G: 60s tick budget, leave headroom.
 const CONCURRENCY = 5;         // §G concurrency cap.
 const INTAKE_LIMIT = 50;       // upper bound per tick.
+// INC-25: any row stuck in `in_progress` past this window with no progress
+// is treated as an abandoned claim from a crashed/raced tick and reset to
+// `queued` at the start of the next tick. 10 minutes is well above the 60s
+// tick budget so an in-flight tick can never be reset out from under itself.
+const STALE_CLAIM_MS = 10 * 60 * 1000;
+// INC-25: KV-backed tick lock prevents Run-Now + cron from racing on the
+// same queued rows (which manifested as `skipped_not_claimed=50, attempted=0`
+// on the loser). TTL > TICK_BUDGET_MS so a crashed tick releases naturally.
+const TICK_LOCK_KEY = 'bad_rental_remediator_main_tick_lock';
+const TICK_LOCK_TTL_S = 120;
 
 export default {
   async fetch(request, env) {
@@ -151,28 +161,53 @@ async function runTick(env) {
     await recordLastTick(env, LAST_MAIN_TICK_KEY, { ...out, completed_at: new Date(startedAt).toISOString(), ms: 0, dormancy_reason: 'missing_credentials' });
     return out;
   }
-  const reports = await fetchOpenReports(env, INTAKE_LIMIT);
-  console.log('[Remediator] fetched ' + reports.length + ' open reports.');
+  // INC-25: refuse to start a second main tick while another is running.
+  // The previous symptom was Run-Now + cron racing on the same queued rows,
+  // surfaced as `skipped_not_claimed=50, attempted=0` on the loser.
+  const lockAcquired = await acquireTickLock(env);
+  if (!lockAcquired) {
+    console.log('[Remediator] tick skipped: another tick is holding the lock.');
+    const out = { skipped: 'tick_in_progress', processed: 0 };
+    await recordLastTick(env, LAST_MAIN_TICK_KEY, { ...out, completed_at: new Date(startedAt).toISOString(), ms: Date.now() - startedAt, dormancy_reason: 'tick_in_progress' });
+    return out;
+  }
 
+  let staleRecovered = 0;
   let processed = 0, attempted = 0;
   const outcomes = {};
   const escalationCandidates = [];
+  let reportsFetched = 0;
+  try {
+    // INC-25: release any rows abandoned in `in_progress` by a prior crashed
+    // or raced tick before we fetch. Without this, those rows leak forever and
+    // the queue depth chart misleads operators.
+    staleRecovered = await recoverStaleClaims(env, STALE_CLAIM_MS);
+    if (staleRecovered > 0) {
+      console.log('[Remediator] recovered ' + staleRecovered + ' stale in_progress claims back to queued.');
+    }
 
-  for (let i = 0; i < reports.length; i += CONCURRENCY) {
-    if (Date.now() - startedAt > TICK_BUDGET_MS) {
-      console.log('[Remediator] tick budget exceeded; stopping at ' + processed + '.');
-      break;
-    }
-    const slice = reports.slice(i, i + CONCURRENCY);
-    const results = await Promise.all(slice.map(r => processReportSafe(env, r)));
-    for (const res of results) {
-      processed++;
-      if (res && res.outcome) {
-        outcomes[res.outcome] = (outcomes[res.outcome] || 0) + 1;
-        if (res.attemptInserted) attempted++;
+    const reports = await fetchOpenReports(env, INTAKE_LIMIT);
+    reportsFetched = reports.length;
+    console.log('[Remediator] fetched ' + reports.length + ' open reports.');
+
+    for (let i = 0; i < reports.length; i += CONCURRENCY) {
+      if (Date.now() - startedAt > TICK_BUDGET_MS) {
+        console.log('[Remediator] tick budget exceeded; stopping at ' + processed + '.');
+        break;
       }
-      if (res && res.escalationCandidate) escalationCandidates.push(res.escalationCandidate);
+      const slice = reports.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(slice.map(r => processReportSafe(env, r)));
+      for (const res of results) {
+        processed++;
+        if (res && res.outcome) {
+          outcomes[res.outcome] = (outcomes[res.outcome] || 0) + 1;
+          if (res.attemptInserted) attempted++;
+        }
+        if (res && res.escalationCandidate) escalationCandidates.push(res.escalationCandidate);
+      }
     }
+  } finally {
+    await releaseTickLock(env);
   }
 
   // §H.3 — batched operator escalations for everything that escalated this tick.
@@ -199,8 +234,9 @@ async function runTick(env) {
   }
 
   const ms = Date.now() - startedAt;
-  const dormancy_reason = reports.length === 0 ? 'no_open_reports' : null;
+  const dormancy_reason = reportsFetched === 0 ? 'no_open_reports' : null;
   console.log('[Remediator] tick done in ' + ms + 'ms; processed=' + processed
+    + ' stale_recovered=' + staleRecovered
     + ' outcomes=' + JSON.stringify(outcomes)
     + ' escalations=' + JSON.stringify(escalationsResult)
     + ' vendor_batch=' + JSON.stringify(vendorBatch));
@@ -208,6 +244,7 @@ async function runTick(env) {
     completed_at: new Date(Date.now()).toISOString(),
     processed,
     attempted,
+    stale_recovered: staleRecovered,
     outcomes,
     escalations: escalationsResult,
     vendorBatch,
@@ -215,7 +252,7 @@ async function runTick(env) {
     dormancy_reason,
   };
   await recordLastTick(env, LAST_MAIN_TICK_KEY, summary);
-  return { processed, attempted, outcomes, escalations: escalationsResult, vendorBatch, ms };
+  return { processed, attempted, stale_recovered: staleRecovered, outcomes, escalations: escalationsResult, vendorBatch, ms };
 }
 
 async function recordLastTick(env, key, summary) {
@@ -317,6 +354,11 @@ async function processReportSafe(env, report) {
     return await processReport(env, report);
   } catch (err) {
     console.log('[Remediator] report ' + report.id + ' error: ' + err);
+    // INC-25: if processReport threw after claimReport flipped the row to
+    // `in_progress`, the row would otherwise leak forever and need the next
+    // tick's stale-claim sweep to recover. Try a best-effort reset back to
+    // `queued` so the next tick picks it up immediately.
+    try { await releaseClaimedToQueued(env, report.id); } catch (_) { /* swallow */ }
     return { outcome: 'error', error: String(err) };
   }
 }
@@ -979,6 +1021,71 @@ async function insertAttempt(env, row) {
     const txt = await resp.text();
     console.log('[Remediator] attempt insert failed for report ' + row.report_id + ': ' + resp.status + ' ' + txt);
   }
+}
+
+// INC-25: bulk-reset abandoned `in_progress` claims back to `queued` so the
+// next tick can pick them up. PostgREST returns the affected rows when we ask
+// for representation, which lets us report a precise stale_recovered count.
+async function recoverStaleClaims(env, thresholdMs) {
+  const cutoff = new Date(Date.now() - thresholdMs).toISOString();
+  // `last_auto_attempt_at < cutoff` OR `last_auto_attempt_at is null`
+  // (defensive: a row marked in_progress with no timestamp shouldn't exist,
+  // but if it does we still want it released).
+  const filter = '?auto_remediation_state=eq.in_progress'
+    + '&or=(last_auto_attempt_at.lt.' + encodeURIComponent(cutoff) + ',last_auto_attempt_at.is.null)'
+    + '&status=in.(received,in_triage)';
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
+      method: 'PATCH',
+      headers: { ...supabaseHeaders(env, true), Prefer: 'return=representation,count=exact' },
+      body: JSON.stringify({ auto_remediation_state: 'queued' }),
+    });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      console.log('[Remediator] recoverStaleClaims failed: ' + resp.status + ' ' + txt);
+      return 0;
+    }
+    const rows = await resp.json().catch(() => []);
+    return Array.isArray(rows) ? rows.length : 0;
+  } catch (err) {
+    console.log('[Remediator] recoverStaleClaims error: ' + err);
+    return 0;
+  }
+}
+
+// INC-25: best-effort reset of a single in_progress row back to queued when
+// processReport throws after claim succeeded. CAS filter avoids stomping a
+// verify_pending / operator_locked / escalated row that some other path set.
+async function releaseClaimedToQueued(env, reportId) {
+  const filter = '?id=eq.' + encodeURIComponent(reportId)
+    + '&auto_remediation_state=eq.in_progress';
+  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
+    method: 'PATCH',
+    headers: supabaseHeaders(env, false),
+    body: JSON.stringify({ auto_remediation_state: 'queued' }),
+  });
+  if (!resp.ok) {
+    console.log('[Remediator] releaseClaimedToQueued failed for ' + reportId + ': ' + resp.status);
+  }
+}
+
+async function acquireTickLock(env) {
+  if (!env.REMEDIATOR_KV) return true; // no KV → no lock, single-instance fallback
+  try {
+    const existing = await env.REMEDIATOR_KV.get(TICK_LOCK_KEY);
+    if (existing) return false;
+    await env.REMEDIATOR_KV.put(TICK_LOCK_KEY, new Date().toISOString(), { expirationTtl: TICK_LOCK_TTL_S });
+    return true;
+  } catch (err) {
+    console.log('[Remediator] acquireTickLock error: ' + err);
+    return true; // fail-open: prefer running a tick over silently stalling
+  }
+}
+
+async function releaseTickLock(env) {
+  if (!env.REMEDIATOR_KV) return;
+  try { await env.REMEDIATOR_KV.delete(TICK_LOCK_KEY); }
+  catch (err) { console.log('[Remediator] releaseTickLock error: ' + err); }
 }
 
 async function fetchOpenReports(env, limit) {

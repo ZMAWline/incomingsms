@@ -14548,7 +14548,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     const outcomes = mt.outcomes ? Object.entries(mt.outcomes).map(function(kv){return kv[0]+':'+kv[1];}).join(', ') : '';
                     mainEl.innerHTML =
                         '<div>' + escapeHtml(fmtTickAgo(mt.completed_at)) + '</div>' +
-                        '<div class="text-dark-400 text-[10px] mt-0.5">processed=' + (mt.processed||0) + ' attempted=' + (mt.attempted||0) + ' ms=' + (mt.ms||0) + '</div>' +
+                        '<div class="text-dark-400 text-[10px] mt-0.5">processed=' + (mt.processed||0) + ' attempted=' + (mt.attempted||0) + ' stale_recovered=' + (mt.stale_recovered||0) + ' ms=' + (mt.ms||0) + '</div>' +
                         (outcomes ? '<div class="text-dark-400 text-[10px]">' + escapeHtml(outcomes) + '</div>' : '') +
                         (mt.error ? '<div class="text-rose-300 text-[10px]">error: ' + escapeHtml(mt.error) + '</div>' : '');
                 } else {
