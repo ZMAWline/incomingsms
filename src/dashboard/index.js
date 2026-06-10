@@ -7813,8 +7813,8 @@ function getHTML(helixEnabled) {
                     <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition">Rotate MDN</button>
                     <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Fix SIM</button>
                     <button onclick="showBulkResellerActionModal()" class="px-3 py-1.5 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition">Reseller…</button>
-                    <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
-                    <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
+                    <button onclick="showBulkCancelChoiceModal()" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel…</button>
+                    <button onclick="showBulkResumeChoiceModal()" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume…</button>
                     <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Send Online</button>
                     <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
                     <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
@@ -16793,6 +16793,163 @@ async function sendSimOnline(simId, phoneNumber) {
             } catch (err) {
                 showToast('Error unassigning: ' + err, 'error');
             }
+        }
+
+        function showBulkCancelChoiceModal() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) { showToast('Select at least one SIM first', 'error'); return; }
+            const existing = document.getElementById('bulk-cancel-choice-modal');
+            if (existing) existing.remove();
+            const modal = document.createElement('div');
+            modal.id = 'bulk-cancel-choice-modal';
+            modal.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            const box = document.createElement('div');
+            box.className = 'bg-gray-800 rounded-xl shadow-xl w-96 p-6';
+            const titleEl = document.createElement('h3');
+            titleEl.className = 'text-lg font-semibold text-white mb-1';
+            titleEl.textContent = 'Cancel / Suspend SIMs';
+            const subtitle = document.createElement('p');
+            subtitle.className = 'text-xs text-gray-400 mb-1';
+            subtitle.textContent = simIds.length + ' SIM(s) selected';
+            const note = document.createElement('p');
+            note.className = 'text-xs text-gray-500 mb-4';
+            note.textContent = 'Helix and ATOMIC SIMs hit the carrier. Wing IoT and Teltik report carrier-not-supported per SIM.';
+            const optionsWrap = document.createElement('div');
+            optionsWrap.className = 'flex flex-col gap-2';
+            const opts = [
+                { label: 'Cancel (permanent deactivate)', desc: 'Marks the SIM canceled. Helix: Cancel/CAN. ATOMIC: deactivateSubscriber/DD.', cls: 'bg-red-600 hover:bg-red-700', fn: function(){ bulkSimAction('cancel'); } },
+                { label: 'Suspend (temporary)', desc: 'Holds service. Helix: Suspend/CR/22. ATOMIC: suspendSubscriber/NPG.', cls: 'bg-yellow-600 hover:bg-yellow-700', fn: function(){ bulkStatusChange('suspend', 'Suspend'); } }
+            ];
+            opts.forEach(function(o) {
+                const wrap = document.createElement('div');
+                wrap.className = 'flex flex-col';
+                const btn = document.createElement('button');
+                btn.className = 'w-full px-3 py-2 text-sm text-white rounded transition ' + o.cls;
+                btn.textContent = o.label;
+                btn.onclick = function() { modal.remove(); o.fn(); };
+                wrap.appendChild(btn);
+                const helpEl = document.createElement('p');
+                helpEl.className = 'text-[11px] text-gray-500 mt-1 ml-1';
+                helpEl.textContent = o.desc;
+                wrap.appendChild(helpEl);
+                optionsWrap.appendChild(wrap);
+            });
+            const cancelRow = document.createElement('div');
+            cancelRow.className = 'mt-4 flex justify-end';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'px-3 py-1.5 text-sm bg-gray-600 hover:bg-gray-700 text-gray-300 rounded transition';
+            cancelBtn.textContent = 'Close';
+            cancelBtn.onclick = function() { modal.remove(); };
+            cancelRow.appendChild(cancelBtn);
+            box.appendChild(titleEl);
+            box.appendChild(subtitle);
+            box.appendChild(note);
+            box.appendChild(optionsWrap);
+            box.appendChild(cancelRow);
+            modal.appendChild(box);
+            document.body.appendChild(modal);
+        }
+
+        function showBulkResumeChoiceModal() {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) { showToast('Select at least one SIM first', 'error'); return; }
+            const existing = document.getElementById('bulk-resume-choice-modal');
+            if (existing) existing.remove();
+            const modal = document.createElement('div');
+            modal.id = 'bulk-resume-choice-modal';
+            modal.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4';
+            const box = document.createElement('div');
+            box.className = 'bg-gray-800 rounded-xl shadow-xl w-96 p-6';
+            const titleEl = document.createElement('h3');
+            titleEl.className = 'text-lg font-semibold text-white mb-1';
+            titleEl.textContent = 'Resume / Reactivate SIMs';
+            const subtitle = document.createElement('p');
+            subtitle.className = 'text-xs text-gray-400 mb-1';
+            subtitle.textContent = simIds.length + ' SIM(s) selected';
+            const note = document.createElement('p');
+            note.className = 'text-xs text-gray-500 mb-4';
+            note.textContent = 'Helix and ATOMIC SIMs hit the carrier. Wing IoT and Teltik report carrier-not-supported per SIM.';
+            const optionsWrap = document.createElement('div');
+            optionsWrap.className = 'flex flex-col gap-2';
+            const opts = [
+                { label: 'Resume (from suspended)', desc: 'Brings a suspended SIM back. Helix: Unsuspend/CR/35. ATOMIC: restoreSubscriber/CR.', cls: 'bg-emerald-600 hover:bg-emerald-700', fn: function(){ bulkStatusChange('restore', 'Resume'); } },
+                { label: 'Reactivate (from canceled)', desc: 'Reconnects a canceled SIM. Helix: Resume On Cancel/BBL/20. ATOMIC: reconnectSubscriber.', cls: 'bg-teal-600 hover:bg-teal-700', fn: function(){ bulkSimAction('resume'); } }
+            ];
+            opts.forEach(function(o) {
+                const wrap = document.createElement('div');
+                wrap.className = 'flex flex-col';
+                const btn = document.createElement('button');
+                btn.className = 'w-full px-3 py-2 text-sm text-white rounded transition ' + o.cls;
+                btn.textContent = o.label;
+                btn.onclick = function() { modal.remove(); o.fn(); };
+                wrap.appendChild(btn);
+                const helpEl = document.createElement('p');
+                helpEl.className = 'text-[11px] text-gray-500 mt-1 ml-1';
+                helpEl.textContent = o.desc;
+                wrap.appendChild(helpEl);
+                optionsWrap.appendChild(wrap);
+            });
+            const cancelRow = document.createElement('div');
+            cancelRow.className = 'mt-4 flex justify-end';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.className = 'px-3 py-1.5 text-sm bg-gray-600 hover:bg-gray-700 text-gray-300 rounded transition';
+            cancelBtn.textContent = 'Close';
+            cancelBtn.onclick = function() { modal.remove(); };
+            cancelRow.appendChild(cancelBtn);
+            box.appendChild(titleEl);
+            box.appendChild(subtitle);
+            box.appendChild(note);
+            box.appendChild(optionsWrap);
+            box.appendChild(cancelRow);
+            modal.appendChild(box);
+            document.body.appendChild(modal);
+        }
+
+        async function bulkStatusChange(endpoint, label) {
+            const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (simIds.length === 0) return;
+            if (!(await showConfirm('Run Action', 'Run ' + label + ' on ' + simIds.length + ' SIM(s)?'))) return;
+            const output = document.getElementById('sim-action-output');
+            document.getElementById('sim-action-title').textContent = 'Bulk ' + label + ' — ' + simIds.length + ' SIMs';
+            output.textContent = 'Starting...';
+            output.classList.remove('hidden');
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+            window.__bulkCancel = false;
+            showBulkCancelButton();
+            let ok = 0, fail = 0, cancelled = 0, skipped = 0;
+            const lines = [];
+            for (const simId of simIds) {
+                if (window.__bulkCancel) { cancelled = simIds.length - ok - fail - skipped; break; }
+                try {
+                    const res = await fetch(API_BASE + '/' + endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sim_ids: [simId] })
+                    });
+                    const result = await res.json();
+                    const r = Array.isArray(result.results) && result.results.length ? result.results[0] : null;
+                    if (r && r.ok) {
+                        if (r.skipped) { skipped++; lines.push('SIM #' + simId + ': skipped — ' + (r.reason || 'no change needed')); }
+                        else { ok++; lines.push('SIM #' + simId + ': OK'); }
+                    } else {
+                        fail++;
+                        const err = (r && r.error) || result.error || 'unknown';
+                        lines.push('SIM #' + simId + ': FAILED — ' + err);
+                    }
+                } catch (e) {
+                    fail++;
+                    lines.push('SIM #' + simId + ': EXCEPTION — ' + (e && e.message ? e.message : e));
+                }
+                output.textContent = lines.join('\\n') + '\\n\\nProcessing... (' + (ok + fail + skipped) + '/' + simIds.length + ')';
+            }
+            hideBulkCancelButton();
+            const parts = [ok + ' OK'];
+            if (skipped) parts.push(skipped + ' skipped');
+            if (fail) parts.push(fail + ' failed');
+            if (cancelled) parts.push(cancelled + ' cancelled');
+            output.textContent = 'Done: ' + parts.join(', ') + '\\n\\n' + lines.join('\\n');
+            loadSims(true);
         }
 
         function showBulkResellerActionModal() {
