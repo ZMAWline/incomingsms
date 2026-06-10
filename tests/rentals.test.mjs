@@ -74,8 +74,9 @@ ok('carrierForVendor collapses vendors to att/tmobile buckets');
   // 3*1.10 + 2*1.60 = 3.30 + 3.20 = 6.50
   assert.equal(r.total_amount, 6.5, 'flat per-carrier rate applied, SMS volume irrelevant');
   assert.equal(r.rate_fallback_used, false, 'configured rates used, not qbo daily_rate fallback');
-  // start (2026-05-01) is before cutover, so effectiveStart clamps to cutover.
-  assert.equal(r.cutover, RENTAL_CUTOVER_DATE);
+  // Per 2026-06-01 decision (decision-log.md): no clamp — effectiveStart = the
+  // requested start. The cutover is operational, not a calculator limit.
+  assert.equal(r.cutover, '2026-05-01');
   ok('flat-rate rental billing: 3 AT&T @1.10 + 2 T-Mobile @1.60 = $6.50');
 }
 

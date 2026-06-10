@@ -4,6 +4,22 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-06-02 — INC-3 bad-rental reporting: operator-in-the-loop only in Phase 1; no auto-credits
+
+**Decision:** The bad-rental reporting flow (INC-3 Phase 1) is **fully operator-gated**. When a reseller reports a bad rental via `POST /api/rentals/report-bad`, we record the report and surface it in the operator dashboard tab "Bad Rentals". No automatic remediation (rotate, port reset, SIM replace), no automatic credits, no invoice adjustments happen without operator action.
+
+**Why:** Auto-remediation on a reseller-reported signal carries real risk (false positives, SIM disruption, double-action with manual ops already in flight). Phase 1 builds the evidence channel and queue; the operator decides what to do per case. Auto-credit policy would require legal/billing review (separate proposal).
+
+**Consequence (do not undo):**
+- Do NOT add automatic rotation or port-reset triggers to `handleReportBadByRental` or `insertOrReturnExistingReport`.
+- Do NOT write automatic `rental_report_events` rows with status `remediated` from worker code — only from operator action.
+- Auto-credit policy is Phase 3, requires explicit separate board + billing review. The schema allows it (remediation_action + closed_at) but no code drives it yet.
+- Outbound webhook to the reseller on status transitions is Phase 2 (partner sign-off required, not in Phase 1).
+
+**Phase 1 thresholds (data, not code):** rate limit is 1 report/SIM/hour and 200/reseller/day via `portal_report_bad` action in `reseller_actions_log`. Both values were chosen as "plenty of headroom for a real outage, tight enough to flag a runaway client." To adjust: add a `reseller_settings` table entry or change the constant in `checkRateLimit()`.
+
+---
+
 ## 2026-06-01 — Rental billing calculator has NO cutover clamp; cutover is operational only
 
 **Decision:** `computeRentalBilling` (`src/shared/rentals.js`) uses `effectiveStart = start` — it no longer clamps the requested window up to `RENTAL_CUTOVER_DATE` (2026-05-22). The preview/calculator bills the exact `[start, end]` range in either engine, any date. The dashboard invoice preview + "Download for QuickBooks" generate route now DEFAULT to the rental engine; a **"Use legacy billing (compare)"** checkbox switches to legacy. Legacy engine/code is kept intact (dormant fallback), not removed.

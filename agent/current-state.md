@@ -1,7 +1,113 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-01 (session 63 — INC-2 rental→PROD, rotation reliability, ATOMIC self-heal, carrier escalations)
+> Last updated: 2026-06-04 (session 67 — reports list `?status=resolved` alias fix)
+
+---
+
+## Session 67 (2026-06-04) — INC-3 follow-up: `?status=resolved` alias fix
+
+Board bug report: `GET /api/sims/reports?status=resolved` returned `[]` even though resolved reports exist. Root cause confirmed: the `rental_reports.status` CHECK constraint only allows `received|in_triage|remediated|unable_to_reproduce|duplicate` — there is no `resolved` literal in the DB. The handler was passing `status=eq.resolved` through to PostgREST, which legitimately matched zero rows.
+
+**Fix:** added `src/shared/rental-report-status.js` with `buildStatusFilter(raw)` that expands the user-facing aliases into PostgREST filter fragments:
+- `open` → `&status=in.(received,in_triage)` (already supported; preserved)
+- `resolved` → `&status=in.(remediated,unable_to_reproduce,duplicate)` (new)
+- `all` → no filter
+- literal enum values → `&status=eq.<value>` pass-through
+- anything else → `{ok:false}` so the handler returns 400 with the accepted list
+- missing/empty → defaults to `open` (preserves prior behaviour)
+
+Trim + lower-case normalization included. `handleReportsList` in `src/reseller-portal/index.js` now uses the helper and returns a 400 `bad_request` payload listing accepted values for unknown statuses.
+
+**Tests:** new `tests/reports-list-status.test.mjs` (14 cases) covering every alias, every literal, garbage, missing, case-insensitivity, and whitespace. `npm run test:reports-list-status`. Existing `npm run test:report-bad` still 13/13 — resolver contract untouched.
+
+**Deployed:** reseller-portal `36049cd7-d464-4f53-9b4f-3e8fe16de01e`. Dashboard not redeployed (its `?status=` filter is on `sims.status`, unrelated).
+
+**Probes (Maxime's key, prod):**
+| Probe | Result |
+|---|---|
+| `GET /api/sims/reports?status=resolved` | 200, 1 row (id=1, `remediated`) |
+| `GET /api/sims/reports?status=open` | 200, `[]` (no currently open reports) |
+| `GET /api/sims/reports?status=garbage` | 400 `bad_request` + accepted list |
+| `GET /api/sims/reports?status=all` | 200, 1 row |
+
+## Session 66 (2026-06-04) — INC-3 follow-up: Bad Rentals first-class surface
+
+Board directive (2026-06-04 14:28 UTC): "Bad Rental doesn't have a unique domain/route/surface — implement the appropriate unique domain/route/surface." Chose **subdomain** over path-group per Single Responsibility constraint #2 and the existing `portal.incoming-sms.com` precedent.
+
+**New worker:** `src/bad-rentals/` (index.js + wrangler.toml).
+**New surface:** `https://bad-rentals.incoming-sms.com` — landing page + 3 API routes.
+
+- `GET  /` — public landing with the contract, curl examples, and an inline "Check status" form.
+- `GET  /healthz` — liveness.
+- `POST /api/rentals/report-bad` — primary intake (same Bearer rsk_* auth, same dedup, same rate-limits as portal).
+- `GET  /api/rentals/report-bad/status?reseller_rental_id=…|e164=…` — most-recent report for one of your rentals.
+- `GET  /api/reports?status=open` — list this reseller's reports.
+
+Resolver moved to `src/shared/report-bad-resolver.js` (was `src/reseller-portal/`); imported by both workers. 13 contract tests still pass; 8 new worker routing/auth tests added (`tests/bad-rentals-worker.test.mjs`, `npm run test:bad-rentals`).
+
+**Backward compatibility:** the old portal routes (`/api/rentals/report-bad`, `/api/sims/:id/report-status`, `/api/sims/reports`) are deliberately left in place so Maxime's existing integration keeps working unchanged. Portal HTML docs updated to recommend the new dedicated surface.
+
+**Deployed:**
+- bad-rentals `ca8612b0-fcd7-4202-8b37-555504b4b5d7` (bad-rentals.incoming-sms.com custom domain auto-provisioned).
+- reseller-portal `cd5f0a46-0315-4a37-8b32-677ce970f98c` (HTML docs only; routes unchanged).
+
+**Probes (Maxime's key, prod):**
+| Probe | Result |
+|---|---|
+| `GET /` landing | 200, 6588 bytes HTML |
+| `GET /healthz` | 200 `{ok:true}` |
+| `GET /api/reports` no auth | 401 |
+| POST `sim_id` | 400 bad_request |
+| POST `iccid` | 400 bad_request |
+| POST internal `rental_id` | 400 bad_request |
+| POST historical MDN | 404 not_found |
+| POST `reseller_rental_id` | 200 (new) → second call 200 deduped |
+| POST current `e164` | 200 deduped |
+| GET status by reseller_rental_id | 200 |
+| GET /api/reports?status=open | 200 (1 report) |
+| Legacy `portal.incoming-sms.com/api/rentals/report-bad` | 200 (unchanged) |
+
+## Session 66 (2026-06-04) — INC-3 Bad Rentals dashboard deep-link (reversed subdomain)
+
+User clarified that "unique URL" meant a dashboard deep-link (`dashboard.zalmen-531.workers.dev/bad-rentals`), not a separate worker. Reversed the earlier `bad-rentals.incoming-sms.com` worker and added the SPA route mapping instead.
+
+- `wrangler delete bad-rentals --env=""` → worker removed from Cloudflare.
+- Deleted `src/bad-rentals/` + `tests/bad-rentals-worker.test.mjs` + `test:bad-rentals` script.
+- Resolver stays at `src/shared/report-bad-resolver.js` (clean refactor, used by reseller-portal).
+- Reseller-portal docs reverted to `portal.incoming-sms.com` URLs (legacy `/api/sims/{sim_id}/report-status` etc.).
+- Dashboard `TAB_ROUTES` adds `'bad-rentals': '/bad-rentals'` so the sidebar link + URL deep-link both land on the Bad Rentals tab.
+- Deployed: dashboard `b9b24424-fc40-4afb-84f8-dcd26c5a79ba`, reseller-portal `ca48643f-2161-4786-b8b2-b691f936c146`.
+- Tests: `npm run test:report-bad` 13/13.
+- Verified: `bad-rentals.incoming-sms.com` no longer resolves; `dashboard.zalmen-531.workers.dev/bad-rentals` returns 200 with the dashboard SPA.
+
+## Session 65 (2026-06-04) — INC-3 report-bad contract lockdown deployed
+
+Per board directive: reseller-facing report-bad now accepts ONLY `reseller_rental_id` or current-MDN `e164`. `sim_id`, `iccid`, internal `rental_id`, and historical/original MDNs are all rejected with a 400 + explicit message. The convenience route `POST /api/sims/:simId/report-bad` is removed; the portal Submit button posts the SIM's current MDN to `/api/rentals/report-bad`.
+
+- Resolver extracted to `src/reseller-portal/report-bad-resolver.js` (pure module, 13 contract tests in `tests/report-bad-resolver.test.mjs`).
+- reseller-portal redeployed prod `dd7997f3-3b50-4ece-bb5c-f8d9f04deb31`.
+- Live probes (Maxime's API key, prod): sim_id/iccid/rental_id → 400 bad_request; original MDN → 404; current MDN + reseller_rental_id → 200 dedup; removed route → 404.
+
+Migration note for partner: tell Maxime to switch his payload field from `rental_id` to `reseller_rental_id` (same value, different key).
+
+## Session 64 (2026-06-03) — INC-3 Phase 1 deploy: workers to PROD, migration pending
+
+Board approved option 1 (deploy all INC-3 Phase 1 to prod for live testing).
+
+**Deployed from branch `feat/inc-2-rental-billing` HEAD (1565dbe):**
+- reseller-portal `27b1a7b4-8ca2-41d8-8f70-35d412552fdd` (portal.incoming-sms.com)
+- dashboard `eeb532da-e765-471d-aeac-907179ae020c`
+- details-finalizer `47fc0b58-be80-4571-b50d-bb6e185ac97b` (cron */5, 30 10, 0 */6)
+
+Smoke: portal 400 on /login (expects POST — alive), dashboard 401 (auth required — alive), details-finalizer 200.
+
+**DB migration applied** via Supabase Management API (`SUPABASE_ACCESS_TOKEN` from `.dev.vars`, project ref `lzjqegxazqlktttyybth`). Both tables present in public schema: `rental_reports`, `rental_report_events`. RLS enabled per migration. All three new code paths are now backed by their tables:
+- portal `POST /api/sims/:id/report-bad`
+- dashboard `/api/bad-rentals*` (Bad Rentals tab)
+- details-finalizer nightly bad-rental count
+
+INC-3 Phase 1 is fully live in production. Next: monitor for reseller intake, watch nightly count cron.
 
 ---
 

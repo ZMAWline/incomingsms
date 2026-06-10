@@ -6,6 +6,8 @@
   "scripts": {
     "test": "node tests/rentals.test.mjs",
     "test:address-picker": "node tests/address-picker.test.mjs",
+    "test:report-bad": "node tests/report-bad-resolver.test.mjs",
+    "test:reports-list-status": "node tests/reports-list-status.test.mjs",
     "check:db-constraints": "node scripts/check_db_constraints.mjs",
     "predeploy": "npm run check:db-constraints"
   },
