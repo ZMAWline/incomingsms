@@ -1,5 +1,6 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
+import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -4577,6 +4578,25 @@ async function sendWebhookWithDeduplication(env, webhookUrl, payload, options = 
     });
   } catch (err) {
     console.log(`[Webhook] Failed to record delivery: ${err}`);
+  }
+
+  if (result.ok && !result.skipped) {
+    try {
+      const persisted = await persistRentalFromWebhookResponse({
+        env,
+        payload,
+        responseBody: result.responseBody,
+        resellerId: options.resellerId,
+        deliveredAt: new Date().toISOString(),
+      });
+      if (persisted.upserted) {
+        console.log(`[Webhook] rentals upsert ok for ${messageId} → reseller_rental_id=${persisted.rentalContext?.reseller_rental_id}`);
+      } else if (persisted.reason && persisted.reason !== 'not_number_online' && persisted.reason !== 'no_rental_id_in_response') {
+        console.log(`[Webhook] rentals upsert skipped for ${messageId}: ${persisted.reason}`);
+      }
+    } catch (err) {
+      console.log(`[Webhook] rentals upsert threw for ${messageId}: ${err}`);
+    }
   }
 
   return result;
