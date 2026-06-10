@@ -48,7 +48,7 @@ export default {
     }
 
     if (url.pathname === '/api/messages') {
-      return handleMessages(env, corsHeaders);
+      return handleMessages(env, corsHeaders, url);
     }
 
     if (url.pathname === '/api/resellers') {
@@ -954,13 +954,61 @@ async function handleSims(env, corsHeaders, url) {
   }
 }
 
-async function handleMessages(env, corsHeaders) {
+async function handleMessages(env, corsHeaders, url) {
   try {
-    const query = `inbound_sms?select=id,to_number,from_number,body,received_at,sim_id,sims(iccid)&order=received_at.desc&limit=500`;
-    const response = await supabaseGet(env, query);
-    const messages = await response.json();
+    const baseSelect = 'select=id,to_number,from_number,body,received_at,sim_id,sims(iccid)';
+    const search = ((url && url.searchParams && url.searchParams.get('search')) || '').trim();
 
-    // Flatten the structure
+    let queryPath;
+    if (!search) {
+      queryPath = `inbound_sms?${baseSelect}&order=received_at.desc&limit=500`;
+    } else {
+      const terms = search.split(/[,;\r\n]+/)
+        .map(t => t.replace(/[^a-zA-Z0-9\s+\-]/g, '').trim())
+        .filter(Boolean)
+        .slice(0, 10);
+      if (!terms.length) {
+        return new Response(JSON.stringify([]), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      const predicates = [];
+      const simIds = new Set();
+      for (const t of terms) {
+        const enc = encodeURIComponent(`*${t}*`);
+        predicates.push(`body.ilike.${enc}`);
+        predicates.push(`from_number.ilike.${enc}`);
+        predicates.push(`to_number.ilike.${enc}`);
+        const digits = t.replace(/\D/g, '');
+        if (digits && digits !== t) {
+          const encD = encodeURIComponent(`*${digits}*`);
+          predicates.push(`from_number.ilike.${encD}`);
+          predicates.push(`to_number.ilike.${encD}`);
+        }
+        if (digits && digits.length >= 4) {
+          try {
+            const simResp = await supabaseGet(env, `sims?select=id&iccid=ilike.${encodeURIComponent('*' + digits + '*')}&limit=200`);
+            if (simResp.ok) {
+              const sims = await simResp.json();
+              if (Array.isArray(sims)) for (const s of sims) simIds.add(s.id);
+            }
+          } catch (_) { /* ignore — fall back to text search */ }
+        }
+      }
+      if (simIds.size) {
+        predicates.push(`sim_id.in.(${[...simIds].join(',')})`);
+      }
+      queryPath = `inbound_sms?${baseSelect}&or=(${predicates.join(',')})&order=received_at.desc&limit=2000`;
+    }
+
+    const response = await supabaseGet(env, queryPath);
+    const messages = await response.json();
+    if (!response.ok || !Array.isArray(messages)) {
+      return new Response(JSON.stringify({ error: 'messages_query_failed', detail: messages }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
     const formatted = messages.map(msg => ({
       id: msg.id,
       to_number: msg.to_number,
@@ -7935,7 +7983,7 @@ function getHTML(helixEnabled) {
                     <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
                         <h2 class="text-lg font-semibold text-white">SMS Messages</h2>
                         <div class="flex items-center gap-3">
-                            <input id="messages-search" type="text" placeholder="Search..." oninput="renderMessages()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-40">
+                            <input id="messages-search" type="text" placeholder="Search..." oninput="onMessagesSearchInput(this.value)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent w-40">
                             <button onclick="loadMessages()" class="text-xs text-accent hover:text-green-400 transition">Refresh</button>
                         </div>
                     </div>
@@ -12258,16 +12306,31 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
+        let _msgsSearchTimer = null;
+        function onMessagesSearchInput(v) {
+            clearTimeout(_msgsSearchTimer);
+            _msgsSearchTimer = setTimeout(function(){
+                tableState.messages.page = 1;
+                loadMessages();
+            }, 300);
+        }
+
         async function loadMessages() {
             try {
-                const response = await fetch(\`\${API_BASE}/messages\`);
+                const search = (document.getElementById('messages-search')?.value || '').trim();
+                const msgsUrl = search
+                    ? \`\${API_BASE}/messages?search=\${encodeURIComponent(search)}\`
+                    : \`\${API_BASE}/messages\`;
+                const response = await fetch(msgsUrl);
                 const messages = await response.json();
 
                 // Update main messages table
-                tableState.messages.data = messages;
+                tableState.messages.data = Array.isArray(messages) ? messages : [];
                 renderMessages();
-                // Update preview table (first 5)
+                // Update preview table (first 5) — skip while a search is active so the
+                // dashboard preview always shows the most recent unfiltered messages.
                 const preview = document.getElementById('messages-preview');
+                if (search) return;
                 const previewMsgs = messages.slice(0, 5);
                 if (previewMsgs.length === 0) {
                     preview.innerHTML = '<tr><td colspan="4" class="px-5 py-4 text-center text-gray-500">No messages</td></tr>';
