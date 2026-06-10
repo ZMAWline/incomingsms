@@ -7815,8 +7815,6 @@ function getHTML(helixEnabled) {
                     <button onclick="showBulkResellerActionModal()" class="px-3 py-1.5 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition">Reseller…</button>
                     <button onclick="bulkSimAction('cancel')" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel</button>
                     <button onclick="bulkSimAction('resume')" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume</button>
-                    <button onclick="bulkSetRotationEligible(false)" class="px-3 py-1.5 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition">Pause Auto-Rotate</button>
-                    <button onclick="bulkSetRotationEligible(true)" class="px-3 py-1.5 text-xs bg-lime-600 hover:bg-lime-700 text-white rounded transition">Resume Auto-Rotate</button>
                     <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Send Online</button>
                     <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
                     <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
