@@ -786,6 +786,11 @@ async function insertOrReturnExistingReport(env, resellerId, resolved, body, sou
   }
 
   // Insert.
+  // INC-25 followup: when the resolver couldn't tie the current-MDN e164 to a
+  // rental row (rental missing for the SIM's current sim_number), flag the
+  // report `escalated / intake_unresolved_current_mdn_no_rental` at intake so
+  // the remediator never vendor-acts against a stale historical rental.
+  const isUnresolved = resolved.unresolved === true;
   const row = {
     reseller_id: Number(resellerId),
     rental_id: resolved.rental_id || null,
@@ -798,8 +803,12 @@ async function insertOrReturnExistingReport(env, resellerId, resolved, body, sou
     first_attempt_at: firstAttemptAt,
     client_request_id: clientRequestId,
     status: 'received',
-    raw_payload: body,
+    raw_payload: isUnresolved
+      ? { ...body, _intake: { needs_resolution: true, intake_state: resolved.intake_state || 'current_mdn_no_rental_row' } }
+      : body,
     source: source || null,
+    auto_remediation_state: isUnresolved ? 'escalated' : null,
+    escalation_reason: isUnresolved ? 'intake_unresolved_current_mdn_no_rental' : null,
   };
   let insertResp;
   try {

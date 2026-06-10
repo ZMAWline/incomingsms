@@ -29,17 +29,19 @@ const { resolveRentalForReport } = await import(bundle + '?cache=' + Date.now())
 // Reseller 4 owns SIM 7777 (current MDN +14155550199) with rental 99001.
 
 const RENTALS = [
-  { id: 47111, reseller_id: 3, sim_id: 3500, sim_number_id: 60362, e164: '+18126100326', minted_at: '2026-05-29T22:08:59Z', reseller_rental_id: '1617922' },
+  // INC-25 followup: rental on SIM 3500 now points to the CURRENT sim_number
+  // (id 70362, e164 +17752002752) — used to assert ACCEPT current MDN.
+  { id: 47111, reseller_id: 3, sim_id: 3500, sim_number_id: 70362, e164: '+17752002752', minted_at: '2026-05-29T22:08:59Z', reseller_rental_id: '1617922' },
   { id: 99001, reseller_id: 4, sim_id: 7777, sim_number_id: 88001, e164: '+14155550100', minted_at: '2026-05-30T00:00:00Z', reseller_rental_id: 'extra-1' },
 ];
 
 const SIM_NUMBERS = [
   // current (valid_to NULL)
-  { sim_id: 3500, e164: '+17752002752', valid_to: null },
-  { sim_id: 7777, e164: '+14155550199', valid_to: null },
+  { id: 70362, sim_id: 3500, e164: '+17752002752', valid_to: null },
+  { id: 88002, sim_id: 7777, e164: '+14155550199', valid_to: null },
   // historical
-  { sim_id: 3500, e164: '+18126100326', valid_to: '2026-05-30T00:00:00Z' },
-  { sim_id: 7777, e164: '+14155550100', valid_to: '2026-05-30T12:00:00Z' },
+  { id: 60362, sim_id: 3500, e164: '+18126100326', valid_to: '2026-05-30T00:00:00Z' },
+  { id: 88001, sim_id: 7777, e164: '+14155550100', valid_to: '2026-05-30T12:00:00Z' },
 ];
 
 const RESELLER_SIMS = [
@@ -56,6 +58,7 @@ function makeSbGet(tables) {
     const table = qIndex === -1 ? tableAndQuery : tableAndQuery.slice(0, qIndex);
     const params = qIndex === -1 ? '' : tableAndQuery.slice(qIndex + 1);
     const filters = {};
+    const orClauses = [];
     let limit = Infinity;
     for (const kv of params.split('&')) {
       if (!kv) continue;
@@ -64,6 +67,7 @@ function makeSbGet(tables) {
       const v = decodeURIComponent(kv.slice(eq + 1));
       if (k === 'select' || k === 'order') continue;
       if (k === 'limit') { limit = Number(v); continue; }
+      if (k === 'or') { orClauses.push(v); continue; }
       filters[k] = v;
     }
     let rows = (tables[table] || []).slice();
@@ -80,6 +84,15 @@ function makeSbGet(tables) {
       } else {
         throw new Error('unhandled filter in test sbGet: ' + col + '=' + expr);
       }
+    }
+    for (const clause of orClauses) {
+      const inner = clause.replace(/^\(/, '').replace(/\)$/, '');
+      const parts = inner.split(',');
+      rows = rows.filter(r => parts.some(p => {
+        const m = p.match(/^([^.]+)\.eq\.(.+)$/);
+        if (!m) return false;
+        return String(r[m[1]]) === m[2];
+      }));
     }
     if (Number.isFinite(limit)) rows = rows.slice(0, limit);
     return {
@@ -215,6 +228,33 @@ await t('AMBIGUOUS — two owned SIMs share the same current MDN', async () => {
   assert.equal(r.ok, false);
   assert.equal(r.code, 'ambiguous');
   assert.match(r.message, /reseller_rental_id/);
+});
+
+// INC-25 followup — report #3 shape: current MDN is on an owned SIM, but no
+// rental row exists for that current MDN. The latest rental on the SIM is
+// historical (different e164, different sim_number_id). The resolver must
+// NOT fall back to the historical rental; it must return unresolved so the
+// handler can flag the report `escalated / intake_unresolved_current_mdn_no_rental`.
+await t('REPORT-3 shape: current MDN with no matching rental → unresolved (no historical fallback)', async () => {
+  const tables = makeTables();
+  // SIM 3501 — current MDN +18465776590 (sim_number 68411), historical MDN
+  // +12345678249 (sim_number 60361). Reseller owns the SIM. Only rental on
+  // SIM points to the historical sim_number.
+  tables.sim_numbers.push({ id: 68411, sim_id: 3501, e164: '+18465776590', valid_to: null });
+  tables.sim_numbers.push({ id: 60361, sim_id: 3501, e164: '+12345678249', valid_to: '2026-05-30T08:15:11.756Z' });
+  tables.reseller_sims.push({ reseller_id: 3, sim_id: 3501 });
+  tables.rentals.push({ id: 47116, reseller_id: 3, sim_id: 3501, sim_number_id: 60361, e164: '+12345678249', minted_at: '2026-05-30T00:00:00Z', reseller_rental_id: 'r3-historical' });
+
+  const sb = makeSbGet(tables);
+  const r = await resolveRentalForReport(env, 3, { e164: '+18465776590' }, sb);
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.unresolved, true, 'expected unresolved=true');
+  assert.equal(r.intake_state, 'current_mdn_no_rental_row');
+  assert.equal(r.rental_id, null, 'must NOT attach to historical rental 47116');
+  assert.equal(r.sim_id, 3501);
+  assert.equal(r.sim_number_id, 68411, 'should report the CURRENT sim_number_id, not the historical 60361');
+  assert.equal(r.e164, '+18465776590');
 });
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');

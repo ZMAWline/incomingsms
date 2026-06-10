@@ -80,7 +80,7 @@ export async function resolveRentalForReport(env, resellerId, body, sbGet) {
   if (!norm) return { ok: false, code: 'bad_request', message: 'e164 is not a plausible phone number' };
 
   const snResp = await sbGet(env,
-    'sim_numbers?select=sim_id,e164,valid_to' +
+    'sim_numbers?select=id,sim_id,e164,valid_to' +
     '&e164=eq.' + encodeURIComponent(norm) +
     '&valid_to=is.null'
   );
@@ -109,17 +109,43 @@ export async function resolveRentalForReport(env, resellerId, body, sbGet) {
   }
 
   const ownedSimId = owned[0].sim_id;
+  // INC-25 followup: the current sim_number row for the resolved e164 (we
+  // already filtered by valid_to=is.null above). Use its id to require the
+  // rental row to match either the current sim_number_id or the same e164 —
+  // without this, the rentals lookup falls back to the latest historical
+  // rental on the SIM and silently glues a current-MDN report to a stale
+  // rental row (report #3 / report 134 shape).
+  const currentSimNumber = sns.find(s => s.sim_id === ownedSimId) || sns[0];
+  const currentSimNumberId = currentSimNumber && currentSimNumber.id;
+
   const rResp = await sbGet(env,
     'rentals?select=id,sim_id,sim_number_id,e164,minted_at' +
     '&reseller_id=eq.' + encodeURIComponent(resellerId) +
     '&sim_id=eq.' + encodeURIComponent(ownedSimId) +
+    '&or=(e164.eq.' + encodeURIComponent(norm)
+      + (currentSimNumberId ? (',sim_number_id.eq.' + encodeURIComponent(currentSimNumberId)) : '')
+      + ')' +
     '&order=minted_at.desc&limit=1'
   );
   if (!rResp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
   const rRows = await rResp.json();
-  if (!Array.isArray(rRows) || rRows.length === 0) {
-    return { ok: false, code: 'not_found', message: 'no rental for this number under your account' };
+  if (Array.isArray(rRows) && rRows.length > 0) {
+    const r = rRows[0];
+    return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: norm };
   }
-  const r = rRows[0];
-  return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: norm };
+
+  // No rental matches the CURRENT MDN. Return unresolved instead of falling
+  // back to the latest historical rental on the SIM. The handler stores the
+  // report with rental_id=null and immediately flags it `escalated /
+  // intake_unresolved_current_mdn_no_rental` so the remediator never
+  // vendor-acts against a stale context.
+  return {
+    ok: true,
+    unresolved: true,
+    intake_state: 'current_mdn_no_rental_row',
+    rental_id: null,
+    sim_id: ownedSimId,
+    sim_number_id: currentSimNumberId || null,
+    e164: norm,
+  };
 }
