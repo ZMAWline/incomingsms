@@ -2,11 +2,11 @@
   "name": "incomingsms",
   "version": "1.0.0",
   "description": "A collection of Cloudflare Workers for handling incoming SMS messages with SIM card management and routing capabilities.",
-  "main": "fix_both.js",
+  "main": "src/dashboard/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test \"tests/*.test.mjs\"",
     "check:db-constraints": "node scripts/check_db_constraints.mjs",
-    "predeploy": "npm run check:db-constraints"
+    "predeploy": "npm test && npm run check:db-constraints"
   },
   "repository": {
     "type": "git",
