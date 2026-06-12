@@ -678,10 +678,25 @@ async function rotateTeltikSims(env) {
   const lanes = Math.max(1, parseInt(env.TELTIK_ROTATE_CONCURRENCY || '4', 10) || 4);
   let timedOut = false;
 
+  // Outage circuit breaker: 8 CONSECUTIVE transport-level failures (relay
+  // 5xx/530, timeouts, network errors) abort the tick — remaining SIMs stay
+  // unclaimed and the next :10/:40 tick retries when the outage clears.
+  // Application-level rejections (body status=FAILED, "Only 1 per 48h") do
+  // NOT count: those are per-SIM verdicts, not signs the vendor is down.
+  // Added with the concurrency speed-up so a relay outage at 4+ lanes can't
+  // burn through the whole due list (the 2026-05-25 outage logged 12,150
+  // failed carrier calls under the old always-keep-going loop).
+  const BREAKER_THRESHOLD = 8;
+  let consecutiveTransportFails = 0;
+  let breakerTripped = false;
+  const isTransportError = (msg) =>
+    /\b5\d\d\b|timeout|timed out|network|fetch failed|TypeError|ECONN|socket/i.test(String(msg || ''));
+
   async function runPool(list, isRetry) {
     let next = 0;
     async function lane() {
       while (true) {
+        if (breakerTripped) return;
         if (Date.now() - startedMs > ROTATE_TIME_BUDGET_MS) { timedOut = true; return; }
         const i = next++;
         if (i >= list.length) return;
@@ -691,9 +706,19 @@ async function rotateTeltikSims(env) {
           if (result.skipped) { if (isRetry) retrySkipped++; else skipped++; }
           else if (result.ok) { if (isRetry) retried++; else rotated++; }
           else errors++;
+          if (result.ok || result.skipped || !isTransportError(result.error)) {
+            consecutiveTransportFails = 0;
+          } else if (++consecutiveTransportFails >= BREAKER_THRESHOLD) {
+            breakerTripped = true;
+            console.error(`[Rotate] circuit breaker: ${BREAKER_THRESHOLD} consecutive transport failures — aborting tick, ${list.length - next} SIMs deferred to next tick`);
+          }
         } catch (err) {
           console.error(`[Rotate${isRetry ? '/Retry' : ''}] SIM ${sim.iccid}: error: ${err}`);
           errors++;
+          if (isTransportError(err) && ++consecutiveTransportFails >= BREAKER_THRESHOLD) {
+            breakerTripped = true;
+            console.error(`[Rotate] circuit breaker tripped (thrown transport errors) — aborting tick`);
+          }
         }
       }
     }
@@ -723,6 +748,7 @@ async function rotateTeltikSims(env) {
     retried,
     retry_skipped: retrySkipped,
     time_budget_hit: timedOut,
+    breaker_tripped: breakerTripped,
     concurrency: lanes,
   };
 }

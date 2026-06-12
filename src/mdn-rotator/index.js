@@ -1482,20 +1482,44 @@ async function processRotationBatch(env, options = {}) {
   }
 
   let ok = 0, skipped = 0, failed = 0;
+  // Outage circuit breaker: 8 CONSECUTIVE transport-level failures (relay
+  // 5xx/530, timeouts, network errors) stop the batch — remaining SIMs are
+  // left for the next 20-min tick instead of burning claims against a down
+  // vendor (the 2026-05-25 relay outage logged 12,150 failed calls under the
+  // old always-keep-going behavior). Per-SIM application errors (zip
+  // rejected, data mismatch) do NOT count. Added with the concurrency
+  // speed-up; restore-on-failure still un-stamps pre-swap throws as before.
+  const BATCH_BREAKER_THRESHOLD = 8;
+  let consecutiveTransportFails = 0;
+  let breakerTripped = false;
+  let skippedBreaker = 0;
+  const isTransportErr = (msg) =>
+    /\b5\d\d\b|timeout|timed out|network|fetch failed|TypeError|ECONN|socket/i.test(String(msg || ''));
+
   await runWithConcurrency(candidates, concurrency, async (sim) => {
+    if (breakerTripped) { skippedBreaker++; return; }
     try {
       const result = await rotateSingleSim(env, token, sim);
       if (result && result.skipped) { skipped++; return; }
       ok++;
+      consecutiveTransportFails = 0;
     } catch (err) {
       failed++;
       console.error(`[ProcessBatch] SIM ${sim.iccid} failed: ${err}`);
       await updateSimRotationError(env, sim.id, `Rotation failed: ${err}`).catch(() => {});
+      if (isTransportErr(err)) {
+        if (++consecutiveTransportFails >= BATCH_BREAKER_THRESHOLD) {
+          breakerTripped = true;
+          console.error(`[ProcessBatch] circuit breaker: ${BATCH_BREAKER_THRESHOLD} consecutive transport failures — deferring remaining SIMs to next tick`);
+        }
+      } else {
+        consecutiveTransportFails = 0;
+      }
     }
   });
 
-  console.log(`[ProcessBatch] attempted=${candidates.length} ok=${ok} skipped=${skipped} failed=${failed} stuck_ok=${stuckOk} stuck_failed=${stuckFailed}`);
-  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed, stuck_ok: stuckOk, stuck_failed: stuckFailed };
+  console.log(`[ProcessBatch] attempted=${candidates.length} ok=${ok} skipped=${skipped} failed=${failed} skipped_breaker=${skippedBreaker} stuck_ok=${stuckOk} stuck_failed=${stuckFailed}`);
+  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed, skipped_breaker: skippedBreaker, breaker_tripped: breakerTripped, stuck_ok: stuckOk, stuck_failed: stuckFailed };
 }
 
 // ===========================
