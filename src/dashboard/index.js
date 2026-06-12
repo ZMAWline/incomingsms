@@ -500,6 +500,12 @@ export default {
     if (url.pathname === '/api/rotation-review/run' && request.method === 'POST') {
       return handleRotationReviewRun(request, env, corsHeaders);
     }
+    if (url.pathname === '/api/rotation-health' && request.method === 'GET') {
+      return handleRotationHealth(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/catchup-sweep/run' && request.method === 'POST') {
+      return handleCatchupSweepRun(request, env, corsHeaders);
+    }
     if (url.pathname === '/api/pending-items' && request.method === 'GET') {
       return handlePendingItemsList(request, env, corsHeaders);
     }
@@ -2903,6 +2909,112 @@ async function handleRotationReviewRun(request, env, corsHeaders) {
     const r = await env.DETAILS_FINALIZER.fetch(url, { method: 'GET' });
     const body = await r.text();
     return new Response(JSON.stringify({ ok: r.ok, status: r.status, report_md: body }), {
+      status: r.ok ? 200 : 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// GET /api/rotation-health — the Rotation Health tab's single data call.
+// Mirrors details-finalizer's computeDueBaseline()/countDeliveryGaps() logic
+// (src/shared/rotation-baseline.mjs) but runs the queries directly here so the
+// tab loads with one fast round-trip and no service-binding hop.
+async function handleRotationHealth(request, env, corsHeaders) {
+  const jsonResp = (body, status = 200) => new Response(JSON.stringify(body), {
+    status, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
+  try {
+    // Start of today's NY calendar date as UTC ISO (DST-safe: try both offsets)
+    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' })
+      .formatToParts(new Date()).reduce((a, p) => (p.type !== 'literal' && (a[p.type] = p.value), a), {});
+    let tonightStart = `${parts.year}-${parts.month}-${parts.day}T05:00:00Z`;
+    for (const off of ['04', '05']) {
+      const cand = `${parts.year}-${parts.month}-${parts.day}T${off}:00:00Z`;
+      const back = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' })
+        .formatToParts(new Date(cand)).reduce((a, p) => (p.type !== 'literal' && (a[p.type] = p.value), a), {});
+      if (back.day === parts.day) { tonightStart = cand; break; }
+    }
+    const enc = encodeURIComponent;
+
+    const [nightly, teltik, recent, failedTonight, lastRuns] = await Promise.all([
+      supabaseGetAllArray(env, `sims?select=id,vendor,last_mdn_rotated_at,activated_at,reseller_sims!inner(reseller_id,active)&reseller_sims.active=eq.true&status=eq.active&vendor=neq.teltik&rotation_eligible=eq.true`),
+      supabaseGetAllArray(env, `sims?select=id,last_mdn_rotated_at,rotation_interval_hours,reseller_sims!inner(reseller_id,active)&reseller_sims.active=eq.true&status=eq.active&vendor=eq.teltik`),
+      supabaseGetAllArray(env, `sims?select=id,vendor,last_mdn_rotated_at,last_notified_at&status=eq.active&rotation_status=eq.success&last_mdn_rotated_at=gte.${enc(new Date(Date.now() - 24 * 3600 * 1000).toISOString())}`),
+      supabaseGetAllArray(env, `sims?select=id,vendor,msisdn,last_rotation_error&rotation_status=eq.failed&last_mdn_rotated_at=gt.${enc(tonightStart)}`),
+      supabaseGet(env, `cron_runs?select=run_id,kind,status,started_at,ended_at,summary&kind=in.(rotation_review,catchup_sweep)&order=started_at.desc&limit=10`)
+        .then(r => r.ok ? r.json() : []),
+    ]);
+
+    // Open-pending count (needs Prefer: count=exact, so a dedicated call)
+    let pendingOpen = 0;
+    try {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items?status=eq.open&select=id&limit=1`, {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          Prefer: 'count=exact',
+        },
+      });
+      const m = (res.headers.get('content-range') || '').match(/\/(\d+|\*)$/);
+      pendingOpen = m && m[1] !== '*' ? parseInt(m[1], 10) : 0;
+    } catch {}
+
+    const perVendor = {};
+    let missedTotal = 0;
+    for (const s of nightly) {
+      const v = s.vendor || 'unknown';
+      if (!perVendor[v]) perVendor[v] = { eligible: 0, rotated: 0, missed: 0 };
+      perVendor[v].eligible++;
+      const rotatedToday = s.last_mdn_rotated_at && s.last_mdn_rotated_at >= tonightStart;
+      const activatedToday = s.activated_at && s.activated_at >= tonightStart;
+      if (rotatedToday) perVendor[v].rotated++;
+      else if (!activatedToday) { perVendor[v].missed++; missedTotal++; }
+    }
+    const nowMs = Date.now();
+    const teltikDue = teltik.filter(s => !s.last_mdn_rotated_at
+      || nowMs - new Date(s.last_mdn_rotated_at).getTime() >= (s.rotation_interval_hours || 48) * 3600 * 1000).length;
+    const teltikRotatedToday = teltik.filter(s => s.last_mdn_rotated_at && s.last_mdn_rotated_at >= tonightStart).length;
+    const deliveryGaps = recent.filter(s => s.last_mdn_rotated_at
+      && (!s.last_notified_at || new Date(s.last_notified_at) < new Date(s.last_mdn_rotated_at)));
+
+    return jsonResp({
+      generated_at: new Date().toISOString(),
+      tonight_start: tonightStart,
+      per_vendor: perVendor,
+      missed_total: missedTotal,
+      teltik: { eligible: teltik.length, due_now: teltikDue, rotated_today: teltikRotatedToday },
+      delivery_gaps: deliveryGaps.length,
+      delivery_gap_sims: deliveryGaps.slice(0, 50).map(s => ({ id: s.id, vendor: s.vendor, rotated_at: s.last_mdn_rotated_at })),
+      failed_tonight: failedTonight.length,
+      failed_sims: failedTonight.slice(0, 50),
+      pending_open: pendingOpen,
+      recent_runs: lastRuns,
+    });
+  } catch (e) {
+    return jsonResp({ error: String(e) }, 500);
+  }
+}
+
+// POST /api/catchup-sweep/run — manual "fix it now" trigger; proxies the
+// details-finalizer /catchup-sweep endpoint (same engine as the 2h cron).
+async function handleCatchupSweepRun(request, env, corsHeaders) {
+  try {
+    if (!env.FINALIZER_RUN_SECRET || !env.DETAILS_FINALIZER) {
+      return new Response(JSON.stringify({ error: 'FINALIZER_RUN_SECRET or DETAILS_FINALIZER not configured' }), {
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const reqUrl = new URL(request.url);
+    const dry = reqUrl.searchParams.get('dry') === '1' ? '&dry=1' : '';
+    const url = 'https://details-finalizer/catchup-sweep?secret=' + encodeURIComponent(env.FINALIZER_RUN_SECRET) + dry;
+    const r = await env.DETAILS_FINALIZER.fetch(url, { method: 'GET' });
+    const body = await r.text();
+    let parsed; try { parsed = JSON.parse(body); } catch { parsed = { raw: body.slice(0, 500) }; }
+    return new Response(JSON.stringify({ ok: r.ok, status: r.status, result: parsed }), {
       status: r.ok ? 200 : 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });

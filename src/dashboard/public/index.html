@@ -550,45 +550,30 @@
                 </div>
             </div>
             <nav class="flex flex-col gap-1 px-2">
+                <div class="px-6 pt-1 pb-1 text-[10px] font-bold uppercase tracking-[0.14em]" style="color:var(--mc-mute);">Operations</div>
                 <a href="/" onclick="event.preventDefault();switchTab('dashboard')" data-tab="dashboard" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Dashboard">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"></path></svg>
                     <span class="text-sm">Dashboard</span>
                 </a>
+                <a href="/rotation-reviews" onclick="event.preventDefault();switchTab('rotation-reviews')" data-tab="rotation-reviews" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Rotation Health">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>
+                    <span class="text-sm font-medium">Rotation Health</span>
+                    <span id="sidebar-review-badge" class="hidden ml-auto text-xs px-2 py-0.5 rounded-full bg-red-600 text-white">0</span>
+                </a>
                 <a href="/sims" onclick="event.preventDefault();switchTab('sims')" data-tab="sims" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="SIMs">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
                     <span class="text-sm">SIMs</span>
-                </a>
-                <a href="/messages" onclick="event.preventDefault();switchTab('messages')" data-tab="messages" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Messages">
-                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
-                    <span class="text-sm">Messages</span>
-                </a>
-                <a href="/workers" onclick="event.preventDefault();switchTab('workers')" data-tab="workers" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Workers">
-                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-                    <span class="text-sm">Workers</span>
-                </a>
-                <a href="/gateways" onclick="event.preventDefault();switchTab('gateways')" data-tab="gateways" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Gateways">
-                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
-                    <span class="text-sm">Gateways</span>
-                </a>
-                <a href="/imei-pool" onclick="event.preventDefault();switchTab('imei-pool')" data-tab="imei-pool" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="IMEI Pool">
-                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-                    <span class="text-sm">IMEI Pool</span>
-                </a>
-                <a href="/errors" onclick="event.preventDefault();switchTab('errors')" data-tab="errors" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Errors">
-                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
-                    <span class="text-sm">Errors</span>
-                    <span id="error-badge" class="hidden ml-auto min-w-[16px] h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center px-1">0</span>
                 </a>
                 <a href="/bad-rentals" onclick="event.preventDefault();switchTab('bad-rentals')" data-tab="bad-rentals" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Bad Rentals">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
                     <span class="text-sm">Bad Rentals</span>
                     <span id="bad-rentals-badge" class="hidden ml-auto min-w-[16px] h-4 bg-amber-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center px-1">0</span>
                 </a>
-                <a href="/rotation-reviews" onclick="event.preventDefault();switchTab('rotation-reviews')" data-tab="rotation-reviews" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Rotation Reviews">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>
-                    <span class="text-sm font-medium">Rotation Reviews</span>
-                    <span id="sidebar-review-badge" class="hidden ml-auto text-xs px-2 py-0.5 rounded-full bg-red-600 text-white">0</span>
+                <a href="/gateways" onclick="event.preventDefault();switchTab('gateways')" data-tab="gateways" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Gateways">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                    <span class="text-sm">Gateways</span>
                 </a>
+                <div class="px-6 pt-5 pb-1 text-[10px] font-bold uppercase tracking-[0.14em]" style="color:var(--mc-mute);">Money</div>
                 <a href="/invoicing" onclick="event.preventDefault();switchTab('invoicing')" data-tab="invoicing" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Invoicing">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
                     <span class="text-sm">Invoicing</span>
@@ -601,13 +586,31 @@
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 3v18h18M7 15l4-4 4 4 5-5"></path></svg>
                     <span class="text-sm">SMS Usage</span>
                 </a>
-                <a href="/guide" onclick="event.preventDefault();switchTab('guide')" data-tab="guide" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Guide">
-                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
-                    <span class="text-sm">Guide</span>
+                <div class="px-6 pt-5 pb-1 text-[10px] font-bold uppercase tracking-[0.14em]" style="color:var(--mc-mute);">Toolbox</div>
+                <a href="/workers" onclick="event.preventDefault();switchTab('workers')" data-tab="workers" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Workers">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                    <span class="text-sm">Workers</span>
+                </a>
+                <a href="/messages" onclick="event.preventDefault();switchTab('messages')" data-tab="messages" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Messages">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                    <span class="text-sm">Messages</span>
+                </a>
+                <a href="/imei-pool" onclick="event.preventDefault();switchTab('imei-pool')" data-tab="imei-pool" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="IMEI Pool">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                    <span class="text-sm">IMEI Pool</span>
+                </a>
+                <a href="/errors" onclick="event.preventDefault();switchTab('errors')" data-tab="errors" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Errors">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
+                    <span class="text-sm">Errors</span>
+                    <span id="error-badge" class="hidden ml-auto min-w-[16px] h-4 bg-red-500 rounded-full text-[10px] font-bold text-white flex items-center justify-center px-1">0</span>
                 </a>
                 <a href="/api-tester" onclick="event.preventDefault();switchTab('api-tester')" data-tab="api-tester" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="API Tester">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
                     <span class="text-sm">API Tester</span>
+                </a>
+                <a href="/guide" onclick="event.preventDefault();switchTab('guide')" data-tab="guide" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Guide">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
+                    <span class="text-sm">Guide</span>
                 </a>
             </nav>
             <div class="mt-auto px-6 pb-4">
@@ -1360,9 +1363,21 @@
 
             <!-- Rotation Reviews Tab -->
             <div id="tab-rotation-reviews" class="tab-content hidden">
+                <!-- Tonight at a glance (rotation health) -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-semibold text-white">Tonight at a glance</h3>
+                        <button onclick="runCatchupSweepNow()" id="run-sweep-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-700 text-white rounded-lg transition flex items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                            Run catch-up sweep
+                        </button>
+                    </div>
+                    <div id="rotation-health-body"><p class="text-sm text-dark-400">Loading...</p></div>
+                </div>
+
                 <div class="flex items-center justify-between mb-6">
                     <div class="flex items-center gap-3">
-                        <h2 class="text-xl font-bold text-white">Rotation Reviews</h2>
+                        <h2 class="text-xl font-bold text-white">Rotation Health</h2>
                         <span id="review-status-pill" class="text-xs px-2 py-1 rounded-full bg-dark-700 text-dark-300">idle</span>
                     </div>
                     <button onclick="runReviewNow()" id="run-review-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-700 text-white rounded-lg transition flex items-center gap-2">
@@ -3863,7 +3878,7 @@ set verify_pending; schedule §C.3 poll
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'bad-rentals': 'Bad Rentals', 'rotation-reviews': 'Rotation Reviews', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'bad-rentals': 'Bad Rentals', 'rotation-reviews': 'Rotation Health', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
             const PAGE_HEADERS = {
                 dashboard:   ['Overview',       'Dashboard',          'Monitor SIMs, messages, and system status.'],
                 sims:        ['Inventory',      'SIMs',               'Browse, filter, and manage every SIM card in the fleet.'],
@@ -3873,7 +3888,7 @@ set verify_pending; schedule §C.3 poll
                 'imei-pool': ['Identity',       'IMEI Pool',          'Pool of device identifiers available for assignment.'],
                 errors:      ['Incidents',      'Errors',             'Recent worker errors and activation failures.'],
                 'bad-rentals': ['Incidents',     'Bad Rentals',        'Reseller-reported broken rentals awaiting review or remediation.'],
-                'rotation-reviews': ['Automation',  'Rotation Reviews',   'Daily agent review of recent rotation runs.'],
+                'rotation-reviews': ['Operations',  'Rotation Health',    'Due vs rotated vs delivered — with one-click remediation.'],
                 invoicing:   ['Billing',        'Invoicing',          'Reseller plans, QuickBooks mappings, and invoices.'],
                 billing:     ['Billing',        'Reseller Billing',   'Charging audit, billing ledger, and plan rates.'],
                 'sms-usage': ['Analytics',      'SMS Usage',          'Inbound SMS volume per SIM over time.'],
@@ -3898,7 +3913,7 @@ set verify_pending; schedule §C.3 poll
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
             if (tabName === 'sims') { loadRotationAudit(); try { syncSimsUrl(); } catch(e){} }
-            if (tabName === 'rotation-reviews') { loadRotationReviews(); }
+            if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); }
         }
 
         // Handle browser back/forward
@@ -4828,6 +4843,102 @@ set verify_pending; schedule §C.3 poll
             if (inList) html += '</ul>';
             if (inTable) html += '</table>';
             return html;
+        }
+
+        // ─── Rotation health ("Tonight at a glance") ────────────────────────
+        async function loadRotationHealth() {
+            const body = document.getElementById('rotation-health-body');
+            if (!body) return;
+            try {
+                const r = await fetch(`${API_BASE}/rotation-health`);
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const h = await r.json();
+                renderRotationHealth(h);
+            } catch (e) {
+                body.innerHTML = `<p class="text-sm text-red-400">Failed to load rotation health: ${escapeHtml(e.message || e)}</p>`;
+            }
+        }
+
+        function renderRotationHealth(h) {
+            const body = document.getElementById('rotation-health-body');
+            if (!body) return;
+            const pv = h.per_vendor || {};
+            const vendors = Object.keys(pv);
+            const due = vendors.reduce((s, v) => s + ((pv[v] || {}).eligible || 0), 0);
+            const rotated = vendors.reduce((s, v) => s + ((pv[v] || {}).rotated || 0), 0);
+            const missed = h.missed_total || 0;
+            const gaps = h.delivery_gaps || 0;
+            const failed = h.failed_tonight || 0;
+            const open = h.pending_open || 0;
+            let html = '';
+
+            const issues = missed + gaps + failed;
+            if (issues > 0) {
+                const tone = (missed > 0 || gaps > 0)
+                    ? 'border-red-500/40 bg-red-500/10 text-red-400'
+                    : 'border-amber-500/40 bg-amber-500/10 text-amber-400';
+                html += `<div class="mb-4 px-4 py-2 rounded-lg border ${tone} text-sm">&#9888; ${issues} issue${issues === 1 ? '' : 's'} need${issues === 1 ? 's' : ''} attention &mdash; the sweep will retry automatically; or run it now.</div>`;
+            }
+
+            const card = (label, val, cls) =>
+                `<div class="bg-dark-700/50 rounded-lg p-4 border border-dark-600 text-center"><div class="text-2xl font-bold ${cls}">${val}</div><div class="text-xs text-dark-400 mt-1">${label}</div></div>`;
+            html += '<div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">'
+                + card('Due tonight', due, 'text-white')
+                + card('Rotated', rotated, (due > 0 && rotated === due) ? 'text-emerald-400' : 'text-white')
+                + card('Missed', missed, missed === 0 ? 'text-emerald-400' : 'text-red-400')
+                + card('Delivery gaps', gaps, gaps === 0 ? 'text-emerald-400' : 'text-red-400')
+                + card('Failed tonight', failed, failed === 0 ? 'text-emerald-400' : 'text-amber-400')
+                + card('Open escalations', open, open === 0 ? 'text-emerald-400' : 'text-red-400')
+                + '</div>';
+
+            let rows = vendors.map(v => {
+                const d = pv[v] || {};
+                return `<tr class="border-b border-dark-700/50"><td class="py-1.5 pr-4">${escapeHtml(v)}</td><td class="pr-4">${d.eligible || 0}</td><td class="pr-4">${d.rotated || 0}</td><td>${(d.missed || 0) > 0 ? `<span class="text-red-400">${d.missed}</span>` : '0'}</td></tr>`;
+            }).join('');
+            const tk = h.teltik || {};
+            rows += `<tr><td class="py-1.5 pr-4">teltik</td><td colspan="3" class="text-dark-300">${tk.rotated_today || 0} rotated today / ${tk.due_now || 0} due now (48h cadence)</td></tr>`;
+            html += `<div class="mt-4 overflow-x-auto"><table class="w-full text-sm text-dark-100"><thead><tr class="text-left text-xs uppercase tracking-wider text-dark-400 border-b border-dark-600"><th class="py-2 pr-4">Vendor</th><th class="pr-4">Eligible</th><th class="pr-4">Rotated tonight</th><th>Missed</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+
+            const sweep = (h.recent_runs || []).find(r => r.kind === 'catchup_sweep');
+            if (sweep) {
+                const when = sweep.started_at ? new Date(sweep.started_at).toLocaleString() : '?';
+                const counts = _sweepSummaryCounts(sweep.summary);
+                html += `<p class="mt-4 text-sm text-dark-400">Last catch-up sweep: ${escapeHtml(when)} &mdash; ${escapeHtml(sweep.status || 'unknown')}${counts ? ' (' + escapeHtml(counts) + ')' : ''}</p>`;
+            } else {
+                html += '<p class="mt-4 text-sm text-dark-400">No sweep has run yet.</p>';
+            }
+            body.innerHTML = html;
+        }
+
+        function _sweepSummaryCounts(s) {
+            if (!s || typeof s !== 'object') return '';
+            const num = (v) => (v && typeof v === 'object') ? (v.ok ?? v.count ?? 0) : (v ?? 0);
+            const parts = [];
+            if (s.force_rotated !== undefined) parts.push(`${num(s.force_rotated)} force-rotated ok`);
+            if (s.flipped !== undefined) parts.push(`${num(s.flipped)} flipped`);
+            if (s.gaps_resent !== undefined) parts.push(`${num(s.gaps_resent)} gaps re-sent`);
+            else if (s.delivery_gaps !== undefined) parts.push(`${num(s.delivery_gaps)} gaps re-sent`);
+            return parts.join(', ');
+        }
+
+        async function runCatchupSweepNow() {
+            const ok = await showConfirm('Run catch-up sweep?', 'Retries safe failures, missed rotations and missed deliveries now. Same engine as the 2-hourly automatic sweep.');
+            if (!ok) return;
+            const btn = document.getElementById('run-sweep-btn');
+            const orig = btn ? btn.innerHTML : '';
+            if (btn) { btn.disabled = true; btn.classList.add('opacity-60', 'cursor-not-allowed'); btn.innerHTML = 'Sweeping&hellip;'; }
+            try {
+                const r = await fetch(`${API_BASE}/catchup-sweep/run`, { method: 'POST' });
+                const data = await r.json().catch(() => ({}));
+                if (!r.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + r.status));
+                const counts = _sweepSummaryCounts(data.result);
+                showToast('Sweep done' + (counts ? ': ' + counts : (data.status ? ': ' + data.status : '')), 'success');
+                loadRotationHealth();
+            } catch (e) {
+                showToast('Catch-up sweep failed: ' + (e.message || e), 'error');
+            } finally {
+                if (btn) { btn.disabled = false; btn.classList.remove('opacity-60', 'cursor-not-allowed'); btn.innerHTML = orig; }
+            }
         }
 
         async function runReviewNow() {
