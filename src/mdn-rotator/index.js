@@ -1076,9 +1076,13 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
     const hour = new Date(event.scheduledTime).getUTCHours();
     if (isInsideRotationWindowNY()) {
       // DB-driven polling: processRotationBatch runs inline (no CF Queue).
-      // 60 SIMs per tick at concurrency=3 → ~3.3 min wall clock, well inside
-      // Workers' paid 15-min scheduled-invocation limit.
-      ctx.waitUntil(processRotationBatch(env, { limit: 60, concurrency: 3 }));
+      // Pace is operator-tunable via ROTATE_TICK_LIMIT / ROTATE_TICK_CONCURRENCY
+      // vars so ramping is a config edit (speed-up approved 2026-06-12 — finish
+      // the fleet early in the window instead of trickling until ~8:30am NY).
+      // Defaults 100 @ 6 ≈ 12.5 min worst case, inside the 15-min scheduled cap.
+      const limit = Math.max(1, parseInt(env.ROTATE_TICK_LIMIT || '100', 10) || 100);
+      const concurrency = Math.max(1, parseInt(env.ROTATE_TICK_CONCURRENCY || '6', 10) || 6);
+      ctx.waitUntil(processRotationBatch(env, { limit, concurrency }));
     } else {
       console.log(`[Cron] outside NY rotation window (0-8); NY hour=${getNYHour()} — skipping rotation`);
     }

@@ -665,32 +665,51 @@ async function rotateTeltikSims(env) {
 
   let rotated = 0, errors = 0, skipped = 0, retried = 0, retrySkipped = 0;
 
-  for (const sim of due) {
-    try {
-      const result = await rotateOneTeltikSim(env, sim, { force: false });
-      if (result.skipped) skipped++;
-      else if (result.ok) rotated++;
-      else errors++;
-    } catch (err) {
-      console.error(`[Rotate] SIM ${sim.iccid}: error: ${err}`);
-      errors++;
+  // Bounded-concurrency pool + graceful time budget (speed-up approved
+  // 2026-06-12). The old serial loop did ~6/min and was KILLED at the 15-min
+  // scheduled cap mid-flight (the session-58 stuck-state source), stretching
+  // 1,400 SIMs until ~8:30am NY. Lanes are tunable via TELTIK_ROTATE_CONCURRENCY
+  // (default 4 — ramp after a clean night); the 13-min budget exits cleanly
+  // before the platform cap, leftovers picked up by the next :10/:40 tick.
+  // Per-SIM safety is unchanged: claim_rotation_slot / claim_rotation_retry_slot
+  // RPCs remain the single source of eligibility truth.
+  const ROTATE_TIME_BUDGET_MS = 13 * 60 * 1000;
+  const startedMs = Date.now();
+  const lanes = Math.max(1, parseInt(env.TELTIK_ROTATE_CONCURRENCY || '4', 10) || 4);
+  let timedOut = false;
+
+  async function runPool(list, isRetry) {
+    let next = 0;
+    async function lane() {
+      while (true) {
+        if (Date.now() - startedMs > ROTATE_TIME_BUDGET_MS) { timedOut = true; return; }
+        const i = next++;
+        if (i >= list.length) return;
+        const sim = list[i];
+        try {
+          const result = await rotateOneTeltikSim(env, sim, { force: false, retry: isRetry });
+          if (result.skipped) { if (isRetry) retrySkipped++; else skipped++; }
+          else if (result.ok) { if (isRetry) retried++; else rotated++; }
+          else errors++;
+        } catch (err) {
+          console.error(`[Rotate${isRetry ? '/Retry' : ''}] SIM ${sim.iccid}: error: ${err}`);
+          errors++;
+        }
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(lanes, list.length) }, lane));
   }
+
+  await runPool(due, false);
 
   // Retry pass: rotateOneTeltikSim with retry:true takes the claim_rotation_retry_slot
   // path. The RPC will reject any SIM that doesn't meet the in-window predicate, so the
   // 15-min backoff and NY-today-only constraint are enforced at the DB layer (single
   // source of truth — the worker just kicks the tires).
-  for (const sim of retryList) {
-    try {
-      const result = await rotateOneTeltikSim(env, sim, { force: false, retry: true });
-      if (result.skipped) retrySkipped++;
-      else if (result.ok) retried++;
-      else errors++;
-    } catch (err) {
-      console.error(`[Rotate/Retry] SIM ${sim.iccid}: error: ${err}`);
-      errors++;
-    }
+  await runPool(retryList, true);
+
+  if (timedOut) {
+    console.log(`[Rotate] time budget reached after ${Math.round((Date.now() - startedMs) / 1000)}s — remaining SIMs roll to the next tick`);
   }
 
   return {
@@ -703,6 +722,8 @@ async function rotateTeltikSims(env) {
     retry_eligible: retryList.length,
     retried,
     retry_skipped: retrySkipped,
+    time_budget_hit: timedOut,
+    concurrency: lanes,
   };
 }
 

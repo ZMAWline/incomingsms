@@ -172,7 +172,34 @@ export async function reserveEscalation(env, batch) {
     throw new Error('reserveEscalation failed ' + resp.status + ' ' + txt);
   }
   const rows = await resp.json().catch(() => []);
-  return Array.isArray(rows) && rows[0] || null;
+  const reserved = Array.isArray(rows) && rows[0] || null;
+
+  // Bridge into the operator's dashboard inbox (pending_review_items — the
+  // same widget the rotation review uses), so bad-rental escalations and
+  // rotation escalations live in ONE place. The reserve above is the dedup
+  // gate, so this fires exactly once per (tick, vendor, failure_type) batch.
+  // Best-effort: an inbox-write failure must never block the escalation path.
+  if (reserved) {
+    const ids = (batch.report_ids || []).slice(0, 20).join(', ');
+    const sims = (batch.line_items || []).slice(0, 10)
+      .map(li => (li && (li.sim_id != null ? `#${li.sim_id}` : li.iccid)) || '?').join(', ');
+    await fetch(env.SUPABASE_URL + '/rest/v1/pending_review_items', {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify([{
+        kind: 'bad_rental_escalation',
+        summary: `bad-rental ${batch.vendor}/${batch.failure_type}: ${(batch.report_ids || []).length} report(s)`,
+        details_md: `**Vendor:** ${batch.vendor}\n**Failure type:** ${batch.failure_type}\n**Reports:** ${ids}\n**SIMs:** ${sims}\n\n_Escalated by bad-rental-remediator (operator_escalations id ${reserved.id})._`,
+        status: 'open',
+      }]),
+    }).catch(err => console.error('[Escalate] inbox bridge failed: ' + err));
+  }
+  return reserved;
 }
 
 export async function postEscalation(env, reservedRow, issuePayload) {
