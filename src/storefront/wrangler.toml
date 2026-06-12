@@ -1,0 +1,34 @@
+name = "storefront"
+main = "index.js"
+compatibility_date = "2024-01-01"
+account_id = "5313f8b98e20a8915418b2683ad7278c"
+workers_dev = true
+
+# Frontend (public/index.html landing + public/app.html app) ships as static
+# assets. run_worker_first keeps the worker in front so /api/* and /ipn/* are
+# always handled by code; everything else falls through to env.ASSETS.fetch().
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# Secrets (wrangler secret put): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+# SESSION_SECRET; optional: NOWPAYMENTS_API_KEY, NOWPAYMENTS_IPN_SECRET,
+# RELAY_URL, RELAY_KEY.
+
+# ============ TEST ENVIRONMENT ============
+[env.test]
+name = "storefront-test"
+
+[env.test.assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+
+[env.test.observability.logs]
+enabled = true
+invocation_logs = true

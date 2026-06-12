@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --ink: #0B1220;
+  --muted: #5B6472;
+  --bg: #F6F7F9;
+  --panel: #ffffff;
+  --line: #E5E8EC;
+  --accent: #2563EB;
+  --ok: #16803C;
+  --bad: #B42318;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: var(--bg); color: var(--ink); line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 980px; margin: 0 auto; padding: 0 20px 64px; }
+a { color: var(--accent); text-decoration: none; }
+.hidden { display: none !important; }
+
+header { background: var(--panel); border-bottom: 1px solid var(--line); margin-bottom: 28px; }
+.head-inner {
+  max-width: 980px; margin: 0 auto; padding: 0 20px; height: 60px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.wordmark { font-weight: 700; font-size: 17px; letter-spacing: -0.02em; color: var(--ink); }
+.head-right { display: flex; align-items: center; gap: 14px; font-size: 14px; }
+.balance { font-weight: 600; }
+.head-right .muted { color: var(--muted); }
+
+.btn {
+  background: var(--accent); color: #fff; border: none; border-radius: 8px;
+  font: 600 14px 'Inter', sans-serif; padding: 9px 16px; cursor: pointer;
+}
+.btn:hover { background: #1D4FD7; }
+.btn:disabled { opacity: 0.55; cursor: default; }
+.btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+.btn-ghost:hover { background: var(--bg); color: var(--ink); }
+.btn-sm { padding: 6px 12px; font-size: 13px; }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 24px; }
+h2 { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 16px; }
+.section { margin-bottom: 28px; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+
+/* auth */
+.auth-card { max-width: 380px; margin: 60px auto; }
+.auth-tabs { display: flex; gap: 4px; background: var(--bg); border-radius: 8px; padding: 4px; margin-bottom: 20px; }
+.auth-tabs button {
+  flex: 1; border: none; background: transparent; border-radius: 6px;
+  font: 600 14px 'Inter', sans-serif; padding: 8px; cursor: pointer; color: var(--muted);
+}
+.auth-tabs button.on { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgba(11,18,32,.08); }
+label { display: block; font-size: 13px; font-weight: 500; margin: 14px 0 5px; }
+input[type=email], input[type=password], input[type=number] {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+  font: 400 14px 'Inter', sans-serif; color: var(--ink); background: var(--panel);
+}
+input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+.auth-card .btn { width: 100%; margin-top: 20px; }
+.form-err { color: var(--bad); font-size: 13px; margin-top: 12px; min-height: 18px; }
+
+/* stock grid */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+.stock-card { border: 1px solid var(--line); border-radius: 10px; padding: 16px; background: var(--panel); }
+.stock-num { font-size: 17px; font-weight: 600; letter-spacing: 0.01em; margin: 6px 0 2px; }
+.tag {
+  display: inline-block; font-size: 11.5px; font-weight: 600; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 99px; padding: 2px 9px;
+}
+.stock-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; }
+.price { font-weight: 600; font-size: 14px; }
+.price span { color: var(--muted); font-weight: 400; font-size: 12px; }
+
+/* rentals */
+.rental { border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; background: var(--panel); margin-bottom: 10px; }
+.rental-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.rental-num { font-size: 18px; font-weight: 600; letter-spacing: 0.01em; }
+.pill { font-size: 11.5px; font-weight: 600; border-radius: 99px; padding: 3px 10px; }
+.pill.active { background: #EAF6EE; color: var(--ok); }
+.pill.ended, .pill.cancelled { background: var(--bg); color: var(--muted); }
+.rental-meta { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.rental-actions { display: flex; gap: 8px; align-items: center; }
+.countdown { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 13px; }
+
+/* inbox */
+.inbox { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 14px; }
+.msg { padding: 10px 0; border-bottom: 1px solid var(--bg); font-size: 14px; }
+.msg-head { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); margin-bottom: 3px; }
+.msg-body { white-space: pre-wrap; word-break: break-word; }
+mark { background: #DBEAFE; color: var(--accent); font-weight: 600; padding: 0 3px; border-radius: 3px; }
+
+/* modal */
+.overlay {
+  position: fixed; inset: 0; background: rgba(11,18,32,.45);
+  display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px;
+}
+.modal { background: var(--panel); border-radius: 12px; padding: 24px; width: 100%; max-width: 400px; }
+.modal h2 { margin-bottom: 4px; }
+.amounts { display: flex; gap: 8px; margin: 16px 0 12px; }
+.amounts button {
+  flex: 1; border: 1px solid var(--line); background: var(--panel); border-radius: 8px;
+  font: 600 14px 'Inter', sans-serif; padding: 10px; cursor: pointer; color: var(--ink);
+}
+.amounts button.on { border-color: var(--accent); color: var(--accent); background: #EFF4FE; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+.note { background: var(--bg); border-radius: 8px; padding: 12px 14px; font-size: 13px; color: var(--muted); margin-top: 14px; }
+
+/* toasts */
+#toasts { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 100; display: flex; flex-direction: column; gap: 8px; }
+.toast {
+  background: var(--ink); color: #fff; font-size: 13.5px; font-weight: 500;
+  padding: 10px 18px; border-radius: 8px; box-shadow: 0 4px 16px rgba(11,18,32,.25);
+}
+.toast.err { background: var(--bad); }
+.empty { color: var(--muted); font-size: 14px; padding: 12px 0; }
+</style>
+</head>
+<body>
+
+<header id="appHeader" class="hidden">
+  <div class="head-inner">
+    <span class="wordmark" data-brand="name"></span>
+    <div class="head-right">
+      <span class="muted" id="meEmail"></span>
+      <span class="balance" id="balance">$0.00</span>
+      <button class="btn btn-sm" id="addFundsBtn">Add funds</button>
+      <button class="btn btn-ghost btn-sm" id="logoutBtn">Log out</button>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- AUTH -->
+  <div id="authView" class="hidden">
+    <div class="panel auth-card">
+      <div style="text-align:center; margin-bottom:18px;">
+        <div class="wordmark" style="font-size:20px;" data-brand="name"></div>
+        <div class="muted small" data-brand="tagline"></div>
+      </div>
+      <div class="auth-tabs">
+        <button id="tabLogin" class="on">Log in</button>
+        <button id="tabSignup">Sign up</button>
+      </div>
+      <form id="authForm">
+        <label for="email">Email</label>
+        <input type="email" id="email" autocomplete="email" required>
+        <label for="password">Password</label>
+        <input type="password" id="password" autocomplete="current-password" minlength="8" required>
+        <div class="form-err" id="authErr"></div>
+        <button class="btn" type="submit" id="authSubmit">Log in</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- APP -->
+  <div id="appView" class="hidden">
+
+    <div class="section panel">
+      <h2>Rent a number</h2>
+      <div id="stockGrid" class="grid"></div>
+      <div id="stockEmpty" class="empty hidden">No numbers available right now — check back shortly.</div>
+    </div>
+
+    <div class="section">
+      <h2 style="padding:0 2px;">My rentals</h2>
+      <div id="rentalsList"></div>
+      <div id="rentalsEmpty" class="empty hidden">No rentals yet. Rent a number above to get started.</div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ADD FUNDS MODAL -->
+<div id="fundsOverlay" class="overlay hidden">
+  <div class="modal">
+    <h2>Add funds</h2>
+    <div class="muted small">Minimum deposit is $10. Funds are credited to your balance.</div>
+    <div class="amounts">
+      <button data-amt="1000">$10</button>
+      <button data-amt="2500" class="on">$25</button>
+      <button data-amt="5000">$50</button>
+    </div>
+    <label for="customAmt">Custom amount (USD)</label>
+    <input type="number" id="customAmt" min="10" step="1" placeholder="25">
+    <div id="depositNote" class="note hidden"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="fundsCancel">Close</button>
+      <button class="btn" id="fundsGo">Continue</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+'use strict';
+
+// ---- state -----------------------------------------------------------------
+let CONFIG = null;          // /api/config — brand, deposits_mode, min deposit
+let ME = null;              // /api/me
+let RENTALS = [];
+let openInboxRentalId = null;
+let inboxTimer = null;
+let countdownTimer = null;
+let authMode = 'login';
+
+const $ = (id) => document.getElementById(id);
+
+// ---- helpers ---------------------------------------------------------------
+async function api(path, opts) {
+  const res = await fetch(path, Object.assign({ credentials: 'same-origin' }, opts || {}));
+  let body = null;
+  try { body = await res.json(); } catch {}
+  return { status: res.status, ok: res.ok, body };
+}
+
+function postJson(path, data) {
+  return api(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+}
+
+function toast(msg, isErr) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (isErr ? ' err' : '');
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 4200);
+}
+
+function dollars(cents) { return '$' + (Number(cents || 0) / 100).toFixed(2); }
+
+function fmtE164(e164) {
+  const m = String(e164 || '').match(/^\+1(\d{3})(\d{3})(\d{4})$/);
+  return m ? `(${m[1]}) ${m[2]}-${m[3]}` : String(e164 || '');
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// keep in sync with highlightOtpHtml in src/storefront/logic.mjs
+function highlightOtpHtml(body) {
+  return escapeHtml(body).replace(/\b\d{4,8}\b/g, (m) => '<mark>' + m + '</mark>');
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function countdownText(endsAtIso) {
+  let ms = Date.parse(endsAtIso) - Date.now();
+  if (!(ms > 0)) return 'expired';
+  const h = Math.floor(ms / 3600000); ms -= h * 3600000;
+  const m = Math.floor(ms / 60000); ms -= m * 60000;
+  const s = Math.floor(ms / 1000);
+  return h + 'h ' + String(m).padStart(2, '0') + 'm ' + String(s).padStart(2, '0') + 's';
+}
+
+// ---- boot ------------------------------------------------------------------
+async function boot() {
+  const cfg = await api('/api/config');
+  CONFIG = cfg.body || { brand: { name: '', tagline: '', supportEmail: '' } };
+  document.querySelectorAll('[data-brand="name"]').forEach((el) => el.textContent = CONFIG.brand.name);
+  document.querySelectorAll('[data-brand="tagline"]').forEach((el) => el.textContent = CONFIG.brand.tagline);
+  document.title = CONFIG.brand.name;
+
+  const me = await api('/api/me');
+  if (me.ok) {
+    ME = me.body;
+    showApp();
+  } else {
+    showAuth();
+  }
+}
+
+function showAuth() {
+  $('authView').classList.remove('hidden');
+  $('appView').classList.add('hidden');
+  $('appHeader').classList.add('hidden');
+}
+
+async function showApp() {
+  $('authView').classList.add('hidden');
+  $('appView').classList.remove('hidden');
+  $('appHeader').classList.remove('hidden');
+  renderMe();
+  await Promise.all([loadStock(), loadRentals()]);
+  if (!countdownTimer) countdownTimer = setInterval(tickCountdowns, 1000);
+  setInterval(refreshMe, 60000); // keep balance fresh (e.g. deposit confirms)
+}
+
+function renderMe() {
+  $('meEmail').textContent = ME.email;
+  $('balance').textContent = dollars(ME.balance_cents);
+}
+
+async function refreshMe() {
+  const me = await api('/api/me');
+  if (me.ok) { ME = me.body; renderMe(); }
+}
+
+// ---- auth ------------------------------------------------------------------
+function setAuthMode(mode) {
+  authMode = mode;
+  $('tabLogin').classList.toggle('on', mode === 'login');
+  $('tabSignup').classList.toggle('on', mode === 'signup');
+  $('authSubmit').textContent = mode === 'login' ? 'Log in' : 'Create account';
+  $('password').autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+  $('authErr').textContent = '';
+}
+$('tabLogin').onclick = () => setAuthMode('login');
+$('tabSignup').onclick = () => setAuthMode('signup');
+
+$('authForm').onsubmit = async (e) => {
+  e.preventDefault();
+  $('authErr').textContent = '';
+  $('authSubmit').disabled = true;
+  const payload = { email: $('email').value.trim(), password: $('password').value };
+  const res = await postJson(authMode === 'login' ? '/api/login' : '/api/signup', payload);
+  $('authSubmit').disabled = false;
+  if (res.ok) {
+    const me = await api('/api/me');
+    if (me.ok) { ME = me.body; showApp(); }
+    return;
+  }
+  const errs = {
+    invalid_credentials: 'Wrong email or password.',
+    account_disabled: 'This account is disabled. Contact support.',
+    email_taken: 'An account with this email already exists.',
+    invalid_email: 'Please enter a valid email address.',
+    password_too_short: 'Password must be at least 8 characters.',
+  };
+  $('authErr').textContent = errs[res.body && res.body.error] || 'Something went wrong. Try again.';
+};
+
+$('logoutBtn').onclick = async () => {
+  await postJson('/api/logout', {});
+  location.reload();
+};
+
+// ---- stock -----------------------------------------------------------------
+async function loadStock() {
+  const res = await api('/api/stock');
+  const stock = (res.body && res.body.stock) || [];
+  const grid = $('stockGrid');
+  grid.innerHTML = '';
+  $('stockEmpty').classList.toggle('hidden', stock.length > 0);
+  for (const item of stock) {
+    const card = document.createElement('div');
+    card.className = 'stock-card';
+    card.innerHTML =
+      '<span class="tag">' + escapeHtml(item.carrier) + '</span>' +
+      '<div class="stock-num">' + escapeHtml(item.masked_number) + '</div>' +
+      '<div class="muted small">Area code ' + escapeHtml(item.area_code || '—') + '</div>' +
+      '<div class="stock-foot">' +
+        '<span class="price">' + dollars(item.daily_price_cents) + '<span> / day</span></span>' +
+        '<button class="btn btn-sm">Rent</button>' +
+      '</div>';
+    card.querySelector('button').onclick = () => rent(item);
+    grid.appendChild(card);
+  }
+}
+
+async function rent(item) {
+  const ok = confirm(
+    'Rent ' + item.masked_number + ' (' + item.carrier + ') for 24 hours at ' +
+    dollars(item.daily_price_cents) + '?'
+  );
+  if (!ok) return;
+  const res = await postJson('/api/rent', { sim_id: item.sim_id });
+  if (res.ok) {
+    toast('Number rented — it is yours for 24 hours.');
+    await Promise.all([refreshMe(), loadStock(), loadRentals()]);
+    return;
+  }
+  if (res.status === 402) {
+    toast('Insufficient balance — add funds first.', true);
+    openFunds();
+  } else if (res.status === 409) {
+    toast('That number was just taken. Refreshing stock…', true);
+    loadStock();
+  } else {
+    toast('Could not rent this number. Try another.', true);
+    loadStock();
+  }
+}
+
+// ---- rentals + inbox ---------------------------------------------------------
+async function loadRentals() {
+  const res = await api('/api/rentals');
+  RENTALS = (res.body && res.body.rentals) || [];
+  const list = $('rentalsList');
+  list.innerHTML = '';
+  $('rentalsEmpty').classList.toggle('hidden', RENTALS.length > 0);
+  for (const r of RENTALS) {
+    const st = r.effective_status;
+    const div = document.createElement('div');
+    div.className = 'rental';
+    div.dataset.id = r.id;
+    const statusLabel = st === 'ended' && r.ended_reason === 'number_rotated' ? 'ended (rotated)' : st;
+    div.innerHTML =
+      '<div class="rental-top">' +
+        '<div>' +
+          '<span class="rental-num">' + escapeHtml(fmtE164(r.e164)) + '</span> ' +
+          '<button class="btn btn-ghost btn-sm" data-act="copy">Copy</button>' +
+          '<div class="rental-meta">' + escapeHtml(r.carrier || '') + ' · ' + dollars(r.price_cents) +
+            ' · rented ' + fmtTime(r.starts_at) + '</div>' +
+        '</div>' +
+        '<div class="rental-actions">' +
+          (st === 'active' ? '<span class="countdown" data-ends="' + escapeHtml(r.ends_at) + '"></span>' : '') +
+          '<span class="pill ' + escapeHtml(st) + '">' + escapeHtml(statusLabel) + '</span>' +
+          '<button class="btn btn-sm" data-act="inbox">' +
+            (openInboxRentalId === r.id ? 'Hide inbox' : 'View inbox') + '</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="inbox hidden" data-inbox></div>';
+    div.querySelector('[data-act=copy]').onclick = async () => {
+      try { await navigator.clipboard.writeText(r.e164); toast('Number copied.'); }
+      catch { toast('Copy failed — long-press to copy: ' + r.e164, true); }
+    };
+    div.querySelector('[data-act=inbox]').onclick = () => toggleInbox(r.id);
+    list.appendChild(div);
+  }
+  tickCountdowns();
+  if (openInboxRentalId != null) {
+    const open = RENTALS.find((r) => r.id === openInboxRentalId);
+    if (open) showInboxPanel(openInboxRentalId);
+    else closeInbox();
+  }
+}
+
+function tickCountdowns() {
+  document.querySelectorAll('.countdown').forEach((el) => {
+    el.textContent = countdownText(el.dataset.ends) + ' left';
+  });
+}
+
+function toggleInbox(rentalId) {
+  if (openInboxRentalId === rentalId) { closeInbox(); loadRentals(); return; }
+  openInboxRentalId = rentalId;
+  showInboxPanel(rentalId);
+  pollInbox();
+  if (inboxTimer) clearInterval(inboxTimer);
+  inboxTimer = setInterval(pollInbox, 5000); // poll every 5s while open
+  loadRentals();
+}
+
+function closeInbox() {
+  openInboxRentalId = null;
+  if (inboxTimer) { clearInterval(inboxTimer); inboxTimer = null; }
+}
+
+function showInboxPanel(rentalId) {
+  document.querySelectorAll('.rental').forEach((card) => {
+    const box = card.querySelector('[data-inbox]');
+    box.classList.toggle('hidden', Number(card.dataset.id) !== rentalId);
+  });
+}
+
+async function pollInbox() {
+  if (openInboxRentalId == null) return;
+  const id = openInboxRentalId;
+  const res = await api('/api/rentals/' + id + '/messages');
+  if (id !== openInboxRentalId) return; // panel changed while fetching
+  const box = document.querySelector('.rental[data-id="' + id + '"] [data-inbox]');
+  if (!box) return;
+  if (!res.ok) { box.innerHTML = '<div class="empty">Could not load messages.</div>'; return; }
+  const msgs = (res.body && res.body.messages) || [];
+  if (!msgs.length) {
+    box.innerHTML = '<div class="empty">No messages yet — they appear here within seconds of arriving.</div>';
+    return;
+  }
+  box.innerHTML = msgs.map((m) =>
+    '<div class="msg">' +
+      '<div class="msg-head"><span>From ' + escapeHtml(m.from_number || 'unknown') + '</span>' +
+      '<span>' + escapeHtml(fmtTime(m.received_at)) + '</span></div>' +
+      '<div class="msg-body">' + highlightOtpHtml(m.body) + '</div>' +
+    '</div>'
+  ).join('');
+}
+
+// ---- deposits ----------------------------------------------------------------
+let pickedCents = 2500;
+
+function openFunds() {
+  $('fundsOverlay').classList.remove('hidden');
+  $('depositNote').classList.add('hidden');
+}
+$('addFundsBtn').onclick = openFunds;
+$('fundsCancel').onclick = () => $('fundsOverlay').classList.add('hidden');
+
+document.querySelectorAll('.amounts button').forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll('.amounts button').forEach((x) => x.classList.remove('on'));
+    b.classList.add('on');
+    pickedCents = Number(b.dataset.amt);
+    $('customAmt').value = '';
+  };
+});
+$('customAmt').oninput = () => {
+  document.querySelectorAll('.amounts button').forEach((x) => x.classList.remove('on'));
+  pickedCents = Math.round(Number($('customAmt').value || 0) * 100);
+};
+
+$('fundsGo').onclick = async () => {
+  const min = (CONFIG && CONFIG.min_deposit_cents) || 1000;
+  if (!Number.isInteger(pickedCents) || pickedCents < min) {
+    toast('Minimum deposit is ' + dollars(min) + '.', true);
+    return;
+  }
+  $('fundsGo').disabled = true;
+  const res = await postJson('/api/deposits', { amount_cents: pickedCents });
+  $('fundsGo').disabled = false;
+  if (!res.ok) {
+    toast('Could not start the deposit. Try again or contact support.', true);
+    return;
+  }
+  const note = $('depositNote');
+  note.classList.remove('hidden');
+  if (res.body.mode === 'crypto') {
+    window.open(res.body.invoice_url, '_blank');
+    note.textContent =
+      'Payment page opened in a new tab. Your balance updates automatically ' +
+      'once the payment confirms (deposit #' + res.body.deposit_id + ').';
+  } else {
+    note.textContent = res.body.instructions;
+  }
+};
+
+boot();
+</script>
+</body>
+</html>

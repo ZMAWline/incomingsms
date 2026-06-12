@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Numbox — Private US numbers for SMS verification</title>
+<meta name="description" content="Rent a private US phone number for 24 hours and receive SMS verification codes instantly.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script>
+// keep in sync with src/storefront/brand.mjs
+const BRAND = {
+  name: 'Numbox',
+  tagline: 'Private US numbers for SMS verification',
+  supportEmail: 'support@numbox.io',
+};
+</script>
+<style>
+:root {
+  --ink: #0B1220;
+  --muted: #5B6472;
+  --bg: #ffffff;
+  --bg-soft: #F6F7F9;
+  --line: #E5E8EC;
+  --accent: #2563EB;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+
+nav { border-bottom: 1px solid var(--line); }
+.nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+.wordmark { font-weight: 700; font-size: 18px; letter-spacing: -0.02em; color: var(--ink); text-decoration: none; }
+.nav-links { display: flex; gap: 24px; align-items: center; }
+.nav-links a { color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 500; }
+.nav-links a:hover { color: var(--ink); }
+.nav-links a.btn { color: #fff; }
+
+.btn {
+  display: inline-block; background: var(--accent); color: #fff;
+  font-weight: 600; font-size: 15px; text-decoration: none;
+  padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer;
+}
+.btn:hover { background: #1D4FD7; }
+.btn-lg { padding: 13px 28px; font-size: 16px; }
+
+.hero { padding: 96px 0 80px; text-align: center; }
+.hero h1 {
+  font-size: 48px; line-height: 1.15; font-weight: 700;
+  letter-spacing: -0.03em; max-width: 720px; margin: 0 auto 20px;
+}
+.hero p { font-size: 18px; color: var(--muted); max-width: 540px; margin: 0 auto 32px; }
+.hero .fine { font-size: 13px; color: var(--muted); margin-top: 16px; }
+
+section { padding: 72px 0; }
+section.alt { background: var(--bg-soft); }
+h2 { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; text-align: center; margin-bottom: 40px; }
+
+.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+.card {
+  background: var(--bg); border: 1px solid var(--line);
+  border-radius: 12px; padding: 24px;
+}
+.card h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+.card p { font-size: 14px; color: var(--muted); }
+
+.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; counter-reset: step; }
+.step { text-align: center; padding: 0 12px; }
+.step .num {
+  width: 36px; height: 36px; line-height: 36px; margin: 0 auto 14px;
+  border-radius: 50%; background: var(--ink); color: #fff;
+  font-weight: 600; font-size: 15px;
+}
+.step h3 { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+.step p { font-size: 14px; color: var(--muted); }
+
+.pricing { text-align: center; }
+.pricing .price { font-size: 44px; font-weight: 700; letter-spacing: -0.03em; }
+.pricing .price span { font-size: 17px; font-weight: 500; color: var(--muted); }
+.pricing p { color: var(--muted); max-width: 440px; margin: 8px auto 28px; }
+
+.faq { max-width: 680px; margin: 0 auto; }
+details { border-bottom: 1px solid var(--line); }
+details summary {
+  cursor: pointer; font-weight: 600; font-size: 15px; padding: 18px 0;
+  list-style: none; display: flex; justify-content: space-between; align-items: center;
+}
+details summary::-webkit-details-marker { display: none; }
+details summary::after { content: '+'; color: var(--muted); font-weight: 400; font-size: 20px; }
+details[open] summary::after { content: '\2212'; }
+details div { padding: 0 0 18px; font-size: 14px; color: var(--muted); }
+
+footer { border-top: 1px solid var(--line); padding: 32px 0; }
+.foot { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--muted); }
+.foot a { color: var(--muted); text-decoration: none; }
+.foot a:hover { color: var(--ink); }
+.foot .links { display: flex; gap: 20px; }
+
+@media (max-width: 800px) {
+  .hero h1 { font-size: 34px; }
+  .cards { grid-template-columns: 1fr 1fr; }
+  .steps { grid-template-columns: 1fr; }
+}
+@media (max-width: 480px) { .cards { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap nav-inner">
+    <a class="wordmark" href="/" data-brand="name">Numbox</a>
+    <div class="nav-links">
+      <a href="#how">How it works</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#faq">FAQ</a>
+      <a class="btn" href="/app.html">Log in</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <h1 data-brand="tagline">Private US numbers for SMS verification</h1>
+    <p>Rent a real US mobile number for 24 hours. Receive every SMS sent to it in a clean live inbox — no apps, no contracts.</p>
+    <a class="btn btn-lg" href="/app.html">Get a number</a>
+    <p class="fine">Pay-as-you-go. No subscription.</p>
+  </div>
+</header>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>Why rent here</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>Real SIM numbers</h3>
+        <p>Numbers live on physical SIM cards on major US carriers — not throwaway VoIP ranges that services reject.</p>
+      </div>
+      <div class="card">
+        <h3>Full inbox for 24h</h3>
+        <p>The number is yours for a full day. Every inbound SMS shows up in your inbox, not just one code.</p>
+      </div>
+      <div class="card">
+        <h3>Pay with crypto</h3>
+        <p>Top up your balance with cryptocurrency. Funds appear automatically once payment confirms.</p>
+      </div>
+      <div class="card">
+        <h3>Instant delivery</h3>
+        <p>Your number is revealed the moment you rent it, and messages arrive in seconds.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2>How it works</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="num">1</div>
+        <h3>Fund your balance</h3>
+        <p>Create an account and add funds. Deposits start at $10.</p>
+      </div>
+      <div class="step">
+        <div class="num">2</div>
+        <h3>Pick a number</h3>
+        <p>Choose a line by carrier and area code. Rent it with one click.</p>
+      </div>
+      <div class="step">
+        <div class="num">3</div>
+        <h3>Receive your codes</h3>
+        <p>Use the number anywhere. Verification codes appear in your live inbox for 24 hours.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="pricing">
+  <div class="wrap pricing">
+    <h2>Simple pricing</h2>
+    <div class="price">from $3<span> / day per number</span></div>
+    <p>One flat price per rental. No hidden per-message fees. Your balance only moves when you rent a number.</p>
+    <a class="btn btn-lg" href="/app.html">Get a number</a>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap">
+    <h2>Frequently asked questions</h2>
+    <div class="faq">
+      <details>
+        <summary>What is this service?</summary>
+        <div>We rent out private US mobile numbers by the day. You rent a number, use it to receive SMS — verification codes, one-time passwords, sign-up confirmations — and read everything in your online inbox.</div>
+      </details>
+      <details>
+        <summary>How long do I keep the number?</summary>
+        <div>Each rental lasts 24 hours from the moment you rent it. During that window every SMS sent to the number is delivered to your inbox.</div>
+      </details>
+      <details>
+        <summary>Which carriers are the numbers on?</summary>
+        <div>Numbers are on real physical SIMs on major US networks, currently AT&amp;T and T-Mobile. The carrier is shown next to each available number before you rent.</div>
+      </details>
+      <details>
+        <summary>How do payments work?</summary>
+        <div>You fund an account balance (cryptocurrency supported) and rentals are deducted from it. Minimum deposit is $10. Your balance never expires.</div>
+      </details>
+      <details>
+        <summary>What is the refund policy?</summary>
+        <div>Unused rentals are non-refundable once a number is delivered. If a number turns out to be faulty during your rental window, contact support and we will make it right.</div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot">
+    <div><span data-brand="name">Numbox</span> &copy; <span id="year"></span></div>
+    <div class="links">
+      <a data-brand="supportEmailLink" href="mailto:support@numbox.io" data-brand-email>support@numbox.io</a>
+      <a href="#" title="Coming soon">Terms</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+// Apply BRAND everywhere via data-brand attributes — no scattered hardcoding.
+document.querySelectorAll('[data-brand="name"]').forEach(function (el) { el.textContent = BRAND.name; });
+document.querySelectorAll('[data-brand="tagline"]').forEach(function (el) { el.textContent = BRAND.tagline; });
+document.querySelectorAll('[data-brand-email]').forEach(function (el) {
+  el.textContent = BRAND.supportEmail;
+  el.href = 'mailto:' + BRAND.supportEmail;
+});
+document.title = BRAND.name + ' — ' + BRAND.tagline;
+document.getElementById('year').textContent = new Date().getFullYear();
+</script>
+</body>
+</html>
