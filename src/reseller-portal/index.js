@@ -1,4 +1,10 @@
 import { computeBillingBreakdown, estDateFromDate } from '../shared/billing.js';
+import {
+  resolveRentalForReport,
+  normalizeE164,
+  REPORT_REASON_CODES,
+} from '../shared/report-bad-resolver.js';
+import { buildStatusFilter } from '../shared/rental-report-status.js';
 
 const COOKIE_NAME = 'rp_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
@@ -98,6 +104,19 @@ async function checkRateLimit(env, resellerId, action, simId = null) {
     if (perHour >= 100) return { allowed: false, retryAfter: 3600, reason: 'Per-reseller resend cap (100/hour) reached' };
     return { allowed: true };
   }
+  if (action === 'portal_report_bad') {
+    // Per-SIM cooldown: one report per SIM per hour. The DB unique index on
+    // open reports already prevents true duplicates; this catches rapid
+    // re-reports across statuses (e.g. report → mark unable_to_reproduce →
+    // immediate re-report) and gives a clean 429 instead of a silent dedup.
+    if (simId != null) {
+      const perSim = await countActionsSince(env, resellerId, 'portal_report_bad', 3600, simId);
+      if (perSim >= 1) return { allowed: false, retryAfter: 3600, reason: 'This SIM was reported within the last hour' };
+    }
+    const perDay = await countActionsSince(env, resellerId, 'portal_report_bad', 86400);
+    if (perDay >= 200) return { allowed: false, retryAfter: 86400, reason: 'Per-reseller daily cap (200) reached' };
+    return { allowed: true };
+  }
   return { allowed: true };
 }
 
@@ -110,6 +129,28 @@ async function logAction(env, resellerId, action, simId = null) {
     });
   } catch (e) {
     console.log('[RateLimit] failed to log action: ' + e);
+  }
+}
+
+// Fire-and-forget diagnostic logger for bad-rental intake. Stores the parsed
+// JSON (when available) and the raw body text (capped) so an operator can see
+// exactly what the reseller sent when a payload was rejected. Never throws.
+async function logReportRejection(env, info) {
+  try {
+    const MAX_RAW = 8192;
+    const rawText = info.rawBodyText == null ? null
+      : String(info.rawBodyText).slice(0, MAX_RAW);
+    await sbPost(env, 'rental_report_rejections', {
+      reseller_id: info.resellerId != null ? Number(info.resellerId) : null,
+      source: String(info.source || 'unknown'),
+      rejection_code: String(info.code || 'bad_request'),
+      rejection_message: info.message != null ? String(info.message).slice(0, 1000) : null,
+      raw_payload: info.body !== undefined ? info.body : null,
+      raw_body_text: rawText,
+      http_status: info.status != null ? Number(info.status) : null,
+    });
+  } catch (e) {
+    console.log('[ReportBad] failed to log rejection: ' + e);
   }
 }
 
@@ -347,6 +388,21 @@ async function handleSims(auth, env, url) {
     activeClause +
     '&order=active.desc,sim_id.asc'
   );
+
+  // INC-3: pull open bad-rental reports for this reseller in one shot, then map
+  // them onto SIM rows. Single query rather than per-row lookups so the SIMs
+  // tab doesn't fan out N times when there's nothing to show.
+  const openReports = await sbGet(env,
+    'rental_reports?select=id,sim_id,rental_id,reason_code,status,remediation_action,received_at' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&status=in.(received,in_triage)&limit=1000'
+  );
+  const openBySim = new Map();
+  if (openReports.ok) {
+    const arr = await openReports.json();
+    if (Array.isArray(arr)) for (const r of arr) if (r.sim_id != null && !openBySim.has(r.sim_id)) openBySim.set(r.sim_id, r);
+  }
+
   const out = (Array.isArray(rows) ? rows : []).map(r => {
     const sim = r.sims || {};
     const interval = sim.rotation_interval_hours || (sim.vendor === 'teltik' ? 48 : 24);
@@ -355,6 +411,7 @@ async function handleSims(auth, env, url) {
     const baseTs = sim.last_rotation_at || sim.last_mdn_rotated_at || null;
     const start = baseTs || sim.activated_at || null;
     const expires = baseTs ? midnightNYAfterInterval(baseTs, interval) : null;
+    const openReport = openBySim.get(r.sim_id) || null;
     return {
       sim_id: r.sim_id,
       active: r.active,
@@ -368,6 +425,7 @@ async function handleSims(auth, env, url) {
       start_at: start,
       online_until: expires,
       rotation_interval_hours: interval,
+      open_report: openReport,
     };
   });
   return jsonResp(out);
@@ -678,6 +736,227 @@ async function handleOnlineHistory(simId, auth, env) {
   return jsonResp(out);
 }
 
+// ---------------------------------------------------------------------------
+// INC-3 Phase 1: bad-rental reporting.
+//
+// Intake: the reseller tells us a number isn't working. We record it, surface
+// it to the operator dashboard, and report status back. No automatic
+// remediation — operator triages from src/dashboard/index.js using existing
+// tools (rotate / port reset / replace). See
+// docs/superpowers/specs/2026-06-02-failed-rental-reporting-design.md (rev 5).
+// ---------------------------------------------------------------------------
+
+// Insert (or return existing open) report row, log the action, return the
+// reseller-facing envelope. Shared by both report-bad endpoints once the
+// rental has been resolved. `source` is the route tag used both on the
+// inserted row and on any rejection record so the operator can attribute
+// payloads to a handler.
+async function insertOrReturnExistingReport(env, resellerId, resolved, body, source) {
+  const reasonCode = body.reason_code && REPORT_REASON_CODES.has(body.reason_code) ? body.reason_code : 'no_sms_received';
+  const reasonNote = body.reason_note != null ? String(body.reason_note).slice(0, 500) : null;
+  const attempts = body.attempts != null && Number.isFinite(Number(body.attempts)) ? Number(body.attempts) : null;
+  const firstAttemptAt = body.first_attempt_at ? String(body.first_attempt_at) : null;
+  const clientRequestId = body.client_request_id != null ? String(body.client_request_id).slice(0, 128) : null;
+
+  // Dedup: if an open report exists for this (reseller_id, rental_id), return it.
+  if (resolved.rental_id != null) {
+    const existing = await sbGet(env,
+      'rental_reports?select=id,status,received_at,e164,sim_id,sim_number_id,rental_id' +
+      '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+      '&rental_id=eq.' + encodeURIComponent(resolved.rental_id) +
+      '&status=in.(received,in_triage)&limit=1'
+    );
+    if (existing.ok) {
+      const rows = await existing.json();
+      if (Array.isArray(rows) && rows.length > 0) {
+        const r = rows[0];
+        return jsonResp({
+          report_id: r.id,
+          rental_id: r.rental_id,
+          sim_id: r.sim_id,
+          sim_number_id: r.sim_number_id,
+          e164: r.e164,
+          status: r.status,
+          queued_at: r.received_at,
+          deduped: true,
+          note: 'A report for this rental is already open; returning the existing report_id.',
+        });
+      }
+    }
+  }
+
+  // Insert.
+  // INC-25 followup: when the resolver couldn't tie the current-MDN e164 to a
+  // rental row (rental missing for the SIM's current sim_number), flag the
+  // report `escalated / intake_unresolved_current_mdn_no_rental` at intake so
+  // the remediator never vendor-acts against a stale historical rental.
+  const isUnresolved = resolved.unresolved === true;
+  const row = {
+    reseller_id: Number(resellerId),
+    rental_id: resolved.rental_id || null,
+    sim_id: resolved.sim_id || null,
+    sim_number_id: resolved.sim_number_id || null,
+    e164: resolved.e164 || normalizeE164(body.e164) || '',
+    reason_code: reasonCode,
+    reason_note: reasonNote,
+    attempts,
+    first_attempt_at: firstAttemptAt,
+    client_request_id: clientRequestId,
+    status: 'received',
+    raw_payload: isUnresolved
+      ? { ...body, _intake: { needs_resolution: true, intake_state: resolved.intake_state || 'current_mdn_no_rental_row' } }
+      : body,
+    source: source || null,
+    auto_remediation_state: isUnresolved ? 'escalated' : null,
+    escalation_reason: isUnresolved ? 'intake_unresolved_current_mdn_no_rental' : null,
+  };
+  let insertResp;
+  try {
+    insertResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_reports`, {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify(row),
+    });
+  } catch (e) {
+    return jsonResp({ error: 'insert failed: ' + String(e) }, 502);
+  }
+  if (!insertResp.ok) {
+    const t = await insertResp.text().catch(() => '');
+    return jsonResp({ error: 'insert failed: ' + insertResp.status + ' ' + t }, 502);
+  }
+  const inserted = await insertResp.json();
+  const r = Array.isArray(inserted) ? inserted[0] : inserted;
+
+  // Append-only event row for the intake itself.
+  try {
+    await sbPost(env, 'rental_report_events', {
+      report_id: r.id,
+      from_status: null,
+      to_status: 'received',
+      actor: 'reseller',
+      note: reasonNote,
+      evidence: clientRequestId ? { client_request_id: clientRequestId } : null,
+    });
+  } catch (e) {
+    console.log('[ReportBad] event log insert failed: ' + e);
+  }
+
+  // Log to reseller_actions_log for rate-limit accounting and audit.
+  await logAction(env, resellerId, 'portal_report_bad', resolved.sim_id);
+
+  return jsonResp({
+    report_id: r.id,
+    rental_id: r.rental_id,
+    reseller_rental_id: body.reseller_rental_id || null,
+    sim_id: r.sim_id,
+    sim_number_id: r.sim_number_id,
+    e164: r.e164,
+    status: r.status,
+    queued_at: r.received_at,
+    expected_first_action_within_minutes: 60,
+  });
+}
+
+// POST /api/rentals/report-bad — primary, body-keyed.
+async function handleReportBadByRental(auth, env, request) {
+  const source = 'api/rentals/report-bad';
+  let bodyText = '';
+  try { bodyText = await request.text(); } catch { bodyText = ''; }
+  let body;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: 'parse_error', message: 'request body was not valid JSON',
+      rawBodyText: bodyText, status: 400 });
+    return badRequest('JSON body required');
+  }
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) {
+    const shape = Array.isArray(body) ? 'array' : (body === null ? 'null' : typeof body);
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: 'bad_request', message: 'body must be a JSON object (got ' + shape + ')',
+      body: body, rawBodyText: bodyText, status: 400 });
+    return badRequest('JSON object body required');
+  }
+
+  const resolved = await resolveRentalForReport(env, auth.resellerId, body, sbGet);
+  if (!resolved.ok) {
+    const status = resolved.code === 'not_found' ? 404
+                 : resolved.code === 'ambiguous' ? 409
+                 : 400;
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: resolved.code, message: resolved.message, body, rawBodyText: bodyText, status });
+    return jsonResp({ error: resolved.message, code: resolved.code, candidates: resolved.candidates }, status);
+  }
+
+  const rl = await checkRateLimit(env, auth.resellerId, 'portal_report_bad', resolved.sim_id);
+  if (!rl.allowed) {
+    await logReportRejection(env, { resellerId: auth.resellerId, source,
+      code: 'rate_limited', message: rl.reason, body, rawBodyText: bodyText, status: 429 });
+    return jsonResp({ error: rl.reason, retry_after_seconds: rl.retryAfter }, 429);
+  }
+
+  return insertOrReturnExistingReport(env, auth.resellerId, resolved, body, source);
+}
+
+// GET /api/sims/:simId/report-status — most recent report for the SIM's
+// current lifetime + last 5 historical (any status).
+async function handleReportStatus(simId, auth, env) {
+  const ownResp = await sbGet(env,
+    'reseller_sims?select=sim_id' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&limit=1'
+  );
+  if (!ownResp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const ownRows = await ownResp.json();
+  if (!Array.isArray(ownRows) || ownRows.length === 0) return notFound();
+
+  const resp = await sbGet(env,
+    'rental_reports?select=id,rental_id,sim_number_id,e164,reason_code,reason_note,status,remediation_action,received_at,triaged_at,closed_at' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&order=received_at.desc&limit=6'
+  );
+  if (!resp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const rows = await resp.json();
+  const list = Array.isArray(rows) ? rows : [];
+  const open = list.find(r => r.status === 'received' || r.status === 'in_triage') || null;
+  return jsonResp({
+    sim_id: Number(simId),
+    open_report: open,
+    history: list.filter(r => r !== open).slice(0, 5),
+  });
+}
+
+// GET /api/sims/reports — all reports for the reseller, filterable.
+async function handleReportsList(auth, env, url) {
+  const rawStatus = url && url.searchParams ? url.searchParams.get('status') : null;
+  const since = url && url.searchParams ? url.searchParams.get('since') : null;
+  const norm = buildStatusFilter(rawStatus);
+  if (!norm.ok) {
+    return jsonResp({
+      error: norm.error,
+      message: 'unsupported status; accepted values: ' + norm.accepted.join(', '),
+      accepted: norm.accepted,
+    }, 400);
+  }
+  let path = 'rental_reports?select=id,rental_id,sim_id,sim_number_id,e164,reason_code,reason_note,status,remediation_action,received_at,triaged_at,closed_at' +
+    '&reseller_id=eq.' + encodeURIComponent(auth.resellerId);
+  if (norm.filter) path += norm.filter;
+  if (since) path += '&received_at=gte.' + encodeURIComponent(since);
+  path += '&order=received_at.desc&limit=500';
+  const resp = await sbGet(env, path);
+  if (!resp.ok) return jsonResp({ error: 'lookup failed' }, 500);
+  const rows = await resp.json();
+  return jsonResp({ reports: Array.isArray(rows) ? rows : [] });
+}
+
 function loginHtml() {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Reseller Portal</title>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -813,6 +1092,58 @@ function portalHtml() {
         </div>
       </div>
     </div>
+
+    <div class="bg-slate-800 rounded-lg border border-slate-700 p-5">
+      <h2 class="text-lg font-semibold mb-1">Report a Bad Rental</h2>
+      <p class="text-slate-400 text-sm mb-4">
+        Tell us if a number isn't working — no SMS arriving, receiving the wrong account's traffic, etc. We surface
+        the report on our operations dashboard and a specialist will look at the SIM. Identify the rental by either
+        <code class="text-slate-300">reseller_rental_id</code> (your own rental id) or
+        <code class="text-slate-300">e164</code> (the rental's current phone number, in E.164 form). No other
+        identifiers are accepted — <code class="text-slate-300">sim_id</code>, <code class="text-slate-300">iccid</code>,
+        and our internal <code class="text-slate-300">rental_id</code> are rejected because they don't pin to a single
+        current rental.
+      </p>
+      <div class="space-y-3">
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">URL</div>
+          <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-cyan-200 font-mono break-all">POST https://portal.incoming-sms.com/api/rentals/report-bad</code>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Body — either identifier (not both required)</div>
+          <pre class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono whitespace-pre-wrap">{
+  "reseller_rental_id": "1693795",
+  "reason_code": "no_sms_received",
+  "reason_note": "3 send attempts, no SMS in 30 min"
+}
+
+// or, equivalently:
+{
+  "e164": "+15551234567",
+  "reason_code": "no_sms_received"
+}</pre>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">cURL example</div>
+          <pre class="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono whitespace-pre-wrap">curl -X POST -H "Authorization: Bearer YOUR_API_KEY" -H "Content-Type: application/json" \\
+  -d '{"e164":"+15551234567","reason_code":"no_sms_received"}' \\
+  "https://portal.incoming-sms.com/api/rentals/report-bad"</pre>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wide text-slate-500 mb-1">Check report status</div>
+          <code class="block bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs text-slate-300 font-mono break-all">GET https://portal.incoming-sms.com/api/sims/{sim_id}/report-status</code>
+          <div class="text-xs text-slate-500 mt-1">Or list all your reports: <code class="text-slate-300">GET /api/sims/reports?status=open</code></div>
+        </div>
+        <div class="text-xs text-slate-500">
+          Accepted identifiers: <code class="text-slate-300">reseller_rental_id</code> or
+          <code class="text-slate-300">e164</code> (current MDN). Phone-number lookups match the SIM's
+          <em>current</em> MDN only — historical/rotated MDNs do not resolve. If two of your SIMs share the same current
+          number, the response is <code class="text-slate-300">409 ambiguous</code> and you should resubmit with
+          <code class="text-slate-300">reseller_rental_id</code>. Rate limit: one report per SIM per hour, 200 reports per
+          day per account.
+        </div>
+      </div>
+    </div>
   </section>
 </div>
 
@@ -914,12 +1245,22 @@ function renderSimTable(sims, container, opts) {
   if (!sims.length) { container.innerHTML = '<div class="text-slate-500 text-sm py-4">None</div>'; return; }
   const showActions = !opts.showAssigned;
   const rows = sims.map(s => {
+    // INC-3 inline badge: shows when there's an open bad-rental report on this SIM.
+    let reportBadge = '';
+    if (s.open_report) {
+      const r = s.open_report;
+      const label = r.status === 'in_triage' ? 'In triage' : 'Reported';
+      reportBadge = ' <span class="ml-2 inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-amber-500/20 text-amber-300" title="' + esc(r.reason_code || '') + '">' + label + '</span>';
+    }
     const actionsCell = showActions
-      ? '<td class="px-3 py-2 text-right"><button onclick="event.stopPropagation(); resendOne(' + s.sim_id + ', this)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-cyan-600 text-slate-200 hover:text-white rounded">Resend</button></td>'
+      ? '<td class="px-3 py-2 text-right whitespace-nowrap">' +
+          '<button onclick="event.stopPropagation(); resendOne(' + s.sim_id + ', this)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-cyan-600 text-slate-200 hover:text-white rounded">Resend</button>' +
+          ' <button onclick="event.stopPropagation(); reportBad(' + s.sim_id + ', this)" class="px-2 py-1 text-xs bg-slate-700 hover:bg-amber-600 text-slate-200 hover:text-white rounded"' + (s.open_report ? ' disabled title="A report is already open"' : '') + '>Report bad</button>' +
+        '</td>'
       : '';
     return '<tr class="hover:bg-slate-800 cursor-pointer" onclick="openLifetime(' + s.sim_id + ')">' +
       '<td class="px-3 py-2 text-slate-200 font-mono">' + (s.rental_id != null ? '#' + esc(s.rental_id) : '<span class="text-slate-600">—</span>') + '</td>' +
-      '<td class="px-3 py-2 text-slate-200 font-mono">' + esc(s.msisdn || '—') + '</td>' +
+      '<td class="px-3 py-2 text-slate-200 font-mono">' + esc(s.msisdn || '—') + reportBadge + '</td>' +
       '<td class="px-3 py-2 text-slate-300">' + esc(s.status) + '</td>' +
       '<td class="px-3 py-2 text-slate-400 text-xs">' + (opts.showAssigned ? fmtDate(s.assigned_at) : esc(fmtDateTime(s.start_at))) + '</td>' +
       '<td class="px-3 py-2 text-slate-400 text-xs">' + (opts.showAssigned ? '' : esc(fmtDateTime(s.online_until))) + '</td>' +
@@ -990,6 +1331,78 @@ async function resendOne(simId, btn) {
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Resend'; }
   }
+}
+
+// INC-3 — open the reason modal for a single SIM and POST to /report-bad.
+// Same modal pattern as showConfirm; we just need a custom body with a
+// dropdown + textarea.
+async function reportBad(simId, btn) {
+  const sim = allSims.find(s => s.sim_id === simId);
+  const mdn = sim ? (sim.msisdn || 'unknown') : 'unknown';
+  // Build a small DOM-based reason form and reuse showModal for the shell.
+  const body = document.createElement('div');
+  body.innerHTML =
+    '<h2 class="text-xl font-semibold text-slate-100 mb-2">Report ' + esc(mdn) + ' as not working</h2>' +
+    '<p class="text-sm text-slate-400 mb-4">We will queue this for review. A specialist will look at the number; you can check status from this SIM\\'s row or via <code class="bg-slate-900 px-1 rounded">GET /api/sims/' + esc(simId) + '/report-status</code>.</p>' +
+    '<label class="block text-xs uppercase tracking-wide text-slate-400 mb-1">Reason</label>' +
+    '<select id="rp-rb-reason" class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100 mb-3">' +
+      '<option value="no_sms_received">No SMS received</option>' +
+      '<option value="wrong_number">Receiving SMS for the wrong account</option>' +
+      '<option value="delayed_sms">SMS arriving too late</option>' +
+      '<option value="other">Other</option>' +
+    '</select>' +
+    '<label class="block text-xs uppercase tracking-wide text-slate-400 mb-1">Notes (optional)</label>' +
+    '<textarea id="rp-rb-note" rows="3" maxlength="500" placeholder="e.g. 3 send attempts, no SMS in 30 minutes"' +
+      ' class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-100 mb-4"></textarea>' +
+    '<div class="flex justify-end gap-2">' +
+      '<button id="rp-rb-cancel" class="px-4 py-2 text-sm bg-slate-700 hover:bg-slate-600 text-slate-200 rounded">Cancel</button>' +
+      '<button id="rp-rb-submit" class="px-4 py-2 text-sm text-white rounded bg-amber-600 hover:bg-amber-500">Submit report</button>' +
+    '</div>';
+  showModal(body.outerHTML);
+  return new Promise(resolve => {
+    document.getElementById('rp-rb-cancel').addEventListener('click', () => { closeModal(); resolve(); });
+    document.getElementById('rp-rb-submit').addEventListener('click', async () => {
+      const reason_code = document.getElementById('rp-rb-reason').value;
+      const reason_note = document.getElementById('rp-rb-note').value.trim() || null;
+      closeModal();
+      if (btn) { btn.disabled = true; btn.textContent = 'Submitting…'; }
+      try {
+        // INC-3 contract: report-bad accepts only reseller_rental_id or
+        // current-MDN e164. The Submit button sends the SIM current MDN
+        // (sim.msisdn), which the resolver maps to the current rental for this
+        // reseller. sim_id/iccid are no longer accepted.
+        const sim = allSims.find(s => s.sim_id === simId);
+        const currentMdn = sim ? sim.msisdn : null;
+        if (!currentMdn) {
+          showToast('This SIM has no current phone number; cannot file a report.', 'error');
+          return;
+        }
+        const r = await fetch('/api/rentals/report-bad', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ e164: currentMdn, reason_code, reason_note }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (r.status === 429) {
+          showToast('Rate limited: ' + (data.error || 'try again later'), 'error');
+        } else if (r.ok) {
+          if (data.deduped) {
+            showToast('A report for this SIM is already open (ID ' + data.report_id + ').', 'info');
+          } else {
+            showToast('Reported. Report ID ' + data.report_id + '.', 'success');
+          }
+          loadSims();
+        } else {
+          showToast('Report failed: ' + (data.error || ('HTTP ' + r.status)), 'error');
+        }
+      } catch (e) {
+        showToast('Report failed: ' + (e.message || String(e)), 'error');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Report bad'; }
+        resolve();
+      }
+    });
+  });
 }
 
 async function resyncAll() {
@@ -1271,6 +1684,10 @@ export default {
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/lifetime$/))) return handleSimLifetime(m[1], auth, env);
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/resend-online$/)) && request.method === 'POST') return handleResendOnline(m[1], auth, env);
       if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/online-history$/))) return handleOnlineHistory(m[1], auth, env);
+      // INC-3 Phase 1 — bad-rental reporting (rev 5).
+      if (url.pathname === '/api/rentals/report-bad' && request.method === 'POST') return handleReportBadByRental(auth, env, request);
+      if ((m = url.pathname.match(/^\/api\/sims\/(\d+)\/report-status$/))) return handleReportStatus(m[1], auth, env);
+      if (url.pathname === '/api/sims/reports') return handleReportsList(auth, env, url);
       return notFound();
     }
 

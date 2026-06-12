@@ -22,6 +22,11 @@ service = "reseller-sync"
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "reseller-portal-test"
+# Override (do NOT inherit) the top-level production custom domain. Without this,
+# `wrangler deploy --env test` re-points portal.incoming-sms.com at the test worker.
+# Test stays on its *.workers.dev URL only.
+routes = []
+workers_dev = true
 
 [env.test.observability.logs]
 enabled = true

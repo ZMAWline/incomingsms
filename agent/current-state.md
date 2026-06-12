@@ -30,6 +30,165 @@ DB state: `rental_reports` has Maxime's live probes (1+ rows) — diagnostic-onl
 
 ---
 
+## Session 67 (2026-06-04) — INC-3 follow-up: `?status=resolved` alias fix
+
+Board bug report: `GET /api/sims/reports?status=resolved` returned `[]` even though resolved reports exist. Root cause confirmed: the `rental_reports.status` CHECK constraint only allows `received|in_triage|remediated|unable_to_reproduce|duplicate` — there is no `resolved` literal in the DB. The handler was passing `status=eq.resolved` through to PostgREST, which legitimately matched zero rows.
+
+**Fix:** added `src/shared/rental-report-status.js` with `buildStatusFilter(raw)` that expands the user-facing aliases into PostgREST filter fragments:
+- `open` → `&status=in.(received,in_triage)` (already supported; preserved)
+- `resolved` → `&status=in.(remediated,unable_to_reproduce,duplicate)` (new)
+- `all` → no filter
+- literal enum values → `&status=eq.<value>` pass-through
+- anything else → `{ok:false}` so the handler returns 400 with the accepted list
+- missing/empty → defaults to `open` (preserves prior behaviour)
+
+Trim + lower-case normalization included. `handleReportsList` in `src/reseller-portal/index.js` now uses the helper and returns a 400 `bad_request` payload listing accepted values for unknown statuses.
+
+**Tests:** new `tests/reports-list-status.test.mjs` (14 cases) covering every alias, every literal, garbage, missing, case-insensitivity, and whitespace. `npm run test:reports-list-status`. Existing `npm run test:report-bad` still 13/13 — resolver contract untouched.
+
+**Deployed:** reseller-portal `36049cd7-d464-4f53-9b4f-3e8fe16de01e`. Dashboard not redeployed (its `?status=` filter is on `sims.status`, unrelated).
+
+**Probes (Maxime's key, prod):**
+| Probe | Result |
+|---|---|
+| `GET /api/sims/reports?status=resolved` | 200, 1 row (id=1, `remediated`) |
+| `GET /api/sims/reports?status=open` | 200, `[]` (no currently open reports) |
+| `GET /api/sims/reports?status=garbage` | 400 `bad_request` + accepted list |
+| `GET /api/sims/reports?status=all` | 200, 1 row |
+
+## Session 66 (2026-06-04) — INC-3 follow-up: Bad Rentals first-class surface
+
+Board directive (2026-06-04 14:28 UTC): "Bad Rental doesn't have a unique domain/route/surface — implement the appropriate unique domain/route/surface." Chose **subdomain** over path-group per Single Responsibility constraint #2 and the existing `portal.incoming-sms.com` precedent.
+
+**New worker:** `src/bad-rentals/` (index.js + wrangler.toml).
+**New surface:** `https://bad-rentals.incoming-sms.com` — landing page + 3 API routes.
+
+- `GET  /` — public landing with the contract, curl examples, and an inline "Check status" form.
+- `GET  /healthz` — liveness.
+- `POST /api/rentals/report-bad` — primary intake (same Bearer rsk_* auth, same dedup, same rate-limits as portal).
+- `GET  /api/rentals/report-bad/status?reseller_rental_id=…|e164=…` — most-recent report for one of your rentals.
+- `GET  /api/reports?status=open` — list this reseller's reports.
+
+Resolver moved to `src/shared/report-bad-resolver.js` (was `src/reseller-portal/`); imported by both workers. 13 contract tests still pass; 8 new worker routing/auth tests added (`tests/bad-rentals-worker.test.mjs`, `npm run test:bad-rentals`).
+
+**Backward compatibility:** the old portal routes (`/api/rentals/report-bad`, `/api/sims/:id/report-status`, `/api/sims/reports`) are deliberately left in place so Maxime's existing integration keeps working unchanged. Portal HTML docs updated to recommend the new dedicated surface.
+
+**Deployed:**
+- bad-rentals `ca8612b0-fcd7-4202-8b37-555504b4b5d7` (bad-rentals.incoming-sms.com custom domain auto-provisioned).
+- reseller-portal `cd5f0a46-0315-4a37-8b32-677ce970f98c` (HTML docs only; routes unchanged).
+
+**Probes (Maxime's key, prod):**
+| Probe | Result |
+|---|---|
+| `GET /` landing | 200, 6588 bytes HTML |
+| `GET /healthz` | 200 `{ok:true}` |
+| `GET /api/reports` no auth | 401 |
+| POST `sim_id` | 400 bad_request |
+| POST `iccid` | 400 bad_request |
+| POST internal `rental_id` | 400 bad_request |
+| POST historical MDN | 404 not_found |
+| POST `reseller_rental_id` | 200 (new) → second call 200 deduped |
+| POST current `e164` | 200 deduped |
+| GET status by reseller_rental_id | 200 |
+| GET /api/reports?status=open | 200 (1 report) |
+| Legacy `portal.incoming-sms.com/api/rentals/report-bad` | 200 (unchanged) |
+
+## Session 66 (2026-06-04) — INC-3 Bad Rentals dashboard deep-link (reversed subdomain)
+
+User clarified that "unique URL" meant a dashboard deep-link (`dashboard.zalmen-531.workers.dev/bad-rentals`), not a separate worker. Reversed the earlier `bad-rentals.incoming-sms.com` worker and added the SPA route mapping instead.
+
+- `wrangler delete bad-rentals --env=""` → worker removed from Cloudflare.
+- Deleted `src/bad-rentals/` + `tests/bad-rentals-worker.test.mjs` + `test:bad-rentals` script.
+- Resolver stays at `src/shared/report-bad-resolver.js` (clean refactor, used by reseller-portal).
+- Reseller-portal docs reverted to `portal.incoming-sms.com` URLs (legacy `/api/sims/{sim_id}/report-status` etc.).
+- Dashboard `TAB_ROUTES` adds `'bad-rentals': '/bad-rentals'` so the sidebar link + URL deep-link both land on the Bad Rentals tab.
+- Deployed: dashboard `b9b24424-fc40-4afb-84f8-dcd26c5a79ba`, reseller-portal `ca48643f-2161-4786-b8b2-b691f936c146`.
+- Tests: `npm run test:report-bad` 13/13.
+- Verified: `bad-rentals.incoming-sms.com` no longer resolves; `dashboard.zalmen-531.workers.dev/bad-rentals` returns 200 with the dashboard SPA.
+
+## Session 65 (2026-06-04) — INC-3 report-bad contract lockdown deployed
+
+Per board directive: reseller-facing report-bad now accepts ONLY `reseller_rental_id` or current-MDN `e164`. `sim_id`, `iccid`, internal `rental_id`, and historical/original MDNs are all rejected with a 400 + explicit message. The convenience route `POST /api/sims/:simId/report-bad` is removed; the portal Submit button posts the SIM's current MDN to `/api/rentals/report-bad`.
+
+- Resolver extracted to `src/reseller-portal/report-bad-resolver.js` (pure module, 13 contract tests in `tests/report-bad-resolver.test.mjs`).
+- reseller-portal redeployed prod `dd7997f3-3b50-4ece-bb5c-f8d9f04deb31`.
+- Live probes (Maxime's API key, prod): sim_id/iccid/rental_id → 400 bad_request; original MDN → 404; current MDN + reseller_rental_id → 200 dedup; removed route → 404.
+
+Migration note for partner: tell Maxime to switch his payload field from `rental_id` to `reseller_rental_id` (same value, different key).
+
+## Session 64 (2026-06-03) — INC-3 Phase 1 deploy: workers to PROD, migration pending
+
+Board approved option 1 (deploy all INC-3 Phase 1 to prod for live testing).
+
+**Deployed from branch `feat/inc-2-rental-billing` HEAD (1565dbe):**
+- reseller-portal `27b1a7b4-8ca2-41d8-8f70-35d412552fdd` (portal.incoming-sms.com)
+- dashboard `eeb532da-e765-471d-aeac-907179ae020c`
+- details-finalizer `47fc0b58-be80-4571-b50d-bb6e185ac97b` (cron */5, 30 10, 0 */6)
+
+Smoke: portal 400 on /login (expects POST — alive), dashboard 401 (auth required — alive), details-finalizer 200.
+
+**DB migration applied** via Supabase Management API (`SUPABASE_ACCESS_TOKEN` from `.dev.vars`, project ref `lzjqegxazqlktttyybth`). Both tables present in public schema: `rental_reports`, `rental_report_events`. RLS enabled per migration. All three new code paths are now backed by their tables:
+- portal `POST /api/sims/:id/report-bad`
+- dashboard `/api/bad-rentals*` (Bad Rentals tab)
+- details-finalizer nightly bad-rental count
+
+INC-3 Phase 1 is fully live in production. Next: monitor for reseller intake, watch nightly count cron.
+
+---
+
+## Session 63 (2026-06-01) — INC-2 rental → PROD; rotation window/cap; ATOMIC desync self-heal; carrier escalations
+
+### INC-2 rental billing — CUT OVER TO PRODUCTION
+- **Dashboard invoice preview + "Download for QuickBooks" now DEFAULT to the rental engine.** Old "Rental mode (TEST)" checkbox → **"Use legacy billing (compare)"** (checked = legacy SIM-day/block engine). `downloadInvoiceIIF` + the `/billing/download-invoice` generate route now honor `billing_mode` (was always legacy). Legacy engine untouched = dormant fallback. Prod dashboard `98e379ce`.
+- **Rental capture LIVE in prod**: `RENTAL_CAPTURE_ENABLED=true` in `src/reseller-sync/wrangler.toml` (top-level=prod vars). reseller-sync `4146c1c1`. Mints one rental per sim_numbers lifetime on the cron sync path; resend path never mints; `UNIQUE(reseller_id, sim_number_id)` guards.
+- **Removed the forward-only cutover CLAMP** from `computeRentalBilling` (`src/shared/rentals.js`): `effectiveStart = start` (was `max(start, RENTAL_CUTOVER_DATE)`). The preview/calculator now bills the EXACT requested window in either engine — no date limit. Per user: the cutover is an operational choice (don't re-issue agreed invoices), NOT a calculator limit.
+- **Rentals backfill extended to 5/29** (reseller 3) from authoritative "Rental created" 200 responses (response_body has `rentalId`), dated by `payload.created_at` EST, mapped to sim_number lifetime. +2,786 rows → **20,215 total**. Filled the 5/28–5/29 capture gap (2,489 = **$3,488.90**) + 297 historical confirmed rentals the per-lifetime backfill missed. 0 unmapped, 0 dup lifetimes, all new rows carry trustotp_id.
+
+### Rotation reliability (separate PR → merged to main + deployed)
+- **Window 6am → 9am NY**: `isInsideRotationWindowNY()` h<=5 → h<=8 in **mdn-rotator AND teltik-worker**; crons `4-11` → `4-14` UTC (both wrangler.toml).
+- **5-strike fail cap** (was 3): migration `migrations/20260531_rotation_fail_cap_5.sql` (`increment_rotation_fail` threshold 3→5; at cap sets `status='rotation_failed'` → drops from the `status=active` batch). mdn-rotator wing stuck-remediation query now excludes `rotation_fail_count >= 5`. teltik failures now route through `increment_rotation_fail` (added `getNYMidnightISO` helper) for the same counted cap.
+- Deployed: mdn-rotator `3f39b528` then `f90de5e6`; teltik-worker `727d7ef8`.
+
+### Dashboard "Rotation Freshness" panel (rebuilt)
+- New DB function `public.rotation_freshness()` (per-vendor total/fresh/stale). **fresh** = client-assigned SIM whose CURRENT number has a `number.online` delivery returning 200 + rentalId within the carrier window (att 24h / tmobile 48h). **total** = any active reseller link, any sim status. Replaced the old `last_notified_at`-based count in dashboard `handleStats`.
+
+### ATOMIC DB↔carrier MDN desync AUTO-HEAL (new, deployed)
+- **Cause:** swapMSISDN errors on our side but commits at AT&T → DB holds stale MDN, AT&T has subscriber Active under a different number → rotation fails "sim/MSISDN is Inactive" forever → parks at the 5-strike cap.
+- **Fix A (preventive, mdn-rotator `rotateAtomicSim`):** pre_swap_inquiry already returns AT&T's live MDN + attStatus; now if attStatus=Active and AT&T MDN ≠ `sims.msisdn`, adopt it as swap-from (`currentMsisdn` is `let`) + persist. Next rotation self-corrects.
+- **Fix B (curative, details-finalizer `runAtomicFinalizer`):** added parked-desync candidate bucket + attStatus gate. Active+diff MDN → reconcile (offline/online webhooks, sim_numbers rewrite, status=active/success, rotation_fail_count=0) with collision guard; Active+same → un-park; Cancelled/Suspended/Deactivated → flag (`pending_review_items` kind `atomic_mdn_desync`) + `rotation_eligible=false`; inquiry error → skip. Closes a latent bug (old code would've "healed" a cancelled SIM to a stale number). details-finalizer `7860f657` then `472bfbd1` (bugfix: `pending_review_items.run_id` is **uuid** — pass `null`, not a string; insertPendingItem swallows the error).
+
+### Manual SIM fixes this session
+- **9697 / 9727** (atomic desync): reconciled DB to AT&T's live MDN + force-rotated → active/success.
+- **7 of 21 stuck Wing IoT SIMs** recovered via force-rotate (1119 + 6 from the sweep).
+
+### Carrier escalations (Slack drafts written, NOT auto-sent)
+- **ATOMIC → Wing Alpha (dan@wingalpha.com):** 6 SIMs the carrier cancelled/suspended, not API-recoverable: **1067/770/771/994/743 Cancelled, 688 Suspended**. AT&T records inconsistent (inquiry vs reconnect disagree on MDN). All `rotation_eligible=false` + open `pending_review_items` (kind atomic_mdn_desync). Triggered by ~5/29 AT&T swapMSISDN backend errors (TPESYSTEM/Jolt csChgSub00).
+- **Wing IoT → Wing Tel (SUBNINE):** **14 SIMs stuck** — AT&T plan-change PUT (→ABIR) intermittently 500s (`Unknown server error / 30000001`) or accepts-but-never-commits. ~1/3 succeed on retry. **Left PARKED pending Wing Tel response (user decision).** Still on working dialable numbers. ICCID/MDN list in the session transcript / Slack draft.
+
+### Prod deploy versions (all from `main`): dashboard `98e379ce`, reseller-sync `4146c1c1`, mdn-rotator `f90de5e6`, teltik-worker `727d7ef8`, details-finalizer `472bfbd1`.
+
+### PENDING / KNOWN ISSUES
+- **14 Wing IoT SIMs parked** pending Wing Tel fixing the intermittent plan-change endpoint. Re-sweep (`/rotate-sim?force=true`) or re-enable for nightly retry once confirmed.
+- **6 ATOMIC SIMs** (1067/770/771/994/743 cancelled, 688 suspended) pending Wing Alpha reactivation; `rotation_eligible=false` until then.
+- **`feat/inc-2-rental-billing` working tree has uncommitted WIP (NOT deployed):** a stuck-inventory report in `details-finalizer` `runRotationReview` + a circuit breaker on the mdn-rotator `/remediate-stuck-wing` HTTP handler. Plus now-redundant copies of the rotation window/cap edits (already in main/deployed). Decide whether to finish/commit or discard. Prod runs from `main`, which does NOT include this WIP.
+
+## Session 62 (2026-05-27) — INC-2 rental billing: test enablement (gated, board-approved)
+
+- **Migration applied to PROD Supabase** (`20260527_rental_billing.sql`, via Management API — supabase MCP not available in this runtime): added tables `rentals` (UNIQUE `uq_rentals_reseller_sim_number` on `(reseller_id, sim_number_id)`, RLS on) and `reseller_rental_rates` (RLS on). Additive/dormant — no existing table altered; nothing reads them unless `billing_mode='rental'`.
+- **One-off seed/backfill (TrustOTP, reseller_id=3), for dashboard-test rental testing only:**
+  - `reseller_rental_rates`: `att $1.10` + `tmobile $1.60`, `effective_from=2026-05-14` (widened from 2026-05-22 so the audit-diff window prices at correct per-carrier rates; rate values unchanged), no end.
+  - `rentals`: **full backfill of 17,728 rows** = every `sim_numbers` lifetime with EST `valid_from` ≥ **2026-05-14** for the reseller's active sims (window widened from 5/22 for audit comparison). 7,675 att + 10,053 tmobile, dates 5/14–5/27. `rental_date` = historical EST date of `valid_from` (not today). `reseller_rental_id` = `reseller_sims.last_rental_id` on each sim's latest lifetime only (2,057 rows), NULL on older lifetimes (no backward smear). Idempotent via `ON CONFLICT (reseller_id, sim_number_id) DO NOTHING` — verified re-run inserts 0. Criteria = `reseller_sims.active=true` (matches legacy billing's SIM filter).
+  - Rental-mode total over 5/14–5/27: **$24,527.30** (att $8,442.50 + tmobile $16,084.80).
+  - **Cutover override:** `computeBillingBreakdown`/`computeRentalBilling` now accept optional `cutover`; `/api/billing/preview` forwards `?cutover=`. Absent ⇒ default `RENTAL_CUTOVER_DATE=2026-05-22` (forward-only intact). Test diff needs `&cutover=2026-05-14`.
+  - This is a test backfill, NOT live capture — `RENTAL_CAPTURE_ENABLED` remains OFF. Removable by `DELETE FROM rentals WHERE reseller_id=3;` (no production reader unless `billing_mode='rental'`).
+- **Authoritative `trustotp_rental_id` source = `webhook_deliveries`** (event_type `number.online`, reseller 3). `response_body` JSON: `rentalId` (TrustOTP id) + `message` (`Rental created` = billable / `End date updated for existing rental` = resend, no new rental). Match key is `payload.created_at` EST date (NOT `delivered_at`, which lags) joined on `coalesce(sim_id, payload.data.sim_id)` + MDN. `webhook_deliveries.sim_id` column is NULL on newer rows — use the payload sim_id.
+- **2026-05-28: repopulated `rentals.reseller_rental_id` for reseller 3 from authoritative "Rental created" responses** (cleared prior `last_rental_id` guesses first). 17,369 / 17,728 window rows now carry a real `trustotp_rental_id`; 359 unmatched = 299 `DUP_EXTRA` resend duplicates + 60 unique/first (≈EST-midnight boundary). Recon CSVs (server-local, uncommitted — contain MDN): `trustotp_may14_to_28_recon.csv`, `trustotp_may16_att_recon.csv`. Terminology: `internal_rental_id`=`rentals.id`, `trustotp_rental_id`=`rentals.reseller_rental_id`.
+- **2026-05-28 (board-approved): deleted the 299 `DUP_EXTRA` test rows.** rentals(reseller 3) now 17,429 (17,369 with trustotp_id, 60 without). The 60: 12 are "End date updated" resends (correctly non-billable), 48 have no stored number.online response within 25h (40 on 05-26 AT&T — possible webhook-storage gap). Rental-mode total 05-14..28 = **$24,048.90**.
+- **dashboard-test enhancement (commit 200ab3e):** `computeRentalBilling` returns `total_with_trustotp_id`/`total_without_trustotp_id`; new paginated `/api/billing/rental-export` CSV (internal_rental_id, rental_date, carrier, sim_id, mdn, trustotp_rental_id); invoice preview shows authoritative matched/unmatched count + export button in rental mode. Deployed dashboard-test `346bc6f6`. Production dashboard NOT deployed.
+- **Pending child issue (approved, not yet created — no Paperclip API access from this runtime):** production dedup-key hardening so capture never mints a 2nd internal rental for a same-MDN resend lifetime; key on number lifetime + TrustOTP "Rental created" response. Gated: plan only, no prod deploy/cutover.
+- **Dashboard:** `/api/billing/preview` now accepts `?billing_mode=rental` (commit `7df2dbd`); absent ⇒ legacy. Deployed to **dashboard-test only** (`ae12461b`). Prod dashboard/portal/sync NOT redeployed; QBO invoice path stays legacy.
+- Rental preview validated: total **$45.60** (24×$1.10 + 12×$1.60), `rate_fallback_used=false`.
+
 ## Session 61 (2026-05-26) — Relay (530) outage remediation + rotation stamp hardening
 
 **Trigger:** A ~13h relay outage (2026-05-25 20:00 → 05-26 09:16 NY, HTTP 530, 12,150 failed carrier calls across all vendors) stranded rotations. Root cause of the *damage*: `claim_rotation_slot` stamps `last_mdn_rotated_at` BEFORE the carrier call (it doubles as the dedup lock); failures left that stamp in place, so SIMs looked "rotated today" with no rotation done → cadence-locked until the next NY window.

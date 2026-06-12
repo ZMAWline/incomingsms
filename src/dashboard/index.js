@@ -348,6 +348,10 @@ export default {
       return handleBillingPreview(url, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/billing/rental-export') {
+      return handleRentalExport(url, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/utilization') {
       return handleUtilization(url, env, corsHeaders);
     }
@@ -5623,12 +5627,50 @@ async function handleBillingPreview(url, env, corsHeaders) {
     if (!resellerId || !start || !end) {
       return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    const result = await computeBillingBreakdown(env, { resellerId, start, end });
+    // INC-2: optional billing_mode override for the preview (rental testing).
+    // Absent => undefined => legacy_simday. Only the exact string 'rental' diverts.
+    const billing_mode = url.searchParams.get('billing_mode') || undefined;
+    // Optional forward-only cutover override (rental mode only). Absent => default
+    // RENTAL_CUTOVER_DATE. Used by dashboard-test to diff against an earlier audit window.
+    const cutover = url.searchParams.get('cutover') || undefined;
+    const result = await computeBillingBreakdown(env, { resellerId, start, end, billing_mode, cutover });
     return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
     return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
+async function handleRentalExport(url, env, corsHeaders) {
+  try {
+    const resellerId = url.searchParams.get('reseller_id');
+    const start = url.searchParams.get('start');
+    const end = url.searchParams.get('end');
+    if (!resellerId || !start || !end) {
+      return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const q = env.SUPABASE_URL + '/rest/v1/rentals?select=id,rental_date,carrier,sim_id,e164,reseller_rental_id'
+      + '&reseller_id=eq.' + encodeURIComponent(resellerId)
+      + '&rental_date=gte.' + encodeURIComponent(start)
+      + '&rental_date=lte.' + encodeURIComponent(end)
+      + '&order=rental_date.asc,carrier.asc,sim_id.asc';
+    const hdrs = { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY, Accept: 'application/json' };
+    const lines = ['internal_rental_id,rental_date,carrier,sim_id,mdn,trustotp_rental_id'];
+    const PAGE = 1000;
+    for (let offset = 0; ; offset += PAGE) {
+      const res = await fetch(q + '&limit=' + PAGE + '&offset=' + offset, { headers: hdrs });
+      const rows = await res.json();
+      if (!Array.isArray(rows) || rows.length === 0) break;
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        lines.push([r.id, r.rental_date, r.carrier, r.sim_id, r.e164, (r.reseller_rental_id == null ? '' : r.reseller_rental_id)].join(','));
+      }
+      if (rows.length < PAGE) break;
+    }
+    return new Response(lines.join('\n') + '\n', { headers: { ...corsHeaders, 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="rental_rows.csv"' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
 async function handleUtilization(url, env, corsHeaders) {
   try {
     const resellerId = url.searchParams.get('reseller_id');
@@ -5730,7 +5772,8 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    const breakdown = await computeBillingBreakdown(env, { resellerId, start, end });
+    const billing_mode = url.searchParams.get('billing_mode') || undefined;
+    const breakdown = await computeBillingBreakdown(env, { resellerId, start, end, billing_mode });
     if (!breakdown.mapping) {
       return new Response(JSON.stringify({ error: 'No customer rate configured for this reseller' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }

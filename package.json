@@ -5,6 +5,8 @@
   "main": "src/dashboard/index.js",
   "scripts": {
     "test": "node --test \"tests/*.test.mjs\"",
+    "test:report-bad": "node tests/report-bad-resolver.test.mjs",
+    "test:reports-list-status": "node tests/reports-list-status.test.mjs",
     "check:db-constraints": "node scripts/check_db_constraints.mjs",
     "predeploy": "npm test && npm run check:db-constraints"
   },

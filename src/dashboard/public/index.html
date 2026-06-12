@@ -2015,6 +2015,10 @@
                             <label class="text-xs text-gray-500 uppercase">To</label>
                             <input type="date" id="invoice-end" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
                         </div>
+                        <div class="flex items-center gap-1" title="New rental-based billing is the default. Check to bill with the legacy SIM-day / 48h-block engine instead (for comparison).">
+                            <input type="checkbox" id="invoice-legacy-mode">
+                            <label for="invoice-legacy-mode" class="text-xs text-gray-400 uppercase">Use legacy billing (compare)</label>
+                        </div>
                         <button onclick="previewInvoices()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Preview</button>
                         <button onclick="downloadInvoiceIIF()" id="download-invoice-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Download for QuickBooks</button>
                     </div>
@@ -11326,7 +11330,10 @@ async function sendSimOnline(simId, phoneNumber) {
             const end = document.getElementById("invoice-end").value;
             if (!resellerId || !start || !end) { showToast("Select reseller and date range", "error"); return; }
             try {
-                const resp = await fetch(`${API_BASE}/billing/preview?reseller_id=${encodeURIComponent(resellerId)}&start=${start}&end=${end}`);
+                let __previewQS = `?reseller_id=${encodeURIComponent(resellerId)}&start=${start}&end=${end}`;
+                const __legacyEl = document.getElementById("invoice-legacy-mode");
+                if (!(__legacyEl && __legacyEl.checked)) { __previewQS += "&billing_mode=rental"; }
+                const resp = await fetch(`${API_BASE}/billing/preview${__previewQS}`);
                 const data = await resp.json();
                 if (data.error) { showToast(data.error, "error"); return; }
                 invoicePreviewData = data;
@@ -11340,7 +11347,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     document.getElementById("download-invoice-btn").classList.add("hidden");
                     return;
                 }
-                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Default Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span>' + (data.rules_applied ? ' &nbsp;·&nbsp; <span class="text-blue-400">Volume Pricing rules active</span>' : '') + '</div>';
+                let html = '<div class="mb-3 text-sm text-gray-400">Customer: <span class="text-white">' + data.mapping.qbo_display_name + '</span> &nbsp;·&nbsp; Default Rate: <span class="text-accent">$' + Number(data.daily_rate).toFixed(2) + '</span>' + (data.rules_applied ? ' &nbsp;·&nbsp; <span class="text-blue-400">Volume Pricing rules active</span>' : '') + '</div>' + (data.billing_mode === 'rental' ? ('<div class="mb-3 text-xs"><span class="text-yellow-400 font-semibold">RENTAL (new billing)</span> TrustOTP-matched (authoritative): <span class="text-white">' + (data.total_with_trustotp_id||0) + '</span> of ' + (data.total_rentals||0) + ' &middot; unmatched: <span class="text-white">' + (data.total_without_trustotp_id||0) + '</span></div><div class="mb-3"><a href="' + API_BASE + '/billing/rental-export?reseller_id=' + encodeURIComponent(resellerId) + '&start=' + start + '&end=' + end + '" class="px-3 py-1 text-xs bg-dark-600 hover:bg-dark-500 text-gray-200 rounded">Export rental rows CSV (internal_rental_id + trustotp_rental_id)</a></div>') : '');
                 if (data.active_counts) {
                     const ac = data.active_counts;
                     const parts = [];
@@ -11353,8 +11360,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
                 html += '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="text-left text-xs text-gray-500 border-b border-dark-600"><th class="py-2 pr-4">Date (EST)</th><th class="py-2 pr-4">Scope</th><th class="py-2 pr-4">Units</th><th class="py-2 pr-4">Rate</th><th class="py-2">Amount</th></tr></thead><tbody>';
                 data.days.forEach(d => {
-                    const scope = d.vendor ? d.vendor : 'AT&amp;T';
-                    const unit = d.vendor === 'teltik' ? '/block' : '/SIM-day';
+                    const scope = d.carrier ? (d.carrier === 'tmobile' ? 'T-Mobile' : 'AT&amp;T') : (d.vendor ? d.vendor : 'AT&amp;T');
+                    const unit = d.carrier ? '/rental' : (d.vendor === 'teltik' ? '/block' : '/SIM-day');
                     const tierTag = d.tier ? ' <span class="text-xs text-blue-400" title="Selected because reseller has ' + (d.tier_input_count != null ? d.tier_input_count : '?') + ' active SIMs in scope">[tier ' + d.tier.min_count + (d.tier.max_count == null ? '+' : '–' + d.tier.max_count) + ']</span>' : '';
                     html += `<tr class="border-b border-dark-700"><td class="py-2 pr-4 text-gray-300">${d.date}</td><td class="py-2 pr-4 text-gray-400 text-xs">${scope}</td><td class="py-2 pr-4 text-gray-300">${d.sim_count}</td><td class="py-2 pr-4 text-gray-300 font-mono">$${Number(d.rate).toFixed(4)}${unit}${tierTag}</td><td class="py-2 text-gray-300">$${Number(d.amount).toFixed(2)}</td></tr>`;
                 });
@@ -11373,7 +11380,9 @@ async function sendSimOnline(simId, phoneNumber) {
             const start = document.getElementById("invoice-start").value;
             const end = document.getElementById("invoice-end").value;
             try {
-                const resp = await fetch(`${API_BASE}/billing/download-invoice?reseller_id=${encodeURIComponent(resellerId)}&start=${start}&end=${end}`);
+                const __legacyEl = document.getElementById("invoice-legacy-mode");
+                const __modeQS = (__legacyEl && __legacyEl.checked) ? "" : "&billing_mode=rental";
+                const resp = await fetch(`${API_BASE}/billing/download-invoice?reseller_id=${encodeURIComponent(resellerId)}&start=${start}&end=${end}${__modeQS}`);
                 if (!resp.ok) {
                     const err = await resp.json().catch(() => ({}));
                     showToast("Error: " + (err.error || resp.statusText), "error");

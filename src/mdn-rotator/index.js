@@ -218,11 +218,21 @@ export default {
           });
         }
         const results = [];
+        // Circuit breaker: stop after 5 consecutive AT&T 5xx instead of burning
+        // the whole batch into a dead endpoint (spec §6).
+        let consec5xx = 0, tripped = false;
+        const is5xx = (s) => /failed: 5\d\d/i.test(String(s || ''));
         for (const iccid of iccids) {
+          if (tripped) { results.push({ iccid, ok: false, skipped: true, reason: 'circuit breaker tripped (5 consecutive AT&T 5xx)' }); continue; }
           try {
-            results.push(await remediateStuckWingSim(env, String(iccid)));
+            const r = await remediateStuckWingSim(env, String(iccid));
+            results.push(r);
+            if (r && r.ok) consec5xx = 0;
+            else if (is5xx(r && r.error)) { if (++consec5xx >= 5) tripped = true; }
+            else consec5xx = 0;
           } catch (err) {
             results.push({ iccid, ok: false, error: String(err) });
+            if (is5xx(err)) { if (++consec5xx >= 5) tripped = true; } else consec5xx = 0;
           }
         }
         return new Response(JSON.stringify({ ok: true, results }, null, 2), {

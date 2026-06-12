@@ -1881,6 +1881,30 @@ async function runRotationReview(env, opts = {}) {
     // ── 6. Multi-day pattern detection ───────────────────────────────────────
     const multiDayFailures = await detectMultiDayFailures(env, 3);
 
+    // ── 6a. Current stuck inventory (NOT windowed to tonight) ────────────────
+    // The tally above only counts SIMs rotated since tonight, so SIMs stranded
+    // in a bad rotation state for days were invisible — this hid 110 wing_iot
+    // SIMs stuck on AT&T's ABIR (non-dialable) plan on 2026-05-28. This block
+    // reports the live stuck backlog regardless of when the SIM last rotated.
+    const STUCK_AGE_HOURS = 6;
+    const stuckAgeCutoffMs = Date.now() - STUCK_AGE_HOURS * 3600 * 1000;
+    const stuckSel = 'id,iccid,vendor,status,rotation_status,last_rotation_at,last_mdn_rotated_at,last_rotation_error';
+    const stuckPendingRows = await rotationReviewQuery(env,
+      `sims?select=${stuckSel}&rotation_status=eq.mdn_pending&status=in.(provisioning,active)&limit=5000`).catch(() => []);
+    const stuckFailedRows = await rotationReviewQuery(env,
+      `sims?select=${stuckSel}&status=eq.rotation_failed&limit=5000`).catch(() => []);
+    const stuckRows = [...stuckPendingRows, ...stuckFailedRows];
+    const stuckByVendor = {};
+    const stuckAgedSims = [];
+    for (const s of stuckRows) {
+      const t = s.last_rotation_at || s.last_mdn_rotated_at;
+      const aged = !t || new Date(t).getTime() < stuckAgeCutoffMs;
+      if (!stuckByVendor[s.vendor]) stuckByVendor[s.vendor] = { total: 0, aged: 0 };
+      stuckByVendor[s.vendor].total++;
+      if (aged) { stuckByVendor[s.vendor].aged++; stuckAgedSims.push(s); }
+    }
+    const stuckAgedCount = stuckAgedSims.length;
+
     // ── 6b. Read operator responses from pending items ───────────────────────
     const openPending = await loadOpenPendingItems(env).catch(() => []);
     const answeredItems = openPending.filter(i => i.status === 'answered' && i.operator_response);
@@ -1922,6 +1946,18 @@ async function runRotationReview(env, opts = {}) {
         await insertPendingItem(env, {
           kind: 'multi_day_failure', summary, details_md: details,
           run_id: runId, sim_id: s.sim_id, status: 'open',
+        });
+        newPendingCreated++;
+      }
+      for (const s of stuckAgedSims) {
+        const existing = await findOpenPendingForSim(env, s.id, 'stuck_rotation');
+        if (existing) continue;
+        const t = s.last_rotation_at || s.last_mdn_rotated_at || 'unknown';
+        const summary = `stuck_rotation: SIM #${s.id} (${s.vendor}) ${s.rotation_status}/${s.status} since ${t}`;
+        const details = `SIM #${s.id} (${s.vendor}) has been stuck in **${s.rotation_status}/${s.status}** since ${t} (> ${STUCK_AGE_HOURS}h). The finalizer defers these indefinitely; the reconciliation sweep should clear them. If it persists, the carrier (e.g. AT&T) may be refusing the plan switch — manual force-rotate or vendor follow-up.\n\n**Error:** ${(s.last_rotation_error || '—').slice(0, 300)}`;
+        await insertPendingItem(env, {
+          kind: 'stuck_rotation', summary, details_md: details,
+          run_id: runId, sim_id: s.id, status: 'open',
         });
         newPendingCreated++;
       }
@@ -2046,6 +2082,26 @@ async function runRotationReview(env, opts = {}) {
       lines.push('');
     }
 
+    if (stuckRows.length > 0) {
+      lines.push('## Stuck rotations (live inventory, any age)');
+      lines.push('');
+      lines.push('| Vendor | Stuck total | Aged > 6h |');
+      lines.push('|--------|------------:|----------:|');
+      for (const [v, c] of Object.entries(stuckByVendor)) {
+        lines.push(`| ${v} | ${c.total} | ${c.aged} |`);
+      }
+      lines.push('');
+      if (stuckAgedCount > 0) {
+        lines.push(`⚠️ **${stuckAgedCount} SIM(s) stuck > ${STUCK_AGE_HOURS}h** in mdn_pending/rotation_failed — invisible to the tonight-windowed tally above. Sample:`);
+        for (const s of stuckAgedSims.slice(0, 15)) {
+          const t = s.last_rotation_at || s.last_mdn_rotated_at || 'unknown';
+          lines.push(`- SIM #${s.id} (${s.vendor}) ${s.rotation_status}/${s.status} since ${t}`);
+        }
+        if (stuckAgedCount > 15) lines.push(`  …+${stuckAgedCount - 15} more`);
+        lines.push('');
+      }
+    }
+
     if (answeredItems.length > 0) {
       lines.push('## Operator responses since last run');
       lines.push('');
@@ -2064,6 +2120,30 @@ async function runRotationReview(env, opts = {}) {
       lines.push('');
     }
 
+    // INC-3 Phase 1: append open bad-rental report count.
+    // Single non-blocking query; failure just omits the line rather than
+    // breaking the rotation review.
+    try {
+      const badResp = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/rental_reports?select=id&status=in.(received,in_triage)&limit=1000`,
+        {
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            Accept: 'application/json',
+          },
+        }
+      );
+      if (badResp.ok) {
+        const badRows = await badResp.json();
+        const badCount = Array.isArray(badRows) ? badRows.length : 0;
+        lines.push('');
+        lines.push(`**Bad Rental Reports (open):** ${badCount}${badCount > 0 ? ' — [review in dashboard](/bad-rentals)' : ''}`);
+      }
+    } catch (e) {
+      console.log('[runRotationReview] bad-rental count fetch failed: ' + e);
+    }
+
     lines.push('---');
     lines.push(`_Generated by details-finalizer /rotation-review in ${(Date.now() - startedAt) / 1000}s. Source: src/details-finalizer/index.js runRotationReview(). Playbook: src/shared/rotation-playbook.mjs (${PLAYBOOK.length} entries)._`);
 
@@ -2078,7 +2158,8 @@ async function runRotationReview(env, opts = {}) {
         // Under-rotation / under-delivery beyond noise level (the review runs
         // mid-window at 12:30 UTC, so a few not-yet-rotated SIMs are normal).
         || missedTotal > 25
-        || (deliveryGapsNow ?? 0) > 25;
+        || (deliveryGapsNow ?? 0) > 25
+        || stuckAgedCount > 0;
       const subject = urgent
         ? `🔧 Rotation Review ${today} — ${unclassified.length + humanReviewBuckets.reduce((n, b) => n + b.sims.length, 0)} need review`
         : `✅ Rotation Review ${today} — all clear`;
@@ -2092,6 +2173,8 @@ async function runRotationReview(env, opts = {}) {
         baseline: baseline ? { perVendor: baseline.perVendor, missed: missedTotal, teltik_due_now: baseline.teltikDueNow } : null,
         delivery_gaps: deliveryGapsNow,
         multi_day_count: multiDayFailures.length,
+        stuck_total: stuckRows.length,
+        stuck_aged: stuckAgedCount,
         breaker: breaker.trippedVendors(),
         pending_open: stillOpenCount,
         pending_new:  newPendingCreated,
