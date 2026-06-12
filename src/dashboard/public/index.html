@@ -130,9 +130,9 @@
                             100: 'rgb(var(--dark-100) / <alpha-value>)',
                         },
                         accent: {
-                            DEFAULT: '#2563EB',
-                            hover: '#1D4ED8',
-                            glow: 'rgba(37, 99, 235, 0.25)'
+                            DEFAULT: '#111827',
+                            hover: '#1F2937',
+                            glow: 'rgba(17, 24, 39, 0.25)'
                         },
                         signal: {
                             DEFAULT: '#CF4500',
@@ -534,21 +534,25 @@
     </style>
     <style>
         /* ====================================================================
-           OPERATIONS CONSOLE refresh (2026-06) — FINAL override layer.
-           Deep-blue accent, cool gray neutrals, flat professional surfaces.
-           This block must remain the LAST <style> in <head> so it wins the
-           cascade over the legacy cream/Mastercard layer above.
+           QUIET INK refresh (2026-06, pass 1) — FINAL override layer.
+           Near-monochrome light theme: ink primaries, gray neutrals, status
+           is the only color (muted). This block must remain the LAST <style>
+           in <head> so it wins the cascade over the legacy layers above.
            ==================================================================== */
         :root {
-            --ops-accent:       #2563EB;
-            --ops-accent-hover: #1D4ED8;
-            --ops-accent-soft:  #EFF4FF;
-            --ops-success:      #047857;
-            --ops-success-bg:   #ECFDF3;
+            --ops-accent:       #111827;  /* ink — primary action color */
+            --ops-accent-hover: #1F2937;
+            --ops-accent-soft:  #F2F4F7;  /* neutral tile / active nav bg */
+            --ops-soft-hover:   #F7F8FA;
+            --ops-icon:         #364152;  /* neutral icon ink */
+            --ops-link:         #2563EB;  /* true hyperlinks only */
+            --ops-focus:        rgba(17, 24, 39, 0.30);
+            --ops-success:      #15803D;
+            --ops-success-bg:   #F0FDF4;
             --ops-warning:      #B45309;
-            --ops-warning-bg:   #FFFAEB;
-            --ops-danger:       #B42318;
-            --ops-danger-bg:    #FEF3F2;
+            --ops-warning-bg:   #FFFBEB;
+            --ops-danger:       #B91C1C;
+            --ops-danger-bg:    #FEF2F2;
             --ops-card-shadow:  0 1px 2px rgba(16, 24, 40, 0.05);
             --ops-pop-shadow:   0 8px 24px rgba(16, 24, 40, 0.12);
         }
@@ -563,9 +567,9 @@
         p { font-weight: 400; }
         h1, h2, h3, h4 { letter-spacing: -0.02em; color: var(--mc-ink); }
         h1, h2 { font-weight: 600 !important; }
-        #page-title { font-weight: 600 !important; letter-spacing: -0.02em !important; }
-        ::selection { background: rgba(37, 99, 235, 0.18); color: var(--mc-ink); }
-        a:hover { color: var(--ops-accent); }
+        #page-title { font-size: 26px !important; font-weight: 600 !important; letter-spacing: -0.02em !important; }
+        ::selection { background: rgba(17, 24, 39, 0.12); color: var(--mc-ink); }
+        a:hover { color: var(--mc-ink); }
 
         /* ---- Scrollbars: thin, cool gray ---- */
         ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -573,15 +577,23 @@
         ::-webkit-scrollbar-thumb { background: #D0D5DD; border-radius: 999px; }
         ::-webkit-scrollbar-thumb:hover { background: #98A2B3; }
 
-        /* ---- Accent: deep blue everywhere the old accent appeared ---- */
+        /* ---- Accent demoted: ink is the primary action color ---- */
         .bg-accent { background-color: var(--ops-accent) !important; }
         .bg-accent:hover, .bg-accent[class*='hover:bg-']:hover { background-color: var(--ops-accent-hover) !important; }
         .text-accent { color: var(--ops-accent) !important; }
         .text-accent[class*='hover:text-']:hover { color: var(--ops-accent-hover) !important; }
+        a.text-accent:hover, .prose .text-accent:hover { text-decoration: underline; }
         .border-accent, [class*='focus:border-accent']:focus { border-color: var(--ops-accent) !important; }
         .bg-accent .text-white, .bg-accent.text-white { color: #ffffff !important; }
 
-        /* Blue family = primary intent (was remapped to ink by legacy layer) */
+        /* True hyperlinks keep a single blue (guide TOC, "view" links) */
+        .quiet-link { color: var(--ops-link) !important; font-weight: 500; }
+        .quiet-link:hover { color: var(--ops-link) !important; text-decoration: underline; }
+        #tab-guide a { color: var(--ops-link) !important; }
+        #tab-guide a:hover { color: var(--ops-link) !important; text-decoration: underline; }
+        a[href][class*='underline'] { color: var(--ops-link) !important; }
+
+        /* Blue/indigo family = primary intent → ink */
         .bg-blue-500, .bg-blue-600, .bg-blue-700, .bg-blue-800, .bg-blue-900,
         .bg-indigo-500, .bg-indigo-600, .bg-indigo-700, .bg-indigo-800
         { background-color: var(--ops-accent) !important; }
@@ -593,13 +605,24 @@
         { background-color: var(--ops-accent-soft) !important; }
         [class*='text-blue-'], [class*='text-indigo-'] { color: var(--ops-accent) !important; }
 
+        /* Decorative rainbow (purple/cyan/pink/violet/sky) → neutral ink/gray */
+        button[class*='bg-purple-'], button[class*='bg-violet-'], button[class*='bg-fuchsia-'],
+        button[class*='bg-cyan-'], button[class*='bg-sky-'], button[class*='bg-pink-']
+        { background-color: var(--ops-accent) !important; color: #ffffff !important; }
+        button[class*='bg-purple-']:hover, button[class*='bg-violet-']:hover, button[class*='bg-fuchsia-']:hover,
+        button[class*='bg-cyan-']:hover, button[class*='bg-sky-']:hover, button[class*='bg-pink-']:hover
+        { background-color: var(--ops-accent-hover) !important; }
+        [class*='text-purple-'], [class*='text-violet-'], [class*='text-fuchsia-'],
+        [class*='text-cyan-'], [class*='text-sky-'], [class*='text-pink-']
+        { color: var(--ops-icon) !important; }
+
         /* ---- Status colors: consistent tinted system ---- */
         .bg-green-500, .bg-green-600, .bg-green-700, .bg-green-800,
         .bg-emerald-500, .bg-emerald-600, .bg-emerald-700, .bg-emerald-800,
         .bg-teal-500, .bg-teal-600, .bg-teal-700, .bg-teal-800
         { background-color: var(--ops-success) !important; }
         [class*='hover:bg-green-']:hover, [class*='hover:bg-emerald-']:hover, [class*='hover:bg-teal-']:hover
-        { background-color: #065F46 !important; }
+        { background-color: #166534 !important; }
         [class*='bg-green-500/'], [class*='bg-green-600/'], [class*='bg-green-400/'],
         [class*='bg-emerald-500/'], [class*='bg-emerald-600/']
         { background-color: var(--ops-success-bg) !important; }
@@ -609,10 +632,29 @@
         .bg-rose-500, .bg-rose-600, .bg-rose-700, .bg-rose-800
         { background-color: var(--ops-danger) !important; }
         [class*='hover:bg-red-']:hover, [class*='hover:bg-rose-']:hover
-        { background-color: #912018 !important; }
+        { background-color: #991B1B !important; }
         [class*='bg-red-500/'], [class*='bg-red-600/'], [class*='bg-red-400/']
         { background-color: var(--ops-danger-bg) !important; }
         [class*='text-red-'], [class*='text-rose-'] { color: var(--ops-danger) !important; }
+
+        /* Destructive buttons: white w/ red text + red border by default; */
+        /* solid red is reserved for confirm modals (.fixed.inset-0). */
+        button[class*='bg-red-'], button[class*='bg-rose-'], .mc-btn-danger {
+            background-color: #FFFFFF !important;
+            color: var(--ops-danger) !important;
+            border: 1px solid rgba(185, 28, 28, 0.4) !important;
+        }
+        button[class*='bg-red-']:hover, button[class*='bg-rose-']:hover, .mc-btn-danger:hover {
+            background-color: var(--ops-danger-bg) !important;
+        }
+        .fixed.inset-0 button[class*='bg-red-'], .fixed.inset-0 button[class*='bg-rose-'],
+        .fixed.inset-0 .mc-btn-danger {
+            background-color: var(--ops-danger) !important;
+            color: #FFFFFF !important;
+            border: 0 !important;
+        }
+        .fixed.inset-0 button[class*='bg-red-']:hover, .fixed.inset-0 button[class*='bg-rose-']:hover,
+        .fixed.inset-0 .mc-btn-danger:hover { background-color: #991B1B !important; }
 
         .bg-yellow-500, .bg-yellow-600, .bg-yellow-700, .bg-yellow-800,
         .bg-amber-500, .bg-amber-600, .bg-amber-700, .bg-amber-800,
@@ -640,18 +682,18 @@
             transition: color 0.15s, background-color 0.15s;
         }
         .sidebar-btn:hover {
-            background-color: #F2F4F7 !important;
+            background-color: var(--ops-soft-hover) !important;
             color: var(--mc-ink) !important;
             transform: none !important;
         }
-        .sidebar-btn:focus-visible { outline: 2px solid var(--ops-accent); outline-offset: -2px; }
+        .sidebar-btn:focus-visible { outline: 2px solid var(--ops-focus); outline-offset: -2px; }
         .sidebar-btn.text-white {
             background-color: var(--ops-accent-soft) !important;
-            color: var(--ops-accent) !important;
-            border-left-color: var(--ops-accent) !important;
+            color: var(--mc-ink) !important;
+            border-left-color: transparent !important;
             font-weight: 600 !important;
         }
-        .sidebar-btn.text-white:hover { background-color: var(--ops-accent-soft) !important; color: var(--ops-accent) !important; }
+        .sidebar-btn.text-white:hover { background-color: var(--ops-accent-soft) !important; color: var(--mc-ink) !important; }
 
         /* ---- Radius scale: crisper console geometry ---- */
         .rounded-2xl { border-radius: 12px !important; }
@@ -685,7 +727,7 @@
         button:active, .btn:active { transform: none !important; }
         button:focus-visible, .btn:focus-visible, [role="button"]:focus-visible {
             outline: none !important;
-            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.35) !important;
+            box-shadow: 0 0 0 2px var(--ops-focus) !important;
         }
         button.bg-dark-700, button.bg-dark-800, button.bg-dark-600, button.bg-dark-500 {
             background-color: #FFFFFF !important;
@@ -714,7 +756,7 @@
         }
         input:focus, textarea:focus, select:focus {
             border-color: var(--ops-accent) !important;
-            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2) !important;
+            box-shadow: 0 0 0 2px var(--ops-focus) !important;
         }
         input[type="checkbox"], input[type="radio"] { accent-color: var(--ops-accent); }
 
@@ -745,6 +787,116 @@
             border: 1px solid var(--mc-hair) !important;
         }
         #toast.bg-dark-700, #toast.bg-dark-700 #toast-message { color: var(--mc-ink) !important; }
+
+        /* ---- Status badges: quiet pills (soft bg + muted colored text) ---- */
+        span.rounded-full[class*='px-'] {
+            display: inline-flex !important;
+            align-items: center;
+            font-size: 12px !important;
+            font-weight: 500 !important;
+            padding: 1px 8px !important;
+            border-radius: 999px !important;
+            line-height: 1.5;
+        }
+        /* Saturated badge fills → soft bg + colored text (counters, pills) */
+        span.rounded-full[class*='px-'].bg-red-500, span.rounded-full[class*='px-'].bg-red-600,
+        span.rounded-full[class*='px-'].bg-red-700, span.rounded-full[class*='px-'].bg-rose-500
+        { background-color: var(--ops-danger-bg) !important; color: var(--ops-danger) !important; }
+        span.rounded-full[class*='px-'].bg-amber-500, span.rounded-full[class*='px-'].bg-yellow-500,
+        span.rounded-full[class*='px-'].bg-yellow-600, span.rounded-full[class*='px-'].bg-orange-500
+        { background-color: var(--ops-warning-bg) !important; color: var(--ops-warning) !important; }
+        span.rounded-full[class*='px-'].bg-green-500, span.rounded-full[class*='px-'].bg-green-600,
+        span.rounded-full[class*='px-'].bg-emerald-500, span.rounded-full[class*='px-'].bg-emerald-600,
+        span.rounded-full[class*='px-'].bg-teal-600
+        { background-color: var(--ops-success-bg) !important; color: var(--ops-success) !important; }
+        span.rounded-full[class*='px-'][class*='bg-blue-'], span.rounded-full[class*='px-'][class*='bg-indigo-'],
+        span.rounded-full[class*='px-'][class*='bg-purple-'], span.rounded-full[class*='px-'][class*='bg-slate-'],
+        span.rounded-full[class*='px-'][class*='bg-cyan-'], span.rounded-full[class*='px-'][class*='bg-violet-']
+        { background-color: var(--ops-accent-soft) !important; color: var(--ops-icon) !important; }
+
+        /* ---- Neutral icon tiles (stat cards, action grids) ---- */
+        .quiet-tile { background-color: var(--ops-accent-soft) !important; }
+        .quiet-tile svg, .quiet-tile { color: var(--ops-icon) !important; }
+
+        /* ---- Dashboard stat cards: plain 28px numbers, 12px gray labels ---- */
+        #tab-dashboard .stat-num {
+            font-size: 28px;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            color: var(--mc-ink) !important;
+        }
+
+        /* ---- Quiet action containers: neutralize the icon-tile rainbow ---- */
+        .quiet-actions > button {
+            background-color: #FFFFFF !important;
+            border: 1px solid var(--mc-hair) !important;
+            color: var(--mc-ink) !important;
+        }
+        .quiet-actions > button:hover { background-color: var(--ops-soft-hover) !important; }
+        .quiet-actions button div[class*='bg-'] { background-color: var(--ops-accent-soft) !important; }
+        .quiet-actions button svg { color: var(--ops-icon) !important; }
+        .quiet-actions button span, .quiet-actions button p { color: var(--mc-ink) !important; }
+        .quiet-actions button span { font-size: 13px; }
+        .quiet-actions button p[class*='text-gray-'], .quiet-actions button p.text-xs { color: var(--mc-mute) !important; font-size: 12px; }
+        /* Bulk-bar colored buttons → neutral chips (red = destructive, stays white/red) */
+        .quiet-actions button[class*='bg-blue-'], .quiet-actions button[class*='bg-indigo-'],
+        .quiet-actions button[class*='bg-purple-'], .quiet-actions button[class*='bg-violet-'],
+        .quiet-actions button[class*='bg-cyan-'], .quiet-actions button[class*='bg-teal-'],
+        .quiet-actions button[class*='bg-pink-'], .quiet-actions button[class*='bg-orange-'],
+        .quiet-actions button[class*='bg-rose-'], .quiet-actions button[class*='bg-green-'],
+        .quiet-actions button[class*='bg-emerald-'], .quiet-actions button[class*='bg-yellow-'],
+        .quiet-actions button[class*='bg-amber-'], .quiet-actions button[class*='bg-gray-'] {
+            background-color: var(--ops-accent-soft) !important;
+            color: var(--ops-icon) !important;
+            border: 1px solid var(--mc-hair) !important;
+        }
+        .quiet-actions button[class*='bg-blue-']:hover, .quiet-actions button[class*='bg-indigo-']:hover,
+        .quiet-actions button[class*='bg-purple-']:hover, .quiet-actions button[class*='bg-violet-']:hover,
+        .quiet-actions button[class*='bg-cyan-']:hover, .quiet-actions button[class*='bg-teal-']:hover,
+        .quiet-actions button[class*='bg-pink-']:hover, .quiet-actions button[class*='bg-orange-']:hover,
+        .quiet-actions button[class*='bg-rose-']:hover, .quiet-actions button[class*='bg-green-']:hover,
+        .quiet-actions button[class*='bg-emerald-']:hover, .quiet-actions button[class*='bg-yellow-']:hover,
+        .quiet-actions button[class*='bg-amber-']:hover, .quiet-actions button[class*='bg-gray-']:hover {
+            background-color: #E9ECF1 !important;
+        }
+        .quiet-actions button[class*='bg-red-'] {
+            background-color: #FFFFFF !important;
+            color: var(--ops-danger) !important;
+            border: 1px solid rgba(185, 28, 28, 0.4) !important;
+        }
+        .quiet-actions button[class*='bg-red-']:hover { background-color: var(--ops-danger-bg) !important; }
+
+        /* ---- SIMs bulk bar: "More" popover ---- */
+        #sim-more-btn {
+            background-color: #FFFFFF !important;
+            border: 1px solid var(--mc-hair) !important;
+            color: var(--mc-ink) !important;
+        }
+        #sim-more-btn:hover { background-color: var(--ops-soft-hover) !important; }
+        #sim-more-menu {
+            background-color: #FFFFFF !important;
+            border: 1px solid var(--mc-hair) !important;
+            box-shadow: var(--ops-pop-shadow) !important;
+        }
+        #sim-more-menu button {
+            display: block;
+            width: 100%;
+            text-align: left;
+            padding: 8px 12px;
+            font-size: 13px !important;
+            color: var(--mc-ink) !important;
+            background-color: transparent !important;
+            border: 0 !important;
+            border-radius: 6px;
+        }
+        #sim-more-menu button:hover { background-color: #F7F8FA !important; }
+
+        /* ---- Port grid: muted status palette ---- */
+        .pg-registered  { background-color: #15803D !important; }
+        .pg-registering { background-color: #B45309 !important; }
+        .pg-idle        { background-color: #94A3B8 !important; }
+        .pg-error       { background-color: #B91C1C !important; }
+        .pg-nobal       { background-color: #6B7280 !important; }
     </style>
 </head>
 <body class="bg-cream text-ink min-h-screen selection:bg-signal/20 tracking-tight overflow-x-hidden" style="background-color:#F6F7F9;">
@@ -864,91 +1016,84 @@
                         <svg id="theme-icon-moon" class="w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
                     </button>
                     <span id="last-updated" class="text-xs" style="color:var(--mc-mute);"></span>
-                    <span class="inline-flex items-center gap-2 py-1.5 px-3" style="background:var(--mc-paper);border:1px solid var(--mc-hair);border-radius:999px;font-size:12px;font-weight:500;color:var(--mc-ink);">
-                      <span class="w-1.5 h-1.5 rounded-full animate-pulse" style="background:#15803d;"></span>
-                      <span>Connected</span>
-                    </span>
                 </div>
             </header>
 
             <!-- Dashboard Tab -->
             <div id="tab-dashboard" class="tab-content">
-                <!-- Stats Cards -->
-                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-                    <!-- Total SIMs -->
-                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
-                        <div class="flex items-center justify-between mb-3">
-                            <span class="text-sm text-gray-400">Total SIMs</span>
-                            <div class="w-8 h-8 rounded-lg bg-blue-500/20 flex items-center justify-center">
-                                <svg class="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
-                            </div>
-                        </div>
-                        <p class="text-3xl font-bold text-white" id="total-sims">-</p>
-                    </div>
-
-                    <!-- Active SIMs with Ring -->
-                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
-                        <div class="flex items-center justify-between">
-                            <div>
-                                <span class="text-sm text-gray-400">Active SIMs</span>
-                                <p class="text-3xl font-bold text-white mt-2" id="active-sims">-</p>
-                            </div>
-                            <div class="relative">
-                                <svg class="progress-ring w-16 h-16" viewBox="0 0 60 60">
-                                    <circle class="text-dark-600" stroke="currentColor" stroke-width="6" fill="none" cx="30" cy="30" r="26"/>
-                                    <circle id="active-ring" class="progress-ring__circle text-accent" stroke="currentColor" stroke-width="6" fill="none" cx="30" cy="30" r="26" stroke-dasharray="163.36" stroke-dashoffset="163.36" stroke-linecap="round"/>
-                                </svg>
-                                <span id="active-percent" class="absolute inset-0 flex items-center justify-center text-xs font-semibold text-accent">0%</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Provisioning -->
-                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
-                        <div class="flex items-center justify-between mb-3">
-                            <span class="text-sm text-gray-400">Provisioning</span>
-                            <div class="w-8 h-8 rounded-lg bg-yellow-500/20 flex items-center justify-center">
-                                <svg class="w-4 h-4 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                            </div>
-                        </div>
-                        <p class="text-3xl font-bold text-white" id="provisioning-sims">-</p>
-                    </div>
-
-                    <!-- Messages 24h -->
-                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
-                        <div class="flex items-center justify-between mb-3">
-                            <span class="text-sm text-gray-400">Messages (24h)</span>
-                            <div class="w-8 h-8 rounded-lg bg-purple-500/20 flex items-center justify-center">
-                                <svg class="w-4 h-4 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
-                            </div>
-                        </div>
-                        <p class="text-3xl font-bold text-white" id="messages-24h">-</p>
-                    </div>
-                </div>
-
-                <!-- Notification Freshness -->
+                <!-- Rotation Freshness -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <div class="flex items-center justify-between mb-4">
                         <div>
                             <h3 class="text-sm font-medium text-gray-300">Rotation Freshness</h3>
                             <p class="text-xs text-gray-500 mt-0.5">Current number confirmed by client (rental ID) &mdash; AT&amp;T within 24h, T-Mobile within 48h</p>
                         </div>
-                        <span id="freshness-summary" class="text-xs text-gray-500"></span>
+                        <div class="flex items-center gap-3">
+                            <span id="freshness-summary" class="text-xs text-gray-500"></span>
+                            <a href="/rotation-reviews" onclick="event.preventDefault();switchTab('rotation-reviews')" class="quiet-link text-xs whitespace-nowrap">Open Rotation Health &rarr;</a>
+                        </div>
                     </div>
                     <div id="freshness-rows" class="space-y-1.5 text-sm text-gray-300">
                         <div class="text-gray-500 text-xs">Loading&hellip;</div>
                     </div>
                 </div>
 
-                <!-- SIM Charts -->
+                <!-- Stats Cards -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                    <!-- Total SIMs -->
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-xs text-gray-500">Total SIMs</span>
+                            <div class="w-8 h-8 rounded-lg quiet-tile flex items-center justify-center">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
+                            </div>
+                        </div>
+                        <p class="stat-num text-white" id="total-sims">-</p>
+                    </div>
+
+                    <!-- Active SIMs -->
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-xs text-gray-500">Active SIMs</span>
+                            <div class="w-8 h-8 rounded-lg quiet-tile flex items-center justify-center">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            </div>
+                        </div>
+                        <p class="stat-num text-white" id="active-sims">-</p>
+                    </div>
+
+                    <!-- Provisioning -->
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-xs text-gray-500">Provisioning</span>
+                            <div class="w-8 h-8 rounded-lg quiet-tile flex items-center justify-center">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            </div>
+                        </div>
+                        <p class="stat-num text-white" id="provisioning-sims">-</p>
+                    </div>
+
+                    <!-- Messages 24h -->
+                    <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
+                        <div class="flex items-center justify-between mb-3">
+                            <span class="text-xs text-gray-500">Messages (24h)</span>
+                            <div class="w-8 h-8 rounded-lg quiet-tile flex items-center justify-center">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
+                            </div>
+                        </div>
+                        <p class="stat-num text-white" id="messages-24h">-</p>
+                    </div>
+                </div>
+
+                <!-- SIM Breakdowns -->
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
                     <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
                         <h3 class="text-sm font-medium text-gray-400 mb-4">SIMs by Status</h3>
-                        <canvas id="dash-status-chart" height="220"></canvas>
+                        <div id="dash-status-chart"></div>
                     </div>
                     <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
                         <h3 class="text-sm font-medium text-gray-400 mb-4">SIMs by Vendor</h3>
-                        <canvas id="dash-vendor-chart" height="220"></canvas>
+                        <div id="dash-vendor-chart"></div>
                     </div>
                 </div>
 
@@ -957,7 +1102,7 @@
                     <div class="px-5 py-4 border-b border-dark-600">
                         <h2 class="text-lg font-semibold text-white">Quick Actions</h2>
                     </div>
-                    <div class="p-5 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+                    <div class="quiet-actions p-5 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
                         <button onclick="showActivateModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
                             <div class="w-10 h-10 rounded-lg bg-blue-500/20 flex items-center justify-center group-hover:bg-blue-500/30 transition">
                                 <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
@@ -1007,7 +1152,7 @@
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
                         <h2 class="text-lg font-semibold text-white">Recent Messages</h2>
-                        <button onclick="switchTab('messages')" class="text-xs text-accent hover:text-green-400 transition">View All</button>
+                        <a href="/messages" onclick="event.preventDefault();switchTab('messages')" class="quiet-link text-xs">All messages &rarr;</a>
                     </div>
                     <div class="overflow-x-auto">
                         <table class="w-full">
@@ -1029,22 +1174,27 @@
 
             <!-- SIMs Tab -->
             <div id="tab-sims" class="tab-content hidden">
-                <div id="sim-action-bar" class="hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
+                <div id="sim-action-bar" class="quiet-actions hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
                     <span id="sim-selected-count" class="text-sm text-gray-300">0 selected</span>
-                    <button onclick="bulkSimAction('ota_refresh')" class="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">OTA Refresh</button>
-                    <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition">Rotate MDN</button>
-                    <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Fix SIM</button>
-                    <button onclick="showBulkResellerActionModal()" class="px-3 py-1.5 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition">Reseller…</button>
-                    <button onclick="showBulkCancelChoiceModal()" class="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 text-white rounded transition">Cancel…</button>
-                    <button onclick="showBulkResumeChoiceModal()" class="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">Resume…</button>
-                    <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition">Send Online</button>
-                    <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs bg-teal-600 hover:bg-teal-700 text-white rounded transition">Send SMS</button>
-                    <button onclick="bulkResetToProvisioning()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition">Re-finalize</button>
-                    <button onclick="bulkModifyImei()" class="px-3 py-1.5 text-xs bg-violet-600 hover:bg-violet-700 text-white rounded transition">Modify IMEI</button>
-                    <button onclick="showBulkSetStatusModal()" class="px-3 py-1.5 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition">Set Status</button>
-                    <button onclick="bulkQuery()" class="px-3 py-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 text-white rounded transition">Query</button>
-                    <button onclick="bulkRetryActivation()" class="px-3 py-1.5 text-xs bg-pink-600 hover:bg-pink-700 text-white rounded transition">Retry Activation</button>
-                    <button onclick="bulkDeleteSims()" class="px-3 py-1.5 text-xs bg-red-700 hover:bg-red-800 text-white rounded transition">Delete SIMs</button>
+                    <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs rounded transition">Rotate MDN</button>
+                    <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs rounded transition">Fix SIM</button>
+                    <button onclick="bulkQuery()" class="px-3 py-1.5 text-xs rounded transition">Query</button>
+                    <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs rounded transition">Send Online</button>
+                    <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs rounded transition">Send SMS</button>
+                    <div class="relative">
+                        <button id="sim-more-btn" onclick="toggleSimMoreMenu()" class="px-3 py-1.5 text-xs rounded transition">More &#9662;</button>
+                        <div id="sim-more-menu" class="hidden absolute left-0 top-full mt-1 w-48 rounded-lg z-50 py-1">
+                            <button onclick="bulkSimAction('ota_refresh')">OTA Refresh</button>
+                            <button onclick="bulkResetToProvisioning()">Re-finalize</button>
+                            <button onclick="bulkRetryActivation()">Retry Activation</button>
+                            <button onclick="bulkModifyImei()">Modify IMEI</button>
+                            <button onclick="showBulkSetStatusModal()">Set Status&hellip;</button>
+                            <button onclick="showBulkResellerActionModal()">Reseller&hellip;</button>
+                            <button onclick="showBulkCancelChoiceModal()">Cancel&hellip;</button>
+                            <button onclick="showBulkResumeChoiceModal()">Resume&hellip;</button>
+                        </div>
+                    </div>
+                    <button onclick="bulkDeleteSims()" class="ml-auto px-3 py-1.5 text-xs bg-red-700 hover:bg-red-800 text-white rounded transition">Delete SIMs</button>
                 </div>
                 <div id="rotation-audit-widget" class="hidden mb-4 p-4 bg-dark-800 rounded-xl border border-dark-600 flex flex-wrap items-center gap-4">
                     <div class="flex flex-col min-w-0">
@@ -1187,7 +1337,7 @@
                     <div class="px-5 py-4 border-b border-dark-600">
                         <h2 class="text-lg font-semibold text-white">Worker Controls</h2>
                     </div>
-                    <div class="p-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <div class="quiet-actions p-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                         <button onclick="runWorker('bulk-activator')" class="flex items-center gap-4 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition text-left">
                             <div class="w-12 h-12 rounded-lg bg-blue-500/20 flex items-center justify-center flex-shrink-0">
                                 <svg class="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path></svg>
@@ -1318,11 +1468,11 @@
                     <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
                         <h2 class="text-lg font-semibold text-white">Port Status</h2>
                         <div class="flex items-center gap-3 text-xs text-gray-500">
-                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-green-500 inline-block"></span> Registered</span>
-                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-yellow-500 inline-block"></span> Registering</span>
-                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-blue-500 inline-block"></span> Idle</span>
-                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-red-500 inline-block"></span> Error/No SIM</span>
-                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-orange-500 inline-block"></span> No Balance</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded pg-registered inline-block"></span> Registered</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded pg-registering inline-block"></span> Registering</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded pg-idle inline-block"></span> Idle</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded pg-error inline-block"></span> Error/No SIM</span>
+                            <span class="flex items-center gap-1"><span class="w-3 h-3 rounded pg-nobal inline-block"></span> No Balance</span>
                         </div>
                         <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none ml-3">
                             <input id="show-defective-slots" type="checkbox" onchange="onShowDefectiveSlotsToggle()" class="w-3.5 h-3.5 accent-accent">
@@ -1352,7 +1502,7 @@
                     <div class="px-5 py-4 border-b border-dark-600">
                         <h2 class="text-lg font-semibold text-white">Gateway Actions</h2>
                     </div>
-                    <div class="p-5 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+                    <div class="quiet-actions p-5 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
                         <button onclick="showGwSwitchSimModal()" class="flex flex-col items-center gap-2 p-4 rounded-lg bg-dark-700 hover:bg-dark-600 border border-dark-500 transition group">
                             <div class="w-10 h-10 rounded-lg bg-purple-500/20 flex items-center justify-center group-hover:bg-purple-500/30 transition">
                                 <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
@@ -1457,24 +1607,24 @@
                 <!-- Stats Row -->
                 <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
                     <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400" title="Total number of SIM slots across all gateways">Slots</span>
-                        <p class="text-2xl font-bold text-purple-400" id="imei-slots">-</p>
+                        <span class="text-xs text-gray-500" title="Total number of SIM slots across all gateways">Slots</span>
+                        <p class="text-2xl font-bold" style="color:#0B1220;" id="imei-slots">-</p>
                     </div>
                     <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400" title="IMEIs currently assigned to a gateway slot">In Use</span>
-                        <p class="text-2xl font-bold text-blue-400" id="imei-in-use">-</p>
+                        <span class="text-xs text-gray-500" title="IMEIs currently assigned to a gateway slot">In Use</span>
+                        <p class="text-2xl font-bold" style="color:#0B1220;" id="imei-in-use">-</p>
                     </div>
                     <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400" title="Stock IMEIs ready for future assignment">Available</span>
-                        <p class="text-2xl font-bold text-accent" id="imei-available">-</p>
+                        <span class="text-xs text-gray-500" title="Stock IMEIs ready for future assignment">Available</span>
+                        <p class="text-2xl font-bold" style="color:#0B1220;" id="imei-available">-</p>
                     </div>
                     <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400" title="IMEIs rejected by carrier, will not be reused">Retired</span>
-                        <p class="text-2xl font-bold text-gray-500" id="imei-retired">-</p>
+                        <span class="text-xs text-gray-500" title="IMEIs rejected by carrier, will not be reused">Retired</span>
+                        <p class="text-2xl font-bold" style="color:#0B1220;" id="imei-retired">-</p>
                     </div>
                     <div class="bg-dark-800 rounded-xl p-4 border border-dark-600">
-                        <span class="text-sm text-gray-400" title="Total IMEIs in the database">Total IMEIs</span>
-                        <p class="text-2xl font-bold text-white" id="imei-total">-</p>
+                        <span class="text-xs text-gray-500" title="Total IMEIs in the database">Total IMEIs</span>
+                        <p class="text-2xl font-bold" style="color:#0B1220;" id="imei-total">-</p>
                     </div>
                 </div>
 
@@ -1522,7 +1672,7 @@
                 <!-- Error Summary -->
                 <div id="error-summary" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6"></div>
                 <!-- Bulk Action Bar -->
-                <div id="error-action-bar" class="hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
+                <div id="error-action-bar" class="quiet-actions hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
                     <span id="error-selected-count" class="text-sm text-gray-300">0 selected</span>
                     <button onclick="bulkResolveErrors()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-600 text-white rounded transition">Mark Resolved</button>
                     <button onclick="bulkErrorAction('ota_refresh')" class="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">OTA Refresh</button>
@@ -1589,17 +1739,6 @@
                     <div id="rotation-health-body"><p class="text-sm text-dark-400">Loading...</p></div>
                 </div>
 
-                <div class="flex items-center justify-between mb-6">
-                    <div class="flex items-center gap-3">
-                        <h2 class="text-xl font-bold text-white">Rotation Health</h2>
-                        <span id="review-status-pill" class="text-xs px-2 py-1 rounded-full bg-dark-700 text-dark-300">idle</span>
-                    </div>
-                    <button onclick="runReviewNow()" id="run-review-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-700 text-white rounded-lg transition flex items-center gap-2">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-                        Run review now
-                    </button>
-                </div>
-
                 <!-- Pending operator items -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <div class="flex items-center justify-between mb-4">
@@ -1626,6 +1765,17 @@
                             <button onclick="askAgent(true)" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-700 text-white rounded">Save + run now</button>
                         </div>
                     </div>
+                </div>
+
+                <div class="flex items-center justify-between mb-6">
+                    <div class="flex items-center gap-3">
+                        <h2 class="text-xl font-bold text-white">Rotation Health</h2>
+                        <span id="review-status-pill" class="text-xs px-2 py-1 rounded-full bg-dark-700 text-dark-300">idle</span>
+                    </div>
+                    <button onclick="runReviewNow()" id="run-review-btn" class="px-4 py-2 text-sm bg-accent hover:bg-green-700 text-white rounded-lg transition flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                        Run review now
+                    </button>
                 </div>
 
                 <!-- Last 10 reviews table -->
@@ -1847,6 +1997,104 @@
                     <h2 class="text-xl font-bold text-white">Invoicing</h2>
                 </div>
 
+                <!-- Invoice Generator -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Generate Invoice</h3>
+                    <div class="flex flex-wrap items-end gap-3 mb-4">
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">Reseller</label>
+                            <select id="invoice-reseller" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 min-w-40">
+                                <option value="">-- Select Reseller --</option>
+                            </select>
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">From</label>
+                            <input type="date" id="invoice-start" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        </div>
+                        <div class="flex flex-col gap-1">
+                            <label class="text-xs text-gray-500 uppercase">To</label>
+                            <input type="date" id="invoice-end" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        </div>
+                        <button onclick="previewInvoices()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Preview</button>
+                        <button onclick="downloadInvoiceIIF()" id="download-invoice-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Download for QuickBooks</button>
+                    </div>
+                    <div id="invoice-preview" class="text-gray-400 text-sm"></div>
+                </div>
+
+                <!-- Invoice History -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <h3 class="text-lg font-semibold text-white mb-3">Invoice History</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium">Customer</th>
+                                    <th class="px-4 py-3 font-medium">Period</th>
+                                    <th class="px-4 py-3 font-medium">SIM-days</th>
+                                    <th class="px-4 py-3 font-medium">Total</th>
+                                    <th class="px-4 py-3 font-medium">Status</th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="invoice-history-table" class="text-sm">
+                                <tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Customer Mapping -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-semibold text-white">Customer Rates</h3>
+                        <button onclick="showAddMappingModal()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add</button>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-4 py-3 font-medium">Reseller</th>
+                                    <th class="px-4 py-3 font-medium">Customer Name</th>
+                                    <th class="px-4 py-3 font-medium">Daily Rate</th>
+                                    <th class="px-4 py-3 font-medium">Active SIMs</th>
+                                    <th class="px-4 py-3 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mapping-table" class="text-sm">
+                                <tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Volume Pricing Rules -->
+                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-lg font-semibold text-white">Volume Pricing Rules</h3>
+                        <button onclick="showAddResellerRateModal()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add Rule</button>
+                    </div>
+                    <p class="text-sm text-gray-400 mb-4">Override the flat Customer Rate above with time-bounded, volume-tiered selling prices per reseller. All-at-rate: whatever tier the daily SIM count falls in determines the rate for ALL units that day. AT&amp;T tiers are per SIM-day; Teltik tiers are per block (rental). Adding a new rule auto-closes the prior open rule for the same (reseller, vendor).</p>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
+                                    <th class="px-3 py-2 font-medium">Reseller</th>
+                                    <th class="px-3 py-2 font-medium">Vendor</th>
+                                    <th class="px-3 py-2 font-medium">Tiers</th>
+                                    <th class="px-3 py-2 font-medium">Effective From</th>
+                                    <th class="px-3 py-2 font-medium">Effective To</th>
+                                    <th class="px-3 py-2 font-medium">Status</th>
+                                    <th class="px-3 py-2 font-medium">Notes</th>
+                                    <th class="px-3 py-2 font-medium">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="reseller-rates-table" class="text-gray-200">
+                                <tr><td colspan="8" class="px-3 py-3 text-center text-gray-500">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
                 <!-- SIM Utilization Audit -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <div class="flex items-center justify-between mb-3">
@@ -1906,62 +2154,10 @@
                     </div>
                 </div>
 
-                <!-- Customer Mapping -->
-                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
-                    <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-semibold text-white">Customer Rates</h3>
-                        <button onclick="showAddMappingModal()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add</button>
-                    </div>
-                    <div class="overflow-x-auto">
-                        <table class="w-full">
-                            <thead>
-                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
-                                    <th class="px-4 py-3 font-medium">Reseller</th>
-                                    <th class="px-4 py-3 font-medium">Customer Name</th>
-                                    <th class="px-4 py-3 font-medium">Daily Rate</th>
-                                    <th class="px-4 py-3 font-medium">Active SIMs</th>
-                                    <th class="px-4 py-3 font-medium">Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody id="mapping-table" class="text-sm">
-                                <tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <!-- Volume Pricing Rules -->
-                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
-                    <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-semibold text-white">Volume Pricing Rules</h3>
-                        <button onclick="showAddResellerRateModal()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">+ Add Rule</button>
-                    </div>
-                    <p class="text-sm text-gray-400 mb-4">Override the flat Customer Rate above with time-bounded, volume-tiered selling prices per reseller. All-at-rate: whatever tier the daily SIM count falls in determines the rate for ALL units that day. AT&amp;T tiers are per SIM-day; Teltik tiers are per block (rental). Adding a new rule auto-closes the prior open rule for the same (reseller, vendor).</p>
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-sm">
-                            <thead>
-                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
-                                    <th class="px-3 py-2 font-medium">Reseller</th>
-                                    <th class="px-3 py-2 font-medium">Vendor</th>
-                                    <th class="px-3 py-2 font-medium">Tiers</th>
-                                    <th class="px-3 py-2 font-medium">Effective From</th>
-                                    <th class="px-3 py-2 font-medium">Effective To</th>
-                                    <th class="px-3 py-2 font-medium">Status</th>
-                                    <th class="px-3 py-2 font-medium">Notes</th>
-                                    <th class="px-3 py-2 font-medium">Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody id="reseller-rates-table" class="text-gray-200">
-                                <tr><td colspan="8" class="px-3 py-3 text-center text-gray-500">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-
                 <!-- Reseller API Keys -->
                 <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
                     <div class="flex items-center justify-between mb-3">
-                        <h3 class="text-lg font-semibold text-white">Reseller API Keys</h3>
+                        <h3 class="text-lg font-semibold text-white">Reseller access</h3>
                     </div>
                     <p class="text-xs text-gray-500 mb-4">Generate a key per reseller to grant read-only access to the customer portal at <span class="text-gray-300">portal.incoming-sms.com</span>. Each key shows full data scoped to that reseller only.</p>
                     <div class="flex flex-wrap items-end gap-3 mb-4">
@@ -2026,52 +2222,6 @@
                             </thead>
                             <tbody id="reseller-keys-table" class="text-sm">
                                 <tr><td colspan="5" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <!-- Invoice Generator -->
-                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600 mb-6">
-                    <h3 class="text-lg font-semibold text-white mb-3">Generate Invoice</h3>
-                    <div class="flex flex-wrap items-end gap-3 mb-4">
-                        <div class="flex flex-col gap-1">
-                            <label class="text-xs text-gray-500 uppercase">Reseller</label>
-                            <select id="invoice-reseller" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 min-w-40">
-                                <option value="">-- Select Reseller --</option>
-                            </select>
-                        </div>
-                        <div class="flex flex-col gap-1">
-                            <label class="text-xs text-gray-500 uppercase">From</label>
-                            <input type="date" id="invoice-start" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
-                        </div>
-                        <div class="flex flex-col gap-1">
-                            <label class="text-xs text-gray-500 uppercase">To</label>
-                            <input type="date" id="invoice-end" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
-                        </div>
-                        <button onclick="previewInvoices()" class="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Preview</button>
-                        <button onclick="downloadInvoiceIIF()" id="download-invoice-btn" class="hidden px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Download for QuickBooks</button>
-                    </div>
-                    <div id="invoice-preview" class="text-gray-400 text-sm"></div>
-                </div>
-
-                <!-- Invoice History -->
-                <div class="bg-dark-800 rounded-xl p-5 border border-dark-600">
-                    <h3 class="text-lg font-semibold text-white mb-3">Invoice History</h3>
-                    <div class="overflow-x-auto">
-                        <table class="w-full">
-                            <thead>
-                                <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600">
-                                    <th class="px-4 py-3 font-medium">Customer</th>
-                                    <th class="px-4 py-3 font-medium">Period</th>
-                                    <th class="px-4 py-3 font-medium">SIM-days</th>
-                                    <th class="px-4 py-3 font-medium">Total</th>
-                                    <th class="px-4 py-3 font-medium">Status</th>
-                                    <th class="px-4 py-3 font-medium">Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody id="invoice-history-table" class="text-sm">
-                                <tr><td colspan="6" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -4806,59 +4956,55 @@ set verify_pending; schedule §C.3 poll
         }
 
         function updateActiveRing(active, total) {
+            // Progress ring removed in the quiet-ink redesign; Active SIMs is a plain number.
+            const ring = document.getElementById('active-ring');
+            const pct = document.getElementById('active-percent');
+            if (!ring || !pct) return;
             const percent = total > 0 ? Math.round((active / total) * 100) : 0;
             const circumference = 163.36;
             const offset = circumference - (percent / 100) * circumference;
-            document.getElementById('active-ring').style.strokeDashoffset = offset;
-            document.getElementById('active-percent').textContent = percent + '%';
+            ring.style.strokeDashoffset = offset;
+            pct.textContent = percent + '%';
         }
 
         function renderDashboardCharts(data) {
-            var donutOpts = {
-                responsive: true,
-                cutout: '65%',
-                plugins: {
-                    legend: { position: 'bottom', labels: { color: '#5B6472', font: { size: 11 }, padding: 12 } }
+            // Quiet HTML breakdowns (replaced the Chart.js doughnuts).
+            if (window._dashStatusChart) { try { window._dashStatusChart.destroy(); } catch (e) {} window._dashStatusChart = null; }
+            if (window._dashVendorChart) { try { window._dashVendorChart.destroy(); } catch (e) {} window._dashVendorChart = null; }
+            function renderBreakdown(elId, rows) {
+                var el = document.getElementById(elId);
+                if (!el) return;
+                var total = rows.reduce(function(sum, r) { return sum + r.value; }, 0);
+                if (!total) {
+                    el.innerHTML = '<div class="text-xs text-gray-500">No data</div>';
+                    return;
                 }
-            };
-            var statusCtx = document.getElementById('dash-status-chart');
-            if (statusCtx) {
-                if (window._dashStatusChart) window._dashStatusChart.destroy();
-                window._dashStatusChart = new Chart(statusCtx, {
-                    type: 'doughnut',
-                    data: {
-                        labels: ['Active', 'Provisioning', 'Suspended', 'Error'],
-                        datasets: [{
-                            data: [
-                                data.active_sims || 0, data.provisioning_sims || 0,
-                                data.suspended_sims || 0, data.error_sims || 0
-                            ],
-                            backgroundColor: ['#047857', '#F59E0B', '#B45309', '#B42318'],
-                            borderWidth: 0
-                        }]
-                    },
-                    options: donutOpts
-                });
+                el.innerHTML = rows.map(function(r) {
+                    var pct = (r.value / total) * 100;
+                    var fill = r.color || '#94A3B8';
+                    return '<div class="mb-3">' +
+                        '<div class="flex items-center justify-between" style="font-size:13px;color:#364152;">' +
+                            '<span>' + r.label + '</span>' +
+                            '<span class="font-mono" style="color:#111827;">' + r.value + '</span>' +
+                        '</div>' +
+                        '<div style="height:4px;width:100%;background:#F2F4F7;border-radius:999px;margin-top:6px;overflow:hidden;">' +
+                            '<div style="height:4px;width:' + pct.toFixed(1) + '%;background:' + fill + ';border-radius:999px;"></div>' +
+                        '</div>' +
+                    '</div>';
+                }).join('');
             }
-            var vendorCtx = document.getElementById('dash-vendor-chart');
-            if (vendorCtx) {
-                if (window._dashVendorChart) window._dashVendorChart.destroy();
-                window._dashVendorChart = new Chart(vendorCtx, {
-                    type: 'doughnut',
-                    data: {
-                        labels: ['ATOMIC', 'Teltik', 'Wing IoT', 'Helix'],
-                        datasets: [{
-                            data: [
-                                data.vendor_atomic || 0, data.vendor_teltik || 0,
-                                data.vendor_wing_iot || 0, data.vendor_helix || 0
-                            ],
-                            backgroundColor: ['#2563EB', '#7C3AED', '#047857', '#94A3B8'],
-                            borderWidth: 0
-                        }]
-                    },
-                    options: donutOpts
-                });
-            }
+            renderBreakdown('dash-status-chart', [
+                { label: 'Active',       value: data.active_sims || 0,       color: '#15803D' },
+                { label: 'Provisioning', value: data.provisioning_sims || 0, color: '#94A3B8' },
+                { label: 'Suspended',    value: data.suspended_sims || 0,    color: '#B91C1C' },
+                { label: 'Error',        value: data.error_sims || 0,        color: '#B91C1C' }
+            ]);
+            renderBreakdown('dash-vendor-chart', [
+                { label: 'ATOMIC',   value: data.vendor_atomic || 0,   color: '#94A3B8' },
+                { label: 'Teltik',   value: data.vendor_teltik || 0,   color: '#94A3B8' },
+                { label: 'Wing IoT', value: data.vendor_wing_iot || 0, color: '#94A3B8' },
+                { label: 'Helix',    value: data.vendor_helix || 0,    color: '#94A3B8' }
+            ]);
         }
 
         async function loadData() {
@@ -6561,19 +6707,19 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         const PORT_STATUS_COLORS = {
-            0: { bg: 'bg-red-500', label: 'No SIM' },
-            1: { bg: 'bg-blue-500', label: 'Idle' },
-            2: { bg: 'bg-yellow-500', label: 'Registering' },
-            3: { bg: 'bg-green-500', label: 'Registered' },
-            4: { bg: 'bg-green-400', label: 'Call' },
-            5: { bg: 'bg-orange-500', label: 'No Balance' },
-            6: { bg: 'bg-red-500', label: 'Reg Failed' },
+            0: { bg: 'pg-error', label: 'No SIM' },
+            1: { bg: 'pg-idle', label: 'Idle' },
+            2: { bg: 'pg-registering', label: 'Registering' },
+            3: { bg: 'pg-registered', label: 'Registered' },
+            4: { bg: 'pg-registered', label: 'Call' },
+            5: { bg: 'pg-nobal', label: 'No Balance' },
+            6: { bg: 'pg-error', label: 'Reg Failed' },
             7: { bg: 'bg-gray-500', label: 'Dev Locked' },
             8: { bg: 'bg-gray-500', label: 'Op Locked' },
-            9: { bg: 'bg-red-600', label: 'SIM Error' },
+            9: { bg: 'pg-error', label: 'SIM Error' },
             12: { bg: 'bg-gray-500', label: 'User Locked' },
-            15: { bg: 'bg-blue-400', label: 'Mobile Net' },
-            16: { bg: 'bg-red-500', label: 'Timeout' },
+            15: { bg: 'pg-idle', label: 'Mobile Net' },
+            16: { bg: 'pg-error', label: 'Timeout' },
         };
 
         // ===== Gateway Management =====
@@ -9530,6 +9676,18 @@ async function sendSimOnline(simId, phoneNumber) {
             bar.classList.toggle('hidden', checked.length === 0);
         }
 
+        function toggleSimMoreMenu() {
+            const menu = document.getElementById('sim-more-menu');
+            if (menu) menu.classList.toggle('hidden');
+        }
+        document.addEventListener('click', function(ev) {
+            const menu = document.getElementById('sim-more-menu');
+            if (!menu || menu.classList.contains('hidden')) return;
+            const btn = document.getElementById('sim-more-btn');
+            if (btn && btn.contains(ev.target)) return; // toggle handles its own clicks
+            menu.classList.add('hidden'); // outside click (or a menu item click) closes the menu
+        });
+
         async function bulkSimAction(action) {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
@@ -12258,9 +12416,9 @@ async function sendSimOnline(simId, phoneNumber) {
             });
             const labels = Object.keys(byDate).sort();
             const vendorList = Object.keys(vendorsSeen);
-            const palette = { wing_iot: '#2563EB', atomic: '#B45309', teltik: '#7C3AED', helix: '#047857' };
+            const palette = { wing_iot: '#334155', atomic: '#64748B', teltik: '#94A3B8', helix: '#CBD5E1' };
             const datasets = vendorList.map(function(v) {
-                const color = palette[v] || '#94A3B8';
+                const color = palette[v] || '#111827';
                 return {
                     label: v,
                     data: labels.map(function(d) { return byDate[d][v] || 0; }),
@@ -12294,7 +12452,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         x: { ticks: { color: '#5B6472' }, grid: { display: false } },
                     },
                     plugins: {
-                        legend: { labels: { color: '#475061' } },
+                        legend: { labels: { color: '#111827' } },
                         tooltip: { mode: 'index', intersect: false },
                     },
                 },
