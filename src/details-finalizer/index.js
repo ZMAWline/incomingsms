@@ -12,6 +12,7 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { PLAYBOOK, classifyFailure, UNCLASSIFIED_BUCKET } from '../shared/rotation-playbook.mjs';
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
+import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
@@ -87,6 +88,20 @@ export default {
       const result = await runRotationReview(env, { dryRun });
       return new Response(result, { status: 200, headers: { 'Content-Type': 'text/markdown; charset=utf-8' } });
     }
+    if (url.pathname === '/catchup-sweep') {
+      // Every-2h self-healing pass (also cron '45 */2 * * *'). Runs the same
+      // SAFE remediations as the daily review — playbook auto-fixes on failed
+      // SIMs, missed-due retries outside the rotation window, delivery
+      // reconciliation — so retryable problems heal within hours instead of
+      // waiting for tomorrow's 12:30 UTC review. Use ?dry=1 to preview.
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const dryRun = url.searchParams.get('dry') === '1';
+      const result = await runCatchupSweep(env, { dryRun, trigger: 'http' });
+      return json(result);
+    }
     if (url.pathname === '/refill-pool') {
       // Manual trigger for the address-pool refill cron. Replaces quarantined
       // PPU addresses with new OSM-sourced civic-building addresses in the
@@ -102,7 +117,7 @@ export default {
       return json(result);
     }
     if (url.pathname !== '/run') {
-      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0 or /reconcile-rotations?secret=...[&dry=1][&force=1] or /test-offline?secret=...&reseller_id=N&limit=10[&dry=1] or /refill-pool?secret=...[&max=5][&dry=1]', { status: 200 });
+      return new Response('details-finalizer ok. Use /run?secret=... or /sweep-wing-cleanup?secret=...&limit=50&offset=0 or /reconcile-rotations?secret=...[&dry=1][&force=1] or /catchup-sweep?secret=...[&dry=1] or /test-offline?secret=...&reseller_id=N&limit=10[&dry=1] or /refill-pool?secret=...[&max=5][&dry=1]', { status: 200 });
     }
     const secret = url.searchParams.get('secret') || '';
     if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
@@ -127,6 +142,13 @@ export default {
         return;
       }
       ctx.waitUntil(runReconciliationSweep(env, { trigger: 'cron', dryRun: false }));
+      return;
+    }
+    if (event.cron === '45 */2 * * *') {
+      // Catch-up sweep — see /catchup-sweep route comment. Runs at :45 to
+      // stay clear of mdn-rotator (:00/:20/:40) and teltik-worker (:10/:40).
+      ctx.waitUntil(runCatchupSweep(env, { trigger: 'cron' }).catch(err =>
+        console.error(`[CatchupSweep] cron error: ${err}`)));
       return;
     }
     if (event.cron === '0 */6 * * *') {
@@ -1476,6 +1498,236 @@ function newCircuitBreaker() {
   };
 }
 
+/* ── Expected-vs-actual baseline ─────────────────────────────────────────── */
+// Counts the SIMs that SHOULD rotate, not just the ones that did — closes the
+// gap where a 92/750 night still reported "all clear" (2026-05-22 PR-B
+// fallout). Eligibility mirrors the rotation crons exactly:
+//   nightly vendors → mdn-rotator processBatch (active + reseller-assigned +
+//   rotation_eligible, skip rotated/activated today)
+//   teltik → teltik-worker due-filter (per-SIM interval, default 48h)
+async function computeDueBaseline(env) {
+  const tonightStart = nyMidnightUtcIso();
+  const nowMs = Date.now();
+  const perVendor = {};
+  const missedNightly = [];
+
+  const nightly = await rotationReviewQuery(env,
+    `sims?select=id,iccid,vendor,msisdn,last_mdn_rotated_at,activated_at,reseller_sims!inner(reseller_id,active)` +
+    `&reseller_sims.active=eq.true&status=eq.active&vendor=neq.teltik&rotation_eligible=eq.true&limit=5000`);
+  for (const s of nightly) {
+    const v = s.vendor || 'unknown';
+    if (!perVendor[v]) perVendor[v] = { eligible: 0, rotated: 0, missed: 0 };
+    perVendor[v].eligible++;
+    if (tonightStart && s.last_mdn_rotated_at && s.last_mdn_rotated_at >= tonightStart) {
+      perVendor[v].rotated++;
+    } else if (isMissedDueNightly(s, tonightStart)) {
+      perVendor[v].missed++;
+      missedNightly.push(s);
+    }
+  }
+
+  const teltik = await rotationReviewQuery(env,
+    `sims?select=id,iccid,vendor,last_mdn_rotated_at,rotation_interval_hours,reseller_sims!inner(reseller_id,active)` +
+    `&reseller_sims.active=eq.true&status=eq.active&vendor=eq.teltik&limit=5000`);
+  const teltikDue = teltik.filter(s => isTeltikDue(s, nowMs));
+  perVendor.teltik = { eligible: teltik.length, due_now: teltikDue.length };
+
+  return { tonightStart, perVendor, missedNightly, teltikDueNow: teltikDue.length };
+}
+
+// Read-only count of SIMs that rotated in the last 24h but whose reseller was
+// never notified afterwards (same predicate as runReconciliationSweep Bucket B).
+async function countDeliveryGaps(env) {
+  const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const rows = await rotationReviewQuery(env,
+    `sims?select=id,last_mdn_rotated_at,last_notified_at&status=eq.active&rotation_status=eq.success` +
+    `&last_mdn_rotated_at=gte.${encodeURIComponent(cutoff)}&limit=5000`);
+  return rows.filter(isDeliveryGap).length;
+}
+
+// ── Catch-up sweep (cron at :45 every 2 hours) ─────────────────────────────
+// The daily review remediates once a day; this sweep runs the same SAFE
+// remediations every 2 hours so retryable failures and missed deliveries
+// self-heal within hours. Bounds:
+//   - run-lock kind='catchup_sweep' (cron_runs)
+//   - shared per-SIM daily budgets via remediation_attempts
+//     (force_rotate ≤3/day — shared with the review; sweep_rotate ≤2/day)
+//   - SWEEP_MAX_ROTATES total rotate calls per sweep, so a hung vendor
+//     (75s timeout each) cannot blow the 15-min scheduled wall-clock
+//   - per-vendor 5xx circuit breaker
+//   - missed-due retries NEVER run inside the nightly rotation window
+//     (the cron is still working; no reason to race it)
+const SWEEP_MAX_ROTATES = 10;
+
+async function runCatchupSweep(env, opts = {}) {
+  const dryRun = opts.dryRun === true;
+  const tonightStart = nyMidnightUtcIso() || new Date(Date.now() - 12 * 3600 * 1000).toISOString();
+  const startedAt = Date.now();
+
+  let lockHandle = null;
+  let runId = null;
+  if (!dryRun) {
+    lockHandle = await acquireReviewLock(env, 'catchup_sweep');
+    if (!lockHandle.acquired) return { ok: false, skipped: true, reason: lockHandle.reason };
+    runId = lockHandle.run?.run_id || null;
+  }
+
+  const breaker = newCircuitBreaker();
+  let rotateCalls = 0;
+  const summary = {
+    trigger: opts.trigger || 'manual',
+    dry_run: dryRun,
+    failed_found: 0,
+    flipped_to_mdn_pending: 0,
+    force_rotated: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0, skipped_cap: 0 },
+    missed_due_found: 0,
+    missed_retried: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0, skipped_window: 0, skipped_race: 0, skipped_cap: 0 },
+    recon: null,
+    delivery_gaps_after: null,
+    pending_created: 0,
+  };
+
+  try {
+    // ── 1. Playbook auto-fixes on tonight's failed SIMs (same rules as the review)
+    const failedRows = await rotationReviewQuery(env,
+      `sims?select=id,iccid,vendor,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error&rotation_status=eq.failed&last_mdn_rotated_at=gt.${encodeURIComponent(tonightStart)}&limit=5000`);
+    summary.failed_found = failedRows.length;
+    const buckets = {};
+    const unclassified = [];
+    for (const sim of failedRows) {
+      const entry = classifyFailure(sim);
+      if (!entry) { unclassified.push(sim); continue; }
+      if (!buckets[entry.id]) buckets[entry.id] = { entry, sims: [] };
+      buckets[entry.id].sims.push(sim);
+    }
+
+    for (const { entry, sims } of Object.values(buckets)) {
+      if (dryRun) continue;
+      if (entry.action === 'flip_to_mdn_pending' && sims.length > 0) {
+        const ids = sims.map(s => s.id).join(',');
+        const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
+          method: 'PATCH',
+          headers: {
+            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify({ status: 'provisioning', rotation_status: 'mdn_pending' }),
+        });
+        if (flipRes.ok) {
+          summary.flipped_to_mdn_pending += sims.length;
+          await Promise.all(sims.map(s => recordAttempt(env, s.id, runId, 'flip_to_mdn_pending', 'ok', null)));
+        }
+      } else if (entry.action === 'force_rotate') {
+        for (const sim of sims) {
+          if (rotateCalls >= SWEEP_MAX_ROTATES) { summary.force_rotated.skipped_cap++; continue; }
+          if (breaker.isTripped(sim.vendor)) { summary.force_rotated.skipped_breaker++; continue; }
+          const used = await attemptsToday(env, sim.id, 'force_rotate');
+          if (used >= 3) { summary.force_rotated.skipped_budget++; continue; }
+          summary.force_rotated.attempted++;
+          rotateCalls++;
+          const r = await forceRotateSim(env, sim);
+          breaker.record(sim.vendor, r.ok, r.status || 0);
+          if (r.ok) {
+            summary.force_rotated.ok++;
+            await recordAttempt(env, sim.id, runId, 'force_rotate', 'ok', null);
+          } else {
+            summary.force_rotated.fail++;
+            await recordAttempt(env, sim.id, runId, 'force_rotate', 'fail', r.error || `status=${r.status}`);
+          }
+          await new Promise(res => setTimeout(res, 2000));
+        }
+      }
+    }
+
+    // ── 2. Missed-due retry — nightly vendors only, never inside the window
+    const baseline = await computeDueBaseline(env);
+    summary.missed_due_found = baseline.missedNightly.length;
+    if (!dryRun && baseline.missedNightly.length > 0) {
+      if (inNightlyRotationWindow(new Date())) {
+        summary.missed_retried.skipped_window = baseline.missedNightly.length;
+      } else {
+        for (const sim of baseline.missedNightly) {
+          if (rotateCalls >= SWEEP_MAX_ROTATES) { summary.missed_retried.skipped_cap++; continue; }
+          if (breaker.isTripped(sim.vendor)) { summary.missed_retried.skipped_breaker++; continue; }
+          // Race-guard: re-read the row; skip if it rotated (or is rotating)
+          // since our list query — claim_rotation_slot dedups anyway, but
+          // force=true bypasses it, so we must not race.
+          const fresh = (await rotationReviewQuery(env,
+            `sims?id=eq.${sim.id}&select=last_mdn_rotated_at,rotation_status&limit=1`))[0];
+          if (!fresh
+              || (fresh.last_mdn_rotated_at && fresh.last_mdn_rotated_at >= tonightStart)
+              || fresh.rotation_status === 'rotating') {
+            summary.missed_retried.skipped_race++;
+            continue;
+          }
+          const used = await attemptsToday(env, sim.id, 'sweep_rotate');
+          if (used >= 2) { summary.missed_retried.skipped_budget++; continue; }
+          summary.missed_retried.attempted++;
+          rotateCalls++;
+          const r = await forceRotateSim(env, sim);
+          breaker.record(sim.vendor, r.ok, r.status || 0);
+          if (r.ok) {
+            summary.missed_retried.ok++;
+            await recordAttempt(env, sim.id, runId, 'sweep_rotate', 'ok', null);
+          } else {
+            summary.missed_retried.fail++;
+            await recordAttempt(env, sim.id, runId, 'sweep_rotate', 'fail', r.error || `status=${r.status}`);
+          }
+          await new Promise(res => setTimeout(res, 2000));
+        }
+      }
+    }
+
+    // ── 3. Delivery reconciliation — reuse the existing capped sweep
+    if (!dryRun && env.RECONCILIATION_ENABLED === 'true') {
+      summary.recon = await runReconciliationSweep(env, { trigger: 'catchup_sweep', dryRun: false });
+    } else {
+      summary.recon = { skipped: true, reason: dryRun ? 'dry_run' : 'RECONCILIATION_ENABLED!=true' };
+    }
+    summary.delivery_gaps_after = await countDeliveryGaps(env).catch(() => null);
+
+    // ── 4. Escalate human-review + unclassified failures NOW (dedup'd), so the
+    //       operator sees them on the dashboard hours before the morning review.
+    if (!dryRun) {
+      for (const { entry, sims } of Object.values(buckets)) {
+        if (entry.safe) continue;
+        for (const sim of sims) {
+          if (await findOpenPendingForSim(env, sim.id, 'human_review_failure')) continue;
+          await insertPendingItem(env, {
+            kind: 'human_review_failure',
+            summary: `${entry.id}: SIM #${sim.id} (${sim.vendor})`,
+            details_md: `**Bucket:** ${entry.id}\n**Vendor:** ${sim.vendor}\n**MSISDN:** ${sim.msisdn || '—'}\n**Error:** ${(sim.last_rotation_error || '').slice(0, 400)}\n\n_Escalated by catch-up sweep._`,
+            run_id: runId, sim_id: sim.id, status: 'open',
+          });
+          summary.pending_created++;
+        }
+      }
+      for (const sim of unclassified) {
+        if (await findOpenPendingForSim(env, sim.id, 'unclassified_pattern')) continue;
+        await insertPendingItem(env, {
+          kind: 'unclassified_pattern',
+          summary: `unclassified: SIM #${sim.id} (${sim.vendor})`,
+          details_md: `**No playbook entry matched.**\n\n**Vendor:** ${sim.vendor}\n**MSISDN:** ${sim.msisdn || '—'}\n**Error:** ${(sim.last_rotation_error || '').slice(0, 400)}\n\n_Escalated by catch-up sweep._`,
+          run_id: runId, sim_id: sim.id, status: 'open',
+        });
+        summary.pending_created++;
+      }
+    }
+
+    if (!dryRun && lockHandle?.run?.id) {
+      await releaseReviewLock(env, lockHandle.run.id, 'completed', summary, null);
+    }
+    return { ok: true, duration_s: (Date.now() - startedAt) / 1000, ...summary };
+  } catch (err) {
+    if (!dryRun && lockHandle?.run?.id) {
+      await releaseReviewLock(env, lockHandle.run.id, 'aborted', { error: String(err) });
+    }
+    throw err;
+  }
+}
+
 async function runRotationReview(env, opts = {}) {
   const dryRun = opts.dryRun === true;
   const tonightStart = nyMidnightUtcIso() || new Date(Date.now() - 12 * 3600 * 1000).toISOString();
@@ -1512,6 +1764,14 @@ async function runRotationReview(env, opts = {}) {
       }
       tally[v] = stats;
     }
+
+    // ── 1b. Expected-vs-actual baseline + delivery gaps ──────────────────────
+    // Baseline failures must not abort the whole review — degrade to "n/a".
+    let baseline = null;
+    let deliveryGapsNow = null;
+    try { baseline = await computeDueBaseline(env); } catch (e) { console.error('[Review] baseline failed:', e); }
+    try { deliveryGapsNow = await countDeliveryGaps(env); } catch (e) { console.error('[Review] gap count failed:', e); }
+    const missedTotal = baseline ? baseline.missedNightly.length : 0;
 
     // ── 2. Classify failed SIMs via the playbook ─────────────────────────────
     const failedRows = await rotationReviewQuery(env,
@@ -1686,6 +1946,33 @@ async function runRotationReview(env, opts = {}) {
     }
     lines.push('');
 
+    lines.push('## Expected vs actual (due baseline)');
+    lines.push('');
+    if (!baseline) {
+      lines.push('_Baseline unavailable this run (query failed — see worker logs)._');
+    } else {
+      lines.push('| Vendor | Eligible | Rotated tonight | Missed |');
+      lines.push('|--------|---------:|----------------:|-------:|');
+      for (const [v, b] of Object.entries(baseline.perVendor)) {
+        if (v === 'teltik') continue;
+        const flag = b.missed > 0 ? ' ⚠️' : '';
+        lines.push(`| ${v} | ${b.eligible} | ${b.rotated} | ${b.missed}${flag} |`);
+      }
+      lines.push(`| teltik | ${baseline.perVendor.teltik?.eligible ?? 0} | (48h cadence) | ${baseline.teltikDueNow} due now |`);
+      lines.push('');
+      if (missedTotal > 0) {
+        const sample = baseline.missedNightly.slice(0, 10).map(s => `#${s.id}`).join(', ');
+        const more = missedTotal > 10 ? ` …+${missedTotal - 10} more` : '';
+        lines.push(`- ⚠️ **${missedTotal} SIMs were due but did not rotate tonight**: ${sample}${more}`);
+        lines.push('- The catch-up sweep retries these automatically after the rotation window closes (16:00 UTC).');
+      } else {
+        lines.push('- ✅ Every due SIM rotated tonight.');
+      }
+    }
+    lines.push('');
+    lines.push(`- Delivery gaps right now (rotated <24h, reseller not notified): **${deliveryGapsNow ?? 'n/a'}**${(deliveryGapsNow ?? 0) > 0 ? ' ⚠️' : ' ✅'}`);
+    lines.push('');
+
     lines.push('## Failure breakdown (playbook classified)');
     lines.push('');
     if (Object.keys(buckets).length === 0 && unclassified.length === 0) {
@@ -1787,7 +2074,11 @@ async function runRotationReview(env, opts = {}) {
       const urgent = (Object.values(buckets).some(({ entry }) => !entry.safe))
         || unclassified.length > 0
         || multiDayFailures.length > 0
-        || breakerEvents.length > 0;
+        || breakerEvents.length > 0
+        // Under-rotation / under-delivery beyond noise level (the review runs
+        // mid-window at 12:30 UTC, so a few not-yet-rotated SIMs are normal).
+        || missedTotal > 25
+        || (deliveryGapsNow ?? 0) > 25;
       const subject = urgent
         ? `🔧 Rotation Review ${today} — ${unclassified.length + humanReviewBuckets.reduce((n, b) => n + b.sims.length, 0)} need review`
         : `✅ Rotation Review ${today} — all clear`;
@@ -1798,6 +2089,8 @@ async function runRotationReview(env, opts = {}) {
     if (!dryRun && lockHandle?.run?.id) {
       await releaseReviewLock(env, lockHandle.run.id, 'completed', {
         tally, actions, pool: poolStats,
+        baseline: baseline ? { perVendor: baseline.perVendor, missed: missedTotal, teltik_due_now: baseline.teltikDueNow } : null,
+        delivery_gaps: deliveryGapsNow,
         multi_day_count: multiDayFailures.length,
         breaker: breaker.trippedVendors(),
         pending_open: stillOpenCount,
