@@ -832,15 +832,22 @@ async function insertOrReturnExistingReport(env, resellerId, resolved, body, sou
   const inserted = await insertResp.json();
   const r = Array.isArray(inserted) ? inserted[0] : inserted;
 
-  // Append-only event row for the intake itself.
+  // Append-only event row for the intake itself. When the resolver
+  // self-healed (backfilled the missing rentals row from a delivered
+  // number.online webhook instead of escalating
+  // intake_unresolved_current_mdn_no_rental), record that in evidence so the
+  // recovery is auditable.
   try {
+    const evidence = {};
+    if (clientRequestId) evidence.client_request_id = clientRequestId;
+    if (resolved.self_healed) evidence.self_healed = resolved.self_healed;
     await sbPost(env, 'rental_report_events', {
       report_id: r.id,
       from_status: null,
       to_status: 'received',
       actor: 'reseller',
       note: reasonNote,
-      evidence: clientRequestId ? { client_request_id: clientRequestId } : null,
+      evidence: Object.keys(evidence).length ? evidence : null,
     });
   } catch (e) {
     console.log('[ReportBad] event log insert failed: ' + e);

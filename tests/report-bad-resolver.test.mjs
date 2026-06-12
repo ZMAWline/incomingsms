@@ -75,6 +75,10 @@ function makeSbGet(tables) {
       if (expr.startsWith('eq.')) {
         const target = expr.slice(3);
         rows = rows.filter(r => String(r[col]) === target);
+      } else if (expr.startsWith('gte.')) {
+        // ISO timestamps compare correctly as strings.
+        const target = expr.slice(4);
+        rows = rows.filter(r => r[col] != null && String(r[col]) >= target);
       } else if (expr === 'is.null') {
         rows = rows.filter(r => r[col] == null);
       } else if (expr.startsWith('in.(')) {
@@ -109,6 +113,7 @@ function makeTables() {
     rentals: RENTALS.slice(),
     sim_numbers: SIM_NUMBERS.slice(),
     reseller_sims: RESELLER_SIMS.slice(),
+    webhook_deliveries: [],
   };
 }
 
@@ -255,6 +260,159 @@ await t('REPORT-3 shape: current MDN with no matching rental → unresolved (no 
   assert.equal(r.sim_id, 3501);
   assert.equal(r.sim_number_id, 68411, 'should report the CURRENT sim_number_id, not the historical 60361');
   assert.equal(r.e164, '+18465776590');
+});
+
+// ---------------------------------------------------------------------------
+// SELF-HEAL (2026-06-12) — `intake_unresolved_current_mdn_no_rental` recovery.
+//
+// When the current-MDN e164 resolves to an owned SIM but no rentals row
+// matches the current sim_number, the resolver must FIRST look for proof in
+// webhook_deliveries: the most recent delivered `number.online` row for that
+// SIM (last 14 days) whose payload number matches the reported e164 and whose
+// stored response_body carries the reseller's rentalId. If found, it backfills
+// the rentals row (persist-rental.mjs semantics, on_conflict
+// reseller_id,sim_number_id), re-runs the rental lookup, and resolves with
+// `self_healed: 'rental_backfilled_from_delivery'`. Otherwise it escalates
+// exactly as before (REPORT-3 shape above stays pinned).
+// ---------------------------------------------------------------------------
+
+const healEnv = {
+  SUPABASE_URL: 'https://example.supabase.co',
+  SUPABASE_SERVICE_ROLE_KEY: 'fake',
+};
+
+// SIM 3501 — current MDN +18465776590 (sim_number 68411), historical rental
+// only (same shape as the REPORT-3 test above).
+function addNoRentalShape(tables) {
+  tables.sim_numbers.push({ id: 68411, sim_id: 3501, e164: '+18465776590', valid_from: '2026-05-30T08:15:11.756Z', valid_to: null });
+  tables.sim_numbers.push({ id: 60361, sim_id: 3501, e164: '+12345678249', valid_to: '2026-05-30T08:15:11.756Z' });
+  tables.reseller_sims.push({ reseller_id: 3, sim_id: 3501 });
+  tables.rentals.push({ id: 47116, reseller_id: 3, sim_id: 3501, sim_number_id: 60361, e164: '+12345678249', minted_at: '2026-05-30T00:00:00Z', reseller_rental_id: 'r3-historical' });
+}
+
+function makeDelivery(over = {}) {
+  return {
+    id: 9001,
+    reseller_id: 3,
+    sim_id: 3501,
+    event_type: 'number.online',
+    status: 'delivered',
+    delivered_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(), // 1h ago
+    payload: { event_type: 'number.online', data: { sim_id: 3501, number: '+18465776590', carrier: 'att' } },
+    response_body: '{"success":true,"message":"Rental created","rentalId":1799001}',
+    ...over,
+  };
+}
+
+// Fake fetch for the persist-rental path (sims + sim_numbers lookups and the
+// rentals upsert). Captures writes and reflects the upsert back into the
+// canned tables so the resolver's re-run lookup can see the new rental row.
+function makeHealFetch(tables, writes) {
+  return async function fakeFetch(url, init) {
+    const u = String(url);
+    const resp = (status, rows) => ({ ok: status < 400, status, json: async () => rows, text: async () => JSON.stringify(rows) });
+    if (u.includes('/rest/v1/sims?')) {
+      return resp(200, [{ id: 3501, carrier: 'att', vendor: 'atomic' }]);
+    }
+    if (u.includes('/rest/v1/sim_numbers?')) {
+      return resp(200, [{ id: 68411, sim_id: 3501, e164: '+18465776590', valid_from: '2026-05-30T08:15:11.756Z', valid_to: null }]);
+    }
+    if (u.includes('/rest/v1/rentals')) {
+      const body = JSON.parse(init.body);
+      writes.push({ url: u, init, body });
+      tables.rentals.push({ id: 50001, minted_at: new Date().toISOString(), ...body });
+      return resp(201, []);
+    }
+    return resp(404, []);
+  };
+}
+
+await t('SELF-HEAL: no rental + delivered number.online with rentalId → backfills and resolves', async () => {
+  const tables = makeTables();
+  addNoRentalShape(tables);
+  tables.webhook_deliveries.push(makeDelivery());
+  const writes = [];
+  const sb = makeSbGet(tables);
+
+  const r = await resolveRentalForReport(healEnv, 3, { e164: '+18465776590' }, sb, { fetchImpl: makeHealFetch(tables, writes) });
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.notEqual(r.unresolved, true, 'must not escalate when delivery proof exists: ' + JSON.stringify(r));
+  assert.equal(r.self_healed, 'rental_backfilled_from_delivery');
+  assert.equal(r.rental_id, 50001, 'must resolve to the freshly backfilled rental');
+  assert.equal(r.sim_id, 3501);
+  assert.equal(r.sim_number_id, 68411);
+  assert.equal(r.e164, '+18465776590');
+  // The rentals upsert must follow persist-rental semantics.
+  assert.equal(writes.length, 1, 'exactly one rentals upsert');
+  assert.match(writes[0].url, /on_conflict=reseller_id%2Csim_number_id|on_conflict=reseller_id,sim_number_id/);
+  assert.equal(writes[0].body.reseller_id, 3);
+  assert.equal(writes[0].body.sim_number_id, 68411);
+  assert.equal(writes[0].body.reseller_rental_id, '1799001');
+});
+
+await t('SELF-HEAL: no rental + NO delivery → escalates unchanged (unresolved)', async () => {
+  const tables = makeTables();
+  addNoRentalShape(tables);
+  const writes = [];
+  const sb = makeSbGet(tables);
+
+  const r = await resolveRentalForReport(healEnv, 3, { e164: '+18465776590' }, sb, { fetchImpl: makeHealFetch(tables, writes) });
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.unresolved, true);
+  assert.equal(r.intake_state, 'current_mdn_no_rental_row');
+  assert.equal(r.rental_id, null);
+  assert.equal(r.self_healed, undefined, 'must not claim self-heal');
+  assert.equal(writes.length, 0, 'no rentals write');
+});
+
+await t('SELF-HEAL: no rental + delivery without rentalId in body → escalates unchanged', async () => {
+  const tables = makeTables();
+  addNoRentalShape(tables);
+  tables.webhook_deliveries.push(makeDelivery({ response_body: '{"success":true}' }));
+  const writes = [];
+  const sb = makeSbGet(tables);
+
+  const r = await resolveRentalForReport(healEnv, 3, { e164: '+18465776590' }, sb, { fetchImpl: makeHealFetch(tables, writes) });
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.unresolved, true);
+  assert.equal(r.intake_state, 'current_mdn_no_rental_row');
+  assert.equal(r.rental_id, null);
+  assert.equal(writes.length, 0, 'no rentals write');
+});
+
+await t('SELF-HEAL: delivery older than 14 days → escalates unchanged', async () => {
+  const tables = makeTables();
+  addNoRentalShape(tables);
+  tables.webhook_deliveries.push(makeDelivery({
+    delivered_at: new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString(), // 20 days ago
+  }));
+  const writes = [];
+  const sb = makeSbGet(tables);
+
+  const r = await resolveRentalForReport(healEnv, 3, { e164: '+18465776590' }, sb, { fetchImpl: makeHealFetch(tables, writes) });
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.unresolved, true);
+  assert.equal(writes.length, 0, 'no rentals write');
+});
+
+await t('SELF-HEAL: delivery for a DIFFERENT number on the SIM → escalates unchanged', async () => {
+  const tables = makeTables();
+  addNoRentalShape(tables);
+  tables.webhook_deliveries.push(makeDelivery({
+    payload: { event_type: 'number.online', data: { sim_id: 3501, number: '+12345678249', carrier: 'att' } },
+  }));
+  const writes = [];
+  const sb = makeSbGet(tables);
+
+  const r = await resolveRentalForReport(healEnv, 3, { e164: '+18465776590' }, sb, { fetchImpl: makeHealFetch(tables, writes) });
+
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.unresolved, true);
+  assert.equal(writes.length, 0, 'no rentals write');
 });
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');

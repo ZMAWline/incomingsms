@@ -17,9 +17,15 @@
 //
 // Exported as a pure module so the same logic runs in the Worker and in tests.
 
+import { parseRentalIdFromResponse, persistRentalFromWebhookResponse } from './persist-rental.mjs';
+
 export const REPORT_REASON_CODES = new Set(['no_sms_received', 'wrong_number', 'delayed_sms', 'other']);
 
 const REJECTED_FIELDS = ['sim_id', 'iccid', 'sim_iccid', 'rental_id'];
+
+// Self-heal (2026-06-12): only trust number.online deliveries this recent when
+// backfilling a missing rentals row at report-bad intake.
+const SELF_HEAL_DELIVERY_WINDOW_DAYS = 14;
 
 export function normalizeE164(input) {
   if (input == null) return null;
@@ -28,9 +34,68 @@ export function normalizeE164(input) {
   return '+' + digits;
 }
 
+// Rentals lookup for the e164 path: the rental must match the CURRENT
+// sim_number (by id) or the current e164 itself — never a historical row.
+// Extracted so the self-heal path can re-run it after a backfill.
+async function lookupRentalForCurrentNumber(env, resellerId, simId, norm, currentSimNumberId, sbGet) {
+  const rResp = await sbGet(env,
+    'rentals?select=id,sim_id,sim_number_id,e164,minted_at' +
+    '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&or=(e164.eq.' + encodeURIComponent(norm)
+      + (currentSimNumberId ? (',sim_number_id.eq.' + encodeURIComponent(currentSimNumberId)) : '')
+      + ')' +
+    '&order=minted_at.desc&limit=1'
+  );
+  if (!rResp.ok) return { error: true, row: null };
+  const rRows = await rResp.json();
+  return { error: false, row: Array.isArray(rRows) && rRows.length > 0 ? rRows[0] : null };
+}
+
+// Self-heal for the #1 escalation class (`intake_unresolved_current_mdn_no_rental`):
+// in most of these cases the proof already exists in webhook_deliveries — the
+// most recent delivered `number.online` webhook for the SIM carries the
+// reseller's own rentalId in its stored response_body (see persist-rental.mjs,
+// incident 2026-06-10). Find such a delivery (matching number, last 14 days),
+// and upsert the missing rentals row from it so the report can resolve normally.
+async function backfillRentalFromDelivery({ env, resellerId, simId, e164, sbGet, fetchImpl }) {
+  const since = new Date(Date.now() - SELF_HEAL_DELIVERY_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const resp = await sbGet(env,
+    'webhook_deliveries?select=id,payload,response_body,delivered_at' +
+    '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+    '&sim_id=eq.' + encodeURIComponent(simId) +
+    '&event_type=eq.number.online' +
+    '&status=eq.delivered' +
+    '&delivered_at=gte.' + encodeURIComponent(since) +
+    '&order=delivered_at.desc&limit=5'
+  );
+  if (!resp.ok) return { upserted: false, reason: 'delivery_lookup_failed' };
+  const rows = await resp.json();
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { upserted: false, reason: 'no_delivered_number_online' };
+  }
+  // Most-recent first; require the delivery's number to be the reported
+  // current MDN and its response to carry a parseable rentalId.
+  const match = rows.find(d =>
+    normalizeE164(d && d.payload && d.payload.data && d.payload.data.number) === e164 &&
+    parseRentalIdFromResponse(d.response_body) != null
+  );
+  if (!match) return { upserted: false, reason: 'no_rental_id_in_recent_deliveries' };
+  return persistRentalFromWebhookResponse({
+    env,
+    payload: match.payload,
+    responseBody: match.response_body,
+    resellerId,
+    deliveredAt: match.delivered_at,
+    fetchImpl,
+  });
+}
+
 // sbGet is injected so tests can mock PostgREST. Signature mirrors the
 // Worker's helper: `sbGet(env, path) → Response`.
-export async function resolveRentalForReport(env, resellerId, body, sbGet) {
+// opts.fetchImpl (optional) backs the self-heal rentals upsert; defaults to
+// global fetch inside persist-rental.mjs. Tests inject a stub.
+export async function resolveRentalForReport(env, resellerId, body, sbGet, opts) {
   body = body || {};
 
   const rejected = REJECTED_FIELDS.filter(k => body[k] != null);
@@ -118,27 +183,47 @@ export async function resolveRentalForReport(env, resellerId, body, sbGet) {
   const currentSimNumber = sns.find(s => s.sim_id === ownedSimId) || sns[0];
   const currentSimNumberId = currentSimNumber && currentSimNumber.id;
 
-  const rResp = await sbGet(env,
-    'rentals?select=id,sim_id,sim_number_id,e164,minted_at' +
-    '&reseller_id=eq.' + encodeURIComponent(resellerId) +
-    '&sim_id=eq.' + encodeURIComponent(ownedSimId) +
-    '&or=(e164.eq.' + encodeURIComponent(norm)
-      + (currentSimNumberId ? (',sim_number_id.eq.' + encodeURIComponent(currentSimNumberId)) : '')
-      + ')' +
-    '&order=minted_at.desc&limit=1'
-  );
-  if (!rResp.ok) return { ok: false, code: 'bad_request', message: 'lookup failed' };
-  const rRows = await rResp.json();
-  if (Array.isArray(rRows) && rRows.length > 0) {
-    const r = rRows[0];
+  const looked = await lookupRentalForCurrentNumber(env, resellerId, ownedSimId, norm, currentSimNumberId, sbGet);
+  if (looked.error) return { ok: false, code: 'bad_request', message: 'lookup failed' };
+  if (looked.row) {
+    const r = looked.row;
     return { ok: true, rental_id: r.id, sim_id: r.sim_id, sim_number_id: r.sim_number_id, e164: norm };
   }
 
-  // No rental matches the CURRENT MDN. Return unresolved instead of falling
-  // back to the latest historical rental on the SIM. The handler stores the
-  // report with rental_id=null and immediately flags it `escalated /
-  // intake_unresolved_current_mdn_no_rental` so the remediator never
-  // vendor-acts against a stale context.
+  // No rental matches the CURRENT MDN. SELF-HEAL (2026-06-12): before
+  // escalating, check whether a recent delivered number.online webhook for
+  // this SIM already proved the rental (reseller's rentalId echoed in
+  // webhook_deliveries.response_body). If so, backfill the rentals row and
+  // re-run the lookup so the report proceeds through the standard pipeline.
+  // Any failure here falls through to the unchanged escalation — the heal
+  // must never block intake.
+  try {
+    const healed = await backfillRentalFromDelivery({
+      env, resellerId, simId: ownedSimId, e164: norm, sbGet,
+      fetchImpl: opts && opts.fetchImpl,
+    });
+    if (healed && healed.upserted) {
+      const again = await lookupRentalForCurrentNumber(env, resellerId, ownedSimId, norm, currentSimNumberId, sbGet);
+      if (!again.error && again.row) {
+        const r = again.row;
+        return {
+          ok: true,
+          rental_id: r.id,
+          sim_id: r.sim_id,
+          sim_number_id: r.sim_number_id,
+          e164: norm,
+          self_healed: 'rental_backfilled_from_delivery',
+        };
+      }
+    }
+  } catch (e) {
+    // swallow — escalate exactly as before
+  }
+
+  // Return unresolved instead of falling back to the latest historical rental
+  // on the SIM. The handler stores the report with rental_id=null and
+  // immediately flags it `escalated / intake_unresolved_current_mdn_no_rental`
+  // so the remediator never vendor-acts against a stale context.
   return {
     ok: true,
     unresolved: true,
