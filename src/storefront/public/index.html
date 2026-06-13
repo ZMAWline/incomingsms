@@ -2,9 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Numbox — Private US numbers for SMS verification</title>
-<meta name="description" content="Rent a private US phone number for 24 hours and receive SMS verification codes instantly.">
+<meta name="description" content="Rent a private US phone number for 24 hours and receive SMS verification codes instantly. Real SIM numbers, pay-as-you-go, no subscription.">
+<meta name="theme-color" content="#FFFFFF">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Numbox — Private US numbers for SMS verification">
+<meta property="og:description" content="Rent a real US mobile number for 24 hours and read every SMS in a clean live inbox. Pay-as-you-go, no subscription.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230B1220'/%3E%3Cpath d='M22 46V18l20 28V18' stroke='%23ffffff' stroke-width='6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -21,107 +26,189 @@ const BRAND = {
   --ink: #0B1220;
   --muted: #5B6472;
   --bg: #ffffff;
-  --bg-soft: #F6F7F9;
-  --line: #E5E8EC;
+  --bg-soft: #F7F8FA;
+  --line: #E5E7EB;
   --accent: #2563EB;
+  --accent-down: #1D4FD7;
+  --radius: 12px;
+  --shadow-sm: 0 1px 2px rgb(16 24 40 / 6%);
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
 body {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 16px;
   color: var(--ink);
   background: var(--bg);
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
 }
-.wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+.wrap {
+  max-width: 1080px; margin: 0 auto;
+  padding-left: max(20px, env(safe-area-inset-left));
+  padding-right: max(20px, env(safe-area-inset-right));
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 
-nav { border-bottom: 1px solid var(--line); }
-.nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
-.wordmark { font-weight: 700; font-size: 18px; letter-spacing: -0.02em; color: var(--ink); text-decoration: none; }
-.nav-links { display: flex; gap: 24px; align-items: center; }
-.nav-links a { color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 500; }
+/* nav */
+nav {
+  border-bottom: 1px solid var(--line);
+  background: rgb(255 255 255 / 92%);
+  backdrop-filter: blur(8px);
+  position: sticky; top: 0; z-index: 20;
+  padding-top: env(safe-area-inset-top);
+}
+.nav-inner { display: flex; align-items: center; justify-content: space-between; min-height: 64px; gap: 12px; }
+.wordmark {
+  display: inline-flex; align-items: center; gap: 9px;
+  font-weight: 700; font-size: 18px; letter-spacing: -0.02em;
+  color: var(--ink); text-decoration: none;
+}
+.wordmark svg { flex: none; }
+.nav-links { display: flex; gap: 4px; align-items: center; }
+.nav-links a {
+  display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px;
+  color: var(--muted); text-decoration: none; font-size: 15px; font-weight: 500;
+  border-radius: 8px;
+}
 .nav-links a:hover { color: var(--ink); }
-.nav-links a.btn { color: #fff; }
+.nav-anchor { display: none; }
 
+/* buttons */
 .btn {
-  display: inline-block; background: var(--accent); color: #fff;
-  font-weight: 600; font-size: 15px; text-decoration: none;
-  padding: 10px 20px; border-radius: 8px; border: none; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 44px; background: var(--accent); color: #fff;
+  font-weight: 600; font-size: 16px; line-height: 1.2; text-decoration: none;
+  padding: 0 22px; border-radius: var(--radius); border: none; cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: background-color 0.15s ease;
 }
-.btn:hover { background: #1D4FD7; }
-.btn-lg { padding: 13px 28px; font-size: 16px; }
+.btn:hover { background: var(--accent-down); color: #fff; }
+.nav-links a.btn { color: #fff; font-size: 15px; padding: 0 18px; }
+.btn-lg { min-height: 52px; padding: 0 30px; }
 
-.hero { padding: 96px 0 80px; text-align: center; }
+/* hero */
+.hero {
+  padding: 64px 0 56px; text-align: center;
+  background: radial-gradient(60% 55% at 50% 0%, rgb(37 99 235 / 5%), transparent 72%);
+}
 .hero h1 {
-  font-size: 48px; line-height: 1.15; font-weight: 700;
-  letter-spacing: -0.03em; max-width: 720px; margin: 0 auto 20px;
+  font-size: clamp(1.9rem, 7vw, 3.2rem); line-height: 1.12; font-weight: 700;
+  letter-spacing: -0.03em; max-width: 760px; margin: 0 auto 18px;
 }
-.hero p { font-size: 18px; color: var(--muted); max-width: 540px; margin: 0 auto 32px; }
-.hero .fine { font-size: 13px; color: var(--muted); margin-top: 16px; }
+.hero p.lede {
+  font-size: clamp(1rem, 2.6vw, 1.125rem); color: var(--muted);
+  max-width: 540px; margin: 0 auto 30px;
+}
+.hero .fine { font-size: 14px; color: var(--muted); margin-top: 16px; }
 
-section { padding: 72px 0; }
+/* sections */
+section { padding: 64px 0; }
 section.alt { background: var(--bg-soft); }
-h2 { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; text-align: center; margin-bottom: 40px; }
+h2 {
+  font-size: clamp(1.4rem, 4.5vw, 1.75rem); font-weight: 700;
+  letter-spacing: -0.02em; text-align: center; margin-bottom: 36px;
+}
 
-.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+/* feature cards */
+.cards { display: grid; grid-template-columns: 1fr; gap: 14px; }
 .card {
   background: var(--bg); border: 1px solid var(--line);
-  border-radius: 12px; padding: 24px;
+  border-radius: var(--radius); padding: 22px; box-shadow: var(--shadow-sm);
 }
-.card h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
-.card p { font-size: 14px; color: var(--muted); }
+.card .icon {
+  width: 38px; height: 38px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-soft); border: 1px solid var(--line); margin-bottom: 14px;
+}
+.card .icon svg { display: block; }
+.card h3 { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+.card p { font-size: 14.5px; color: var(--muted); }
 
-.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; counter-reset: step; }
+/* steps */
+.steps { display: grid; grid-template-columns: 1fr; gap: 28px; counter-reset: step; }
 .step { text-align: center; padding: 0 12px; }
 .step .num {
-  width: 36px; height: 36px; line-height: 36px; margin: 0 auto 14px;
+  width: 40px; height: 40px; line-height: 40px; margin: 0 auto 14px;
   border-radius: 50%; background: var(--ink); color: #fff;
   font-weight: 600; font-size: 15px;
 }
-.step h3 { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
-.step p { font-size: 14px; color: var(--muted); }
+.step h3 { font-size: 16.5px; font-weight: 600; margin-bottom: 6px; }
+.step p { font-size: 14.5px; color: var(--muted); max-width: 320px; margin: 0 auto; }
 
+/* pricing */
 .pricing { text-align: center; }
-.pricing .price { font-size: 44px; font-weight: 700; letter-spacing: -0.03em; }
-.pricing .price span { font-size: 17px; font-weight: 500; color: var(--muted); }
-.pricing p { color: var(--muted); max-width: 440px; margin: 8px auto 28px; }
+.pricing .price-card {
+  max-width: 420px; margin: 0 auto; background: var(--bg);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 36px 26px; box-shadow: var(--shadow-sm);
+}
+.pricing .price { font-size: clamp(2.2rem, 8vw, 2.75rem); font-weight: 700; letter-spacing: -0.03em; line-height: 1.1; }
+.pricing .price span { font-size: 16px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+.pricing p { color: var(--muted); font-size: 15px; margin: 12px auto 26px; }
 
+/* faq */
 .faq { max-width: 680px; margin: 0 auto; }
 details { border-bottom: 1px solid var(--line); }
 details summary {
-  cursor: pointer; font-weight: 600; font-size: 15px; padding: 18px 0;
-  list-style: none; display: flex; justify-content: space-between; align-items: center;
+  cursor: pointer; font-weight: 600; font-size: 15.5px;
+  min-height: 48px; padding: 16px 0;
+  list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 16px;
 }
 details summary::-webkit-details-marker { display: none; }
-details summary::after { content: '+'; color: var(--muted); font-weight: 400; font-size: 20px; }
-details[open] summary::after { content: '\2212'; }
-details div { padding: 0 0 18px; font-size: 14px; color: var(--muted); }
+details summary .chev { flex: none; color: var(--muted); transition: transform 0.18s ease; }
+details[open] summary .chev { transform: rotate(45deg); }
+details div.answer { padding: 0 0 18px; font-size: 14.5px; color: var(--muted); }
 
-footer { border-top: 1px solid var(--line); padding: 32px 0; }
-.foot { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--muted); }
-.foot a { color: var(--muted); text-decoration: none; }
-.foot a:hover { color: var(--ink); }
-.foot .links { display: flex; gap: 20px; }
-
-@media (max-width: 800px) {
-  .hero h1 { font-size: 34px; }
-  .cards { grid-template-columns: 1fr 1fr; }
-  .steps { grid-template-columns: 1fr; }
+/* footer */
+footer {
+  border-top: 1px solid var(--line);
+  padding: 32px 0 calc(32px + env(safe-area-inset-bottom));
 }
-@media (max-width: 480px) { .cards { grid-template-columns: 1fr; } }
+.foot {
+  display: flex; flex-direction: column; gap: 14px; align-items: flex-start;
+  font-size: 14px; color: var(--muted);
+}
+.foot a {
+  color: var(--muted); text-decoration: none;
+  display: inline-flex; align-items: center; min-height: 44px;
+}
+.foot a:hover { color: var(--ink); }
+.foot .links { display: flex; gap: 24px; flex-wrap: wrap; }
+
+/* tablet and up */
+@media (min-width: 640px) {
+  .cards { grid-template-columns: 1fr 1fr; gap: 16px; }
+  .steps { grid-template-columns: repeat(3, 1fr); gap: 24px; }
+  .foot { flex-direction: row; justify-content: space-between; align-items: center; }
+}
+@media (min-width: 880px) {
+  .hero { padding: 110px 0 96px; }
+  section { padding: 96px 0; }
+  h2 { margin-bottom: 44px; }
+  .cards { grid-template-columns: repeat(4, 1fr); }
+  .nav-anchor { display: inline-flex; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
 </style>
 </head>
 <body>
 
 <nav>
   <div class="wrap nav-inner">
-    <a class="wordmark" href="/" data-brand="name">Numbox</a>
+    <a class="wordmark" href="/">
+      <svg width="24" height="24" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#0B1220"/><path d="M22 46V18l20 28V18" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+      <span data-brand="name">Numbox</span>
+    </a>
     <div class="nav-links">
-      <a href="#how">How it works</a>
-      <a href="#pricing">Pricing</a>
-      <a href="#faq">FAQ</a>
-      <a class="btn" href="/app.html">Log in</a>
+      <a class="nav-anchor" href="#how">How it works</a>
+      <a class="nav-anchor" href="#pricing">Pricing</a>
+      <a class="nav-anchor" href="#faq">FAQ</a>
+      <a href="/app.html">Log in</a>
+      <a class="btn" href="/app.html">Get a number</a>
     </div>
   </div>
 </nav>
@@ -129,7 +216,7 @@ footer { border-top: 1px solid var(--line); padding: 32px 0; }
 <header class="hero">
   <div class="wrap">
     <h1 data-brand="tagline">Private US numbers for SMS verification</h1>
-    <p>Rent a real US mobile number for 24 hours. Receive every SMS sent to it in a clean live inbox — no apps, no contracts.</p>
+    <p class="lede">Rent a real US mobile number for 24 hours. Receive every SMS sent to it in a clean live inbox — no apps, no contracts.</p>
     <a class="btn btn-lg" href="/app.html">Get a number</a>
     <p class="fine">Pay-as-you-go. No subscription.</p>
   </div>
@@ -140,18 +227,30 @@ footer { border-top: 1px solid var(--line); padding: 32px 0; }
     <h2>Why rent here</h2>
     <div class="cards">
       <div class="card">
+        <div class="icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0B1220" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><rect x="9" y="12" width="6" height="6" rx="1"/></svg>
+        </div>
         <h3>Real SIM numbers</h3>
         <p>Numbers live on physical SIM cards on major US carriers — not throwaway VoIP ranges that services reject.</p>
       </div>
       <div class="card">
+        <div class="icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0B1220" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1z"/></svg>
+        </div>
         <h3>Full inbox for 24h</h3>
         <p>The number is yours for a full day. Every inbound SMS shows up in your inbox, not just one code.</p>
       </div>
       <div class="card">
+        <div class="icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0B1220" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.1-1.3-2-3-2s-3 .9-3 2 1.1 1.7 3 2 3 1 3 2.1-1.3 2-3 2-3-.9-3-2"/></svg>
+        </div>
         <h3>Pay with crypto</h3>
         <p>Top up your balance with cryptocurrency. Funds appear automatically once payment confirms.</p>
       </div>
       <div class="card">
+        <div class="icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0B1220" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></svg>
+        </div>
         <h3>Instant delivery</h3>
         <p>Your number is revealed the moment you rent it, and messages arrive in seconds.</p>
       </div>
@@ -185,9 +284,11 @@ footer { border-top: 1px solid var(--line); padding: 32px 0; }
 <section class="alt" id="pricing">
   <div class="wrap pricing">
     <h2>Simple pricing</h2>
-    <div class="price">from $3<span> / day per number</span></div>
-    <p>One flat price per rental. No hidden per-message fees. Your balance only moves when you rent a number.</p>
-    <a class="btn btn-lg" href="/app.html">Get a number</a>
+    <div class="price-card">
+      <div class="price">from $3<span> / day per number</span></div>
+      <p>One flat price per rental. No hidden per-message fees. Your balance only moves when you rent a number.</p>
+      <a class="btn btn-lg" href="/app.html">Get a number</a>
+    </div>
   </div>
 </section>
 
@@ -196,24 +297,24 @@ footer { border-top: 1px solid var(--line); padding: 32px 0; }
     <h2>Frequently asked questions</h2>
     <div class="faq">
       <details>
-        <summary>What is this service?</summary>
-        <div>We rent out private US mobile numbers by the day. You rent a number, use it to receive SMS — verification codes, one-time passwords, sign-up confirmations — and read everything in your online inbox.</div>
+        <summary>What is this service?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
+        <div class="answer">We rent out private US mobile numbers by the day. You rent a number, use it to receive SMS — verification codes, one-time passwords, sign-up confirmations — and read everything in your online inbox.</div>
       </details>
       <details>
-        <summary>How long do I keep the number?</summary>
-        <div>Each rental lasts 24 hours from the moment you rent it. During that window every SMS sent to the number is delivered to your inbox.</div>
+        <summary>How long do I keep the number?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
+        <div class="answer">Each rental lasts 24 hours from the moment you rent it. During that window every SMS sent to the number is delivered to your inbox.</div>
       </details>
       <details>
-        <summary>Which carriers are the numbers on?</summary>
-        <div>Numbers are on real physical SIMs on major US networks, currently AT&amp;T and T-Mobile. The carrier is shown next to each available number before you rent.</div>
+        <summary>Which carriers are the numbers on?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
+        <div class="answer">Numbers are on real physical SIMs on major US networks, currently AT&amp;T and T-Mobile. The carrier is shown next to each available number before you rent.</div>
       </details>
       <details>
-        <summary>How do payments work?</summary>
-        <div>You fund an account balance (cryptocurrency supported) and rentals are deducted from it. Minimum deposit is $10. Your balance never expires.</div>
+        <summary>How do payments work?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
+        <div class="answer">You fund an account balance (cryptocurrency supported) and rentals are deducted from it. Minimum deposit is $10. Your balance never expires.</div>
       </details>
       <details>
-        <summary>What is the refund policy?</summary>
-        <div>Unused rentals are non-refundable once a number is delivered. If a number turns out to be faulty during your rental window, contact support and we will make it right.</div>
+        <summary>What is the refund policy?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
+        <div class="answer">Unused rentals are non-refundable once a number is delivered. If a number turns out to be faulty during your rental window, contact support and we will make it right.</div>
       </details>
     </div>
   </div>
