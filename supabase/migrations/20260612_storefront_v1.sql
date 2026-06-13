@@ -136,3 +136,8 @@ alter table shop_pool      enable row level security;
 alter table shop_rentals   enable row level security;
 alter table shop_deposits  enable row level security;
 alter table shop_prices    enable row level security;
+
+-- 20260613 addendum (applied as migration storefront_durations):
+-- weekly/monthly rental pricing for the AI-agent and stable-US-number segments.
+-- alter table shop_prices add column weekly_price_cents bigint;
+-- alter table shop_prices add column monthly_price_cents bigint;
