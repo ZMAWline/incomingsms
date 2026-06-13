@@ -205,6 +205,31 @@ mark { background: #DBEAFE; color: var(--accent); font-weight: 600; padding: 0 3
 @media (min-width: 640px) { .modal-actions .btn { flex: 0 0 auto; } }
 .note { background: var(--bg); border-radius: 10px; padding: 12px 14px; font-size: 13.5px; color: var(--muted); margin-top: 14px; }
 
+/* duration segmented control (rent modal) */
+.seg { display: flex; gap: 8px; margin: 16px 0 4px; }
+.seg button {
+  flex: 1; min-height: 58px; border: 1px solid var(--line); background: var(--panel); border-radius: 10px;
+  font: 600 14px 'Inter', system-ui, sans-serif; cursor: pointer; color: var(--ink);
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+}
+.seg button .seg-price { font-size: 12.5px; font-weight: 500; color: var(--muted); font-variant-numeric: tabular-nums; }
+.seg button.on { border-color: var(--accent); color: var(--accent); background: #EFF4FE; }
+.seg button.on .seg-price { color: var(--accent); }
+
+/* API access */
+.token-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+code.token {
+  font: 500 13.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; letter-spacing: 0.02em; word-break: break-all; min-width: 0;
+  color: var(--ink);
+}
+
+/* app footer */
+.app-foot { text-align: center; font-size: 13.5px; color: var(--muted); padding: 8px 0 0; }
+.app-foot a { color: var(--muted); padding: 8px 4px; display: inline-block; }
+.app-foot a:hover { color: var(--ink); }
+
 /* toasts */
 #toasts {
   position: fixed; bottom: calc(20px + env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
@@ -306,6 +331,24 @@ mark { background: #DBEAFE; color: var(--accent); font-weight: 600; padding: 0 3
       </div>
     </div>
 
+    <div class="section panel">
+      <h2>API access</h2>
+      <p class="muted small" style="margin-bottom:12px;">
+        Automate rentals and read OTPs from scripts or AI agents with your personal token.
+        Send it as <code>Authorization: Bearer &lt;token&gt;</code> — see the <a href="/docs.html">API docs</a>.
+      </p>
+      <div class="token-row">
+        <code class="token" id="apiToken">••••••••</code>
+        <button class="btn btn-ghost btn-sm" id="tokenReveal">Reveal</button>
+        <button class="btn btn-ghost btn-sm" id="tokenCopy">Copy</button>
+        <button class="btn btn-ghost btn-sm" id="tokenRotate">Rotate</button>
+      </div>
+    </div>
+
+    <div class="app-foot">
+      <a href="/docs.html">API docs</a> &middot; <a href="/">Home</a> &middot; <a id="footSupport" href="mailto:support@numbox.io">Support</a>
+    </div>
+
   </div>
 </div>
 
@@ -337,6 +380,20 @@ mark { background: #DBEAFE; color: var(--accent); font-weight: 600; padding: 0 3
     <div class="modal-actions">
       <button class="btn btn-ghost" id="fundsCancel">Close</button>
       <button class="btn" id="fundsGo">Continue</button>
+    </div>
+  </div>
+</div>
+
+<!-- RENT MODAL (duration picker + confirm) -->
+<div id="rentOverlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="rentTitle">
+  <div class="modal">
+    <h2 id="rentTitle">Rent this number</h2>
+    <div class="muted small" id="rentSub"></div>
+    <div class="seg" id="rentDurations" role="radiogroup" aria-label="Rental duration"></div>
+    <div class="note">You keep the same number for the whole term, and every SMS lands in your inbox.</div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="rentCancel">Cancel</button>
+      <button class="btn" id="rentGo">Rent</button>
     </div>
   </div>
 </div>
@@ -406,6 +463,16 @@ function fmtTime(iso) {
   return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+// keep in sync with durationFromHours in src/storefront/logic.mjs — fallback
+// for rentals the server has not labelled (derive from the window length)
+function durationOf(r) {
+  const hours = Math.round((Date.parse(r.ends_at) - Date.parse(r.starts_at)) / 3600000);
+  if (!Number.isFinite(hours)) return 'day';
+  if (hours >= 720) return 'month';
+  if (hours >= 168) return 'week';
+  return 'day';
+}
+
 function countdownText(endsAtIso) {
   let ms = Date.parse(endsAtIso) - Date.now();
   if (!(ms > 0)) return 'expired';
@@ -433,6 +500,7 @@ async function boot() {
   document.querySelectorAll('[data-brand="name"]').forEach((el) => el.textContent = CONFIG.brand.name);
   document.querySelectorAll('[data-brand="tagline"]').forEach((el) => el.textContent = CONFIG.brand.tagline);
   document.title = CONFIG.brand.name;
+  if (CONFIG.brand.supportEmail) $('footSupport').href = 'mailto:' + CONFIG.brand.supportEmail;
 
   const me = await api('/api/me');
   if (me.ok) {
@@ -464,6 +532,7 @@ async function showApp() {
 function renderMe() {
   $('meEmail').textContent = ME.email;
   $('balance').textContent = dollars(ME.balance_cents);
+  renderToken();
 }
 
 async function refreshMe() {
@@ -522,28 +591,71 @@ async function loadStock() {
   for (const item of stock) {
     const card = document.createElement('div');
     card.className = 'stock-card';
+    const dayPrice = (item.prices && item.prices.day) || item.daily_price_cents;
     card.innerHTML =
       '<span class="tag">' + escapeHtml(item.carrier) + '</span>' +
       '<div class="stock-num">' + escapeHtml(item.masked_number) + '</div>' +
       '<div class="muted small">Area code ' + escapeHtml(item.area_code || '—') + '</div>' +
       '<div class="stock-foot">' +
-        '<span class="price">' + dollars(item.daily_price_cents) + '<span> / day</span></span>' +
+        '<span class="price">from ' + dollars(dayPrice) + '<span> / day</span></span>' +
         '<button class="btn btn-sm btn-block">Rent</button>' +
       '</div>';
-    card.querySelector('button').onclick = () => rent(item);
+    card.querySelector('button').onclick = () => openRent(item);
     grid.appendChild(card);
   }
 }
 
-async function rent(item) {
-  const ok = confirm(
-    'Rent ' + item.masked_number + ' (' + item.carrier + ') for 24 hours at ' +
-    dollars(item.daily_price_cents) + '?'
-  );
-  if (!ok) return;
-  const res = await postJson('/api/rent', { sim_id: item.sim_id });
+// ---- rent flow (duration picker modal) ---------------------------------------
+let rentItem = null;
+let rentDuration = 'day';
+const DURATION_LABELS = { day: '1 day', week: '7 days', month: '30 days' };
+
+function rentPrices() {
+  // prices come from /api/stock; older payloads only had daily_price_cents
+  const p = (rentItem && rentItem.prices) || {};
+  const day = p.day || (rentItem && rentItem.daily_price_cents) || 0;
+  return { day, week: p.week || day * 7, month: p.month || day * 28 };
+}
+
+function openRent(item) {
+  rentItem = item;
+  rentDuration = 'day';
+  $('rentSub').textContent =
+    item.masked_number + ' · ' + item.carrier + ' · area code ' + (item.area_code || '—');
+  renderRentDurations();
+  $('rentOverlay').classList.remove('hidden');
+}
+
+function renderRentDurations() {
+  const prices = rentPrices();
+  $('rentDurations').innerHTML = ['day', 'week', 'month'].map((d) =>
+    '<button type="button" role="radio" aria-checked="' + (d === rentDuration) + '"' +
+      (d === rentDuration ? ' class="on"' : '') + ' data-d="' + d + '">' +
+      DURATION_LABELS[d] +
+      '<span class="seg-price">' + dollars(prices[d]) + '</span>' +
+    '</button>'
+  ).join('');
+  $('rentDurations').querySelectorAll('button').forEach((b) => {
+    b.onclick = () => { rentDuration = b.dataset.d; renderRentDurations(); };
+  });
+  // the confirm button doubles as the summary: duration + price
+  $('rentGo').textContent = 'Rent ' + DURATION_LABELS[rentDuration] + ' · ' + dollars(prices[rentDuration]);
+}
+
+function closeRent() { $('rentOverlay').classList.add('hidden'); rentItem = null; }
+$('rentCancel').onclick = closeRent;
+$('rentOverlay').onclick = (e) => { if (e.target === $('rentOverlay')) closeRent(); };
+
+$('rentGo').onclick = async () => {
+  if (!rentItem) return;
+  const item = rentItem;
+  const duration = rentDuration;
+  $('rentGo').disabled = true;
+  const res = await postJson('/api/rent', { sim_id: item.sim_id, duration });
+  $('rentGo').disabled = false;
+  closeRent();
   if (res.ok) {
-    toast('Number rented — it is yours for 24 hours.');
+    toast('Number rented — it is yours for ' + DURATION_LABELS[duration] + '.');
     await Promise.all([refreshMe(), loadStock(), loadRentals()]);
     return;
   }
@@ -557,7 +669,7 @@ async function rent(item) {
     toast('Could not rent this number. Try another.', true);
     loadStock();
   }
-}
+};
 
 // ---- rentals + inbox ---------------------------------------------------------
 async function loadRentals() {
@@ -572,6 +684,7 @@ async function loadRentals() {
     div.className = 'rental';
     div.dataset.id = r.id;
     const statusLabel = st === 'ended' && r.ended_reason === 'number_rotated' ? 'ended (rotated)' : st;
+    const durLabel = { day: '1-day', week: '7-day', month: '30-day' }[r.duration || durationOf(r)] || '';
     const inboxOpen = openInboxRentalId === r.id && !inboxOverlayOpen;
     div.innerHTML =
       '<div class="rental-top">' +
@@ -583,7 +696,8 @@ async function loadRentals() {
               'Copy</button>' +
             '<span class="pill ' + escapeHtml(st) + '">' + escapeHtml(statusLabel) + '</span>' +
           '</div>' +
-          '<div class="rental-meta">' + escapeHtml(r.carrier || '') + ' · ' + dollars(r.price_cents) +
+          '<div class="rental-meta">' + escapeHtml(r.carrier || '') +
+            (durLabel ? ' · ' + durLabel + ' rental' : '') + ' · ' + dollars(r.price_cents) +
             ' · rented ' + fmtTime(r.starts_at) + '</div>' +
         '</div>' +
         '<div class="rental-actions">' +
@@ -695,6 +809,43 @@ async function pollInbox() {
   ).join('');
 }
 
+// ---- API access ----------------------------------------------------------------
+let tokenRevealed = false;
+
+function maskToken(t) {
+  return t ? t.slice(0, 4) + '••••••••••••' + t.slice(-4) : '—';
+}
+
+function renderToken() {
+  const t = ME && ME.api_token;
+  $('apiToken').textContent = tokenRevealed ? (t || '—') : maskToken(t);
+  $('tokenReveal').textContent = tokenRevealed ? 'Hide' : 'Reveal';
+}
+
+$('tokenReveal').onclick = () => { tokenRevealed = !tokenRevealed; renderToken(); };
+
+$('tokenCopy').onclick = async () => {
+  if (!ME || !ME.api_token) return;
+  try { await navigator.clipboard.writeText(ME.api_token); toast('API token copied.'); }
+  catch { toast('Copy failed — reveal the token and copy it manually.', true); }
+};
+
+$('tokenRotate').onclick = async () => {
+  const ok = confirm('Rotate your API token? The old token stops working immediately — every script or agent using it must be updated.');
+  if (!ok) return;
+  $('tokenRotate').disabled = true;
+  const res = await postJson('/api/token/rotate', {});
+  $('tokenRotate').disabled = false;
+  if (res.ok && res.body && res.body.api_token) {
+    ME.api_token = res.body.api_token;
+    tokenRevealed = true; // show the fresh token so it can be copied right away
+    renderToken();
+    toast('New API token generated.');
+  } else {
+    toast('Could not rotate the token. Try again.', true);
+  }
+};
+
 // ---- deposits ----------------------------------------------------------------
 let pickedCents = 2500;
 
@@ -711,6 +862,7 @@ $('fundsOverlay').onclick = (e) => {
 // Escape closes whichever overlay is open
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  if (!$('rentOverlay').classList.contains('hidden')) { closeRent(); return; }
   if (!$('fundsOverlay').classList.contains('hidden')) { $('fundsOverlay').classList.add('hidden'); return; }
   if (inboxOverlayOpen) { closeInbox(); loadRentals(); }
 });

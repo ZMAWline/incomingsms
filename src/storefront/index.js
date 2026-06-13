@@ -15,13 +15,20 @@ import {
   vendorToCarrier,
   areaCode,
   maskNumber,
-  priceForVendor,
+  priceFor,
+  durationToHours,
+  durationFromHours,
+  parseBearerToken,
 } from './logic.mjs';
 
 const COOKIE_NAME = 'nb_session';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const MIN_DEPOSIT_CENTS = 1000;
-const RENTAL_HOURS = 24;
+
+// All three duration price columns; vendor rows may hold NULLs (priceFor
+// falls back per-column to the 'default' row, then derives from daily).
+const PRICES_SELECT =
+  'shop_prices?select=vendor,daily_price_cents,weekly_price_cents,monthly_price_cents';
 
 // ---------------------------------------------------------------------------
 // relayFetch — copied from src/mdn-rotator/index.js. Project constraint: ALL
@@ -182,7 +189,24 @@ async function createSession(env, customerId) {
 }
 
 // Returns the customer row, or a Response (401/403) the route should return.
+// Two credentials are accepted on every authed endpoint:
+//   1. Authorization: Bearer <api_token> — for scripts / AI agents. The token
+//      is a random 32-hex secret looked up by indexed equality; tokens carry
+//      no structure so there is nothing timing-sensitive to compare in JS.
+//   2. The nb_session cookie — for the browser app.
 async function requireCustomer(request, env) {
+  const bearer = parseBearerToken(request.headers.get('Authorization'));
+  if (bearer) {
+    const customers = await sbSelect(
+      env,
+      `shop_customers?api_token=eq.${encodeURIComponent(bearer)}&select=id,email,status,api_token&limit=1`
+    );
+    const customer = customers[0];
+    if (!customer) return json({ error: 'unauthorized' }, 401);
+    if (customer.status === 'banned') return json({ error: 'account_disabled' }, 403);
+    return customer;
+  }
+
   const token = getSessionToken(request);
   if (!token) return json({ error: 'unauthorized' }, 401);
   const sessions = await sbSelect(
@@ -288,7 +312,7 @@ async function handleStock(env) {
     selectIn(env, 'sims', 'id', poolIds, 'status=eq.active&select=id,vendor'),
     selectIn(env, 'sim_numbers', 'sim_id', poolIds, 'valid_to=is.null&select=sim_id,e164'),
     selectIn(env, 'shop_rentals', 'sim_id', poolIds, 'status=eq.active&select=sim_id'),
-    sbSelect(env, 'shop_prices?select=vendor,daily_price_cents'),
+    sbSelect(env, PRICES_SELECT),
   ]);
 
   const numberBySim = new Map(numbers.map((n) => [n.sim_id, n.e164]));
@@ -299,12 +323,18 @@ async function handleStock(env) {
     if (rentedSims.has(sim.id)) continue;
     const e164 = numberBySim.get(sim.id);
     if (!e164) continue;
+    const tier = {
+      day: priceFor(sim.vendor, 'day', prices),
+      week: priceFor(sim.vendor, 'week', prices),
+      month: priceFor(sim.vendor, 'month', prices),
+    };
     stock.push({
       sim_id: sim.id,
       carrier: vendorToCarrier(sim.vendor),
       area_code: areaCode(e164),
       masked_number: maskNumber(e164),
-      daily_price_cents: priceForVendor(sim.vendor, prices),
+      daily_price_cents: tier.day, // back-compat for older clients
+      prices: tier,
     });
   }
   return json({ stock });
@@ -325,10 +355,22 @@ async function handleMe(customer, env) {
   });
 }
 
+// shop_rentals has no duration column: derive the label from the rental
+// window so day/week/month rentals self-describe in API responses.
+function withDuration(rental) {
+  if (!rental || !rental.starts_at || !rental.ends_at) return rental;
+  const hours = (Date.parse(rental.ends_at) - Date.parse(rental.starts_at)) / 3600000;
+  return { ...rental, duration: durationFromHours(hours) };
+}
+
 async function handleRent(customer, env, request) {
   const body = await readJsonBody(request);
   const simId = Number(body?.sim_id);
   if (!Number.isInteger(simId) || simId <= 0) return json({ error: 'invalid_sim_id' }, 400);
+
+  const duration = body?.duration == null ? 'day' : String(body.duration);
+  const hours = durationToHours(duration);
+  if (hours == null) return json({ error: 'invalid_duration' }, 400);
 
   // Re-verify sellability. These checks give clean errors for the common
   // cases; the RPC + partial unique index remain the actual race-safety.
@@ -344,8 +386,8 @@ async function handleRent(customer, env, request) {
   if (active.length) return json({ error: 'just_taken' }, 409);
 
   const vendor = sims[0].vendor;
-  const prices = await sbSelect(env, 'shop_prices?select=vendor,daily_price_cents');
-  const priceCents = priceForVendor(vendor, prices);
+  const prices = await sbSelect(env, PRICES_SELECT);
+  const priceCents = priceFor(vendor, duration, prices);
   const e164 = normalizeToE164(numbers[0].e164);
 
   const rpc = await sbRpc(env, 'shop_claim_rental', {
@@ -354,7 +396,7 @@ async function handleRent(customer, env, request) {
     p_e164: e164,
     p_carrier: vendorToCarrier(vendor),
     p_price_cents: priceCents,
-    p_hours: RENTAL_HOURS,
+    p_hours: hours,
   });
   if (!rpc.ok) {
     if (rpc.text.includes('insufficient_balance')) {
@@ -367,7 +409,7 @@ async function handleRent(customer, env, request) {
   }
   const rentalId = Number(JSON.parse(rpc.text));
   const rentals = await sbSelect(env, `shop_rentals?id=eq.${rentalId}&select=*&limit=1`);
-  return json({ rental: rentals[0] || { id: rentalId } });
+  return json({ rental: rentals[0] ? withDuration(rentals[0]) : { id: rentalId, duration } });
 }
 
 function effectiveStatus(rental, currentE164BySim, nowMs) {
@@ -395,8 +437,17 @@ async function handleRentals(customer, env) {
   const currentBySim = new Map(currentNumbers.map((n) => [n.sim_id, normalizeToE164(n.e164)]));
   const now = Date.now();
   return json({
-    rentals: rentals.map((r) => ({ ...r, ...effectiveStatus(r, currentBySim, now) })),
+    rentals: rentals.map((r) => ({ ...withDuration(r), ...effectiveStatus(r, currentBySim, now) })),
   });
+}
+
+// Regenerate the customer's api_token (same shape as the one minted at
+// signup) and hand the fresh one back. The old token dies with the patch —
+// the escape hatch for leaked agent credentials.
+async function handleRotateToken(customer, env) {
+  const newToken = randomHex(16); // 32-hex, matches signup
+  await sbPatch(env, `shop_customers?id=eq.${customer.id}`, { api_token: newToken });
+  return json({ ok: true, api_token: newToken });
 }
 
 async function handleMessages(customer, env, rentalId) {
@@ -626,13 +677,14 @@ export default {
         const messagesMatch = path.match(/^\/api\/rentals\/(\d+)\/messages$/);
         const isAuthedRoute =
           path === '/api/me' || path === '/api/rent' || path === '/api/rentals' ||
-          path === '/api/deposits' || messagesMatch;
+          path === '/api/deposits' || path === '/api/token/rotate' || messagesMatch;
         if (isAuthedRoute) {
           const auth = await requireCustomer(request, env);
           if (auth instanceof Response) return auth;
           if (path === '/api/me' && method === 'GET') return handleMe(auth, env);
           if (path === '/api/rent' && method === 'POST') return handleRent(auth, env, request);
           if (path === '/api/rentals' && method === 'GET') return handleRentals(auth, env);
+          if (path === '/api/token/rotate' && method === 'POST') return handleRotateToken(auth, env);
           if (messagesMatch && method === 'GET') return handleMessages(auth, env, Number(messagesMatch[1]));
           if (path === '/api/deposits' && method === 'POST') return handleCreateDeposit(auth, env, request);
           if (path === '/api/deposits' && method === 'GET') return handleListDeposits(auth, env);

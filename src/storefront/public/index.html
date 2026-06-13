@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Numbox — Private US numbers for SMS verification</title>
-<meta name="description" content="Rent a private US phone number for 24 hours and receive SMS verification codes instantly. Real SIM numbers, pay-as-you-go, no subscription.">
+<meta name="description" content="Rent a private US phone number by the day, week, or month and receive SMS verification codes instantly. Real SIM numbers, pay-as-you-go, no subscription.">
 <meta name="theme-color" content="#FFFFFF">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Numbox — Private US numbers for SMS verification">
-<meta property="og:description" content="Rent a real US mobile number for 24 hours and read every SMS in a clean live inbox. Pay-as-you-go, no subscription.">
+<meta property="og:description" content="Rent a real US mobile number by the day, week, or month and read every SMS in a clean live inbox. Pay-as-you-go, no subscription.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230B1220'/%3E%3Cpath d='M22 46V18l20 28V18' stroke='%23ffffff' stroke-width='6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -136,16 +136,44 @@ h2 {
 .step h3 { font-size: 16.5px; font-weight: 600; margin-bottom: 6px; }
 .step p { font-size: 14.5px; color: var(--muted); max-width: 320px; margin: 0 auto; }
 
+/* audiences */
+.audience { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.aud-card {
+  background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 28px 24px; box-shadow: var(--shadow-sm);
+  display: flex; flex-direction: column; align-items: flex-start; gap: 10px;
+}
+.aud-card .icon {
+  width: 38px; height: 38px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-soft); border: 1px solid var(--line);
+}
+.aud-card h3 { font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
+.aud-card p { font-size: 14.5px; color: var(--muted); }
+.aud-card .btn { margin-top: 8px; }
+@media (min-width: 740px) { .audience { grid-template-columns: 1fr 1fr; gap: 16px; } .aud-card { padding: 32px 28px; } }
+
 /* pricing */
 .pricing { text-align: center; }
-.pricing .price-card {
-  max-width: 420px; margin: 0 auto; background: var(--bg);
-  border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 36px 26px; box-shadow: var(--shadow-sm);
+.tiers {
+  display: grid; grid-template-columns: 1fr; gap: 14px;
+  max-width: 780px; margin: 0 auto 22px;
 }
-.pricing .price { font-size: clamp(2.2rem, 8vw, 2.75rem); font-weight: 700; letter-spacing: -0.03em; line-height: 1.1; }
-.pricing .price span { font-size: 16px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
-.pricing p { color: var(--muted); font-size: 15px; margin: 12px auto 26px; }
+.tier {
+  background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 28px 22px; box-shadow: var(--shadow-sm);
+}
+.tier.featured { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--shadow-sm); }
+.tier .tier-name {
+  font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--muted); margin-bottom: 8px;
+}
+.tier.featured .tier-name { color: var(--accent); }
+.pricing .price { font-size: clamp(1.9rem, 7vw, 2.4rem); font-weight: 700; letter-spacing: -0.03em; line-height: 1.1; }
+.pricing .price span { font-size: 15px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+.tier p { color: var(--muted); font-size: 14px; margin-top: 10px; }
+.pricing .fine-print { color: var(--muted); font-size: 15px; max-width: 560px; margin: 0 auto 26px; }
+@media (min-width: 640px) { .tiers { grid-template-columns: repeat(3, 1fr); gap: 16px; } }
 
 /* faq */
 .faq { max-width: 680px; margin: 0 auto; }
@@ -206,6 +234,7 @@ footer {
     <div class="nav-links">
       <a class="nav-anchor" href="#how">How it works</a>
       <a class="nav-anchor" href="#pricing">Pricing</a>
+      <a class="nav-anchor" href="/docs.html">API</a>
       <a class="nav-anchor" href="#faq">FAQ</a>
       <a href="/app.html">Log in</a>
       <a class="btn" href="/app.html">Get a number</a>
@@ -216,7 +245,7 @@ footer {
 <header class="hero">
   <div class="wrap">
     <h1 data-brand="tagline">Private US numbers for SMS verification</h1>
-    <p class="lede">Rent a real US mobile number for 24 hours. Receive every SMS sent to it in a clean live inbox — no apps, no contracts.</p>
+    <p class="lede">Rent a real US mobile number by the day, week, or month. Receive every SMS sent to it in a clean live inbox — no apps, no contracts.</p>
     <a class="btn btn-lg" href="/app.html">Get a number</a>
     <p class="fine">Pay-as-you-go. No subscription.</p>
   </div>
@@ -237,8 +266,8 @@ footer {
         <div class="icon">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0B1220" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1z"/></svg>
         </div>
-        <h3>Full inbox for 24h</h3>
-        <p>The number is yours for a full day. Every inbound SMS shows up in your inbox, not just one code.</p>
+        <h3>Full inbox, full term</h3>
+        <p>The number is yours for the whole rental — 1, 7, or 30 days. Every inbound SMS shows up in your inbox, not just one code.</p>
       </div>
       <div class="card">
         <div class="icon">
@@ -258,7 +287,31 @@ footer {
   </div>
 </section>
 
-<section id="how">
+<section id="audiences">
+  <div class="wrap">
+    <h2>Made for agents and expats alike</h2>
+    <div class="audience">
+      <div class="aud-card">
+        <div class="icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0B1220" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        </div>
+        <h3>For AI agents &amp; developers</h3>
+        <p>Give your agent a real US phone number. One API call to rent, one to read the OTP. Bearer-token auth, no browser needed.</p>
+        <a class="btn" href="/docs.html">Read the API docs</a>
+      </div>
+      <div class="aud-card">
+        <div class="icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0B1220" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg>
+        </div>
+        <h3>For people abroad</h3>
+        <p>Keep a stable US number for your bank, broker, and account OTPs. Weekly and monthly rentals keep the <strong>same number</strong> for the whole term.</p>
+        <a class="btn" href="/app.html">Get a number</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="how">
   <div class="wrap">
     <h2>How it works</h2>
     <div class="steps">
@@ -281,18 +334,32 @@ footer {
   </div>
 </section>
 
-<section class="alt" id="pricing">
+<section id="pricing">
   <div class="wrap pricing">
     <h2>Simple pricing</h2>
-    <div class="price-card">
-      <div class="price">from $3<span> / day per number</span></div>
-      <p>One flat price per rental. No hidden per-message fees. Your balance only moves when you rent a number.</p>
-      <a class="btn btn-lg" href="/app.html">Get a number</a>
+    <div class="tiers">
+      <div class="tier">
+        <div class="tier-name">Day</div>
+        <div class="price">from $3<span> / day</span></div>
+        <p>24 hours of inbox time. Perfect for a one-off verification.</p>
+      </div>
+      <div class="tier featured">
+        <div class="tier-name">Week</div>
+        <div class="price">from $15<span> / week</span></div>
+        <p>7 days, same number the whole time. Room to verify at your pace.</p>
+      </div>
+      <div class="tier">
+        <div class="tier-name">Month</div>
+        <div class="price">from $45<span> / month</span></div>
+        <p>30 days with one stable number for your important accounts.</p>
+      </div>
     </div>
+    <p class="fine-print">One flat price per rental. No hidden per-message fees. Your balance only moves when you rent a number.</p>
+    <a class="btn btn-lg" href="/app.html">Get a number</a>
   </div>
 </section>
 
-<section id="faq">
+<section class="alt" id="faq">
   <div class="wrap">
     <h2>Frequently asked questions</h2>
     <div class="faq">
@@ -302,7 +369,15 @@ footer {
       </details>
       <details>
         <summary>How long do I keep the number?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
-        <div class="answer">Each rental lasts 24 hours from the moment you rent it. During that window every SMS sent to the number is delivered to your inbox.</div>
+        <div class="answer">You choose when you rent: 1 day, 7 days, or 30 days from the moment you rent it. During that window every SMS sent to the number is delivered to your inbox.</div>
+      </details>
+      <details>
+        <summary>Can I keep the same number?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
+        <div class="answer">Yes. Weekly and monthly rentals hold one number for the full term — ideal when your bank, broker, or other accounts need a stable US number for recurring OTPs.</div>
+      </details>
+      <details>
+        <summary>Do you have an API?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
+        <div class="answer">Yes — every account comes with an API token. Rent numbers and read OTPs straight from scripts or AI agents with simple bearer-token auth. See the <a href="/docs.html">API docs</a>.</div>
       </details>
       <details>
         <summary>Which carriers are the numbers on?<svg class="chev" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 2v12M2 8h12"/></svg></summary>
@@ -325,6 +400,7 @@ footer {
     <div><span data-brand="name">Numbox</span> &copy; <span id="year"></span></div>
     <div class="links">
       <a data-brand="supportEmailLink" href="mailto:support@numbox.io" data-brand-email>support@numbox.io</a>
+      <a href="/docs.html">API</a>
       <a href="#" title="Coming soon">Terms</a>
     </div>
   </div>

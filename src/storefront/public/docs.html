@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Numbox API — rent US numbers and read OTPs programmatically</title>
+<meta name="description" content="Numbox HTTP API: rent a real US phone number with one call and poll its SMS inbox for OTP codes. Bearer-token auth, built for scripts and AI agents.">
+<meta name="theme-color" content="#FFFFFF">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230B1220'/%3E%3Cpath d='M22 46V18l20 28V18' stroke='%23ffffff' stroke-width='6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script>
+// keep in sync with src/storefront/brand.mjs
+const BRAND = {
+  name: 'Numbox',
+  tagline: 'Private US numbers for SMS verification',
+  supportEmail: 'support@numbox.io',
+};
+</script>
+<style>
+:root {
+  --ink: #0B1220;
+  --muted: #5B6472;
+  --bg: #ffffff;
+  --bg-soft: #F7F8FA;
+  --line: #E5E7EB;
+  --accent: #2563EB;
+  --accent-down: #1D4FD7;
+  --radius: 12px;
+  --shadow-sm: 0 1px 2px rgb(16 24 40 / 6%);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+body {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 16px; color: var(--ink); background: var(--bg); line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 820px; margin: 0 auto;
+  padding-left: max(20px, env(safe-area-inset-left));
+  padding-right: max(20px, env(safe-area-inset-right));
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+/* nav — same as landing */
+nav {
+  border-bottom: 1px solid var(--line);
+  background: rgb(255 255 255 / 92%);
+  backdrop-filter: blur(8px);
+  position: sticky; top: 0; z-index: 20;
+  padding-top: env(safe-area-inset-top);
+}
+.nav-inner { display: flex; align-items: center; justify-content: space-between; min-height: 64px; gap: 12px; }
+.wordmark {
+  display: inline-flex; align-items: center; gap: 9px;
+  font-weight: 700; font-size: 18px; letter-spacing: -0.02em;
+  color: var(--ink); text-decoration: none;
+}
+.wordmark:hover { text-decoration: none; }
+.nav-links { display: flex; gap: 4px; align-items: center; }
+.nav-links a {
+  display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px;
+  color: var(--muted); text-decoration: none; font-size: 15px; font-weight: 500; border-radius: 8px;
+}
+.nav-links a:hover { color: var(--ink); text-decoration: none; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 44px; background: var(--accent); color: #fff;
+  font-weight: 600; font-size: 15px; line-height: 1.2; text-decoration: none;
+  padding: 0 18px; border-radius: var(--radius); border: none; cursor: pointer;
+  box-shadow: var(--shadow-sm); transition: background-color 0.15s ease;
+}
+.btn:hover { background: var(--accent-down); color: #fff; text-decoration: none; }
+.nav-links a.btn { color: #fff; }
+
+/* docs body */
+main { padding: 40px 0 64px; }
+h1 { font-size: clamp(1.7rem, 6vw, 2.3rem); font-weight: 700; letter-spacing: -0.03em; line-height: 1.15; margin-bottom: 12px; }
+.lede { color: var(--muted); font-size: 16.5px; max-width: 640px; margin-bottom: 8px; }
+h2 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; margin: 44px 0 12px; }
+h3 { font-size: 16px; font-weight: 600; margin: 26px 0 8px; }
+p { margin-bottom: 10px; }
+p.muted, li.muted { color: var(--muted); }
+ul { padding-left: 22px; margin-bottom: 10px; }
+li { margin-bottom: 4px; }
+
+code {
+  font: 500 13.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--bg-soft); border: 1px solid var(--line); border-radius: 6px;
+  padding: 1px 6px; word-break: break-word;
+}
+pre {
+  background: #0E1726; color: #E6EAF2; border-radius: var(--radius);
+  padding: 16px 18px; overflow-x: auto; -webkit-overflow-scrolling: touch;
+  font: 400 13.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  margin: 12px 0 18px;
+}
+pre code { background: transparent; border: none; padding: 0; color: inherit; font: inherit; }
+pre .c { color: #7C8AA5; } /* comments */
+
+.endpoint {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 20px; margin: 16px 0; box-shadow: var(--shadow-sm); background: var(--bg);
+}
+.endpoint .sig { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.method {
+  font: 700 12px/1 'Inter', system-ui, sans-serif; letter-spacing: 0.06em;
+  border-radius: 6px; padding: 6px 9px; color: #fff; background: var(--ink);
+}
+.method.get { background: #16803C; }
+.method.post { background: var(--accent); }
+.endpoint .path { font: 600 15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
+.endpoint .auth-tag {
+  font-size: 12px; font-weight: 600; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 99px; padding: 3px 10px;
+}
+.endpoint p { font-size: 14.5px; color: var(--muted); }
+.endpoint ul { font-size: 14.5px; color: var(--muted); }
+.endpoint pre { margin-bottom: 4px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 14.5px; margin: 12px 0 18px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
+td code { white-space: nowrap; }
+
+.note {
+  background: var(--bg-soft); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 16px; font-size: 14px; color: var(--muted); margin: 18px 0;
+}
+
+/* footer — same as landing */
+footer { border-top: 1px solid var(--line); padding: 32px 0 calc(32px + env(safe-area-inset-bottom)); }
+.foot {
+  display: flex; flex-direction: column; gap: 14px; align-items: flex-start;
+  font-size: 14px; color: var(--muted);
+}
+.foot a { color: var(--muted); display: inline-flex; align-items: center; min-height: 44px; }
+.foot a:hover { color: var(--ink); text-decoration: none; }
+.foot .links { display: flex; gap: 24px; flex-wrap: wrap; }
+@media (min-width: 640px) { .foot { flex-direction: row; justify-content: space-between; align-items: center; } }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap nav-inner">
+    <a class="wordmark" href="/">
+      <svg width="24" height="24" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="14" fill="#0B1220"/><path d="M22 46V18l20 28V18" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+      <span data-brand="name">Numbox</span>
+    </a>
+    <div class="nav-links">
+      <a href="/">Home</a>
+      <a class="btn" href="/app.html">Open the app</a>
+    </div>
+  </div>
+</nav>
+
+<main>
+  <div class="wrap">
+    <h1>API documentation</h1>
+    <p class="lede">Built for automation and AI agents — every account has an API token. Rent a real US number with one call, poll its inbox for the OTP with another. No browser, no scraping.</p>
+
+    <h2 id="auth">Authentication</h2>
+    <p>All authenticated endpoints accept your account's API token as a bearer token:</p>
+    <pre><code>Authorization: Bearer $TOKEN</code></pre>
+    <p class="muted">Find the token in the app under <strong>API access</strong> (it is also returned by <code>GET /api/me</code>). The examples below assume two shell variables:</p>
+    <pre><code>BASE=https://your-numbox-host   <span class="c"># the storefront origin</span>
+TOKEN=0123abcd...               <span class="c"># your API token</span></code></pre>
+    <p class="muted">If a token leaks, rotate it with <a href="#rotate"><code>POST /api/token/rotate</code></a> — the old token stops working immediately. The browser app's session cookie works on the same endpoints, so everything below can also be called from logged-in frontend code.</p>
+
+    <h2 id="endpoints">Endpoints</h2>
+
+    <div class="endpoint" id="stock">
+      <div class="sig"><span class="method get">GET</span><span class="path">/api/stock</span><span class="auth-tag">public</span></div>
+      <p>List rentable numbers. Each item carries the per-duration price in cents under <code>prices</code> (<code>day</code> / <code>week</code> / <code>month</code>). Numbers are masked until rented.</p>
+      <pre><code>curl -s $BASE/api/stock</code></pre>
+      <pre><code>{ "stock": [ { "sim_id": 42, "carrier": "AT&amp;T", "area_code": "347",
+    "masked_number": "(347) •••-••43",
+    "prices": { "day": 300, "week": 1500, "month": 4500 } } ] }</code></pre>
+    </div>
+
+    <div class="endpoint" id="rent">
+      <div class="sig"><span class="method post">POST</span><span class="path">/api/rent</span><span class="auth-tag">bearer / cookie</span></div>
+      <p>Rent a number. Body parameters:</p>
+      <ul>
+        <li><code>sim_id</code> (integer, required) — from <code>/api/stock</code></li>
+        <li><code>duration</code> (string, optional) — <code>"day"</code> (24&nbsp;h, default), <code>"week"</code> (7&nbsp;days), or <code>"month"</code> (30&nbsp;days); anything else is a 400</li>
+      </ul>
+      <p>The price for the chosen duration is debited from your balance. The response reveals the full number in <code>rental.e164</code>.</p>
+      <pre><code>curl -s -X POST $BASE/api/rent \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"sim_id": 42, "duration": "week"}'</code></pre>
+    </div>
+
+    <div class="endpoint" id="rentals">
+      <div class="sig"><span class="method get">GET</span><span class="path">/api/rentals</span><span class="auth-tag">bearer / cookie</span></div>
+      <p>Your rentals, newest first, each with <code>e164</code>, <code>duration</code>, <code>ends_at</code>, and <code>effective_status</code> (<code>active</code> or <code>ended</code>).</p>
+      <pre><code>curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/rentals</code></pre>
+    </div>
+
+    <div class="endpoint" id="messages">
+      <div class="sig"><span class="method get">GET</span><span class="path">/api/rentals/:id/messages</span><span class="auth-tag">bearer / cookie</span></div>
+      <p>The rental's inbox, newest first. <strong>Poll this endpoint</strong> — OTP codes arrive in the message <code>body</code> within seconds of being sent. A few seconds between polls is plenty.</p>
+      <pre><code>curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/rentals/1234/messages</code></pre>
+      <pre><code>{ "messages": [ { "from_number": "+1855...", "body": "Your code is 482913",
+    "received_at": "2026-06-13T18:02:11Z" } ] }</code></pre>
+    </div>
+
+    <div class="endpoint" id="deposits">
+      <div class="sig"><span class="method post">POST</span><span class="path">/api/deposits</span><span class="auth-tag">bearer / cookie</span></div>
+      <p>Top up your balance. Body: <code>amount_cents</code> (integer, minimum 1000 = $10). With crypto payments enabled the response includes an <code>invoice_url</code> to pay; the balance credits automatically on confirmation.</p>
+      <pre><code>curl -s -X POST $BASE/api/deposits \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"amount_cents": 2500}'</code></pre>
+    </div>
+
+    <div class="endpoint" id="me">
+      <div class="sig"><span class="method get">GET</span><span class="path">/api/me</span><span class="auth-tag">bearer / cookie</span></div>
+      <p>Your account: <code>email</code>, <code>balance_cents</code>, and the current <code>api_token</code>. Handy as a cheap auth check before a run.</p>
+      <pre><code>curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/me</code></pre>
+    </div>
+
+    <div class="endpoint" id="rotate">
+      <div class="sig"><span class="method post">POST</span><span class="path">/api/token/rotate</span><span class="auth-tag">bearer / cookie</span></div>
+      <p>Replace your API token. The response carries the new token; the old one is dead the moment this call returns. Use it whenever a token may have leaked.</p>
+      <pre><code>curl -s -X POST -H "Authorization: Bearer $TOKEN" $BASE/api/token/rotate</code></pre>
+      <pre><code>{ "ok": true, "api_token": "f3a9c0..." }</code></pre>
+    </div>
+
+    <h2 id="agent-flow">Example: an agent fetches an OTP</h2>
+    <p class="muted">The whole loop — pick the cheapest number, rent it for a day, poll the inbox until a 4–8 digit code shows up:</p>
+    <pre><code><span class="c"># 1. cheapest available number</span>
+SIM_ID=$(curl -s $BASE/api/stock \
+  | jq '.stock | sort_by(.prices.day) | .[0].sim_id')
+
+<span class="c"># 2. rent it for a day</span>
+RENTAL=$(curl -s -X POST $BASE/api/rent \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"sim_id\": $SIM_ID, \"duration\": \"day\"}")
+RENTAL_ID=$(echo "$RENTAL" | jq '.rental.id')
+echo "number: $(echo "$RENTAL" | jq -r '.rental.e164')"
+
+<span class="c"># 3. use the number wherever, then poll until a code lands</span>
+while :; do
+  CODE=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    $BASE/api/rentals/$RENTAL_ID/messages \
+    | jq -r '.messages[].body' | grep -oE '[0-9]{4,8}' | head -1)
+  [ -n "$CODE" ] &amp;&amp; break
+  sleep 5
+done
+echo "OTP: $CODE"</code></pre>
+
+    <h2 id="errors">Errors</h2>
+    <p class="muted">Errors are JSON: <code>{ "error": "&lt;code&gt;" }</code> with a matching HTTP status.</p>
+    <table>
+      <thead><tr><th>Status</th><th>Error</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>401</code></td><td><code>unauthorized</code></td><td>Missing or invalid token / session. Check the <code>Authorization: Bearer</code> header, or rotate the token if you lost it.</td></tr>
+        <tr><td><code>402</code></td><td><code>insufficient_balance</code></td><td>The rental price exceeds your balance — top up via <code>POST /api/deposits</code> and retry.</td></tr>
+        <tr><td><code>409</code></td><td><code>just_taken</code></td><td>Someone rented that number between your stock check and rent call. Re-fetch <code>/api/stock</code> and pick another.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">Rate limits may apply to keep the service fast for everyone. Abuse — including using numbers for fraud or spam — leads to account bans per our acceptable-use policy. Questions? <a data-brand-email href="mailto:support@numbox.io">support@numbox.io</a>.</div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <div><span data-brand="name">Numbox</span> &copy; <span id="year"></span></div>
+    <div class="links">
+      <a href="/">Home</a>
+      <a href="/app.html">App</a>
+      <a data-brand-email href="mailto:support@numbox.io">support@numbox.io</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll('[data-brand="name"]').forEach(function (el) { el.textContent = BRAND.name; });
+document.querySelectorAll('[data-brand-email]').forEach(function (el) {
+  el.textContent = BRAND.supportEmail;
+  el.href = 'mailto:' + BRAND.supportEmail;
+});
+document.title = BRAND.name + ' API — rent US numbers and read OTPs programmatically';
+document.getElementById('year').textContent = new Date().getFullYear();
+</script>
+</body>
+</html>
