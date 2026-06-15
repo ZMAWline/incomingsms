@@ -303,41 +303,70 @@ async function handleConfig(env) {
   });
 }
 
-async function handleStock(env) {
+// Shared availability query behind both /api/stock and /api/stats. Resolves the
+// set of currently-sellable sims: in shop_pool ∩ sims.status='active' ∩ has a
+// current sim_numbers row (valid_to is null) ∩ NOT in an active shop_rental.
+// Returns one entry per available sim with its vendor + current e164 — callers
+// decide how much (if anything) to expose.
+async function availableSims(env) {
   const pool = await sbSelect(env, 'shop_pool?select=sim_id');
   const poolIds = pool.map((r) => r.sim_id);
-  if (!poolIds.length) return json({ stock: [] });
+  if (!poolIds.length) return [];
 
-  const [sims, numbers, activeRentals, prices] = await Promise.all([
+  const [sims, numbers, activeRentals] = await Promise.all([
     selectIn(env, 'sims', 'id', poolIds, 'status=eq.active&select=id,vendor'),
     selectIn(env, 'sim_numbers', 'sim_id', poolIds, 'valid_to=is.null&select=sim_id,e164'),
     selectIn(env, 'shop_rentals', 'sim_id', poolIds, 'status=eq.active&select=sim_id'),
-    sbSelect(env, PRICES_SELECT),
   ]);
 
   const numberBySim = new Map(numbers.map((n) => [n.sim_id, n.e164]));
   const rentedSims = new Set(activeRentals.map((r) => r.sim_id));
 
-  const stock = [];
+  const out = [];
   for (const sim of sims) {
     if (rentedSims.has(sim.id)) continue;
     const e164 = numberBySim.get(sim.id);
     if (!e164) continue;
+    out.push({ sim_id: sim.id, vendor: sim.vendor, e164 });
+  }
+  return out;
+}
+
+async function handleStock(env) {
+  const [available, prices] = await Promise.all([
+    availableSims(env),
+    sbSelect(env, PRICES_SELECT),
+  ]);
+
+  const stock = available.map((s) => {
     const tier = {
-      day: priceFor(sim.vendor, 'day', prices),
-      week: priceFor(sim.vendor, 'week', prices),
-      month: priceFor(sim.vendor, 'month', prices),
+      day: priceFor(s.vendor, 'day', prices),
+      week: priceFor(s.vendor, 'week', prices),
+      month: priceFor(s.vendor, 'month', prices),
     };
-    stock.push({
-      sim_id: sim.id,
-      carrier: vendorToCarrier(sim.vendor),
-      area_code: areaCode(e164),
-      masked_number: maskNumber(e164),
+    return {
+      sim_id: s.sim_id,
+      carrier: vendorToCarrier(s.vendor),
+      area_code: areaCode(s.e164),
+      masked_number: maskNumber(s.e164),
       daily_price_cents: tier.day, // back-compat for older clients
       prices: tier,
-    });
-  }
+    };
+  });
   return json({ stock });
+}
+
+// Public, no-auth aggregate availability for the landing page. Same query as
+// /api/stock but leaks no numbers — only a total count and a per-carrier
+// breakdown.
+async function handleStats(env) {
+  const available = await availableSims(env);
+  const carriers = {};
+  for (const s of available) {
+    const carrier = vendorToCarrier(s.vendor);
+    carriers[carrier] = (carriers[carrier] || 0) + 1;
+  }
+  return json({ available: available.length, carriers });
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +696,7 @@ export default {
       // --- public API ---
       if (path === '/api/config' && method === 'GET') return handleConfig(env);
       if (path === '/api/stock' && method === 'GET') return handleStock(env);
+      if (path === '/api/stats' && method === 'GET') return handleStats(env);
       if (path === '/api/signup' && method === 'POST') return handleSignup(request, env);
       if (path === '/api/login' && method === 'POST') return handleLogin(request, env);
       if (path === '/api/logout' && method === 'POST') return handleLogout(request, env);
