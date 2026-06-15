@@ -2,7 +2,7 @@
 // the matching inline copy in public/index.html, marked "keep in sync") to
 // rebrand the whole shop. Nothing else hardcodes the name.
 export const BRAND = {
-  name: 'Numbox',
+  name: 'OTPDock',
   tagline: 'Private US numbers for SMS verification',
-  supportEmail: 'support@numbox.io',
+  supportEmail: 'support@otpdock.io',
 };
