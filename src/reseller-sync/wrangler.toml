@@ -4,6 +4,13 @@ compatibility_date = "2024-01-01"
 account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
+# INC-2: enable forward-only rental capture in production (top-level = prod env).
+# Mints one rental per sim_numbers lifetime per reseller on the cron sync path;
+# guarded by rentals UNIQUE(reseller_id, sim_number_id). Resend path never mints.
+# Named envs (e.g. test) do not inherit these vars.
+[vars]
+RENTAL_CAPTURE_ENABLED = "true"
+
 [triggers]
 crons = ["0 15 * * *"]
 

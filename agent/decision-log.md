@@ -12,6 +12,26 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 **Consequence:** Do NOT add `anon`/`authenticated` RLS policies or re-grant EXECUTE to those roles expecting the app to use them — if you do, you're opening a new public surface, not fixing a bug. If a future feature needs direct client→Supabase access (e.g. a browser using the anon key), that's a deliberate architecture change requiring its own scoped policies. Migrations: `lock_down_public_rls_critical`, `security_hardening_funcs_views`. The remaining INFO `rls_enabled_no_policy` advisor lints are expected and should be left as-is. The **test project `lwapudjjlwkskijefxdz`** still needs the same treatment (MCP not connected to it).
 
+## 2026-06-16 — Dashboard frontend extracted from the getHTML template literal
+**Decision:** The dashboard UI was moved out of the 19.7k-line `getHTML()` template string in `src/dashboard/index.js` into a real static file `src/dashboard/public/index.html`, served as a Cloudflare static asset (`[assets]` binding, `run_worker_first=true` so Basic auth still gates everything). `index.js` is now an API-only worker (~7k lines).
+**Why:** The single giant template literal was so fragile that every edit required throwaway `_fix_*.js` patch scripts (the CRLF/backtick-escaping ritual). It was the #1 source of fragility and dead files.
+**Consequence:** The `patch-dashboard` skill / patch-script ritual is OBSOLETE — edit `public/index.html` as a normal file. Do NOT reintroduce a getHTML template. The worker injects the single `__HELIX_ENABLED__` placeholder at serve time.
+
+## 2026-06-16 — Teltik morning→midnight re-anchoring is delay-only, 100/night
+**Decision:** To cluster Teltik rotations at night, defer morning-anchored lines (NY 6–8am) past their next due slot so they re-rotate at the following midnight — 100/night via `sims.rotation_hold_until` + `teltik_hold_morning_batch()` RPC + a pre-window cron.
+**Why:** Teltik hard-enforces a 48h minimum server-side, and 48h is exactly 2 days, so a line's rotation clock-time is sticky and can only be pushed LATER, never pulled earlier. The only way to move a 7am line to midnight is to skip one cycle (a one-time ~65h gap). Gradual 100/night keeps the one-time freshness/revenue dip small and avoids piling the whole fleet onto one midnight tick.
+**Consequence:** Do not try to "force-rotate" lines earlier to fix timing — Teltik will reject it. The catch-up sweep deliberately does NOT force-rotate healthy held lines (only failed ones), so it won't fight the migration. Turn `TELTIK_NIGHT_MIGRATION=off` when morning lines reach 0.
+
+## 2026-06-16 — Rotation pace is config-driven and outage-guarded
+**Decision:** Rotation throughput is tuned via env vars (`ROTATE_TICK_LIMIT`/`ROTATE_TICK_CONCURRENCY` on mdn-rotator, `TELTIK_ROTATE_CONCURRENCY` on teltik-worker), and both nightly loops abort a tick after 8 consecutive transport-level failures (5xx/timeout/network).
+**Why:** Lets the operator ramp pace without code changes, and prevents a vendor/relay outage from burning the whole due list against a dead endpoint (the 2026-05-25 outage logged 12,150 failed calls under the old always-keep-going loop). Teltik also got a 13-min time budget to end the mid-flight 15-min platform kills that were the session-58 stuck-state source.
+**Consequence:** Application-level rejections (zip rejected, "1 per 48h", data mismatch) deliberately do NOT trip the breaker — only transport errors do.
+
+## 2026-06-16 — Storefront stock is opt-in only (shop_pool)
+**Decision:** The OTPDock storefront can only sell SIMs explicitly listed in `shop_pool`; everything is additive `shop_*` tables in the shared Supabase. All current SIMs belong to the reseller, so stock is empty until the operator allocates lines.
+**Why:** Guarantees customer sales can never collide with reseller-allocated SIMs by accident. Shop-pool lines also don't auto-rotate (rotation crons only touch reseller-assigned SIMs), which is exactly what week/month rentals need (stable number).
+**Consequence:** Do not auto-populate shop_pool. Storefront is preview-only until the operator opts lines in.
+
 ---
 
 ## 2026-06-04 — INC-3 report-bad accepts only `reseller_rental_id` and current-MDN `e164`
@@ -31,6 +51,54 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 **Why:** The board's "unique URL" requirement was for an operator-facing bookmark-able tab, not a new customer-facing surface. Splitting Bad Rental into its own worker added DNS surface, deploy-pipeline weight, and a second auth path without operator benefit. The reseller-facing API (`/api/rentals/report-bad`) already lives on `portal.incoming-sms.com`; that's the public surface. The dashboard is the operator surface.
 
 **Consequence:** Do NOT recreate `src/bad-rentals/` as a separate worker. New Bad Rental operator features (filters, batch actions, export) belong inside `src/dashboard/index.js`. The resolver was kept in `src/shared/` because that move is independently useful for cross-worker imports.
+
+---
+
+## 2026-06-02 — INC-3 bad-rental reporting: operator-in-the-loop only in Phase 1; no auto-credits
+
+**Decision:** The bad-rental reporting flow (INC-3 Phase 1) is **fully operator-gated**. When a reseller reports a bad rental via `POST /api/rentals/report-bad`, we record the report and surface it in the operator dashboard tab "Bad Rentals". No automatic remediation (rotate, port reset, SIM replace), no automatic credits, no invoice adjustments happen without operator action.
+
+**Why:** Auto-remediation on a reseller-reported signal carries real risk (false positives, SIM disruption, double-action with manual ops already in flight). Phase 1 builds the evidence channel and queue; the operator decides what to do per case. Auto-credit policy would require legal/billing review (separate proposal).
+
+**Consequence (do not undo):**
+- Do NOT add automatic rotation or port-reset triggers to `handleReportBadByRental` or `insertOrReturnExistingReport`.
+- Do NOT write automatic `rental_report_events` rows with status `remediated` from worker code — only from operator action.
+- Auto-credit policy is Phase 3, requires explicit separate board + billing review. The schema allows it (remediation_action + closed_at) but no code drives it yet.
+- Outbound webhook to the reseller on status transitions is Phase 2 (partner sign-off required, not in Phase 1).
+
+**Phase 1 thresholds (data, not code):** rate limit is 1 report/SIM/hour and 200/reseller/day via `portal_report_bad` action in `reseller_actions_log`. Both values were chosen as "plenty of headroom for a real outage, tight enough to flag a runaway client." To adjust: add a `reseller_settings` table entry or change the constant in `checkRateLimit()`.
+
+---
+
+## 2026-06-01 — Rental billing calculator has NO cutover clamp; cutover is operational only
+
+**Decision:** `computeRentalBilling` (`src/shared/rentals.js`) uses `effectiveStart = start` — it no longer clamps the requested window up to `RENTAL_CUTOVER_DATE` (2026-05-22). The preview/calculator bills the exact `[start, end]` range in either engine, any date. The dashboard invoice preview + "Download for QuickBooks" generate route now DEFAULT to the rental engine; a **"Use legacy billing (compare)"** checkbox switches to legacy. Legacy engine/code is kept intact (dormant fallback), not removed.
+
+**Why:** Per the owner, the "cutover" only means "we don't re-issue already-agreed invoices" — a process choice, not a limit on what the calculator can compute. A 5/15–5/21 preview returning $0 (because the clamp pushed start past end) was a bug, not a feature. `RENTAL_CUTOVER_DATE` is now only a fallback when no `start` is supplied.
+
+**Consequence:** Do NOT re-add the `max(start, floor)` clamp to `computeRentalBilling`. Generating a rental invoice for an already-invoiced pre-5/22 period is now *possible*; the guardrail is procedural. Rental capture is LIVE in prod (`RENTAL_CAPTURE_ENABLED=true`), so the `rentals` table populates going forward; the calculator reads it directly.
+
+---
+
+## 2026-06-01 — ATOMIC rotation trusts AT&T's inquiry MDN over our DB (desync self-heal)
+
+**Decision:** Both the rotator (`rotateAtomicSim`, Fix A) and the finalizer (`runAtomicFinalizer`, Fix B) treat the AT&T `subsriberInquiry` result as the source of truth for an ATOMIC SIM's current MDN. If `attStatus=Active` and AT&T's MDN differs from `sims.msisdn`, adopt AT&T's number (rotator: as swap-from + persist; finalizer: full reconcile + reseller webhooks + `rotation_fail_count=0`). The finalizer reconcile is **gated on `attStatus=Active`** — Cancelled/Suspended/Deactivated are NOT healed; they're flagged (`pending_review_items` kind `atomic_mdn_desync`) and `rotation_eligible=false`.
+
+**Why:** An "uncertain swap" (swapMSISDN errors on our side but commits at AT&T) leaves our DB with a stale MDN; rotation then fails "sim/MSISDN is Inactive" forever and parks at the 5-strike cap. AT&T's inquiry already runs every rotation (Fix A is zero extra cost). The attStatus gate fixes a latent bug where the old finalizer would "heal" a cancelled SIM onto a stale number.
+
+**Consequence:** The attStatus gate is load-bearing — do not reconcile on MDN-difference alone. `pending_review_items.run_id` is a **uuid** column; pass `null` from the finalizer (no cron_runs row), not a synthetic string, or the insert is silently rejected. Carrier-cancelled ATOMIC SIMs are NOT auto-recoverable — they need a Wing Alpha (dan@wingalpha.com) reactivation, not an API retry.
+
+---
+
+## 2026-06-01 — Rotation parks a SIM after 5 fails; Wing IoT plan-switch flakiness left to escalation
+
+**Decision:** `increment_rotation_fail` threshold raised 3→5 (`migrations/20260531_rotation_fail_cap_5.sql`); rotation window extended to 9am NY (mdn-rotator + teltik; crons `4-11`→`4-14`). After 5 same-day fails a SIM parks at `status='rotation_failed'` (out of the `status=active` batch); the wing stuck-remediation query excludes `rotation_fail_count>=5`. teltik failures now route through `increment_rotation_fail` for the same cap. When AT&T's Wing Tel plan-change endpoint is intermittently failing (500 `30000001` / accept-but-no-commit), stuck SIMs are escalated to Wing Tel and left parked rather than mass-retried.
+
+**Why:** Before the cap, wing SIMs hit fail counts of 60–73 hammering a flaky AT&T endpoint. ~1/3 of plan-switches succeed on retry, so it's a carrier reliability problem. The owner chose to wait on Wing Tel rather than burn attempts.
+
+**Consequence:** Parked SIMs (rotation_failed) need a manual `/rotate-sim?force=true` sweep or a re-enable (`status=active, rotation_fail_count=0, rotation_eligible=true`) to retry — the normal batch won't pick them up. Verify-timeout wing failures leave the SIM on its original dialable number (AT&T didn't commit), so they're safe to re-attempt; don't assume a verify-failure left the SIM on ABIR without checking.
+
+---
 
 ## 2026-05-26 — `last_mdn_rotated_at` is restored on failure only when no MDN was consumed
 

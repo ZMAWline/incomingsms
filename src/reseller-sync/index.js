@@ -107,7 +107,7 @@ async function runResellerSync(env, limit, force = false) {
   // (not TRUE), so a bare `neq.failed` would silently drop fresh activations with NULL status.
   const sims = await sbGetArray(
     env,
-    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,last_rotation_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=last_notified_at.asc.nullsfirst&limit=${limit}`
+    `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,last_rotation_at,sim_numbers!inner(id,e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=last_notified_at.asc.nullsfirst&limit=${limit}`
   );
 
   let attempted = sims.length;
@@ -209,6 +209,29 @@ async function runResellerSync(env, limit, force = false) {
             },
             body: JSON.stringify({ last_rental_id: rentalId }),
           }).catch(err => console.log(`[ResellerSync] Failed to write last_rental_id for sim ${simId}: ${err}`));
+        }
+
+        // INC-2: forward-only rental capture. Mint one rental per sim_numbers
+        // lifetime per reseller. Dormant until RENTAL_CAPTURE_ENABLED='true'
+        // (the rentals table is created by an approval-gated migration that has
+        // NOT been applied yet). Only the cron path mints: rotation creates a
+        // new sim_numbers lifetime → a fresh rental; the resend path
+        // (resendOneSim) deliberately never calls this, so a resend can never
+        // mint. The DB UNIQUE(reseller_id, sim_number_id) is the hard guardrail.
+        if (env.RENTAL_CAPTURE_ENABLED === 'true') {
+          const simNumberId = sim.sim_numbers?.[0]?.id;
+          if (simNumberId != null) {
+            const { upsertRental } = await import('../shared/rentals.js');
+            const r = await upsertRental(env, {
+              resellerId,
+              simId,
+              simNumberId,
+              vendor: sim.vendor,
+              e164: currentNumber,
+              resellerRentalId: rentalId,
+            });
+            if (!r.ok) console.log(`[ResellerSync] rental capture failed for sim ${simId}: status=${r.status} ${r.error || ''}`);
+          }
         }
       }
 

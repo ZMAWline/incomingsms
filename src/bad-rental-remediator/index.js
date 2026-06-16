@@ -87,7 +87,10 @@ export default {
     // Two cron expressions are registered (§G):
     //   - '*/1 * * * *'  → §C receive-poll: walk verify_pending reports, look
     //                      for the nonce in inbound_sms, timeout-then-escalate.
-    //   - '0 */2 * * *'  → main intake tick (S1..S6 + vendor classifier).
+    //   - '*/5 * * * *'  → main intake tick (S1..S6 + vendor classifier).
+    //                      (Was 2h; sped up 2026-06-12. Tick lock + claim CAS
+    //                      make the higher frequency safe; idle ticks are one
+    //                      indexed query.)
     // event.cron is the literal expression the trigger fired on.
     const cron = (event && event.cron) || '';
     if (cron === '*/1 * * * *') {

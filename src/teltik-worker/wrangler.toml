@@ -4,10 +4,19 @@ compatibility_date = "2024-01-01"
 account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
+[vars]
+# Rotation concurrency: 8 lanes (ramped from 4 after the clean first night
+# 2026-06-16) so the nightly cohort clears early in the window.
+TELTIK_ROTATE_CONCURRENCY = "8"
+# Night-migration: defer morning-anchored lines to midnight, 100/day. Set to
+# "off" (or remove) once migration is complete (~14 days). Operator-approved.
+TELTIK_NIGHT_MIGRATION = "on"
+TELTIK_MIGRATION_BATCH = "100"
+
 [triggers]
-# Rotation window: 12:00 AM – 9:00 AM America/New_York (DST-aware).
-# UTC 4-14 covers both DST states; isInsideRotationWindowNY() gate narrows to NY 0-8.
-crons = ["10,40 4-14 * * *"]
+# 10,40 4-14 UTC — rotation ticks; isInsideRotationWindowNY() narrows to NY 0-8.
+# 0 2 * * * UTC (NY 22:00, before the window) — daily night-migration batch.
+crons = ["10,40 4-14 * * *", "0 2 * * *"]
 
 [observability.logs]
 enabled = true

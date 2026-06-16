@@ -10,8 +10,12 @@ workers_dev = true
 # min after rotation window closes. Gated on RECONCILIATION_ENABLED secret.
 # 0 */6 * * * — address-pool refill every 6h: replace quarantined PPU addresses
 # with fresh OSM-sourced civic-building addresses in the same zip.
-# scheduled() branches on event.cron so the three paths never run together.
-crons = ["*/5 * * * *", "30 10 * * *", "0 */6 * * *"]
+# 45 */2 * * * — catch-up sweep: safe playbook auto-fixes + missed-due retries
+# (outside the rotation window) + delivery reconciliation, every 2h at :45 to
+# stay clear of mdn-rotator (:00/:20/:40) and teltik-worker (:10/:40) ticks.
+# Operator-approved 2026-06-12.
+# scheduled() branches on event.cron so the paths never run together.
+crons = ["*/5 * * * *", "30 10 * * *", "0 */6 * * *", "45 */2 * * *"]
 
 [observability.logs]
 enabled = true

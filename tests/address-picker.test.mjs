@@ -22,7 +22,10 @@ test('pickNextPpuAddress returns full address record on RPC hit', async () => {
     SUPABASE_SERVICE_ROLE_KEY: 'fake',
   };
   const origFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify(sample.id), { status: 200 });
+  // RPC claim_address_pool_entry returns the full row since migration
+  // claim_address_pool_entry_returns_row (runtime no longer consults the
+  // static pool file).
+  globalThis.fetch = async () => new Response(JSON.stringify(sample), { status: 200 });
   try {
     const got = await pickNextPpuAddress(fakeEnv, {});
     assert.equal(got.id, sample.id);
@@ -57,12 +60,12 @@ test('pickNextPpuAddress throws on RPC error', async () => {
   }
 });
 
-test('pickNextPpuAddress throws if DB returns id not in static pool', async () => {
+test('pickNextPpuAddress treats a non-record response as pool exhausted', async () => {
   const fakeEnv = { SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'fake' };
   const origFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify('does-not-exist-id'), { status: 200 });
+  globalThis.fetch = async () => new Response(JSON.stringify('bare-id-not-a-row'), { status: 200 });
   try {
-    await assert.rejects(() => pickNextPpuAddress(fakeEnv, {}), /not in static pool/);
+    await assert.rejects(() => pickNextPpuAddress(fakeEnv, {}), /pool exhausted/i);
   } finally {
     globalThis.fetch = origFetch;
   }

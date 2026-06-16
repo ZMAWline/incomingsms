@@ -218,11 +218,21 @@ export default {
           });
         }
         const results = [];
+        // Circuit breaker: stop after 5 consecutive AT&T 5xx instead of burning
+        // the whole batch into a dead endpoint (spec §6).
+        let consec5xx = 0, tripped = false;
+        const is5xx = (s) => /failed: 5\d\d/i.test(String(s || ''));
         for (const iccid of iccids) {
+          if (tripped) { results.push({ iccid, ok: false, skipped: true, reason: 'circuit breaker tripped (5 consecutive AT&T 5xx)' }); continue; }
           try {
-            results.push(await remediateStuckWingSim(env, String(iccid)));
+            const r = await remediateStuckWingSim(env, String(iccid));
+            results.push(r);
+            if (r && r.ok) consec5xx = 0;
+            else if (is5xx(r && r.error)) { if (++consec5xx >= 5) tripped = true; }
+            else consec5xx = 0;
           } catch (err) {
             results.push({ iccid, ok: false, error: String(err) });
+            if (is5xx(err)) { if (++consec5xx >= 5) tripped = true; } else consec5xx = 0;
           }
         }
         return new Response(JSON.stringify({ ok: true, results }, null, 2), {
@@ -1076,9 +1086,13 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
     const hour = new Date(event.scheduledTime).getUTCHours();
     if (isInsideRotationWindowNY()) {
       // DB-driven polling: processRotationBatch runs inline (no CF Queue).
-      // 60 SIMs per tick at concurrency=3 → ~3.3 min wall clock, well inside
-      // Workers' paid 15-min scheduled-invocation limit.
-      ctx.waitUntil(processRotationBatch(env, { limit: 60, concurrency: 3 }));
+      // Pace is operator-tunable via ROTATE_TICK_LIMIT / ROTATE_TICK_CONCURRENCY
+      // vars so ramping is a config edit (speed-up approved 2026-06-12 — finish
+      // the fleet early in the window instead of trickling until ~8:30am NY).
+      // Defaults 100 @ 6 ≈ 12.5 min worst case, inside the 15-min scheduled cap.
+      const limit = Math.max(1, parseInt(env.ROTATE_TICK_LIMIT || '100', 10) || 100);
+      const concurrency = Math.max(1, parseInt(env.ROTATE_TICK_CONCURRENCY || '6', 10) || 6);
+      ctx.waitUntil(processRotationBatch(env, { limit, concurrency }));
     } else {
       console.log(`[Cron] outside NY rotation window (0-8); NY hour=${getNYHour()} — skipping rotation`);
     }
@@ -1478,20 +1492,44 @@ async function processRotationBatch(env, options = {}) {
   }
 
   let ok = 0, skipped = 0, failed = 0;
+  // Outage circuit breaker: 8 CONSECUTIVE transport-level failures (relay
+  // 5xx/530, timeouts, network errors) stop the batch — remaining SIMs are
+  // left for the next 20-min tick instead of burning claims against a down
+  // vendor (the 2026-05-25 relay outage logged 12,150 failed calls under the
+  // old always-keep-going behavior). Per-SIM application errors (zip
+  // rejected, data mismatch) do NOT count. Added with the concurrency
+  // speed-up; restore-on-failure still un-stamps pre-swap throws as before.
+  const BATCH_BREAKER_THRESHOLD = 8;
+  let consecutiveTransportFails = 0;
+  let breakerTripped = false;
+  let skippedBreaker = 0;
+  const isTransportErr = (msg) =>
+    /\b5\d\d\b|timeout|timed out|network|fetch failed|TypeError|ECONN|socket/i.test(String(msg || ''));
+
   await runWithConcurrency(candidates, concurrency, async (sim) => {
+    if (breakerTripped) { skippedBreaker++; return; }
     try {
       const result = await rotateSingleSim(env, token, sim);
       if (result && result.skipped) { skipped++; return; }
       ok++;
+      consecutiveTransportFails = 0;
     } catch (err) {
       failed++;
       console.error(`[ProcessBatch] SIM ${sim.iccid} failed: ${err}`);
       await updateSimRotationError(env, sim.id, `Rotation failed: ${err}`).catch(() => {});
+      if (isTransportErr(err)) {
+        if (++consecutiveTransportFails >= BATCH_BREAKER_THRESHOLD) {
+          breakerTripped = true;
+          console.error(`[ProcessBatch] circuit breaker: ${BATCH_BREAKER_THRESHOLD} consecutive transport failures — deferring remaining SIMs to next tick`);
+        }
+      } else {
+        consecutiveTransportFails = 0;
+      }
     }
   });
 
-  console.log(`[ProcessBatch] attempted=${candidates.length} ok=${ok} skipped=${skipped} failed=${failed} stuck_ok=${stuckOk} stuck_failed=${stuckFailed}`);
-  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed, stuck_ok: stuckOk, stuck_failed: stuckFailed };
+  console.log(`[ProcessBatch] attempted=${candidates.length} ok=${ok} skipped=${skipped} failed=${failed} skipped_breaker=${skippedBreaker} stuck_ok=${stuckOk} stuck_failed=${stuckFailed}`);
+  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed, skipped_breaker: skippedBreaker, breaker_tripped: breakerTripped, stuck_ok: stuckOk, stuck_failed: stuckFailed };
 }
 
 // ===========================

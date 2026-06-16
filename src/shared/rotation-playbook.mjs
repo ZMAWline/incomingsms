@@ -39,9 +39,10 @@ export const PLAYBOOK = [
     id: 'teltik_body_failed',
     vendor: 'teltik',
     match: (err) => /change-number body status=FAILED/i.test(err || ''),
-    action: 'human_review',
-    description: 'Teltik returned HTTP 200 with body status=FAILED for the change-number request. Usually means the SIM is in an unexpected state on Teltik\'s side (suspended, swapped, port-out in progress, etc.). Worth a manual look at the SIM\'s Teltik dashboard entry.',
-    safe: false,
+    action: 'force_rotate',
+    maxAttempts: 1,
+    description: 'Teltik returned HTTP 200 with body status=FAILED for the change-number request. The bodies carry no reason field and a later retry typically succeeds (operator-observed pattern; auto-retry enabled 2026-06-12). No MDN was burned (FAILED = no rotation happened). If it keeps failing, the 3/day budget caps attempts and multi-day detection escalates after 3 consecutive days.',
+    safe: true,
   },
   {
     id: 'teltik_mdn_unchanged',
@@ -117,6 +118,23 @@ export const PLAYBOOK = [
     action: 'human_review',
     description: 'Wing IoT SIM is stuck on the non-dialable plan. Usually a per-SIM AT&T-side issue or daily plan-change quota. The mdn-rotator\'s stuck-wing remediation handles this in the regular cron; manual investigation only if it persists for 2+ days.',
     safe: false,
+  },
+
+  // ── Catch-all: transient transport errors (any vendor) ─────────────────
+  // MUST stay last — specific entries above win first. Encodes the operator's
+  // observed pattern "most failures go through once I retry": any failure
+  // that looks like a network/vendor hiccup (5xx, relay 530, timeout, socket
+  // drop) gets ONE automatic retry per run, still bounded by the 3/day budget
+  // and the circuit breaker. Logical rejections (zip not supported, cancelled
+  // at carrier, data mismatch) never match this and still escalate.
+  {
+    id: 'generic_transient',
+    vendor: 'any',
+    match: (err) => /\b5\d\d\b|timeout|timed out|network|fetch failed|TypeError|ECONN|socket|relay/i.test(err || ''),
+    action: 'force_rotate',
+    maxAttempts: 1,
+    description: 'Unrecognized failure that looks transport-level (5xx/timeout/network). One bounded automatic retry; if it persists across days, multi-day detection escalates to the operator.',
+    safe: true,
   },
 ];
 

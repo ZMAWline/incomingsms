@@ -43,10 +43,12 @@ const COLUMNS = [
 
 function makeRx(column) {
   // Matches:   column: 'value'    column = 'value'    'column': 'value'
-  // The negative lookbehind `(?<![A-Za-z0-9_])` ensures we don't match the
+  // The negative lookbehind `(?<![A-Za-z0-9_.])` ensures we don't match the
   // column name as a suffix of another identifier — e.g. `rotation_status`
-  // or `attStatus` must NOT trigger the `status` column check.
-  return new RegExp(`(?<![A-Za-z0-9_])${column}['"]?\\s*[:=]\\s*['"]([^'"]+)['"]`, 'g');
+  // or `attStatus` must NOT trigger the `status` column check — and that a
+  // property READ like `res.status` followed by a multiline ternary
+  // (`res.status\n ? ... : 'text'`) is never mistaken for a DB write.
+  return new RegExp(`(?<![A-Za-z0-9_.])${column}['"]?\\s*[:=]\\s*['"]([^'"]+)['"]`, 'g');
 }
 
 // Only flag a `status` literal if the surrounding ~400 chars reference the
