@@ -75,6 +75,21 @@ export default {
       }
     }
 
+    // Manual night-migration trigger (same engine as the daily cron). Defers
+    // up to ?batch=N (default 100) morning-anchored lines to the next midnight.
+    if (url.pathname === '/migrate-night' && (request.method === 'POST' || request.method === 'GET')) {
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const batch = parseInt(url.searchParams.get('batch') || '100', 10) || 100;
+      try {
+        const held = await supabaseRpc(env, 'teltik_hold_morning_batch', { p_batch: batch });
+        return jsonResponse({ ok: true, held }, 200);
+      } catch (err) {
+        return jsonResponse({ ok: false, error: String(err) }, 500);
+      }
+    }
+
     if (url.pathname === '/setup-webhook') {
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
         return new Response('Unauthorized', { status: 401 });
@@ -115,6 +130,25 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    // Night-migration tick (runs once/day at NY 22:00, OUTSIDE the rotation
+    // window): defer one batch of morning-anchored lines to the next midnight.
+    // Gated on TELTIK_NIGHT_MIGRATION='on' so it can be stopped instantly
+    // without redeploy once migration is complete.
+    if (event.cron === '0 2 * * *') {
+      if (env.TELTIK_NIGHT_MIGRATION !== 'on') {
+        console.log('[Migrate] TELTIK_NIGHT_MIGRATION not "on" — skipping');
+        return;
+      }
+      const batch = parseInt(env.TELTIK_MIGRATION_BATCH || '100', 10) || 100;
+      try {
+        const held = await supabaseRpc(env, 'teltik_hold_morning_batch', { p_batch: batch });
+        console.log(`[Migrate] held ${held} morning-anchored teltik lines for next-midnight rotation`);
+      } catch (err) {
+        console.error(`[Migrate] failed: ${err}`);
+      }
+      return;
+    }
+
     if (!isInsideRotationWindowNY()) {
       console.log(`[Cron] teltik-worker outside NY rotation window (0-8); NY hour=${getNYHour()} — skipping`);
       return;
@@ -626,11 +660,16 @@ async function rotateTeltikSims(env) {
   // 1. Query active Teltik SIMs assigned to active resellers
   const sims = await supabaseGetArray(
     env,
-    `sims?vendor=eq.teltik&status=eq.active&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours,reseller_sims!inner(reseller_id,active)&reseller_sims.active=eq.true&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
+    `sims?vendor=eq.teltik&status=eq.active&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours,rotation_hold_until,reseller_sims!inner(reseller_id,active)&reseller_sims.active=eq.true&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
   );
 
-  // Filter: include if never rotated OR overdue based on rotation_interval_hours
+  // Filter: include if never rotated OR overdue based on rotation_interval_hours,
+  // BUT skip any line on a night-migration hold whose hold window hasn't passed
+  // (rotation_hold_until defers a morning-anchored line past its next slot so it
+  // re-rotates at the following NY midnight; cleared on rotation).
+  const isHeld = (sim) => sim.rotation_hold_until && now < new Date(sim.rotation_hold_until).getTime();
   const due = sims.filter(sim => {
+    if (isHeld(sim)) return false;
     if (!sim.last_mdn_rotated_at) return true;
     const intervalMs = (sim.rotation_interval_hours || 48) * 60 * 60 * 1000;
     return (now - new Date(sim.last_mdn_rotated_at).getTime()) >= intervalMs;
@@ -650,7 +689,7 @@ async function rotateTeltikSims(env) {
   try {
     retryCandidates = await supabaseGetArray(
       env,
-      `sims?vendor=eq.teltik&status=in.(active,provisioning)&rotation_status=eq.failed&rotation_eligible=eq.true&reseller_sims.active=eq.true&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours,reseller_sims!inner(reseller_id,active)&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
+      `sims?vendor=eq.teltik&status=in.(active,provisioning)&rotation_status=eq.failed&rotation_eligible=eq.true&reseller_sims.active=eq.true&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours,rotation_hold_until,reseller_sims!inner(reseller_id,active)&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
     );
   } catch (err) {
     console.error(`[Rotate] retry-candidates query failed (continuing with main pass): ${err}`);
@@ -658,8 +697,9 @@ async function rotateTeltikSims(env) {
 
   // Dedup: a SIM might appear in both `due` (never-rotated edge) and `retryCandidates`;
   // prefer the normal-due path so it goes through claim_rotation_slot, not the retry RPC.
+  // Also drop any held line from the retry pass (defense in depth — a held line is healthy).
   const dueIds = new Set(due.map(s => s.id));
-  const retryList = retryCandidates.filter(s => !dueIds.has(s.id));
+  const retryList = retryCandidates.filter(s => !dueIds.has(s.id) && !isHeld(s));
 
   console.log(`[Rotate] ${sims.length} active Teltik SIMs, ${due.length} due, ${retryList.length} eligible for in-window retry`);
 
@@ -842,6 +882,7 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
         last_rotation_at: nowIso,
         last_rotation_error: null,
         rotation_fail_count: 0,
+        rotation_hold_until: null, // night-migration hold satisfied once it rotates
       });
 
       // Reseller webhooks: old number offline, new number online.
@@ -862,6 +903,7 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
       status: 'provisioning',
       last_rotation_error: null,
       rotation_fail_count: 0,
+      rotation_hold_until: null, // night-migration hold satisfied once it rotates
     });
 
     console.log(`[Rotate] SIM ${sim.iccid}: change-number issued (requestId=${requestId}) — no new_msisdn in response, status=provisioning, details-finalizer will pick up MDN`);
