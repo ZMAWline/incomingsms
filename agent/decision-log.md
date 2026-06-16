@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-06-16 — Supabase RLS/hardening: lock to service_role, do NOT add anon policies
+
+**Decision:** When clearing Supabase security advisors on the prod project (`lzjqegxazqlktttyybth`), the fix for RLS-disabled public tables is `ENABLE ROW LEVEL SECURITY` **with no policies**, and for over-permissioned SECURITY DEFINER RPCs it is `REVOKE EXECUTE FROM anon, authenticated, public` + `GRANT EXECUTE TO service_role`. We deliberately did NOT write any `anon`/`authenticated` RLS policies, and dropped the two `TO public USING (true)` allow-everyone policies (`sim_sms_daily`, `system_errors`) rather than scoping them.
+
+**Why:** The entire backend (all Cloudflare Workers) reaches Supabase exclusively through `SUPABASE_SERVICE_ROLE_KEY`, which bypasses RLS. There is zero anon-key / `createClient` usage anywhere in the repo — nothing client-side touches the DB directly; the dashboard and storefront go through the workers. So RLS-on-no-policy fully denies the public `anon`/`authenticated` roles (closing the exposure the advisor flagged) while leaving the app completely unaffected. Adding anon policies would create a real public surface where none is needed.
+
+**Consequence:** Do NOT add `anon`/`authenticated` RLS policies or re-grant EXECUTE to those roles expecting the app to use them — if you do, you're opening a new public surface, not fixing a bug. If a future feature needs direct client→Supabase access (e.g. a browser using the anon key), that's a deliberate architecture change requiring its own scoped policies. Migrations: `lock_down_public_rls_critical`, `security_hardening_funcs_views`. The remaining INFO `rls_enabled_no_policy` advisor lints are expected and should be left as-is. The **test project `lwapudjjlwkskijefxdz`** still needs the same treatment (MCP not connected to it).
+
+---
+
 ## 2026-06-04 — INC-3 report-bad accepts only `reseller_rental_id` and current-MDN `e164`
 
 **Decision:** The reseller-facing `POST /api/rentals/report-bad` accepts exactly two identifiers: `reseller_rental_id` (the reseller's own string id) and `e164` (the SIM's CURRENT MDN — `sim_numbers.e164 WHERE valid_to IS NULL`). It explicitly rejects `sim_id`, `iccid`, our internal `rental_id`, and any historical/rotated MDN. Logic lives in `src/shared/report-bad-resolver.js` as a pure module, imported by `src/reseller-portal/index.js`; the convenience route `POST /api/sims/:simId/report-bad` and its handler were removed.
