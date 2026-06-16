@@ -1,7 +1,35 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-04 (sessions 64–67 — INC-3 Phase 1 live, report-bad contract locked down, dashboard deep-link)
+> Last updated: 2026-06-16 (redesign branch built + switched to prod; storefront MVP built; teltik night-migration started)
+
+---
+
+## Session 2026-06-12→16 — redesign branch shipped to prod + new storefront product
+
+**All work is on branch `worktree-redesign-2026-06` (pushed). It is now the de-facto source of truth — production runs it. `main` is STALE; merge worktree-redesign-2026-06 → main next (prevents the 06-12-style "bulk deploy from main silently reverts a feature" accident).**
+
+**Deployed to PRODUCTION this session (verified):**
+
+| Worker | Version | What changed |
+|---|---|---|
+| reseller-sync | `f1b70c71` | RENTAL_CAPTURE_ENABLED back on (was reverted by a 06-12 17:09 bulk deploy from main). Backfilled 7,260 missing rentals from webhook_deliveries (idempotent; still_missing=0, total 50,571). |
+| mdn-rotator | `06d48996` | Tunable pace (ROTATE_TICK_LIMIT=100/CONCURRENCY=6, was 60/3) + 8-consecutive-5xx outage circuit breaker. |
+| teltik-worker | `9e73e317` | Concurrency pool (TELTIK_ROTATE_CONCURRENCY=8, ramped from 4) + circuit breaker + 13-min time budget; **night-migration** (see below). |
+| details-finalizer | (deployed) | Catch-up sweep cron `45 */2 * * *` + expected-vs-actual baseline + delivery-gap recon. |
+| bad-rental-remediator | `7f62c577` | Intake cron 2h → `*/5`; auto-retry playbook (teltik body-FAILED + generic transient) + intake self-heal; escalations bridged to pending_review_items inbox. |
+| dashboard | `31e1c53a` | Frontend extracted from 19.7k-line getHTML template → src/dashboard/public/index.html (asset-served, run_worker_first keeps Basic auth). index.js now API-only ~7k lines. Rotation Health tab; sidebar groups; quiet-ink light design. **patch-dashboard ritual now obsolete — edit public/index.html as a normal file.** |
+
+**First faster night (06-15→16) was clean:** AT&T+Wing 586/586 rotated, finished 00:40 NY (was ~08:37); teltik 1,304 rotated; delivery gaps 0; 1 failed SIM (auto-retry class). Catch-up sweeps ran every 2h on schedule.
+
+**Teltik night-migration (in progress, ~13 nights left):** re-anchors morning-rotating teltik lines (NY 6–8am, was ~1,343) to midnight, 100/night, via `sims.rotation_hold_until` + `teltik_hold_morning_batch(n)` RPC + daily cron `0 2 * * *` UTC (gated `TELTIK_NIGHT_MIGRATION=on`). First 100 (8am edge) held 06-16; ~1,243 remain. **Action when done:** set `TELTIK_NIGHT_MIGRATION=off` once morning_remaining = 0. 0–5am lines deliberately left alone.
+
+**New product — OTPDock storefront (src/storefront, PREVIEW ONLY at storefront.zalmen-531.workers.dev):** customer-facing SMS day/week/month rental shop on shop_* tables (additive; stock opt-in via shop_pool which is EMPTY). Open signup, crypto deposits (NOWPayments-ready, manual fallback), Bearer-token API for AI agents + /docs, legal pages (terms/privacy/aup/refund — placeholders [Legal entity]/[Jurisdiction] still need filling + counsel review). GTM plan at docs/storefront-gtm.md. **Blocked on operator:** register otpdock.io, NOWPayments keys, allocate pool lines, set shop_prices. Telegram bot + MCP server = phase 2.
+
+**Pending / next session:**
+- Merge `worktree-redesign-2026-06` → `main` (source-of-truth alignment).
+- Watch teltik night-migration on Rotation Health; turn it off when complete.
+- Storefront launch keys (operator): domain, NOWPayments, pool lines, legal blanks + counsel.
 
 ---
 

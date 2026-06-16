@@ -4,6 +4,28 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-06-16 — Dashboard frontend extracted from the getHTML template literal
+**Decision:** The dashboard UI was moved out of the 19.7k-line `getHTML()` template string in `src/dashboard/index.js` into a real static file `src/dashboard/public/index.html`, served as a Cloudflare static asset (`[assets]` binding, `run_worker_first=true` so Basic auth still gates everything). `index.js` is now an API-only worker (~7k lines).
+**Why:** The single giant template literal was so fragile that every edit required throwaway `_fix_*.js` patch scripts (the CRLF/backtick-escaping ritual). It was the #1 source of fragility and dead files.
+**Consequence:** The `patch-dashboard` skill / patch-script ritual is OBSOLETE — edit `public/index.html` as a normal file. Do NOT reintroduce a getHTML template. The worker injects the single `__HELIX_ENABLED__` placeholder at serve time.
+
+## 2026-06-16 — Teltik morning→midnight re-anchoring is delay-only, 100/night
+**Decision:** To cluster Teltik rotations at night, defer morning-anchored lines (NY 6–8am) past their next due slot so they re-rotate at the following midnight — 100/night via `sims.rotation_hold_until` + `teltik_hold_morning_batch()` RPC + a pre-window cron.
+**Why:** Teltik hard-enforces a 48h minimum server-side, and 48h is exactly 2 days, so a line's rotation clock-time is sticky and can only be pushed LATER, never pulled earlier. The only way to move a 7am line to midnight is to skip one cycle (a one-time ~65h gap). Gradual 100/night keeps the one-time freshness/revenue dip small and avoids piling the whole fleet onto one midnight tick.
+**Consequence:** Do not try to "force-rotate" lines earlier to fix timing — Teltik will reject it. The catch-up sweep deliberately does NOT force-rotate healthy held lines (only failed ones), so it won't fight the migration. Turn `TELTIK_NIGHT_MIGRATION=off` when morning lines reach 0.
+
+## 2026-06-16 — Rotation pace is config-driven and outage-guarded
+**Decision:** Rotation throughput is tuned via env vars (`ROTATE_TICK_LIMIT`/`ROTATE_TICK_CONCURRENCY` on mdn-rotator, `TELTIK_ROTATE_CONCURRENCY` on teltik-worker), and both nightly loops abort a tick after 8 consecutive transport-level failures (5xx/timeout/network).
+**Why:** Lets the operator ramp pace without code changes, and prevents a vendor/relay outage from burning the whole due list against a dead endpoint (the 2026-05-25 outage logged 12,150 failed calls under the old always-keep-going loop). Teltik also got a 13-min time budget to end the mid-flight 15-min platform kills that were the session-58 stuck-state source.
+**Consequence:** Application-level rejections (zip rejected, "1 per 48h", data mismatch) deliberately do NOT trip the breaker — only transport errors do.
+
+## 2026-06-16 — Storefront stock is opt-in only (shop_pool)
+**Decision:** The OTPDock storefront can only sell SIMs explicitly listed in `shop_pool`; everything is additive `shop_*` tables in the shared Supabase. All current SIMs belong to the reseller, so stock is empty until the operator allocates lines.
+**Why:** Guarantees customer sales can never collide with reseller-allocated SIMs by accident. Shop-pool lines also don't auto-rotate (rotation crons only touch reseller-assigned SIMs), which is exactly what week/month rentals need (stable number).
+**Consequence:** Do not auto-populate shop_pool. Storefront is preview-only until the operator opts lines in.
+
+---
+
 ## 2026-06-04 — INC-3 report-bad accepts only `reseller_rental_id` and current-MDN `e164`
 
 **Decision:** The reseller-facing `POST /api/rentals/report-bad` accepts exactly two identifiers: `reseller_rental_id` (the reseller's own string id) and `e164` (the SIM's CURRENT MDN — `sim_numbers.e164 WHERE valid_to IS NULL`). It explicitly rejects `sim_id`, `iccid`, our internal `rental_id`, and any historical/rotated MDN. Logic lives in `src/shared/report-bad-resolver.js` as a pure module, imported by `src/reseller-portal/index.js`; the convenience route `POST /api/sims/:simId/report-bad` and its handler were removed.
