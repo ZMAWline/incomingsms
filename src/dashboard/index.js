@@ -5739,9 +5739,9 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
     const invoiceId = url.searchParams.get('invoice_id');
 
     if (invoiceId) {
-      // Re-download an existing invoice from history (single summary line item)
+      // Re-download an existing invoice from history
       const invResp = await supabaseGet(env,
-        'qbo_invoices?select=id,week_start,week_end,sim_count,total,qbo_customer_map(qbo_display_name,daily_rate)&id=eq.' + encodeURIComponent(invoiceId) + '&limit=1'
+        'qbo_invoices?select=id,week_start,week_end,sim_count,total,daily_breakdown,qbo_customer_map(qbo_display_name,daily_rate)&id=eq.' + encodeURIComponent(invoiceId) + '&limit=1'
       );
       const invData = await invResp.json();
       const inv = Array.isArray(invData) && invData[0] ? invData[0] : null;
@@ -5751,8 +5751,12 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       const customerName = inv.qbo_customer_map?.qbo_display_name || 'Customer';
       const dailyRate = parseFloat(inv.qbo_customer_map?.daily_rate || 0);
       const totalAmount = parseFloat(inv.total);
-      // For re-download we don't have day-by-day breakdown, use a single summary line
-      const days = [{ sim_count: inv.sim_count, amount: totalAmount }];
+      // Prefer the per-day breakdown snapshotted at generation time. Invoices
+      // generated before the daily_breakdown column existed fall back to a
+      // single summary line.
+      const days = (Array.isArray(inv.daily_breakdown) && inv.daily_breakdown.length > 0)
+        ? inv.daily_breakdown
+        : [{ sim_count: inv.sim_count, amount: totalAmount }];
       const csv = buildCSV(customerName, inv.week_start, inv.week_end, days, dailyRate);
       const filename = 'invoice_' + customerName.replace(/[^a-z0-9]/gi, '_') + '_' + inv.week_start + '_' + inv.week_end + '.csv';
       return new Response(csv, {
@@ -5804,6 +5808,7 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
         sim_count: totalSimDays,
         total: totalAmount,
         status: 'draft',
+        daily_breakdown: days,
       }),
     });
 
