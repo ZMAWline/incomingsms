@@ -12,6 +12,11 @@ TELTIK_ROTATE_CONCURRENCY = "8"
 # "off" (or remove) once migration is complete (~14 days). Operator-approved.
 TELTIK_NIGHT_MIGRATION = "on"
 TELTIK_MIGRATION_BATCH = "100"
+# INC-2 rental capture: mint a rental (+ record the reseller's rentalId from the
+# number.online 200 response) on every inline Teltik rotation. reseller-sync and
+# details-finalizer already do this on their paths; the inline rotate path here
+# (used by the night-migration) did not — causing uncaptured rentals from 06-16.
+RENTAL_CAPTURE_ENABLED = "true"
 
 [triggers]
 # 10,40 4-14 UTC — rotation ticks; isInsideRotationWindowNY() narrows to NY 0-8.

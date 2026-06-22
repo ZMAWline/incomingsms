@@ -1491,6 +1491,28 @@ async function applyTeltikSwap(env, data) {
   return { outcome: 'applied', simId: simRow.id };
 }
 
+// Extract the reseller's rentalId from a number.online 200 response body.
+// Mirrors reseller-sync / details-finalizer so rental capture is consistent
+// across every path that fires number.online.
+function parseRentalIdFromResponse(body) {
+  if (!body) return null;
+  const s = String(body);
+  try {
+    const obj = JSON.parse(s);
+    const v = obj && (obj.rentalId ?? obj.rental_id ?? obj.id);
+    if (v != null) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  } catch {}
+  const m = s.match(/"rental[_]?[Ii]d"\s*:\s*([0-9]+)/);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
 async function sendTeltikSwapWebhooks(env, sim, newIccid, newE164, newMsisdnBare, rotatedAtIso) {
   const rows = await supabaseGetArray(
     env,
@@ -1528,6 +1550,32 @@ async function sendTeltikSwapWebhooks(env, sim, newIccid, newE164, newMsisdnBare
 
   if (onlineRes.ok) {
     await supabasePatch(env, `sims?id=eq.${sim.id}`, { last_notified_at: new Date().toISOString() }).catch(() => {});
+
+    // INC-2 rental capture. This inline rotate path (used by the night-migration)
+    // fires number.online directly instead of going through reseller-sync, so it
+    // must mint the rental itself — otherwise the lifetime is billed by nothing.
+    // One rental per (reseller, sim_number_id); idempotent via the DB UNIQUE.
+    // The reseller's rentalId is echoed in the number.online 200 body.
+    if (env.RENTAL_CAPTURE_ENABLED === 'true') {
+      try {
+        const resellerRentalId = parseRentalIdFromResponse(onlineRes.responseBody);
+        const snRows = await supabaseGetArray(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null&select=id&limit=1`);
+        const simNumberId = snRows[0]?.id;
+        if (simNumberId != null) {
+          const { upsertRental } = await import('../shared/rentals.js');
+          const r = await upsertRental(env, {
+            resellerId, simId: sim.id, simNumberId, vendor: 'teltik', e164: newE164, resellerRentalId,
+          });
+          if (!r.ok) console.log(`[Rotate] SIM ${sim.id}: rental capture failed: status=${r.status} ${r.error || ''}`);
+        }
+        if (resellerRentalId != null) {
+          await supabasePatch(env, `reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${sim.id}`,
+            { last_rental_id: resellerRentalId }).catch(() => {});
+        }
+      } catch (err) {
+        console.error(`[Rotate] SIM ${sim.id}: rental capture threw: ${err}`);
+      }
+    }
   }
 }
 
