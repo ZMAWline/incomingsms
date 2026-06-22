@@ -105,6 +105,31 @@ function pickRentalRate(rules, day, carrier) {
   return best ? parseFloat(best.rate) : null;
 }
 
+// Pick the volume-tier rate for `count` from a legacy reseller_rates rule's tiers.
+function tierRate(tiers, count) {
+  if (!Array.isArray(tiers)) return null;
+  const sorted = [...tiers].sort((a, b) => (Number(a.min_count) || 0) - (Number(b.min_count) || 0));
+  for (const t of sorted) {
+    const min = Number(t.min_count) || 0;
+    const max = (t.max_count == null || t.max_count === '') ? Infinity : Number(t.max_count);
+    if (count >= min && count <= max) return parseFloat(t.rate);
+  }
+  return null;
+}
+
+// Most-recent legacy reseller_rates rule active on `day` for a vendor scope
+// (null = the "all AT&T" rule). Mirrors billing.js pickActiveRuleForScope.
+function pickTierRule(rules, day, vendor) {
+  let best = null;
+  for (const r of rules) {
+    if ((r.vendor || null) !== vendor) continue;
+    if (r.effective_from > day) continue;
+    if (r.effective_to && r.effective_to < day) continue;
+    if (!best || r.effective_from > best.effective_from) best = r;
+  }
+  return best;
+}
+
 // Rental-mode billing. One billable unit per rental whose rental_date is in
 // [start, end] AND on/after the forward-only cutover. Flat per-carrier rate,
 // independent of days or SMS volume. Output shape mirrors
@@ -127,46 +152,88 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
   const fallbackRate = mapping ? parseFloat(mapping.daily_rate) : 0;
 
   const rentals = await sbGetAll(env,
-    'rentals?select=carrier,rental_date,reseller_rental_id' +
+    'rentals?select=carrier,rental_date,reseller_rental_id,sim_number_id' +
     '&reseller_id=eq.' + encodeURIComponent(resellerId) +
     '&rental_date=gte.' + encodeURIComponent(effectiveStart) +
     '&rental_date=lte.' + encodeURIComponent(end) +
     '&order=rental_date.asc'
   );
 
-  const rules = await sbGetAll(env,
+  // Flat per-carrier rental rates (fallback when no volume tier matches).
+  const flatRules = await sbGetAll(env,
     'reseller_rental_rates?select=carrier,effective_from,effective_to,rate' +
     '&reseller_id=eq.' + encodeURIComponent(resellerId) +
     '&effective_from=lte.' + end +
     '&or=(effective_to.is.null,effective_to.gte.' + effectiveStart + ')'
   );
 
-  // group[date][carrier] = count
+  // Volume-pricing tiers live in the legacy reseller_rates table (vendor-scoped).
+  // Rental mode honors them keyed on the carrier's TOTAL billed rentals in the
+  // window — e.g. "total tmobile rentals > 3000 → $1.55/block". tmobile maps to
+  // the 'teltik' scope; att to the all-att (vendor=null) scope.
+  const tierRules = await sbGetAll(env,
+    'reseller_rates?select=vendor,effective_from,effective_to,tiers' +
+    '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+    '&effective_from=lte.' + end +
+    '&or=(effective_to.is.null,effective_to.gte.' + effectiveStart + ')'
+  );
+
+  // Bad-rental exclusion: a lifetime reported defective and NOT resolved on the
+  // same EST day it was reported is not billable. received_at can't precede the
+  // rental, so the window's own start bounds the fetch.
+  const reports = await sbGetAll(env,
+    'rental_reports?select=sim_number_id,received_at,closed_at' +
+    '&reseller_id=eq.' + encodeURIComponent(resellerId) +
+    '&sim_number_id=not.is.null' +
+    '&received_at=gte.' + encodeURIComponent(effectiveStart)
+  );
+  const excludedLifetimes = new Set();
+  for (const rep of (Array.isArray(reports) ? reports : [])) {
+    if (rep.sim_number_id == null) continue;
+    const recDay = estDateFromDate(new Date(rep.received_at));
+    const resolvedSameDay = rep.closed_at && estDateFromDate(new Date(rep.closed_at)) === recDay;
+    if (!resolvedSameDay) excludedLifetimes.add(rep.sim_number_id);
+  }
+
+  // group[date][carrier] = count; carrierTotal drives the volume tier.
   const group = {};
-  let missingRate = false;
-  // Authoritative reconciliation: how many billed rentals carry a TrustOTP
-  // rentalId (matched to a 'Rental created' webhook response) vs not.
+  const carrierTotal = {};
   let withTrustotpId = 0;
   let withoutTrustotpId = 0;
+  let excludedBad = 0;
   for (const r of (Array.isArray(rentals) ? rentals : [])) {
+    if (r.sim_number_id != null && excludedLifetimes.has(r.sim_number_id)) { excludedBad++; continue; }
     if (!group[r.rental_date]) group[r.rental_date] = {};
     group[r.rental_date][r.carrier] = (group[r.rental_date][r.carrier] || 0) + 1;
+    carrierTotal[r.carrier] = (carrierTotal[r.carrier] || 0) + 1;
     if (r.reseller_rental_id) withTrustotpId++; else withoutTrustotpId++;
   }
 
+  // Resolve the rate per (date, carrier): volume tier (legacy reseller_rates,
+  // keyed on the carrier's WINDOW-TOTAL count) → flat reseller_rental_rate
+  // effective on that date → daily_rate fallback. Per-date resolution preserves
+  // mid-window flat-rate changes; the tier uses the window total so a rule like
+  // "total tmobile rentals > 3000 → 1.55" holds across every day of the window.
+  const VENDOR_SCOPE = { tmobile: 'teltik', att: null };
+  let missingRate = false;
+  let rulesApplied = false;
   const days = [];
   for (const date of Object.keys(group).sort()) {
     for (const carrier of Object.keys(group[date]).sort()) {
       const count = group[date][carrier];
-      let rate = pickRentalRate(rules, date, carrier);
+      const total = carrierTotal[carrier];
+      let rate = null;
+      const tierRule = pickTierRule(tierRules, date, carrier in VENDOR_SCOPE ? VENDOR_SCOPE[carrier] : null);
+      if (tierRule) {
+        const tr = tierRate(tierRule.tiers, total);
+        if (tr != null) { rate = tr; rulesApplied = true; }
+      }
+      if (rate == null) {
+        const fr = pickRentalRate(flatRules, date, carrier);
+        if (fr != null) { rate = fr; rulesApplied = true; }
+      }
       if (rate == null) { rate = fallbackRate; missingRate = true; }
-      days.push({
-        date,
-        carrier,
-        sim_count: count,
-        rate,
-        amount: +(count * rate).toFixed(2),
-      });
+      days.push({ date, carrier, sim_count: count, rate, amount: +(count * rate).toFixed(2) });
     }
   }
 
@@ -186,7 +253,9 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
     // Authoritative count = rentals matched to a TrustOTP 'Rental created' rentalId.
     total_with_trustotp_id: withTrustotpId,
     total_without_trustotp_id: withoutTrustotpId,
-    rules_applied: Array.isArray(rules) && rules.length > 0,
+    // Lifetimes excluded because they were reported bad and not resolved same-day.
+    excluded_bad_rentals: excludedBad,
+    rules_applied: rulesApplied,
     rate_fallback_used: missingRate,
   };
 }
