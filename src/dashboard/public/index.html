@@ -5728,14 +5728,32 @@ async function sendSimOnline(simId, phoneNumber) {
         async function importTeltik() {
             if (!(await showConfirm('Import Teltik', 'Fetch all Teltik lines and upsert into DB?'))) return;
             showToast('Importing Teltik lines...', 'info');
-            const res = await fetch(`${API_BASE}/import-teltik`, { method: 'POST' });
-            const data = await res.json();
-            if (res.ok) {
-                showToast('Imported: ' + data.imported + ' new, ' + data.updated + ' updated', 'success');
-                loadSims();
-            } else {
-                showToast('Error: ' + data.error, 'error');
+            let offset = 0;
+            let totals = { imported: 0, updated: 0, unchanged: 0, skipped: 0 };
+            let total = null;
+            const MAX_CHUNKS = 100; // safety stop = 20k SIMs
+            for (let i = 0; i < MAX_CHUNKS; i++) {
+                const res = await fetch(`${API_BASE}/import-teltik?offset=${offset}&limit=200`, { method: 'POST' });
+                let data;
+                try { data = await res.json(); } catch { showToast('Import failed: bad response at offset ' + offset, 'error'); return; }
+                if (!res.ok || data.ok === false) {
+                    showToast('Import failed at offset ' + offset + ': ' + (data.error || res.status), 'error');
+                    return;
+                }
+                totals.imported += data.imported || 0;
+                totals.updated += data.updated || 0;
+                totals.unchanged += data.unchanged || 0;
+                totals.skipped += data.skipped || 0;
+                total = data.total ?? total;
+                if (total) {
+                    const done = Math.min(offset + (data.processed || 0), total);
+                    showToast(`Importing Teltik... ${done}/${total} (+${totals.imported} new)`, 'info');
+                }
+                if (!data.has_more || data.next_offset == null) break;
+                offset = data.next_offset;
             }
+            showToast('Imported: ' + totals.imported + ' new, ' + totals.updated + ' updated, ' + totals.unchanged + ' unchanged, ' + totals.skipped + ' skipped', 'success');
+            loadSims();
         }
 
         let _msgsSearchTimer = null;
