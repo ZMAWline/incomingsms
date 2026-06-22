@@ -11441,7 +11441,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         <td class="px-4 py-3 text-gray-300">${inv.sim_count}</td>
                         <td class="px-4 py-3 text-accent">$${Number(inv.total).toFixed(2)}</td>
                         <td class="px-4 py-3">${badge}</td>
-                        <td class="px-4 py-3"><button onclick="downloadHistoryIIF(${inv.id})" class="text-xs text-blue-400 hover:text-blue-300">Download CSV</button>${toggleBtn}</td>
+                        <td class="px-4 py-3"><button onclick="downloadHistoryIIF(${inv.id})" class="text-xs text-blue-400 hover:text-blue-300">Download CSV</button>${toggleBtn}<button onclick="deleteInvoice(${inv.id})" class="text-xs text-red-400 hover:text-red-300 ml-2">Delete</button></td>
                     </tr>`;
                 }).join("");
             } catch (error) {
@@ -11459,6 +11459,17 @@ async function sendSimOnline(simId, phoneNumber) {
                 const result = await resp.json();
                 if (result.error) { showToast('Failed: ' + result.error, 'error'); return; }
                 showToast(paid ? 'Invoice marked paid' : 'Invoice marked unpaid', 'success');
+                loadInvoiceHistory();
+            } catch (e) { showToast('Error: ' + e, 'error'); }
+        }
+
+        async function deleteInvoice(invoiceId) {
+            if (!confirm('Permanently delete this invoice? This frees the week so it can be re-generated. This cannot be undone.')) return;
+            try {
+                const resp = await fetch(API_BASE + '/qbo-invoices/' + invoiceId, { method: 'DELETE' });
+                const result = await resp.json();
+                if (result.error) { showToast('Failed: ' + result.error, 'error'); return; }
+                showToast('Invoice deleted', 'success');
                 loadInvoiceHistory();
             } catch (e) { showToast('Error: ' + e, 'error'); }
         }

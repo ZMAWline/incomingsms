@@ -325,6 +325,9 @@ export default {
     if (url.pathname.startsWith('/api/qbo-invoices/') && request.method === 'PATCH') {
       return handleQboInvoicePatch(request, env, corsHeaders, url);
     }
+    if (url.pathname.startsWith('/api/qbo-invoices/') && request.method === 'DELETE') {
+      return handleQboInvoiceDelete(env, corsHeaders, url);
+    }
 
     if (url.pathname === '/api/reseller-keys' && request.method === 'GET') {
       return handleResellerKeysList(url, env, corsHeaders);
@@ -5609,6 +5612,29 @@ async function handleQboInvoicePatch(request, env, corsHeaders, url) {
     });
     if (!resp.ok) return new Response(JSON.stringify({ error: 'update failed' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true, ...patch }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  }
+}
+
+async function handleQboInvoiceDelete(env, corsHeaders, url) {
+  try {
+    const id = url.pathname.split('/').pop();
+    if (!id || !/^\d+$/.test(id)) return new Response(JSON.stringify({ error: 'invalid id' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/qbo_invoices?id=eq.' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        Prefer: 'return=representation',
+      },
+    });
+    if (!resp.ok) return new Response(JSON.stringify({ error: 'delete failed' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const deleted = await resp.json();
+    if (!Array.isArray(deleted) || deleted.length === 0) {
+      return new Response(JSON.stringify({ error: 'Invoice not found' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, deleted: deleted.length }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (e) {
     return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
