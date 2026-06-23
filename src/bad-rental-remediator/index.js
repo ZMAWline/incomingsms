@@ -21,7 +21,7 @@
 import { runVerifyPoll, preResolveGate } from './verify-runner.mjs';
 import { executeAction } from './actions.mjs';
 import { canAttempt } from './cooldown.mjs';
-import { teltikPortStatus } from './vendor.mjs';
+import { teltikPortStatus, readVendorView } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import { flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType } from './escalations.mjs';
 
@@ -746,20 +746,28 @@ async function classifyShared(env, report, evidence) {
   }
 
   // Nothing shared fired — hand off to the vendor classifier (INC-16b).
-  // Vendor read + IMEI check are wired in 16d/16e; for now we pass nulls so the
-  // classifier returns the pending_vendor_read situation and the worker records
-  // a classify_only attempt. Cooldown engine schedules the next review.
+  // INC-16d/16e completion: the live vendor read (evidence.vendorRead, built by
+  // readVendorView in gatherEvidence) is now passed in. When the read failed,
+  // vendorRead.ok is false and we pass vendorView=null so the classifier defers
+  // (pending_vendor_read / classify_only) instead of acting on a bad read.
+  // imeiCheck stays null for now (classifier tolerates null — every IMEI branch
+  // is guarded); the IMEI signal is a separate follow-up.
   const { classifyVendor } = await import('./classifier.mjs');
   const { nextReviewAt }   = await import('./cooldown.mjs');
+  const vr = evidence.vendorRead;
+  const vendorView = (vr && vr.ok) ? vr.view : null;
+  // The report itself is a fresh reseller "bad" signal, so the A1/W3/H3/T3
+  // "active + webhook delivered, still reported bad → OTA/reset" branches apply.
+  const cancelGuard = await cancelGuardCheck(env, report, evidence);
   const situation = classifyVendor({
     sim: evidence.sim,
-    vendorView: null,
+    vendorView,
     imeiCheck: null,
-    webhook: { delivered: false },
+    webhook: { delivered: !!(evidence.webhook && evidence.webhook.delivered) },
     report,
     priorAttempts: evidence.priorAttempts || 0,
-    cancelGuard: { activeRentalExists: false, evidence: {} },
-    recentResellerBadSignal: false,
+    cancelGuard,
+    recentResellerBadSignal: true,
   });
   if (!situation) {
     return terminal('S6', 'escalate', 'escalate', {
@@ -768,13 +776,23 @@ async function classifyShared(env, report, evidence) {
     }, 'insufficient_evidence');
   }
   const nra = nextReviewAt({ action: situation.auto_action, now: new Date() });
+  const isEscalate = situation.auto_action === 'escalate';
+  const isDuplicate = situation.auto_action === 'close_duplicate';
   return {
     mode: situation.id,
     action: situation.auto_action,
-    outcome: situation.auto_action === 'classify_only' ? 'no_change' : 'classify_only',
+    outcome: isEscalate ? 'escalate'
+           : isDuplicate ? 'duplicate'
+           : situation.auto_action === 'classify_only' ? 'no_change' : 'classify_only',
     evidenceSummary: { situation_id: situation.id, vendor, situation_evidence: situation.evidence_bundle },
-    terminal: false,
+    terminal: isEscalate || isDuplicate,
+    escalationReason: situation.escalation_reason || null,
     nextReviewAt: nra,
+    // §C post-action gate inputs (consumed by maybeExecuteAction → preResolveGate).
+    // vendorReadHealth must reflect a clean live read; situationExtras carries
+    // teltik's requirePortOnline predicate.
+    vendorReadHealth: (vr && vr.ok) ? { healthy: !!vr.healthy } : null,
+    situationExtras: (vr && vr.extras) || null,
   };
 }
 
@@ -842,6 +860,10 @@ async function gatherEvidence(env, report) {
     newerOpenReportId: null,
     gatewayOffline: false,
     priorAttempts: 0,
+    priorActionAttempts: {},   // per-action count — drives the §G cooldown gate
+    lastActionAttemptAt: {},    // per-action latest attempted_at (ISO)
+    webhook: { delivered: false, lastDeliveredAt: null },
+    vendorRead: null,           // { ok, view, healthy, extras, raw } from readVendorView
   };
 
   if (report.sim_id) {
@@ -854,7 +876,7 @@ async function gatherEvidence(env, report) {
     // without a coordinated cross-worker rewrite.
     const r = await supabaseGet(env,
       'sims?id=eq.' + encodeURIComponent(report.sim_id)
-      + '&select=id,iccid,vendor,status,msisdn,activated_at,gateway_id,port&limit=1');
+      + '&select=id,iccid,vendor,status,msisdn,activated_at,gateway_id,port,imei,att_ban,mobility_subscription_id&limit=1');
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) {
@@ -940,13 +962,57 @@ async function gatherEvidence(env, report) {
       if (Array.isArray(rows) && rows.length > 0) evidence.newerOpenReportId = rows[0].id;
     }
   }
-  // Prior attempt count.
+  // Prior attempts — count overall AND per-action with last-attempt time. The
+  // per-action maps drive the §G cooldown gate in maybeExecuteAction; without
+  // them the gate always sees 0 attempts and would re-fire live vendor actions
+  // every tick (carrier spam). `action` holds the action token (e.g.
+  // 'atomic_restore'); `attempted_at` is the timestamp.
   const ar = await supabaseGet(env,
     'rental_report_remediation_attempts?report_id=eq.' + encodeURIComponent(report.id)
-    + '&select=id&order=id.desc&limit=50');
+    + '&select=id,action,attempted_at&order=id.desc&limit=200');
   if (ar.ok) {
     const rows = await ar.json();
-    if (Array.isArray(rows)) evidence.priorAttempts = rows.length;
+    if (Array.isArray(rows)) {
+      evidence.priorAttempts = rows.length;
+      for (const row of rows) {
+        const act = row && row.action;
+        if (!act) continue;
+        evidence.priorActionAttempts[act] = (evidence.priorActionAttempts[act] || 0) + 1;
+        const at = row.attempted_at || null;
+        if (at && (!evidence.lastActionAttemptAt[act] || at > evidence.lastActionAttemptAt[act])) {
+          evidence.lastActionAttemptAt[act] = at;
+        }
+      }
+    }
+  }
+  // Webhook delivery signal (§C.4.3 + classifier A6/W2/H2/T2). Has a recent
+  // delivered number.online webhook gone out for this SIM? Used both to route
+  // (webhook missing → resend_online) and as a §C pre-resolve predicate.
+  if (report.sim_id) {
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const wr = await supabaseGet(env,
+      'webhook_deliveries?select=delivered_at'
+      + '&sim_id=eq.' + encodeURIComponent(report.sim_id)
+      + '&event_type=eq.number.online&status=eq.delivered'
+      + '&delivered_at=gte.' + encodeURIComponent(since)
+      + '&order=delivered_at.desc&limit=1');
+    if (wr.ok) {
+      const rows = await wr.json();
+      if (Array.isArray(rows) && rows.length > 0) {
+        evidence.webhook = { delivered: true, lastDeliveredAt: rows[0].delivered_at || null };
+      }
+    }
+  }
+  // Live vendor status read — the input the classifier needs to choose a real
+  // remediation action. On any failure readVendorView returns { ok:false } and
+  // the classifier defers (pending_vendor_read) instead of acting on bad data.
+  if (evidence.sim && evidence.sim.vendor) {
+    try {
+      evidence.vendorRead = await readVendorView(env, evidence.sim);
+    } catch (err) {
+      console.log('[Remediator] vendor read failed for report ' + report.id + ': ' + err);
+      evidence.vendorRead = { ok: false, error: String(err && err.message || err) };
+    }
   }
   // S5 gateway-offline probe (only if we have gateway+port).
   if (evidence.sim && evidence.sim.gateway_id && evidence.sim.port && env.SKYLINE_GATEWAY) {
