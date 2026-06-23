@@ -474,7 +474,14 @@ export async function readVendorView(env, sim) {
   try {
     let read;
     if (vendor === 'atomic') {
-      read = await atomicSubscriberInquiry(env, { msisdn: sim.current_mdn_e164, iccid: sim.iccid });
+      // Query by ICCID ALONE. Passing both sim+msisdn makes Atomic reject the
+      // pair (statusCode 908 "sim does not link to msisdn") whenever the DB MDN
+      // is stale — which is exactly the MDN-drift case these reports are about.
+      // ICCID is stable; the vendor returns the CURRENT MSISDN, and the
+      // classifier's A9 then detects the drift and db_sync_upserts it.
+      read = sim.iccid
+        ? await atomicSubscriberInquiry(env, { iccid: sim.iccid })
+        : await atomicSubscriberInquiry(env, { msisdn: sim.current_mdn_e164 });
     } else if (vendor === 'wing_iot') {
       read = await wingGetDevice(env, { iccid: sim.iccid });
     } else if (vendor === 'helix') {

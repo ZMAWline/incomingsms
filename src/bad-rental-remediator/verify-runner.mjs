@@ -160,11 +160,40 @@ export async function resolvePendingVerify(env, report, opts) {
         to_number: match.to_number,
       },
     });
+    // §C proof complete. The line received our nonce, so it can receive SMS
+    // again — and the non-SMS predicate (vendor healthy + webhook delivered +
+    // situation extras) already passed in preResolveGate BEFORE the nonce was
+    // sent. So a received nonce is a definitive `remediated` close.
+    //
+    // Previously this re-queued the report; the action's 24h cooldown then
+    // blocked the main tick from ever closing it, so verify_received reports
+    // spun in 'queued' forever (0 remediated closes despite matched nonces).
+    const closedAt = now().toISOString();
     await patchReport(env, report.id, {
-      auto_remediation_state: 'queued',
+      auto_remediation_state: 'done',
+      status: 'remediated',
+      remediation_action: 'other',
+      closed_at: closedAt,
       verify_pending_nonce: null,
       verify_pending_sent_at: null,
     });
+    // Mirror the dashboard/applyClassificationState timeline row for a remediated close.
+    try {
+      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+        method: 'POST',
+        headers: supabaseHeaders(env, false),
+        body: JSON.stringify({
+          report_id: report.id,
+          from_status: report.status || null,
+          to_status: 'remediated',
+          actor: 'auto-remediator',
+          note: 'auto-remediator §C verified (inbound nonce received)',
+          evidence: { source: 'auto_remediator', verify: 'received', inbound_sms_id: match.id },
+        }),
+      });
+    } catch (e) {
+      console.log('[Verify] remediated event log insert failed report=' + report.id + ': ' + e);
+    }
     return 'match';
   }
 
@@ -201,7 +230,9 @@ export async function runVerifyPoll(env) {
   let matched = 0, timedOut = 0, stillPending = 0;
   for (const r of rows) {
     try {
-      const out = await resolvePendingVerify(env, r);
+      // Prefer the report's own e164 (the reported current MDN) as the inbound
+      // match number; readSimE164 is the fallback.
+      const out = await resolvePendingVerify(env, { ...r, verify_to_number: r.verify_to_number || r.e164 });
       if (out === 'match') matched++;
       else if (out === 'timeout') timedOut++;
       else if (out === 'still_pending') stillPending++;
@@ -281,11 +312,27 @@ async function skylineSendSms(env, { gateway_id, port, to, message }) {
 
 async function readSimE164(env, simId) {
   if (!simId) return null;
+  // `sims` has no current_mdn_e164 column (schema: msisdn). Selecting it
+  // returned HTTP 400 -> null -> the receive poll exited `still_pending`
+  // forever and verify_pending reports never resolved (INC-25 column trap).
+  // Read msisdn and synthesize E.164 to match inbound_sms.to_number (+1XXXXXXXXXX).
   const r = await supabaseGet(env,
-    'sims?id=eq.' + encodeURIComponent(simId) + '&select=current_mdn_e164&limit=1');
+    'sims?id=eq.' + encodeURIComponent(simId) + '&select=msisdn&limit=1');
   if (!r.ok) return null;
   const rows = await r.json();
-  return rows && rows[0] && rows[0].current_mdn_e164 || null;
+  const msisdn = rows && rows[0] && rows[0].msisdn;
+  return simMsisdnToE164(msisdn);
+}
+
+// National 10-digit msisdn ("2078989874") -> "+12078989874". Mirrors the
+// worker's msisdnToE164 so the receive poll and the main tick agree on format.
+function simMsisdnToE164(msisdn) {
+  if (msisdn == null) return null;
+  const s = String(msisdn).trim().replace(/[^\d]/g, '');
+  if (!s) return null;
+  if (s.length === 10) return '+1' + s;
+  if (s.length === 11 && s.startsWith('1')) return '+' + s;
+  return s.startsWith('+') ? s : null;
 }
 
 async function findNonceInbound(env, { toNumber, nonce, afterIso }) {
@@ -306,7 +353,7 @@ async function findNonceInbound(env, { toNumber, nonce, afterIso }) {
 
 async function fetchVerifyPendingReports(env, limit) {
   const q = 'rental_reports?auto_remediation_state=eq.verify_pending'
-    + '&select=id,sim_id,verify_pending_nonce,verify_pending_sent_at'
+    + '&select=id,sim_id,e164,status,verify_pending_nonce,verify_pending_sent_at'
     + '&order=verify_pending_sent_at.asc&limit=' + limit;
   const r = await supabaseGet(env, q);
   if (!r.ok) return [];

@@ -253,9 +253,13 @@ test('§C receive-match: nonce found in inbound_sms → verify_received, state c
     assert.equal(r, 'match');
     assert.equal(calls.attempts[0].outcome, 'verify_received');
     assert.equal(calls.attempts[0].evidence.inbound_sms_id, 9001);
+    // A matched nonce is a definitive §C close: report → remediated/done, not
+    // re-queued (re-queuing stranded verified reports behind the action cooldown).
     const clear = calls.patches.find(p => p.patch.verify_pending_nonce === null);
     assert.ok(clear);
-    assert.equal(clear.patch.auto_remediation_state, 'queued');
+    assert.equal(clear.patch.auto_remediation_state, 'done');
+    assert.equal(clear.patch.status, 'remediated');
+    assert.ok(clear.patch.closed_at, 'expected closed_at to be set on remediated close');
   } finally {
     restore();
   }

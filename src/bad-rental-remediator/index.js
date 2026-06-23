@@ -544,10 +544,14 @@ async function maybeExecuteAction(env, args) {
   if (action === 'db_sync_upsert') {
     ctx.targets = classification.targets || {};
   } else if (action === 'atomic_ota' || action === 'atomic_restore' || action === 'helix_unsuspend') {
-    ctx.msisdn = (evidence.sim && evidence.sim.current_mdn_e164) || null;
+    // Atomic (resendOtaProfile/restoreSubscriber) and Helix want a 10-digit
+    // MSISDN — NOT E.164. current_mdn_e164 is "+1XXXXXXXXXX"; passing it raw
+    // yields statusCode 512 "Invalid MSISDN". mdn10() collapses it to 10 digits.
+    ctx.msisdn = mdn10((evidence.sim && evidence.sim.current_mdn_e164) || '') || null;
+    ctx.subscriberNumber = ctx.msisdn;
     if (action !== 'atomic_restore') ctx.iccid = (evidence.sim && evidence.sim.iccid) || null;
   } else if (action === 'helix_ota') {
-    ctx.msisdn = (evidence.sim && evidence.sim.current_mdn_e164) || null;
+    ctx.msisdn = mdn10((evidence.sim && evidence.sim.current_mdn_e164) || '') || null;
     ctx.iccid  = (evidence.sim && evidence.sim.iccid) || null;
     ctx.ban    = (evidence.sim && (evidence.sim.att_ban || evidence.sim.helix_ban)) || null;
     ctx.subscriberNumber = ctx.msisdn;
@@ -784,7 +788,10 @@ async function classifyShared(env, report, evidence) {
     outcome: isEscalate ? 'escalate'
            : isDuplicate ? 'duplicate'
            : situation.auto_action === 'classify_only' ? 'no_change' : 'classify_only',
-    evidenceSummary: { situation_id: situation.id, vendor, situation_evidence: situation.evidence_bundle },
+    evidenceSummary: {
+      situation_id: situation.id, vendor, situation_evidence: situation.evidence_bundle,
+      vendor_read_error: (vr && vr.ok !== true) ? (vr.error || 'read_failed') : null,
+    },
     terminal: isEscalate || isDuplicate,
     escalationReason: situation.escalation_reason || null,
     nextReviewAt: nra,
@@ -1010,8 +1017,11 @@ async function gatherEvidence(env, report) {
     try {
       evidence.vendorRead = await readVendorView(env, evidence.sim);
     } catch (err) {
-      console.log('[Remediator] vendor read failed for report ' + report.id + ': ' + err);
       evidence.vendorRead = { ok: false, error: String(err && err.message || err) };
+    }
+    if (evidence.vendorRead && evidence.vendorRead.ok !== true) {
+      console.log('[Remediator] vendor read not ok for report ' + report.id
+        + ' vendor=' + evidence.sim.vendor + ' error=' + (evidence.vendorRead.error || 'unknown'));
     }
   }
   // S5 gateway-offline probe (only if we have gateway+port).
