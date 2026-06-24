@@ -84,12 +84,11 @@ Flow:
    - `status !== 'canceled'`.
    - Has an MSISDN (from `sims.msisdn`, fallback active `sim_numbers.e164`
      reduced to 10 digits).
-   - `new_iccid`: digits only, length 15-22, differs from the current ICCID, and
-     is not already owned by another `sims` row (pre-check to avoid a raw
-     Postgres unique-violation). NOTE: validation is deliberately lenient and
-     does **not** require the `89` prefix, because the operator's sample
-     `newSim` ("356719117453485", 15 digits) does not start with `89`. See "Open
-     question" below.
+   - `new_iccid` is a real ICCID: matches `^89\d{17,19}$` (same detection the
+     rest of the dashboard uses in `handleAtomicQuery`), differs from the current
+     ICCID, and is not already owned by another `sims` row (pre-check to avoid a
+     raw Postgres unique-violation). The full ICCID is what we send as `newSim`
+     and what we store in `sims.iccid`.
    - Resolve `zipCode = zip_code || sims.activation_zip`; if neither, reject
      ("ZIP required for swapSIM").
 3. Verify ATOMIC creds present (`ATOMIC_USERNAME/TOKEN/PIN`), else 500 with the
@@ -138,13 +137,12 @@ registration).
 - Manual: operator runs one real swap on an ATOMIC SIM after deploy. No live
   swap is fired automatically during development.
 
-## Open question
+## Resolved questions
 
-The operator's sample payload uses `"newSim": "356719117453485"` (15 digits, no
-`89` prefix) — which looks more like an IMEI/dummy than a real ICCID. Confirm
-what the `newSim` field actually carries (full ICCID vs. some shorter SIM
-identifier) so client/server validation matches reality. Until confirmed,
-validation stays lenient (digits, 15-22 length).
+- The sample `"newSim": "356719117453485"` was a **dummy** value. The `newSim`
+  field carries a real, regular ICCID (`89…`, 19-21 digits). Client and server
+  validate with `^89\d{17,19}$`; the full ICCID is both sent as `newSim` and
+  stored in `sims.iccid`.
 
 ## Out of scope
 
