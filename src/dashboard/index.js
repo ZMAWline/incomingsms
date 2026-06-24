@@ -7231,6 +7231,7 @@ async function handleAtomicSwapSim(request, env, corsHeaders) {
     if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
     if (sim.vendor !== 'atomic') return json({ ok: false, error: 'SIM swap is only supported for ATOMIC (AT&T) SIMs; this SIM is ' + sim.vendor }, 400);
     if (sim.status === 'canceled') return json({ ok: false, error: 'SIM is canceled; cannot swap' }, 400);
+    if (sim.status === 'provisioning') return json({ ok: false, error: 'SIM is still provisioning; wait for activation before swapping' }, 400);
 
     const fmt = validateNewIccid(newIccid, sim.iccid);
     if (!fmt.ok) return json({ ok: false, error: fmt.error }, 400);
@@ -7287,7 +7288,23 @@ async function handleAtomicSwapSim(request, env, corsHeaders) {
     }
 
     const note = 'ICCID swapped from ' + sim.iccid + ' to ' + newIccid + ' on ' + new Date().toISOString();
-    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(sim.id)), { iccid: newIccid, status_reason: note });
+    // Carrier already accepted the swap, so the DB write is consequential — check it
+    // explicitly rather than via best-effort sbPatch (which swallows non-2xx).
+    const patchRes = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(String(sim.id)), {
+      method: 'PATCH',
+      headers: {
+        'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+        'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal',
+      },
+      body: JSON.stringify({ iccid: newIccid, status_reason: note }),
+    });
+    if (!patchRes.ok) {
+      const detail = await patchRes.text().catch(() => '');
+      await logSystemError(env, { source: 'dashboard', action: 'swap_sim_db_patch', sim_id: sim.id, iccid: sim.iccid, error_message: 'Carrier swapSIM succeeded but DB patch failed: HTTP ' + patchRes.status, error_details: { new_iccid: newIccid, detail } });
+      return json({ ok: false, error: 'Carrier swap succeeded but the database update failed (HTTP ' + patchRes.status + '). The line is now on ' + newIccid + ' at AT&T — check system errors and fix the SIM record.', new_iccid: newIccid, response: data }, 502);
+    }
 
     return json({ ok: true, sim_id: sim.id, old_iccid: sim.iccid, new_iccid: newIccid, msisdn, response: data });
   } catch (error) {
