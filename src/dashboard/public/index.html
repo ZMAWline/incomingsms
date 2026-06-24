@@ -10860,8 +10860,8 @@ async function sendSimOnline(simId, phoneNumber) {
             if (sim.vendor !== 'atomic') { showToast('SIM swap is only for ATOMIC SIMs', 'error'); return; }
             _swapSimId = sim.id;
             document.getElementById('swap-sim-info').innerHTML =
-                'SIM #' + sim.id + ' &middot; current ICCID <span class="font-mono text-gray-300">' + (sim.iccid || '-') + '</span><br>' +
-                'Number <span class="font-mono text-gray-300">' + (sim.phone_number || '-') + '</span> &middot; reseller ' + (sim.reseller_name || '-');
+                'SIM #' + sim.id + ' &middot; current ICCID <span class="font-mono text-gray-300">' + escapeHtml(sim.iccid || '-') + '</span><br>' +
+                'Number <span class="font-mono text-gray-300">' + escapeHtml(sim.phone_number || '-') + '</span> &middot; reseller ' + escapeHtml(sim.reseller_name || '-');
             document.getElementById('swap-sim-iccid').value = '';
             document.getElementById('swap-sim-zip').value = '';
             document.getElementById('swap-sim-result').classList.add('hidden');
@@ -10869,12 +10869,13 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('swap-sim-modal').classList.remove('hidden');
         }
         async function submitSwapSim() {
+            if (!_swapSimId) { showToast('No SIM context', 'error'); return; }
             const newIccid = document.getElementById('swap-sim-iccid').value.trim();
             const zip = document.getElementById('swap-sim-zip').value.trim();
             if (!/^89\d{17,19}$/.test(newIccid)) { showToast('Enter a real ICCID (starts with 89, 19-21 digits)', 'error'); return; }
             const btn = document.getElementById('swap-sim-submit');
             const orig = btn.textContent;
-            btn.disabled = true; btn.textContent = 'Swapping…';
+            btn.disabled = true; btn.textContent = 'Swapping...';
             try {
                 const res = await fetch(API_BASE + '/atomic-swap-sim', {
                     method: 'POST',
