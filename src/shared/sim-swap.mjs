@@ -14,7 +14,7 @@ export function to10DigitMsisdn(raw) {
   if (!raw) return null;
   let d = String(raw).replace(/\D/g, '');
   if (d.length === 11 && d.startsWith('1')) d = d.slice(1);
-  return d.length === 10 ? d : (d || null);
+  return d.length === 10 ? d : null;
 }
 
 // MSISDN comes from sims.msisdn (ATOMIC stores the 10-digit MDN) or, failing

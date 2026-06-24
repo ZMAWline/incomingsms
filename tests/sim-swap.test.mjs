@@ -28,6 +28,8 @@ test('to10DigitMsisdn strips +1 and non-digits', () => {
   assert.equal(to10DigitMsisdn('3322408354'), '3322408354');
   assert.equal(to10DigitMsisdn(''), null);
   assert.equal(to10DigitMsisdn(null), null);
+  assert.equal(to10DigitMsisdn('1234567'), null);       // too short
+  assert.equal(to10DigitMsisdn('123456789012'), null);  // too long
 });
 
 test('resolveMsisdn prefers sims.msisdn, falls back to active e164', () => {
@@ -35,6 +37,7 @@ test('resolveMsisdn prefers sims.msisdn, falls back to active e164', () => {
   assert.equal(resolveMsisdn({ msisdn: null, sim_numbers: [{ e164: '+13322408354' }] }), '3322408354');
   assert.equal(resolveMsisdn({ msisdn: null, sim_numbers: [] }), null);
   assert.equal(resolveMsisdn({}), null);
+  assert.equal(resolveMsisdn(null), null);
 });
 
 test('resolveZip prefers explicit input, falls back to activation_zip', () => {
@@ -46,8 +49,8 @@ test('resolveZip prefers explicit input, falls back to activation_zip', () => {
 test('validateNewIccid enforces format, difference', () => {
   assert.deepEqual(validateNewIccid('8901240197155370510', '8901240197155370999'), { ok: true });
   assert.equal(validateNewIccid('356719117453485', '8901240197155370999').ok, false); // bad format
-  assert.equal(validateNewIccid('8901240197155370510', '8901240197155370510').ok, false); // same as current
-  assert.equal(validateNewIccid('', '8901240197155370999').ok, false); // missing
+  assert.deepEqual(validateNewIccid('8901240197155370510', '8901240197155370510'), { ok: false, error: 'New ICCID is the same as the current ICCID' }); // same as current
+  assert.deepEqual(validateNewIccid('', '8901240197155370999'), { ok: false, error: 'New ICCID is required' }); // missing
 });
 
 test('buildSwapSimRequest produces the wholeSaleApi envelope', () => {
