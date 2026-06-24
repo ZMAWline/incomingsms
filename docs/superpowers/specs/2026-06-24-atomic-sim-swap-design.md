@@ -49,8 +49,7 @@ rental, no bad-rental risk).
 
 We do **not** create a second `sims` row or repoint any foreign keys. The old
 ICCID is preserved in the audit trail (`carrier_api_logs` + a
-`sims.status_reason` note + a `sim_status_history` entry), not as a separate
-"cancelled" row.
+`sims.status_reason` note), not as a separate "cancelled" row.
 
 Rejected alternative (Approach B: new row + cancel old + move all FKs): much
 riskier given the rental / bad-rental machinery keyed on `sim_id` /
@@ -99,9 +98,10 @@ Flow:
    'atomic'`, the **old** ICCID, and an `error` summary when not `00`.
 6. Success = `wholeSaleApi.wholeSaleResponse.statusCode === '00'`.
    - **On success only:** `PATCH sims?id=eq.<sim_id>` setting `iccid =
-     new_iccid` and `status_reason = 'ICCID swapped from <old> on <ISO>'`;
-     append a `sim_status_history` row (old_status = new_status = current
-     status, reason = swap note) if the table schema permits.
+     new_iccid` and `status_reason = 'ICCID swapped from <old> on <ISO>'`. (No
+     `sim_status_history` row: the status does not change in a swap, and that
+     table has no free-text/reason column — the `carrier_api_logs` entry plus
+     the `status_reason` note are the audit trail.)
    - **On failure:** change nothing in the DB; return `{ ok:false, error }`.
 7. Return `{ ok, old_iccid, new_iccid, response }`.
 
