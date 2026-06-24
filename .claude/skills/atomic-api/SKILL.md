@@ -20,6 +20,7 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
 | 3 | Deactivate | `deactivateSubscriber` | Permanently cancel/deactivate |
 | 3 | Reconnect | `reconnectSubscriber` | Reconnect a deactivated subscriber |
 | 4 | Swap MSISDN | `swapMSISDN` | Change MDN based on ZIP code |
+| 4b | Swap SIM | `swapSIM` | Change the ICCID on a line (physical SIM swap); MSISDN stays |
 | 5 | Update Subscriber Info | `UpdateSubscriberInfo` | Update name/address on subscriber |
 | 6 | Resend OTA Profile | `resendOtaProfile` | Trigger OTA network refresh |
 
@@ -63,6 +64,10 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
 2. **Update Subscriber Info** — Update PPU address to target ZIP
 3. **Swap MSISDN** — Change MDN (new area code based on current ZIP)
 4. **Subscriber Inquiry** — Verify new MDN
+
+### SIM Swap Sequence (ICCID change)
+1. **Swap SIM** -- POST `swapSIM` with current `MSISDN`, `zipCode`, and `newSim` (new ICCID)
+2. **Subscriber Inquiry** -- Verify the line now reports the new ICCID
 
 ### Status Change Reference
 
@@ -220,6 +225,24 @@ Returns: attStatus, BAN, activationDate, plan info, device info (BLIMEI/NWIMEI),
 ```
 **Note:** New MDN area code is based on the ZIP currently associated with the MDN. Update address first via UpdateSubscriberInfo if targeting a specific area code.
 
+### 7b. Swap SIM (Change ICCID)
+```json
+{"wholeSaleApi": {
+  "session": {
+    "userName": "ezbiz",
+    "token": "EZ(3928_*=wH)le",
+    "pin": "EZ32726"
+  },
+  "wholeSaleRequest": {
+    "requestType": "swapSIM",
+    "MSISDN": "CURRENT_MDN",
+    "zipCode": "SUBSCRIBER_ZIP",
+    "newSim": "NEW_ICCID"
+  }
+}}
+```
+**Note:** Keeps the same MSISDN/BAN and moves the line to `newSim` (the new ICCID). The old ICCID is auto-detached at the carrier -- do **not** send a separate `deactivateSubscriber`. `zipCode` is the subscriber's ZIP on file; if it is wrong, fix it first with `UpdateSubscriberInfo`. `newSim` must be a real ICCID (89-prefixed, 19-21 digits).
+
 ### 8. Update Subscriber Information
 ```json
 {"wholeSaleApi": {
@@ -279,6 +302,7 @@ Returns: attStatus, BAN, activationDate, plan info, device info (BLIMEI/NWIMEI),
 | Multiple endpoints | Single endpoint, different `requestType` |
 | 4.6 Change Status | Separate requestTypes per action |
 | 4.16 Update CTN/MDN | `swapMSISDN` |
+| 4.x Swap SIM / change ICCID | `swapSIM` (MSISDN + zipCode + newSim) |
 | 4.4 Update Subscriber | `UpdateSubscriberInfo` |
 | 4.11 Send OTA | `resendOtaProfile` |
 
