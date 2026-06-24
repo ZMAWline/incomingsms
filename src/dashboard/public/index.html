@@ -4206,6 +4206,32 @@ set verify_pending; schedule §C.3 poll
         </div>
     </div>
 
+    <div id="swap-sim-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-lg max-h-[85vh] flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+                <h3 class="text-lg font-semibold text-white">Swap SIM (ATOMIC)</h3>
+                <button onclick="document.getElementById('swap-sim-modal').classList.add('hidden')" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
+            </div>
+            <div class="p-5 overflow-y-auto flex-1">
+                <div class="mb-4 p-3 rounded-lg bg-yellow-900/20 border border-yellow-800/40 text-xs text-yellow-300">
+                    This performs a <strong>live AT&amp;T carrier change</strong>: the phone number stays, the line moves to the new ICCID, and the old ICCID is detached. All history stays on this SIM.
+                </div>
+                <p id="swap-sim-info" class="text-sm text-gray-400 mb-4"></p>
+                <label class="block text-xs text-gray-500 mb-1">New ICCID (real ICCID, starts 89)</label>
+                <input id="swap-sim-iccid" type="text" maxlength="22" inputmode="numeric" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono mb-3" placeholder="8901240197155370510">
+                <label class="block text-xs text-gray-500 mb-1">ZIP (leave blank to use the ZIP on file)</label>
+                <input id="swap-sim-zip" type="text" maxlength="10" inputmode="numeric" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono mb-4" placeholder="ZIP on file">
+                <button id="swap-sim-submit" onclick="submitSwapSim()" class="w-full px-4 py-2 text-sm bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Swap SIM</button>
+                <div id="swap-sim-result" class="mt-4 hidden">
+                    <pre id="swap-sim-output" class="bg-dark-900 p-4 rounded-lg text-xs font-mono overflow-x-auto text-gray-300 border border-dark-600"></pre>
+                </div>
+            </div>
+            <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
+                <button onclick="document.getElementById('swap-sim-modal').classList.add('hidden')" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const API_BASE = '/api';
 
@@ -10826,6 +10852,53 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
+        let _swapSimId = null;
+        function _sdSwap() { if (!_sdCurrentSim) return; var c = _sdCurrentSim; closeSimDetail(); showSwapSimModal(c.id); }
+        function showSwapSimModal(simId) {
+            const sim = tableState.sims && tableState.sims.data && tableState.sims.data.find(function(s){ return String(s.id) === String(simId); });
+            if (!sim) { showToast('SIM #' + simId + ' not in current view — refresh first', 'error'); return; }
+            if (sim.vendor !== 'atomic') { showToast('SIM swap is only for ATOMIC SIMs', 'error'); return; }
+            _swapSimId = sim.id;
+            document.getElementById('swap-sim-info').innerHTML =
+                'SIM #' + sim.id + ' &middot; current ICCID <span class="font-mono text-gray-300">' + (sim.iccid || '-') + '</span><br>' +
+                'Number <span class="font-mono text-gray-300">' + (sim.phone_number || '-') + '</span> &middot; reseller ' + (sim.reseller_name || '-');
+            document.getElementById('swap-sim-iccid').value = '';
+            document.getElementById('swap-sim-zip').value = '';
+            document.getElementById('swap-sim-result').classList.add('hidden');
+            document.getElementById('swap-sim-output').textContent = '';
+            document.getElementById('swap-sim-modal').classList.remove('hidden');
+        }
+        async function submitSwapSim() {
+            const newIccid = document.getElementById('swap-sim-iccid').value.trim();
+            const zip = document.getElementById('swap-sim-zip').value.trim();
+            if (!/^89\d{17,19}$/.test(newIccid)) { showToast('Enter a real ICCID (starts with 89, 19-21 digits)', 'error'); return; }
+            const btn = document.getElementById('swap-sim-submit');
+            const orig = btn.textContent;
+            btn.disabled = true; btn.textContent = 'Swapping…';
+            try {
+                const res = await fetch(API_BASE + '/atomic-swap-sim', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_id: _swapSimId, new_iccid: newIccid, zip_code: zip })
+                });
+                const result = await res.json();
+                const out = document.getElementById('swap-sim-output');
+                document.getElementById('swap-sim-result').classList.remove('hidden');
+                out.textContent = JSON.stringify(result, null, 2);
+                if (res.ok && result.ok) {
+                    showToast('Swapped to ' + result.new_iccid, 'success');
+                    document.getElementById('swap-sim-modal').classList.add('hidden');
+                    loadSims(true);
+                } else {
+                    showToast('Swap failed: ' + (result.error || res.status), 'error');
+                }
+            } catch (e) {
+                showToast('Swap error: ' + e, 'error');
+            } finally {
+                btn.disabled = false; btn.textContent = orig;
+            }
+        }
+
         // ===== Change IMEI =====
         window._changeImeiContext = null;
 
@@ -12206,6 +12279,7 @@ async function sendSimOnline(simId, phoneNumber) {
             var canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
             var canOta = sim.status === 'active' && ['teltik','wing_iot'].indexOf(sim.vendor) === -1 && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
             var canRetry = sim.status === 'error' && sim.vendor !== 'teltik' && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
+            var canSwap = sim.vendor === 'atomic' && sim.status === 'active';
             var gatewayPort = (sim.gateway_name || sim.gateway_code || (sim.gateway_id ? 'GW#' + sim.gateway_id : '')) + (sim.port ? ' / ' + normalizePortDisplay(sim.port) : '');
             var errHtml = (sim.status === 'error' && sim.last_activation_error)
                 ? '<div class="mt-3 p-2 bg-red-900/20 border border-red-800/40 rounded text-xs text-red-400 font-mono break-all">' + sim.last_activation_error.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>'
@@ -12214,6 +12288,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 (canSendOnline ? '<button onclick="sendSimOnline(_sdCurrentSim.id, _sdCurrentSim.phone_number)" class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Online Webhook</button>' : '') +
                 (canOta ? '<button onclick="_sdOta()" class="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">OTA Refresh</button>' : '') +
                 (canRetry ? '<button onclick="_sdRetry()" class="px-3 py-1.5 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg transition">Retry Activation</button>' : '') +
+                (canSwap ? '<button onclick="_sdSwap()" class="px-3 py-1.5 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Swap SIM</button>' : '') +
                 '<button onclick="_sdViewLogs()" class="px-3 py-1.5 text-xs bg-dark-600 hover:bg-dark-500 text-gray-300 rounded-lg transition">View Logs</button>' +
                 '</div>';
             document.getElementById('sdtab-details').innerHTML =
