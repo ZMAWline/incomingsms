@@ -1,4 +1,5 @@
 import { computeBillingBreakdown, computeResellerUtilization } from '../shared/billing.js';
+import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateChanging } from './api-tester-presets.js';
 
 function normalizeImeiPoolPort(port) {
@@ -461,6 +462,9 @@ export default {
 
     if (url.pathname === '/api/atomic-query' && request.method === 'POST') {
       return handleAtomicQuery(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/atomic-swap-sim' && request.method === 'POST') {
+      return handleAtomicSwapSim(request, env, corsHeaders);
     }
 
     if (url.pathname === '/api/teltik-query' && request.method === 'POST') {
@@ -7203,6 +7207,91 @@ async function handleAtomicQuery(request, env, corsHeaders) {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
+  }
+}
+
+// POST /api/atomic-swap-sim — swap the ICCID on an active ATOMIC line in place.
+// Carrier swapSIM keeps the MSISDN/BAN; only sims.iccid changes here. Approach A
+// (see docs/superpowers/specs/2026-06-24-atomic-sim-swap-design.md): same sims
+// row, so number/rental/reseller/slot/history stay attached.
+async function handleAtomicSwapSim(request, env, corsHeaders) {
+  const json = (obj, status) => new Response(JSON.stringify(obj), { status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  try {
+    const body = await request.json();
+    const simId = body.sim_id;
+    const newIccid = (body.new_iccid == null ? '' : String(body.new_iccid)).trim();
+    if (!simId) return json({ ok: false, error: 'sim_id required' }, 400);
+
+    if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+      return json({ ok: false, error: 'ATOMIC credentials not configured on dashboard worker (push ATOMIC_USERNAME, ATOMIC_TOKEN, ATOMIC_PIN secrets)' }, 500);
+    }
+
+    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,activation_zip,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1');
+    const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
+    if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
+    if (sim.vendor !== 'atomic') return json({ ok: false, error: 'SIM swap is only supported for ATOMIC (AT&T) SIMs; this SIM is ' + sim.vendor }, 400);
+    if (sim.status === 'canceled') return json({ ok: false, error: 'SIM is canceled; cannot swap' }, 400);
+
+    const fmt = validateNewIccid(newIccid, sim.iccid);
+    if (!fmt.ok) return json({ ok: false, error: fmt.error }, 400);
+
+    const clash = await sbGet(env, 'sims?select=id&iccid=eq.' + encodeURIComponent(newIccid) + '&limit=1');
+    if (Array.isArray(clash) && clash[0] && String(clash[0].id) !== String(sim.id)) {
+      return json({ ok: false, error: 'ICCID ' + newIccid + ' is already assigned to SIM #' + clash[0].id }, 409);
+    }
+
+    const msisdn = resolveMsisdn(sim);
+    if (!msisdn) return json({ ok: false, error: 'No MSISDN on file for this SIM; cannot swap' }, 400);
+    const zipCode = resolveZip(body.zip_code, sim);
+    if (!zipCode) return json({ ok: false, error: 'ZIP required for swapSIM (none on file; enter one)' }, 400);
+
+    const apiUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+    const requestBody = buildSwapSimRequest({
+      session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+      msisdn,
+      zipCode,
+      newSim: newIccid,
+    });
+
+    const res = await relayFetch(env, apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    const success = res.ok && isSwapSuccess(data);
+    const errMsg = success ? null : swapErrorMessage(data, res.status);
+
+    await logCarrierApiCall(env, {
+      run_id: 'atomic_swap_' + sim.iccid + '_' + Date.now(),
+      step: 'swap_sim',
+      iccid: sim.iccid,
+      imei: null,
+      vendor: 'atomic',
+      request_url: apiUrl,
+      request_method: 'POST',
+      request_body: requestBody,
+      response_status: res.status,
+      response_ok: res.ok,
+      response_body_text: text,
+      response_body_json: data,
+      error: errMsg,
+    });
+
+    if (!success) {
+      await logSystemError(env, { source: 'dashboard', action: 'swap_sim', sim_id: sim.id, iccid: sim.iccid, error_message: 'ATOMIC swapSIM failed: ' + errMsg, error_details: { msisdn, new_iccid: newIccid, response: data, status: res.status } });
+      return json({ ok: false, error: errMsg, response: data }, res.status >= 400 ? res.status : 502);
+    }
+
+    const note = 'ICCID swapped from ' + sim.iccid + ' to ' + newIccid + ' on ' + new Date().toISOString();
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(sim.id)), { iccid: newIccid, status_reason: note });
+
+    return json({ ok: true, sim_id: sim.id, old_iccid: sim.iccid, new_iccid: newIccid, msisdn, response: data });
+  } catch (error) {
+    return json({ ok: false, error: String(error) }, 500);
   }
 }
 
