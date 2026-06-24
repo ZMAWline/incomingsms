@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-06-23 — Rental billing: capture on every number.online path; volume tiers by window-total; exclude bad rentals
+
+**Decision:** (1) Rental minting (`upsertRental`) must run on **every** path that fires a `number.online` webhook — added it to teltik-worker's inline `sendTeltikSwapWebhooks` (reseller-sync + details-finalizer already did). (2) The rental engine (`computeRentalBilling`) now reads volume tiers from the **legacy `reseller_rates`** table, keyed on the carrier's **window-total** billed rentals (`tmobile→teltik` scope, `att→all-att`), falling back to flat `reseller_rental_rates` (per date) then `daily_rate`. (3) A lifetime reported bad and **not resolved the same EST day** is excluded from billing. (4) Only the history "Download CSV" serves a frozen snapshot; "Download for QuickBooks" (generate) keeps recomputing live, and re-generating an existing week does NOT overwrite its snapshot.
+
+**Why:** The Teltik night-migration moved rotations onto the teltik-worker inline path, which fired number.online but never minted — so rental-mode billing silently under-counted Teltik by ~95% from 06-16 (the rentals table is the billing source of truth). Volume tiers live only in `reseller_rates` (the rental engine had no tier logic at all, billing a flat 1.60 instead of the operator's >3000→1.55 rule). Window-total (not per-day, not active-SIM) matches the operator's stated rule "total tmobile rentals > 3000 → 1.55" and reconciled HYPPE to within ~$35 of the customer. Bad-rental exclusion per operator policy (a defective line not fixed same-day is not billable). The snapshot-only-on-CSV split is an explicit operator choice (they want the generate button live, only the saved CSV locked).
+
+**Consequence:** When adding/altering any rotation or number.online path, confirm it mints, or billing silently drops those lifetimes (see [[rental-capture-every-online-path]]). The flat `reseller_rental_rates` row is now a fallback only (the dead tmobile 1.60 row was deleted); volume pricing is authoritative via `reseller_rates`. `rentals.sim_number_id` is `ON DELETE CASCADE` — deleting a sim_numbers row also deletes its rental, but the 06-16 collapse was a *minting gap*, not a deletion. To lock a corrected invoice, Delete then regenerate (refreshes the snapshot). Backfill/recovery method for missing rentalIds: re-send number.online through the relay with the **real `valid_to`** (even if past) so TrustOTP echoes the existing id without changing the rental.
+
+---
+
 ## 2026-06-16 — Supabase RLS/hardening: lock to service_role, do NOT add anon policies
 
 **Decision:** When clearing Supabase security advisors on the prod project (`lzjqegxazqlktttyybth`), the fix for RLS-disabled public tables is `ENABLE ROW LEVEL SECURITY` **with no policies**, and for over-permissioned SECURITY DEFINER RPCs it is `REVOKE EXECUTE FROM anon, authenticated, public` + `GRANT EXECUTE TO service_role`. We deliberately did NOT write any `anon`/`authenticated` RLS policies, and dropped the two `TO public USING (true)` allow-everyone policies (`sim_sms_daily`, `system_errors`) rather than scoping them.

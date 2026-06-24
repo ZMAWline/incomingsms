@@ -1,7 +1,32 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-16 (Supabase security advisors cleared on prod; redesign branch built + switched to prod; storefront MVP built; teltik night-migration started)
+> Last updated: 2026-06-23 (invoice per-day snapshot + delete button; Teltik rental capture gap fixed + 10,445 backfilled + 535 ids recovered; rental engine volume tiers + bad-rental exclusion)
+
+---
+
+## Session close (2026-06-23) — invoice fixes + Teltik rental capture gap + rental billing engine corrections
+
+Long session, all deployed + verified. Branch `fix/import-teltik-chunked-progress` merged into `main` and deleted; prod runs main.
+
+**Invoice download / generation (dashboard):**
+- **Per-day breakdown is now snapshotted at generation** (`qbo_invoices.daily_breakdown` JSONB, migration `20260619`). The history **"Download CSV"** serves the frozen snapshot (locked); **"Download for QuickBooks"** still recomputes live. This split is deliberate (operator: only the CSV should be locked). Re-generating a week that already has an invoice does NOT overwrite its snapshot (insert skipped on the UNIQUE) → to refresh a locked copy, **Delete the invoice then regenerate**. Operator declined auto-overwrite.
+- **Delete-invoice button** added (hard delete; frees the `UNIQUE(customer, week_start)` slot so the week can be re-generated). `DELETE /api/qbo-invoices/{id}`.
+
+**Teltik rental capture gap — FIXED + backfilled (teltik-worker `cfdd9c2f`):**
+- Root cause: the night-migration rotates via teltik-worker's inline `sendTeltikSwapWebhooks`, which fired `number.online` but **never called `upsertRental`** (only reseller-sync + details-finalizer mint). So ~95% of Teltik lifetimes since the 06-16 migration start had no `rentals` row → rental-mode billing under-counted Teltik (~37/day vs ~1500). **Not a deletion** (sim_numbers ids intact + sequential). Forward fix: teltik-worker now mints + records the TrustOTP rentalId on inline rotation, gated `RENTAL_CAPTURE_ENABLED=true`. Verified live 06-23: Teltik rotations = rentals 1:1.
+- **Backfilled 10,445 missing rentals** (06-16→06-22) from `sim_numbers` + `webhook_deliveries` response bodies. 9,910 recovered the rentalId; the 535 on 06-21 (~05:27 UTC, null response bodies) were later recovered by **re-sending number.online through the relay with the real `valid_to`** (all returned "End date updated for existing rental" — no rentals created/changed). Reseller 3 is now 100% matched (0 null rentalIds).
+
+**Rental billing engine — volume tiers + bad-rental exclusion (`src/shared/rentals.js`, commit `27c9ffe`; dashboard `61968867` + reseller-portal `e16bf825`):**
+- Was billing a **flat** `reseller_rental_rates` rate (1.60) and **ignoring volume tiers entirely**. Now resolves per (date, carrier): legacy `reseller_rates` **volume tier** (keyed on the carrier's **window-total** billed rentals; `tmobile→teltik` scope, `att→all-att`) → flat `reseller_rental_rate` (per date, preserves mid-window changes) → `daily_rate`. TrustOTP >3000 → **$1.55**.
+- **Bad-rental exclusion:** a lifetime reported defective and not closed the **same EST day** is excluded (returned as `excluded_bad_rentals`).
+- Removed the now-dead flat tmobile **1.60** row from `reseller_rental_rates` (the tier always wins; it was misleading).
+- **Reconciliation (HYPPE/TrustOTP 06-12..18):** after fixes our weekly invoice ≈ the customer's own report within **~$35** (was $819 off). Residual is a small systematic AT&T +line difference (needs his per-line rentalIds to attribute) + live drift (invoice recomputes from a moving table). **Not timezone** — EST vs UTC window totals are identical. Operator OK with not matching exactly; reconciliation skipped indefinitely.
+
+**Pending / carry-over:**
+- Unit tests for the new tier/exclusion logic: operator **declined**.
+- Teltik night-migration still running (carry-over): set `TELTIK_NIGHT_MIGRATION=off` when morning_remaining = 0.
+- Storefront launch keys still blocked on operator (carry-over).
 
 ---
 
