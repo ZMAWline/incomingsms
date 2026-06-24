@@ -116,7 +116,7 @@ registration).
 - Modal contents:
   - Read-only: current ICCID, number (MSISDN), reseller.
   - Editable ZIP, pre-filled from `activation_zip`.
-  - **New ICCID** text input (client-side validated `^89\d{17,18}$`).
+  - **New ICCID** text input (client-side validated `^89\d{17,19}$`).
   - A clear warning that this performs a **live carrier change**.
 - Submit → `POST /api/atomic-swap-sim` with `{ sim_id, new_iccid, zip_code }`.
   Show a toast with the result; on success close the modal and refresh the SIM
