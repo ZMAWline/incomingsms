@@ -1,6 +1,7 @@
 import { computeBillingBreakdown, computeResellerUtilization } from '../shared/billing.js';
 import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateChanging } from './api-tester-presets.js';
+import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -14,6 +15,12 @@ function normalizeImeiPoolPort(port) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    // WING gateway-status: external partner endpoint with its own API-key auth.
+    // Must run BEFORE the operator Basic-auth gate so WING never needs operator creds.
+    if (url.pathname === '/api/gateway-status') {
+      return handleGatewayStatus(request, env);
+    }
 
     // Basic auth check
     const authHeader = request.headers.get('Authorization');
@@ -7330,3 +7337,161 @@ async function serveApp(env) {
     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
   });
 }
+
+// ===== WING gateway-status endpoint (external partner, read-only) =====
+// GET /api/gateway-status?iccid=... or ?iccids=a,b,c
+// Auth: dedicated GATEWAY_STATUS_API_KEY via X-Api-Key header (or ?key=).
+// Returns live Skyline gateway state per ICCID, with the numeric `st` mapped
+// to a human string like "State 3 = Registered (ready)". See
+// src/shared/skyline-state.mjs and docs/superpowers/specs/2026-06-26-wing-gateway-status-api-design.md
+const GATEWAY_STATUS_MAX_ICCIDS = 100;
+
+function gatewayStatusKeyEquals(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+// Live read of one gateway's ports via the skyline-gateway worker. Returns
+// { ok: true, iccidMap } where iccidMap[iccid] = port entry, or { ok: false }
+// when the gateway/bridge is unreachable or returns an error.
+async function fetchGatewayPortInfo(env, gatewayId) {
+  try {
+    if (!env.SKYLINE_GATEWAY || !env.SKYLINE_SECRET) return { ok: false };
+    const params = new URLSearchParams({
+      gateway_id: String(gatewayId),
+      secret: env.SKYLINE_SECRET,
+      all_slots: '1',
+    });
+    const resp = await env.SKYLINE_GATEWAY.fetch(
+      'https://skyline-gateway/port-info?' + params.toString(),
+      { method: 'GET' }
+    );
+    const text = await resp.text();
+    let data;
+    try { data = JSON.parse(text); } catch { return { ok: false }; }
+    if (!resp.ok || !data || !data.ok) return { ok: false };
+    const iccidMap = {};
+    for (const p of (data.ports || [])) {
+      if (p && p.iccid) iccidMap[p.iccid] = p;
+    }
+    return { ok: true, iccidMap };
+  } catch {
+    return { ok: false };
+  }
+}
+
+// Assemble the per-ICCID result. `sim` is the matching sims row (or undefined),
+// `portInfoByGateway` maps gateway_id -> result of fetchGatewayPortInfo.
+function buildGatewayStatusResult(iccid, sim, portInfoByGateway) {
+  const base = {
+    iccid,
+    found: false,
+    state_code: null,
+    state_label: null,
+    gateway_state: null,
+    number: null,
+    operator: null,
+    signal: null,
+    imei: null,
+    message: null,
+  };
+
+  if (!sim) {
+    base.message = 'not found in system';
+    return base;
+  }
+  base.found = true;
+  base.number = (sim.sim_numbers && sim.sim_numbers[0]) ? sim.sim_numbers[0].e164 : null;
+
+  if (sim.gateway_id === null || sim.gateway_id === undefined) {
+    base.message = 'not assigned to a gateway';
+    return base;
+  }
+
+  const info = portInfoByGateway[sim.gateway_id];
+  if (!info || !info.ok) {
+    base.message = 'gateway unreachable';
+    return base;
+  }
+
+  const entry = info.iccidMap[iccid];
+  if (!entry) {
+    base.message = 'not present in gateway';
+    return base;
+  }
+
+  const fmt = formatGatewayState(entry.st);
+  base.state_code = fmt.state_code;
+  base.state_label = fmt.state_label;
+  base.gateway_state = fmt.gateway_state;
+  base.operator = entry.operator != null ? entry.operator : null;
+  base.signal = entry.signal != null ? entry.signal : null;
+  base.imei = entry.imei != null ? entry.imei : null;
+  // Prefer our DB number; fall back to the gateway-reported number if absent.
+  if (base.number == null && entry.number) base.number = entry.number;
+  return base;
+}
+
+async function handleGatewayStatus(request, env) {
+  const cors = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key',
+  };
+  const jsonRes = (obj, status) => new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: { ...cors, 'Content-Type': 'application/json' },
+  });
+
+  if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
+  if (request.method !== 'GET') return jsonRes({ error: 'method not allowed' }, 405);
+
+  // Auth: dedicated API key, fail closed if not configured.
+  const configuredKey = env.GATEWAY_STATUS_API_KEY;
+  if (!configuredKey) return jsonRes({ error: 'gateway-status endpoint not configured' }, 503);
+
+  const url = new URL(request.url);
+  const presentedKey = request.headers.get('X-Api-Key') || url.searchParams.get('key') || '';
+  if (!gatewayStatusKeyEquals(presentedKey, configuredKey)) {
+    return jsonRes({ error: 'unauthorized' }, 401);
+  }
+
+  const iccids = parseIccidList(url.searchParams.get('iccid'), url.searchParams.get('iccids'));
+  if (iccids.length === 0) return jsonRes({ error: 'iccid or iccids required' }, 400);
+  if (iccids.length > GATEWAY_STATUS_MAX_ICCIDS) {
+    return jsonRes({ error: 'too many iccids (max ' + GATEWAY_STATUS_MAX_ICCIDS + ')' }, 400);
+  }
+
+  try {
+    // 1. Look up the SIMs by ICCID (id, gateway, active number).
+    const inList = iccids.map(c => encodeURIComponent(c)).join(',');
+    const simsResp = await supabaseGet(
+      env,
+      'sims?iccid=in.(' + inList + ')&select=id,iccid,gateway_id,sim_numbers(e164)&sim_numbers.valid_to=is.null'
+    );
+    const sims = simsResp.ok ? await simsResp.json() : [];
+    const simByIccid = {};
+    for (const s of sims) simByIccid[s.iccid] = s;
+
+    // 2. One live /port-info call per distinct gateway.
+    const gatewayIds = [...new Set(
+      sims.filter(s => s.gateway_id !== null && s.gateway_id !== undefined).map(s => s.gateway_id)
+    )];
+    const portInfoByGateway = {};
+    for (const gid of gatewayIds) {
+      portInfoByGateway[gid] = await fetchGatewayPortInfo(env, gid);
+    }
+
+    // 3. Assemble results in request order.
+    const results = iccids.map(iccid =>
+      buildGatewayStatusResult(iccid, simByIccid[iccid], portInfoByGateway)
+    );
+    return jsonRes({ ok: true, count: results.length, results });
+  } catch (e) {
+    return jsonRes({ error: String(e && e.message ? e.message : e) }, 500);
+  }
+}
+
