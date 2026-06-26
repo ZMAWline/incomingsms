@@ -9,7 +9,7 @@
 
 New read-only partner endpoint so WING can check live Skyline gateway state by ICCID. All deployed + verified in prod.
 
-**`/api/gateway-status` (dashboard, commit `73e1628`; prod versions `d151d318` then `33663b85`):**
+**`/api/gateway-status` (dashboard, commit `51a9baa`; prod versions `d151d318` then `33663b85`):**
 - `GET /api/gateway-status?iccid=...` or `?iccids=a,b,c` (comma-separated, max 100). Per-ICCID result maps the numeric Skyline `st` to text (e.g. `State 3 = Registered (ready)`) and includes `state_code`/`state_label`, the **gateway-reported** IMEI, number, operator, signal. No `registered` boolean (operator chose the string as source of truth).
 - **Auth: dedicated `GATEWAY_STATUS_API_KEY` secret** (set in prod), via `X-Api-Key` header or `?key=`. The route is intercepted at the TOP of `fetch()` BEFORE the operator Basic-auth gate, does its own constant-time key check, and **fails closed (503) when the secret is unset** — WING never gets operator creds. Live key was handed to the operator in-session (starts `wing_48af...`); rotate with `printf '%s' <newkey> | npx wrangler secret put GATEWAY_STATUS_API_KEY --env=""` from `src/dashboard/`.
 - Pure mapping + ICCID parsing live in `src/shared/skyline-state.mjs` with 11 unit tests (`tests/skyline-state.test.mjs`; full suite 239 green). Labels are the verbatim SkyLine-API reference table; any code not in the table (incl. 10) -> "Unknown".
