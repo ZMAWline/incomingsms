@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-06-26 — Partner-facing dashboard endpoints: intercept before the Basic-auth gate, own key, fail closed
+
+**Decision:** The WING-facing `/api/gateway-status` lookup is dispatched at the very top of the dashboard worker's `fetch()`, BEFORE the global operator Basic-auth gate, and authenticates with its own dedicated `GATEWAY_STATUS_API_KEY` secret (constant-time compare; `X-Api-Key` header or `?key=`). It fails closed with 503 when the secret is unset. The pure state-mapping + ICCID-parsing logic went into a new `src/shared/skyline-state.mjs`, not inline in `index.js`.
+
+**Why:** External partners must never receive operator dashboard credentials, so a partner route cannot sit behind the operator Basic-auth gate. Placing it before the gate with an isolated key keeps the two auth domains separate and the key independently rotatable; fail-closed guarantees we never serve partner data if the secret is missing or misconfigured. The logic lives in `.mjs` because `src/dashboard/index.js` is `type: commonjs` + `.js`, so the Node test runner (`node --test tests/*.mjs`) cannot import it — only `.mjs` shared modules are unit-testable (same pattern as `sim-swap.mjs`, `address-picker.mjs`).
+
+**Consequence:** This is the template for any future partner/external endpoint on the dashboard worker: intercept before the auth gate, dedicated secret, constant-time check, fail closed, no operator creds shared. Do NOT move such a route below the Basic-auth block (it would then demand operator creds). Keep any unit-testable worker logic in `src/shared/*.mjs`, never inline in a worker `.js` entrypoint, or the node suite can't reach it. `index.js` is still CRLF, so continue patching it with a CRLF-safe Node script (normalize -> edit -> re-CRLF), not the Edit tool — the getHTML escaping ritual is gone but the line-ending hazard is not. Static files are only served under `/static/*`; anything hosted for download (e.g. the WING PDF) must go in `src/dashboard/public/static/`.
+
+---
+
 ## 2026-06-23 — Rental billing: capture on every number.online path; volume tiers by window-total; exclude bad rentals
 
 **Decision:** (1) Rental minting (`upsertRental`) must run on **every** path that fires a `number.online` webhook — added it to teltik-worker's inline `sendTeltikSwapWebhooks` (reseller-sync + details-finalizer already did). (2) The rental engine (`computeRentalBilling`) now reads volume tiers from the **legacy `reseller_rates`** table, keyed on the carrier's **window-total** billed rentals (`tmobile→teltik` scope, `att→all-att`), falling back to flat `reseller_rental_rates` (per date) then `daily_rate`. (3) A lifetime reported bad and **not resolved the same EST day** is excluded from billing. (4) Only the history "Download CSV" serves a frozen snapshot; "Download for QuickBooks" (generate) keeps recomputing live, and re-generating an existing week does NOT overwrite its snapshot.

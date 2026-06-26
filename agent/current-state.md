@@ -1,7 +1,24 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-23 (invoice per-day snapshot + delete button; Teltik rental capture gap fixed + 10,445 backfilled + 535 ids recovered; rental engine volume tiers + bad-rental exclusion)
+> Last updated: 2026-06-26 (WING-facing /api/gateway-status: live Skyline gateway state by ICCID, numeric code -> text, dedicated API key; partner PDF guide hosted behind dashboard auth)
+
+---
+
+## Session close (2026-06-26) — WING-facing /api/gateway-status endpoint + partner PDF guide
+
+New read-only partner endpoint so WING can check live Skyline gateway state by ICCID. All deployed + verified in prod.
+
+**`/api/gateway-status` (dashboard, commit `73e1628`; prod versions `d151d318` then `33663b85`):**
+- `GET /api/gateway-status?iccid=...` or `?iccids=a,b,c` (comma-separated, max 100). Per-ICCID result maps the numeric Skyline `st` to text (e.g. `State 3 = Registered (ready)`) and includes `state_code`/`state_label`, the **gateway-reported** IMEI, number, operator, signal. No `registered` boolean (operator chose the string as source of truth).
+- **Auth: dedicated `GATEWAY_STATUS_API_KEY` secret** (set in prod), via `X-Api-Key` header or `?key=`. The route is intercepted at the TOP of `fetch()` BEFORE the operator Basic-auth gate, does its own constant-time key check, and **fails closed (503) when the secret is unset** — WING never gets operator creds. Live key was handed to the operator in-session (starts `wing_48af...`); rotate with `printf '%s' <newkey> | npx wrangler secret put GATEWAY_STATUS_API_KEY --env=""` from `src/dashboard/`.
+- Pure mapping + ICCID parsing live in `src/shared/skyline-state.mjs` with 11 unit tests (`tests/skyline-state.test.mjs`; full suite 239 green). Labels are the verbatim SkyLine-API reference table; any code not in the table (incl. 10) -> "Unknown".
+- Data flow: look up ICCIDs in `sims` -> group by `gateway_id` -> one live skyline-gateway `/port-info` call per distinct gateway (all_slots=1) -> match by ICCID. One bad ICCID never fails the batch; per-ICCID `message` covers not found / not assigned to a gateway / not present in gateway / gateway unreachable.
+- Spec: `docs/superpowers/specs/2026-06-26-wing-gateway-status-api-design.md`.
+
+**Partner PDF guide (NOT committed — contains the live key):**
+- `WING-Gateway-Status-API-Guide.pdf` (generator `_make_wing_pdf.py`; both untracked/local). Hosted for operator download at **`https://dashboard.zalmen-531.workers.dev/static/WING-Gateway-Status-API-Guide.pdf`** (behind dashboard Basic-auth — only `/static/*` paths are served as real files, all other paths return the SPA). The served copy is `src/dashboard/public/static/WING-Gateway-Status-API-Guide.pdf` (untracked).
+- **CARRY-OVER / cleanup:** the key-bearing PDF is sitting in the deployed asset bundle. After the operator confirms download, delete `src/dashboard/public/static/WING-Gateway-Status-API-Guide.pdf` and redeploy (`--env=""`) so the secret isn't hosted long-term. (Or build a key-redacted PDF to host openly and deliver the key separately.)
 
 ---
 
