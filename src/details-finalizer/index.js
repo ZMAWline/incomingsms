@@ -1847,7 +1847,12 @@ async function runRotationReview(env, opts = {}) {
                 'Content-Type': 'application/json',
                 Prefer: 'return=minimal',
               },
-              body: JSON.stringify({ iccid: newIccid, status: 'provisioning', rotation_status: 'mdn_pending' }),
+              // MDN doesn't change on a SIM card swap — only the ICCID does.
+              // Match applyTeltikSwap (sim.swapped webhook): go straight to active/success
+              // so the next rotation window picks up the new ICCID. mdn_pending would
+              // send the SIM to the teltik finalizer which expects the MDN to have changed
+              // and would time out after 30 min with "MDN did not change within 30m".
+              body: JSON.stringify({ iccid: newIccid, status: 'active', rotation_status: 'success', last_rotation_error: null }),
             });
             if (patchRes.ok) {
               actions.iccid_synced++;
