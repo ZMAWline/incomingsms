@@ -1852,7 +1852,7 @@ async function runRotationReview(env, opts = {}) {
               // so the next rotation window picks up the new ICCID. mdn_pending would
               // send the SIM to the teltik finalizer which expects the MDN to have changed
               // and would time out after 30 min with "MDN did not change within 30m".
-              body: JSON.stringify({ iccid: newIccid, status: 'active', rotation_status: 'success', last_rotation_error: null }),
+              body: JSON.stringify({ iccid: newIccid, status: 'active', rotation_status: 'success', last_rotation_error: null, status_reason: `ICCID swapped from ${sim.iccid} to ${newIccid} on ${new Date().toISOString()}` }),
             });
             if (patchRes.ok) {
               actions.iccid_synced++;
