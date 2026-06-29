@@ -559,6 +559,9 @@ async function maybeExecuteAction(env, args) {
     ctx.iccid = (evidence.sim && evidence.sim.iccid) || null;
   } else if (action === 'teltik_reset_network' || action === 'teltik_reset_port') {
     ctx.mdn = (evidence.sim && evidence.sim.current_mdn_e164) || null;
+  } else if (action === 'teltik_sync_iccid') {
+    // T12 — the current ICCID the classifier resolved from the get-info-by-MDN read.
+    ctx.newIccid = (evidence.vendorRead && evidence.vendorRead.view && evidence.vendorRead.view.iccid) || null;
   }
 
   const res = await executeAction(env, ctx);

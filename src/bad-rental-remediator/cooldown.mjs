@@ -41,6 +41,7 @@ export const COOLDOWN_TABLE = Object.freeze({
   helix_unsuspend:      { maxAttempts: 1, cooldownMs: 24 * H,  label: '24h' },
   teltik_reset_network: { maxAttempts: 1, cooldownMs: 24 * H,  label: '24h' },
   teltik_reset_port:    { maxAttempts: 1, cooldownMs: 24 * H,  label: '24h' },
+  teltik_sync_iccid:    { maxAttempts: 2, cooldownMs: 0,       label: 'n/a' },
   verify_send_sms:      { maxAttempts: 3, cooldownMs: 60 * S,  label: '60s' },
   classify_only:        { maxAttempts: 3, cooldownMs: 2 * H,   label: '2h' },
   close_duplicate:      { maxAttempts: 1, cooldownMs: 0,       label: 'n/a' },

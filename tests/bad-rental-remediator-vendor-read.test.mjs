@@ -70,6 +70,11 @@ test('teltik active + port online → healthy + requirePortOnline extras', () =>
   assert.deepEqual(p.extras, { requirePortOnline: true, portOnline: true });
 });
 
+test('teltik projection surfaces vendor iccid (drives T12 ICCID-drift detection)', () => {
+  const p = vendorViewFromRead('teltik', { ok: true, not_found: false, line_state: 'active', status: 'active', port_status: 'online', MDN: '3073845304', iccid: '8901NEW0000000000000' });
+  assert.equal(p.view.iccid, '8901NEW0000000000000');
+});
+
 test('teltik port not online → not healthy (so port reset can route), extras flags offline', () => {
   const p = vendorViewFromRead('teltik', { ok: true, not_found: false, line_state: 'active', status: 'active', port_status: 'offline', MDN: '3073845304' });
   assert.equal(p.healthy, false);

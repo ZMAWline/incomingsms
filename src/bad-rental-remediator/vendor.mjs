@@ -414,7 +414,10 @@ export async function teltikLineView(env, { mdn }) {
   if (!resp.ok) return { ok: false, error: 'teltik_http_' + resp.status };
   let json = null; try { json = JSON.parse(text); } catch { json = {}; }
   const lineState = String(json.line_state || json.status || json.state || '').toLowerCase() || null;
-  const out = { ok: true, not_found: false, line_state: lineState, status: lineState, MDN: norm };
+  // Capture the vendor's current ICCID: a get-info BY MDN still resolves a line
+  // whose physical SIM card was swapped (the MDN is stable), so json.iccid is the
+  // authoritative current ICCID even when our DB holds the now-invalid old one.
+  const out = { ok: true, not_found: false, line_state: lineState, status: lineState, MDN: norm, iccid: json.iccid || null };
   // Port state — only trust a positively-read state.
   const port = await teltikPortStatus(env, { mdn: norm });
   if (port && port.status && port.status >= 200 && port.status < 300) {
@@ -456,7 +459,7 @@ export function vendorViewFromRead(vendor, read) {
     return {
       view: {
         not_found: false, line_state: read.line_state, status: read.status,
-        port_status: read.port_status, MDN: read.MDN,
+        port_status: read.port_status, MDN: read.MDN, iccid: read.iccid || null,
       },
       healthy: (read.line_state === 'active' || read.line_state === 'activated' || !read.line_state)
         && portOnline,
