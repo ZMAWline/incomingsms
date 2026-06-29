@@ -1788,6 +1788,7 @@ async function runRotationReview(env, opts = {}) {
     // ── 3. Apply playbook auto-fixes ─────────────────────────────────────────
     const actions = {
       flipped_to_mdn_pending: 0,
+      iccid_synced: 0,
       force_rotated: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0 },
       finalizer_drained: { helix: 0, wing: 0, teltik: 0, atomic: 0 },
       second_read_verified: 0,
@@ -1812,6 +1813,50 @@ async function runRotationReview(env, opts = {}) {
           if (flipRes.ok) {
             actions.flipped_to_mdn_pending += sims.length;
             await Promise.all(sims.map(s => recordAttempt(env, s.id, runId, 'flip_to_mdn_pending', 'ok', null)));
+          }
+        }
+      } else if (entry.action === 'sync_iccid' && !dryRun) {
+        for (const sim of sims) {
+          if (!sim.msisdn) {
+            await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', 'no msisdn on SIM record');
+            continue;
+          }
+          try {
+            const mdn = `1${sim.msisdn}`; // sims.msisdn is bare 10-digit; get-info wants 11-digit
+            const infoRes = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${env.TELTIK_API_KEY}&mdn=${encodeURIComponent(mdn)}`);
+            if (!infoRes.ok) {
+              await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', `get-info ${infoRes.status}`);
+              continue;
+            }
+            const info = await infoRes.json();
+            const newIccid = info.iccid;
+            if (!newIccid) {
+              await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', 'get-info returned no iccid');
+              continue;
+            }
+            if (newIccid === sim.iccid) {
+              // Same ICCID means Teltik doesn't recognise the line at all — flag for human review
+              await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', 'get-info returned same iccid — SIM may be deprovisioned on Teltik');
+              continue;
+            }
+            const patchRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${sim.id}`, {
+              method: 'PATCH',
+              headers: {
+                apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                'Content-Type': 'application/json',
+                Prefer: 'return=minimal',
+              },
+              body: JSON.stringify({ iccid: newIccid, status: 'provisioning', rotation_status: 'mdn_pending' }),
+            });
+            if (patchRes.ok) {
+              actions.iccid_synced++;
+              await recordAttempt(env, sim.id, runId, 'sync_iccid', 'ok', `${sim.iccid} → ${newIccid}`);
+            } else {
+              await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', `DB patch ${patchRes.status}`);
+            }
+          } catch (e) {
+            await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', String(e).slice(0, 200));
           }
         }
       } else if (entry.action === 'force_rotate' && !dryRun) {
@@ -2031,6 +2076,7 @@ async function runRotationReview(env, opts = {}) {
     lines.push('## Auto-fixes applied');
     lines.push('');
     lines.push(`- Flipped to mdn_pending: **${actions.flipped_to_mdn_pending}**`);
+    lines.push(`- ICCID synced (SIM card swap): **${actions.iccid_synced}**`);
     lines.push(`- Force-rotated: **${actions.force_rotated.attempted}** attempted (${actions.force_rotated.ok} ok, ${actions.force_rotated.fail} fail, ${actions.force_rotated.skipped_budget} skipped-budget, ${actions.force_rotated.skipped_breaker} skipped-breaker)`);
     if (actions.second_read_verified + actions.second_read_failed > 0) {
       lines.push(`- Atomic second-read verification: ${actions.second_read_verified} confirmed new MDN, ${actions.second_read_failed} MDN unchanged after force-rotate`);

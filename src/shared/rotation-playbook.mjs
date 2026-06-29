@@ -28,6 +28,14 @@
 export const PLAYBOOK = [
   // ── Teltik ──────────────────────────────────────────────────────────────
   {
+    id: 'teltik_invalid_iccid',
+    vendor: 'teltik',
+    match: (err) => /change-number failed 404/.test(err || '') && /Invalid ICCID/i.test(err || ''),
+    action: 'sync_iccid',
+    description: 'Teltik swapped the physical SIM card for this line — our DB has the old ICCID. Call /v1/get-info with the MDN to resolve the new ICCID, update sims.iccid, then flip to mdn_pending so the teltik finalizer picks up the current MDN.',
+    safe: true,
+  },
+  {
     id: 'teltik_already_rotated',
     vendor: 'teltik',
     match: (err) => /Only 1 number change allowed/i.test(err || ''),
