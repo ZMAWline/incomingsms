@@ -2,6 +2,7 @@ import { computeBillingBreakdown, computeResellerUtilization } from '../shared/b
 import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateChanging } from './api-tester-presets.js';
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
+import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -2125,6 +2126,52 @@ async function handleHelixQuery(request, env, corsHeaders) {
   }
 }
 
+// Heal a swapped-card Teltik SIM. After Teltik replaces the physical SIM the
+// ICCID changes but the MDN does not, so every call keyed by the OLD ICCID 404s
+// "Invalid ICCID" — but get-info BY MDN still resolves the line and returns the
+// CURRENT ICCID. Adopt it via the shared iccidSwapPatch (no number churn, no
+// reseller webhook). Never throws. `sim` needs { id, iccid, msisdn }.
+async function healTeltikIccidBySim(env, sim) {
+  if (!sim || !sim.id) return { ok: false, reason: 'missing_sim' };
+  if (!env.TELTIK_API_KEY) return { ok: false, reason: 'teltik_key_missing' };
+  const mdn = String(sim.msisdn || '').replace(/\D/g, '').replace(/^1/, '');
+  if (mdn.length !== 10) return { ok: false, reason: 'missing_or_invalid_mdn' };
+  const infoUrl = 'https://api.smsgateway.xyz/v1/get-info?apikey=' + encodeURIComponent(env.TELTIK_API_KEY) + '&mdn=' + encodeURIComponent(mdn);
+  let res, text;
+  try { res = await relayFetch(env, infoUrl, { method: 'GET' }); text = await res.text(); }
+  catch (e) { return { ok: false, reason: 'get_info_exception' }; }
+  let info = null; try { info = JSON.parse(text); } catch {}
+  await logCarrierApiCall(env, {
+    run_id: 'teltik_heal_iccid_' + sim.id + '_' + Date.now(),
+    step: 'sync_iccid', iccid: sim.iccid, imei: null, vendor: 'teltik',
+    request_url: 'https://api.smsgateway.xyz/v1/get-info?mdn=' + encodeURIComponent(mdn),
+    request_method: 'GET', request_body: null,
+    response_status: res.status, response_ok: res.ok,
+    response_body_text: text, response_body_json: info,
+    error: res.ok ? null : ('Teltik get-info HTTP ' + res.status),
+  });
+  if (res.status === 404) return { ok: false, reason: 'line_not_found_deprovisioned' };
+  if (!res.ok || !info) return { ok: false, reason: 'get_info_http_' + res.status };
+  const newIccid = info.iccid || null;
+  if (!newIccid) return { ok: false, reason: 'no_iccid_in_response' };
+  if (newIccid === sim.iccid) return { ok: true, changed: false, iccid: newIccid };
+  const patchRes = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(String(sim.id)), {
+    method: 'PATCH',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(iccidSwapPatch(sim.iccid, newIccid)),
+  });
+  if (!patchRes.ok) {
+    const detail = await patchRes.text().catch(() => '');
+    return { ok: false, reason: 'db_patch_' + patchRes.status, detail: detail.slice(0, 200) };
+  }
+  return { ok: true, changed: true, old_iccid: sim.iccid, new_iccid: newIccid };
+}
+
 async function handleTeltikQuery(request, env, corsHeaders) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405, headers: corsHeaders });
@@ -2169,6 +2216,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
 
     let db_update = null;
     let resolvedMdn = null;
+    let iccid_heal = null;
     if (res.ok && json) {
       const rawMdn = json.msisdn || json.mdn || json.phone_number || '';
       if (rawMdn) {
@@ -2178,6 +2226,18 @@ async function handleTeltikQuery(request, env, corsHeaders) {
         await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
           status: 'error',
           last_rotation_error: 'Teltik query: no MDN in response at ' + new Date().toISOString(),
+        }).catch(() => {});
+      }
+    } else if (isTeltikInvalidIccidResponse(res.status, json || text)) {
+      // Physical SIM-card swap: the old ICCID is dead but the MDN still resolves.
+      // Auto-heal by adopting the line's current ICCID instead of just flagging error.
+      const simRows = await sbGet(env, 'sims?iccid=eq.' + encodeURIComponent(iccid) + '&select=id,iccid,msisdn&limit=1').catch(() => null);
+      const simRow = Array.isArray(simRows) && simRows[0] ? simRows[0] : null;
+      if (simRow) iccid_heal = await healTeltikIccidBySim(env, simRow);
+      if (!(iccid_heal && iccid_heal.ok)) {
+        await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
+          status: 'error',
+          last_rotation_error: 'Teltik query HTTP ' + res.status + ' (Invalid ICCID; heal ' + ((iccid_heal && iccid_heal.reason) || 'unavailable') + ') at ' + new Date().toISOString(),
         }).catch(() => {});
       }
     } else {
@@ -2237,6 +2297,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
       iccid,
       response: json || text,
       db_update,
+      iccid_heal,
       port_status,
     }, null, 2), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -3147,35 +3208,56 @@ async function handleFixSim(request, env, corsHeaders) {
       });
     }
 
-    if (!env.MDN_ROTATOR) {
-      return new Response(JSON.stringify({ error: 'MDN_ROTATOR service binding not configured' }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    // Teltik SIMs can't be fixed via mdn-rotator (it has no Teltik API — Teltik
+    // is delegated to teltik-worker). The dominant Teltik "broken" case is a
+    // physical SIM-card swap → stale ICCID, which we heal in-dashboard via
+    // get-info-by-MDN. Partition: heal teltik here, forward the rest to mdn-rotator.
+    const idList = simIds.map(s => encodeURIComponent(String(s))).join(',');
+    const simRows = await sbGet(env, 'sims?id=in.(' + idList + ')&select=id,iccid,msisdn,vendor').catch(() => null);
+    const rows = Array.isArray(simRows) ? simRows : [];
+    const teltikRows = rows.filter(r => r.vendor === 'teltik');
+    const teltikIds = new Set(teltikRows.map(r => String(r.id)));
+    const otherIds = simIds.filter(s => !teltikIds.has(String(s)));
+
+    const results = [];
+    for (const r of teltikRows) {
+      const heal = await healTeltikIccidBySim(env, r);
+      results.push({ sim_id: r.id, vendor: 'teltik', ok: !!heal.ok, changed: !!heal.changed, new_iccid: heal.new_iccid || null, reason: heal.reason || null });
+    }
+
+    let rotatorRaw = null;
+    if (otherIds.length > 0) {
+      if (!env.MDN_ROTATOR) {
+        return new Response(JSON.stringify({ error: 'MDN_ROTATOR service binding not configured' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      if (!env.ADMIN_RUN_SECRET) {
+        return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      const workerUrl = 'https://mdn-rotator/fix-sim?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET);
+      const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sim_ids: otherIds })
       });
+      const responseText = await workerResponse.text();
+      try { rotatorRaw = JSON.parse(responseText); } catch {
+        rotatorRaw = { ok: false, error: 'Non-JSON response: ' + responseText.slice(0, 200) };
+      }
+      if (rotatorRaw && Array.isArray(rotatorRaw.results)) results.push(...rotatorRaw.results);
     }
 
-    if (!env.ADMIN_RUN_SECRET) {
-      return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    const workerUrl = `https://mdn-rotator/fix-sim?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
-    const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sim_ids: simIds })
-    });
-
-    const responseText = await workerResponse.text();
-    let result;
-    try { result = JSON.parse(responseText); } catch {
-      result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
-    }
-
-    return new Response(JSON.stringify(result, null, 2), {
-      status: workerResponse.status,
+    return new Response(JSON.stringify({
+      ok: true,
+      results,
+      ...(rotatorRaw && !Array.isArray(rotatorRaw.results) ? { rotator: rotatorRaw } : {}),
+    }, null, 2), {
+      status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {

@@ -12,6 +12,7 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { PLAYBOOK, classifyFailure, UNCLASSIFIED_BUCKET } from '../shared/rotation-playbook.mjs';
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
+import { iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
@@ -1852,7 +1853,8 @@ async function runRotationReview(env, opts = {}) {
               // so the next rotation window picks up the new ICCID. mdn_pending would
               // send the SIM to the teltik finalizer which expects the MDN to have changed
               // and would time out after 30 min with "MDN did not change within 30m".
-              body: JSON.stringify({ iccid: newIccid, status: 'active', rotation_status: 'success', last_rotation_error: null, status_reason: `ICCID swapped from ${sim.iccid} to ${newIccid} on ${new Date().toISOString()}` }),
+              // Shared patch shape — identical heal across every fix surface.
+              body: JSON.stringify(iccidSwapPatch(sim.iccid, newIccid)),
             });
             if (patchRes.ok) {
               actions.iccid_synced++;
