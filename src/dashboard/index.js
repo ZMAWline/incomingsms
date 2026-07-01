@@ -1,5 +1,5 @@
 import { computeBillingBreakdown, computeResellerUtilization } from '../shared/billing.js';
-import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
+import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, buildSwapImeiRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateChanging } from './api-tester-presets.js';
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
@@ -473,6 +473,12 @@ export default {
     }
     if (url.pathname === '/api/atomic-swap-sim' && request.method === 'POST') {
       return handleAtomicSwapSim(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/atomic-swap-imei' && request.method === 'POST') {
+      return handleAtomicSwapImei(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/atomic-sub-action' && request.method === 'POST') {
+      return handleAtomicSubAction(request, env, corsHeaders);
     }
 
     if (url.pathname === '/api/teltik-query' && request.method === 'POST') {
@@ -7396,6 +7402,154 @@ async function handleAtomicSwapSim(request, env, corsHeaders) {
     }
 
     return json({ ok: true, sim_id: sim.id, old_iccid: sim.iccid, new_iccid: newIccid, msisdn, response: data });
+  } catch (error) {
+    return json({ ok: false, error: String(error) }, 500);
+  }
+}
+
+// POST /api/atomic-swap-imei — set the device IMEI (NWIMEI) AT&T whitelists for an
+// ATOMIC line so it matches what the gateway broadcasts. A line registers iff the
+// gateway-broadcast IMEI == AT&T NWIMEI. MSISDN/BAN/ICCID stay; only sims.imei changes.
+async function handleAtomicSwapImei(request, env, corsHeaders) {
+  const json = (obj, status) => new Response(JSON.stringify(obj), { status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  try {
+    const body = await request.json();
+    const simId = body.sim_id;
+    const newImei = (body.imei == null ? '' : String(body.imei)).trim();
+    if (!simId) return json({ ok: false, error: 'sim_id required' }, 400);
+    if (!/^\d{15}$/.test(newImei)) return json({ ok: false, error: 'imei must be 15 digits' }, 400);
+
+    if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+      return json({ ok: false, error: 'ATOMIC credentials not configured on dashboard worker' }, 500);
+    }
+
+    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,activation_zip,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1');
+    const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
+    if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
+    if (sim.vendor !== 'atomic') return json({ ok: false, error: 'swapImei is only supported for ATOMIC (AT&T) SIMs; this SIM is ' + sim.vendor }, 400);
+    if (sim.status === 'canceled') return json({ ok: false, error: 'SIM is canceled; cannot swap IMEI' }, 400);
+
+    const msisdn = resolveMsisdn(sim);
+    if (!msisdn) return json({ ok: false, error: 'No MSISDN on file for this SIM' }, 400);
+    const zipCode = resolveZip(body.zip_code, sim);
+    if (!zipCode) return json({ ok: false, error: 'ZIP required for swapImei (PPU zip; none on file)' }, 400);
+
+    const apiUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+    const requestBody = buildSwapImeiRequest({
+      session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+      msisdn,
+      zipCode,
+      imei: newImei,
+    });
+
+    const res = await relayFetch(env, apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    const success = res.ok && isSwapSuccess(data);
+    const errMsg = success ? null : swapErrorMessage(data, res.status);
+
+    await logCarrierApiCall(env, {
+      run_id: 'atomic_swapimei_' + sim.iccid + '_' + Date.now(),
+      step: 'swap_imei',
+      iccid: sim.iccid,
+      imei: newImei,
+      vendor: 'atomic',
+      request_url: apiUrl,
+      request_method: 'POST',
+      request_body: requestBody,
+      response_status: res.status,
+      response_ok: res.ok,
+      response_body_text: text,
+      response_body_json: data,
+      error: errMsg,
+    });
+
+    if (!success) {
+      await logSystemError(env, { source: 'dashboard', action: 'swap_imei', sim_id: sim.id, iccid: sim.iccid, error_message: 'ATOMIC swapImei failed: ' + errMsg, error_details: { msisdn, imei: newImei, zipCode, response: data, status: res.status } });
+      return json({ ok: false, error: errMsg, response: data }, res.status >= 400 ? res.status : 502);
+    }
+
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(sim.id)), { imei: newImei });
+
+    return json({ ok: true, sim_id: sim.id, iccid: sim.iccid, msisdn, zipCode, imei: newImei, response: data });
+  } catch (error) {
+    return json({ ok: false, error: String(error) }, 500);
+  }
+}
+
+// POST /api/atomic-sub-action — drive an ATOMIC subscriber lifecycle op for a line.
+// op: suspend|restore|deactivate|reconnect. Used to re-provision lines stuck in
+// network "registration denied" (CEREG 0,3) despite attStatus=Active.
+async function handleAtomicSubAction(request, env, corsHeaders) {
+  const json = (obj, status) => new Response(JSON.stringify(obj), { status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  const OPS = {
+    suspend:    { requestType: 'suspendSubscriber',    reasonCode: 'NPG', status: 'suspended' },
+    restore:    { requestType: 'restoreSubscriber',    reasonCode: 'CR',  status: 'active' },
+    deactivate: { requestType: 'deactivateSubscriber', reasonCode: 'DD',  status: 'canceled' },
+    reconnect:  { requestType: 'reconnectSubscriber',  reasonCode: '',    status: 'active' },
+  };
+  try {
+    const body = await request.json();
+    const simId = body.sim_id;
+    const op = String(body.op || '').trim();
+    if (!simId) return json({ ok: false, error: 'sim_id required' }, 400);
+    if (!OPS[op]) return json({ ok: false, error: 'op must be one of: ' + Object.keys(OPS).join(', ') }, 400);
+    if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+      return json({ ok: false, error: 'ATOMIC credentials not configured on dashboard worker' }, 500);
+    }
+
+    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1');
+    const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
+    if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
+    if (sim.vendor !== 'atomic') return json({ ok: false, error: 'ATOMIC only; this SIM is ' + sim.vendor }, 400);
+    const msisdn = resolveMsisdn(sim);
+    if (!msisdn) return json({ ok: false, error: 'No MSISDN on file for this SIM' }, 400);
+
+    const spec = OPS[op];
+    const apiUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+    const requestBody = {
+      wholeSaleApi: {
+        session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+        wholeSaleRequest: { requestType: spec.requestType, MSISDN: msisdn, reasonCode: spec.reasonCode },
+      },
+    };
+
+    const res = await relayFetch(env, apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody) });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    const success = res.ok && isSwapSuccess(data);
+    const errMsg = success ? null : swapErrorMessage(data, res.status);
+
+    await logCarrierApiCall(env, {
+      run_id: 'atomic_' + op + '_' + sim.iccid + '_' + Date.now(),
+      step: 'sub_' + op,
+      iccid: sim.iccid,
+      imei: null,
+      vendor: 'atomic',
+      request_url: apiUrl,
+      request_method: 'POST',
+      request_body: requestBody,
+      response_status: res.status,
+      response_ok: res.ok,
+      response_body_text: text,
+      response_body_json: data,
+      error: errMsg,
+    });
+
+    if (!success) {
+      await logSystemError(env, { source: 'dashboard', action: 'sub_' + op, sim_id: sim.id, iccid: sim.iccid, error_message: 'ATOMIC ' + spec.requestType + ' failed: ' + errMsg, error_details: { msisdn, response: data, status: res.status } });
+      return json({ ok: false, error: errMsg, response: data }, res.status >= 400 ? res.status : 502);
+    }
+
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(sim.id)), { status: spec.status });
+    return json({ ok: true, sim_id: sim.id, iccid: sim.iccid, msisdn, op, requestType: spec.requestType, new_status: spec.status, response: data });
   } catch (error) {
     return json({ ok: false, error: String(error) }, 500);
   }
