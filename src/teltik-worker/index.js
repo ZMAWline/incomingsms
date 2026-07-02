@@ -273,6 +273,7 @@ async function importTeltikLines(env, opts = {}) {
     const simData = {
       iccid,
       vendor: 'teltik',
+      gateway_host: 'teltik',
       carrier: 'tmobile',
       rotation_interval_hours: 48,
       status: 'active',
@@ -1382,6 +1383,7 @@ async function applyTeltikActivation(env, data) {
   const upsertRes = await supabaseUpsert(env, 'sims', {
     iccid,
     vendor: 'teltik',
+    gateway_host: 'teltik',
     carrier: 'tmobile',
     rotation_interval_hours: 48,
     status: 'active',
