@@ -74,24 +74,30 @@ GUARDED. Carrier-level sites are host-agnostic by design.
 | MDN swap / change | carrier | `mdn-rotator/index.js` `rotateSingleSim`; `shared/atomic.ts`, `shared/helix.ts`, `shared/wing-iot.ts`; `teltik-worker/index.js` | `vendor` | Host-agnostic. |
 | OTA refresh (carrier) | carrier | `shared/atomic.ts`, `shared/helix.ts`; `ota-status-sync/index.js`; `actions.mjs` `execAtomicOta`/`execHelixOta` | `vendor` | Distinct from Teltik "reset-port". |
 | Suspend/restore/deactivate/reconnect | carrier | `shared/atomic.ts`; `sim-status-changer/index.js`; `sim-canceller/index.js`; `actions.mjs` | `vendor` | Host-agnostic. |
-| Inbound SMS capture | gateway | `teltik-worker` webhook; `skyline-gateway` inbound | `gateway_host` | See gap below: teltik-worker webhook still filters `vendor=eq.teltik`. |
+| Inbound SMS capture | gateway | `teltik-worker` webhook (`processTeltikSmsItem`); `skyline-gateway` inbound | resolves by MDN | Vendor-agnostic: resolves SIM by `sim_numbers.e164`, so ATOMIC-in-Teltik SMS ARE captured/forwarded. Auto-tags `gateway_host='teltik'` on first inbound. |
 
-## Known gaps (not yet wired) for ATOMIC-in-Teltik
+## ATOMIC-in-Teltik: what works and what to know
 
-These are open. If you extend the distinction, start here:
+Key fact (operator, 2026-07-02): for ATOMIC-in-Teltik, Teltik is ONLY the physical
+hardware/gateway. ALL cellular operations (activation, MDN rotation via swapMSISDN,
+OTA refresh, suspend/restore) go through the ATOMIC API and work normally regardless
+of gateway. The Teltik API's own refresh/change-number does NOT apply (these are not
+Teltik carrier lines). So the ONLY thing the Teltik hardware cannot do is a physical
+gateway op: writing the modem IMEI (AT+EGMR). That is the single capability the
+`gateway_host` split guards.
 
-1. **Inbound SMS capture**: `teltik-worker` webhook + `rotate-sim` lookup filter
-   `vendor=eq.teltik`. An ATOMIC-in-Teltik SIM (`vendor='atomic'`) receiving SMS
-   through the Teltik gateway is not found, so its SMS/rental capture is dropped.
-   Decide whether the webhook keys on `gateway_host='teltik'` (any vendor).
-2. **Onboarding/tagging**: how an ATOMIC-in-Teltik SIM first enters `sims` and gets
-   `gateway_host='teltik'` set (manual add, CSV import, or Teltik reconcile).
-3. **Dashboard "Query" health**: for teltik-hosted SIMs regardless of vendor, use
-   Teltik `port-status` + `get-info`-by-MDN (ICCID reverse-lookup returns "MSISDN Not
-   Found" for these), not the Skyline/ATOMIC path.
-4. **Remediator heals**: the Teltik reset/sync actions are gated to `vendor='teltik'`
-   and so are not offered to a stuck ATOMIC-in-Teltik SIM even though a Teltik port
-   reset would help it.
+Consequences, now handled:
+- **Inbound SMS**: captured + forwarded fine (webhook resolves by MDN, not vendor).
+- **Onboarding/tagging**: automatic. `processTeltikSmsItem` sets `gateway_host='teltik'`
+  on first inbound SMS for any SIM not already tagged. No manual step needed. (The very
+  first test SIM, id 32047, was tagged by hand before this shipped.)
+- **Rotation**: ATOMIC-driven via `mdn-rotator` (vendor='atomic'), works.
+- **Dashboard "Query" / remediator**: route on `vendor='atomic'` to the ATOMIC path,
+  which works regardless of gateway. No Teltik-specific handling needed.
+
+Watch-item (not a code gap): SMS addressed to a SIM's PREVIOUS number after rotation
+resolve to `sim_id=NULL` (the old `sim_numbers` row has `valid_to` set), so they are
+stored but not forwarded. This is generic post-rotation behavior, not Teltik-specific.
 
 ## Checklist: adding a new cross-cutting SIM distinction
 
