@@ -1,7 +1,29 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-26 (WING-facing /api/gateway-status: live Skyline gateway state by ICCID, numeric code -> text, dedicated API key; partner PDF guide hosted behind dashboard auth)
+> Last updated: 2026-07-02 (ATOMIC registration-denied investigation + AT&T fix attempts; ⚠️ 14 lines left DEACTIVATED — see carry-over)
+
+---
+
+## Session close (2026-06-30 → 07-02) — ATOMIC "registration denied" diagnosis + fix attempts
+
+Long multi-day session on ~97 AT&T ATOMIC lines failing to register (gateway port `st=6`, no SMS 12h+).
+
+**⚠️ CRITICAL CARRY-OVER — 14 lines DEACTIVATED, awaiting operator/Leonid decision:**
+A batch cancel→reactivate on the 27 gw 64-1 failing lines left **14 lines deactivated that won't reconnect**. Cause: those 14 are on a **5G plan SOC `APXN50MS5`**, and AT&T `reconnectSubscriber` rejects a **4G IMEI** (we set TAC `35734209`) with `statusCode 948 "PP/SOC APXN50MS5 not compatible with equipment"`. Can't `swapImei` to fix (fails `915` while Inactive). **14 sim_ids: 2610, 2612, 2613, 2614, 2617, 2618, 2619, 2622, 2623, 2625, 2626, 2627, 2628, 2631** (all `8901280433…`, status=canceled in DB + at carrier). Recovery options put to Leonid: (1) he moves them to a 4G plan (ATTNOVOICE) → I reconnect; (2) re-`Activate` on ATTNOVOICE (new MDNs). **gw 512-1 batch (70 lines) HALTED** — must check how many are on APXN50MS5 before touching (same failure would cancel more). The other 13 gw1 lines reconnected fine (4G-compatible plan). Only **sim 644** ever actually registered on-network all session (via a 5-min cold-off + restart).
+
+**Root cause (proven, escalated):** these lines are network-side "registration denied" (`AT+CEREG 0,3`, `CEER 6,259` vs `6,258` working). Device side is healthy (signal, SIM ready, IMEI==BLIMEI, sees AT&T). Tried and FAILED to clear it: swapImei, OTA, gateway IMEI reset, `AT+CFUN=1,1`, suspend→restore, deactivate→reconnect, fresh unique 4G IMEI systemwide, KASA power-cycle. Escalation write-up: `atomic_registration_denied_escalation_2026-06-30.md` (+ CSVs, untracked). It's an AT&T HSS/provisioning issue.
+
+**New tooling deployed + committed:**
+- `POST /api/atomic-swap-imei` (swapImei) and `POST /api/atomic-sub-action` (op=suspend|restore|deactivate|reconnect) on dashboard — commit `589c8d2`.
+- skyline-gateway `/set-imei` now writes **both** the `sim_imei` config AND `AT+EGMR` modem IMEI (they're separate; dashboard reads the config, network validates the modem/EGMR value) and fails if EGMR doesn't confirm — commit `c5e0e14`. NOTE: EGMR via the worker's bridge fails on a **locked** port; the batch script wrote the gateway IMEI **directly** (goip_send_at) instead.
+- Skyline **AT-command transport** discovered: `GET /goip_send_at.html?...&port=<N>&at=<urlenc>`. Reliable detach = gateway `op=lock` (holds `CEREG 0,0`; AT `CFUN=0/4`/`COPS=2` do NOT hold).
+
+**KASA incident:** both gateways (`64-1`,`512-1`,`512-2` outlets) were found powered **OFF** (unreachable) mid-session — likely the overnight KASA reboot cron left them off. Restored via `POST /api/kasa/outlet {alias,action:on}`. **Review the KASA reboot cron** so it doesn't leave gateways off.
+
+**Pool:** added 200 IMEIs TAC `35734209` (4G phone) as available; 97 reserved (`in_use`) for the reg-fix batch. The 14 deactivated lines' reserved IMEIs are now on-file-but-line-dead.
+
+**Orchestrator:** scratch `fix_batch.py` (gw arg, prep/all modes, safety gate that aborts before cancel if lock/IMEI prep <60%). Cloudflare blocks `python-urllib` UA (err 1010) → must send a `curl/*` User-Agent.
 
 ---
 

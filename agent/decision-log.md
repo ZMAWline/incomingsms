@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-07-02 — Gateway IMEI writes must hit BOTH sim_imei config and AT+EGMR; ATOMIC 5G-plan lines can't take a 4G IMEI
+
+**Decision:** (1) The Skyline `/set-imei` endpoint now writes the IMEI to two places on every call: the gateway `sim_imei(n)` config (what `goip_get_status`/the dashboard report) AND the modem itself via `AT+EGMR=1,7,"…"` (the identity the carrier validates at registration), failing loudly if EGMR doesn't confirm. (2) The AT-command transport is `GET /goip_send_at.html?...&port=<N>&at=<urlencoded>`; the only detach that holds on these modems is the gateway `op=lock` (not `CFUN=0/4`/`COPS=2`).
+
+**Why:** The two IMEI fields are independent — setting `sim_imei` config alone (the old behavior) left the modem broadcasting a different IMEI, so the dashboard showed one value while the network saw another and registration failed. `AT+EGMR` is the real write. Discovered while chasing ~97 registration-denied ATOMIC lines. Also discovered: EGMR through the worker's Supabase bridge fails on a locked port, so bulk operations write the gateway IMEI **directly** via `goip_send_at.html`.
+
+**Consequence:** Never write only `sim_imei` config again — always pair it with EGMR (the endpoint enforces this now). When verifying an IMEI actually took, use `AT+CGSN=1` (modem truth), not the `goip_get_status` field. **HARD CONSTRAINT for cancel/reactivate on ATOMIC:** `reconnectSubscriber` enforces plan/equipment compatibility — a line on a **5G plan SOC (e.g. `APXN50MS5`)** will NOT reconnect onto a **4G IMEI** (statusCode 948), and you cannot `swapImei` to fix it while the line is Inactive (915). So do NOT deactivate a 5G-plan ATOMIC line unless it will be reconnected with 5G-compatible equipment or first moved to a 4G plan (ATTNOVOICE). Check the SOC (`subsriberInquiry` → `attSoc`/`ocsPlan`) BEFORE any deactivate in a bulk fix. This trap deactivated 14 lines on 2026-07-02 (see current-state carry-over). Cloudflare blocks the `python-urllib` User-Agent (err 1010) — scripts hitting the workers must send a `curl/*` UA.
+
+---
+
 ## 2026-06-26 — Partner-facing dashboard endpoints: intercept before the Basic-auth gate, own key, fail closed
 
 **Decision:** The WING-facing `/api/gateway-status` lookup is dispatched at the very top of the dashboard worker's `fetch()`, BEFORE the global operator Basic-auth gate, and authenticates with its own dedicated `GATEWAY_STATUS_API_KEY` secret (constant-time compare; `X-Api-Key` header or `?key=`). It fails closed with 503 when the secret is unset. The pure state-mapping + ICCID-parsing logic went into a new `src/shared/skyline-state.mjs`, not inline in `index.js`.
