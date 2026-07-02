@@ -579,9 +579,22 @@ async function processTeltikSmsItem(body, env) {
   // Look up sim_id by current E.164 number
   const simNumbers = await supabaseGetArray(
     env,
-    `sim_numbers?e164=eq.${encodeURIComponent(mdn)}&valid_to=is.null&select=sim_id&limit=1`
+    `sim_numbers?e164=eq.${encodeURIComponent(mdn)}&valid_to=is.null&select=sim_id,sims(gateway_host,vendor)&limit=1`
   );
   const simId = simNumbers[0]?.sim_id || null;
+  const simRow = simNumbers[0]?.sims || null;
+
+  // Auto-onboard gateway_host: any SIM that receives inbound SMS through the Teltik
+  // gateway is, by definition, physically Teltik-hosted. Tag it so the gateway-host
+  // capability guards (e.g. skip IMEI writes) apply to ATOMIC-in-Teltik SIMs. Only
+  // writes on first sighting (when not already 'teltik'), so it is a no-op for
+  // native Teltik SIMs.
+  if (simId && simRow && simRow.gateway_host !== 'teltik') {
+    console.log(`[Webhook] auto-tagging sim ${simId} (was gateway_host=${simRow.gateway_host}, vendor=${simRow.vendor}) as gateway_host=teltik`);
+    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+      gateway_host: 'teltik',
+    }).catch((e) => console.log(`[Webhook] gateway_host auto-tag failed for sim ${simId}: ${e}`));
+  }
 
   // Generate deterministic message ID for dedup
   const messageId = await generateMessageIdAsync({
