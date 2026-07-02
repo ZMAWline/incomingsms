@@ -1,6 +1,7 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
+import { isTeltikHosted, gatewaySupports } from '../shared/gateway-host.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -3034,8 +3035,10 @@ async function fixAtomicSim(env, sim) {
     pin: env.ATOMIC_PIN,
   };
 
-  // Auto-discover gateway/port if not set
-  if (!sim.gateway_id || !sim.port) {
+  const canSetImei = gatewaySupports(sim, 'setImei');
+
+  // Auto-discover gateway/port if not set (Skyline-hosted only; Teltik gateways have no port scan)
+  if (canSetImei && (!sim.gateway_id || !sim.port)) {
     console.log(`[FixAtomicSim] SIM ${iccid}: no gateway_id/port — scanning gateways...`);
     const found = await scanGatewaysForIccid(env, iccid);
     if (!found) throw new Error(`SIM ${iccid}: no gateway_id/port and ICCID not found on any gateway`);
@@ -3049,28 +3052,39 @@ async function fixAtomicSim(env, sim) {
 
   console.log(`[FixAtomicSim] Starting for SIM ${simId} (${iccid})`);
 
-  // Step 1: Retire old pool entries, allocate fresh IMEI
-  await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
-  const poolEntry = await allocateImeiFromPool(env, simId);
-  const newImei = poolEntry.imei;
-  console.log(`[FixAtomicSim] SIM ${iccid}: allocated IMEI ${newImei} (pool entry ${poolEntry.id})`);
+  // Step 1: Retire old pool entries, allocate fresh IMEI (Skyline-hosted only).
+  // Teltik-hosted ATOMIC SIMs have no Skyline gateway/port: the IMEI write is
+  // physically impossible, so we skip allocate/push/patch and go straight to the
+  // carrier-level inquiry/restore, which still works. poolEntry/newImei stay
+  // null (IMEI unchanged) in that case.
+  let poolEntry = null;
+  let newImei = sim.imei || null;
 
   try {
-    // Set new IMEI on gateway
-    await retryWithBackoff(
-      () => callSkylineSetImei(env, sim.gateway_id, sim.port, newImei),
-      { attempts: 3, label: `setImei ${iccid}` }
-    );
-    console.log(`[FixAtomicSim] SIM ${iccid}: IMEI set on gateway`);
-    markGatewayImeiSynced(env, simId).catch(() => {});
+    if (canSetImei) {
+      await retireAllPoolEntriesForSim(env, simId, sim.current_imei_pool_id);
+      poolEntry = await allocateImeiFromPool(env, simId);
+      newImei = poolEntry.imei;
+      console.log(`[FixAtomicSim] SIM ${iccid}: allocated IMEI ${newImei} (pool entry ${poolEntry.id})`);
 
-    // Update pool entry with slot info and SIM record with new IMEI
-    await supabasePatch(env, `imei_pool?id=eq.${encodeURIComponent(String(poolEntry.id))}`, {
-      gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString(),
-    });
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
-      imei: newImei, current_imei_pool_id: poolEntry.id,
-    });
+      // Set new IMEI on gateway
+      await retryWithBackoff(
+        () => callSkylineSetImei(env, sim.gateway_id, sim.port, newImei),
+        { attempts: 3, label: `setImei ${iccid}` }
+      );
+      console.log(`[FixAtomicSim] SIM ${iccid}: IMEI set on gateway`);
+      markGatewayImeiSynced(env, simId).catch(() => {});
+
+      // Update pool entry with slot info and SIM record with new IMEI
+      await supabasePatch(env, `imei_pool?id=eq.${encodeURIComponent(String(poolEntry.id))}`, {
+        gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString(),
+      });
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+        imei: newImei, current_imei_pool_id: poolEntry.id,
+      });
+    } else {
+      console.log(`[FixAtomicSim] SIM ${iccid}: Teltik-hosted — skipping IMEI allocate + gateway push`);
+    }
 
     // Step 2: ATOMIC subscriber inquiry — get live status + MSISDN
     const inqBody = {
@@ -3178,13 +3192,17 @@ async function fixAtomicSim(env, sim) {
     }
 
   } catch (err) {
-    console.error(`[FixAtomicSim] SIM ${iccid}: failed, rolling back pool allocation: ${err}`);
-    try { await releaseImeiPoolEntry(env, poolEntry.id, simId); } catch {}
+    if (poolEntry) {
+      console.error(`[FixAtomicSim] SIM ${iccid}: failed, rolling back pool allocation: ${err}`);
+      try { await releaseImeiPoolEntry(env, poolEntry.id, simId); } catch {}
+    } else {
+      console.error(`[FixAtomicSim] SIM ${iccid}: failed (no pool allocation to roll back): ${err}`);
+    }
     throw err;
   }
 
   console.log(`[FixAtomicSim] SIM ${iccid}: fix complete (IMEI=${newImei})`);
-  return { imei: newImei, pool_entry_id: poolEntry.id };
+  return { imei: newImei, pool_entry_id: poolEntry?.id ?? null };
 }
 
 // ===========================
