@@ -23,7 +23,7 @@
 // `sims.gateway_host` is a newer column and may be null on older rows; when it
 // is absent (or holds an unexpected value) we derive the host from `vendor`:
 // teltik-vendor => Teltik gateway, everything else => Skyline. Pure functions
-// only; no IO — unit-tested directly (tests/gateway-host.test.mjs).
+// only; no IO. Unit-tested directly (tests/gateway-host.test.mjs).
 // =========================================================
 
 export const SKYLINE = 'skyline';

@@ -3091,7 +3091,7 @@ async function fixAtomicSim(env, sim) {
         imei: newImei, current_imei_pool_id: poolEntry.id,
       });
     } else {
-      console.log(`[FixAtomicSim] SIM ${iccid}: Teltik-hosted — skipping IMEI allocate + gateway push`);
+      console.log(`[FixAtomicSim] SIM ${iccid}: Teltik-hosted, skipping IMEI allocate + gateway push`);
     }
 
     // Step 2: ATOMIC subscriber inquiry — get live status + MSISDN
