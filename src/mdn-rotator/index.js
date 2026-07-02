@@ -4018,6 +4018,13 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
   );
   if (!Array.isArray(sims) || sims.length === 0) throw new Error('SIM not found: ' + simId);
   const sim = sims[0];
+  // Retry-activation is a Skyline-only flow: it pushes a pool IMEI to the gateway
+  // AND registers that IMEI with the carrier. Teltik-hosted SIMs present Teltik's
+  // own modem IMEI to AT&T and are activated through Teltik's portal, so this path
+  // does not apply. Refuse clearly instead of half-running it.
+  if (!gatewaySupports(sim, 'setImei')) {
+    return { ok: false, error: `SIM ${sim.iccid} is Teltik-hosted: retry-activation is Skyline-only. Activate Teltik-hosted SIMs through Teltik.`, gateway_host: 'teltik' };
+  }
   if (sim.status !== 'error') throw new Error('SIM ' + sim.iccid + ' is not in error state (status: ' + sim.status + ')');
   const vendor = sim.vendor || 'helix';
   console.log('[RetryActivation] Starting for SIM ' + simId + ' (' + sim.iccid + ') vendor=' + vendor);
