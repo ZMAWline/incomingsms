@@ -414,7 +414,7 @@ export default {
         // Load SIM from DB
         const sims = await supabaseSelect(
           env,
-          `sims?select=id,iccid,msisdn,mobility_subscription_id,vendor,gateway_id,port,status,imei,activated_at,att_ban,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
+          `sims?select=id,iccid,msisdn,mobility_subscription_id,vendor,gateway_host,gateway_id,port,status,imei,activated_at,att_ban,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
         );
         if (!Array.isArray(sims) || sims.length === 0) {
           return new Response(JSON.stringify({ ok: false, error: `SIM not found: ${sim_id}` }), {
@@ -2794,7 +2794,7 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   // Load SIM details from DB
   const sims = await supabaseSelect(
     env,
-    `sims?select=id,iccid,vendor,msisdn,mobility_subscription_id,gateway_id,port,slot,current_imei_pool_id,status,imei,activated_at&id=eq.${encodeURIComponent(String(simId))}&limit=1`
+    `sims?select=id,iccid,vendor,gateway_host,msisdn,mobility_subscription_id,gateway_id,port,slot,current_imei_pool_id,status,imei,activated_at&id=eq.${encodeURIComponent(String(simId))}&limit=1`
   );
   if (!Array.isArray(sims) || sims.length === 0) {
     throw new Error(`SIM not found: ${simId}`);
@@ -4014,7 +4014,7 @@ async function getUnoccupiedCandidates(env) {
 async function retryActivation(env, simId, manualGatewayId = null, manualPort = null, imeiStrategy = 'new') {
   const sims = await supabaseSelect(
     env,
-    'sims?select=id,iccid,status,current_imei_pool_id,imei,vendor,gateway_id,port&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
+    'sims?select=id,iccid,status,current_imei_pool_id,imei,vendor,gateway_host,gateway_id,port&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
   );
   if (!Array.isArray(sims) || sims.length === 0) throw new Error('SIM not found: ' + simId);
   const sim = sims[0];
