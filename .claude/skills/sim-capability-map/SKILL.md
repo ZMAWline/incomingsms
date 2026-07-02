@@ -63,9 +63,9 @@ GUARDED. Carrier-level sites are host-agnostic by design.
 | Operation | Level | File(s) | Gate | Notes |
 |-----------|-------|---------|------|-------|
 | Write IMEI (AT+EGMR) | gateway | `skyline-gateway/index.js` (`/set-imei`, `AT+EGMR`) | host | The physical write. Only Skyline. |
-| IMEI change flow | gateway | `mdn-rotator/index.js` `/sim-action` `change_imei` | `gatewaySupports(sim,'setImei')` — GUARDED (409) | Operator "Set/Change IMEI" routes here via dashboard `/api/sim-action`. |
-| Fix SIM (atomic) | gateway+carrier | `mdn-rotator/index.js` `fixAtomicSim` | `canSetImei` skips gateway scan + IMEI push — GUARDED | Dashboard `/api/fix-sim` routes here. Carrier inquiry/restore still runs. |
-| Retry activation | gateway+carrier | `mdn-rotator/index.js` `retryActivation` | refuses Teltik-hosted — GUARDED | Skyline-only: it registers the pushed IMEI with the carrier. |
+| IMEI change flow | gateway | `mdn-rotator/index.js` `/sim-action` `change_imei` | `gatewaySupports(sim,'setImei')`, GUARDED (409) | Operator "Set/Change IMEI" routes here via dashboard `/api/sim-action`. |
+| Fix SIM (atomic) | gateway+carrier | `mdn-rotator/index.js` `fixAtomicSim` | `canSetImei` skips gateway scan + IMEI push, GUARDED | Dashboard `/api/fix-sim` routes here. Carrier inquiry/restore still runs. |
+| Retry activation | gateway+carrier | `mdn-rotator/index.js` `retryActivation` | refuses Teltik-hosted, GUARDED | Skyline-only: it registers the pushed IMEI with the carrier. |
 | Pool slot fix | gateway | `dashboard/index.js` `handleImeiPoolFixSlot` (`/api/imei-pool/fix-slot`) | keyed by `gateway_id`+`port` | Internal pool-reconcile tool; cannot target a Teltik SIM (null gateway). |
 | IMEI heartbeat / blimei sweep | gateway | `mdn-rotator/index.js` (`imei_heartbeat`, `blimei_update`) | DEAD CODE (disabled) | If ever re-enabled, gate on `setImei`. |
 | Skyline SMS send | gateway | `skyline-gateway/index.js` `/send-sms`; `dashboard` send-test-sms proxy | `gatewaySupports(sim,'skylineSms')` | Not yet exercised for Teltik-hosted; gate if a path sends via Skyline for them. |
@@ -80,33 +80,33 @@ GUARDED. Carrier-level sites are host-agnostic by design.
 
 These are open. If you extend the distinction, start here:
 
-1. **Inbound SMS capture** — `teltik-worker` webhook + `rotate-sim` lookup filter
+1. **Inbound SMS capture**: `teltik-worker` webhook + `rotate-sim` lookup filter
    `vendor=eq.teltik`. An ATOMIC-in-Teltik SIM (`vendor='atomic'`) receiving SMS
    through the Teltik gateway is not found, so its SMS/rental capture is dropped.
    Decide whether the webhook keys on `gateway_host='teltik'` (any vendor).
-2. **Onboarding/tagging** — how an ATOMIC-in-Teltik SIM first enters `sims` and gets
+2. **Onboarding/tagging**: how an ATOMIC-in-Teltik SIM first enters `sims` and gets
    `gateway_host='teltik'` set (manual add, CSV import, or Teltik reconcile).
-3. **Dashboard "Query" health** — for teltik-hosted SIMs regardless of vendor, use
+3. **Dashboard "Query" health**: for teltik-hosted SIMs regardless of vendor, use
    Teltik `port-status` + `get-info`-by-MDN (ICCID reverse-lookup returns "MSISDN Not
    Found" for these), not the Skyline/ATOMIC path.
-4. **Remediator heals** — the Teltik reset/sync actions are gated to `vendor='teltik'`
+4. **Remediator heals**: the Teltik reset/sync actions are gated to `vendor='teltik'`
    and so are not offered to a stuck ATOMIC-in-Teltik SIM even though a Teltik port
    reset would help it.
 
 ## Checklist: adding a new cross-cutting SIM distinction
 
-1. **Schema** — add the column + backfill migration under `supabase/migrations/`.
+1. **Schema**: add the column + backfill migration under `supabase/migrations/`.
    Give it a `NOT NULL DEFAULT` and a CHECK constraint. Backfill existing rows.
-2. **Helper** — extend `src/shared/gateway-host.mjs` (or add a sibling shared module)
+2. **Helper**: extend `src/shared/gateway-host.mjs` (or add a sibling shared module)
    with a resolver + capability; keep it pure and add unit tests in `tests/`.
-3. **Tag every insert path** — every `INSERT`/`UPSERT` into `sims` must set the new
+3. **Tag every insert path**: every `INSERT`/`UPSERT` into `sims` must set the new
    column: `teltik-worker` (`importTeltikLines`, `applyTeltikActivation`), activation
    flows, CSV import. Reads (`sims?...=eq...`) do NOT need changing.
 4. **Guard every gateway-level site** in the inventory table above with the new
    `gatewaySupports(sim, 'cap')` check. Carrier-level sites stay on `vendor`.
-5. **Surface it** — add the column to the `/api/sims` select in `dashboard`
+5. **Surface it**: add the column to the `/api/sims` select in `dashboard`
    (`handleSims`) so the UI/operator can see and branch on it.
-6. **Deploy set** — the workers that read/route on SIM state:
+6. **Deploy set**: the workers that read/route on SIM state:
    `mdn-rotator`, `dashboard`, `teltik-worker`, `bad-rental-remediator`,
    `details-finalizer`.
 7. **Never use an em dash** anywhere (hard project rule); use commas/colons/parens.
