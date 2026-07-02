@@ -1,7 +1,7 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
-import { isTeltikHosted, gatewaySupports } from '../shared/gateway-host.mjs';
+import { gatewaySupports } from '../shared/gateway-host.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -486,6 +486,14 @@ export default {
 
         // For change_imei — full IMEI swap flow
         if (action === "change_imei") {
+          // Teltik-hosted SIMs cannot take an IMEI write (no Skyline gateway/port).
+          if (!gatewaySupports(sim, 'setImei')) {
+            return new Response(JSON.stringify({
+              ok: false,
+              error: `SIM ${sim.iccid} is Teltik-hosted: IMEI writes are not supported (no Skyline gateway).`,
+              gateway_host: 'teltik',
+            }), { status: 409, headers: { "Content-Type": "application/json" } });
+          }
           const autoImei = body.auto_imei === true;
           const newImeiRaw = body.new_imei ? String(body.new_imei).trim() : null;
 
