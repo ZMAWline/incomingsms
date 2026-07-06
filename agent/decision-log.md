@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-07-06 — Teltik night-guard is permanent; anchors drift ~15 min/day and must be continuously re-anchored
+
+**Decision:** The Teltik night-migration (`teltik_hold_morning_batch` + 22:00-NY cron) is now a PERMANENT night-guard, not a finite migration: window widened NY 6–8 → 3–8 (migration `teltik_hold_widen_3_8`, applied to prod 2026-07-06), batch 100 → 150/night. Rotation cron cadence tightened from every 30 min to every 15 min (`5,20,35,50 4-14 UTC`). New inline re-anchor in `rotateOneTeltikSim`: a **retried or forced** rotation that succeeds at NY hour ≥ 5 (tunable `TELTIK_REANCHOR_FROM_HOUR`) gets a next-midnight `rotation_hold_until` instead of null.
+
+**Why:** Three weeks of data showed the 6–8am cohort stuck at ~730 lines despite holding 100/night. Root cause: measured per-cycle anchor drift is exactly one cron tick (median 30 min per 48h cycle — a line just-misses the tick 48h after its last rotation and waits for the next), i.e. ~15 min/day forward for the whole fleet, ~100 lines/day crossing into 6–8am — exactly cancelling the 100/night drain. Teltik's hard 48h minimum means anchors can only move later, never earlier, so drift is structural and the guard can never be "done". Halving the tick gap halves the drift (~7.5 min/day); catching drifters at 3am keeps rotations in the 0–3am band; the inline re-anchor stops morning failure-recoveries (retry pass + catch-up sweeps succeeding at 5–8am) from re-seeding the cohort.
+
+**Consequence:** Do NOT set `TELTIK_NIGHT_MIGRATION=off` — the "turn it off when morning_remaining = 0" instruction from 2026-06-16 is obsolete; the pool refills by drift and the guard must keep running. The inline re-anchor deliberately applies only to retry/force successes (uncapped path — applying it to normal due rotations would hold hundreds of lines in one night); the drift cohort drains through the batch-capped RPC only. Keep the rotation tick spacing ≥ 15 min: the rotate pass has a 13-min time budget, so tighter spacing would overlap invocations. Expect ~2 weeks for the 2,110-line hour-3–8 pool to drain at 150/night; each held line takes a one-time ~65–69h gap (skipped cycle) — that is the unavoidable price of moving a line earlier.
+
+---
+
 ## 2026-06-26 — Partner-facing dashboard endpoints: intercept before the Basic-auth gate, own key, fail closed
 
 **Decision:** The WING-facing `/api/gateway-status` lookup is dispatched at the very top of the dashboard worker's `fetch()`, BEFORE the global operator Basic-auth gate, and authenticates with its own dedicated `GATEWAY_STATUS_API_KEY` secret (constant-time compare; `X-Api-Key` header or `?key=`). It fails closed with 503 when the secret is unset. The pure state-mapping + ICCID-parsing logic went into a new `src/shared/skyline-state.mjs`, not inline in `index.js`.

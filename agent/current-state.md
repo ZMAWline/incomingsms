@@ -1,7 +1,20 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-26 (WING-facing /api/gateway-status: live Skyline gateway state by ICCID, numeric code -> text, dedicated API key; partner PDF guide hosted behind dashboard auth)
+> Last updated: 2026-07-06 (Teltik 7am rotations: night-guard made permanent, window 3-8, batch 150, 15-min ticks, inline re-anchor for morning recoveries)
+
+---
+
+## Session 2026-07-06 — Teltik morning-rotation fix (branch `claude/celtic-sims-rotation-timing-8oer9s`)
+
+Operator asked why many Teltik SIMs rotate ~7am instead of early night. Root cause (measured): rotation anchors drift exactly one cron tick later per 48h cycle (median 30 min ⇒ ~15 min/day, fleet-wide) because Teltik's hard 48h minimum means a line always just-misses the tick 48h after its last rotation. ~100 lines/day drifted into 6–8am, exactly cancelling the night-migration's 100/night drain — the 6–8am cohort sat at ~730 for 3 weeks (367 anchored at 7am on 07-06).
+
+**Changed (see decision-log 2026-07-06):**
+- `teltik_hold_morning_batch` window NY 6–8 → **3–8** — **applied to prod DB** (migration `teltik_hold_widen_3_8`) — takes effect at tonight's 22:00-NY guard tick even before worker redeploy.
+- teltik-worker (NEEDS DEPLOY): rotation crons every 30 min → **every 15 min** (halves drift); `TELTIK_MIGRATION_BATCH` 100 → **150**; new inline re-anchor — retry/force rotations succeeding at NY hour ≥ 5 (`TELTIK_REANCHOR_FROM_HOUR`) set a next-midnight `rotation_hold_until` instead of clearing it.
+- The night-guard is now **PERMANENT** — the old "set `TELTIK_NIGHT_MIGRATION=off` when morning_remaining = 0" carry-over is obsolete; drift refills the pool forever.
+
+**Deploy step pending:** `cd src/teltik-worker && npx wrangler deploy --env=""` (this session had no Cloudflare creds). Pool at hours 3–8 was 2,110 unheld lines ⇒ ~2 weeks to drain at 150/night. Watch the Rotation Health tab / hour-distribution: `select extract(hour from last_mdn_rotated_at at time zone 'America/New_York')::int h, count(*) from sims s join reseller_sims rs on rs.sim_id=s.id and rs.active where s.vendor='teltik' and s.status='active' group by 1 order by 1;`
 
 ---
 

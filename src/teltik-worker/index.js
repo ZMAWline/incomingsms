@@ -820,6 +820,20 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
     if (force) console.log(`[Rotate] SIM ${sim.iccid}: force=true — claimed with interval bypass`);
     if (retry) console.log(`[Rotate] SIM ${sim.iccid}: retry=true — in-window retry of failed rotation`);
 
+    // Late-morning recovery re-anchor: a retried/forced rotation that succeeds at
+    // NY 5-8am would otherwise anchor the line's 48h clock to that morning hour
+    // forever (Teltik's hard 48h minimum means anchors can never move earlier).
+    // Set the same next-midnight hold the night-migration RPC uses so the line
+    // rejoins the night cohort instead of re-seeding the morning one. Normal
+    // (non-retry) due rotations are left alone — the capped nightly
+    // teltik_hold_morning_batch handles those gradually.
+    const reanchorFromHour = parseInt(env.TELTIK_REANCHOR_FROM_HOUR || '5', 10) || 5;
+    const nyHourNow = getNYHour();
+    const reanchorHold = (retry || force) && nyHourNow >= reanchorFromHour && nyHourNow <= 8
+      ? nyMidnightAfterNextDue(new Date().toISOString(), sim.rotation_interval_hours)
+      : null;
+    if (reanchorHold) console.log(`[Rotate] SIM ${sim.iccid}: late-morning recovery (NY hour ${nyHourNow}) — re-anchoring to night, hold until ${reanchorHold}`);
+
     // 2. Initiate number change (async on Teltik's side). Do NOT poll here — the blocking
     //    poll inside the rotate path caused races where Teltik assigned a new MDN but our
     //    6-attempt / 62s window expired, leaving DB stamped as failed while Teltik had
@@ -882,7 +896,9 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
         last_rotation_at: nowIso,
         last_rotation_error: null,
         rotation_fail_count: 0,
-        rotation_hold_until: null, // night-migration hold satisfied once it rotates
+        // Hold satisfied once it rotates; late-morning recoveries get a fresh
+        // next-midnight hold so they re-anchor to the night window.
+        rotation_hold_until: reanchorHold,
       });
 
       // Reseller webhooks: old number offline, new number online.
@@ -903,7 +919,8 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
       status: 'provisioning',
       last_rotation_error: null,
       rotation_fail_count: 0,
-      rotation_hold_until: null, // night-migration hold satisfied once it rotates
+      // Same re-anchor logic as the inline-success path above.
+      rotation_hold_until: reanchorHold,
     });
 
     console.log(`[Rotate] SIM ${sim.iccid}: change-number issued (requestId=${requestId}) — no new_msisdn in response, status=provisioning, details-finalizer will pick up MDN`);
@@ -972,6 +989,25 @@ function midnightNYAfterInterval(lastRotatedAt, intervalHours) {
   const [y, m, d] = nyDate.split('-').map(Number);
   const intervalDays = Math.ceil((intervalHours || 48) / 24);
   const probe = new Date(Date.UTC(y, m - 1, d + intervalDays, 5, 0, 0));
+  const probeNyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(probe);
+  const tzPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', timeZoneName: 'shortOffset'
+  }).formatToParts(probe).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-4';
+  const offsetHours = -parseInt(tzPart.replace('GMT', '') || '-4');
+  return new Date(`${probeNyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
+}
+
+// NY midnight on the day AFTER the next due slot — the same hold the
+// teltik_hold_morning_batch RPC computes. midnightNYAfterInterval (above) lands
+// BEFORE a morning due slot (midnight of the due day), which would not defer
+// anything; the re-anchor hold must land past the due slot so the line skips
+// one cycle and rotates at the following midnight.
+function nyMidnightAfterNextDue(baseIso, intervalHours) {
+  const baseDt = new Date(baseIso || Date.now());
+  const nyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(baseDt);
+  const [y, m, d] = nyDate.split('-').map(Number);
+  const intervalDays = Math.ceil((intervalHours || 48) / 24);
+  const probe = new Date(Date.UTC(y, m - 1, d + intervalDays + 1, 5, 0, 0));
   const probeNyDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(probe);
   const tzPart = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York', timeZoneName: 'shortOffset'
