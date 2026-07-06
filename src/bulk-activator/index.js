@@ -229,7 +229,7 @@ async function activateViaAtomic(env, iccid, imei, runId) {
         streetDirection: addr.streetDirection || '',
         streetName: addr.streetName,
         zip: addr.zipCode,
-        plan: 'ATTNOVOICE',
+        plan: 'EBNOVOICE',
         portMdn: '',
       },
     },

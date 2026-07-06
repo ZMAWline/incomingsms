@@ -46,7 +46,7 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
 }}
 ```
 
-**Mandatory Plan Code:** Always use `ATTNOVOICE` for activations.
+**Mandatory Plan Code:** Always use `EBNOVOICE` for activations (replaced `ATTNOVOICE` as of 2026-07-06; existing lines may still be on `ATTNOVOICE`).
 
 **Common Identifiers:**
 - `MSISDN` — 10-digit phone number (MDN)
@@ -57,7 +57,7 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
 ## Key Workflows
 
 ### Activation Sequence
-1. **Activate** — POST with SIM, IMEI, name, address, `plan: "ATTNOVOICE"`
+1. **Activate** — POST with SIM, IMEI, name, address, `plan: "EBNOVOICE"`
 2. **Subscriber Inquiry** — Verify activation, get assigned MDN and BAN
 
 ### MDN Change Sequence (Area Code Change)
@@ -103,7 +103,7 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
     "streetDirection": "",
     "streetName": "YOUR_STREET_NAME",
     "zip": "YOUR_ZIP",
-    "plan": "ATTNOVOICE",
+    "plan": "EBNOVOICE",
     "portMdn": ""
   }
 }}
@@ -304,7 +304,7 @@ Returns: attStatus, BAN, activationDate, plan info, device info (BLIMEI/NWIMEI),
 ## Critical Enforcement Rules
 
 1. **Only use assigned credentials** (ezbiz / EZ32726)
-2. **Always use plan code `ATTNOVOICE`** for activations
+2. **Always use plan code `EBNOVOICE`** for activations
 3. **Always verify MDN after activation** using Subscriber Inquiry
 4. **Use correct reasonCode** for each status change action (see table above)
 5. **For area code changes:** Update address first, then swap MSISDN
