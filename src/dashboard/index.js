@@ -5773,7 +5773,7 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
         ? inv.daily_breakdown
         : [{ sim_count: inv.sim_count, amount: totalAmount }];
       const csv = buildCSV(customerName, inv.week_start, inv.week_end, days, dailyRate);
-      const filename = 'invoice_' + customerName.replace(/[^a-z0-9]/gi, '_') + '_' + inv.week_start + '_' + inv.week_end + '.csv';
+      const filename = 'invoice' + customerName.replace(/[^a-z0-9]/gi, '') + String(inv.week_start).replace(/[^0-9]/g, '') + String(inv.week_end).replace(/[^0-9]/g, '') + '.csv';
       return new Response(csv, {
         headers: {
           ...corsHeaders,
@@ -5828,7 +5828,7 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
     });
 
     const csv = buildCSV(mapping.qbo_display_name, start, end, days, dailyRate);
-    const filename = 'invoice_' + mapping.qbo_display_name.replace(/[^a-z0-9]/gi, '_') + '_' + start + '_' + end + '.csv';
+    const filename = 'invoice' + mapping.qbo_display_name.replace(/[^a-z0-9]/gi, '') + start.replace(/[^0-9]/g, '') + end.replace(/[^0-9]/g, '') + '.csv';
     return new Response(csv, {
       headers: {
         ...corsHeaders,
