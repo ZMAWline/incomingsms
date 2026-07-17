@@ -55,6 +55,18 @@ export default {
       return handleSims(env, corsHeaders, url);
     }
 
+    if (url.pathname === '/api/sims/query') {
+      return handleSimsQuery(env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/sim-history') {
+      return handleSimHistory(env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/update-sim' && request.method === 'POST') {
+      return handleUpdateSim(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/messages') {
       return handleMessages(env, corsHeaders, url);
     }
@@ -7495,3 +7507,316 @@ async function handleGatewayStatus(request, env) {
   }
 }
 
+// ============ Sims v2: server-side query / history / guarded field correction ============
+// Spec: docs/superpowers/specs/2026-07-17-sims-table-redesign.md
+
+const SIMS_QUERY_SORTS = {
+  id: 'id', iccid: 'iccid', status: 'status', vendor: 'vendor', carrier: 'carrier',
+  activated_at: 'activated_at', last_mdn_rotated_at: 'last_mdn_rotated_at',
+  last_rotation_at: 'last_rotation_at', last_notified_at: 'last_notified_at',
+  gateway_id: 'gateway_id', gateway_code: 'gateway_id', msisdn: 'msisdn', phone_number: 'msisdn',
+};
+
+function utcTodayStartIso() {
+  return new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
+}
+function hoursAgoIso(h) {
+  return new Date(Date.now() - h * 3600 * 1000).toISOString();
+}
+
+async function handleSimsQuery(env, corsHeaders, url) {
+  try {
+    const p = url.searchParams;
+    const page = Math.max(1, parseInt(p.get('page') || '1', 10) || 1);
+    const pageSize = Math.min(500, Math.max(1, parseInt(p.get('page_size') || '50', 10) || 50));
+    const sortKey = SIMS_QUERY_SORTS[p.get('sort') || ''] || 'id';
+    const dir = p.get('dir') === 'asc' ? 'asc' : 'desc';
+    const csv = (name) => (p.get(name) || '').split(',').map(s => s.trim()).filter(Boolean);
+
+    const filters = [];
+
+    const statuses = csv('status').filter(s => /^[a-z_]+$/.test(s));
+    if (statuses.length) filters.push('status=in.(' + statuses.join(',') + ')');
+    else if (p.get('hide_cancelled') !== 'false') filters.push('status=neq.canceled');
+
+    const vendors = csv('vendor').filter(s => /^[a-z_]+$/.test(s));
+    if (vendors.length) filters.push('vendor=in.(' + vendors.join(',') + ')');
+
+    const hosts = csv('gateway_host').filter(s => /^[a-z_]+$/.test(s));
+    if (hosts.length) filters.push('gateway_host=in.(' + hosts.join(',') + ')');
+
+    const gatewayIds = csv('gateway_id').filter(s => /^\d+$/.test(s));
+    if (gatewayIds.length) filters.push('gateway_id=in.(' + gatewayIds.join(',') + ')');
+
+    let gatewayJoin = 'gateways(code,name)';
+    const gatewayCodes = csv('gateway_code').filter(s => /^[A-Za-z0-9_-]+$/.test(s));
+    if (gatewayCodes.length) {
+      gatewayJoin = 'gateways!inner(code,name)';
+      filters.push('gateways.code=in.(' + gatewayCodes.join(',') + ')');
+    }
+
+    const aFrom = p.get('activated_from');
+    if (aFrom && /^\d{4}-\d{2}-\d{2}$/.test(aFrom)) filters.push('activated_at=gte.' + aFrom);
+    const aTo = p.get('activated_to');
+    if (aTo && /^\d{4}-\d{2}-\d{2}$/.test(aTo)) filters.push('activated_at=lte.' + encodeURIComponent(aTo + 'T23:59:59'));
+
+    // Server-side search. Single term: ICCID/MSISDN substring (+ exact id for short
+    // numerics). Multiple tokens (pasted ID/MDN/ICCID lists, any whitespace/comma
+    // separated): exact-match union across id/iccid/msisdn.
+    const qRaw = (p.get('q') || '').replace(/[()'"\\%]/g, '').trim();
+    const qTokens = qRaw.split(/[\s,;]+/).map(t => t.trim()).filter(Boolean);
+    if (qTokens.length > 1) {
+      const digits = qTokens.map(t => t.replace(/\D/g, '')).filter(Boolean);
+      const ors = [];
+      if (digits.length) {
+        const ids = digits.filter(d => d.length <= 9);
+        if (ids.length) ors.push('id.in.(' + ids.join(',') + ')');
+        ors.push('iccid.in.(' + digits.join(',') + ')');
+        // Pasted numbers may carry a leading 1 / +1 or not; match both forms.
+        const mdnForms = [...new Set(digits.flatMap(d => d.length === 10 ? [d, '1' + d] : [d, d.replace(/^1/, '')]))];
+        ors.push('msisdn.in.(' + mdnForms.join(',') + ')');
+      }
+      if (ors.length) filters.push('or=(' + ors.join(',') + ')');
+    } else if (qTokens.length === 1) {
+      const q = qTokens[0];
+      const pat = encodeURIComponent('*' + q + '*');
+      const ors = ['iccid.ilike.' + pat, 'msisdn.ilike.' + pat];
+      if (/^\d+$/.test(q) && q.length <= 9) ors.push('id.eq.' + q);
+      filters.push('or=(' + ors.join(',') + ')');
+    }
+
+    let resellerJoin = 'reseller_sims(reseller_id,resellers(name))';
+    const resellerRaw = csv('reseller_id');
+    const resellerIds = resellerRaw.filter(s => /^\d+$/.test(s));
+    if (resellerIds.length) {
+      resellerJoin = 'reseller_sims!inner(reseller_id,resellers(name))';
+      filters.push('reseller_sims.reseller_id=in.(' + resellerIds.join(',') + ')');
+    } else if (resellerRaw.includes('none')) {
+      // No ACTIVE reseller assignment (embed already filtered to active=eq.true)
+      filters.push('reseller_sims=is.null');
+    }
+
+    // Presets mirror the client-side SIM_PRESETS semantics (see public/index.html).
+    for (const preset of csv('preset')) {
+      if (preset === 'no_reseller') filters.push('reseller_sims=is.null');
+      else if (preset === 'auto_paused') filters.push('rotation_eligible=is.false');
+      else if (preset === 'any_error') filters.push('status=in.(error,helix_timeout,data_mismatch)');
+      else if (preset === 'not_rotated_today') {
+        filters.push('or=(last_mdn_rotated_at.is.null,last_mdn_rotated_at.lt.' + encodeURIComponent(utcTodayStartIso()) + ')');
+      } else if (preset === 'not_notified') {
+        const t24 = encodeURIComponent(hoursAgoIso(24));
+        const t48 = encodeURIComponent(hoursAgoIso(48));
+        filters.push('status=eq.active');
+        filters.push('not.and=(vendor.eq.wing_iot,rotation_status.eq.failed)');
+        filters.push('or=(and(vendor.eq.teltik,last_notified_at.is.null),and(vendor.eq.teltik,last_notified_at.lt.' + t48 + '),and(vendor.neq.teltik,last_notified_at.is.null),and(vendor.neq.teltik,last_notified_at.lt.' + t24 + '))');
+      } else if (preset === 'stuck_provisioning') {
+        const t1h = encodeURIComponent(hoursAgoIso(1));
+        filters.push('status=eq.provisioning');
+        filters.push('or=(and(activated_at.not.is.null,activated_at.lt.' + t1h + '),and(activated_at.is.null,created_at.lt.' + t1h + '))');
+      }
+      // no_sms_12h: requires an SMS-count join; not server-mappable yet (Stage 3).
+    }
+
+    const select = 'id,iccid,port,slot,imei,status,status_reason,vendor,carrier,gateway_host,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,msisdn,last_mdn_rotated_at,last_rotation_at,last_rotation_error,activated_at,last_activation_error,last_notified_at,created_at,rotation_status,' + gatewayJoin + ',sim_numbers(e164,verification_status),' + resellerJoin;
+    let query = 'sims?select=' + select + '&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true';
+    if (filters.length) query += '&' + filters.join('&');
+    query += '&order=' + sortKey + '.' + dir + '.nullslast&limit=' + pageSize + '&offset=' + ((page - 1) * pageSize);
+
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + query, {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        Accept: 'application/json',
+        Prefer: 'count=exact',
+      },
+    });
+    if (!resp.ok) throw new Error('PostgREST ' + resp.status + ': ' + (await resp.text()));
+    const rows = await resp.json();
+    const range = resp.headers.get('content-range') || '';
+    const total = parseInt(range.split('/')[1], 10);
+
+    // SMS 24h counts for the current page only (one RPC call, <=500 ids)
+    const smsMap = {};
+    if (rows.length > 0) {
+      const rpcResp = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/get_sms_counts_24h', {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ sim_ids: rows.map(s => s.id) }),
+      });
+      const smsRows = await rpcResp.json().catch(() => []);
+      if (Array.isArray(smsRows)) {
+        for (const row of smsRows) smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
+      }
+    }
+
+    const formatted = rows.map(sim => {
+      const smsStat = smsMap[sim.id] || { count: 0, last_received: null };
+      const resellerSim = sim.reseller_sims && sim.reseller_sims[0];
+      return {
+        id: sim.id,
+        iccid: sim.iccid,
+        port: sim.port,
+        slot: sim.slot,
+        imei: sim.imei,
+        status: sim.status,
+        status_reason: sim.status_reason || null,
+        mobility_subscription_id: sim.mobility_subscription_id,
+        phone_number: (sim.sim_numbers && sim.sim_numbers[0] && sim.sim_numbers[0].e164) || null,
+        verification_status: (sim.sim_numbers && sim.sim_numbers[0] && sim.sim_numbers[0].verification_status) || null,
+        sms_count: smsStat.count,
+        last_sms_received: smsStat.last_received,
+        reseller_id: (resellerSim && resellerSim.reseller_id) || null,
+        reseller_name: (resellerSim && resellerSim.resellers && resellerSim.resellers.name) || null,
+        gateway_id: sim.gateway_id,
+        gateway_code: (sim.gateways && sim.gateways.code) || null,
+        gateway_name: (sim.gateways && sim.gateways.name) || null,
+        gateway_host: sim.gateway_host || 'skyline',
+        msisdn: sim.msisdn || null,
+        last_mdn_rotated_at: sim.last_mdn_rotated_at || null,
+        last_rotation_at: sim.last_rotation_at || null,
+        last_rotation_error: sim.last_rotation_error || null,
+        activated_at: sim.activated_at || null,
+        created_at: sim.created_at || null,
+        last_activation_error: sim.last_activation_error || null,
+        last_notified_at: sim.last_notified_at || null,
+        vendor: sim.vendor || 'unknown',
+        carrier: sim.carrier || null,
+        rotation_status: sim.rotation_status || null,
+        rotation_interval_hours: sim.rotation_interval_hours || 24,
+        rotation_eligible: sim.rotation_eligible !== false,
+      };
+    });
+
+    return new Response(JSON.stringify({
+      rows: formatted,
+      total: Number.isNaN(total) ? formatted.length : total,
+      page,
+      page_size: pageSize,
+    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// Merged per-SIM timeline: status transitions + manual edits + errors + webhook notifies.
+async function handleSimHistory(env, corsHeaders, url) {
+  try {
+    const simId = parseInt(url.searchParams.get('sim_id') || '0', 10);
+    if (!simId) {
+      return new Response(JSON.stringify({ error: 'sim_id required' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const [statusHist, edits, errors, webhooks] = await Promise.all([
+      sbGet(env, 'sim_status_history?sim_id=eq.' + simId + '&order=changed_at.desc&limit=100'),
+      sbGet(env, 'sim_edit_log?sim_id=eq.' + simId + '&order=changed_at.desc&limit=100'),
+      sbGet(env, 'system_errors?sim_id=eq.' + simId + '&select=id,source,action,error_message,severity,status,created_at&order=created_at.desc&limit=50'),
+      sbGet(env, 'webhook_deliveries?select=id,status,attempts,delivered_at,created_at&event_type=eq.number.online&payload->data->>sim_id=eq.' + simId + '&order=created_at.desc&limit=25'),
+    ]);
+    const events = [];
+    if (Array.isArray(statusHist)) for (const h of statusHist) {
+      events.push({ type: 'status', at: h.changed_at, detail: (h.old_status || '?') + ' \u2192 ' + h.new_status });
+    }
+    if (Array.isArray(edits)) for (const e of edits) {
+      events.push({ type: 'edit', at: e.changed_at, by: e.changed_by, detail: e.field + ': ' + (e.old_value == null ? '(empty)' : e.old_value) + ' \u2192 ' + (e.new_value == null ? '(empty)' : e.new_value) });
+    }
+    if (Array.isArray(errors)) for (const e of errors) {
+      events.push({ type: 'error', at: e.created_at, status: e.status, detail: '[' + e.source + (e.action ? '/' + e.action : '') + '] ' + e.error_message });
+    }
+    if (Array.isArray(webhooks)) for (const w of webhooks) {
+      events.push({ type: 'webhook', at: w.created_at, detail: 'number.online ' + w.status + ' (attempts: ' + (w.attempts || 0) + ')' });
+    }
+    events.sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0));
+    return new Response(JSON.stringify({ sim_id: simId, events }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// Guarded field correction: whitelisted fields, compare-and-set on prior values,
+// every applied change audited to sim_edit_log. Never used by automation —
+// operator corrections only (SIM #639 lesson: no silent overwrites).
+const SIM_EDITABLE_FIELDS = {
+  vendor: v => ['atomic', 'teltik', 'wing_iot', 'helix', 'unknown'].includes(v),
+  carrier: v => v === null || /^[a-z_]{2,20}$/.test(v),
+  gateway_host: v => ['skyline', 'teltik'].includes(v),
+  status_reason: v => v === null || (typeof v === 'string' && v.length <= 300),
+  gateway_id: v => v === null || (Number.isInteger(v) && v > 0),
+  port: v => v === null || (typeof v === 'string' && v.length <= 10),
+  slot: v => v === null || (typeof v === 'string' && v.length <= 2),
+  msisdn: v => v === null || /^\d{10,15}$/.test(v),
+  rotation_interval_hours: v => Number.isInteger(v) && v >= 1 && v <= 168,
+};
+
+async function handleUpdateSim(request, env, corsHeaders) {
+  const jsonOut = (obj, status) => new Response(JSON.stringify(obj), {
+    status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
+  try {
+    const body = await request.json();
+    const simId = parseInt(body.sim_id, 10);
+    const changes = body.changes;
+    if (!simId || !changes || typeof changes !== 'object' || Array.isArray(changes)) {
+      return jsonOut({ error: 'sim_id and changes{} required' }, 400);
+    }
+    const fields = Object.keys(changes);
+    if (!fields.length) return jsonOut({ error: 'no changes' }, 400);
+    for (const f of fields) {
+      if (!SIM_EDITABLE_FIELDS[f]) return jsonOut({ error: 'field not editable: ' + f }, 400);
+      const newVal = changes[f].new === undefined ? null : changes[f].new;
+      if (!SIM_EDITABLE_FIELDS[f](newVal)) return jsonOut({ error: 'invalid value for ' + f }, 400);
+    }
+    const sbHeaders = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      'Content-Type': 'application/json',
+    };
+    const applied = [];
+    for (const f of fields) {
+      const oldVal = changes[f].old === undefined ? null : changes[f].old;
+      const newVal = changes[f].new === undefined ? null : changes[f].new;
+      if (oldVal === newVal) continue;
+      // Compare-and-set: PATCH only matches if the field still holds the value the
+      // operator saw. Row changed underneath -> 0 rows -> 409, no clobber.
+      const guard = oldVal === null ? f + '=is.null' : f + '=eq.' + encodeURIComponent(String(oldVal));
+      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + simId + '&' + guard, {
+        method: 'PATCH',
+        headers: { ...sbHeaders, Prefer: 'return=representation' },
+        body: JSON.stringify({ [f]: newVal }),
+      });
+      if (!resp.ok) return jsonOut({ error: 'update failed for ' + f + ': ' + (await resp.text()), applied }, 500);
+      const rows = await resp.json().catch(() => []);
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return jsonOut({
+          error: 'conflict', field: f, applied,
+          message: 'SIM ' + simId + ' field "' + f + '" no longer holds the value you saw. Reload and retry.',
+        }, 409);
+      }
+      applied.push(f);
+      // Audit trail; non-fatal if sim_edit_log is absent (pre-migration env).
+      await fetch(env.SUPABASE_URL + '/rest/v1/sim_edit_log', {
+        method: 'POST',
+        headers: { ...sbHeaders, Prefer: 'return=minimal' },
+        body: JSON.stringify({
+          sim_id: simId, field: f,
+          old_value: oldVal === null ? null : String(oldVal),
+          new_value: newVal === null ? null : String(newVal),
+        }),
+      }).catch(() => {});
+    }
+    return jsonOut({ ok: true, sim_id: simId, applied });
+  } catch (error) {
+    return jsonOut({ error: String(error) }, 500);
+  }
+}

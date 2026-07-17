@@ -873,3 +873,25 @@ These items were verified to be working correctly as of their last check:
 ## Open Questions
 
 _None currently tracked._
+
+---
+
+## Session 2026-07-17 — Sims table redesign, Stage 1 backend (TEST ONLY, branch `redesign/sims-table-v2`)
+
+**Prod untouched.** Spec: `docs/superpowers/specs/2026-07-17-sims-table-redesign.md`.
+
+**Test env changes (dashboard-test, version `9acb1dcd`):**
+- Baseline: current main deployed to `dashboard-test` first (was stale since 06-09).
+- **`dashboard-test` was reading the PROD Supabase** — repointed `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` (test env secrets) to `incomingsms-test` (`lwapudjjlwkskijefxdz`). Test now uses the test project's **anon key** + permissive RLS policies (service key not on this host; data is synthetic). To restore old behavior: set the secrets back to the prod project values.
+- Test project schema rebuilt to prod parity for sims domain (sims incl. `gateway_host`, gateways, sim_numbers, reseller_sims, resellers, sim_status_history, system_errors, webhook_deliveries, rotation_audit, inbound_sms, new `sim_edit_log`, `get_sms_counts_24h` RPC). Seeded **synthetic** 5,344-SIM fleet matching prod distribution — no real customer data.
+- Fresh test-only Basic-auth cred set on `dashboard-test` (old value unknown/unrecoverable; ask operator-side notes or reset again as needed).
+
+**New API endpoints (in `src/dashboard/index.js`, verified live on test):**
+- `GET /api/sims/query` — server-side filter/sort/pagination + exact total; params: page/page_size/sort/dir/q (single-term ilike or multi-token pasted ID/MDN/ICCID exact lists)/status,vendor,gateway_host,gateway_id,gateway_code,reseller_id (csv; `none` = unassigned)/activated_from,to/preset (csv, AND-composed, mirrors client SIM_PRESETS; `no_sms_12h` not server-mappable yet). SMS 24h counts fetched for current page only.
+- `GET /api/sim-history?sim_id=` — merged timeline: sim_status_history + sim_edit_log + system_errors + number.online deliveries.
+- `POST /api/update-sim` — guarded field correction (vendor/carrier/gateway_host/status_reason/gateway_id/port/slot/msisdn/rotation_interval_hours), **compare-and-set on prior values** (409 on stale), audits every change to `sim_edit_log`. Verified: ok/409/400 + audit rows + revert.
+- Legacy `/api/sims` untouched (regression-checked).
+
+**Prod rollout prereq:** `supabase/migrations/20260717_sim_edit_log.sql` (not applied to prod).
+
+**REMAINING (Stage 1 frontend, not started):** convert Sims tab to server mode (`loadSims` → `/api/sims/query`, sort/page/filter handlers reload server-side), detail modal → drawer + Edit/History tabs, saved views (localStorage), command palette, density toggle, type-to-confirm bulk delete, Host column. Patch scripts `_fix_sims_query_api.js`/`_fix_sims_query_v2.js` kept at root until feature complete.
