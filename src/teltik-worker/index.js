@@ -192,8 +192,22 @@ function getNYMidnightISO() {
 
 // =========================================================
 // IMPORT — fetch all Teltik lines and upsert into DB
+//
+// HOSTING ≠ SERVICE PROVIDER: Teltik hosts SIMs whose service provider is
+// Atomic/Wing/etc., so its all-lines API can return ICCIDs that already exist
+// in our DB under another vendor. Import must NEVER write to an existing sims
+// row (SIM #639 was clobbered to vendor=teltik this way) — it may only CREATE
+// rows for genuinely unknown ICCIDs, and only when they don't look like AT&T.
 // =========================================================
-async function importTeltikLines(env, opts = {}) {
+
+// AT&T ICCIDs start 890141 (e.g. 89014103...); Teltik/T-Mobile start 890126.
+// ponytail: single known prefix, extend list if a new AT&T IIN shows up.
+const ATT_ICCID_PREFIXES = ['890141'];
+export function looksLikeAttIccid(iccid) {
+  return ATT_ICCID_PREFIXES.some(p => String(iccid).startsWith(p));
+}
+
+export async function importTeltikLines(env, opts = {}) {
   const apiKey = env.TELTIK_API_KEY;
   const offset = opts.offset || 0;
   const limit = opts.limit || 200;
@@ -220,13 +234,15 @@ async function importTeltikLines(env, opts = {}) {
   const total = allLines.length;
   const slice = allLines.slice(offset, offset + limit);
 
-  // Precompute existing ICCID → sim_id once per chunk so unchanged rows skip
-  // the post-upsert SELECT (saves one subrequest per existing SIM).
-  const existingDbRows = await supabaseGetAllArray(env, `sims?vendor=eq.teltik&select=id,iccid`);
-  const iccidToSimId = new Map();
-  for (const r of existingDbRows) iccidToSimId.set(String(r.iccid), r.id);
+  // Precompute existing ICCID → {id, vendor} once per chunk. Covers ALL
+  // vendors, not just teltik: a Teltik-hosted foreign-vendor SIM must be
+  // recognized as existing so we never insert/overwrite it (see note above).
+  const existingDbRows = await supabaseGetAllArray(env, `sims?select=id,iccid,vendor`);
+  const iccidToSim = new Map();
+  for (const r of existingDbRows) iccidToSim.set(String(r.iccid), r);
 
   let imported = 0, updated = 0, unchanged = 0, skipped = 0;
+  let skippedForeignVendor = 0, skippedAttUnknown = 0;
 
   for (const line of slice) {
     // Extract MDN from line object (try common field names)
@@ -266,44 +282,49 @@ async function importTeltikLines(env, opts = {}) {
     }
 
     // Existence lookup served from the precomputed map (no DB call here).
-    const existingSimId = iccidToSimId.get(String(iccid)) || null;
-    const existing = existingSimId ? { id: existingSimId } : null;
+    // Existing rows are NEVER written to (hosting ≠ service provider, above).
+    const existing = iccidToSim.get(String(iccid)) || null;
 
-    // 4. Upsert SIM record (gateway_id/port/slot/imei null — Teltik has no physical gateway)
-    const simData = {
-      iccid,
-      vendor: 'teltik',
-      carrier: 'tmobile',
-      rotation_interval_hours: 48,
-      status: 'active',
-      gateway_id: null,
-      port: null,
-      slot: null,
-      imei: null,
-    };
+    let simId;
+    if (existing) {
+      if (existing.vendor !== 'teltik') {
+        console.log(`[Import] ICCID ${iccid} exists with vendor=${existing.vendor} (hosted on Teltik, not Teltik-provided) — skipping, not overwriting`);
+        skippedForeignVendor++;
+        continue;
+      }
+      // Existing teltik row: leave the sims row untouched, only sync sim_numbers below.
+      simId = existing.id;
+    } else {
+      if (looksLikeAttIccid(iccid)) {
+        console.log(`[Import] ALERT: unknown ICCID ${iccid} has AT&T prefix ${String(iccid).slice(0, 6)} — NOT creating as teltik/tmobile; classify manually`);
+        skippedAttUnknown++;
+        continue;
+      }
 
-    // For brand-new rows only: stamp activation + rotation to import time so the
-    // 48h rotation cron has a baseline. Existing rows are not overwritten.
-    if (!existing) {
+      // Brand-new line: create as teltik/tmobile (no physical gateway, so
+      // gateway_id/port/slot/imei stay at their null defaults). Stamp
+      // activation + rotation to import time so the 48h rotation cron has a
+      // baseline. Plain insert, not upsert — this path must never be able to
+      // touch an existing row.
       const nowIso = new Date().toISOString();
-      simData.activated_at = nowIso;
-      simData.last_mdn_rotated_at = nowIso;
-    }
+      const insRes = await supabaseInsert(env, 'sims', [{
+        iccid,
+        vendor: 'teltik',
+        carrier: 'tmobile',
+        rotation_interval_hours: 48,
+        status: 'active',
+        activated_at: nowIso,
+        last_mdn_rotated_at: nowIso,
+      }]);
+      if (!insRes.ok) {
+        const errText = await insRes.text();
+        console.log(`[Import] Insert failed for ICCID ${iccid}: ${insRes.status} ${errText}`);
+        continue;
+      }
 
-    const upsertRes = await supabaseUpsert(env, 'sims', simData, 'iccid');
-    if (!upsertRes.ok) {
-      const errText = await upsertRes.text();
-      console.log(`[Import] Upsert failed for ICCID ${iccid}: ${upsertRes.status} ${errText}`);
-      continue;
-    }
-
-    // Reuse the simId from the precomputed map for existing rows; only query
-    // the DB for brand-new ones (one subrequest saved per existing SIM).
-    let simId = existingSimId;
-    if (!simId) {
       const simRows = await supabaseGetArray(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`);
       if (!Array.isArray(simRows) || simRows.length === 0) {
-        console.log(`[Import] Could not find SIM after upsert for ICCID ${iccid}`);
+        console.log(`[Import] Could not find SIM after insert for ICCID ${iccid}`);
         skipped++;
         continue;
       }
@@ -365,6 +386,8 @@ async function importTeltikLines(env, opts = {}) {
     updated,
     unchanged,
     skipped,
+    skipped_foreign_vendor: skippedForeignVendor,
+    skipped_att_unknown: skippedAttUnknown,
     next_offset: hasMore ? nextOffset : null,
     has_more: hasMore,
   };
@@ -1377,6 +1400,19 @@ async function applyTeltikActivation(env, data) {
   const mdnE164 = normalizeToE164(rawMdn);
   const mdnBare = rawMdn ? String(rawMdn).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
   if (!iccid || !mdnE164) return { outcome: 'noop', simId: null };
+
+  // Same hosting ≠ service-provider guard as importTeltikLines: Teltik can
+  // fire lifecycle events for SIMs it merely hosts. Never overwrite a row
+  // owned by another vendor, and never auto-create AT&T-looking ICCIDs.
+  const preexisting = await supabaseGetOne(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id,vendor&limit=1`);
+  if (preexisting && preexisting.vendor !== 'teltik') {
+    console.log(`[Lifecycle/activated] ICCID ${iccid} exists with vendor=${preexisting.vendor} — not overwriting`);
+    return { outcome: 'skipped_foreign_vendor', simId: preexisting.id };
+  }
+  if (!preexisting && looksLikeAttIccid(iccid)) {
+    console.log(`[Lifecycle/activated] ALERT: unknown ICCID ${iccid} has AT&T prefix — NOT creating as teltik; classify manually`);
+    return { outcome: 'skipped_att_unknown', simId: null };
+  }
 
   const nowIso = new Date().toISOString();
   const upsertRes = await supabaseUpsert(env, 'sims', {
