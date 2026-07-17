@@ -164,6 +164,9 @@
         }
     </script>
     <style>
+        /* SIMs table density toggle: compact halves row padding */
+        .sims-compact #sims-table td, .sims-compact thead th { padding-top: 0.3rem !important; padding-bottom: 0.3rem !important; }
+        .sims-compact #sims-table td { font-size: 0.75rem; }
         /* ====================================================================
            Mastercard-inspired design system — Canvas Cream / Ink Black
            Single source of theme tokens. All Tailwind dark-* classes are
@@ -1226,12 +1229,21 @@
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>
                                     Export
                                 </button>
+                                <button id="sims-density-btn" onclick="toggleSimsDensity()" title="Toggle row density (comfortable / compact)" class="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-gray-400 hover:text-white bg-dark-700 hover:bg-dark-600 border border-dark-500 rounded-lg transition">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
+                                    <span id="sims-density-label">Compact</span>
+                                </button>
                             </div>
                             <div class="flex flex-col gap-3 w-full">
                                 <div class="flex flex-wrap items-center gap-2">
+                                    <span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Views</span>
+                                    <span id="sims-saved-views" class="flex flex-wrap items-center gap-2"></span>
+                                    <button onclick="saveCurrentSimView()" title="Save the current filters, sort, and page size as a named view" class="px-2.5 py-1 text-xs rounded-full border border-dashed border-dark-400 text-gray-400 hover:text-white hover:border-gray-300 transition">+ Save view</button>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2">
                                     <span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Quick</span>
                                     <button data-preset="not_rotated_today"  onclick="toggleSimsPreset('not_rotated_today')"  class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Not rotated today</button>
-                                    <button data-preset="no_sms_12h"         onclick="toggleSimsPreset('no_sms_12h')"         class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No SMS in 12h</button>
+                                    <button disabled title="Needs server-side SMS counts — coming in Stage 3" class="px-2.5 py-1 text-xs rounded-full border border-dark-600 bg-dark-800 text-gray-600 cursor-not-allowed">No SMS in 12h</button>
                                     <button data-preset="any_error"          onclick="toggleSimsPreset('any_error')"          class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Any error</button>
                                     <button data-preset="no_reseller"        onclick="toggleSimsPreset('no_reseller')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No reseller</button>
                                     <button data-preset="auto_paused"        onclick="toggleSimsPreset('auto_paused')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Auto-rotate paused</button>
@@ -1265,10 +1277,10 @@
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','iccid')">ICCID <span class="sort-arrow" data-table="sims" data-col="iccid"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','phone_number')">Phone <span class="sort-arrow" data-table="sims" data-col="phone_number"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','status')">Status <span class="sort-arrow" data-table="sims" data-col="status"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','vendor')">Vendor <span class="sort-arrow" data-table="sims" data-col="vendor"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','vendor')" title="Service provider (badge) and hosting gateway (@ line)">Vendor / Host <span class="sort-arrow" data-table="sims" data-col="vendor"></span></th>
+                                    <th class="px-4 py-3 font-medium" title="Not sortable in server mode">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></th>
+                                    <th class="px-4 py-3 font-medium" title="Not sortable in server mode">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
+                                    <th class="px-4 py-3 font-medium" title="Not sortable in server mode">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_rotation_at')">Last Rotated <span class="sort-arrow" data-table="sims" data-col="last_rotation_at"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','activated_at')">Activated <span class="sort-arrow" data-table="sims" data-col="activated_at"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_notified_at')">Last Notified <span class="sort-arrow" data-table="sims" data-col="last_notified_at"></span></th>
@@ -4396,7 +4408,7 @@ set verify_pending; schedule §C.3 poll
             _simsSearchTimer = setTimeout(function(){
                 simsFilterState.search = (v || '').trim();
                 tableState.sims.page = 1;
-                renderSims();
+                loadSims();
             }, 250);
         }
         function onSimsStatusChange(v) {
@@ -4416,27 +4428,27 @@ set verify_pending; schedule §C.3 poll
         function onSimsVendorChange(v) {
             simsFilterState.vendors = v ? [v] : [];
             tableState.sims.page = 1;
-            renderSims();
+            loadSims();
         }
         function onSimsGatewayChange(v) {
             simsFilterState.gateways = v ? [v] : [];
             tableState.sims.page = 1;
-            renderSims();
+            loadSims();
         }
         function onSimsPresetChange(v) {
             simsFilterState.presets = new Set(v ? [v] : []);
             tableState.sims.page = 1;
-            renderSims();
+            loadSims();
         }
         function onSimsActivatedFromChange(v) {
             simsFilterState.activatedFrom = v || '';
             tableState.sims.page = 1;
-            renderSims();
+            loadSims();
         }
         function onSimsActivatedToChange(v) {
             simsFilterState.activatedTo = v || '';
             tableState.sims.page = 1;
-            renderSims();
+            loadSims();
         }
 
         // ===== SIMs filter UI: presets, multi-select popover, active chips =====
@@ -4459,7 +4471,7 @@ set verify_pending; schedule §C.3 poll
                 simsFilterState.presets.delete(id);
                 tableState.sims.page = 1;
                 renderSimsPresetChips();
-                renderSims();
+                loadSims();
                 return;
             }
             // Activating preset: clear all non-preset filters first.
@@ -4477,7 +4489,7 @@ set verify_pending; schedule §C.3 poll
             simsFilterState.presets.add(id);
             tableState.sims.page = 1;
             renderSimsPresetChips();
-            if (hadServerFilters) loadSims(true); else renderSims();
+            loadSims();
         }
         function setSimsCountBadges() {
             function fmt(arr){ return (arr && arr.length > 0) ? '(' + arr.length + ')' : ''; }
@@ -4575,7 +4587,7 @@ set verify_pending; schedule §C.3 poll
             else if (kind === 'activatedTo')   { simsFilterState.activatedTo = '';   const el = document.getElementById('filter-activated-to');   if (el) el.value = ''; }
             else if (kind === 'search') {        simsFilterState.search = '';        const el = document.getElementById('sims-search');           if (el) el.value = ''; }
             tableState.sims.page = 1;
-            renderSims();
+            loadSims();
         }
         function clearAllSimsFilters() {
             simsFilterState.status = [];
@@ -4597,46 +4609,45 @@ set verify_pending; schedule §C.3 poll
             const menu = document.getElementById('sims-filter-menu');
             if (!menu) return;
             menu._kind = kind;
-            const data = tableState.sims.data || [];
+            // Options are fixed lists (server-side filtering; per-option counts would need
+            // a facet endpoint — Stage 4).
             let opts = [];
             if (kind === 'status') {
-            const STATUS_OPTS = [
-                { value: 'active', label: 'Active' },
-                { value: 'provisioning', label: 'Provisioning' },
-                { value: 'pending', label: 'Pending' },
-                { value: 'suspended', label: 'Suspended' },
-                { value: 'canceled', label: 'Cancelled' },
-                { value: 'error', label: 'Error' },
-                { value: 'helix_timeout', label: 'Helix Timeout' },
-                { value: 'data_mismatch', label: 'Data Mismatch' },
-                { value: '__all__', label: 'Include cancelled (server flag)' },
-            ];
-                const counts = {};
-                data.forEach(function(s){ counts[s.status] = (counts[s.status]||0) + 1; });
-                opts = STATUS_OPTS.map(function(o){ return { value: o.value, label: o.label, count: o.value === '__all__' ? 0 : (counts[o.value] || 0) }; });
+                opts = [
+                    { value: 'active', label: 'Active' },
+                    { value: 'provisioning', label: 'Provisioning' },
+                    { value: 'pending', label: 'Pending' },
+                    { value: 'suspended', label: 'Suspended' },
+                    { value: 'canceled', label: 'Cancelled' },
+                    { value: 'error', label: 'Error' },
+                    { value: 'helix_timeout', label: 'Helix Timeout' },
+                    { value: 'data_mismatch', label: 'Data Mismatch' },
+                    { value: '__all__', label: 'Include cancelled (server flag)' },
+                ];
             } else if (kind === 'vendor') {
-            const VENDOR_OPTS = [
-                { value: 'helix', label: 'Helix (legacy)' },
-                { value: 'atomic', label: 'ATOMIC' },
-                { value: 'wing_iot', label: 'Wing IoT' },
-                { value: 'teltik', label: 'Teltik' },
-            ];
-                const counts = {};
-                data.forEach(function(s){ counts[s.vendor] = (counts[s.vendor]||0) + 1; });
-                opts = VENDOR_OPTS.map(function(o){ return { value: o.value, label: o.label, count: counts[o.value] || 0 }; });
+                opts = [
+                    { value: 'helix', label: 'Helix (legacy)' },
+                    { value: 'atomic', label: 'ATOMIC' },
+                    { value: 'wing_iot', label: 'Wing IoT' },
+                    { value: 'teltik', label: 'Teltik' },
+                ];
             } else if (kind === 'gateway') {
-                const counts = {};
-                data.forEach(function(s){ if (s.gateway_code) counts[s.gateway_code] = (counts[s.gateway_code]||0) + 1; });
-                opts = Object.keys(counts).sort().map(function(g){ return { value: g, label: g, count: counts[g] }; });
-                if (opts.length === 0) opts = [{ value: '', label: '(no gateways in current data)', count: 0 }];
+                const gws = window._simsGatewaysCache;
+                if (!gws) {
+                    opts = [{ value: '', label: 'Loading gateways…' }];
+                    fetch(API_BASE + '/gateways').then(function(r){ return r.json(); }).then(function(list){
+                        window._simsGatewaysCache = Array.isArray(list) ? list : [];
+                        if (!menu.classList.contains('hidden') && menu._kind === 'gateway') openSimsFilterMenu('gateway', anchorEl);
+                    }).catch(function(){ window._simsGatewaysCache = []; });
+                } else {
+                    opts = gws.filter(function(g){ return g.code; }).map(function(g){ return { value: g.code, label: g.code }; });
+                    if (opts.length === 0) opts = [{ value: '', label: '(no gateways)' }];
+                }
             } else if (kind === 'reseller') {
                 const cache = window._simsResellersCache || [];
-                const counts = {};
-                data.forEach(function(s){ if (s.reseller_id != null) counts[s.reseller_id] = (counts[s.reseller_id]||0) + 1; });
-                const noneCount = data.filter(function(s){ return !s.reseller_id; }).length;
-                opts = [{ value: 'none', label: '(unassigned)', count: noneCount }];
+                opts = [{ value: 'none', label: '(unassigned)' }];
                 cache.forEach(function(r){
-                    opts.push({ value: String(r.id), label: r.name || ('#' + r.id), count: counts[r.id] || 0 });
+                    opts.push({ value: String(r.id), label: r.name || ('#' + r.id) });
                 });
             }
             const selected = simsFilterMenuGetSelected(kind);
@@ -4646,10 +4657,12 @@ set verify_pending; schedule §C.3 poll
                 const checked = selected.has(v) ? 'checked' : '';
                 const safeV = v.replace(/"/g, '&quot;');
                 const safeLabel = String(o.label).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                if (v === '') {
+                    return '<div class="px-2 py-1 text-sm text-gray-500">' + safeLabel + '</div>';
+                }
                 return '<label class="flex items-center gap-2 px-2 py-1 rounded hover:bg-dark-700 cursor-pointer text-sm text-gray-300">' +
                     '<input type="checkbox" ' + checked + ' value="' + safeV + '" class="accent-green-500" onchange="simsFilterMenuToggle(this)">' +
                     '<span class="flex-1">' + safeLabel + '</span>' +
-                    '<span class="text-gray-500 text-xs">(' + (o.count || 0) + ')</span>' +
                     '</label>';
             }).join('');
             const search = document.getElementById('sims-filter-menu-search');
@@ -4695,7 +4708,7 @@ set verify_pending; schedule §C.3 poll
                 if (checked) pushUnique(simsFilterState[key], v);
                 else simsFilterState[key] = simsFilterState[key].filter(function(s){ return String(s) !== v; });
                 tableState.sims.page = 1;
-                renderSims();
+                loadSims();
             }
         }
         function simsFilterMenuFilter() {
@@ -4722,11 +4735,12 @@ set verify_pending; schedule §C.3 poll
             const menu = document.getElementById('sims-filter-menu');
             if (!menu) return;
             const kind = menu._kind;
-            if      (kind === 'status')   { simsFilterState.status = [];      loadSims(true); }
-            else if (kind === 'vendor')   { simsFilterState.vendors = [];     renderSims(); }
-            else if (kind === 'gateway')  { simsFilterState.gateways = [];    renderSims(); }
-            else if (kind === 'reseller') { simsFilterState.resellerIds = []; loadSims(true); }
+            if      (kind === 'status')   simsFilterState.status = [];
+            else if (kind === 'vendor')   simsFilterState.vendors = [];
+            else if (kind === 'gateway')  simsFilterState.gateways = [];
+            else if (kind === 'reseller') simsFilterState.resellerIds = [];
             tableState.sims.page = 1;
+            loadSims();
             simsFilterMenuClose();
         }
 
@@ -4878,6 +4892,83 @@ set verify_pending; schedule §C.3 poll
             }
         }
 
+        // ===== SIMs saved views (localStorage snapshots of the URL-serialized filter state) =====
+        function getSavedSimViews() {
+            try { return JSON.parse(localStorage.getItem('simsSavedViews') || '[]'); } catch(e) { return []; }
+        }
+        function setSavedSimViews(views) {
+            try { localStorage.setItem('simsSavedViews', JSON.stringify(views)); } catch(e) {}
+            renderSimsSavedViews();
+        }
+        function renderSimsSavedViews() {
+            const el = document.getElementById('sims-saved-views');
+            if (!el) return;
+            const views = getSavedSimViews();
+            el.innerHTML = views.map(function(v, i){
+                const safeName = String(v.name).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+                return '<span class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-full border border-indigo-500/40 bg-indigo-500/10 text-indigo-300">' +
+                    '<button onclick="applySimView(' + i + ')" class="hover:text-white transition" title="Apply this view">' + safeName + '</button>' +
+                    '<button onclick="deleteSimView(' + i + ')" class="text-indigo-400/60 hover:text-red-400 transition" title="Delete this view">&times;</button>' +
+                    '</span>';
+            }).join('');
+        }
+        function saveCurrentSimView() {
+            syncSimsUrl();
+            const name = window.prompt('Name for this view (current filters, sort, and page size):');
+            if (!name || !name.trim()) return;
+            const views = getSavedSimViews().filter(function(v){ return v.name !== name.trim(); });
+            views.push({ name: name.trim(), qs: location.search || '' });
+            setSavedSimViews(views);
+            showToast('View "' + name.trim() + '" saved', 'success');
+        }
+        function resetSimsFilterState() {
+            simsFilterState.status = ['active'];
+            simsFilterState.resellerIds = [];
+            simsFilterState.vendors = [];
+            simsFilterState.gateways = [];
+            simsFilterState.presets = new Set();
+            simsFilterState.activatedFrom = '';
+            simsFilterState.activatedTo = '';
+            simsFilterState.search = '';
+            tableState.sims.sortKey = 'id';
+            tableState.sims.sortDir = 'desc';
+            tableState.sims.page = 1;
+            tableState.sims.pageSize = 50;
+            const fa = document.getElementById('filter-activated-from'); if (fa) fa.value = '';
+            const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = '';
+            const sa = document.getElementById('sims-search');            if (sa) sa.value = '';
+        }
+        function applySimView(idx) {
+            const v = getSavedSimViews()[idx];
+            if (!v) return;
+            resetSimsFilterState();
+            history.replaceState(history.state || { tab: 'sims' }, '', '/sims' + (v.qs || ''));
+            hydrateSimsFromUrl();
+            loadSims();
+        }
+        function deleteSimView(idx) {
+            const views = getSavedSimViews();
+            const v = views[idx];
+            if (!v) return;
+            views.splice(idx, 1);
+            setSavedSimViews(views);
+            showToast('View "' + v.name + '" deleted', 'info');
+        }
+
+        // ===== SIMs density toggle (comfortable / compact) =====
+        function applySimsDensity() {
+            const compact = localStorage.getItem('simsDensity') === 'compact';
+            const tab = document.getElementById('tab-sims');
+            if (tab) tab.classList.toggle('sims-compact', compact);
+            const label = document.getElementById('sims-density-label');
+            if (label) label.textContent = compact ? 'Comfortable' : 'Compact';
+        }
+        function toggleSimsDensity() {
+            const compact = localStorage.getItem('simsDensity') === 'compact';
+            try { localStorage.setItem('simsDensity', compact ? 'comfortable' : 'compact'); } catch(e) {}
+            applySimsDensity();
+        }
+
         function sortTable(table, key) {
             const state = tableState[table];
             if (state.sortKey === key) {
@@ -4892,7 +4983,7 @@ set verify_pending; schedule §C.3 poll
             if (arrow) arrow.textContent = state.sortDir === 'asc' ? ' ▲' : ' ▼';
             state.page = 1;
             // Re-render
-            if (table === 'sims') renderSims();
+            if (table === 'sims') loadSims();
             else if (table === 'messages') renderMessages();
             else if (table === 'imei') renderImeiPool();
             else if (table === 'errors') renderErrors();
@@ -5129,7 +5220,7 @@ set verify_pending; schedule §C.3 poll
                     if (typeof simsFilterState !== 'undefined') {
                         simsFilterState.presets = new Set(['not_notified']);
                         if (typeof renderSimsPresetChips === 'function') renderSimsPresetChips();
-                        if (typeof renderSims === 'function') renderSims();
+                        if (typeof loadSims === 'function') loadSims();
                     }
                 }, 50);
             } catch(e) { console.error('goToStaleSims failed', e); }
@@ -5575,110 +5666,95 @@ set verify_pending; schedule §C.3 poll
           }
         }
 
-                let lastSimsFetchedAt = 0;
-        const SIM_CACHE_MS = 30 * 60 * 1000; // 30 minutes
-
-        async function loadSims(force = false) {
-            // Check cache: if data loaded < 30 min ago and not forced, skip fetch
-            const now = Date.now();
-            if (!force && lastSimsFetchedAt && (now - lastSimsFetchedAt) < SIM_CACHE_MS && tableState.sims.data.length > 0) {
-                const cacheAge = Math.round((now - lastSimsFetchedAt) / 60000);
-                const cacheLabel = document.getElementById('sims-cache-label');
-                if (cacheLabel) cacheLabel.textContent = '(cached ' + cacheAge + 'm ago)';
-                renderSims();
-                return;
+        // ===== SIMs server mode: every load fetches the current page from /api/sims/query =====
+        // Sort keys the server accepts (mirrors SIMS_QUERY_SORTS in the worker).
+        const SIMS_SERVER_SORTS = ['id','iccid','status','vendor','carrier','activated_at','last_mdn_rotated_at','last_rotation_at','last_notified_at','gateway_id','gateway_code','msisdn','phone_number'];
+        function buildSimsQueryParams() {
+            const s = simsFilterState;
+            const t = tableState.sims;
+            const params = new URLSearchParams();
+            params.set('page', String(t.page));
+            params.set('page_size', String(t.pageSize));
+            if (SIMS_SERVER_SORTS.includes(t.sortKey)) {
+                params.set('sort', t.sortKey);
+                params.set('dir', t.sortDir);
             }
+            if (s.search) params.set('q', s.search);
+            const statuses = s.status.filter(function(v){ return v !== '__all__'; });
+            if (statuses.length) params.set('status', statuses.join(','));
+            if (s.status.includes('__all__')) params.set('hide_cancelled', 'false');
+            if (s.vendors.length) params.set('vendor', s.vendors.join(','));
+            if (s.gateways.length) params.set('gateway_code', s.gateways.join(','));
+            if (s.resellerIds.length) params.set('reseller_id', s.resellerIds.join(','));
+            if (s.presets.size) params.set('preset', Array.from(s.presets).join(','));
+            if (s.activatedFrom) params.set('activated_from', s.activatedFrom);
+            if (s.activatedTo) params.set('activated_to', s.activatedTo);
+            return params;
+        }
+        let _simsLoadSeq = 0;
+        async function loadSims() {
+            const seq = ++_simsLoadSeq;
+            const cacheLabel = document.getElementById('sims-cache-label');
+            if (cacheLabel) cacheLabel.textContent = '(loading…)';
             try {
-                const params = new URLSearchParams();
-                const sArr = simsFilterState.status;
-                const includeCancelled = sArr.includes('__all__') || sArr.includes('canceled');
-                if (includeCancelled) {
-                    params.set('hide_cancelled', 'false');
+                const response = await fetch(API_BASE + '/sims/query?' + buildSimsQueryParams().toString());
+                const data = await response.json();
+                if (!response.ok || data.error) throw new Error(data.error || ('HTTP ' + response.status));
+                if (seq !== _simsLoadSeq) return; // a newer request superseded this one
+                if ((!data.rows || data.rows.length === 0) && data.total > 0 && tableState.sims.page > 1) {
+                    // Filters shrank the result set below the current page — snap back to page 1.
+                    tableState.sims.page = 1;
+                    loadSims();
+                    return;
                 }
-                if (sArr.length === 1 && sArr[0] !== '__all__') {
-                    params.set('status', sArr[0]);
-                }
-                // Multi-status without canceled/__all__: server hides cancelled (default),
-                // returning a smaller set. renderSims() filters the union client-side.
-                const rIds = simsFilterState.resellerIds;
-                if (rIds.length === 1 && rIds[0] !== 'none') {
-                    params.set('reseller_id', String(rIds[0]));
-                }
-                if (force) params.set('force', 'true');
-
-                const url = API_BASE + '/sims?' + params.toString();
-                const response = await fetch(url);
-                const sims = await response.json();
-                tableState.sims.data = sims;
-                lastSimsFetchedAt = Date.now();
-                // Populate gateway dropdown
-                const gwSel = document.getElementById('filter-gateway');
-                if (gwSel) {
-                  const current = gwSel.value;
-                  const gateways = [...new Set(sims.map(s => s.gateway_code).filter(Boolean))].sort();
-                  gwSel.innerHTML = '<option value="">All Gateways</option>' + gateways.map(g => `<option value="${g}"${current===g?' selected':''}>${g}</option>`).join('');
-                }
-                const cacheLabel = document.getElementById('sims-cache-label');
-                if (cacheLabel) cacheLabel.textContent = '(just loaded)';
+                tableState.sims.data = data.rows || [];
+                tableState.sims.total = data.total || 0;
+                if (cacheLabel) cacheLabel.textContent = '';
                 const lastUpdated = document.getElementById('last-updated');
                 if (lastUpdated) lastUpdated.textContent = 'Updated ' + new Date().toLocaleTimeString();
                 renderSims();
             } catch (error) {
-                showToast('Error loading SIMs', 'error');
+                if (seq !== _simsLoadSeq) return;
+                if (cacheLabel) cacheLabel.textContent = '';
+                showToast('Error loading SIMs: ' + (error && error.message ? error.message : error), 'error');
                 console.error(error);
             }
         }
-// Apply the active SIMs filters + sort and return the matching rows (pre-pagination).
-// Shared by renderSims() (for display) and exportSimsCsv() (for export).
-function getFilteredSims() {
-  const state = tableState.sims;
-  let data = state.data;
-  // Search (debounced upstream via onSimsSearchInput)
-  if (simsFilterState.search) data = data.filter(s => matchesSearch(s, simsFilterState.search));
-  // Reseller (multi: 'none' sentinel = unassigned, otherwise numeric id)
-  const rIds = simsFilterState.resellerIds;
-  if (rIds.length > 0) {
-    data = data.filter(s => rIds.some(id => id === 'none' ? !s.reseller_id : (s.reseller_id === id || s.reseller_id === parseInt(id, 10))));
-  }
-  // Gateway (multi)
-  if (simsFilterState.gateways.length > 0) {
-    data = data.filter(s => simsFilterState.gateways.includes(s.gateway_code));
-  }
-  // Vendor (multi)
-  if (simsFilterState.vendors.length > 0) {
-    data = data.filter(s => simsFilterState.vendors.includes(s.vendor));
-  }
-  // Status (only client-filter when multi-select; single-status case already filtered server-side)
-  const sArr = simsFilterState.status;
-  if (sArr.length > 1 && !sArr.includes('__all__')) {
-    data = data.filter(s => sArr.includes(s.status));
-  }
-  // Activated date range
-  if (simsFilterState.activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= simsFilterState.activatedFrom);
-  if (simsFilterState.activatedTo) data = data.filter(s => s.activated_at && s.activated_at <= simsFilterState.activatedTo + 'T23:59:59');
-  // Presets (AND across active presets)
-  for (const pid of simsFilterState.presets) {
-    const p = SIM_PRESETS[pid];
-    if (p && p.test) data = data.filter(p.test);
-  }
-  return genericSort(data, state.sortKey, state.sortDir);
-}
-
+        // Fetch every row matching the current filters (paged server fetch). Used by CSV export.
+        async function fetchAllFilteredSims(maxRows) {
+            maxRows = maxRows || 10000;
+            const out = [];
+            let page = 1;
+            for (;;) {
+                const params = buildSimsQueryParams();
+                params.set('page', String(page));
+                params.set('page_size', '500');
+                const resp = await fetch(API_BASE + '/sims/query?' + params.toString());
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+                out.push(...(data.rows || []));
+                if (!data.rows || data.rows.length === 0 || out.length >= data.total || out.length >= maxRows) break;
+                page++;
+            }
+            return out;
+        }
 function renderSims() {
   renderSimsPresetChips();
   renderSimsActiveChips();
+  renderSimsSavedViews();
+  applySimsDensity();
   setSimsCountBadges();
   syncSimsUrl();
   const state = tableState.sims;
-  let data = getFilteredSims();
+  const data = state.data;
+  const total = state.total || 0;
 
   const tbody = document.getElementById('sims-table');
   const countEl = document.getElementById('sims-count');
-  countEl.textContent = `${data.length} of ${state.data.length} SIM(s)`;
+  const totalPages = Math.max(1, Math.ceil(total / state.pageSize));
+  countEl.textContent = total + ' matching \u00b7 page ' + Math.min(state.page, totalPages) + '/' + totalPages;
 
-            const totalFiltered = data.length;
-            data = paginate(data, 'sims');
-            renderPaginationControls('sims-pagination', 'sims', totalFiltered);
+            renderPaginationControls('sims-pagination', 'sims', total);
 
             if (data.length === 0) {
                 const fs = simsFilterState;
@@ -5716,7 +5792,7 @@ function renderSims() {
                     <td class="px-4 py-3">
                         <span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${sim.status}</span>
                     </td>
-                    <td class="px-4 py-3">${vendorBadge}</td>
+                    <td class="px-4 py-3">${vendorBadge}<span class="block text-[10px] text-gray-500 mt-0.5" title="Hosting gateway (where the SIM physically sits)">@ ${sim.gateway_host || 'skyline'}</span></td>
                     <td class="px-4 py-3 text-gray-400">${sim.reseller_name || '-'}</td>
                     <td class="px-4 py-3 text-gray-300">${sim.sms_count || 0}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">${lastSms}</td>
@@ -5741,11 +5817,16 @@ function renderSims() {
 
         // Export SIMs to CSV. If any rows are selected (checkboxes), export only those;
         // otherwise export every SIM matching the current filters. Columns mirror the table.
-        function exportSimsCsv() {
+        async function exportSimsCsv() {
             const selectedIds = new Set([...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value)));
-            const rows = selectedIds.size > 0
-                ? tableState.sims.data.filter(s => selectedIds.has(s.id))
-                : getFilteredSims();
+            let rows;
+            if (selectedIds.size > 0) {
+                rows = tableState.sims.data.filter(s => selectedIds.has(s.id));
+            } else {
+                showToast('Exporting all SIMs matching the current filters…', 'info');
+                try { rows = await fetchAllFilteredSims(); }
+                catch (e) { showToast('Export failed: ' + (e && e.message ? e.message : e), 'error'); return; }
+            }
             if (!rows.length) {
                 showToast('No SIMs to export', 'error');
                 return;
@@ -7916,13 +7997,13 @@ async function sendSimOnline(simId, phoneNumber) {
         function changePageSize(table, size) {
             tableState[table].pageSize = parseInt(size);
             tableState[table].page = 1;
-            const renderMap = { sims: renderSims, messages: renderMessages, imei: renderImeiPool, errors: renderErrors };
+            const renderMap = { sims: loadSims, messages: renderMessages, imei: renderImeiPool, errors: renderErrors };
             if (renderMap[table]) renderMap[table]();
         }
 
         function goToPage(table, page) {
             tableState[table].page = page;
-            const renderMap = { sims: renderSims, messages: renderMessages, imei: renderImeiPool, errors: renderErrors };
+            const renderMap = { sims: loadSims, messages: renderMessages, imei: renderImeiPool, errors: renderErrors };
             if (renderMap[table]) renderMap[table]();
         }
 
@@ -8725,7 +8806,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         }
                         const sa = document.getElementById('sims-search');
                         if (sa) sa.value = q;
-                        if (typeof renderSims === 'function') renderSims();
+                        if (typeof loadSims === 'function') loadSims();
                     } catch(inner) { console.error('goToSimsBySearch hydrate failed', inner); }
                 }, 50);
             } catch(e) { console.error('goToSimsBySearch failed', e); }
@@ -10626,7 +10707,9 @@ async function sendSimOnline(simId, phoneNumber) {
         async function bulkDeleteSims() {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            if (!(await showConfirm('Delete SIMs', 'Permanently delete ' + simIds.length + ' SIM(s)? This deletes all SMS history and CANNOT be undone.'))) return;
+            const typed = window.prompt('Permanently delete ' + simIds.length + ' SIM(s)? This deletes all SMS history and CANNOT be undone.\n\nType the number of SIMs (' + simIds.length + ') to confirm:');
+            if (typed === null) return;
+            if (typed.trim() !== String(simIds.length)) { showToast('Count mismatch — delete cancelled', 'info'); return; }
             const output = document.getElementById('sim-action-output');
             document.getElementById('sim-action-title').textContent = 'Bulk Delete — ' + simIds.length + ' SIMs';
             output.textContent = 'Starting...';
@@ -12221,6 +12304,7 @@ async function sendSimOnline(simId, phoneNumber) {
             _sdCurrentSim = sim;
             document.getElementById('sd-title').textContent = 'SIM #' + sim.id;
             document.getElementById('sd-subtitle').textContent = sim.iccid || '';
+            renderSimDetailBadges(sim);
             renderSimDetailDetails(sim);
             renderSimDetailStatus(sim);
             renderSimDetailImei(sim);
@@ -12236,7 +12320,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         function switchSimDetailTab(tab) {
-            ['details', 'status', 'imei', 'logs', 'billing'].forEach(function(t) {
+            ['details', 'status', 'imei', 'logs', 'billing', 'history', 'edit'].forEach(function(t) {
                 var content = document.getElementById('sdtab-' + t);
                 var btn = document.getElementById('sdtab-btn-' + t);
                 if (!content || !btn) return;
@@ -12251,6 +12335,165 @@ async function sendSimOnline(simId, phoneNumber) {
             });
             if (tab === 'logs' && _sdCurrentSim) loadSimDetailLogs(_sdCurrentSim.id, _sdCurrentSim.iccid);
             if (tab === 'billing' && _sdCurrentSim) loadSimDetailBilling(_sdCurrentSim.id);
+            if (tab === 'history' && _sdCurrentSim) loadSimDetailHistory(_sdCurrentSim.id);
+            if (tab === 'edit' && _sdCurrentSim) renderSimDetailEdit(_sdCurrentSim);
+        }
+
+        function _sdEsc(v) {
+            return String(v == null ? '' : v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+
+        // Header badges: status + service provider (vendor) + hosting gateway.
+        // Vendor vs host is the SIM #639 class of confusion — both always visible here.
+        function renderSimDetailBadges(sim) {
+            var el = document.getElementById('sd-badges');
+            if (!el) return;
+            var statusClass = ({
+                active: 'bg-accent/20 text-accent',
+                provisioning: 'bg-yellow-500/20 text-yellow-400',
+                suspended: 'bg-orange-500/20 text-orange-400',
+                canceled: 'bg-red-500/20 text-red-400',
+                error: 'bg-red-500/20 text-red-400',
+            })[sim.status] || 'bg-gray-500/20 text-gray-400';
+            var vendorClass = ({teltik:'bg-purple-500/20 text-purple-300', atomic:'bg-blue-500/20 text-blue-300', wing_iot:'bg-green-500/20 text-green-300', helix:'bg-gray-500/20 text-gray-400'})[sim.vendor] || 'bg-gray-500/20 text-gray-400';
+            el.innerHTML =
+                '<span class="px-2 py-0.5 text-xs font-medium rounded-full ' + statusClass + '">' + _sdEsc(sim.status || '?') + '</span>' +
+                '<span class="px-2 py-0.5 text-xs font-medium rounded ' + vendorClass + '" title="Service provider (who bills / provisions this SIM)">SP: ' + _sdEsc(sim.vendor || 'unknown') + '</span>' +
+                '<span class="px-2 py-0.5 text-xs font-medium rounded bg-slate-500/20 text-slate-300" title="Hosting gateway (where the SIM physically sits)">Host: ' + _sdEsc(sim.gateway_host || 'skyline') + '</span>';
+        }
+
+        // ===== Drawer: History tab (merged timeline from /api/sim-history) =====
+        async function loadSimDetailHistory(simId) {
+            var c = document.getElementById('sd-history-container');
+            c.innerHTML = '<p class="text-gray-500 text-sm">Loading history&hellip;</p>';
+            try {
+                var resp = await fetch(API_BASE + '/sim-history?sim_id=' + simId);
+                var data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+                var events = Array.isArray(data.events) ? data.events : [];
+                if (!events.length) {
+                    c.innerHTML = '<p class="text-gray-500 text-sm">No history recorded for this SIM.</p>';
+                    return;
+                }
+                var TYPE_STYLE = {
+                    status:  ['Status',  'bg-yellow-500/20 text-yellow-400'],
+                    edit:    ['Edit',    'bg-blue-500/20 text-blue-300'],
+                    error:   ['Error',   'bg-red-500/20 text-red-400'],
+                    webhook: ['Webhook', 'bg-indigo-500/20 text-indigo-300'],
+                };
+                c.innerHTML = events.map(function(ev) {
+                    var st = TYPE_STYLE[ev.type] || [ev.type, 'bg-gray-500/20 text-gray-400'];
+                    var when = ev.at ? new Date(ev.at).toLocaleString() : '?';
+                    var by = ev.by ? ' <span class="text-gray-500">by ' + _sdEsc(ev.by) + '</span>' : '';
+                    return '<div class="flex items-start gap-3 py-2 border-b border-dark-700">' +
+                        '<span class="px-1.5 py-0.5 text-[10px] font-medium rounded uppercase shrink-0 mt-0.5 ' + st[1] + '">' + _sdEsc(st[0]) + '</span>' +
+                        '<div class="min-w-0 flex-1">' +
+                        '<p class="text-sm text-gray-200 break-words">' + _sdEsc(ev.detail || '') + by + '</p>' +
+                        '<p class="text-xs text-gray-500 mt-0.5">' + _sdEsc(when) + '</p>' +
+                        '</div></div>';
+                }).join('');
+            } catch (e) {
+                c.innerHTML = '<p class="text-red-400 text-sm">Failed to load history: ' + _sdEsc(e && e.message ? e.message : e) + '</p>';
+            }
+        }
+
+        // ===== Drawer: Edit tab (guarded field correction via /api/update-sim) =====
+        // Whitelist mirrors SIM_EDITABLE_FIELDS in the worker.
+        var SIM_EDIT_FIELDS = [
+            { key: 'vendor', label: 'Service provider (vendor)', type: 'select', options: ['atomic','teltik','wing_iot','helix','unknown'] },
+            { key: 'gateway_host', label: 'Hosting gateway', type: 'select', options: ['skyline','teltik'] },
+            { key: 'carrier', label: 'Carrier', type: 'text', hint: 'lowercase, e.g. tmobile / att' },
+            { key: 'status_reason', label: 'Status reason', type: 'text' },
+            { key: 'gateway_id', label: 'Gateway ID', type: 'number' },
+            { key: 'port', label: 'Port', type: 'text' },
+            { key: 'slot', label: 'Slot', type: 'text' },
+            { key: 'msisdn', label: 'MSISDN', type: 'text', hint: 'digits only, 10–15' },
+            { key: 'rotation_interval_hours', label: 'Rotation interval (hours)', type: 'number', hint: '1–168' },
+        ];
+        var _sdEditPrior = null;
+        function renderSimDetailEdit(sim) {
+            _sdEditPrior = {};
+            var rows = SIM_EDIT_FIELDS.map(function(f) {
+                var cur = sim[f.key];
+                _sdEditPrior[f.key] = (cur === undefined || cur === '') ? null : cur;
+                var inputId = 'sd-edit-' + f.key;
+                var input;
+                if (f.type === 'select') {
+                    input = '<select id="' + inputId + '" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent">' +
+                        f.options.map(function(o){ return '<option value="' + o + '"' + (String(cur) === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') +
+                        '</select>';
+                } else {
+                    input = '<input id="' + inputId + '" type="' + (f.type === 'number' ? 'number' : 'text') + '" value="' + _sdEsc(cur == null ? '' : cur) + '" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm font-mono focus:outline-none focus:border-accent">';
+                }
+                var hint = f.hint ? '<p class="text-[11px] text-gray-600 mt-0.5">' + f.hint + '</p>' : '';
+                return '<div><p class="text-xs text-gray-500 mb-1">' + f.label + '</p>' + input + hint + '</div>';
+            }).join('');
+            document.getElementById('sdtab-edit').innerHTML =
+                '<div class="mb-4 p-3 bg-dark-900 border border-dark-600 rounded-lg text-xs text-gray-400">' +
+                'Guarded correction: only changed fields are sent, each with the value you see now. ' +
+                'If the SIM changed underneath you meanwhile, the save fails with a conflict instead of overwriting.' +
+                '</div>' +
+                '<div class="grid grid-cols-2 gap-x-6 gap-y-4">' + rows + '</div>' +
+                '<div class="mt-5 pt-4 border-t border-dark-600 flex justify-end gap-2">' +
+                '<button onclick="renderSimDetailEdit(_sdCurrentSim)" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-300 rounded-lg transition">Reset</button>' +
+                '<button id="sd-edit-save" onclick="applySimDetailEdit()" class="px-4 py-2 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition">Save changes</button>' +
+                '</div>';
+        }
+        function _sdEditReadValue(f) {
+            var el = document.getElementById('sd-edit-' + f.key);
+            if (!el) return null;
+            var v = el.value;
+            if (v === '' || v == null) return null;
+            if (f.type === 'number') { var n = parseInt(v, 10); return Number.isFinite(n) ? n : null; }
+            return String(v).trim() === '' ? null : String(v).trim();
+        }
+        async function applySimDetailEdit() {
+            if (!_sdCurrentSim || !_sdEditPrior) return;
+            var changes = {};
+            var labels = [];
+            for (var i = 0; i < SIM_EDIT_FIELDS.length; i++) {
+                var f = SIM_EDIT_FIELDS[i];
+                var oldVal = _sdEditPrior[f.key];
+                var newVal = _sdEditReadValue(f);
+                if (String(oldVal == null ? '' : oldVal) === String(newVal == null ? '' : newVal)) continue;
+                changes[f.key] = { old: oldVal, new: newVal };
+                labels.push(f.key + ': ' + (oldVal == null ? '(empty)' : oldVal) + ' → ' + (newVal == null ? '(empty)' : newVal));
+            }
+            if (!labels.length) { showToast('No changes to save', 'info'); return; }
+            // Vendor changes get an explicit confirm naming both values (SIM #639 lesson).
+            if (changes.vendor) {
+                var ok = await showConfirm('Change service provider',
+                    'Change vendor of SIM #' + _sdCurrentSim.id + ' from "' + (changes.vendor.old || 'unknown') + '" to "' + changes.vendor.new + '"? This affects rotation, billing, and notification logic.');
+                if (!ok) return;
+            }
+            var btn = document.getElementById('sd-edit-save');
+            if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+            try {
+                var resp = await fetch(API_BASE + '/update-sim', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_id: _sdCurrentSim.id, changes: changes }),
+                });
+                var result = await resp.json();
+                if (resp.status === 409) {
+                    showToast('Conflict: ' + (result.message || result.error || 'row changed underneath') + (result.applied && result.applied.length ? ' (already applied: ' + result.applied.join(', ') + ')' : ''), 'error');
+                    closeSimDetail();
+                    loadSims();
+                    return;
+                }
+                if (!resp.ok || !result.ok) throw new Error(result.error || ('HTTP ' + resp.status));
+                showToast('SIM #' + _sdCurrentSim.id + ' updated: ' + (result.applied || []).join(', '), 'success');
+                // Reflect the change locally and refresh the drawer + table.
+                for (var k in changes) _sdCurrentSim[k] = changes[k].new;
+                renderSimDetailBadges(_sdCurrentSim);
+                renderSimDetailDetails(_sdCurrentSim);
+                renderSimDetailEdit(_sdCurrentSim);
+                loadSims();
+            } catch (e) {
+                showToast('Update failed: ' + (e && e.message ? e.message : e), 'error');
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = 'Save changes'; }
+            }
         }
 
         function normalizePortDisplay(p) {
@@ -13315,21 +13558,26 @@ async function sendSimOnline(simId, phoneNumber) {
         </div>
     </div>
 
-    <div id="sim-detail-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-3xl max-h-[90vh] flex flex-col">
-            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-center">
+    <!-- SIM record drawer (right side panel) -->
+    <div id="sim-detail-modal" class="hidden fixed inset-0 z-50">
+        <div class="absolute inset-0 bg-black/50" onclick="closeSimDetail()"></div>
+        <div class="absolute right-0 top-0 h-full w-full max-w-2xl bg-dark-800 border-l border-dark-600 shadow-2xl flex flex-col">
+            <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-start">
                 <div>
                     <h3 id="sd-title" class="text-lg font-semibold text-white">SIM Detail</h3>
                     <p id="sd-subtitle" class="text-xs text-gray-500 mt-0.5 font-mono"></p>
+                    <div id="sd-badges" class="flex flex-wrap items-center gap-2 mt-2"></div>
                 </div>
                 <button onclick="closeSimDetail()" class="text-gray-400 hover:text-white text-xl leading-none">&times;</button>
             </div>
-            <div class="border-b border-dark-600 flex px-2">
+            <div class="border-b border-dark-600 flex px-2 overflow-x-auto">
                 <button id="sdtab-btn-details" onclick="switchSimDetailTab('details')" class="py-3 px-4 text-sm text-white border-b-2 border-accent transition">Details</button>
                 <button id="sdtab-btn-status" onclick="switchSimDetailTab('status')" class="py-3 px-4 text-sm text-gray-400 transition">Status</button>
                 <button id="sdtab-btn-imei" onclick="switchSimDetailTab('imei')" class="py-3 px-4 text-sm text-gray-400 transition">IMEI</button>
                 <button id="sdtab-btn-logs" onclick="switchSimDetailTab('logs')" class="py-3 px-4 text-sm text-gray-400 transition">API Logs</button>
                 <button id="sdtab-btn-billing" onclick="switchSimDetailTab('billing')" class="py-3 px-4 text-sm text-gray-400 transition">Billing</button>
+                <button id="sdtab-btn-history" onclick="switchSimDetailTab('history')" class="py-3 px-4 text-sm text-gray-400 transition">History</button>
+                <button id="sdtab-btn-edit" onclick="switchSimDetailTab('edit')" class="py-3 px-4 text-sm text-gray-400 transition">Edit</button>
             </div>
             <div class="p-5 overflow-y-auto flex-1">
                 <div id="sdtab-details"></div>
@@ -13343,6 +13591,14 @@ async function sendSimOnline(simId, phoneNumber) {
                     <div id="sd-logs-container"></div>
                 </div>
                 <div id="sdtab-billing" class="hidden"></div>
+                <div id="sdtab-history" class="hidden">
+                    <div class="flex justify-between items-center mb-3">
+                        <p class="text-sm text-gray-400">Status changes, manual edits, errors, and webhook notifies</p>
+                        <button onclick="if(_sdCurrentSim)loadSimDetailHistory(_sdCurrentSim.id)" class="px-2 py-1 text-xs bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">&#8635; Refresh</button>
+                    </div>
+                    <div id="sd-history-container"></div>
+                </div>
+                <div id="sdtab-edit" class="hidden"></div>
             </div>
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end">
                 <button onclick="closeSimDetail()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>
