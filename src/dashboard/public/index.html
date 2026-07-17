@@ -4915,12 +4915,15 @@ set verify_pending; schedule §C.3 poll
         }
 
         function normalizePastedSearch(el, e, cb) {
-            var NL = String.fromCharCode(10);
-            var CR = String.fromCharCode(13);
             var text = (e.clipboardData||window.clipboardData).getData('text');
-            if (text.indexOf(NL) === -1 && text.indexOf(CR) === -1) return;
+            var tokens = text.split(/[\s,;]+/).map(function(s){return s.trim();}).filter(Boolean);
+            // Treat the paste as an ID list if it has hard separators (newline/tab)
+            // or is multiple long numeric tokens (SIM IDs, MDNs, ICCIDs, rental IDs).
+            // Free-text phrases with ordinary spaces paste through untouched.
+            var isList = /[\n\r\t]/.test(text) || (tokens.length > 1 && tokens.every(function(t){return /^\+?\d{5,}$/.test(t);}));
+            if (!isList) return;
             e.preventDefault();
-            var normalized = text.split(new RegExp('[' + CR + NL + ']+')).map(function(s){return s.trim();}).filter(Boolean).join(',');
+            var normalized = tokens.join(',');
             var s = el.selectionStart, end = el.selectionEnd;
             el.value = el.value.slice(0, s) + normalized + el.value.slice(end);
             cb();
@@ -4928,11 +4931,12 @@ set verify_pending; schedule §C.3 poll
 
         function matchesSearch(obj, query) {
             if (!query) return true;
-            let terms = query.split(/[,;\n\r]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+            let terms = query.split(/[,;\n\r\t]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
             // Mobile <input> strips newlines from pasted text to spaces; if the whole query is
-            // a whitespace-separated list of phone-shaped tokens, treat each token as a term.
+            // a whitespace-separated list of long numeric tokens (SIM IDs, MDNs, ICCIDs,
+            // rental IDs), treat each token as a term. Free-text phrases stay one substring.
             const wsParts = query.split(/[\s,;]+/).map(t => t.trim()).filter(Boolean);
-            if (wsParts.length > terms.length && wsParts.every(p => /^\+?\d{10,15}$/.test(p))) {
+            if (wsParts.length > terms.length && wsParts.every(p => /^\+?\d{5,}$/.test(p))) {
               terms = wsParts.map(p => p.toLowerCase());
             }
             if (!terms.length) return true;
