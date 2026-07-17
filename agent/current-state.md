@@ -1,9 +1,19 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-06-26 (WING-facing /api/gateway-status: live Skyline gateway state by ICCID, numeric code -> text, dedicated API key; partner PDF guide hosted behind dashboard auth)
+> Last updated: 2026-07-17 (sims table redesign Stage 1 frontend deployed to dashboard-test; awaiting operator review)
 
 ---
+
+## Session 2026-07-17 — sims v2 Stage 1 frontend on dashboard-test (TEST ONLY, not in prod)
+
+Branch `redesign/sims-table-v2`, commit `8e10815` (frontend) on top of `33e622d` (backend). Deployed to **dashboard-test** version `d26c1aa7`. Prod untouched.
+
+- Sims tab now fully server-driven via `/api/sims/query` (pagination/sort/filter/search, exact totals, page-scoped SMS counts). Client cache + client filter path removed. CSV export = paged server fetch of full filtered set.
+- Detail modal → right-hand drawer; header badges show status + SP (vendor) + Host (`gateway_host`). New **History** tab (`/api/sim-history`) and **Edit** tab (`/api/update-sim`, compare-and-set; vendor change needs explicit old→new confirm; 409 on stale prior). Verified live incl. 409 + `sim_edit_log` audit + revert.
+- Saved views (localStorage chips), density toggle, type-the-count bulk delete. `no_sms_12h` preset disabled (needs server counts — Stage 3). Command palette deferred. Reseller/SMS/Last-SMS columns not sortable in server mode (no server sort key).
+- **dashboard-test Basic-auth reset this session** (prior value unrecoverable). Value in `scratch/dashboard-test-credentials.txt` (untracked, local only) — hand to operator, do not commit/print.
+- Stage 2 (prod) per spec §6: apply `sim_edit_log` migration to prod project, merge to main, deploy `--env=""`.
 
 ## Session close (2026-06-26) — WING-facing /api/gateway-status endpoint + partner PDF guide
 
