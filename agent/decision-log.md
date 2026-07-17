@@ -1166,3 +1166,13 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 **Why:** Plan said to ship Phase 4 for symmetry. Local helpers because the rotator already maintains its own copies of `hxMdnChange`/`hxSubscriberDetails`/`logHelixApiCall` and doesn't import from `shared/helix.ts`. Touching the shared file would have created a partial migration pattern.
 
 **Consequence:** Code is dormant in practice (no helix SIMs will exercise it). If helix activations ever resume, the apex flow runs automatically. If we ever consolidate the rotator's helix code into `shared/helix.ts`, port the apex flow at the same time.
+
+---
+
+## 2026-07-17 — Hosting ≠ service provider; Teltik import/lifecycle never overwrites existing SIMs
+
+**Decision:** A SIM's HOST (whose server/API it appears on — Teltik/Celtic) is distinct from its SERVICE PROVIDER (`sims.vendor`: atomic, wing_iot, helix, teltik). Teltik's `all-lines` API and lifecycle webhooks can return ICCIDs whose service provider is Atomic/Wing/etc. because Teltik merely hosts them. Therefore `importTeltikLines` and `applyTeltikActivation` (src/teltik-worker/index.js) never write to an existing `sims` row: foreign-vendor rows are skipped (`skipped_foreign_vendor`); existing teltik rows only get `sim_numbers` synced plus the INC-5 `sims.msisdn` lockstep patch. Brand-new ICCIDs are created as teltik/tmobile via plain INSERT (not upsert) — unless the ICCID has an AT&T prefix (890141), in which case it is skipped + logged (`skipped_att_unknown`) for manual classification. Guard tests: tests/teltik-import-guard.test.mjs.
+
+**Why:** The old import upsert clobbered SIM #639 (an Atomic SIM hosted on Teltik) to vendor=teltik/carrier=tmobile and nulled gateway/port/slot/imei. The chunked-import precompute only loaded `vendor=eq.teltik` rows, so a hosted foreign-vendor ICCID looked brand-new and got upserted. Considered adding a `hosted_on` column to model hosting properly; rejected for now (schema migration, larger blast radius). The never-overwrite guard is the minimal fix that makes the clobber impossible regardless of hosting arrangement.
+
+**Consequence:** Import no longer re-activates canceled teltik SIMs that reappear in all-lines — `/reconcile`'s `in_teltik_but_canceled_in_db` report is now the (manual) path for that. If a real unknown AT&T-hosted-on-Teltik SIM shows up, it lands in `skipped_att_unknown` in the import result and worker logs instead of the DB. A future `hosted_on`/host column is the proper model if hosting relationships need to be queryable.
