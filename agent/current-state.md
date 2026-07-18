@@ -1,9 +1,21 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-07-17 (sims table redesign Stage 1 frontend deployed to dashboard-test; awaiting operator review)
+> Last updated: 2026-07-18 (Atomic SIMs Skyline→Teltik hosting migration, DB-only)
 
 ---
+
+## Session 2026-07-18 — Atomic SIMs moved to Teltik hosting (DB-only data ops, no deploys)
+
+Operator: the ~300 Atomic SIMs formerly on Skyline gateways are physically moved into Teltik hosting. Service provider unchanged (vendor=atomic, carrier=att) — Teltik is HOST only (see hosting-vs-service-provider memory).
+
+- **Updated 310 rows** (`vendor='atomic' AND status='active' AND gateway_host='skyline'`): `gateway_host='teltik'`, `rotation_eligible=true`, `rotation_interval_hours=24` (was already 24). Vendor/carrier/status untouched. 27 canceled atomic rows left alone.
+- **Activated 310 `reseller_sims` links to TrustOTP (reseller 3)** — rows pre-existed with active=false; flipped to true. TrustOTP active total now 4,306.
+- **Backups (for rollback):** DB tables `backup_20260718_atomic_teltik_move_sims` + `backup_20260718_atomic_teltik_move_reseller_sims` (310 rows each) and local `scratch/backup-2026-07-18-atomic-teltik-move-pre.json`. Drop backup tables once stable.
+- **Evidence of move** (Teltik all-lines API unreachable — TELTIK_API_KEY/ADMIN_RUN_SECRET/DASHBOARD_AUTH are worker-only secrets, no local copies): since 07-17, these sims receive SMS through the teltik-worker webhook path (inbound_sms with `message_id` set, `port` null; 407 msgs / 28 distinct sims in first 2 days) and zero skyline-port traffic.
+- **Rotation:** all 310 pass mdn-rotator's exact eligibility query (vendor atomic, msisdn set, reseller link active); last_mdn_rotated_at = 2026-07-07 so the whole set rotates at the next cron window (04:00 UTC = NY midnight), paced ~100/tick. rotateAtomicSim is host-independent (pure Atomic carrier API), no skyline calls.
+- **Deliberately left stale:** their `gateway_id`/`port`/`slot`/`imei` still point at skyline gateways (unique index (gateway_id,port) — clear these before reseating new SIMs in those skyline ports). Watch first rotation window + Rotation Health tab.
+- Recommended follow-up: run dashboard **Teltik reconcile** (needs operator Basic auth) to confirm all 310 ICCIDs appear in Teltik's all-lines (they'll show under `in_teltik_not_in_db`, which only counts vendor=teltik).
 
 ## Session 2026-07-17 — sims v2 Stage 1 frontend on dashboard-test (TEST ONLY, not in prod)
 
