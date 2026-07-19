@@ -13,6 +13,10 @@ import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { PLAYBOOK, classifyFailure, UNCLASSIFIED_BUCKET } from '../shared/rotation-playbook.mjs';
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
+import {
+  isParkedCandidate, parkedSince, decideParkedAction, countSameErrorFails, parkedBackoffAllows,
+  PARKED_MAX_ROTATES_PER_RUN, PARKED_MAX_PROBES_PER_RUN, PARKED_DAILY_ROTATE_CAP, PARKED_LIFETIME_SAME_ERROR_CAP,
+} from '../shared/parked-recovery.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
@@ -1585,6 +1589,7 @@ async function runCatchupSweep(env, opts = {}) {
     recon: null,
     delivery_gaps_after: null,
     pending_created: 0,
+    parked: null,
   };
 
   try {
@@ -1639,6 +1644,18 @@ async function runCatchupSweep(env, opts = {}) {
           await new Promise(res => setTimeout(res, 2000));
         }
       }
+    }
+
+    // ── 1b. Parked-SIM recovery — teltik rotation_failed backlog, any age > 6h.
+    // Shares the sweep's rotate cap and breaker; own per-SIM daily budget.
+    try {
+      summary.parked = await runParkedTeltikRecovery(env, {
+        runId, dryRun, breaker,
+        maxRotates: Math.max(0, SWEEP_MAX_ROTATES - rotateCalls),
+      });
+      rotateCalls += summary.parked?.rotated?.attempted || 0;
+    } catch (e) {
+      console.error('[CatchupSweep] parked recovery:', e);
     }
 
     // ── 2. Missed-due retry — nightly vendors only, never inside the window
@@ -1726,6 +1743,146 @@ async function runCatchupSweep(env, opts = {}) {
     }
     throw err;
   }
+}
+
+// ── Parked-SIM recovery (teltik) ───────────────────────────────────────────
+// Recovers teltik SIMs stranded outside the tonight-windowed remediation
+// queries: status='rotation_failed' (5-fail park) or active/provisioning with
+// rotation_status='failed', any age > 6h (SIM #8549 sat 13 days report-only).
+// Vendor is queried FIRST — if Teltik already moved the MDN we only flip to
+// mdn_pending and let the finalizer finish (no rotation burned). Only
+// transient error classes get a bounded force-rotate: ≤maxRotates per run,
+// ≤1 parked_rotate per SIM per NY day, daily for 3 days then every 3rd day,
+// lifetime hard stop after 8 same-class fails. Logical failures escalate.
+// Never resets rotation_fail_count. Strictly vendor='teltik' (SIM #639 lesson).
+async function runParkedTeltikRecovery(env, opts = {}) {
+  const { runId = null, dryRun = false, maxRotates = PARKED_MAX_ROTATES_PER_RUN } = opts;
+  const breaker = opts.breaker || newCircuitBreaker();
+  const summary = {
+    candidates: 0, probed: 0, refreshed: 0, escalated: 0,
+    rotated: { attempted: 0, ok: 0, fail: 0 },
+    skipped: { in_flight: 0, budget: 0, backoff: 0, lifetime: 0, breaker: 0, cap: 0, vendor_guard: 0, vendor_query: 0, probe_cap: 0 },
+  };
+  if (!env.TELTIK_API_KEY) return { ...summary, disabled: 'teltik_api_key_missing' };
+
+  const sel = 'id,iccid,vendor,status,rotation_status,msisdn,last_rotation_at,last_mdn_rotated_at,last_rotation_error';
+  const parkedRows = await rotationReviewQuery(env,
+    `sims?select=${sel}&vendor=eq.teltik&status=eq.rotation_failed&limit=200`).catch(() => []);
+  const failedRows = await rotationReviewQuery(env,
+    `sims?select=${sel}&vendor=eq.teltik&status=in.(active,provisioning)&rotation_status=eq.failed&limit=200`).catch(() => []);
+  const nowMs = Date.now();
+  const candidates = [...parkedRows, ...failedRows]
+    .filter(s => isParkedCandidate(s, nowMs))
+    .sort((a, b) => String(parkedSince(a) || '').localeCompare(String(parkedSince(b) || '')));
+  summary.candidates = candidates.length;
+  if (dryRun) return summary;
+
+  for (const sim of candidates) {
+    // sims.vendor routes the API — never the hosting side (SIM #639 lesson).
+    if (sim.vendor !== 'teltik') { summary.skipped.vendor_guard++; continue; }
+    if (summary.probed >= PARKED_MAX_PROBES_PER_RUN) { summary.skipped.probe_cap++; continue; }
+
+    // Race guard: skip anything that went in-flight since the list query
+    // (rotating, or mdn_pending now owned by the finalizer).
+    const fresh = (await rotationReviewQuery(env,
+      `sims?id=eq.${sim.id}&select=status,rotation_status,msisdn&limit=1`).catch(() => []))[0];
+    if (!fresh || fresh.rotation_status === 'rotating' || fresh.rotation_status === 'mdn_pending') {
+      summary.skipped.in_flight++;
+      continue;
+    }
+    if (fresh.msisdn) sim.msisdn = fresh.msisdn;
+
+    // Vendor first: what MDN does Teltik hold for this ICCID right now?
+    summary.probed++;
+    const getUrl = `${TELTIK_BASE}/v1/get-phone-number/?apikey=${env.TELTIK_API_KEY}&iccid=${encodeURIComponent(sim.iccid)}`;
+    let vendorMdn = null;
+    let vendorOk = false;
+    try {
+      const res = await relayFetch(env, getUrl, { method: 'GET' });
+      const bodyText = await res.text();
+      let data = {};
+      try { data = JSON.parse(bodyText); } catch {}
+      await logTeltikApiCall(env, {
+        run_id: `parked_${sim.iccid}_${Date.now()}`, step: 'parked_recovery_get', iccid: sim.iccid,
+        request_url: getUrl.replace(/apikey=[^&]+/, 'apikey=***'),
+        request_method: 'GET', request_body: null,
+        response_status: res.status, response_ok: res.ok,
+        response_body_text: bodyText, response_body_json: data,
+        error: res.ok ? null : `GET ${res.status}`,
+      });
+      if (res.ok) {
+        vendorOk = true;
+        const raw = data.msisdn || data.mdn || data.phone_number || data.number || null;
+        vendorMdn = raw ? String(raw).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
+      }
+    } catch { /* vendorOk stays false */ }
+    if (!vendorOk) { summary.skipped.vendor_query++; continue; } // can't see vendor state — never rotate blind
+
+    const decision = decideParkedAction(sim, vendorMdn);
+
+    if (decision.action === 'refresh') {
+      // Teltik already rotated — flip to mdn_pending; the finalizer syncs the
+      // new MDN and fires webhooks. No rotation_fail_count touch.
+      try {
+        await supabasePatch(env, `sims?id=eq.${sim.id}`, { status: 'provisioning', rotation_status: 'mdn_pending' });
+        summary.refreshed++;
+        await recordAttempt(env, sim.id, runId, 'parked_refresh', 'ok', `vendor mdn ${sim.msisdn} → ${vendorMdn}`);
+      } catch (e) {
+        await recordAttempt(env, sim.id, runId, 'parked_refresh', 'fail', String(e).slice(0, 200));
+      }
+      continue;
+    }
+
+    if (decision.action === 'escalate') {
+      if (!(await findOpenPendingForSim(env, sim.id, 'parked_recovery_blocked'))) {
+        await insertPendingItem(env, {
+          kind: 'parked_recovery_blocked',
+          summary: `parked ${decision.class}: SIM #${sim.id} (teltik) stuck since ${parkedSince(sim) || 'unknown'}`,
+          details_md: `**Class:** ${decision.class} (no auto force-rotate)\n**Status:** ${sim.rotation_status}/${sim.status}\n**MSISDN:** ${sim.msisdn || '—'} (Teltik reports ${vendorMdn || 'none'})\n**Error:** ${(sim.last_rotation_error || '—').slice(0, 400)}\n\n_Escalated by parked-SIM recovery._`,
+          run_id: runId, sim_id: sim.id, status: 'open',
+        });
+        summary.escalated++;
+      }
+      continue;
+    }
+
+    // decision.action === 'rotate' — bounded force-rotate.
+    if (summary.rotated.attempted >= maxRotates) { summary.skipped.cap++; continue; }
+    if (breaker.isTripped('teltik')) { summary.skipped.breaker++; continue; }
+    const usedToday = await attemptsToday(env, sim.id, 'parked_rotate');
+    if (usedToday >= PARKED_DAILY_ROTATE_CAP) { summary.skipped.budget++; continue; }
+    if (!parkedBackoffAllows(parkedSince(sim), nowMs)) { summary.skipped.backoff++; continue; }
+    const priorFails = await rotationReviewQuery(env,
+      `remediation_attempts?select=action,result,error&sim_id=eq.${sim.id}&action=eq.parked_rotate&result=eq.fail&limit=100`).catch(() => []);
+    if (countSameErrorFails(priorFails, decision.class) >= PARKED_LIFETIME_SAME_ERROR_CAP) {
+      summary.skipped.lifetime++;
+      if (!(await findOpenPendingForSim(env, sim.id, 'parked_recovery_blocked'))) {
+        await insertPendingItem(env, {
+          kind: 'parked_recovery_blocked',
+          summary: `parked exhausted: SIM #${sim.id} (teltik) — ${PARKED_LIFETIME_SAME_ERROR_CAP} lifetime ${decision.class} fails`,
+          details_md: `**Class:** ${decision.class} hit the lifetime retry cap (${PARKED_LIFETIME_SAME_ERROR_CAP}). No further auto force-rotates.\n**Error:** ${(sim.last_rotation_error || '—').slice(0, 400)}\n\n_Escalated by parked-SIM recovery._`,
+          run_id: runId, sim_id: sim.id, status: 'open',
+        });
+        summary.escalated++;
+      }
+      continue;
+    }
+
+    summary.rotated.attempted++;
+    const r = await forceRotateSim(env, sim);
+    breaker.record('teltik', r.ok, r.status || 0);
+    if (r.ok) {
+      summary.rotated.ok++;
+      await recordAttempt(env, sim.id, runId, 'parked_rotate', 'ok', null);
+    } else {
+      summary.rotated.fail++;
+      await recordAttempt(env, sim.id, runId, 'parked_rotate', 'fail',
+        `class=${decision.class}; ${r.error || `status=${r.status}`}`);
+    }
+    await new Promise(res => setTimeout(res, 2000));
+  }
+
+  return summary;
 }
 
 async function runRotationReview(env, opts = {}) {
@@ -1900,6 +2057,14 @@ async function runRotationReview(env, opts = {}) {
         }
       }
     }
+
+    // ── 3b. Parked-SIM recovery — teltik SIMs stranded outside tonight's
+    // window (any age > 6h). Runs before the drain so refreshed SIMs finalize
+    // in this same run.
+    let parked = null;
+    try {
+      parked = await runParkedTeltikRecovery(env, { runId, dryRun, breaker, maxRotates: PARKED_MAX_ROTATES_PER_RUN });
+    } catch (e) { console.error('[Review] parked recovery:', e); }
 
     // ── 4. Drain pending finalizer work ──────────────────────────────────────
     if (!dryRun) {
@@ -2086,6 +2251,10 @@ async function runRotationReview(env, opts = {}) {
     if (actions.second_read_verified + actions.second_read_failed > 0) {
       lines.push(`- Atomic second-read verification: ${actions.second_read_verified} confirmed new MDN, ${actions.second_read_failed} MDN unchanged after force-rotate`);
     }
+    if (parked) {
+      const p = parked;
+      lines.push(`- Parked recovery (teltik, any age > 6h): **${p.candidates}** candidates — ${p.refreshed} refreshed to mdn_pending, ${p.rotated.attempted} force-rotated (${p.rotated.ok} ok, ${p.rotated.fail} fail), ${p.escalated} escalated (skips: budget=${p.skipped.budget} backoff=${p.skipped.backoff} lifetime=${p.skipped.lifetime} breaker=${p.skipped.breaker} cap=${p.skipped.cap} in-flight=${p.skipped.in_flight} vendor-query=${p.skipped.vendor_query})`);
+    }
     lines.push(`- Finalizer drain: helix=${actions.finalizer_drained.helix}, wing=${actions.finalizer_drained.wing}, teltik=${actions.finalizer_drained.teltik}, atomic=${actions.finalizer_drained.atomic}`);
     if (breakerEvents.length > 0) {
       lines.push('');
@@ -2220,7 +2389,7 @@ async function runRotationReview(env, opts = {}) {
 
     if (!dryRun && lockHandle?.run?.id) {
       await releaseReviewLock(env, lockHandle.run.id, 'completed', {
-        tally, actions, pool: poolStats,
+        tally, actions, parked, pool: poolStats,
         baseline: baseline ? { perVendor: baseline.perVendor, missed: missedTotal, teltik_due_now: baseline.teltikDueNow } : null,
         delivery_gaps: deliveryGapsNow,
         multi_day_count: multiDayFailures.length,
