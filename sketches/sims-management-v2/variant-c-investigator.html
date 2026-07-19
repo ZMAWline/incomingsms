@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IncomingSMS · SIMs — Sketch C: Investigator</title>
+<style>
+  /* ============ tokens ============ */
+  :root {
+    --bg: #fafaf9;          /* off-white */
+    --panel: #ffffff;
+    --panel-2: #f5f5f4;
+    --ink: #1c1917;
+    --ink-2: #44403c;
+    --muted: #78716c;
+    --faint: #a8a29e;
+    --border: #e7e5e4;
+    --border-2: #d6d3d1;
+
+    /* status (AA on light) */
+    --ok: #15803d;
+    --ok-bg: #f0fdf4;
+    --warn: #b45309;
+    --warn-bg: #fffbeb;
+    --err: #b91c1c;
+    --err-bg: #fef2f2;
+    --info: #1d4ed8;
+    --info-bg: #eff6ff;
+    --rot: #6b21a8;
+    --rot-bg: #faf5ff;
+
+    /* SP filled badge (one hue, consistent everywhere) */
+    --sp-bg: #e0e7ff;
+    --sp-ink: #3730a3;
+    --sp-border: #c7d2fe;
+
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--ink);
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+  }
+  .mono { font-family: var(--mono); }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  a { color: var(--info); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  :focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 2px; }
+
+  /* ============ top bar ============ */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 0 16px;
+    height: 48px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex: none;
+  }
+  .brand { font-weight: 650; font-size: 13px; letter-spacing: -0.01em; }
+  .brand span { color: var(--muted); font-weight: 400; }
+  .crumb { color: var(--muted); font-size: 12px; }
+  .crumb b { color: var(--ink); font-weight: 550; }
+  .crumb .sep { margin: 0 6px; color: var(--faint); }
+  .topbar .spacer { flex: 1; }
+  .variant-tag {
+    font-size: 11px;
+    font-weight: 550;
+    color: var(--ink-2);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 99px;
+    padding: 2px 10px;
+  }
+  .stamp { font-size: 11px; color: var(--faint); }
+  .kbd-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--panel);
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius);
+    padding: 4px 8px;
+  }
+  .kbd-btn:hover { background: var(--panel-2); }
+  .kbd-btn kbd {
+    font-family: var(--mono);
+    font-size: 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 4px;
+  }
+
+  /* ============ split layout ============ */
+  .split { flex: 1; display: flex; min-height: 0; }
+
+  /* ============ left pane ============ */
+  .master {
+    width: 340px;
+    flex: none;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .search-wrap { padding: 12px 12px 8px; flex: none; }
+  .search-box {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .search-box svg { position: absolute; left: 10px; color: var(--faint); pointer-events: none; }
+  .search-box input {
+    width: 100%;
+    font: inherit;
+    font-size: 13px;
+    padding: 9px 10px 9px 32px;
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius);
+    background: var(--panel);
+    color: var(--ink);
+  }
+  .search-box input::placeholder { color: var(--faint); }
+  .search-box input:focus { border-color: var(--ink-2); outline: none; }
+
+  .master-scroll { flex: 1; overflow-y: auto; min-height: 0; padding-bottom: 16px; }
+  .list-group { margin-top: 10px; }
+  .list-label {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 0 14px 4px;
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .list-label a { font-size: 11px; font-weight: 450; letter-spacing: 0; text-transform: none; }
+
+  .simrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    padding: 6px 14px;
+    border: 0;
+    background: none;
+    border-left: 2px solid transparent;
+  }
+  .simrow:hover { background: var(--panel-2); }
+  .simrow.sel { background: #f0efed; border-left-color: var(--ink); }
+  .simrow .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .simrow .rid { font-weight: 600; font-size: 12.5px; width: 44px; flex: none; }
+  .simrow .tail { font-family: var(--mono); font-size: 11px; color: var(--muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .simrow .sub { font-size: 11px; color: var(--muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .dot-active { background: var(--ok); }
+  .dot-suspended { background: var(--warn); }
+  .dot-error { background: var(--err); }
+  .dot-provisioning { background: var(--info); }
+  .dot-canceled { background: var(--faint); }
+
+  /* micro badges in list rows */
+  .mb { font-size: 9.5px; font-weight: 650; letter-spacing: 0.03em; border-radius: 3px; padding: 1px 4px; flex: none; text-transform: uppercase; }
+  .mb-sp { background: var(--sp-bg); color: var(--sp-ink); }
+  .mb-host { border: 1px solid var(--border-2); color: var(--ink-2); background: transparent; }
+
+  .empty-note { padding: 8px 14px; font-size: 12px; color: var(--faint); }
+
+  /* ============ dossier ============ */
+  .detail { flex: 1; min-width: 0; overflow-y: auto; }
+  .dossier { max-width: 1060px; padding: 20px 24px 48px; }
+
+  .dhead { border-bottom: 1px solid var(--border); padding-bottom: 16px; }
+  .dhead-row1 { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .dhead h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 99px;
+    padding: 2px 9px;
+  }
+  .status-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .st-active { color: var(--ok); background: var(--ok-bg); }
+  .st-suspended { color: var(--warn); background: var(--warn-bg); }
+  .st-error { color: var(--err); background: var(--err-bg); }
+  .st-provisioning { color: var(--info); background: var(--info-bg); }
+  .st-canceled { color: var(--muted); background: var(--panel-2); }
+
+  .idline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+  .iccid-full { font-family: var(--mono); font-size: 13px; color: var(--ink-2); letter-spacing: 0.02em; }
+  .msisdn { font-family: var(--mono); font-size: 13px; color: var(--ink); font-weight: 600; }
+  .idline .dim { color: var(--faint); }
+  .copy-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 7px;
+  }
+  .copy-btn:hover { background: var(--panel-2); color: var(--ink); }
+  .copy-btn.copied { color: var(--ok); border-color: var(--ok); }
+
+  /* provenance block — the point of this variant */
+  .prov {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    margin-top: 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--panel);
+    max-width: 560px;
+  }
+  .prov-slot { flex: 1; padding: 10px 14px; }
+  .prov-slot + .prov-slot { border-left: 1px solid var(--border); }
+  .prov-slot .lbl {
+    display: block;
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin-bottom: 5px;
+  }
+  .badge-sp {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    background: var(--sp-bg);
+    color: var(--sp-ink);
+    border: 1px solid var(--sp-border);
+    border-radius: 4px;
+    padding: 3px 10px;
+  }
+  .badge-host {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    background: transparent;
+    color: var(--ink-2);
+    border: 1px solid var(--border-2);
+    border-radius: 4px;
+    padding: 3px 10px;
+  }
+  .prov-cap { margin: 6px 2px 0; font-size: 11px; color: var(--muted); max-width: 560px; }
+
+  /* action row */
+  .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .btn {
+    font-size: 12px;
+    font-weight: 550;
+    padding: 6px 12px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border-2);
+    background: var(--panel);
+    color: var(--ink);
+  }
+  .btn:hover { background: var(--panel-2); }
+  .btn:active { background: #eceae8; }
+  .btn-primary { background: var(--ink); color: #fafaf9; border-color: var(--ink); }
+  .btn-primary:hover { background: #2c2825; }
+  .btn-danger { color: var(--err); border-color: #fecaca; }
+  .btn-danger:hover { background: var(--err-bg); }
+  .btn-icon { padding: 6px 9px; }
+
+  /* ============ dossier body ============ */
+  .dbody {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 24px;
+    margin-top: 18px;
+    align-items: start;
+  }
+
+  /* ---- timeline ---- */
+  .tl-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+  .tl-head h2 { font-size: 13px; font-weight: 650; margin: 0; }
+  .tl-head .range { font-size: 11px; color: var(--faint); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip {
+    font-size: 11px;
+    font-weight: 550;
+    padding: 3px 10px;
+    border-radius: 99px;
+    border: 1px solid var(--border-2);
+    background: var(--panel);
+    color: var(--muted);
+  }
+  .chip:hover { background: var(--panel-2); color: var(--ink); }
+  .chip.on { background: var(--ink); color: #fafaf9; border-color: var(--ink); }
+
+  .day-head {
+    font-size: 11px;
+    font-weight: 650;
+    color: var(--muted);
+    letter-spacing: 0.02em;
+    padding: 12px 0 6px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+  }
+  .day-head:first-child { padding-top: 2px; }
+
+  .tl-entry {
+    display: flex;
+    gap: 10px;
+    padding: 8px 8px 8px 4px;
+    border-radius: var(--radius);
+    border-left: 2px solid transparent;
+  }
+  .tl-entry:hover { background: var(--panel); }
+  .tl-entry.flagged {
+    background: var(--warn-bg);
+    border-left-color: var(--warn);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  .tl-ico {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    margin-top: 1px;
+  }
+  .ico-edit { background: var(--info-bg); color: var(--info); }
+  .ico-error { background: var(--err-bg); color: var(--err); }
+  .ico-status { background: var(--panel-2); color: var(--muted); }
+  .ico-notification { background: var(--ok-bg); color: var(--ok); }
+  .ico-rotation { background: var(--rot-bg); color: var(--rot); }
+
+  .tl-main { flex: 1; min-width: 0; }
+  .tl-title { font-size: 12.5px; font-weight: 600; }
+  .tl-title .arrow { color: var(--faint); font-weight: 400; }
+  .tl-title .val { font-family: var(--mono); font-weight: 550; font-size: 12px; }
+  .tl-detail { font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .tl-note {
+    display: inline-block;
+    font-size: 11px;
+    color: var(--ink-2);
+    background: var(--panel-2);
+    border-radius: 4px;
+    padding: 1px 7px;
+    margin-top: 4px;
+  }
+  .tl-entry.flagged .tl-note { background: #fef3c7; color: #92400e; }
+  .tl-meta { flex: none; text-align: right; }
+  .tl-time { font-size: 11.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .tl-rel { font-size: 10.5px; color: var(--faint); }
+  .tl-src { font-size: 10.5px; color: var(--faint); margin-top: 2px; }
+  .tl-src b { font-weight: 600; color: var(--muted); }
+  .tl-empty { padding: 20px 4px; color: var(--faint); font-size: 12px; }
+
+  .tl-footer { margin-top: 14px; font-size: 12px; }
+
+  /* ---- side cards ---- */
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 14px;
+  }
+  .card-h {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .card-h h3 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .card-b { padding: 6px 12px 10px; }
+
+  .kv { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
+  .kv .k { width: 96px; flex: none; font-size: 11.5px; color: var(--muted); }
+  .kv .v { flex: 1; min-width: 0; font-size: 12.5px; font-weight: 500; }
+  .kv .v.mono { font-size: 12px; }
+  .pencil {
+    flex: none;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    background: none;
+    border-radius: 4px;
+    color: var(--faint);
+    font-size: 11px;
+    visibility: hidden;
+  }
+  .kv:hover .pencil { visibility: visible; }
+  .pencil:hover { background: var(--panel-2); color: var(--ink); }
+  .pencil:focus-visible { visibility: visible; }
+
+  /* inline edit state */
+  .kv-editing { align-items: flex-start; background: var(--info-bg); margin: 0 -8px; padding: 6px 8px; border-radius: var(--radius); }
+  .kv-editing .k { padding-top: 6px; }
+  .inline-edit { flex: 1; min-width: 0; }
+  .inline-edit input {
+    width: 100%;
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 8px;
+    border: 1px solid var(--info);
+    border-radius: 4px;
+    background: var(--panel);
+  }
+  .inline-edit .ie-actions { display: flex; gap: 6px; margin-top: 6px; }
+  .btn-xs { font-size: 11px; padding: 3px 9px; border-radius: 4px; }
+
+  .card .hint { font-size: 11px; color: var(--faint); margin: 4px 0 0; }
+
+  .stat-row { display: flex; align-items: baseline; justify-content: space-between; padding: 5px 0; }
+  .stat-row .k { font-size: 11.5px; color: var(--muted); }
+  .stat-row .v { font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat-row .v.ok { color: var(--ok); }
+
+  .note-strip {
+    font-size: 11px;
+    color: var(--ink-2);
+    background: var(--panel-2);
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-top: 6px;
+  }
+
+  /* ============ modal ============ */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(28, 25, 23, 0.4);
+    display: none;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 12vh;
+    z-index: 50;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    width: 440px;
+    max-width: calc(100vw - 32px);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 12px 32px rgba(28, 25, 23, 0.18);
+    padding: 20px;
+  }
+  .modal h2 { margin: 0 0 8px; font-size: 14px; font-weight: 650; }
+  .modal p { margin: 0 0 10px; font-size: 12.5px; color: var(--ink-2); }
+  .cas-diff {
+    font-family: var(--mono);
+    font-size: 13px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    margin: 12px 0;
+  }
+  .cas-diff .old { color: var(--err); text-decoration: line-through; }
+  .cas-diff .new { color: var(--ok); font-weight: 650; }
+  .cas-diff .arr { color: var(--faint); margin: 0 6px; }
+  .cas-guard {
+    display: flex;
+    gap: 8px;
+    font-size: 11.5px;
+    color: var(--warn);
+    background: var(--warn-bg);
+    border-radius: var(--radius);
+    padding: 8px 10px;
+    margin-bottom: 12px;
+  }
+  .modal label { display: block; font-size: 11.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 5px; }
+  .modal label b { font-family: var(--mono); }
+  .modal input[type="text"] {
+    width: 100%;
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 8px 10px;
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius);
+    letter-spacing: 0.08em;
+  }
+  .modal input[type="text"]:focus { border-color: var(--ink); outline: none; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  .btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+  .btn[disabled]:hover { background: var(--ink); }
+  .modal .fine { font-size: 11px; color: var(--faint); margin-top: 10px; }
+
+  /* ============ toast ============ */
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: var(--ink);
+    color: #fafaf9;
+    font-size: 12.5px;
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    box-shadow: 0 8px 20px rgba(28, 25, 23, 0.25);
+    opacity: 0;
+    transform: translateY(6px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    pointer-events: none;
+    max-width: 380px;
+    z-index: 60;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast .sub { display: block; font-size: 11px; color: #d6d3d1; margin-top: 2px; }
+</style>
+</head>
+<body>
+
+  <!-- ================= top bar ================= -->
+  <header class="topbar">
+    <div class="brand">IncomingSMS <span>· SIMs</span></div>
+    <nav class="crumb" aria-label="Breadcrumb">SIMs <span class="sep">/</span> <b id="crumb-id">#639</b></nav>
+    <div class="spacer"></div>
+    <span class="variant-tag">Sketch C — Investigator</span>
+    <span class="stamp">Design sketch · Jul 2026 · fake data</span>
+    <button class="kbd-btn" id="cmdk" title="Jump to search">Search <kbd>⌘K</kbd></button>
+  </header>
+
+  <div class="split">
+
+    <!-- ================= left pane: master ================= -->
+    <aside class="master" aria-label="SIM list">
+      <div class="search-wrap">
+        <div class="search-box">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="search" type="search" placeholder="ICCID, number, or #id" aria-label="Search SIMs by ICCID, number, or id" autocomplete="off">
+        </div>
+      </div>
+
+      <div class="master-scroll" id="master-scroll">
+
+        <div class="list-group" data-group="pinned">
+          <div class="list-label"><span>Pinned</span></div>
+          <div class="rows"></div>
+        </div>
+
+        <div class="list-group" data-group="recent">
+          <div class="list-label"><span>Recent</span></div>
+          <div class="rows"></div>
+        </div>
+
+        <div class="list-group" data-group="queue">
+          <div class="list-label"><span>Any error · 41</span><a href="#" onclick="return false">edit filter</a></div>
+          <div class="rows"></div>
+        </div>
+
+        <div class="empty-note" id="no-results" hidden>No SIMs match “<span></span>”.</div>
+      </div>
+    </aside>
+
+    <!-- ================= right pane: dossier ================= -->
+    <main class="detail">
+      <div class="dossier" id="dossier"><!-- rendered by JS --></div>
+    </main>
+  </div>
+
+  <!-- ================= CAS modal ================= -->
+  <div class="overlay" id="overlay">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h2 id="modal-title">Change service provider on SIM #639</h2>
+      <div class="cas-diff">vendor: <span class="old">teltik</span><span class="arr">→</span><span class="new">atomic</span></div>
+      <div class="cas-guard">
+        <span aria-hidden="true">⛨</span>
+        <span>This is a guarded correction — it uses compare-and-set and will <b>fail loudly</b> if the record changed since you loaded it.</span>
+      </div>
+      <label for="cas-input">Type <b>ATOMIC</b> to confirm</label>
+      <input type="text" id="cas-input" autocomplete="off" spellcheck="false" placeholder="ATOMIC">
+      <p class="fine">Written to sim_edit_log with changed_by = zalmen. Corrections are audited, not undoable.</p>
+      <div class="modal-actions">
+        <button class="btn" id="cas-cancel">Cancel</button>
+        <button class="btn btn-primary" id="cas-confirm" disabled>Apply correction</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+/* ======================================================================
+   Fake data — all local. Two rich records (#639 story, #4821 healthy),
+   everything else generated as thin records so master→detail always works.
+   ====================================================================== */
+
+const VENDOR_LABEL = {
+  atomic:   "Atomic (AT&T)",
+  wing_iot: "Wing IoT (AT&T)",
+  helix:    "Helix (T-Mobile)",
+  teltik:   "Teltik (T-Mobile)"
+};
+const VENDOR_SHORT = { atomic: "ATM", wing_iot: "WNG", helix: "HLX", teltik: "TLK" };
+const HOST_LABEL   = { skyline: "Skyline", teltik: "Teltik" };
+const HOST_SHORT   = { skyline: "SKY", teltik: "TLK" };
+const CARRIER_LABEL = { att: "AT&T", tmobile: "T-Mobile" };
+const TL_ICON = { edit: "✎", error: "!", status: "⇄", notification: "✓", rotation: "↻" };
+
+const SIMS = {};
+
+/* ---------- SIM #639 — the import-clobber story ---------- */
+SIMS[639] = {
+  id: 639,
+  iccid: "89014103279952416398",
+  msisdn: "(872) 555-0119",
+  vendor: "atomic",
+  carrier: "att",
+  host: "teltik",
+  status: "active",
+  status_reason: "carrier fraud flag — resolved",
+  statusReasonEditing: true,
+  reseller: "TrustOTP",
+  rotation_eligible: true,
+  rotation_interval: 24,
+  activated: "Feb 11, 2026",
+  gateway: null, port: null, slot: null,
+  placementNote: "Stale Skyline gateway ref (SKY-04 · port 3) cleared Jul 17 by zalmen — Teltik-hosted SIMs carry no gateway/port.",
+  health: { sms24: 12, lastSms: "38m ago", rotated: "6h ago", nextRotation: "in 18h" },
+  range: "Jun 12 – Jul 19, 2026",
+  timeline: [
+    { d: "Jul 19", t: "09:03", rel: "5h ago", type: "notification",
+      title: "number.online delivered",
+      detail: "200 OK in 412 ms · payload msisdn (872) 555-0119",
+      src: "webhook → trustotp.example/hooks/number-online" },
+    { d: "Jul 19", t: "08:42", rel: "6h ago", type: "rotation",
+      title: "MDN rotated", vals: ["(312) 555-0164", "(872) 555-0119"],
+      detail: "scheduled · interval 24h · swap confirmed by carrier",
+      src: "scheduler · rotate-due" },
+    { d: "Jul 18", t: "16:20", rel: "yesterday", type: "status",
+      title: "import guard active",
+      detail: "teltik-lines sync can no longer write to existing sims rows — inserts only",
+      note: "guard added after this SIM was clobbered",
+      src: "system · deploy 2026-07-18" },
+    { d: "Jul 18", t: "11:05", rel: "yesterday", type: "notification",
+      title: "number.online delivered",
+      detail: "200 OK in 388 ms",
+      src: "webhook → trustotp.example/hooks/number-online" },
+    { d: "Jul 17", t: "14:38", rel: "2d ago", type: "edit",
+      title: "gateway_id:", vals: ["SKY-04", "—"],
+      detail: "stale Skyline gateway ref cleared · port + slot nulled",
+      src: "operator · <b>zalmen</b> · sim_edit_log #8821" },
+    { d: "Jul 17", t: "14:36", rel: "2d ago", type: "edit",
+      title: "vendor:", vals: ["teltik", "atomic"],
+      detail: "guarded compare-and-set · matched loaded revision",
+      note: "corrected import clobber",
+      src: "operator · <b>zalmen</b> · sim_edit_log #8820" },
+    { d: "Jul 17", t: "10:12", rel: "2d ago", type: "error",
+      title: "atomic OTA refresh timeout",
+      detail: "no response after 3 retries · subscriber lookup used vendor=teltik → wrong API",
+      src: "atomic-api · system_errors #30412" },
+    { d: "Jul 16", t: "22:47", rel: "3d ago", type: "error",
+      title: "atomic OTA refresh timeout",
+      detail: "no response after 3 retries",
+      src: "atomic-api · system_errors #30388" },
+    { d: "Jul 16", t: "19:30", rel: "3d ago", type: "error",
+      title: "reconcile mismatch",
+      detail: "local vendor = teltik but carrier subscriber record is Atomic (AT&T)",
+      src: "teltik reconcile · system_errors #30371" },
+    { d: "Jul 16", t: "03:12", rel: "3d ago", type: "edit", flagged: true,
+      title: "vendor:", vals: ["atomic", "teltik"],
+      detail: "unguarded bulk write matched this row by ICCID during hosted-lines sync",
+      note: "automated write to an existing row — root cause",
+      src: "import · <b>import:teltik-lines</b> · sim_edit_log #8714" },
+    { d: "Jul 16", t: "02:58", rel: "3d ago", type: "notification",
+      title: "number.online delivered",
+      detail: "200 OK in 391 ms · last event before the clobber",
+      src: "webhook → trustotp.example/hooks/number-online" },
+    { d: "Jul 14", t: "09:01", rel: "5d ago", type: "notification",
+      title: "number.online delivered",
+      detail: "200 OK in 405 ms",
+      src: "webhook → trustotp.example/hooks/number-online" },
+    { d: "Jul 14", t: "08:40", rel: "5d ago", type: "rotation",
+      title: "MDN rotated", vals: ["(773) 555-0142", "(312) 555-0164"],
+      detail: "scheduled · interval 24h",
+      src: "scheduler · rotate-due" },
+    { d: "Jun 28", t: "08:41", rel: "3w ago", type: "rotation",
+      title: "MDN rotated", vals: ["(224) 555-0187", "(773) 555-0142"],
+      detail: "scheduled · interval 24h",
+      src: "scheduler · rotate-due" },
+    { d: "Jun 20", t: "15:22", rel: "4w ago", type: "status",
+      title: "suspended → active",
+      detail: "restored after carrier review · status_reason kept for the record",
+      src: "atomic-api · sim_status_history" },
+    { d: "Jun 18", t: "07:54", rel: "Jun 18", type: "status",
+      title: "active → suspended",
+      detail: "carrier fraud flag on MDN · auto-suspend",
+      src: "atomic-api · sim_status_history" },
+    { d: "Jun 12", t: "08:39", rel: "Jun 12", type: "rotation",
+      title: "MDN rotated", vals: ["(630) 555-0110", "(224) 555-0187"],
+      detail: "scheduled · interval 24h",
+      src: "scheduler · rotate-due" }
+  ]
+};
+
+/* ---------- SIM #4821 — boring, healthy ---------- */
+SIMS[4821] = {
+  id: 4821,
+  iccid: "8901260882101554821",
+  msisdn: "(646) 555-0187",
+  vendor: "teltik",
+  carrier: "tmobile",
+  host: "teltik",
+  status: "active",
+  status_reason: "",
+  reseller: "TrustOTP",
+  rotation_eligible: true,
+  rotation_interval: 24,
+  activated: "May 3, 2026",
+  gateway: null, port: null, slot: null,
+  placementNote: "Teltik-hosted · no local gateway, port, or slot.",
+  health: { sms24: 47, lastSms: "4m ago", rotated: "11h ago", nextRotation: "in 13h" },
+  range: "May 3 – Jul 19, 2026",
+  timeline: [
+    { d: "Jul 19", t: "10:31", rel: "4h ago", type: "notification",
+      title: "number.online delivered",
+      detail: "200 OK in 356 ms",
+      src: "webhook → trustotp.example/hooks/number-online" },
+    { d: "Jul 19", t: "03:15", rel: "11h ago", type: "rotation",
+      title: "MDN rotated", vals: ["(917) 555-0133", "(646) 555-0187"],
+      detail: "scheduled · interval 24h",
+      src: "scheduler · rotate-due" },
+    { d: "Jul 15", t: "12:02", rel: "4d ago", type: "notification",
+      title: "number.online delivered",
+      detail: "200 OK in 402 ms",
+      src: "webhook → trustotp.example/hooks/number-online" },
+    { d: "May 3", t: "09:12", rel: "May 3", type: "status",
+      title: "provisioning → active",
+      detail: "activated on Teltik · line confirmed live",
+      src: "teltik-api · sim_status_history" }
+  ]
+};
+
+/* ---------- thin records for the rest of the left list ---------- */
+/* ponytail: generated stubs — only #639 and #4821 carry real stories */
+function stubSim(id, vendor, host, status, reason) {
+  const att = (vendor === "atomic" || vendor === "wing_iot");
+  return {
+    id, vendor, host,
+    carrier: att ? "att" : "tmobile",
+    iccid: (att ? "8901410" : "8901260") + String(3279952410000 + id * 977).slice(-13),
+    msisdn: "(305) 555-0" + String(100 + (id % 88)).slice(-3),
+    status, status_reason: reason || "",
+    reseller: id % 3 === 0 ? "TrustOTP" : (id % 7 === 0 ? "HYPPE" : null),
+    rotation_eligible: status === "active",
+    rotation_interval: 24,
+    activated: "Mar 2026",
+    gateway: host === "skyline" ? ("SKY-" + String(id % 9 + 1).padStart(2, "0")) : null,
+    port: host === "skyline" ? (id % 32 + 1) : null,
+    slot: host === "skyline" ? (id % 4 + 1) : null,
+    placementNote: host === "skyline" ? "Skyline-hosted · physical port assignment below." : "Teltik-hosted · no local gateway, port, or slot.",
+    health: { sms24: status === "active" ? (id % 40) : 0, lastSms: status === "active" ? "1h ago" : "—", rotated: "22h ago", nextRotation: status === "active" ? "in 2h" : "paused" },
+    range: "Jul 2026",
+    timeline: [
+      { d: "Jul 19", t: "06:00", rel: "8h ago", type: status === "error" ? "error" : "status",
+        title: status === "error" ? (reason || "delivery failure") : ("status · " + status),
+        detail: status === "error" ? "most recent error for this line" : "no recent anomalies",
+        src: "system" },
+      { d: "Jul 12", t: "09:30", rel: "1w ago", type: "notification",
+        title: "number.online delivered", detail: "200 OK", src: "webhook" }
+    ]
+  };
+}
+
+const LEFT_LIST = {
+  pinned: [
+    { id: 639,  sub: "import clobber — fixed" },
+    { id: 2205, sub: "OTA failing since Jul 15", stub: ["helix", "skyline", "error", "helix OTA refresh timeout"] }
+  ],
+  recent: [
+    { id: 4821, sub: "viewed 1h ago · healthy", stub: null },
+    { id: 1077, sub: "viewed 3h ago · carrier flag", stub: ["wing_iot", "skyline", "suspended", "carrier fraud flag on MDN"] },
+    { id: 3350, sub: "viewed yesterday", stub: ["teltik", "teltik", "active", ""] },
+    { id: 512,  sub: "viewed yesterday · webhook 500s", stub: ["atomic", "teltik", "error", "number.online delivery failing (HTTP 500)"] }
+  ],
+  queue: [
+    { id: 88,   stub: ["teltik", "teltik", "error", "port unreachable"] },
+    { id: 512,  queueOnly: true },
+    { id: 903,  stub: ["helix", "skyline", "error", "helix activation stuck"] },
+    { id: 1440, stub: ["teltik", "teltik", "error", "no SMS in 72h"] },
+    { id: 1892, stub: ["wing_iot", "skyline", "error", "IMEI check failed"] },
+    { id: 2205, queueOnly: true },
+    { id: 2761, stub: ["teltik", "teltik", "error", "webhook delivery failing"] },
+    { id: 3018, stub: ["atomic", "teltik", "error", "atomic OTA refresh timeout"] },
+    { id: 3599, stub: ["helix", "skyline", "error", "gateway port flapping"] },
+    { id: 4102, stub: ["teltik", "teltik", "error", "reconcile mismatch"] }
+  ]
+};
+
+// materialize stubs
+for (const group of Object.values(LEFT_LIST)) {
+  for (const row of group) {
+    if (!SIMS[row.id] && row.stub) {
+      SIMS[row.id] = stubSim(row.id, row.stub[0], row.stub[1], row.stub[2], row.stub[3]);
+    }
+  }
+}
+
+/* ======================================================================
+   State
+   ====================================================================== */
+let currentId = 639;
+let tlFilter = "all";
+
+/* ======================================================================
+   Left pane rendering
+   ====================================================================== */
+function rowHtml(sim, sub) {
+  return `
+    <button class="simrow" data-id="${sim.id}" data-q="${sim.id} ${sim.iccid}">
+      <span class="dot dot-${sim.status}" title="${sim.status}"></span>
+      <span class="rid">#${sim.id}</span>
+      ${sub
+        ? `<span class="sub">${sub}</span>`
+        : `<span class="tail" title="${sim.iccid}">…${sim.iccid.slice(-6)}</span>`}
+      <span class="mb mb-sp" title="Service provider: ${VENDOR_LABEL[sim.vendor]}">${VENDOR_SHORT[sim.vendor]}</span>
+      <span class="mb mb-host" title="Host: ${HOST_LABEL[sim.host]}">${HOST_SHORT[sim.host]}</span>
+    </button>`;
+}
+
+function renderLists() {
+  for (const [name, rows] of Object.entries(LEFT_LIST)) {
+    const el = document.querySelector(`[data-group="${name}"] .rows`);
+    el.innerHTML = rows.map(r => rowHtml(SIMS[r.id], name === "queue" ? null : r.sub)).join("");
+  }
+  document.querySelectorAll(".simrow").forEach(btn => {
+    btn.addEventListener("click", () => selectSim(+btn.dataset.id));
+  });
+  markSelected();
+}
+
+function markSelected() {
+  document.querySelectorAll(".simrow").forEach(btn => {
+    btn.classList.toggle("sel", +btn.dataset.id === currentId);
+  });
+}
+
+function applySearch(q) {
+  q = q.trim().replace(/^#/, "").toLowerCase();
+  let any = false;
+  document.querySelectorAll(".simrow").forEach(btn => {
+    const hit = !q || btn.dataset.q.toLowerCase().includes(q);
+    btn.hidden = !hit;
+    if (hit) any = true;
+  });
+  document.querySelectorAll(".list-group").forEach(g => {
+    g.hidden = ![...g.querySelectorAll(".simrow")].some(b => !b.hidden);
+  });
+  const empty = document.getElementById("no-results");
+  empty.hidden = any || !q;
+  empty.querySelector("span").textContent = q;
+}
+
+/* ======================================================================
+   Dossier rendering
+   ====================================================================== */
+function statusBadge(sim) {
+  return `<span class="status-badge st-${sim.status}">${sim.status}</span>`;
+}
+
+function timelineEntry(e) {
+  const vals = e.vals
+    ? ` <span class="val">${e.vals[0]}</span> <span class="arrow">→</span> <span class="val">${e.vals[1]}</span>`
+    : "";
+  return `
+    <article class="tl-entry ${e.flagged ? "flagged" : ""}" data-type="${e.type}">
+      <span class="tl-ico ico-${e.type}" aria-hidden="true">${TL_ICON[e.type]}</span>
+      <div class="tl-main">
+        <div class="tl-title">${e.type === "edit" ? "edit · " : ""}${e.title}${vals}</div>
+        <div class="tl-detail">${e.detail}</div>
+        ${e.note ? `<span class="tl-note">${e.note}</span>` : ""}
+      </div>
+      <div class="tl-meta">
+        <div class="tl-time">${e.d}, ${e.t}</div>
+        <div class="tl-rel">${e.rel}</div>
+        <div class="tl-src">${e.src}</div>
+      </div>
+    </article>`;
+}
+
+function timelineHtml(sim) {
+  const entries = sim.timeline.filter(e => tlFilter === "all" || e.type === tlFilter);
+  if (!entries.length) return `<div class="tl-empty">No ${tlFilter} events in this window.</div>`;
+  let html = "", day = null;
+  for (const e of entries) {
+    if (e.d !== day) {
+      day = e.d;
+      html += `<div class="day-head">${day}, 2026</div>`;
+    }
+    html += timelineEntry(e);
+  }
+  return html;
+}
+
+function chipsHtml() {
+  const kinds = [["all", "All"], ["status", "Status"], ["edit", "Edits"], ["error", "Errors"], ["notification", "Notifications"], ["rotation", "Rotations"]];
+  return kinds.map(([k, label]) =>
+    `<button class="chip ${tlFilter === k ? "on" : ""}" data-filter="${k}" aria-pressed="${tlFilter === k}">${label}</button>`
+  ).join("");
+}
+
+function kvRow(key, val, opts = {}) {
+  return `
+    <div class="kv">
+      <span class="k">${key}</span>
+      <span class="v ${opts.mono ? "mono" : ""}">${val}</span>
+      ${opts.edit
+        ? `<button class="pencil" data-edit="${opts.edit}" aria-label="Edit ${key}" title="Edit ${key}">✎</button>`
+        : `<span class="pencil" aria-hidden="true"></span>`}
+    </div>`;
+}
+
+function recordCard(sim) {
+  const reasonRow = sim.statusReasonEditing
+    ? `
+    <div class="kv kv-editing">
+      <span class="k">status_reason</span>
+      <div class="inline-edit">
+        <input type="text" id="reason-input" value="${sim.status_reason}" aria-label="Edit status_reason">
+        <div class="ie-actions">
+          <button class="btn btn-primary btn-xs" id="reason-save">Save</button>
+          <button class="btn btn-xs" id="reason-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>`
+    : kvRow("status_reason", sim.status_reason || "<span style='color:var(--faint)'>—</span>", { edit: "status_reason" });
+
+  return `
+    <section class="card" aria-label="Record">
+      <div class="card-h"><h3>Record</h3></div>
+      <div class="card-b">
+        ${kvRow("vendor (SP)", `<span class="badge-sp">${VENDOR_LABEL[sim.vendor]}</span>`, { edit: "vendor" })}
+        ${kvRow("carrier", CARRIER_LABEL[sim.carrier], { edit: "carrier" })}
+        ${kvRow("host", `<span class="badge-host">${HOST_LABEL[sim.host]}</span>`, { edit: "host" })}
+        ${kvRow("msisdn", sim.msisdn, { edit: "msisdn", mono: true })}
+        ${kvRow("rotation", sim.rotation_eligible ? `every ${sim.rotation_interval}h` : "not eligible", { edit: "rotation_interval" })}
+        ${reasonRow}
+        ${kvRow("activated", sim.activated)}
+        <p class="hint">Edits to vendor, carrier, and host are guarded (compare-and-set) and logged to sim_edit_log.</p>
+      </div>
+    </section>`;
+}
+
+function resellerCard(sim) {
+  return `
+    <section class="card" aria-label="Reseller">
+      <div class="card-h">
+        <h3>Reseller</h3>
+        ${sim.reseller ? `<button class="btn btn-xs" data-act="Unassign reseller">Unassign</button>` : ""}
+      </div>
+      <div class="card-b">
+        ${sim.reseller
+          ? `<div class="stat-row"><span class="k">Assigned to</span><span class="v"><a href="#" onclick="return false">${sim.reseller}</a></span></div>
+             <div class="stat-row"><span class="k">Line status</span><span class="v ok">active</span></div>`
+          : `<div class="stat-row"><span class="k">Assigned to</span><span class="v" style="color:var(--faint)">unassigned</span></div>
+             <p class="hint" style="margin-top:6px"><button class="btn btn-xs" data-act="Assign reseller">Assign…</button></p>`}
+      </div>
+    </section>`;
+}
+
+function placementCard(sim) {
+  return `
+    <section class="card" aria-label="Placement">
+      <div class="card-h"><h3>Placement</h3></div>
+      <div class="card-b">
+        <div class="stat-row"><span class="k">Host</span><span class="v"><span class="badge-host">${HOST_LABEL[sim.host]}</span></span></div>
+        ${sim.host === "skyline"
+          ? `<div class="stat-row"><span class="k">Gateway</span><span class="v"><a href="#" onclick="return false">${sim.gateway}</a></span></div>
+             <div class="stat-row"><span class="k">Port / slot</span><span class="v mono">${sim.port} / ${sim.slot}</span></div>`
+          : `<div class="stat-row"><span class="k">Gateway / port</span><span class="v" style="color:var(--faint)">— none (remote host)</span></div>`}
+        <div class="note-strip">${sim.placementNote}</div>
+      </div>
+    </section>`;
+}
+
+function healthCard(sim) {
+  return `
+    <section class="card" aria-label="Health">
+      <div class="card-h"><h3>Health</h3></div>
+      <div class="card-b">
+        <div class="stat-row"><span class="k">SMS · 24h</span><span class="v">${sim.health.sms24}</span></div>
+        <div class="stat-row"><span class="k">Last SMS</span><span class="v">${sim.health.lastSms}</span></div>
+        <div class="stat-row"><span class="k">Last rotation</span><span class="v">${sim.health.rotated}</span></div>
+        <div class="stat-row"><span class="k">Next rotation</span><span class="v">${sim.health.nextRotation}</span></div>
+      </div>
+    </section>`;
+}
+
+function renderDossier() {
+  const sim = SIMS[currentId];
+  document.getElementById("crumb-id").textContent = "#" + sim.id;
+
+  document.getElementById("dossier").innerHTML = `
+    <header class="dhead">
+      <div class="dhead-row1">
+        <h1>#${sim.id}</h1>
+        ${statusBadge(sim)}
+      </div>
+      <div class="idline">
+        <span class="iccid-full" id="iccid-text">${sim.iccid}</span>
+        <button class="copy-btn" id="copy-iccid" aria-label="Copy ICCID">⧉ copy</button>
+        <span class="dim">·</span>
+        <span class="msisdn">${sim.msisdn}</span>
+      </div>
+
+      <div class="prov">
+        <div class="prov-slot">
+          <span class="lbl">Service provider</span>
+          <span class="badge-sp">${VENDOR_LABEL[sim.vendor]}</span>
+        </div>
+        <div class="prov-slot">
+          <span class="lbl">Host</span>
+          <span class="badge-host">${HOST_LABEL[sim.host]}</span>
+        </div>
+      </div>
+      <p class="prov-cap">SP = who provides service · Host = whose server it sits on. Independent axes — never conflate.</p>
+
+      <div class="actions">
+        <button class="btn btn-primary" data-act="Rotate number">Rotate</button>
+        <button class="btn" data-act="Suspend">Suspend</button>
+        <button class="btn" data-act="Send test SMS">Send test SMS</button>
+        <button class="btn btn-icon" data-act="More actions" aria-label="More actions">⋯</button>
+      </div>
+    </header>
+
+    <div class="dbody">
+      <section class="tl" aria-label="Unified timeline">
+        <div class="tl-head">
+          <h2>Timeline</h2>
+          <span class="range">${sim.range} · ${sim.timeline.length} events</span>
+        </div>
+        <div class="chips" role="group" aria-label="Filter timeline">${chipsHtml()}</div>
+        <div id="tl-entries">${timelineHtml(sim)}</div>
+        <div class="tl-footer">
+          Sources: sim_status_history · sim_edit_log · system_errors · number.online deliveries · rotations
+          &nbsp;·&nbsp; <a href="#" onclick="return false">41 other sims with errors →</a>
+        </div>
+      </section>
+
+      <aside class="cards" aria-label="Record details">
+        ${recordCard(sim)}
+        ${resellerCard(sim)}
+        ${placementCard(sim)}
+        ${healthCard(sim)}
+      </aside>
+    </div>`;
+
+  wireDossier(sim);
+}
+
+/* ======================================================================
+   Dossier wiring
+   ====================================================================== */
+function wireDossier(sim) {
+  // timeline chips
+  document.querySelectorAll(".chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      tlFilter = chip.dataset.filter;
+      document.querySelectorAll(".chip").forEach(c => {
+        c.classList.toggle("on", c === chip);
+        c.setAttribute("aria-pressed", c === chip);
+      });
+      document.getElementById("tl-entries").innerHTML = timelineHtml(sim);
+    });
+  });
+
+  // copy ICCID
+  const copyBtn = document.getElementById("copy-iccid");
+  copyBtn.addEventListener("click", () => {
+    try { navigator.clipboard.writeText(sim.iccid); } catch (e) { /* sketch: ok */ }
+    copyBtn.textContent = "✓ Copied";
+    copyBtn.classList.add("copied");
+    setTimeout(() => { copyBtn.textContent = "⧉ copy"; copyBtn.classList.remove("copied"); }, 1600);
+  });
+
+  // mock actions
+  document.querySelectorAll("[data-act]").forEach(btn => {
+    btn.addEventListener("click", () => toast(btn.dataset.act + " · mock action in this sketch"));
+  });
+
+  // edit pencils
+  document.querySelectorAll(".pencil[data-edit]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.edit === "vendor" && sim.id === 639) {
+        openModal();
+      } else {
+        toast("Guarded edit for “" + btn.dataset.edit + "” — vendor on #639 shows the full flow");
+      }
+    });
+  });
+
+  // inline status_reason edit (639 only)
+  const save = document.getElementById("reason-save");
+  if (save) {
+    save.addEventListener("click", () => {
+      sim.status_reason = document.getElementById("reason-input").value;
+      sim.statusReasonEditing = false;
+      renderDossier();
+      toast("status_reason saved", "logged to sim_edit_log · changed_by zalmen");
+    });
+    document.getElementById("reason-cancel").addEventListener("click", () => {
+      sim.statusReasonEditing = false;
+      renderDossier();
+    });
+  }
+}
+
+function selectSim(id) {
+  currentId = id;
+  tlFilter = "all";
+  markSelected();
+  renderDossier();
+  document.querySelector(".detail").scrollTop = 0;
+}
+
+/* ======================================================================
+   CAS modal
+   ====================================================================== */
+const overlay = document.getElementById("overlay");
+const casInput = document.getElementById("cas-input");
+const casConfirm = document.getElementById("cas-confirm");
+
+function openModal() {
+  overlay.classList.add("open");
+  casInput.value = "";
+  casConfirm.disabled = true;
+  casInput.focus();
+}
+function closeModal() {
+  overlay.classList.remove("open");
+}
+
+casInput.addEventListener("input", () => {
+  casConfirm.disabled = casInput.value.trim().toUpperCase() !== "ATOMIC";
+});
+casInput.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !casConfirm.disabled) casConfirm.click();
+});
+casConfirm.addEventListener("click", () => {
+  closeModal();
+  toast("vendor corrected · logged to sim_edit_log", "audited, not undoable — a reverse correction would be a new logged edit");
+});
+document.getElementById("cas-cancel").addEventListener("click", closeModal);
+overlay.addEventListener("click", e => { if (e.target === overlay) closeModal(); });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && overlay.classList.contains("open")) closeModal();
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    document.getElementById("search").focus();
+  }
+});
+
+/* ======================================================================
+   Toast
+   ====================================================================== */
+let toastTimer;
+function toast(msg, sub) {
+  const el = document.getElementById("toast");
+  el.innerHTML = msg + (sub ? `<span class="sub">${sub}</span>` : "");
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 3600);
+}
+
+/* ======================================================================
+   Boot
+   ====================================================================== */
+document.getElementById("search").addEventListener("input", e => applySearch(e.target.value));
+document.getElementById("cmdk").addEventListener("click", () => document.getElementById("search").focus());
+
+renderLists();
+renderDossier();
+</script>
+</body>
+</html>

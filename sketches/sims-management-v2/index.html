@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sims Management v2 — Design Sketches</title>
+<style>
+  :root { --ink:#1c1917; --muted:#78716c; --line:#e7e5e4; --bg:#fafaf9; --card:#fefefe; --accent:#1d4ed8; }
+  * { box-sizing:border-box; margin:0; }
+  body { font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); background:var(--bg); padding:40px 24px 64px; }
+  main { max-width:1080px; margin:0 auto; }
+  h1 { font-size:22px; letter-spacing:-0.01em; }
+  .sub { color:var(--muted); margin:6px 0 8px; }
+  .note { font-size:13px; color:var(--muted); border:1px solid var(--line); background:var(--card); border-radius:8px; padding:10px 14px; margin:16px 0 32px; }
+  .grid { display:grid; gap:24px; }
+  .card { border:1px solid var(--line); background:var(--card); border-radius:10px; overflow:hidden; }
+  .card img { display:block; width:100%; height:auto; border-bottom:1px solid var(--line); }
+  .card .body { padding:16px 20px 20px; }
+  .card h2 { font-size:16px; margin-bottom:4px; }
+  .card p { font-size:13.5px; color:var(--muted); margin-bottom:12px; max-width:70ch; }
+  .links a { display:inline-block; font-size:13.5px; font-weight:600; color:var(--accent); text-decoration:none; margin-right:16px; }
+  .links a:hover, .links a:focus-visible { text-decoration:underline; }
+  a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:2px; }
+  .docs { margin-top:32px; font-size:14px; }
+  .docs a { color:var(--accent); font-weight:600; text-decoration:none; }
+  .docs a:hover { text-decoration:underline; }
+  .badge { display:inline-block; font-size:11px; font-weight:700; letter-spacing:0.04em; padding:2px 8px; border-radius:999px; margin-left:8px; vertical-align:2px; }
+  .rec { background:#dcfce7; color:#166534; }
+</style>
+</head>
+<body>
+<main>
+  <h1>IncomingSMS · Sims Management v2 — design sketches</h1>
+  <p class="sub">Three information architectures, same data and actions. Jul 2026 · fake data · not deployed.</p>
+  <div class="note">Click a title to open the interactive sketch (Ctrl/⌘-K, row clicks, edit pencils, bulk select all work). Process &amp; rationale: <strong>DESIGN.md</strong> · comparison &amp; recommendation: <strong>README.md</strong>.</div>
+
+  <div class="grid">
+    <section class="card">
+      <a href="variant-a-command-center.html"><img src="screenshots/variant-a-command-center.png" alt="Sketch A — Command Center: health stat strip over attention work queues with inline actions"></a>
+      <div class="body">
+        <h2>Sketch A — Command Center<span class="badge rec">recommended home</span></h2>
+        <p>The day starts with "what needs me", not 5,344 rows. Health strip → attention queues (errors, stuck provisioning, not notified…) → each item shows the reason it's here plus recommended actions. Process-next triage, CAS edit confirm, undo toast, command palette.</p>
+        <div class="links"><a href="variant-a-command-center.html">Open sketch</a><a href="screenshots/variant-a-full.png">Full-page screenshot</a></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <a href="variant-b-power-grid.html"><img src="screenshots/variant-b-power-grid.png" alt="Sketch B — Power Grid: dense data grid with facet rail, selection bulk bar and inline editing"></a>
+      <div class="body">
+        <h2>Sketch B — Power Grid</h2>
+        <p>Spreadsheet workbench: saved views + facet counts on the left, dense sortable grid, inline compare-and-set cell editing with a live 409-conflict state, selection scope + dry-run bulk preview, typed bulk delete, keyboard-first.</p>
+        <div class="links"><a href="variant-b-power-grid.html">Open sketch</a><a href="screenshots/variant-b-full.png">Full-page screenshot</a></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <a href="variant-c-investigator.html"><img src="screenshots/variant-c-investigator.png" alt="Sketch C — Investigator: split-pane SIM dossier with unified timeline and guarded record card"></a>
+      <div class="body">
+        <h2>Sketch C — Investigator<span class="badge rec">recommended record view</span></h2>
+        <p>Built around the SIM #639 clobber story: search-first master list, dossier with service-provider vs host provenance block, unified filterable timeline (status · edits · errors · notifications · rotations), guarded type-to-confirm corrections logged to sim_edit_log.</p>
+        <div class="links"><a href="variant-c-investigator.html">Open sketch</a><a href="screenshots/variant-c-full.png">Full-page screenshot</a></div>
+      </div>
+    </section>
+  </div>
+
+  <p class="docs">Docs: <a href="DESIGN.md">DESIGN.md</a> (personas · JTBD · journey map · principles · double diamond) · <a href="README.md">README.md</a> (comparison · recommendation · phased test-env plan)</p>
+</main>
+</body>
+</html>

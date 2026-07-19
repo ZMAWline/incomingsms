@@ -1,0 +1,1465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IncomingSMS · SIMs — Sketch A: Command Center</title>
+<style>
+  /* ============================================================
+     Sketch A — "Ops Command Center"
+     Design sketch, Jul 2026. All data is fake. No external assets.
+     ============================================================ */
+  :root {
+    --bg: #fafaf9;
+    --surface: #fdfdfc;
+    --surface-2: #f5f5f4;
+    --ink: #1c1917;
+    --ink-2: #44403c;
+    --muted: #78716c;
+    --faint: #a8a29e;
+    --border: #e7e5e4;
+    --border-2: #d6d3d1;
+
+    --green: #15803d;
+    --green-bg: #f0fdf4;
+    --amber: #b45309;
+    --amber-bg: #fffbeb;
+    --red: #b91c1c;
+    --red-bg: #fef2f2;
+    --blue: #1d4ed8;
+    --blue-bg: #eff6ff;
+
+    --sp-atomic: #9a3412;
+    --sp-wing: #3730a3;
+    --sp-helix: #0f766e;
+    --sp-teltik: #6d28d9;
+
+    --radius: 6px;
+    --radius-sm: 4px;
+    --shadow-pop: 0 8px 24px rgba(28, 25, 23, 0.16), 0 2px 6px rgba(28, 25, 23, 0.08);
+
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { font-size: 16px; }
+
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    font-size: 0.8125rem; /* 13px base — dense ops UI */
+    line-height: 1.45;
+    min-height: 100vh;
+  }
+
+  button {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: none;
+    cursor: pointer;
+  }
+  button:focus-visible,
+  input:focus-visible,
+  a:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid var(--blue);
+    outline-offset: 1px;
+    border-radius: var(--radius-sm);
+  }
+
+  ul { list-style: none; }
+  .mono { font-family: var(--mono); }
+
+  /* ---------- Header ---------- */
+  .app-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 24px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: baseline; gap: 8px; }
+  .brand-name { font-size: 0.9375rem; font-weight: 650; letter-spacing: -0.01em; }
+  .brand-name .sep { color: var(--faint); font-weight: 400; }
+  .sketch-tag {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    color: var(--amber);
+    background: var(--amber-bg);
+    border: 1px solid #fde68a;
+    border-radius: 999px;
+    padding: 2px 8px;
+  }
+  .header-nav { display: flex; gap: 4px; margin-left: 12px; }
+  .header-nav button {
+    padding: 5px 10px;
+    border-radius: var(--radius-sm);
+    font-weight: 500;
+    color: var(--muted);
+  }
+  .header-nav button:hover { background: var(--surface-2); color: var(--ink); }
+  .header-nav button[aria-current="page"] {
+    color: var(--ink);
+    background: var(--surface-2);
+    font-weight: 600;
+  }
+  .header-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .datestamp { font-size: 0.6875rem; color: var(--faint); }
+  .palette-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    border: 1px solid var(--border-2);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 0.75rem;
+  }
+  .palette-btn:hover { border-color: var(--faint); color: var(--ink); }
+  .palette-btn kbd {
+    font-family: var(--mono);
+    font-size: 0.6875rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 4px;
+    color: var(--muted);
+  }
+
+  /* ---------- Fleet health strip ---------- */
+  .health-strip {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(140px, 1fr));
+    gap: 8px;
+    padding: 16px 24px 12px;
+    max-width: 1440px;
+    margin: 0 auto;
+  }
+  .tile {
+    text-align: left;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    transition: border-color 120ms ease;
+  }
+  .tile:hover { border-color: var(--border-2); background: var(--surface-2); }
+  .tile[aria-pressed="true"] { border-color: var(--ink-2); }
+  .tile-label {
+    font-size: 0.6875rem;
+    font-weight: 500;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .tile-value { font-size: 1.25rem; font-weight: 650; letter-spacing: -0.02em; }
+  .tile-hint { font-size: 0.6875rem; color: var(--faint); }
+  .tile.warn { border-left: 3px solid var(--amber); padding-left: 10px; }
+  .tile.warn .tile-value { color: var(--amber); }
+  .tile.bad { border-left: 3px solid var(--red); padding-left: 10px; }
+  .tile.bad .tile-value { color: var(--red); }
+  .tile.ok .tile-value { color: var(--green); }
+  .trend-up { color: var(--red); }
+  .trend-down { color: var(--green); }
+  .trend-flat { color: var(--faint); }
+
+  /* ---------- Main layout ---------- */
+  .layout {
+    display: grid;
+    grid-template-columns: 232px 1fr;
+    gap: 16px;
+    padding: 4px 24px 96px;
+    max-width: 1440px;
+    margin: 0 auto;
+    align-items: start;
+  }
+
+  /* ---------- Queue rail ---------- */
+  .queue-rail { position: sticky; top: 12px; }
+  .rail-heading {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    color: var(--faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 8px 8px 4px;
+  }
+  .queue-list li { margin-bottom: 1px; }
+  .queue-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+    color: var(--ink-2);
+    text-align: left;
+  }
+  .queue-item:hover { background: var(--surface-2); }
+  .queue-item[aria-current="true"] {
+    background: #edecea;
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .queue-name { flex: 1; }
+  .queue-count {
+    font-size: 0.6875rem;
+    font-family: var(--mono);
+    color: var(--muted);
+    background: var(--surface-2);
+    border-radius: 999px;
+    padding: 1px 7px;
+    min-width: 26px;
+    text-align: center;
+  }
+  .queue-item[aria-current="true"] .queue-count { background: #e0deda; }
+  .queue-count.hot { color: var(--red); background: var(--red-bg); font-weight: 600; }
+  .queue-count.warm { color: var(--amber); background: var(--amber-bg); font-weight: 600; }
+  .rail-divider { height: 1px; background: var(--border); margin: 8px 8px; }
+
+  /* ---------- Worklist ---------- */
+  .worklist-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 8px 2px 10px;
+  }
+  .worklist-title { font-size: 1rem; font-weight: 650; letter-spacing: -0.01em; }
+  .worklist-sub { font-size: 0.75rem; color: var(--muted); }
+  .worklist-head .spacer { flex: 1; }
+  .process-next {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--blue);
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+  }
+  .process-next:hover { background: var(--blue-bg); }
+
+  .work-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 6px;
+  }
+  .work-item.selected { border-color: var(--blue); }
+  .work-item-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+  }
+  .work-item-row input[type="checkbox"] {
+    width: 14px; height: 14px;
+    accent-color: var(--ink);
+    flex-shrink: 0;
+  }
+  .sim-ident {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 300px;
+    flex-shrink: 0;
+  }
+  .sim-id { font-family: var(--mono); font-weight: 650; font-size: 0.8125rem; }
+  .iccid-tail { font-family: var(--mono); font-size: 0.6875rem; color: var(--muted); }
+
+  /* SP badge = FILLED. Host badge = OUTLINED. Deliberately different languages. */
+  .badge-sp {
+    font-size: 0.625rem;
+    font-weight: 650;
+    letter-spacing: 0.03em;
+    color: #fdfdfc;
+    border-radius: var(--radius-sm);
+    padding: 2px 6px;
+    white-space: nowrap;
+  }
+  .badge-sp.atomic { background: var(--sp-atomic); }
+  .badge-sp.wing_iot { background: var(--sp-wing); }
+  .badge-sp.helix { background: var(--sp-helix); }
+  .badge-sp.teltik { background: var(--sp-teltik); }
+  .badge-host {
+    font-size: 0.625rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    color: var(--ink-2);
+    background: transparent;
+    border: 1px dashed var(--border-2);
+    border-radius: var(--radius-sm);
+    padding: 1px 6px;
+    white-space: nowrap;
+  }
+
+  .status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .status-chip .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .status-active { color: var(--green); } .status-active .dot { background: var(--green); }
+  .status-error { color: var(--red); } .status-error .dot { background: var(--red); }
+  .status-suspended { color: var(--muted); } .status-suspended .dot { background: var(--faint); }
+  .status-provisioning { color: var(--blue); } .status-provisioning .dot { background: var(--blue); }
+  .status-canceled { color: var(--faint); } .status-canceled .dot { background: var(--border-2); }
+
+  .queue-reason {
+    flex: 1;
+    font-size: 0.75rem;
+    color: var(--ink-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .queue-reason.reason-error { color: var(--red); }
+  .queue-reason.reason-warn { color: var(--amber); }
+
+  .inline-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .btn {
+    font-size: 0.75rem;
+    font-weight: 550;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-2);
+    background: var(--surface);
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+  .btn:hover { background: var(--surface-2); border-color: var(--faint); color: var(--ink); }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btn-primary { background: var(--ink); border-color: var(--ink); color: #fdfdfc; }
+  .btn-primary:hover { background: #33302c; border-color: #33302c; color: #fdfdfc; }
+  .btn-danger { color: var(--red); border-color: #fecaca; }
+  .btn-danger:hover { background: var(--red-bg); border-color: var(--red); color: var(--red); }
+  .btn-ghost { border-color: transparent; color: var(--muted); }
+  .btn-ghost:hover { background: var(--surface-2); border-color: transparent; }
+
+  .expander {
+    padding: 4px 6px;
+    color: var(--faint);
+    border-radius: var(--radius-sm);
+    font-size: 0.6875rem;
+    flex-shrink: 0;
+  }
+  .expander:hover { color: var(--ink); background: var(--surface-2); }
+
+  /* ---------- Expanded card ---------- */
+  .work-detail {
+    border-top: 1px solid var(--border);
+    padding: 12px 12px 12px 36px;
+    display: none;
+  }
+  .work-item.expanded .work-detail { display: block; }
+  .work-item.expanded { border-color: var(--border-2); }
+  .detail-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(120px, 1fr));
+    gap: 8px 20px;
+    margin-bottom: 12px;
+  }
+  .field-label {
+    font-size: 0.625rem;
+    font-weight: 600;
+    color: var(--faint);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .field-value { font-size: 0.75rem; color: var(--ink); }
+  .field-value.mono { font-size: 0.71875rem; }
+  .field-value .warn-txt { color: var(--amber); }
+
+  .last-error {
+    font-family: var(--mono);
+    font-size: 0.6875rem;
+    color: var(--red);
+    background: var(--red-bg);
+    border: 1px solid #fecaca;
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    margin-bottom: 12px;
+  }
+
+  .mini-timeline { margin-bottom: 12px; }
+  .mini-timeline-title {
+    font-size: 0.625rem;
+    font-weight: 600;
+    color: var(--faint);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+  }
+  .tl-entry {
+    display: flex;
+    gap: 10px;
+    padding: 3px 0 3px 12px;
+    border-left: 2px solid var(--border);
+    font-size: 0.71875rem;
+  }
+  .tl-entry .tl-time {
+    font-family: var(--mono);
+    color: var(--faint);
+    flex-shrink: 0;
+    width: 108px;
+  }
+  .tl-entry .tl-text { color: var(--ink-2); }
+  .tl-entry.tl-error { border-left-color: var(--red); }
+  .tl-entry.tl-error .tl-text { color: var(--red); }
+  .tl-entry.tl-edit { border-left-color: var(--amber); }
+  .tl-view-all {
+    font-size: 0.71875rem;
+    color: var(--blue);
+    padding: 3px 0 0 12px;
+    font-weight: 550;
+  }
+  .tl-view-all:hover { text-decoration: underline; }
+
+  .detail-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* ---------- Bulk bar ---------- */
+  .bulk-bar {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--ink);
+    color: #fdfdfc;
+    border-radius: 8px;
+    padding: 10px 16px;
+    display: none;
+    align-items: center;
+    gap: 14px;
+    box-shadow: var(--shadow-pop);
+    z-index: 40;
+    max-width: 720px;
+  }
+  .bulk-bar.visible { display: flex; }
+  .bulk-count { font-weight: 650; white-space: nowrap; }
+  .bulk-scope { font-size: 0.71875rem; color: #d6d3d1; }
+  .bulk-bar .btn {
+    background: transparent;
+    border-color: #57534e;
+    color: #fdfdfc;
+  }
+  .bulk-bar .btn:hover { background: #33302c; border-color: #78716c; }
+  .bulk-bar .btn-ghost { border-color: transparent; color: #a8a29e; }
+  .bulk-bar .btn-ghost:hover { color: #fdfdfc; background: #33302c; }
+
+  /* ---------- Modal ---------- */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(28, 25, 23, 0.4);
+    display: none;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 12vh;
+    z-index: 50;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: var(--surface);
+    border-radius: 8px;
+    box-shadow: var(--shadow-pop);
+    width: 480px;
+    max-width: calc(100vw - 32px);
+  }
+  .modal-head { padding: 16px 20px 0; }
+  .modal-title { font-size: 0.9375rem; font-weight: 650; }
+  .modal-sub { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+  .modal-body { padding: 14px 20px; }
+  .cas-diff {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 12px;
+  }
+  .cas-field { font-size: 0.75rem; font-weight: 600; color: var(--muted); }
+  .cas-old, .cas-new {
+    font-family: var(--mono);
+    font-size: 0.875rem;
+    font-weight: 650;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+  }
+  .cas-old { background: var(--red-bg); color: var(--red); text-decoration: line-through; }
+  .cas-arrow { color: var(--faint); font-size: 0.875rem; }
+  .cas-new { background: var(--green-bg); color: var(--green); }
+  .modal-warning {
+    display: flex;
+    gap: 8px;
+    font-size: 0.75rem;
+    color: var(--amber);
+    background: var(--amber-bg);
+    border: 1px solid #fde68a;
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    margin-bottom: 10px;
+  }
+  .modal-warning strong { font-weight: 650; }
+  .cas-note { font-size: 0.71875rem; color: var(--muted); }
+  .cas-note .mono { font-size: 0.6875rem; }
+  .modal-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 20px 16px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* ---------- Undo toast ---------- */
+  .toast {
+    position: fixed;
+    bottom: 16px;
+    right: 16px;
+    background: var(--ink);
+    color: #fdfdfc;
+    border-radius: 8px;
+    padding: 10px 14px;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    box-shadow: var(--shadow-pop);
+    z-index: 60;
+    font-size: 0.8125rem;
+  }
+  .toast.visible { display: flex; }
+  .toast-undo {
+    font-weight: 650;
+    color: #93c5fd;
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+  }
+  .toast-undo:hover { background: #33302c; text-decoration: underline; }
+  .toast-timer { font-family: var(--mono); font-size: 0.6875rem; color: #a8a29e; min-width: 20px; }
+
+  /* ---------- Command palette ---------- */
+  .palette {
+    background: var(--surface);
+    border-radius: 8px;
+    box-shadow: var(--shadow-pop);
+    width: 520px;
+    max-width: calc(100vw - 32px);
+    overflow: hidden;
+  }
+  .palette input {
+    width: 100%;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    background: transparent;
+    padding: 14px 16px;
+    font: inherit;
+    font-size: 0.875rem;
+    color: var(--ink);
+  }
+  .palette input::placeholder { color: var(--faint); }
+  .palette input:focus { outline: none; }
+  .palette-results { max-height: 320px; overflow-y: auto; padding: 6px; }
+  .palette-group-label {
+    font-size: 0.625rem;
+    font-weight: 600;
+    color: var(--faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 8px 10px 4px;
+  }
+  .palette-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    text-align: left;
+    color: var(--ink-2);
+  }
+  .palette-item:hover, .palette-item.active { background: var(--surface-2); color: var(--ink); }
+  .palette-item .pi-kind {
+    margin-left: auto;
+    font-size: 0.625rem;
+    color: var(--faint);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .palette-empty { padding: 20px; text-align: center; color: var(--faint); font-size: 0.75rem; }
+  .palette-foot {
+    display: flex;
+    gap: 14px;
+    padding: 8px 14px;
+    border-top: 1px solid var(--border);
+    font-size: 0.6875rem;
+    color: var(--faint);
+  }
+  .palette-foot kbd {
+    font-family: var(--mono);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 4px;
+  }
+
+  /* ---------- Fleet stub ---------- */
+  .fleet-stub {
+    background: var(--surface);
+    border: 1px dashed var(--border-2);
+    border-radius: var(--radius);
+    padding: 48px 32px;
+    text-align: center;
+    color: var(--muted);
+    display: none;
+  }
+  .fleet-stub.visible { display: block; }
+  .fleet-stub h2 { font-size: 0.9375rem; color: var(--ink); margin-bottom: 8px; }
+  .fleet-stub p { font-size: 0.75rem; max-width: 460px; margin: 0 auto 4px; }
+  .view-queues .fleet-stub { display: none; }
+
+  .empty-queue {
+    padding: 40px 24px;
+    text-align: center;
+    color: var(--muted);
+    background: var(--surface);
+    border: 1px dashed var(--border-2);
+    border-radius: var(--radius);
+    font-size: 0.75rem;
+  }
+</style>
+</head>
+<body class="view-queues">
+
+<!-- ============ Header ============ -->
+<header class="app-header">
+  <div class="brand">
+    <span class="brand-name">IncomingSMS <span class="sep">·</span> SIMs</span>
+    <span class="sketch-tag">Sketch A — Command Center</span>
+  </div>
+  <nav class="header-nav" aria-label="Primary">
+    <button id="nav-queues" aria-current="page">Work queues</button>
+    <button id="nav-fleet">Fleet</button>
+  </nav>
+  <div class="header-right">
+    <span class="datestamp">Design sketch · Jul 2026 · fake data</span>
+    <button class="palette-btn" id="open-palette" aria-haspopup="dialog">
+      Search queues &amp; actions… <kbd>Ctrl</kbd><kbd>K</kbd>
+    </button>
+  </div>
+</header>
+
+<!-- ============ Fleet health strip ============ -->
+<section class="health-strip" aria-label="Fleet health">
+  <button class="tile ok" data-queue="__all_active">
+    <span class="tile-label">Active</span>
+    <span class="tile-value">4,419</span>
+    <span class="tile-hint">of 5,344 <span class="trend-flat">· steady</span></span>
+  </button>
+  <button class="tile bad" data-queue="any_error">
+    <span class="tile-label">Errors</span>
+    <span class="tile-value">40</span>
+    <span class="tile-hint"><span class="trend-up">▲ 6 since 06:00</span></span>
+  </button>
+  <button class="tile warn" data-queue="stuck_provisioning">
+    <span class="tile-label">Stuck provisioning</span>
+    <span class="tile-value">25</span>
+    <span class="tile-hint"><span class="trend-up">▲ 3 overnight</span></span>
+  </button>
+  <button class="tile warn" data-queue="not_notified">
+    <span class="tile-label">Not notified today</span>
+    <span class="tile-value">112</span>
+    <span class="tile-hint"><span class="trend-down">▼ 38 since 08:00</span></span>
+  </button>
+  <button class="tile" data-queue="no_reseller">
+    <span class="tile-label">No reseller</span>
+    <span class="tile-value">1,207</span>
+    <span class="tile-hint"><span class="trend-flat">· mostly parked</span></span>
+  </button>
+  <button class="tile warn" data-queue="not_rotated_today">
+    <span class="tile-label">Rotation backlog</span>
+    <span class="tile-value">86</span>
+    <span class="tile-hint">past 24h interval <span class="trend-up">▲ 12</span></span>
+  </button>
+</section>
+
+<!-- ============ Main ============ -->
+<main class="layout" id="main-layout">
+  <!-- Queue rail -->
+  <nav class="queue-rail" aria-label="Work queues">
+    <div class="rail-heading">Attention</div>
+    <ul class="queue-list" id="queue-list">
+      <li><button class="queue-item" data-queue="any_error" aria-current="true">
+        <span class="queue-name">Errors</span><span class="queue-count hot">40</span></button></li>
+      <li><button class="queue-item" data-queue="stuck_provisioning">
+        <span class="queue-name">Stuck provisioning</span><span class="queue-count warm">25</span></button></li>
+      <li><button class="queue-item" data-queue="not_rotated_today">
+        <span class="queue-name">Not rotated today</span><span class="queue-count warm">86</span></button></li>
+      <li><button class="queue-item" data-queue="not_notified">
+        <span class="queue-name">Not notified today</span><span class="queue-count warm">112</span></button></li>
+      <li><button class="queue-item" data-queue="no_reseller">
+        <span class="queue-name">No reseller</span><span class="queue-count">1,207</span></button></li>
+      <li><button class="queue-item" data-queue="auto_paused">
+        <span class="queue-name">Auto-paused</span><span class="queue-count">14</span></button></li>
+    </ul>
+    <div class="rail-divider" role="presentation"></div>
+    <div class="rail-heading">Mine</div>
+    <ul class="queue-list">
+      <li><button class="queue-item" data-queue="recently_edited">
+        <span class="queue-name">Recently edited</span><span class="queue-count">9</span></button></li>
+      <li><button class="queue-item" data-queue="watchlist">
+        <span class="queue-name">Watchlist</span><span class="queue-count">5</span></button></li>
+    </ul>
+  </nav>
+
+  <!-- Worklist -->
+  <section aria-label="Worklist" id="worklist-pane">
+    <div class="worklist-head">
+      <h1 class="worklist-title" id="worklist-title">Errors</h1>
+      <span class="worklist-sub" id="worklist-sub">40 SIMs · showing top 8 by age · newest failure first</span>
+      <span class="spacer"></span>
+      <button class="process-next" id="process-next">Process next →</button>
+    </div>
+    <ul id="worklist"><!-- rendered by JS --></ul>
+
+    <div class="fleet-stub" id="fleet-stub">
+      <h2>Fleet — browse all 5,344 SIMs</h2>
+      <p>Full server-side table lives here in the real build: sortable columns, saved views,
+        filter by SP / Host / carrier / status / reseller, CSV export.</p>
+      <p>Not mocked in this sketch — the command-center bet is that 95% of daily work
+        happens in the queues, so the table is one click away instead of the landing page.</p>
+    </div>
+  </section>
+</main>
+
+<!-- ============ Bulk bar ============ -->
+<div class="bulk-bar" id="bulk-bar" role="region" aria-label="Bulk actions" aria-live="polite">
+  <span class="bulk-count" id="bulk-count">0 selected</span>
+  <button class="btn" id="bulk-rotate">Rotate all</button>
+  <button class="btn" id="bulk-suspend">Suspend all</button>
+  <button class="btn btn-ghost" id="bulk-clear">Clear</button>
+  <span class="bulk-scope" id="bulk-scope"></span>
+</div>
+
+<!-- ============ CAS edit modal ============ -->
+<div class="overlay" id="cas-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="cas-title">
+    <div class="modal-head">
+      <h2 class="modal-title" id="cas-title">Edit guarded field — SIM #639</h2>
+      <p class="modal-sub">Compare-and-set update · one field per commit</p>
+    </div>
+    <div class="modal-body">
+      <div class="cas-diff">
+        <span class="cas-field">vendor (SP)</span>
+        <span class="cas-old">atomic</span>
+        <span class="cas-arrow" aria-hidden="true">→</span>
+        <span class="cas-new">teltik</span>
+      </div>
+      <div class="modal-warning">
+        <span aria-hidden="true">⚠</span>
+        <span>You are changing the <strong>service provider</strong>, not the host.
+          SIM #639 is an <strong>atomic (AT&amp;T)</strong> SIM hosted on
+          <strong>teltik</strong> servers — if you only meant hosting, edit
+          <strong>gateway_host</strong> instead. This exact mix-up caused the
+          #639 data-loss incident in May.</span>
+      </div>
+      <p class="cas-note">This write asserts <span class="mono">vendor = "atomic"</span> at commit time.
+        If the row changed since you opened this dialog, the update
+        <strong>fails safely</strong> and you'll be asked to re-review.</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cas-cancel">Cancel</button>
+      <button class="btn btn-danger" id="cas-confirm">Confirm change: atomic → teltik</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Command palette ============ -->
+<div class="overlay" id="palette-overlay">
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+    <input type="text" id="palette-input" placeholder="Jump to a queue or run an action…"
+      aria-label="Search queues and actions" autocomplete="off">
+    <div class="palette-results" id="palette-results"></div>
+    <div class="palette-foot">
+      <span><kbd>↵</kbd> select first</span>
+      <span><kbd>Esc</kbd> close</span>
+      <span>Actions run on the current selection</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Undo toast ============ -->
+<div class="toast" id="toast" role="status" aria-live="polite">
+  <span id="toast-msg">Suspended SIM #2114</span>
+  <button class="toast-undo" id="toast-undo">Undo</button>
+  <span class="toast-timer" id="toast-timer">8s</span>
+</div>
+
+<script>
+'use strict';
+/* All data below is fake. "Now" is Jul 19, 2026, 09:40 ET. */
+
+/* ---------------- Data ---------------- */
+const SP_LABEL = { atomic: 'SP: ATOMIC', wing_iot: 'SP: WING IOT', helix: 'SP: HELIX', teltik: 'SP: TELTIK' };
+const STATUS_LABEL = {
+  active: 'Active', error: 'Error', suspended: 'Suspended',
+  provisioning: 'Provisioning', canceled: 'Canceled'
+};
+
+const QUEUES = {
+  any_error: {
+    title: 'Errors',
+    sub: '40 SIMs · showing top 8 by age · newest failure first',
+    scope: 'queue “Errors”',
+    items: [
+      {
+        id: 639, iccid: '8901410327913605821', msisdn: '3475550142',
+        vendor: 'atomic', carrier: 'att', host: 'teltik', status: 'error',
+        reason: 'Error: atomic OTA refresh timeout (3×) — last 09:12',
+        reasonClass: 'reason-error',
+        actions: ['OTA refresh', 'Suspend'],
+        expanded: true,
+        detail: {
+          reseller: 'TrustOTP', rotation: 'eligible · every 24h',
+          lastRotated: 'Jul 18, 11:02 (22h ago)', sms24: '0 (last: Jul 18, 19:44)',
+          activated: 'Feb 3, 2026', gateway: '— (teltik-hosted, no port)',
+          statusReason: 'ota_refresh_failed',
+          lastError: 'atomic OTA refresh timeout after 90s — attempt 3/3, carrier ack never received (req 7f31c2)',
+          timeline: [
+            { t: 'Jul 19 09:12', cls: 'tl-error', text: 'OTA refresh failed — timeout after 90s (attempt 3/3)' },
+            { t: 'Jul 19 08:41', cls: 'tl-error', text: 'OTA refresh failed — timeout after 90s (attempt 2/3)' },
+            { t: 'Jul 18 19:44', cls: '', text: 'number.online webhook delivered — 200 OK (last successful)' },
+            { t: 'Jul 18 11:02', cls: '', text: 'MDN rotated 3475550089 → 3475550142 (auto, interval 24h)' },
+            { t: 'May 12 14:20', cls: 'tl-edit', text: 'vendor corrected teltik → atomic by zalmen (incident fix)' }
+          ],
+          extraActions: ['Rotate number', 'Check IMEI', 'Send test SMS', 'Edit vendor', 'View full history']
+        }
+      },
+      {
+        id: 4821, iccid: '8901260842915530776', msisdn: '9175550317',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'error',
+        reason: 'Error: teltik swap failed — line busy (attempt 3)',
+        reasonClass: 'reason-error', actions: ['Rotate', 'Suspend']
+      },
+      {
+        id: 3306, iccid: '8901260790114428359', msisdn: '6465550284',
+        vendor: 'helix', carrier: 'tmobile', host: 'skyline', status: 'error',
+        reason: 'Error: helix HX-AX 422 — MDN not in inventory',
+        reasonClass: 'reason-error', actions: ['Rotate', 'Dismiss']
+      },
+      {
+        id: 1188, iccid: '8901410355208114937', msisdn: '9295550466',
+        vendor: 'wing_iot', carrier: 'att', host: 'skyline', status: 'error',
+        reason: 'Error: SIM not registered on GW-3 / 12A for 2h 10m',
+        reasonClass: 'reason-error', actions: ['OTA refresh', 'Check IMEI']
+      },
+      {
+        id: 2114, iccid: '8901260811473308242', msisdn: '7185550923',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'error',
+        reason: 'Error: webhook delivery failing — 502 from forward URL (11×)',
+        reasonClass: 'reason-error', actions: ['Suspend', 'Dismiss']
+      },
+      {
+        id: 4477, iccid: '8901260858731164105', msisdn: '3055550171',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'error',
+        reason: 'Error: teltik port reset loop — 4 resets in 90m',
+        reasonClass: 'reason-error', actions: ['Suspend', 'Dismiss']
+      },
+      {
+        id: 952, iccid: '8901410309662247180', msisdn: '4695550538',
+        vendor: 'atomic', carrier: 'att', host: 'skyline', status: 'error',
+        reason: 'Error: activation ack missing 40m after MDN swap',
+        reasonClass: 'reason-error', actions: ['OTA refresh', 'Rotate']
+      },
+      {
+        id: 3891, iccid: '8901260836620095413', msisdn: '2135550694',
+        vendor: 'helix', carrier: 'tmobile', host: 'skyline', status: 'error',
+        reason: 'Error: no SMS received in 14h despite active status',
+        reasonClass: 'reason-error', actions: ['Send test SMS', 'Rotate']
+      }
+    ]
+  },
+
+  stuck_provisioning: {
+    title: 'Stuck provisioning',
+    sub: '25 SIMs · provisioning > 2h · oldest first',
+    scope: 'queue “Stuck provisioning”',
+    items: [
+      {
+        id: 5102, iccid: '8901410388254470629', msisdn: '— pending',
+        vendor: 'atomic', carrier: 'att', host: 'teltik', status: 'provisioning',
+        reason: 'Provisioning for 6h 12m — atomic activation queued, no MDN yet',
+        reasonClass: 'reason-warn', actions: ['Check IMEI', 'Cancel']
+      },
+      {
+        id: 5117, iccid: '8901410388254471083', msisdn: '— pending',
+        vendor: 'atomic', carrier: 'att', host: 'teltik', status: 'provisioning',
+        reason: 'Provisioning for 5h 48m — same batch as #5102',
+        reasonClass: 'reason-warn', actions: ['Check IMEI', 'Cancel']
+      },
+      {
+        id: 5089, iccid: '8901260871003295144', msisdn: '3475550801',
+        vendor: 'helix', carrier: 'tmobile', host: 'skyline', status: 'provisioning',
+        reason: 'Provisioning for 4h 31m — MDN assigned but SIM silent on GW-7 / 03B',
+        reasonClass: 'reason-warn', actions: ['OTA refresh', 'Activate']
+      },
+      {
+        id: 5121, iccid: '8901260871003296028', msisdn: '— pending',
+        vendor: 'wing_iot', carrier: 'att', host: 'skyline', status: 'provisioning',
+        reason: 'Provisioning for 3h 05m — wing_iot 202 accepted, no callback',
+        reasonClass: 'reason-warn', actions: ['Check IMEI', 'Cancel']
+      },
+      {
+        id: 5124, iccid: '8901410388254472916', msisdn: '— pending',
+        vendor: 'atomic', carrier: 'att', host: 'skyline', status: 'provisioning',
+        reason: 'Provisioning for 2h 44m — awaiting carrier ack',
+        reasonClass: 'reason-warn', actions: ['Check IMEI', 'Dismiss']
+      },
+      {
+        id: 5130, iccid: '8901260871003297450', msisdn: '— pending',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'provisioning',
+        reason: 'Provisioning for 2h 12m — teltik line create pending',
+        reasonClass: 'reason-warn', actions: ['Dismiss']
+      }
+    ]
+  },
+
+  not_rotated_today: {
+    title: 'Not rotated today',
+    sub: '86 SIMs past their 24h interval · showing 8 most overdue',
+    scope: 'queue “Not rotated today”',
+    items: [
+      {
+        id: 1440, iccid: '8901260803317742168', msisdn: '9175550233',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'active',
+        reason: 'Last rotated Jul 17, 22:05 (35h ago) · interval 24h',
+        reasonClass: 'reason-warn', actions: ['Rotate', 'Dismiss']
+      },
+      {
+        id: 1523, iccid: '8901260803317742857', msisdn: '6465550910',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'active',
+        reason: 'Last rotated Jul 17, 23:40 (34h ago) · interval 24h',
+        reasonClass: 'reason-warn', actions: ['Rotate', 'Dismiss']
+      },
+      {
+        id: 2287, iccid: '8901410344561128704', msisdn: '3475550655',
+        vendor: 'atomic', carrier: 'att', host: 'teltik', status: 'active',
+        reason: 'Last rotated Jul 18, 02:15 (31h ago) · rotation job skipped it twice',
+        reasonClass: 'reason-warn', actions: ['Rotate', 'Dismiss']
+      },
+      {
+        id: 2760, iccid: '8901260827950663391', msisdn: '9295550387',
+        vendor: 'helix', carrier: 'tmobile', host: 'skyline', status: 'active',
+        reason: 'Last rotated Jul 18, 04:52 (29h ago) · interval 24h',
+        reasonClass: 'reason-warn', actions: ['Rotate', 'Dismiss']
+      },
+      {
+        id: 903, iccid: '8901410301877234066', msisdn: '7185550449',
+        vendor: 'wing_iot', carrier: 'att', host: 'skyline', status: 'active',
+        reason: 'Last rotated Jul 18, 06:30 (27h ago) · wing_iot MDN change rate-limited',
+        reasonClass: 'reason-warn', actions: ['Rotate', 'Dismiss']
+      },
+      {
+        id: 3145, iccid: '8901260834109557212', msisdn: '2135550772',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'active',
+        reason: 'Last rotated Jul 18, 07:58 (26h ago) · interval 24h',
+        reasonClass: 'reason-warn', actions: ['Rotate', 'Dismiss']
+      },
+      {
+        id: 3160, iccid: '8901260834109557998', msisdn: '3055550518',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'active',
+        reason: 'Last rotated Jul 18, 08:23 (25h ago) · interval 24h',
+        reasonClass: 'reason-warn', actions: ['Rotate', 'Dismiss']
+      },
+      {
+        id: 4019, iccid: '8901260849226801530', msisdn: '4695550864',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'active',
+        reason: 'Last rotated Jul 18, 09:11 (24h ago) · just crossed interval',
+        reasonClass: '', actions: ['Rotate', 'Dismiss']
+      }
+    ]
+  },
+
+  no_reseller: {
+    title: 'No reseller',
+    sub: '1,207 SIMs unassigned · showing 7 active ones burning capacity',
+    scope: 'queue “No reseller”',
+    items: [
+      {
+        id: 2914, iccid: '8901260822476113059', msisdn: '9175550604',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'active',
+        reason: 'Active 12d, receiving SMS (31 in 24h), no reseller assigned',
+        reasonClass: '', actions: ['Assign TrustOTP', 'Suspend']
+      },
+      {
+        id: 2921, iccid: '8901260822476113680', msisdn: '3475550928',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'active',
+        reason: 'Active 12d, receiving SMS (18 in 24h), no reseller assigned',
+        reasonClass: '', actions: ['Assign TrustOTP', 'Suspend']
+      },
+      {
+        id: 1077, iccid: '8901410312995806422', msisdn: '6465550175',
+        vendor: 'atomic', carrier: 'att', host: 'teltik', status: 'active',
+        reason: 'Active 9d, 44 SMS in 24h — likely should be HYPPE (batch 22)',
+        reasonClass: '', actions: ['Assign HYPPE', 'Assign TrustOTP']
+      },
+      {
+        id: 3488, iccid: '8901260839014472561', msisdn: '9295550241',
+        vendor: 'helix', carrier: 'tmobile', host: 'skyline', status: 'active',
+        reason: 'Active 6d, rotation-eligible, no reseller assigned',
+        reasonClass: '', actions: ['Assign TrustOTP', 'Suspend']
+      },
+      {
+        id: 3502, iccid: '8901260839014473308', msisdn: '7185550386',
+        vendor: 'helix', carrier: 'tmobile', host: 'skyline', status: 'active',
+        reason: 'Active 6d, 0 SMS in 24h — assign or park it',
+        reasonClass: '', actions: ['Assign TrustOTP', 'Suspend']
+      },
+      {
+        id: 660, iccid: '8901410327913609175', msisdn: '2135550830',
+        vendor: 'atomic', carrier: 'att', host: 'teltik', status: 'active',
+        reason: 'Active 21d — oldest unassigned active line',
+        reasonClass: '', actions: ['Assign TrustOTP', 'Suspend']
+      },
+      {
+        id: 4650, iccid: '8901260861308847294', msisdn: '3055550662',
+        vendor: 'teltik', carrier: 'tmobile', host: 'teltik', status: 'active',
+        reason: 'Active 4d, receiving SMS (7 in 24h), no reseller assigned',
+        reasonClass: '', actions: ['Assign TrustOTP', 'Suspend']
+      }
+    ]
+  }
+};
+
+/* Queues listed in the rail but not fully mocked reuse a nearby dataset with a note. */
+const QUEUE_ALIASES = {
+  not_notified: {
+    base: 'not_rotated_today',
+    title: 'Not notified today',
+    sub: '112 SIMs — carrier not notified of number today · stub: reusing rotation items in this sketch'
+  },
+  auto_paused: {
+    base: 'no_reseller',
+    title: 'Auto-paused',
+    sub: '14 SIMs paused by guardrails · stub: reusing unassigned items in this sketch'
+  },
+  recently_edited: {
+    base: 'any_error',
+    title: 'Recently edited',
+    sub: '9 SIMs edited in last 48h · stub: reusing error items in this sketch'
+  },
+  watchlist: {
+    base: 'any_error',
+    title: 'Watchlist',
+    sub: '5 pinned SIMs · stub: reusing error items in this sketch'
+  },
+  __all_active: {
+    base: 'not_rotated_today',
+    title: 'Active fleet',
+    sub: '4,419 active SIMs — use the Fleet tab to browse; showing rotation backlog here'
+  }
+};
+
+/* ---------------- Rendering ---------------- */
+const worklistEl = document.getElementById('worklist');
+const titleEl = document.getElementById('worklist-title');
+const subEl = document.getElementById('worklist-sub');
+let currentQueue = 'any_error';
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function iccidTail(iccid) { return '…' + iccid.slice(-6); }
+
+function renderItem(item) {
+  const li = document.createElement('li');
+  const wrap = document.createElement('div');
+  wrap.className = 'work-item' + (item.expanded ? ' expanded' : '');
+  wrap.dataset.simId = item.id;
+
+  const actionsHtml = (item.actions || []).map(a => {
+    const danger = /suspend|cancel|delete/i.test(a) ? ' btn-danger' : '';
+    return `<button class="btn${danger}" data-action="${esc(a)}" data-sim="${item.id}">${esc(a)}</button>`;
+  }).join('');
+
+  wrap.innerHTML = `
+    <div class="work-item-row">
+      <input type="checkbox" aria-label="Select SIM #${item.id}" data-check="${item.id}">
+      <div class="sim-ident">
+        <span class="sim-id">#${item.id}</span>
+        <span class="iccid-tail" title="${esc(item.iccid)}">${iccidTail(item.iccid)}</span>
+        <span class="badge-sp ${item.vendor}">${SP_LABEL[item.vendor]}</span>
+        <span class="badge-host">Host: ${item.host}</span>
+        <span class="status-chip status-${item.status}"><span class="dot"></span>${STATUS_LABEL[item.status]}</span>
+      </div>
+      <span class="queue-reason ${item.reasonClass || ''}" title="${esc(item.reason)}">${esc(item.reason)}</span>
+      <div class="inline-actions">${actionsHtml}</div>
+      <button class="expander" data-expand="${item.id}"
+        aria-expanded="${item.expanded ? 'true' : 'false'}"
+        aria-label="${item.expanded ? 'Collapse' : 'Expand'} SIM #${item.id} details">${item.expanded ? '▲' : '▼'}</button>
+    </div>
+    ${item.detail ? renderDetail(item) : renderStubDetail(item)}
+  `;
+  li.appendChild(wrap);
+  return li;
+}
+
+function renderDetail(item) {
+  const d = item.detail;
+  const tl = d.timeline.map(e =>
+    `<li class="tl-entry ${e.cls}"><span class="tl-time">${esc(e.t)}</span><span class="tl-text">${esc(e.text)}</span></li>`
+  ).join('');
+  const extra = d.extraActions.map(a => {
+    if (a === 'Edit vendor') {
+      return `<button class="btn" data-open-cas="${item.id}">Edit vendor</button>`;
+    }
+    const danger = /suspend|cancel|delete/i.test(a) ? ' btn-danger' : '';
+    return `<button class="btn${danger}" data-action="${esc(a)}" data-sim="${item.id}">${esc(a)}</button>`;
+  }).join('');
+  return `
+    <div class="work-detail">
+      <div class="detail-grid">
+        <div><div class="field-label">MSISDN</div><div class="field-value mono">${esc(item.msisdn)}</div></div>
+        <div><div class="field-label">ICCID</div><div class="field-value mono">${esc(item.iccid)}</div></div>
+        <div><div class="field-label">Gateway / port / slot</div><div class="field-value">${esc(d.gateway)}</div></div>
+        <div><div class="field-label">Reseller</div><div class="field-value">${esc(d.reseller)}</div></div>
+        <div><div class="field-label">Rotation</div><div class="field-value">${esc(d.rotation)}</div></div>
+        <div><div class="field-label">Last rotated</div><div class="field-value">${esc(d.lastRotated)}</div></div>
+        <div><div class="field-label">SMS (24h)</div><div class="field-value"><span class="warn-txt">${esc(d.sms24)}</span></div></div>
+        <div><div class="field-label">Status reason</div><div class="field-value mono">${esc(d.statusReason)}</div></div>
+      </div>
+      <div class="last-error">${esc(d.lastError)}</div>
+      <div class="mini-timeline">
+        <div class="mini-timeline-title">Recent history</div>
+        <ul>${tl}</ul>
+        <button class="tl-view-all" data-action="View full history" data-sim="${item.id}">View full history (47 entries) →</button>
+      </div>
+      <div class="detail-actions">${extra}</div>
+    </div>
+  `;
+}
+
+function renderStubDetail(item) {
+  return `
+    <div class="work-detail">
+      <div class="detail-grid">
+        <div><div class="field-label">MSISDN</div><div class="field-value mono">${esc(item.msisdn)}</div></div>
+        <div><div class="field-label">ICCID</div><div class="field-value mono">${esc(item.iccid)}</div></div>
+        <div><div class="field-label">Carrier</div><div class="field-value">${item.carrier === 'att' ? 'AT&amp;T' : 'T-Mobile'}</div></div>
+        <div><div class="field-label">Reseller</div><div class="field-value">${item.reseller || '— unassigned'}</div></div>
+      </div>
+      <div class="detail-actions">
+        <button class="btn" data-action="Rotate number" data-sim="${item.id}">Rotate number</button>
+        <button class="btn" data-action="Send test SMS" data-sim="${item.id}">Send test SMS</button>
+        <button class="btn" data-action="View full history" data-sim="${item.id}">View history</button>
+        <button class="btn btn-danger" data-action="Suspend" data-sim="${item.id}">Suspend</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderQueue(key) {
+  let q, title, sub;
+  if (QUEUES[key]) {
+    q = QUEUES[key]; title = q.title; sub = q.sub;
+  } else if (QUEUE_ALIASES[key]) {
+    const alias = QUEUE_ALIASES[key];
+    q = QUEUES[alias.base]; title = alias.title; sub = alias.sub;
+  } else {
+    worklistEl.innerHTML = '<li class="empty-queue">Queue is empty — nothing needs attention here. Nice.</li>';
+    return;
+  }
+  currentQueue = key;
+  titleEl.textContent = title;
+  subEl.textContent = sub;
+  worklistEl.innerHTML = '';
+  q.items.forEach(item => worklistEl.appendChild(renderItem(item)));
+  clearSelection();
+
+  document.querySelectorAll('.queue-item').forEach(b => {
+    b.setAttribute('aria-current', b.dataset.queue === key ? 'true' : 'false');
+  });
+  document.querySelectorAll('.tile').forEach(t => {
+    t.setAttribute('aria-pressed', t.dataset.queue === key ? 'true' : 'false');
+  });
+  showQueuesView();
+}
+
+/* ---------------- Queue switching ---------------- */
+document.querySelectorAll('.queue-item, .tile').forEach(btn => {
+  btn.addEventListener('click', () => renderQueue(btn.dataset.queue));
+});
+
+/* ---------------- Fleet stub tab ---------------- */
+const navQueues = document.getElementById('nav-queues');
+const navFleet = document.getElementById('nav-fleet');
+const fleetStub = document.getElementById('fleet-stub');
+
+function showQueuesView() {
+  document.body.classList.add('view-queues');
+  fleetStub.classList.remove('visible');
+  worklistEl.style.display = '';
+  document.querySelector('.worklist-head').style.display = '';
+  navQueues.setAttribute('aria-current', 'page');
+  navFleet.removeAttribute('aria-current');
+}
+function showFleetView() {
+  document.body.classList.remove('view-queues');
+  fleetStub.classList.add('visible');
+  worklistEl.style.display = 'none';
+  document.querySelector('.worklist-head').style.display = 'none';
+  navFleet.setAttribute('aria-current', 'page');
+  navQueues.removeAttribute('aria-current');
+}
+navQueues.addEventListener('click', showQueuesView);
+navFleet.addEventListener('click', showFleetView);
+
+/* ---------------- Expand / collapse ---------------- */
+worklistEl.addEventListener('click', e => {
+  const exp = e.target.closest('[data-expand]');
+  if (exp) {
+    const card = exp.closest('.work-item');
+    const open = card.classList.toggle('expanded');
+    exp.setAttribute('aria-expanded', open ? 'true' : 'false');
+    exp.textContent = open ? '▲' : '▼';
+    return;
+  }
+  const cas = e.target.closest('[data-open-cas]');
+  if (cas) { openCas(); return; }
+  const act = e.target.closest('[data-action]');
+  if (act) { handleAction(act.dataset.action, act.dataset.sim); return; }
+});
+
+/* "Process next" — expand the first item, collapse others */
+document.getElementById('process-next').addEventListener('click', () => {
+  const cards = Array.from(worklistEl.querySelectorAll('.work-item'));
+  const openIdx = cards.findIndex(c => c.classList.contains('expanded'));
+  cards.forEach(c => c.classList.remove('expanded'));
+  const next = cards[(openIdx + 1) % cards.length];
+  if (next) {
+    next.classList.add('expanded');
+    next.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    const btn = next.querySelector('[data-expand]');
+    if (btn) { btn.setAttribute('aria-expanded', 'true'); btn.textContent = '▲'; }
+  }
+});
+
+/* ---------------- Selection / bulk bar ---------------- */
+const bulkBar = document.getElementById('bulk-bar');
+const bulkCount = document.getElementById('bulk-count');
+const bulkScope = document.getElementById('bulk-scope');
+
+function selectedIds() {
+  return Array.from(worklistEl.querySelectorAll('[data-check]:checked')).map(c => c.dataset.check);
+}
+function refreshBulkBar() {
+  const ids = selectedIds();
+  worklistEl.querySelectorAll('.work-item').forEach(c => {
+    const box = c.querySelector('[data-check]');
+    c.classList.toggle('selected', !!(box && box.checked));
+  });
+  if (ids.length === 0) { bulkBar.classList.remove('visible'); return; }
+  const scopeName = (QUEUES[currentQueue] && QUEUES[currentQueue].scope) ||
+    (QUEUE_ALIASES[currentQueue] ? `queue “${QUEUE_ALIASES[currentQueue].title}”` : 'this queue');
+  bulkCount.textContent = `${ids.length} selected`;
+  bulkScope.textContent =
+    `Applies only to the ${ids.length} checked SIM${ids.length === 1 ? '' : 's'} in ${scopeName} — never the whole fleet.`;
+  bulkBar.classList.add('visible');
+}
+function clearSelection() {
+  worklistEl.querySelectorAll('[data-check]').forEach(c => { c.checked = false; });
+  refreshBulkBar();
+}
+worklistEl.addEventListener('change', e => {
+  if (e.target.matches('[data-check]')) refreshBulkBar();
+});
+document.getElementById('bulk-clear').addEventListener('click', clearSelection);
+document.getElementById('bulk-rotate').addEventListener('click', () => {
+  const ids = selectedIds();
+  showToast(`Rotating ${ids.length} SIMs (${ids.map(i => '#' + i).join(', ')})`);
+  clearSelection();
+});
+document.getElementById('bulk-suspend').addEventListener('click', () => {
+  const ids = selectedIds();
+  showToast(`Suspended ${ids.length} SIMs (${ids.map(i => '#' + i).join(', ')})`);
+  clearSelection();
+});
+
+/* ---------------- Inline actions → toast ---------------- */
+function handleAction(action, simId) {
+  const label = simId ? `SIM #${simId}` : 'selection';
+  const verbs = {
+    'Rotate': `Rotating number on ${label}`,
+    'Rotate number': `Rotating number on ${label}`,
+    'Suspend': `Suspended ${label}`,
+    'Cancel': `Canceled ${label}`,
+    'Activate': `Activation retried on ${label}`,
+    'Dismiss': `Dismissed ${label} from this queue`,
+    'OTA refresh': `OTA refresh queued for ${label}`,
+    'Check IMEI': `IMEI check queued for ${label}`,
+    'Send test SMS': `Test SMS sent to ${label}`,
+    'Assign TrustOTP': `Assigned ${label} to TrustOTP`,
+    'Assign HYPPE': `Assigned ${label} to HYPPE`,
+    'View full history': `History timeline would open for ${label} (not mocked)`
+  };
+  showToast(verbs[action] || `${action} — ${label}`);
+}
+
+/* ---------------- Undo toast ---------------- */
+const toast = document.getElementById('toast');
+const toastMsg = document.getElementById('toast-msg');
+const toastTimer = document.getElementById('toast-timer');
+const toastUndo = document.getElementById('toast-undo');
+let toastInterval = null;
+
+function showToast(msg) {
+  clearInterval(toastInterval);
+  toastMsg.textContent = msg;
+  let secs = 8;
+  toastTimer.textContent = secs + 's';
+  toast.classList.add('visible');
+  toastInterval = setInterval(() => {
+    secs -= 1;
+    toastTimer.textContent = secs + 's';
+    if (secs <= 0) { hideToast(); }
+  }, 1000);
+}
+function hideToast() {
+  clearInterval(toastInterval);
+  toast.classList.remove('visible');
+}
+toastUndo.addEventListener('click', () => {
+  toastMsg.textContent = 'Reverted — no change committed.';
+  toastUndo.style.display = 'none';
+  setTimeout(() => { hideToast(); toastUndo.style.display = ''; }, 1200);
+});
+
+/* ---------------- CAS modal ---------------- */
+const casOverlay = document.getElementById('cas-overlay');
+const casConfirm = document.getElementById('cas-confirm');
+const casCancel = document.getElementById('cas-cancel');
+let lastFocused = null;
+
+function openCas() {
+  lastFocused = document.activeElement;
+  casOverlay.classList.add('open');
+  casCancel.focus();
+}
+function closeCas() {
+  casOverlay.classList.remove('open');
+  if (lastFocused) lastFocused.focus();
+}
+casCancel.addEventListener('click', closeCas);
+casOverlay.addEventListener('click', e => { if (e.target === casOverlay) closeCas(); });
+casConfirm.addEventListener('click', () => {
+  closeCas();
+  showToast('Updated vendor on SIM #639: atomic → teltik');
+});
+
+/* ---------------- Command palette ---------------- */
+const paletteOverlay = document.getElementById('palette-overlay');
+const paletteInput = document.getElementById('palette-input');
+const paletteResults = document.getElementById('palette-results');
+
+const PALETTE_ITEMS = [
+  { label: 'Errors', kind: 'queue', run: () => renderQueue('any_error') },
+  { label: 'Stuck provisioning', kind: 'queue', run: () => renderQueue('stuck_provisioning') },
+  { label: 'Not rotated today', kind: 'queue', run: () => renderQueue('not_rotated_today') },
+  { label: 'Not notified today', kind: 'queue', run: () => renderQueue('not_notified') },
+  { label: 'No reseller', kind: 'queue', run: () => renderQueue('no_reseller') },
+  { label: 'Auto-paused', kind: 'queue', run: () => renderQueue('auto_paused') },
+  { label: 'Recently edited', kind: 'queue', run: () => renderQueue('recently_edited') },
+  { label: 'Watchlist', kind: 'queue', run: () => renderQueue('watchlist') },
+  { label: 'Fleet — browse all SIMs', kind: 'view', run: showFleetView },
+  { label: 'Rotate number…', kind: 'action', run: () => showToast('Pick a SIM first — actions run on the current selection') },
+  { label: 'Suspend SIM…', kind: 'action', run: () => showToast('Pick a SIM first — actions run on the current selection') },
+  { label: 'Restore SIM…', kind: 'action', run: () => showToast('Pick a SIM first — actions run on the current selection') },
+  { label: 'Assign reseller…', kind: 'action', run: () => showToast('Pick a SIM first — actions run on the current selection') },
+  { label: 'OTA refresh…', kind: 'action', run: () => showToast('Pick a SIM first — actions run on the current selection') },
+  { label: 'Send test SMS…', kind: 'action', run: () => showToast('Pick a SIM first — actions run on the current selection') },
+  { label: 'Teltik reconcile', kind: 'action', run: () => showToast('Teltik reconcile queued — diff report in ~2 min') },
+  { label: 'Check IMEI…', kind: 'action', run: () => showToast('Pick a SIM first — actions run on the current selection') }
+];
+
+function renderPalette(filter) {
+  const f = (filter || '').trim().toLowerCase();
+  const matches = PALETTE_ITEMS.filter(it => it.label.toLowerCase().includes(f));
+  if (matches.length === 0) {
+    paletteResults.innerHTML = '<div class="palette-empty">No queue or action matches “' + esc(filter) + '”.</div>';
+    return;
+  }
+  const groups = [['queue', 'Queues'], ['view', 'Views'], ['action', 'Actions']];
+  let html = '';
+  groups.forEach(([kind, label]) => {
+    const grp = matches.filter(m => m.kind === kind);
+    if (grp.length === 0) return;
+    html += `<div class="palette-group-label">${label}</div>`;
+    grp.forEach(m => {
+      const idx = PALETTE_ITEMS.indexOf(m);
+      html += `<button class="palette-item" data-pi="${idx}">${esc(m.label)}<span class="pi-kind">${m.kind}</span></button>`;
+    });
+  });
+  paletteResults.innerHTML = html;
+  const first = paletteResults.querySelector('.palette-item');
+  if (first) first.classList.add('active');
+}
+
+function openPalette() {
+  lastFocused = document.activeElement;
+  paletteOverlay.classList.add('open');
+  paletteInput.value = '';
+  renderPalette('');
+  paletteInput.focus();
+}
+function closePalette() {
+  paletteOverlay.classList.remove('open');
+  if (lastFocused) lastFocused.focus();
+}
+document.getElementById('open-palette').addEventListener('click', openPalette);
+paletteOverlay.addEventListener('click', e => { if (e.target === paletteOverlay) closePalette(); });
+paletteInput.addEventListener('input', () => renderPalette(paletteInput.value));
+paletteInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const first = paletteResults.querySelector('.palette-item');
+    if (first) { PALETTE_ITEMS[+first.dataset.pi].run(); closePalette(); }
+  }
+});
+paletteResults.addEventListener('click', e => {
+  const item = e.target.closest('[data-pi]');
+  if (item) { PALETTE_ITEMS[+item.dataset.pi].run(); closePalette(); }
+});
+
+/* ---------------- Global keys ---------------- */
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    paletteOverlay.classList.contains('open') ? closePalette() : openPalette();
+    return;
+  }
+  if (e.key === 'Escape') {
+    if (paletteOverlay.classList.contains('open')) { closePalette(); return; }
+    if (casOverlay.classList.contains('open')) { closeCas(); return; }
+    if (toast.classList.contains('visible')) { hideToast(); }
+  }
+});
+
+/* ---------------- Boot ---------------- */
+renderQueue('any_error');
+</script>
+</body>
+</html>

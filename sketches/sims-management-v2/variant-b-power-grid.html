@@ -1,0 +1,1164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IncomingSMS · SIMs — Sketch B: Power Grid</title>
+<style>
+  /* ============ tokens ============ */
+  :root{
+    --bg:#fafaf9;
+    --panel:#ffffff;
+    --ink:#1c1917;
+    --ink-2:#44403c;
+    --muted:#78716c;
+    --faint:#a8a29e;
+    --line:#e7e5e4;
+    --line-strong:#d6d3d1;
+    --hover:#f5f5f4;
+    --active-row:#eff6ff;
+    --accent:#1d4ed8;
+    --accent-ink:#1e40af;
+    --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+    --shadow-pop:0 4px 16px rgba(28,25,23,.12), 0 1px 3px rgba(28,25,23,.08);
+    --shadow-modal:0 12px 40px rgba(28,25,23,.18), 0 2px 8px rgba(28,25,23,.10);
+    --ok:#15803d; --ok-bg:#f0fdf4; --ok-line:#bbf7d0;
+    --err:#b91c1c; --err-bg:#fef2f2; --err-line:#fecaca;
+    --warn:#a16207; --warn-bg:#fefce8; --warn-line:#fde68a;
+    --prov:#1d4ed8; --prov-bg:#eff6ff; --prov-line:#bfdbfe;
+    --off:#57534e; --off-bg:#f5f5f4; --off-line:#d6d3d1;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    background:var(--bg); color:var(--ink);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+  button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible,
+  [tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:1px;border-radius:4px}
+  input,select{font:inherit;color:inherit}
+
+  /* ============ header ============ */
+  header.app{
+    display:flex;align-items:center;gap:12px;
+    padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);
+    flex:none;
+  }
+  header.app .brand{font-weight:650;font-size:14px;letter-spacing:-.01em}
+  header.app .brand .sep{color:var(--faint);font-weight:400;margin:0 4px}
+  .variant-tag{
+    font-size:11px;font-weight:600;color:var(--accent-ink);
+    background:var(--prov-bg);border:1px solid var(--prov-line);
+    border-radius:99px;padding:2px 10px;
+  }
+  .sketch-stamp{margin-left:auto;font-size:11px;color:var(--faint)}
+  .cmdk-hint{
+    font-size:11px;color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;padding:3px 8px;background:var(--bg);
+  }
+  .cmdk-hint kbd{font:11px var(--mono);color:var(--ink-2)}
+  .cmdk-hint:hover{background:var(--hover);border-color:var(--line-strong)}
+
+  /* ============ shell ============ */
+  .shell{display:flex;flex:1;min-height:0}
+
+  /* ============ left rail ============ */
+  aside.rail{
+    width:236px;flex:none;background:var(--panel);border-right:1px solid var(--line);
+    overflow-y:auto;padding:12px 0 24px;
+  }
+  .rail h2{
+    font-size:11px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--faint);padding:8px 16px 4px;
+  }
+  .rail .views{list-style:none}
+  .rail .views button{
+    display:flex;width:100%;align-items:center;gap:8px;
+    padding:5px 16px;font-size:13px;color:var(--ink-2);text-align:left;
+  }
+  .rail .views button:hover{background:var(--hover)}
+  .rail .views button[aria-current="true"]{
+    background:var(--active-row);color:var(--accent-ink);font-weight:600;
+    box-shadow:inset 2px 0 0 var(--accent);
+  }
+  .rail .views .vcount{margin-left:auto;font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .facet{padding:2px 0 6px}
+  .facet label{
+    display:flex;align-items:center;gap:8px;padding:3px 16px;
+    font-size:12.5px;color:var(--ink-2);cursor:pointer;
+  }
+  .facet label:hover{background:var(--hover)}
+  .facet input[type=checkbox]{accent-color:var(--accent);width:13px;height:13px;flex:none}
+  .facet .fcount{margin-left:auto;font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .facet .swatch{width:8px;height:8px;border-radius:2px;flex:none}
+  .rail hr{border:none;border-top:1px solid var(--line);margin:10px 16px}
+
+  /* ============ main ============ */
+  main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+
+  /* ============ toolbar ============ */
+  .toolbar{
+    flex:none;padding:10px 16px 8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+    background:var(--bg);
+  }
+  .search{position:relative;flex:1 1 260px;max-width:420px}
+  .search input{
+    width:100%;padding:6px 10px 6px 30px;border:1px solid var(--line-strong);
+    border-radius:7px;background:var(--panel);font-size:13px;
+  }
+  .search input::placeholder{color:var(--faint)}
+  .search input:hover{border-color:var(--faint)}
+  .search .mag{position:absolute;left:9px;top:7px;color:var(--faint);pointer-events:none}
+  .tb-btn{
+    display:inline-flex;align-items:center;gap:6px;
+    border:1px solid var(--line-strong);background:var(--panel);border-radius:7px;
+    padding:5px 10px;font-size:12.5px;color:var(--ink-2);
+  }
+  .tb-btn:hover{background:var(--hover);border-color:var(--faint)}
+  .tb-btn[aria-pressed="true"]{background:var(--ink);color:#fafaf9;border-color:var(--ink)}
+  .tb-sel{border:1px solid var(--line-strong);background:var(--panel);border-radius:7px;
+    padding:5px 6px;font-size:12.5px;color:var(--ink-2)}
+  .seg{display:inline-flex;border:1px solid var(--line-strong);border-radius:7px;overflow:hidden;background:var(--panel)}
+  .seg button{padding:5px 10px;font-size:12.5px;color:var(--muted)}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button[aria-pressed="true"]{background:var(--hover);color:var(--ink);font-weight:600}
+  .seg button:hover{background:var(--hover)}
+
+  .chiprow{
+    flex:none;display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+    padding:0 16px 8px;min-height:8px;
+  }
+  .chip{
+    display:inline-flex;align-items:center;gap:6px;
+    background:var(--panel);border:1px solid var(--line-strong);border-radius:99px;
+    padding:2px 4px 2px 10px;font-size:12px;color:var(--ink-2);
+  }
+  .chip b{font-weight:600;color:var(--ink)}
+  .chip .x{
+    width:16px;height:16px;border-radius:99px;display:inline-flex;align-items:center;
+    justify-content:center;font-size:12px;color:var(--muted);line-height:1;
+  }
+  .chip .x:hover{background:var(--err-bg);color:var(--err)}
+  .result-count{font-size:12px;color:var(--muted);margin-left:2px;font-variant-numeric:tabular-nums}
+  .result-count b{color:var(--ink);font-weight:600}
+  .clear-all{font-size:12px;color:var(--accent-ink);padding:2px 6px;border-radius:5px}
+  .clear-all:hover{background:var(--active-row)}
+
+  /* ============ grid ============ */
+  .gridwrap{flex:1;overflow:auto;border-top:1px solid var(--line);background:var(--panel);position:relative}
+  table.grid{border-collapse:separate;border-spacing:0;width:100%;min-width:1240px;font-size:12.5px}
+  .grid thead th{
+    position:sticky;top:0;z-index:5;background:var(--bg);
+    border-bottom:1px solid var(--line-strong);
+    font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);
+    text-align:left;white-space:nowrap;padding:0;
+  }
+  .grid thead th .hbtn{
+    display:flex;align-items:center;gap:4px;width:100%;padding:7px 10px;
+    font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit;
+  }
+  .grid thead th .hbtn:hover{color:var(--ink);background:var(--hover)}
+  .grid thead th .arr{font-size:9px;color:var(--faint);visibility:hidden}
+  .grid thead th[aria-sort] .arr{visibility:visible;color:var(--accent-ink)}
+  .grid thead th[aria-sort] .hbtn{color:var(--ink)}
+  .grid thead th.plain{padding:7px 10px}
+  .grid tbody td{
+    border-bottom:1px solid var(--line);padding:6px 10px;white-space:nowrap;vertical-align:middle;
+  }
+  .grid.compact tbody td{padding:2px 10px;font-size:12px}
+  .grid tbody tr.datarow:hover td{background:var(--hover)}
+  .grid tbody tr.datarow[data-active="1"] td{background:var(--active-row)}
+  .grid tbody tr.datarow.selected td{background:#f0f6ff}
+  .grid tbody tr.datarow{cursor:default}
+  td.num,th.num .hbtn{justify-content:flex-end}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  td.mono{font-family:var(--mono);font-size:12px}
+  .grid.compact td.mono{font-size:11.5px}
+  td .zero{color:var(--faint)}
+  td .dash{color:var(--faint)}
+  .rel{color:var(--ink-2)}
+  .rel.old{color:var(--faint)}
+  .cb{width:14px;height:14px;accent-color:var(--accent);cursor:pointer}
+  .idcell{font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink)}
+
+  /* badges */
+  .badge{
+    display:inline-flex;align-items:center;gap:5px;border-radius:5px;
+    padding:1px 7px;font-size:11px;font-weight:600;line-height:1.6;white-space:nowrap;
+  }
+  .st-active{color:var(--ok);background:var(--ok-bg);border:1px solid var(--ok-line)}
+  .st-error{color:var(--err);background:var(--err-bg);border:1px solid var(--err-line)}
+  .st-suspended{color:var(--warn);background:var(--warn-bg);border:1px solid var(--warn-line)}
+  .st-provisioning{color:var(--prov);background:var(--prov-bg);border:1px solid var(--prov-line)}
+  .st-canceled{color:var(--off);background:var(--off-bg);border:1px solid var(--off-line)}
+  .dot{width:5px;height:5px;border-radius:99px;background:currentColor;flex:none}
+  /* Service provider = FILLED */
+  .sp{color:#fafaf9;border:1px solid transparent}
+  .sp-teltik{background:#0f766e}
+  .sp-helix{background:#4338ca}
+  .sp-atomic{background:#6d28d9}
+  .sp-wing_iot{background:#0e7490}
+  /* Host = OUTLINED */
+  .host{background:transparent}
+  .host-skyline{color:#92400e;border:1px solid #d97706}
+  .host-teltik{color:#155e75;border:1px solid #0891b2}
+  .carrier{font-size:12px;color:var(--ink-2)}
+  .rs-none{color:var(--faint);font-style:italic}
+
+  td.editable{cursor:pointer;position:relative}
+  td.editable:hover .badge{box-shadow:0 0 0 2px var(--panel),0 0 0 3px var(--line-strong)}
+  td.editable::after{content:"✎";position:absolute;right:4px;top:50%;transform:translateY(-50%);
+    font-size:10px;color:var(--faint);opacity:0}
+  td.editable:hover::after{opacity:1}
+  td.conflict{box-shadow:inset 0 0 0 2px var(--err);border-radius:2px}
+  .conflict-note{
+    display:block;font-size:10.5px;color:var(--err);white-space:normal;max-width:180px;
+    line-height:1.3;margin-top:2px;font-weight:500;
+  }
+  .rowmenu{color:var(--muted);border-radius:5px;padding:2px 7px;font-size:14px;line-height:1}
+  .rowmenu:hover{background:var(--line);color:var(--ink)}
+
+  /* peek strip */
+  tr.peek td{background:#fbfbfa;border-bottom:1px solid var(--line-strong);padding:8px 14px 10px 46px;white-space:normal}
+  .peek-inner{display:flex;gap:28px;align-items:flex-start}
+  .peek-events{list-style:none;font-size:12px;color:var(--ink-2);min-width:420px}
+  .peek-events li{display:flex;gap:10px;padding:2px 0}
+  .peek-events .t{color:var(--faint);font-variant-numeric:tabular-nums;flex:none;width:90px;font-family:var(--mono);font-size:11px}
+  .peek-actions{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
+  .peek-actions .tb-btn{padding:3px 9px;font-size:12px}
+  .peek-title{font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);margin-bottom:4px}
+
+  /* ============ bulk bar ============ */
+  .bulkbar{
+    position:sticky;bottom:0;z-index:8;flex:none;
+    display:none;align-items:center;gap:10px;
+    background:var(--ink);color:#fafaf9;padding:8px 16px;font-size:12.5px;
+  }
+  .bulkbar.on{display:flex}
+  .bulkbar .sel-summary b{font-weight:650}
+  .bulkbar .linklike{color:#93c5fd;text-decoration:underline;text-underline-offset:2px;padding:2px 4px;border-radius:4px}
+  .bulkbar .linklike:hover{color:#bfdbfe}
+  .bulkbar .bb-actions{margin-left:auto;display:flex;gap:6px}
+  .bulkbar .bb-btn{
+    border:1px solid #57534e;border-radius:6px;padding:4px 11px;font-size:12.5px;color:#e7e5e4;
+  }
+  .bulkbar .bb-btn:hover{background:#292524;border-color:#78716c}
+  .bulkbar .bb-btn.danger{color:#fca5a5;border-color:#7f1d1d}
+  .bulkbar .bb-btn.danger:hover{background:#2a1414}
+
+  /* ============ footer ============ */
+  footer.hints{
+    flex:none;display:flex;gap:16px;align-items:center;
+    padding:5px 16px;border-top:1px solid var(--line);background:var(--bg);
+    font-size:11px;color:var(--faint);
+  }
+  footer.hints kbd{
+    font:10.5px var(--mono);background:var(--panel);border:1px solid var(--line-strong);
+    border-bottom-width:2px;border-radius:4px;padding:0 4px;color:var(--muted);
+  }
+  footer.hints .pager{margin-left:auto;display:flex;gap:4px;align-items:center;color:var(--muted)}
+  footer.hints .pager button{border:1px solid var(--line);background:var(--panel);border-radius:5px;padding:1px 8px;font-size:11px;color:var(--ink-2)}
+  footer.hints .pager button:hover{background:var(--hover)}
+  footer.hints .pager button:disabled{color:var(--faint);cursor:default;background:var(--bg)}
+
+  /* ============ popovers / modal / palette / toast ============ */
+  .popover{
+    position:absolute;z-index:40;background:var(--panel);border:1px solid var(--line-strong);
+    border-radius:9px;box-shadow:var(--shadow-pop);padding:12px;min-width:250px;
+  }
+  .popover h3{font-size:12px;font-weight:650;margin-bottom:8px;color:var(--ink)}
+  .popover .field-lab{font-size:11px;color:var(--muted);margin-bottom:3px;display:block}
+  .popover select{
+    width:100%;border:1px solid var(--line-strong);border-radius:6px;padding:5px 7px;
+    background:var(--panel);font-size:12.5px;
+  }
+  .oldnew{
+    margin:9px 0;padding:7px 9px;background:var(--bg);border:1px solid var(--line);
+    border-radius:6px;font-size:12px;display:flex;align-items:center;gap:7px;
+  }
+  .oldnew .arrow{color:var(--faint)}
+  .oldnew .new{font-weight:650;color:var(--accent-ink)}
+  .cas-note{font-size:11px;color:var(--muted);line-height:1.4;margin:8px 0 10px}
+  .pop-btns{display:flex;gap:6px;justify-content:flex-end}
+  .btn{
+    border:1px solid var(--line-strong);background:var(--panel);border-radius:6px;
+    padding:5px 12px;font-size:12.5px;color:var(--ink-2);
+  }
+  .btn:hover{background:var(--hover)}
+  .btn.primary{background:var(--ink);border-color:var(--ink);color:#fafaf9;font-weight:600}
+  .btn.primary:hover{background:#292524}
+  .btn.danger{background:var(--err);border-color:var(--err);color:#fff;font-weight:600}
+  .btn.danger:hover{background:#991b1b}
+
+  .colcfg label{display:flex;align-items:center;gap:8px;font-size:12.5px;padding:3px 2px;cursor:pointer;color:var(--ink-2)}
+  .colcfg input{accent-color:var(--accent)}
+
+  .scrim{
+    position:fixed;inset:0;z-index:50;background:rgba(28,25,23,.32);
+    display:none;align-items:flex-start;justify-content:center;
+  }
+  .scrim.on{display:flex}
+  .modal{
+    background:var(--panel);border-radius:12px;box-shadow:var(--shadow-modal);
+    margin-top:11vh;width:520px;max-width:calc(100vw - 32px);padding:18px 20px;
+  }
+  .modal h3{font-size:15px;font-weight:650;margin-bottom:4px}
+  .modal .sub{font-size:12.5px;color:var(--muted);margin-bottom:12px}
+  .dryrun-sum{
+    display:flex;gap:8px;margin-bottom:10px;
+  }
+  .dryrun-sum .pill{
+    flex:1;border:1px solid var(--line);border-radius:8px;padding:8px 12px;background:var(--bg);
+  }
+  .dryrun-sum .pill b{display:block;font-size:17px;font-variant-numeric:tabular-nums}
+  .dryrun-sum .pill span{font-size:11px;color:var(--muted)}
+  .dryrun-sum .pill.ok b{color:var(--ok)}
+  .dryrun-sum .pill.skip b{color:var(--warn)}
+  .skiplist{list-style:none;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin-bottom:14px}
+  .skiplist li{
+    display:flex;gap:10px;padding:6px 12px;font-size:12.5px;border-bottom:1px solid var(--line);
+    background:var(--panel);
+  }
+  .skiplist li:last-child{border-bottom:none}
+  .skiplist .sid{font-family:var(--mono);font-size:12px;color:var(--ink);flex:none;width:56px}
+  .skiplist .why{color:var(--muted)}
+  .modal .btns{display:flex;justify-content:flex-end;gap:8px}
+  .modal .dry-tag{
+    display:inline-block;font-size:10.5px;font-weight:650;letter-spacing:.05em;text-transform:uppercase;
+    color:var(--warn);background:var(--warn-bg);border:1px solid var(--warn-line);
+    border-radius:4px;padding:1px 7px;margin-left:8px;vertical-align:2px;
+  }
+
+  .palette{
+    background:var(--panel);border-radius:12px;box-shadow:var(--shadow-modal);
+    margin-top:14vh;width:480px;max-width:calc(100vw - 32px);overflow:hidden;
+  }
+  .palette input{
+    width:100%;border:none;border-bottom:1px solid var(--line);padding:13px 16px;font-size:14px;
+    background:var(--panel);
+  }
+  .palette input:focus-visible{outline:none}
+  .palette ul{list-style:none;max-height:320px;overflow-y:auto;padding:6px 0}
+  .palette li button{
+    display:flex;width:100%;align-items:center;gap:10px;padding:7px 16px;font-size:13px;
+    color:var(--ink-2);text-align:left;
+  }
+  .palette li button:hover,.palette li button.hot{background:var(--active-row);color:var(--ink)}
+  .palette .kind{
+    margin-left:auto;font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.05em;
+  }
+  .palette .empty{padding:16px;font-size:12.5px;color:var(--faint);text-align:center}
+  .palette .phead{font-size:10.5px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--faint);padding:6px 16px 2px}
+
+  .toast{
+    position:fixed;left:50%;bottom:52px;transform:translateX(-50%) translateY(8px);z-index:60;
+    background:var(--ink);color:#fafaf9;border-radius:8px;box-shadow:var(--shadow-pop);
+    padding:9px 14px;font-size:12.5px;display:flex;gap:12px;align-items:center;
+    opacity:0;pointer-events:none;transition:opacity .18s ease,transform .18s ease;
+  }
+  .toast.on{opacity:1;pointer-events:auto;transform:translateX(-50%) translateY(0)}
+  .toast button{color:#93c5fd;font-weight:600;text-decoration:underline;text-underline-offset:2px}
+  .toast button:hover{color:#bfdbfe}
+</style>
+</head>
+<body>
+
+<header class="app">
+  <div class="brand">IncomingSMS<span class="sep">·</span>SIMs</div>
+  <span class="variant-tag">Sketch B — Power Grid</span>
+  <button class="cmdk-hint" id="cmdkOpen" title="Open command palette">Commands <kbd>⌘K</kbd></button>
+  <span class="sketch-stamp">Design sketch · Jul 2026 · fake data</span>
+</header>
+
+<div class="shell">
+  <!-- ================= LEFT RAIL ================= -->
+  <aside class="rail" aria-label="Views and filters">
+    <h2>Saved views</h2>
+    <ul class="views" id="viewList">
+      <li><button data-view="all" aria-current="true">All SIMs <span class="vcount">4,544</span></button></li>
+      <li><button data-view="attention">⚠ Needs attention <span class="vcount">125</span></button></li>
+      <li><button data-view="atomic-teltik">Atomic on Teltik <span class="vcount">310</span></button></li>
+      <li><button data-view="trustotp">TrustOTP active <span class="vcount">2,988</span></button></li>
+      <li><button data-view="unassigned">Unassigned inventory <span class="vcount">1,102</span></button></li>
+      <li><button data-view="canceled">Canceled (hidden) <span class="vcount">800</span></button></li>
+    </ul>
+    <hr>
+    <h2>Status</h2>
+    <div class="facet" data-facet="status">
+      <label><input type="checkbox" class="fbox" data-f="status" data-val="active"><span class="swatch" style="background:var(--ok)"></span>Active<span class="fcount">4,419</span></label>
+      <label><input type="checkbox" class="fbox" data-f="status" data-val="error"><span class="swatch" style="background:var(--err)"></span>Error<span class="fcount">40</span></label>
+      <label><input type="checkbox" class="fbox" data-f="status" data-val="suspended"><span class="swatch" style="background:var(--warn)"></span>Suspended<span class="fcount">60</span></label>
+      <label><input type="checkbox" class="fbox" data-f="status" data-val="provisioning"><span class="swatch" style="background:var(--prov)"></span>Provisioning<span class="fcount">25</span></label>
+      <label><input type="checkbox" class="fbox" data-f="status" data-val="canceled"><span class="swatch" style="background:var(--off)"></span>Canceled<span class="fcount">800</span></label>
+    </div>
+    <h2>Service provider</h2>
+    <div class="facet" data-facet="vendor">
+      <label><input type="checkbox" class="fbox" data-f="vendor" data-val="teltik"><span class="swatch" style="background:#0f766e"></span>Teltik<span class="fcount">4,112</span></label>
+      <label><input type="checkbox" class="fbox" data-f="vendor" data-val="helix"><span class="swatch" style="background:#4338ca"></span>Helix<span class="fcount">625</span></label>
+      <label><input type="checkbox" class="fbox" data-f="vendor" data-val="atomic"><span class="swatch" style="background:#6d28d9"></span>Atomic<span class="fcount">337</span></label>
+      <label><input type="checkbox" class="fbox" data-f="vendor" data-val="wing_iot"><span class="swatch" style="background:#0e7490"></span>Wing IoT<span class="fcount">270</span></label>
+    </div>
+    <h2>Host</h2>
+    <div class="facet" data-facet="host">
+      <label><input type="checkbox" class="fbox" data-f="host" data-val="teltik"><span class="swatch" style="border:1.5px solid #0891b2;background:transparent"></span>Teltik gateway<span class="fcount">4,422</span></label>
+      <label><input type="checkbox" class="fbox" data-f="host" data-val="skyline"><span class="swatch" style="border:1.5px solid #d97706;background:transparent"></span>Skyline gateway<span class="fcount">922</span></label>
+    </div>
+    <h2>Carrier</h2>
+    <div class="facet" data-facet="carrier">
+      <label><input type="checkbox" class="fbox" data-f="carrier" data-val="tmobile">T-Mobile<span class="fcount">4,737</span></label>
+      <label><input type="checkbox" class="fbox" data-f="carrier" data-val="att">AT&amp;T<span class="fcount">607</span></label>
+    </div>
+    <h2>Reseller</h2>
+    <div class="facet" data-facet="reseller">
+      <label><input type="checkbox" class="fbox" data-f="reseller" data-val="TrustOTP">TrustOTP<span class="fcount">3,092</span></label>
+      <label><input type="checkbox" class="fbox" data-f="reseller" data-val="HYPPE">HYPPE<span class="fcount">458</span></label>
+      <label><input type="checkbox" class="fbox" data-f="reseller" data-val="none">Unassigned<span class="fcount">1,794</span></label>
+    </div>
+    <hr>
+    <h2>Quick toggles</h2>
+    <div class="facet" data-facet="quick">
+      <label><input type="checkbox" class="fbox" data-f="quick" data-val="has_errors">Has errors<span class="fcount">40</span></label>
+      <label><input type="checkbox" class="fbox" data-f="quick" data-val="not_notified">Not notified today<span class="fcount">217</span></label>
+      <label><input type="checkbox" class="fbox" data-f="quick" data-val="no_sms_12h">No SMS in 12h<span class="fcount">391</span></label>
+    </div>
+  </aside>
+
+  <!-- ================= MAIN ================= -->
+  <main>
+    <div class="toolbar">
+      <div class="search">
+        <span class="mag" aria-hidden="true">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        </span>
+        <input id="searchBox" type="search" placeholder="Search ICCID, number, or ID…" aria-label="Search SIMs">
+      </div>
+      <select class="tb-sel" id="pageSize" aria-label="Rows per page">
+        <option>25 / page</option>
+        <option selected>50 / page</option>
+        <option>100 / page</option>
+        <option>250 / page</option>
+      </select>
+      <div class="seg" role="group" aria-label="Row density">
+        <button id="denComf" aria-pressed="true">Comfortable</button>
+        <button id="denComp" aria-pressed="false">Compact</button>
+      </div>
+      <button class="tb-btn" id="colBtn" aria-haspopup="true">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M15 4v16"/></svg>
+        Columns
+      </button>
+      <button class="tb-btn" id="exportBtn">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+        Export CSV
+      </button>
+    </div>
+
+    <div class="chiprow" id="chipRow" aria-label="Active filters"></div>
+
+    <div class="gridwrap" id="gridwrap">
+      <table class="grid" id="grid" aria-label="SIM fleet">
+        <thead>
+          <tr>
+            <th class="plain" style="width:34px"><input type="checkbox" class="cb" id="checkAll" aria-label="Select all rows on this page"></th>
+            <th data-key="id" class="num"><button class="hbtn">ID <span class="arr">▲</span></button></th>
+            <th data-key="ic"><button class="hbtn">ICCID <span class="arr">▲</span></button></th>
+            <th data-key="num"><button class="hbtn">Number <span class="arr">▲</span></button></th>
+            <th data-key="st"><button class="hbtn">Status <span class="arr">▲</span></button></th>
+            <th data-key="v"><button class="hbtn">Service provider <span class="arr">▲</span></button></th>
+            <th data-key="h"><button class="hbtn">Host <span class="arr">▲</span></button></th>
+            <th data-key="c" data-col="carrier"><button class="hbtn">Carrier <span class="arr">▲</span></button></th>
+            <th data-key="gw" data-col="gw"><button class="hbtn">Gateway / Port <span class="arr">▲</span></button></th>
+            <th data-key="rs" data-col="reseller"><button class="hbtn">Reseller <span class="arr">▲</span></button></th>
+            <th data-key="sms" class="num" aria-sort="descending"><button class="hbtn">SMS 24h <span class="arr">▼</span></button></th>
+            <th data-key="ls"><button class="hbtn">Last SMS <span class="arr">▲</span></button></th>
+            <th data-key="rot" data-col="rotated"><button class="hbtn">Rotated <span class="arr">▲</span></button></th>
+            <th class="plain" style="width:40px"><span class="sr-only" aria-hidden="true"></span></th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+
+    <div class="bulkbar" id="bulkbar">
+      <span class="sel-summary" id="selSummary"></span>
+      <button class="linklike" id="selAllMatching">Select all 312 matching</button>
+      <div class="bb-actions">
+        <button class="bb-btn" id="bulkRotate">Rotate</button>
+        <button class="bb-btn">Suspend</button>
+        <button class="bb-btn">Assign reseller</button>
+        <button class="bb-btn danger" id="bulkDelete">Delete…</button>
+      </div>
+    </div>
+
+    <footer class="hints">
+      <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+      <span><kbd>Space</kbd> select</span>
+      <span><kbd>Enter</kbd> peek</span>
+      <span><kbd>E</kbd> edit cell</span>
+      <span><kbd>⌘K</kbd> commands</span>
+      <div class="pager">
+        <span id="pageLabel">Page 1 of 7</span>
+        <button disabled>‹ Prev</button>
+        <button>Next ›</button>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<!-- dry-run modal -->
+<div class="scrim" id="dryScrim">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dryTitle">
+    <h3 id="dryTitle">Rotate numbers<span class="dry-tag">Dry run</span></h3>
+    <p class="sub" id="drySub">37 SIMs will rotate — preview before anything happens.</p>
+    <div class="dryrun-sum" id="drySum"></div>
+    <ul class="skiplist" id="skipList"></ul>
+    <div class="btns">
+      <button class="btn" id="dryCancel">Cancel</button>
+      <button class="btn primary" id="dryConfirm">Confirm rotate</button>
+    </div>
+  </div>
+</div>
+
+<!-- bulk delete modal -->
+<div class="scrim" id="delScrim">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="delTitle">
+    <h3 id="delTitle" style="color:var(--err)">Delete selected SIMs</h3>
+    <p class="sub" id="delSub">This permanently removes rows and their history. To confirm, type the exact number of selected rows.</p>
+    <label class="field-lab" for="delInput" style="font-size:11px;color:var(--muted)">Type <b id="delCount">37</b> to confirm</label>
+    <input id="delInput" inputmode="numeric" style="width:120px;border:1px solid var(--line-strong);border-radius:6px;padding:6px 9px;font-family:var(--mono);margin:6px 0 14px" placeholder="0">
+    <div class="btns">
+      <button class="btn" id="delCancel">Cancel</button>
+      <button class="btn danger" id="delConfirm" disabled>Delete rows</button>
+    </div>
+  </div>
+</div>
+
+<!-- command palette -->
+<div class="scrim" id="palScrim">
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+    <input id="palInput" placeholder="Type a command or view…" autocomplete="off">
+    <ul id="palList"></ul>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+/* =========================================================================
+   IncomingSMS · SIMs — Sketch B "Power Grid". All data fake & local.
+   "Now" = Jul 19, 2026, 09:40 ET.
+   ========================================================================= */
+
+/* ---------- fake fleet rows (one page's worth) ----------
+   id, ic(iccid), num(msisdn), st(status), sr(status reason),
+   v(vendor/service provider), h(host), c(carrier),
+   gw(gateway/port, skyline only), rs(reseller|null),
+   sms(24h count), ls(last sms, minutes ago|null),
+   rot(last rotation, hours ago|null), re(rotation eligible), nn(not notified today) */
+const ROWS = [
+ {id:4821, ic:"89012604412873305811", num:"9293410087", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:78, ls:4,   rot:9,   re:1, nn:0},
+ {id:3117, ic:"89012604412870114522", num:"3472218809", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:71, ls:11,  rot:14,  re:1, nn:0},
+ {id:  639,ic:"89014103279513660428", num:"6467020193", st:"active", sr:null, v:"atomic", h:"teltik", c:"att",     gw:null, rs:"TrustOTP", sms:64, ls:7,   rot:26,  re:1, nn:0},
+ {id:2954, ic:"89012604412869027741", num:"7183345561", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:61, ls:19,  rot:11,  re:1, nn:0},
+ {id:1206, ic:"89012604410754428190", num:"9174470235", st:"active", sr:null, v:"helix",  h:"skyline",c:"tmobile", gw:"GW-2 / 07A", rs:"TrustOTP", sms:59, ls:3, rot:8, re:1, nn:0},
+ {id:5033, ic:"89012604412875540266", num:"6462291174", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"HYPPE",    sms:57, ls:26,  rot:16,  re:1, nn:0},
+ {id:  702,ic:"89014103279513991458", num:"3479986410", st:"active", sr:null, v:"atomic", h:"teltik", c:"att",     gw:null, rs:"TrustOTP", sms:55, ls:9,   rot:31,  re:1, nn:0},
+ {id:1980, ic:"89012604411206617734", num:"2127740956", st:"active", sr:null, v:"helix",  h:"skyline",c:"tmobile", gw:"GW-1 / 12A", rs:"TrustOTP", sms:52, ls:14, rot:6, re:1, nn:0},
+ {id:4402, ic:"89012604412874219053", num:"9295530618", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:49, ls:31,  rot:19,  re:1, nn:0},
+ {id: 811, ic:"89014103279514027303", num:"6468815527", st:"active", sr:null, v:"wing_iot",h:"skyline",c:"att",    gw:"GW-4 / 02C", rs:"HYPPE", sms:47, ls:22, rot:12, re:1, nn:0},
+ {id:3608, ic:"89012604412871995106", num:"7185098342", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:44, ls:8,   rot:22,  re:1, nn:0},
+ {id:2211, ic:"89012604411484033678", num:"3474432190", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:43, ls:38,  rot:10,  re:1, nn:0},
+ {id:1490, ic:"89012604410912254807", num:"9179952148", st:"active", sr:null, v:"helix",  h:"skyline",c:"tmobile", gw:"GW-2 / 15B", rs:"TrustOTP", sms:41, ls:17, rot:13, re:1, nn:0},
+ {id:5188, ic:"89012604412876281549", num:"6465570823", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:38, ls:44,  rot:15,  re:1, nn:0},
+ {id: 917, ic:"89014103279514266115", num:"2125816604", st:"active", sr:null, v:"atomic", h:"skyline",c:"att",     gw:"GW-3 / 12A", rs:"TrustOTP", sms:36, ls:29, rot:34, re:1, nn:0},
+ {id:2738, ic:"89012604411840662281", num:"7187219905", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"HYPPE",    sms:34, ls:52,  rot:18,  re:1, nn:0},
+ {id:4076, ic:"89012604412873126840", num:"9291184472", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:31, ls:63,  rot:21,  re:1, nn:0},
+ {id:1204, ic:"89012604410751309912", num:"3477608254", st:"active", sr:null, v:"helix",  h:"skyline",c:"tmobile", gw:"GW-1 / 04C", rs:"TrustOTP", sms:29, ls:41, rot:9, re:1, nn:0, conflict:1},
+ {id:3350, ic:"89012604412870886435", num:"6469143377", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:null,       sms:27, ls:75,  rot:23,  re:1, nn:1},
+ {id: 566, ic:"89014103279513412210", num:"9178806531", st:"active", sr:null, v:"atomic", h:"teltik", c:"att",     gw:null, rs:"TrustOTP", sms:25, ls:90,  rot:29,  re:1, nn:0},
+ {id:4990, ic:"89012604412875318727", num:"7182297064", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:23, ls:58,  rot:17,  re:1, nn:0},
+ {id:2402, ic:"89012604411633970558", num:"2129947315", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:null,       sms:19, ls:130, rot:25,  re:1, nn:1},
+ {id:1855, ic:"89012604411105523694", num:"6463328850", st:"active", sr:null, v:"helix",  h:"skyline",c:"tmobile", gw:"GW-3 / 09A", rs:"TrustOTP", sms:17, ls:112, rot:12, re:1, nn:0},
+ {id: 745, ic:"89014103279514108826", num:"3471120468", st:"active", sr:null, v:"wing_iot",h:"skyline",c:"att",    gw:"GW-4 / 07B", rs:null, sms:15, ls:96, rot:40, re:1, nn:1},
+ {id:5299, ic:"89012604412876804412", num:"9299910772", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:14, ls:145, rot:20,  re:1, nn:0},
+ {id:3921, ic:"89012604412872541169", num:"7189935528", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"HYPPE",    sms:12, ls:170, rot:27,  re:1, nn:0},
+ {id:1042, ic:"89012604410688172335", num:"9172253809", st:"active", sr:null, v:"helix",  h:"skyline",c:"tmobile", gw:"GW-2 / 11C", rs:"TrustOTP", sms:11, ls:200, rot:15, re:1, nn:0},
+ {id: 488, ic:"89014103279513288704", num:"6461678042", st:"active", sr:null, v:"atomic", h:"teltik", c:"att",     gw:null, rs:null,       sms:9,  ls:230, rot:36,  re:0, nn:1},
+ {id:4633, ic:"89012604412874790021", num:"3478854126", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:8,  ls:260, rot:24,  re:1, nn:0},
+ {id:2087, ic:"89012604411390417265", num:"2126604937", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:null,       sms:6,  ls:340, rot:30,  re:1, nn:1},
+ {id:3105, ic:"89012604412870235518", num:"7181172290", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:5,  ls:410, rot:52,  re:0, nn:0},
+ {id: 923, ic:"89014103279514287818", num:"9295561140", st:"active", sr:null, v:"wing_iot",h:"skyline",c:"att",    gw:"GW-4 / 11A", rs:"HYPPE", sms:4, ls:485, rot:44, re:1, nn:0},
+ {id:1633, ic:"89012604411002960443", num:"6467749281", st:"active", sr:null, v:"helix",  h:"skyline",c:"tmobile", gw:"GW-1 / 16B", rs:null, sms:2, ls:640, rot:33, re:1, nn:1},
+ {id:4258, ic:"89012604412873887730", num:"9176623308", st:"active", sr:null, v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:1,  ls:760, rot:28,  re:1, nn:0},
+ {id:2214, ic:"89012604411485520903", num:"3473019984", st:"error", sr:"OTA refresh failed: SIM unreachable after 3 attempts", v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:0, ls:1130, rot:47, re:1, nn:1},
+ {id: 391, ic:"89014103279513179552", num:"7184491006", st:"error", sr:"ATOMIC 4102: MDN swap rejected — line pending port-out", v:"atomic", h:"skyline", c:"att", gw:"GW-3 / 05B", rs:"TrustOTP", sms:0, ls:1420, rot:75, re:1, nn:1},
+ {id:1777, ic:"89012604411099316628", num:"6462214475", st:"error", sr:"Helix HX-AX 502 during activation callback", v:"helix", h:"skyline", c:"tmobile", gw:"GW-2 / 03A", rs:null, sms:0, ls:null, rot:null, re:1, nn:1},
+ {id:5121, ic:"89012604412875993264", num:"9292236619", st:"error", sr:"Webhook delivery failing 6h: reseller endpoint 404", v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"HYPPE", sms:0, ls:390, rot:26, re:1, nn:1},
+ {id:5240, ic:"89012604412876455187", num:"3475572203", st:"provisioning", sr:"Stuck 27h — activation accepted, no ICCID confirm from carrier", v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:null, sms:0, ls:null, rot:null, re:0, nn:1},
+ {id:5252, ic:"89014103279514402317", num:"2122287465", st:"provisioning", sr:"Waiting on ATOMIC activation queue (position 4)", v:"atomic", h:"teltik", c:"att", gw:null, rs:null, sms:0, ls:null, rot:null, re:0, nn:1},
+ {id:5261, ic:"89012604412876518809", num:"7186640132", st:"provisioning", sr:"OTA profile push scheduled 10:15 ET", v:"helix", h:"skyline", c:"tmobile", gw:"GW-1 / 08C", rs:null, sms:0, ls:null, rot:null, re:0, nn:1},
+ {id:1348, ic:"89012604410800471296", num:"9177703348", st:"suspended", sr:"Auto-paused: 0 SMS for 72h on rotation-eligible line", v:"helix", h:"skyline", c:"tmobile", gw:"GW-3 / 14A", rs:"TrustOTP", sms:0, ls:4400, rot:120, re:1, nn:1},
+ {id: 274, ic:"89014103279513066110", num:"6464485529", st:"suspended", sr:"Manual: reseller dispute — hold until resolved", v:"atomic", h:"teltik", c:"att", gw:null, rs:"HYPPE", sms:0, ls:6200, rot:210, re:0, nn:1},
+ {id:3766, ic:"89012604412872203358", num:"3476693015", st:"suspended", sr:"Carrier flag: unusual outbound volume review", v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:"TrustOTP", sms:0, ls:2900, rot:96, re:1, nn:1},
+ {id:2890, ic:"89012604411901156674", num:"2128873364", st:"canceled", sr:"Canceled Jul 02 — vendor billing lapse", v:"teltik", h:"teltik", c:"tmobile", gw:null, rs:null, sms:0, ls:null, rot:null, re:0, nn:1},
+ {id: 158, ic:"89014103279512960338", num:"7182219957", st:"canceled", sr:"Canceled Jun 20 — SIM physically removed from tray", v:"wing_iot", h:"skyline", c:"att", gw:"GW-4 / 15C", rs:null, sms:0, ls:null, rot:null, re:0, nn:1},
+];
+
+const VENDOR_LABEL = {teltik:"Teltik", helix:"Helix", atomic:"Atomic", wing_iot:"Wing IoT"};
+const HOST_LABEL   = {teltik:"Teltik", skyline:"Skyline"};
+const CARRIER_LABEL= {att:"AT&T", tmobile:"T-Mobile"};
+
+/* ---------- state ---------- */
+const state = {
+  view:"all",
+  chips:[],                 // {f, val, label}
+  sort:{key:"sms", dir:-1},
+  density:"comfortable",
+  selected:new Set(),
+  allMatching:false,
+  peek:null,
+  activeRow:0,
+  hiddenCols:new Set(),
+};
+
+/* ---------- helpers ---------- */
+const $ = (s,el=document)=>el.querySelector(s);
+const $$ = (s,el=document)=>[...el.querySelectorAll(s)];
+const fmtNum = n => "(" + n.slice(0,3) + ") " + n.slice(3,6) + "-" + n.slice(6);
+const truncIccid = ic => ic.slice(0,6) + "…" + ic.slice(-5);
+function relMin(m){ // minutes ago -> label
+  if(m==null) return null;
+  if(m<60) return m+"m ago";
+  if(m<1440) return Math.round(m/60)+"h ago";
+  return Math.round(m/1440)+"d ago";
+}
+function relHr(h){
+  if(h==null) return null;
+  if(h<48) return h+"h ago";
+  return Math.round(h/24)+"d ago";
+}
+const comma = n => n.toLocaleString("en-US");
+
+/* fake matching counts for chip combos (server would compute these) */
+function fakeMatching(){
+  const set = state.chips.map(c=>c.f+":"+c.val).sort().join("|");
+  const known = {
+    "":4544,
+    "status:!canceled":4544,
+    "host:teltik|status:!canceled|vendor:atomic":312,
+    "host:teltik|vendor:atomic":310,
+    "status:error":40, "status:suspended":60, "status:provisioning":25, "status:canceled":800,
+    "status:active":4419, "vendor:atomic":337, "vendor:helix":625, "vendor:teltik":4112,
+    "vendor:wing_iot":270, "host:skyline":922, "host:teltik":4422,
+    "reseller:TrustOTP":3092, "reseller:HYPPE":458, "reseller:none":1794,
+    "carrier:att":607, "carrier:tmobile":4737,
+    "quick:has_errors":40, "quick:not_notified":217, "quick:no_sms_12h":391,
+    "status:error|status:provisioning|status:suspended":125,
+    "reseller:TrustOTP|status:active":2988,
+    "reseller:none|status:active":1102,
+  };
+  if(known[set]!=null) return known[set];
+  // ponytail: unknown combos fake-derived as min of parts, real impl asks the server
+  let m = 4544;
+  state.chips.forEach(c=>{ const k=known[c.f+":"+c.val]; if(k!=null) m=Math.min(m,k); });
+  return Math.max(17, Math.round(m*0.62));
+}
+
+/* ---------- filtering the visible page rows ---------- */
+function chipGroups(){
+  const g={};
+  state.chips.forEach(c=>{ (g[c.f]=g[c.f]||[]).push(c.val); });
+  return g;
+}
+function rowMatches(r, g){
+  for(const [f,vals] of Object.entries(g)){
+    if(f==="status"){
+      if(vals.includes("!canceled")){ if(r.st==="canceled") return false; }
+      const pos=vals.filter(v=>v!=="!canceled");
+      if(pos.length && !pos.includes(r.st)) return false;
+    }
+    else if(f==="vendor" && !vals.includes(r.v)) return false;
+    else if(f==="host" && !vals.includes(r.h)) return false;
+    else if(f==="carrier" && !vals.includes(r.c)) return false;
+    else if(f==="reseller"){ if(!vals.includes(r.rs ?? "none")) return false; }
+    else if(f==="quick"){
+      for(const q of vals){
+        if(q==="has_errors" && r.st!=="error") return false;
+        if(q==="not_notified" && !r.nn) return false;
+        if(q==="no_sms_12h" && !(r.ls==null || r.ls>720)) return false;
+      }
+    }
+  }
+  return true;
+}
+function visibleRows(){
+  const g=chipGroups();
+  const q=$("#searchBox").value.trim().toLowerCase();
+  let rows=ROWS.filter(r=>rowMatches(r,g));
+  if(q) rows=rows.filter(r=> String(r.id).includes(q) || r.ic.includes(q) || r.num.includes(q));
+  const {key,dir}=state.sort;
+  rows=[...rows].sort((a,b)=>{
+    let av=a[key], bv=b[key];
+    if(av==null) return 1; if(bv==null) return -1;
+    if(typeof av==="string") return av.localeCompare(bv)*dir;
+    return (av-bv)*dir;
+  });
+  return rows;
+}
+
+/* ---------- render: chips ---------- */
+function renderChips(){
+  const row=$("#chipRow");
+  row.innerHTML="";
+  state.chips.forEach((c,i)=>{
+    const el=document.createElement("span");
+    el.className="chip";
+    el.innerHTML=`<b>${c.flabel}:</b> ${c.label} <button class="x" aria-label="Remove filter ${c.flabel} ${c.label}">×</button>`;
+    el.querySelector(".x").onclick=()=>{ removeChip(i); };
+    row.appendChild(el);
+  });
+  if(state.chips.length>1){
+    const clr=document.createElement("button");
+    clr.className="clear-all"; clr.textContent="Clear all";
+    clr.onclick=()=>{ state.chips=state.chips.filter(c=>c.locked); syncFacetBoxes(); rerender(); };
+    row.appendChild(clr);
+  }
+  const m=fakeMatching();
+  const pages=Math.max(1,Math.ceil(m/50));
+  const rc=document.createElement("span");
+  rc.className="result-count";
+  rc.innerHTML=`<b>${comma(m)}</b> matching of <b>5,344</b> · page 1 of ${pages}`;
+  row.appendChild(rc);
+  $("#pageLabel").textContent=`Page 1 of ${pages}`;
+  $("#selAllMatching").textContent=`Select all ${comma(m)} matching`;
+}
+function removeChip(i){
+  const c=state.chips[i];
+  state.chips.splice(i,1);
+  syncFacetBoxes();
+  rerender();
+}
+function syncFacetBoxes(){
+  $$(".fbox").forEach(b=>{
+    b.checked = state.chips.some(c=>c.f===b.dataset.f && c.val===b.dataset.val);
+  });
+}
+
+/* ---------- render: grid ---------- */
+const FLABEL={status:"Status",vendor:"Service provider",host:"Host",carrier:"Carrier",reseller:"Reseller",quick:"Only"};
+
+function statusBadge(r){
+  const label=r.st[0].toUpperCase()+r.st.slice(1);
+  const title=r.sr?` title="${r.sr.replace(/"/g,'&quot;')}"`:"";
+  return `<span class="badge st-${r.st}"${title}><span class="dot"></span>${label}</span>`;
+}
+function peekEvents(r){
+  if(r.st==="error") return [
+    ["09:12 ET", r.sr],
+    ["08:47 ET", "Retry #2 queued by watchdog — backoff 45m"],
+    ["Jul 18",   "Rotation " + fmtNum(r.num) + " ← (929) 341-0087 · ok"],
+  ];
+  if(r.st==="provisioning") return [
+    ["09:31 ET", r.sr],
+    ["07:02 ET", "Activation request accepted by "+VENDOR_LABEL[r.v]],
+    ["Jul 18",   "Row created · vendor "+VENDOR_LABEL[r.v]+", host "+HOST_LABEL[r.h]],
+  ];
+  return [
+    ["09:2"+ (r.id%10) +" ET", "SMS received from 22395 (Google verification) → forwarded to "+(r.rs??"—")],
+    ["0"+(6+r.id%3)+":15 ET", "Rotation ok: previous MDN released, new "+fmtNum(r.num)],
+    ["Jul 18",  "OTA refresh ok · IMEI check passed"],
+  ];
+}
+function renderGrid(){
+  const tb=$("#tbody");
+  const rows=visibleRows();
+  tb.innerHTML="";
+  rows.forEach((r,idx)=>{
+    const tr=document.createElement("tr");
+    tr.className="datarow"+(state.selected.has(r.id)?" selected":"");
+    tr.dataset.id=r.id;
+    if(idx===state.activeRow) tr.dataset.active="1";
+    const gwCell = r.h==="skyline" && r.gw ? `<span class="mono">${r.gw}</span>` : `<span class="dash">—</span>`;
+    const smsCell = r.sms===0 ? `<span class="zero">0</span>` : r.sms;
+    const ls=relMin(r.ls), rot=relHr(r.rot);
+    const conflictCls = r.conflict? " conflict":"";
+    const conflictNote = r.conflict? `<span class="conflict-note">Row changed since you loaded it — refreshed, re-apply your edit.</span>`:"";
+    tr.innerHTML=`
+      <td><input type="checkbox" class="cb rowcb" ${state.selected.has(r.id)?"checked":""} aria-label="Select SIM ${r.id}"></td>
+      <td class="num idcell">${r.id}</td>
+      <td class="mono" title="${r.ic}">${truncIccid(r.ic)}</td>
+      <td class="mono">${fmtNum(r.num)}</td>
+      <td>${statusBadge(r)}</td>
+      <td class="editable vcell${conflictCls}" title="Click to edit service provider (guarded)"><span class="badge sp sp-${r.v}">${VENDOR_LABEL[r.v]}</span>${conflictNote}</td>
+      <td><span class="badge host host-${r.h}">${HOST_LABEL[r.h]}</span></td>
+      <td data-col="carrier"><span class="carrier">${CARRIER_LABEL[r.c]}</span></td>
+      <td data-col="gw">${gwCell}</td>
+      <td data-col="reseller">${r.rs?r.rs:'<span class="rs-none">unassigned</span>'}</td>
+      <td class="num">${smsCell}</td>
+      <td>${ls?`<span class="rel${r.ls>720?" old":""}">${ls}</span>`:'<span class="dash">—</span>'}</td>
+      <td data-col="rotated">${rot?`<span class="rel${r.rot>48?" old":""}">${rot}</span>`:'<span class="dash">—</span>'}</td>
+      <td><button class="rowmenu" aria-label="Actions for SIM ${r.id}" title="Rotate · Suspend · Cancel · OTA refresh · Check IMEI · Test SMS · History">⋯</button></td>`;
+    tb.appendChild(tr);
+
+    if(state.peek===r.id){
+      const pk=document.createElement("tr");
+      pk.className="peek";
+      const evs=peekEvents(r).map(e=>`<li><span class="t">${e[0]}</span><span>${e[1]}</span></li>`).join("");
+      pk.innerHTML=`<td colspan="14"><div class="peek-inner">
+        <div><div class="peek-title">Recent history — SIM #${r.id}</div><ul class="peek-events">${evs}</ul></div>
+        <div class="peek-actions">
+          <button class="tb-btn">Rotate number</button>
+          <button class="tb-btn">${r.st==="suspended"?"Restore":"Suspend"}</button>
+          <button class="tb-btn">OTA refresh</button>
+          <button class="tb-btn">Check IMEI</button>
+          <button class="tb-btn">Send test SMS</button>
+          <button class="tb-btn">Full history</button>
+        </div></div></td>`;
+      tb.appendChild(pk);
+    }
+  });
+  applyHiddenCols();
+  updateBulkbar();
+}
+
+function applyHiddenCols(){
+  $$("[data-col]").forEach(el=>{
+    el.style.display = state.hiddenCols.has(el.dataset.col) ? "none" : "";
+  });
+}
+
+function rerender(){ renderChips(); renderGrid(); }
+
+/* ---------- sorting ---------- */
+$$("#grid thead th[data-key]").forEach(th=>{
+  th.querySelector(".hbtn").addEventListener("click",()=>{
+    const key=th.dataset.key;
+    if(state.sort.key===key) state.sort.dir*=-1;
+    else state.sort={key,dir:1};
+    $$("#grid thead th").forEach(t=>{t.removeAttribute("aria-sort"); const a=t.querySelector(".arr"); if(a)a.textContent="▲";});
+    th.setAttribute("aria-sort", state.sort.dir===1?"ascending":"descending");
+    th.querySelector(".arr").textContent = state.sort.dir===1?"▲":"▼";
+    renderGrid();
+  });
+});
+
+/* ---------- facets & chips ---------- */
+$$(".fbox").forEach(box=>{
+  box.addEventListener("change",()=>{
+    const {f,val}=box.dataset;
+    const label=box.closest("label").textContent.trim().replace(/[\d,]+$/,"").trim();
+    if(box.checked) state.chips.push({f,val,label,flabel:FLABEL[f]});
+    else state.chips=state.chips.filter(c=>!(c.f===f&&c.val===val));
+    rerender();
+  });
+});
+
+/* ---------- saved views ---------- */
+const VIEWS={
+  all:        [{f:"status",val:"!canceled",label:"Hide canceled",flabel:"Status",locked:1}],
+  attention:  [{f:"status",val:"error",label:"Error",flabel:"Status"},{f:"status",val:"suspended",label:"Suspended",flabel:"Status"},{f:"status",val:"provisioning",label:"Provisioning",flabel:"Status"}],
+  "atomic-teltik":[{f:"vendor",val:"atomic",label:"Atomic",flabel:"Service provider"},{f:"host",val:"teltik",label:"Teltik gateway",flabel:"Host"}],
+  trustotp:   [{f:"reseller",val:"TrustOTP",label:"TrustOTP",flabel:"Reseller"},{f:"status",val:"active",label:"Active",flabel:"Status"}],
+  unassigned: [{f:"reseller",val:"none",label:"Unassigned",flabel:"Reseller"},{f:"status",val:"active",label:"Active",flabel:"Status"}],
+  canceled:   [{f:"status",val:"canceled",label:"Canceled",flabel:"Status"}],
+};
+function setView(name){
+  state.view=name;
+  state.chips=VIEWS[name].map(c=>({...c}));
+  state.selected.clear(); state.allMatching=false; state.peek=null; state.activeRow=0;
+  $$("#viewList button").forEach(b=>b.setAttribute("aria-current", b.dataset.view===name?"true":"false"));
+  syncFacetBoxes();
+  rerender();
+}
+$$("#viewList button").forEach(b=>b.addEventListener("click",()=>setView(b.dataset.view)));
+
+/* ---------- search ---------- */
+$("#searchBox").addEventListener("input",()=>renderGrid());
+
+/* ---------- density ---------- */
+function setDensity(d){
+  state.density=d;
+  $("#grid").classList.toggle("compact", d==="compact");
+  $("#denComf").setAttribute("aria-pressed", d==="comfortable");
+  $("#denComp").setAttribute("aria-pressed", d==="compact");
+}
+$("#denComf").onclick=()=>setDensity("comfortable");
+$("#denComp").onclick=()=>setDensity("compact");
+
+/* ---------- selection & bulk bar ---------- */
+function updateBulkbar(){
+  const n=state.selected.size;
+  const bar=$("#bulkbar");
+  bar.classList.toggle("on", n>0 || state.allMatching);
+  const m=fakeMatching();
+  if(state.allMatching){
+    $("#selSummary").innerHTML=`<b>${comma(m)} selected</b> across all pages`;
+    $("#selAllMatching").textContent="Clear selection";
+  }else{
+    const rows=visibleRows();
+    const allPage = n>0 && rows.every(r=>state.selected.has(r.id));
+    $("#selSummary").innerHTML=`<b>${n} selected</b>${allPage?" (all on this page)":""}`;
+    $("#selAllMatching").textContent=`Select all ${comma(m)} matching`;
+  }
+}
+document.addEventListener("change",e=>{
+  if(e.target.classList.contains("rowcb")){
+    const id=+e.target.closest("tr").dataset.id;
+    if(e.target.checked) state.selected.add(id); else {state.selected.delete(id); state.allMatching=false;}
+    e.target.closest("tr").classList.toggle("selected", e.target.checked);
+    updateBulkbar();
+  }
+});
+$("#checkAll").addEventListener("change",e=>{
+  state.allMatching=false;
+  const rows=visibleRows();
+  if(e.target.checked) rows.forEach(r=>state.selected.add(r.id));
+  else state.selected.clear();
+  renderGrid();
+});
+$("#selAllMatching").onclick=()=>{
+  if(state.allMatching){ state.allMatching=false; state.selected.clear(); $("#checkAll").checked=false; renderGrid(); }
+  else { state.allMatching=true; visibleRows().forEach(r=>state.selected.add(r.id)); renderGrid(); }
+};
+
+/* ---------- bulk rotate dry-run ---------- */
+function selectedRows(){ return ROWS.filter(r=>state.selected.has(r.id)); }
+$("#bulkRotate").onclick=()=>{
+  const sel=selectedRows();
+  const m=fakeMatching();
+  const n=state.allMatching?m:sel.length;
+  const skips=[];
+  sel.forEach(r=>{
+    if(r.st==="canceled") skips.push([r.id,"canceled — cannot rotate a canceled line"]);
+    else if(!r.re) skips.push([r.id,"rotation-ineligible (flag off since Jul 11)"]);
+  });
+  // when "all matching" is on, fake plausible extra skip counts
+  const skipN = state.allMatching ? Math.max(skips.length, Math.round(n*0.01)+2) : skips.length;
+  const okN = n - skipN;
+  $("#drySub").textContent=`${comma(n)} SIMs will rotate — nothing has happened yet. Review the plan, then confirm.`;
+  $("#drySum").innerHTML=`
+    <div class="pill ok"><b>${comma(okN)}</b><span>will rotate</span></div>
+    <div class="pill skip"><b>${skipN}</b><span>skipped</span></div>`;
+  const list=$("#skipList");
+  list.innerHTML="";
+  const shown = skips.length?skips:[[2890,"canceled — cannot rotate a canceled line"],[158,"canceled — cannot rotate a canceled line"],[3105,"rotation-ineligible (flag off since Jul 11)"]];
+  shown.slice(0,6).forEach(([id,why])=>{
+    list.innerHTML+=`<li><span class="sid">#${id}</span><span class="why">${why}</span></li>`;
+  });
+  if(!shown.length) list.innerHTML=`<li><span class="why">No skips — every selected SIM is eligible.</span></li>`;
+  openScrim("#dryScrim");
+};
+$("#dryCancel").onclick=()=>closeScrims();
+$("#dryConfirm").onclick=()=>{
+  const n=state.allMatching?fakeMatching():state.selected.size;
+  closeScrims();
+  showToast(`Rotation queued for ${comma(n)} SIMs — watch progress in Jobs.`, null);
+};
+
+/* ---------- bulk delete (type the count) ---------- */
+$("#bulkDelete").onclick=()=>{
+  const n=state.allMatching?fakeMatching():state.selected.size;
+  $("#delCount").textContent=n;
+  $("#delSub").textContent=`This permanently removes ${comma(n)} rows and their history. To confirm, type the exact row count.`;
+  $("#delInput").value=""; $("#delConfirm").disabled=true;
+  openScrim("#delScrim");
+  $("#delInput").focus();
+};
+$("#delInput").addEventListener("input",()=>{
+  $("#delConfirm").disabled = $("#delInput").value.trim() !== $("#delCount").textContent;
+});
+$("#delCancel").onclick=()=>closeScrims();
+$("#delConfirm").onclick=()=>{
+  closeScrims();
+  showToast(`Deleted ${$("#delCount").textContent} rows. (mock — nothing really deleted)`, null);
+  state.selected.clear(); state.allMatching=false; renderGrid();
+};
+
+/* ---------- inline vendor editor (compare-and-set) ---------- */
+let pop=null, popRow=null, popPrev=null;
+function closePopover(){ if(pop){pop.remove();pop=null;popRow=null;} }
+document.addEventListener("click",e=>{
+  const cell=e.target.closest("td.vcell");
+  if(cell && !e.target.closest(".popover")){
+    e.stopPropagation();
+    openVendorEditor(cell);
+    return;
+  }
+  if(pop && !e.target.closest(".popover")) closePopover();
+  const colpop=$("#colPop");
+  if(colpop && !e.target.closest("#colPop") && !e.target.closest("#colBtn")) colpop.remove();
+});
+function openVendorEditor(cell){
+  closePopover();
+  const tr=cell.closest("tr");
+  const r=ROWS.find(x=>x.id===+tr.dataset.id);
+  popRow=r; popPrev=r.v;
+  pop=document.createElement("div");
+  pop.className="popover"; pop.setAttribute("role","dialog"); pop.setAttribute("aria-label","Edit service provider");
+  pop.innerHTML=`
+    <h3>Edit service provider — SIM #${r.id}</h3>
+    <label class="field-lab" for="vSel">Service provider (vendor)</label>
+    <select id="vSel">
+      ${Object.entries(VENDOR_LABEL).map(([k,l])=>`<option value="${k}" ${k===r.v?"selected":""}>${l}</option>`).join("")}
+    </select>
+    <div class="oldnew" id="onPrev"><span>${VENDOR_LABEL[r.v]}</span><span class="arrow">→</span><span class="new">${VENDOR_LABEL[r.v]}</span></div>
+    <p class="cas-note">Saved only if the row is unchanged since load (compare-and-set). If another process touched this row first, the save fails and the row refreshes.</p>
+    <div class="pop-btns">
+      <button class="btn" id="vCancel">Cancel</button>
+      <button class="btn primary" id="vSave" disabled>Save</button>
+    </div>`;
+  document.body.appendChild(pop);
+  const rect=cell.getBoundingClientRect();
+  const pw=270;
+  pop.style.left=Math.min(rect.left, innerWidth-pw-16)+"px";
+  pop.style.top=(rect.bottom+6+scrollY)+"px";
+  const sel=$("#vSel",pop);
+  sel.focus();
+  sel.addEventListener("change",()=>{
+    $("#onPrev .new",pop).textContent=VENDOR_LABEL[sel.value];
+    $("#vSave",pop).disabled = sel.value===popPrev;
+  });
+  $("#vCancel",pop).onclick=closePopover;
+  $("#vSave",pop).onclick=()=>{
+    const nv=sel.value, old=popPrev, row=popRow;
+    row.v=nv;
+    closePopover();
+    renderGrid();
+    showToast(`vendor updated on SIM #${row.id}: ${VENDOR_LABEL[old]} → ${VENDOR_LABEL[nv]}`, ()=>{
+      row.v=old; renderGrid(); showToast(`Reverted — SIM #${row.id} vendor is ${VENDOR_LABEL[old]} again.`, null);
+    });
+  };
+}
+
+/* ---------- column config ---------- */
+$("#colBtn").onclick=e=>{
+  e.stopPropagation();
+  let ex=$("#colPop"); if(ex){ex.remove();return;}
+  const p=document.createElement("div");
+  p.className="popover colcfg"; p.id="colPop"; p.setAttribute("role","dialog"); p.setAttribute("aria-label","Configure columns");
+  p.innerHTML=`<h3>Columns</h3>`+
+    [["carrier","Carrier"],["gw","Gateway / Port"],["reseller","Reseller"],["rotated","Rotated"]]
+    .map(([k,l])=>`<label><input type="checkbox" data-c="${k}" ${state.hiddenCols.has(k)?"":"checked"}>${l}</label>`).join("")+
+    `<p class="cas-note" style="margin-bottom:0">ID, ICCID, Number, Status, Service provider, Host are always shown.</p>`;
+  document.body.appendChild(p);
+  const rect=$("#colBtn").getBoundingClientRect();
+  p.style.left=Math.min(rect.left, innerWidth-280)+"px";
+  p.style.top=(rect.bottom+6)+"px";
+  $$("input",p).forEach(b=>b.addEventListener("change",()=>{
+    if(b.checked) state.hiddenCols.delete(b.dataset.c); else state.hiddenCols.add(b.dataset.c);
+    applyHiddenCols();
+  }));
+};
+
+/* ---------- export ---------- */
+$("#exportBtn").onclick=()=>showToast(`Exported ${visibleRows().length} rows → sims-export-2026-07-19.csv (mock)`, null);
+
+/* ---------- row peek + row nav ---------- */
+document.addEventListener("click",e=>{
+  const tr=e.target.closest("tr.datarow");
+  if(!tr) return;
+  if(e.target.closest("input,button,.editable")) return;
+  const id=+tr.dataset.id;
+  state.peek = state.peek===id ? null : id;
+  renderGrid();
+});
+document.addEventListener("keydown",e=>{
+  if(e.target.matches("input,select,textarea")) return;
+  const rows=visibleRows();
+  if(e.key==="ArrowDown"||e.key==="ArrowUp"){
+    e.preventDefault();
+    state.activeRow=Math.max(0,Math.min(rows.length-1, state.activeRow + (e.key==="ArrowDown"?1:-1)));
+    renderGrid();
+    const el=$(`tr.datarow[data-active="1"]`); if(el) el.scrollIntoView({block:"nearest"});
+  }
+  else if(e.key===" "){ e.preventDefault();
+    const r=rows[state.activeRow]; if(!r) return;
+    if(state.selected.has(r.id)) state.selected.delete(r.id); else state.selected.add(r.id);
+    renderGrid();
+  }
+  else if(e.key==="Enter"){ const r=rows[state.activeRow]; if(!r) return;
+    state.peek = state.peek===r.id?null:r.id; renderGrid();
+  }
+  else if(e.key==="e"||e.key==="E"){ const r=rows[state.activeRow]; if(!r) return;
+    const tr=$(`tr.datarow[data-id="${r.id}"]`); const cell=tr && tr.querySelector(".vcell");
+    if(cell) openVendorEditor(cell);
+  }
+});
+
+/* ---------- command palette ---------- */
+const PAL_ITEMS=[
+  {t:"⚠ Needs attention", k:"view", run:()=>setView("attention")},
+  {t:"Atomic on Teltik", k:"view", run:()=>setView("atomic-teltik")},
+  {t:"TrustOTP active", k:"view", run:()=>setView("trustotp")},
+  {t:"Unassigned inventory", k:"view", run:()=>setView("unassigned")},
+  {t:"Canceled (hidden)", k:"view", run:()=>setView("canceled")},
+  {t:"All SIMs", k:"view", run:()=>setView("all")},
+  {t:"Rotate selected", k:"action", run:()=>{closeScrims(); if(state.selected.size) $("#bulkRotate").click(); else showToast("Nothing selected — check some rows first.",null);}},
+  {t:"Suspend selected", k:"action", run:()=>showToast("Suspend queued (mock).",null)},
+  {t:"Assign reseller to selected", k:"action", run:()=>showToast("Assign reseller (mock).",null)},
+  {t:"Toggle rotation eligibility", k:"action", run:()=>showToast("Rotation eligibility toggled (mock).",null)},
+  {t:"OTA refresh selected", k:"action", run:()=>showToast("OTA refresh queued (mock).",null)},
+  {t:"Check IMEI on active row", k:"action", run:()=>showToast("IMEI check queued (mock).",null)},
+  {t:"Send test SMS to active row", k:"action", run:()=>showToast("Test SMS sent (mock).",null)},
+  {t:"Export CSV", k:"action", run:()=>$("#exportBtn").click()},
+  {t:"Preset: not_rotated_today", k:"preset", run:()=>showToast("Server preset applied: not_rotated_today (mock).",null)},
+  {t:"Preset: any_error", k:"preset", run:()=>setView("attention")},
+  {t:"Preset: no_reseller", k:"preset", run:()=>setView("unassigned")},
+  {t:"Preset: auto_paused", k:"preset", run:()=>showToast("Server preset applied: auto_paused (mock).",null)},
+  {t:"Preset: stuck_provisioning", k:"preset", run:()=>showToast("Server preset applied: stuck_provisioning (mock).",null)},
+  {t:"Preset: not_notified", k:"preset", run:()=>showToast("Server preset applied: not_notified (mock).",null)},
+  {t:"Toggle density", k:"action", run:()=>setDensity(state.density==="compact"?"comfortable":"compact")},
+];
+let palHot=0;
+function renderPalette(){
+  const q=$("#palInput").value.trim().toLowerCase();
+  const items=PAL_ITEMS.filter(i=>i.t.toLowerCase().includes(q));
+  const ul=$("#palList");
+  if(!items.length){ ul.innerHTML=`<li class="empty">No commands match “${q}”.</li>`; return; }
+  palHot=Math.min(palHot, items.length-1);
+  ul.innerHTML=items.map((i,idx)=>`<li><button data-i="${PAL_ITEMS.indexOf(i)}" class="${idx===palHot?"hot":""}">${i.t}<span class="kind">${i.k}</span></button></li>`).join("");
+  $$("#palList button").forEach(b=>b.onclick=()=>{ closeScrims(); PAL_ITEMS[+b.dataset.i].run(); });
+}
+function openPalette(){ palHot=0; $("#palInput").value=""; openScrim("#palScrim"); renderPalette(); $("#palInput").focus(); }
+$("#cmdkOpen").onclick=openPalette;
+$("#palInput").addEventListener("input",()=>{palHot=0;renderPalette();});
+$("#palInput").addEventListener("keydown",e=>{
+  const btns=$$("#palList button");
+  if(e.key==="ArrowDown"){e.preventDefault();palHot=Math.min(palHot+1,btns.length-1);renderPalette();}
+  else if(e.key==="ArrowUp"){e.preventDefault();palHot=Math.max(palHot-1,0);renderPalette();}
+  else if(e.key==="Enter"){const b=$$("#palList button")[palHot]; if(b) b.click();}
+});
+document.addEventListener("keydown",e=>{
+  if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==="k"){e.preventDefault();openPalette();}
+  if(e.key==="Escape"){ closeScrims(); closePopover(); const cp=$("#colPop"); if(cp)cp.remove(); }
+});
+
+/* ---------- scrims & toast ---------- */
+function openScrim(sel){ closeScrims(); $(sel).classList.add("on"); }
+function closeScrims(){ $$(".scrim").forEach(s=>s.classList.remove("on")); }
+$$(".scrim").forEach(s=>s.addEventListener("click",e=>{ if(e.target===s) closeScrims(); }));
+
+let toastTimer=null;
+function showToast(msg, undoFn){
+  const t=$("#toast");
+  t.innerHTML=`<span>${msg}</span>`+(undoFn?`<button id="undoBtn">Undo</button>`:"");
+  if(undoFn) $("#undoBtn").onclick=()=>{ t.classList.remove("on"); undoFn(); };
+  t.classList.add("on");
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>t.classList.remove("on"), 6000);
+}
+
+/* ---------- boot ---------- */
+setView("all");
+
+/* Demo staging so a cold screenshot sells the sketch:
+   pre-select a few rows and open the peek on the error SIM. */
+[4821,3117,639,2954,1206,5033].forEach(id=>state.selected.add(id));
+state.peek=2214;
+state.activeRow=2;
+renderGrid();
+</script>
+</body>
+</html>
