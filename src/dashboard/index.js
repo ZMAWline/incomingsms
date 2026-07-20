@@ -3926,12 +3926,22 @@ async function handleErrorLogs(env, corsHeaders, url) {
   }
 }
 
+const BAD_RENTAL_OPEN_MAX_AGE_HOURS = 48;
+function badRentalOpenCutoffIso(now = Date.now()) {
+  return new Date(now - BAD_RENTAL_OPEN_MAX_AGE_HOURS * 60 * 60 * 1000).toISOString();
+}
+function isOpenBadRentalStatusFilter(statusFilter) {
+  const parts = String(statusFilter || '').split(',').map(s => s.trim()).filter(Boolean);
+  return parts.length > 0 && parts.every(s => s === 'received' || s === 'in_triage');
+}
+
 async function handleBadRentals(env, corsHeaders, url) {
   try {
     const statusParam = url.searchParams.get('status');
     const includeAll = statusParam === 'all';
     const statusFilter = (statusParam && !includeAll) ? statusParam : 'received,in_triage';
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10) || 200, 1000);
+
     // Embeds:
     //   resellers(name)                       — operator label
     //   rentals(reseller_rental_id)           — reseller's own id when echoed
@@ -3953,9 +3963,13 @@ async function handleBadRentals(env, corsHeaders, url) {
     let query = 'rental_reports?select=' + encodeURIComponent(select);
     if (!includeAll) {
       query += '&status=in.(' + encodeURIComponent(statusFilter) + ')';
+      if (isOpenBadRentalStatusFilter(statusFilter)) {
+        query += '&received_at=gte.' + encodeURIComponent(badRentalOpenCutoffIso());
+      }
     }
     query += '&sims.sim_numbers.valid_to=is.null'
       + '&order=received_at.desc&limit=' + limit;
+
     const resp = await supabaseGet(env, query);
     if (!resp.ok) {
       const txt = await resp.text();

@@ -1185,6 +1185,10 @@ async function runAtomicFinalizer(env, limit) {
 
 function pad2(n) { return String(n).padStart(2, '0'); }
 function ymdUtc(d = new Date()) { return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`; }
+const BAD_RENTAL_OPEN_MAX_AGE_HOURS = 48;
+function badRentalOpenCutoffIso(now = Date.now()) {
+  return new Date(now - BAD_RENTAL_OPEN_MAX_AGE_HOURS * 60 * 60 * 1000).toISOString();
+}
 function nyMidnightUtcIso(d = new Date()) {
   // Start of today's NY calendar date as a UTC ISO timestamp.
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -2228,8 +2232,9 @@ async function runRotationReview(env, opts = {}) {
     // Single non-blocking query; failure just omits the line rather than
     // breaking the rotation review.
     try {
+      const cutoff = badRentalOpenCutoffIso();
       const badResp = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/rental_reports?select=id&status=in.(received,in_triage)&limit=1000`,
+        `${env.SUPABASE_URL}/rest/v1/rental_reports?select=id&status=in.(received,in_triage)&received_at=gte.${encodeURIComponent(cutoff)}&limit=1000`,
         {
           headers: {
             apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2242,7 +2247,7 @@ async function runRotationReview(env, opts = {}) {
         const badRows = await badResp.json();
         const badCount = Array.isArray(badRows) ? badRows.length : 0;
         lines.push('');
-        lines.push(`**Bad Rental Reports (open):** ${badCount}${badCount > 0 ? ' — [review in dashboard](/bad-rentals)' : ''}`);
+        lines.push(`**Bad Rental Reports (open, last ${BAD_RENTAL_OPEN_MAX_AGE_HOURS}h):** ${badCount}${badCount > 0 ? ' — [review in dashboard](/bad-rentals)' : ''}`);
       }
     } catch (e) {
       console.log('[runRotationReview] bad-rental count fetch failed: ' + e);
