@@ -1334,6 +1334,23 @@ async function attemptsToday(env, simId, action) {
   return typeof n === 'number' ? n : 0;
 }
 
+async function loadFailedRowIfStillActionable(env, sim, tonightStart) {
+  const fresh = (await rotationReviewQuery(env,
+    `sims?id=eq.${sim.id}&select=id,status,rotation_status,last_mdn_rotated_at,last_notified_at&limit=1`))[0];
+  if (!fresh) return { ok: false, reason: 'missing' };
+
+  const rowStillFailed = fresh.rotation_status === 'failed' || fresh.status === 'rotation_failed';
+  if (!rowStillFailed) return { ok: false, reason: 'no_longer_failed' };
+  if (fresh.rotation_status === 'success') return { ok: false, reason: 'already_success' };
+  if (fresh.last_notified_at && fresh.last_mdn_rotated_at && fresh.last_notified_at >= fresh.last_mdn_rotated_at) {
+    return { ok: false, reason: 'already_notified' };
+  }
+  if (fresh.last_mdn_rotated_at && fresh.last_mdn_rotated_at < tonightStart) {
+    return { ok: false, reason: 'outside_current_window' };
+  }
+  return { ok: true, fresh };
+}
+
 // Force-rotate one SIM via the appropriate worker (service binding — CF blocks
 // worker→public-.workers.dev fetches which is what tripped the first version).
 async function forceRotateSim(env, sim) {
@@ -1579,7 +1596,7 @@ async function runCatchupSweep(env, opts = {}) {
     dry_run: dryRun,
     failed_found: 0,
     flipped_to_mdn_pending: 0,
-    force_rotated: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0, skipped_cap: 0 },
+    force_rotated: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0, skipped_cap: 0, skipped_stale: 0 },
     missed_due_found: 0,
     missed_retried: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0, skipped_window: 0, skipped_race: 0, skipped_cap: 0 },
     recon: null,
@@ -1604,25 +1621,43 @@ async function runCatchupSweep(env, opts = {}) {
     for (const { entry, sims } of Object.values(buckets)) {
       if (dryRun) continue;
       if (entry.action === 'flip_to_mdn_pending' && sims.length > 0) {
-        const ids = sims.map(s => s.id).join(',');
-        const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
-          method: 'PATCH',
-          headers: {
-            apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-            Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-            'Content-Type': 'application/json',
-            Prefer: 'return=minimal',
-          },
-          body: JSON.stringify({ status: 'provisioning', rotation_status: 'mdn_pending' }),
-        });
-        if (flipRes.ok) {
-          summary.flipped_to_mdn_pending += sims.length;
-          await Promise.all(sims.map(s => recordAttempt(env, s.id, runId, 'flip_to_mdn_pending', 'ok', null)));
+        const actionable = [];
+        for (const sim of sims) {
+          const guard = await loadFailedRowIfStillActionable(env, sim, tonightStart).catch(e => ({ ok: false, reason: String(e).slice(0, 120) }));
+          if (!guard.ok) {
+            summary.force_rotated.skipped_stale++;
+            await recordAttempt(env, sim.id, runId, 'flip_to_mdn_pending', 'fail', `stale skipped: ${guard.reason}`);
+            continue;
+          }
+          actionable.push(sim);
+        }
+        if (actionable.length > 0) {
+          const ids = actionable.map(s => s.id).join(',');
+          const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
+            method: 'PATCH',
+            headers: {
+              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+              'Content-Type': 'application/json',
+              Prefer: 'return=minimal',
+            },
+            body: JSON.stringify({ status: 'provisioning', rotation_status: 'mdn_pending' }),
+          });
+          if (flipRes.ok) {
+            summary.flipped_to_mdn_pending += actionable.length;
+            await Promise.all(actionable.map(s => recordAttempt(env, s.id, runId, 'flip_to_mdn_pending', 'ok', null)));
+          }
         }
       } else if (entry.action === 'force_rotate') {
         for (const sim of sims) {
           if (rotateCalls >= SWEEP_MAX_ROTATES) { summary.force_rotated.skipped_cap++; continue; }
           if (breaker.isTripped(sim.vendor)) { summary.force_rotated.skipped_breaker++; continue; }
+          const guard = await loadFailedRowIfStillActionable(env, sim, tonightStart).catch(e => ({ ok: false, reason: String(e).slice(0, 120) }));
+          if (!guard.ok) {
+            summary.force_rotated.skipped_stale++;
+            await recordAttempt(env, sim.id, runId, 'force_rotate', 'fail', `stale skipped: ${guard.reason}`);
+            continue;
+          }
           const used = await attemptsToday(env, sim.id, 'force_rotate');
           if (used >= 3) { summary.force_rotated.skipped_budget++; continue; }
           summary.force_rotated.attempted++;
@@ -1789,7 +1824,7 @@ async function runRotationReview(env, opts = {}) {
     const actions = {
       flipped_to_mdn_pending: 0,
       iccid_synced: 0,
-      force_rotated: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0 },
+      force_rotated: { attempted: 0, ok: 0, fail: 0, skipped_budget: 0, skipped_breaker: 0, skipped_stale: 0 },
       finalizer_drained: { helix: 0, wing: 0, teltik: 0, atomic: 0 },
       second_read_verified: 0,
       second_read_failed: 0,
@@ -1799,20 +1834,32 @@ async function runRotationReview(env, opts = {}) {
     for (const { entry, sims } of Object.values(buckets)) {
       if (entry.action === 'flip_to_mdn_pending') {
         if (!dryRun && sims.length > 0) {
-          const ids = sims.map(s => s.id).join(',');
-          const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
-            method: 'PATCH',
-            headers: {
-              apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-              Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-              'Content-Type': 'application/json',
-              Prefer: 'return=minimal',
-            },
-            body: JSON.stringify({ status: 'provisioning', rotation_status: 'mdn_pending' }),
-          });
-          if (flipRes.ok) {
-            actions.flipped_to_mdn_pending += sims.length;
-            await Promise.all(sims.map(s => recordAttempt(env, s.id, runId, 'flip_to_mdn_pending', 'ok', null)));
+          const actionable = [];
+          for (const sim of sims) {
+            const guard = await loadFailedRowIfStillActionable(env, sim, tonightStart).catch(e => ({ ok: false, reason: String(e).slice(0, 120) }));
+            if (!guard.ok) {
+              actions.force_rotated.skipped_stale++;
+              await recordAttempt(env, sim.id, runId, 'flip_to_mdn_pending', 'fail', `stale skipped: ${guard.reason}`);
+              continue;
+            }
+            actionable.push(sim);
+          }
+          if (actionable.length > 0) {
+            const ids = actionable.map(s => s.id).join(',');
+            const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
+              method: 'PATCH',
+              headers: {
+                apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+                'Content-Type': 'application/json',
+                Prefer: 'return=minimal',
+              },
+              body: JSON.stringify({ status: 'provisioning', rotation_status: 'mdn_pending' }),
+            });
+            if (flipRes.ok) {
+              actions.flipped_to_mdn_pending += actionable.length;
+              await Promise.all(actionable.map(s => recordAttempt(env, s.id, runId, 'flip_to_mdn_pending', 'ok', null)));
+            }
           }
         }
       } else if (entry.action === 'sync_iccid' && !dryRun) {
@@ -1869,6 +1916,12 @@ async function runRotationReview(env, opts = {}) {
         for (const sim of sims.slice(0, maxThisRun)) {
           if (breaker.isTripped(sim.vendor)) {
             actions.force_rotated.skipped_breaker++;
+            continue;
+          }
+          const guard = await loadFailedRowIfStillActionable(env, sim, tonightStart).catch(e => ({ ok: false, reason: String(e).slice(0, 120) }));
+          if (!guard.ok) {
+            actions.force_rotated.skipped_stale++;
+            await recordAttempt(env, sim.id, runId, 'force_rotate', 'fail', `stale skipped: ${guard.reason}`);
             continue;
           }
           const used = await attemptsToday(env, sim.id, 'force_rotate');
@@ -2082,7 +2135,7 @@ async function runRotationReview(env, opts = {}) {
     lines.push('');
     lines.push(`- Flipped to mdn_pending: **${actions.flipped_to_mdn_pending}**`);
     lines.push(`- ICCID synced (SIM card swap): **${actions.iccid_synced}**`);
-    lines.push(`- Force-rotated: **${actions.force_rotated.attempted}** attempted (${actions.force_rotated.ok} ok, ${actions.force_rotated.fail} fail, ${actions.force_rotated.skipped_budget} skipped-budget, ${actions.force_rotated.skipped_breaker} skipped-breaker)`);
+    lines.push(`- Force-rotated: **${actions.force_rotated.attempted}** attempted (${actions.force_rotated.ok} ok, ${actions.force_rotated.fail} fail, ${actions.force_rotated.skipped_budget} skipped-budget, ${actions.force_rotated.skipped_breaker} skipped-breaker, ${actions.force_rotated.skipped_stale} skipped-stale)`);
     if (actions.second_read_verified + actions.second_read_failed > 0) {
       lines.push(`- Atomic second-read verification: ${actions.second_read_verified} confirmed new MDN, ${actions.second_read_failed} MDN unchanged after force-rotate`);
     }
