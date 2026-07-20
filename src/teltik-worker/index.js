@@ -584,7 +584,16 @@ async function handleTeltikSmsWebhook(request, env) {
   return processTeltikSmsItem(body, env);
 }
 
-async function processTeltikSmsItem(body, env) {
+// Pull an ICCID out of alias/nickname free text ("Booth 4 - 89014103…").
+// ICCIDs are 18-22 digits starting with the telecom industry prefix 89, so a
+// 10/11-digit phone number in the alias can never false-match. Digit-run
+// boundaries: an 89… embedded in a longer digit run is rejected.
+export function extractIccidFromAlias(text) {
+  const m = String(text || '').match(/(?<!\d)(89\d{16,20})(?!\d)/);
+  return m ? m[1] : null;
+}
+
+export async function processTeltikSmsItem(body, env) {
   // Teltik push format: { destination, origin, message, timestamp, port, gateway_id, nickname }
   // all-sms polling format: { to, from, message, time_stamp }
   const mdn = normalizeToE164(body.destination || body.to || body.mdn || '');
@@ -593,17 +602,40 @@ async function processTeltikSmsItem(body, env) {
   // Teltik timestamps have no timezone info (likely ET not UTC) — use delivery time instead
   const receivedAt = new Date().toISOString();
 
-  if (!mdn) {
-    console.log('[Webhook] No MDN in payload, ignoring');
+  // Teltik HOSTS foreign-vendor SIMs (Atomic etc.) whose payload MDN can be
+  // stale/wrong; for those the alias/nickname carries the ICCID — the stable
+  // identifier. Prefer ICCID match on sims (ANY vendor), fall back to MDN.
+  const aliasIccid = extractIccidFromAlias(body.nickname || body.alias || body.name || body.line_alias || '');
+
+  if (!mdn && !aliasIccid) {
+    console.log('[Webhook] No MDN or alias ICCID in payload, ignoring');
     return new Response('OK', { status: 200 });
   }
 
-  // Look up sim_id by current E.164 number
-  const simNumbers = await supabaseGetArray(
-    env,
-    `sim_numbers?e164=eq.${encodeURIComponent(mdn)}&valid_to=is.null&select=sim_id&limit=1`
-  );
-  const simId = simNumbers[0]?.sim_id || null;
+  let simId = null;
+  let iccid = null;
+  if (aliasIccid) {
+    const simRows = await supabaseGetArray(
+      env,
+      `sims?iccid=eq.${encodeURIComponent(aliasIccid)}&select=id,iccid&limit=1`
+    );
+    if (simRows[0]) {
+      simId = simRows[0].id;
+      iccid = simRows[0].iccid;
+    } else {
+      console.log(`[Webhook] alias ICCID ${aliasIccid} not in sims — falling back to MDN lookup`);
+      iccid = aliasIccid; // still the true SIM identity per Teltik; forward it
+    }
+  }
+
+  if (!simId && mdn) {
+    // Look up sim_id by current E.164 number
+    const simNumbers = await supabaseGetArray(
+      env,
+      `sim_numbers?e164=eq.${encodeURIComponent(mdn)}&valid_to=is.null&select=sim_id&limit=1`
+    );
+    simId = simNumbers[0]?.sim_id || null;
+  }
 
   // Generate deterministic message ID for dedup
   const messageId = await generateMessageIdAsync({
@@ -628,7 +660,7 @@ async function processTeltikSmsItem(body, env) {
   // Insert into inbound_sms
   const insRes = await supabaseInsert(env, 'inbound_sms', [{
     sim_id: simId,
-    to_number: mdn,
+    to_number: mdn || null,
     from_number: fromNumber,
     body: smsBody,
     received_at: receivedAt,
@@ -661,7 +693,7 @@ async function processTeltikSmsItem(body, env) {
           from: fromNumber,
           message: smsBody,
           received_at: receivedAt,
-          iccid: null,
+          iccid,
           port: null,
         },
       }, {
