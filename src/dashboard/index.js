@@ -3935,7 +3935,7 @@ async function handleBadRentals(env, corsHeaders, url) {
       'auto_remediation_state', 'last_auto_attempt_at', 'escalation_reason',
       'resellers(name)',
       'rentals(reseller_rental_id)',
-      'sims(iccid,sim_numbers(e164,valid_to))',
+      'sims(iccid,vendor,carrier,sim_numbers(e164,valid_to))',
       'report_sim_number:sim_numbers!rental_reports_sim_number_id_fkey(e164,valid_from,valid_to)',
     ].join(',');
     let query = 'rental_reports?select=' + encodeURIComponent(select);
@@ -4019,6 +4019,8 @@ async function handleBadRentals(env, corsHeaders, url) {
         auto_attempts_last_mode: s ? s.last_mode : null,
         resellers: r.resellers || null,
         iccid: r && r.sims ? r.sims.iccid : null,
+        vendor: r && r.sims ? r.sims.vendor : null,
+        carrier: r && r.sims ? r.sims.carrier : null,
         reseller_rental_id: resellerRentalId,
         current_e164: currentE164,
         report_sim_number_e164: rsn ? rsn.e164 : null,
@@ -4487,6 +4489,7 @@ async function handleBadRentalReport(id, env, corsHeaders) {
       'auto_remediation_state','last_auto_attempt_at','escalation_reason',
       'resellers(name)',
       'rentals(reseller_rental_id)',
+      'sims(iccid,vendor,carrier)',
     ].join(',');
     const repResp = await supabaseGet(env, 'rental_reports?id=eq.' + reportId + '&select=' + encodeURIComponent(reportSelect));
     if (!repResp.ok) {

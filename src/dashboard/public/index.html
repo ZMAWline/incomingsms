@@ -1911,7 +1911,7 @@
                                 <th class="px-4 py-3 font-medium" title="Reported MDN is what the reseller submitted with the bad-rental report. Current MDN is the SIM's active number now — when they differ, the reported number has been rotated/swapped.">Reported / Current MDN</th>
                                 <th class="px-4 py-3 font-medium">Reason</th>
                                 <th class="px-4 py-3 font-medium">Status</th>
-                                <th class="px-4 py-3 font-medium">SIM ID</th>
+                                <th class="px-4 py-3 font-medium" title="SIM id + service provider (sims.vendor). Provider is who the line is provisioned with — a Teltik-hosted Atomic SIM still shows Atomic.">SIM / Provider</th>
                                 <th class="px-4 py-3 font-medium" title="Reseller's own rental identifier (from rentals.reseller_rental_id). Falls back to internal rental_id when the reseller didn't echo one.">Reseller Rental ID</th>
                                 <th class="px-4 py-3 font-medium">Received</th>
                                 <th class="px-4 py-3 font-medium">Action</th>
@@ -8002,6 +8002,14 @@ async function sendSimOnline(simId, phoneNumber) {
                     unable_to_reproduce: '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-slate-500/30 text-slate-200">Unable to reproduce</span>',
                     duplicate:           '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-purple-500/20 text-purple-300">Duplicate</span>',
                 };
+                // Service provider = sims.vendor (same badges as the SIMs table).
+                // NOT the hosting gateway — a Teltik-hosted Atomic SIM shows ATOMIC.
+                const VENDOR_BADGES = {
+                    teltik:   '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>',
+                    atomic:   '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-blue-500/20 text-blue-300">ATOMIC</span>',
+                    wing_iot: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-green-500/20 text-green-300">Wing IoT</span>',
+                    helix:    '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>',
+                };
                 tbody.innerHTML = rows.map(function(r) {
                     window._badRentalRowsById[r.id] = r;
                     const resellerName = (r.resellers && r.resellers.name) ? r.resellers.name : (r.reseller_id || '—');
@@ -8011,6 +8019,11 @@ async function sendSimOnline(simId, phoneNumber) {
                             ? '<a href="/sims?search=' + encodeURIComponent(r.iccid) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();" title="Open SIMs page filtered to ICCID ' + escapeHtml(r.iccid) + ' (new tab)" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted">' + escapeHtml(r.sim_id) + '</a>'
                             : '<span title="ICCID unknown for this SIM — open SIMs page manually" class="text-dark-300">' + escapeHtml(r.sim_id) + '</span>')
                         : '—';
+                    const vendorChip = r.vendor
+                        ? '<div class="mt-1" title="Service provider (sims.vendor)' + (r.carrier ? ' · carrier: ' + escapeHtml(r.carrier) : '') + '">'
+                            + (VENDOR_BADGES[r.vendor] || '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">' + escapeHtml(r.vendor) + '</span>')
+                            + '</div>'
+                        : '';
                     const reported = r.e164 || null;
                     const current = r.current_e164 || null;
                     const isStale = !!(reported && current && reported !== current);
@@ -8097,7 +8110,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         '<td class="px-4 py-3 font-mono">' + mdnCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 text-xs" title="' + escapeHtml(r.reason_note || '') + '">' + escapeHtml(r.reason_code || '—') + '</td>' +
                         '<td class="px-4 py-3">' + statusBadge + '</td>' +
-                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + simLink + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + simLink + vendorChip + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + rentalIdCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-400 text-xs">' + escapeHtml(fmtDt(r.received_at)) + '</td>' +
                         '<td class="px-4 py-3">' + actionCell + '</td>' +
@@ -8301,7 +8314,9 @@ async function sendSimOnline(simId, phoneNumber) {
             if (summary) {
                 const reseller = (r.resellers && r.resellers.name) ? r.resellers.name : ('reseller #' + (r.reseller_id || '?'));
                 const mdn = r.e164 || '—';
-                summary.textContent = reseller + ' · reported ' + mdn + ' · current status: ' + (r.status || '?');
+                summary.textContent = reseller + ' · reported ' + mdn
+                    + (r.vendor ? ' · provider: ' + r.vendor : '')
+                    + ' · current status: ' + (r.status || '?');
             }
             modal.dataset.reportId = String(reportId);
             const autoEl = document.getElementById('bad-rentals-edit-auto-state');
@@ -8443,6 +8458,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 ['Reseller rental ID',  resellerRentalId],
                 ['Internal rental ID',  r.rental_id],
                 ['SIM ID',              r.sim_id],
+                ['Provider',            (r.sims && r.sims.vendor) ? r.sims.vendor : null],
+                ['Carrier',             (r.sims && r.sims.carrier) ? r.sims.carrier : null],
                 ['SIM number ID',       r.sim_number_id],
                 ['Status',              r.status],
                 ['Remediation action',  r.remediation_action],
