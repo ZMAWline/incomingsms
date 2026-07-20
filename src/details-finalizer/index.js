@@ -1186,8 +1186,12 @@ async function runAtomicFinalizer(env, limit) {
 function pad2(n) { return String(n).padStart(2, '0'); }
 function ymdUtc(d = new Date()) { return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`; }
 const BAD_RENTAL_OPEN_MAX_AGE_HOURS = 48;
+const PENDING_REVIEW_OPEN_MAX_AGE_HOURS = 48;
 function badRentalOpenCutoffIso(now = Date.now()) {
   return new Date(now - BAD_RENTAL_OPEN_MAX_AGE_HOURS * 60 * 60 * 1000).toISOString();
+}
+function pendingReviewOpenCutoffIso(now = Date.now()) {
+  return new Date(now - PENDING_REVIEW_OPEN_MAX_AGE_HOURS * 60 * 60 * 1000).toISOString();
 }
 function nyMidnightUtcIso(d = new Date()) {
   // Start of today's NY calendar date as a UTC ISO timestamp.
@@ -1271,14 +1275,16 @@ async function releaseReviewLock(env, runDbId, status, summary, reportMd) {
 
 // ---- pending_review_items helpers --------------------------------------
 async function loadOpenPendingItems(env) {
-  return rotationReviewQuery(env,
-    `pending_review_items?status=in.(open,answered)&select=id,kind,summary,sim_id,status,operator_response,agent_seen_at,created_at&order=created_at.desc&limit=200`);
+  const cutoff = pendingReviewOpenCutoffIso();
+  const rows = await rotationReviewQuery(env,
+    `pending_review_items?status=in.(open,answered)&select=id,kind,summary,sim_id,status,operator_response,agent_seen_at,created_at&order=created_at.desc&limit=500`);
+  return rows.filter(i => i.status !== 'open' || (i.created_at && i.created_at >= cutoff)).slice(0, 200);
 }
 
 async function findOpenPendingForSim(env, simId, kind) {
-  // Used for dedup so we don't create duplicate items for the same SIM+kind
+  // Used for dedup so we don't create duplicate non-expired items for the same SIM+kind.
   const rows = await rotationReviewQuery(env,
-    `pending_review_items?status=eq.open&kind=eq.${encodeURIComponent(kind)}&sim_id=eq.${simId}&select=id&limit=1`);
+    `pending_review_items?status=eq.open&created_at=gte.${encodeURIComponent(pendingReviewOpenCutoffIso())}&kind=eq.${encodeURIComponent(kind)}&sim_id=eq.${simId}&select=id&limit=1`);
   return rows[0] || null;
 }
 

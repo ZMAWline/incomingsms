@@ -2960,7 +2960,7 @@ async function handleRotationHealth(request, env, corsHeaders) {
     // Open-pending count (needs Prefer: count=exact, so a dedicated call)
     let pendingOpen = 0;
     try {
-      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items?status=eq.open&select=id&limit=1`, {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items?status=eq.open&created_at=gte.${enc(pendingReviewOpenCutoffIso())}&select=id&limit=1`, {
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
           Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -3043,11 +3043,13 @@ async function handlePendingItemsList(request, env, corsHeaders) {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
     };
+    const openCutoff = pendingReviewOpenCutoffIso();
     const filter = status === 'all' ? '' : '&status=eq.' + encodeURIComponent(status);
-    const res = await fetch(base + 'pending_review_items?select=*' + filter + '&order=created_at.desc&limit=' + limit, { headers });
+    const ageFilter = status === 'open' ? '&created_at=gte.' + encodeURIComponent(openCutoff) : '';
+    const res = await fetch(base + 'pending_review_items?select=*' + filter + ageFilter + '&order=created_at.desc&limit=' + limit, { headers });
     const rows = res.ok ? await res.json() : [];
-    // Also return count of open items for the sidebar badge
-    const countRes = await fetch(base + 'pending_review_items?status=eq.open&select=id&limit=1', {
+    // Also return count of non-expired open items for the sidebar badge.
+    const countRes = await fetch(base + 'pending_review_items?status=eq.open&created_at=gte.' + encodeURIComponent(openCutoff) + '&select=id&limit=1', {
       headers: { ...headers, Prefer: 'count=exact' }
     });
     const cr = countRes.headers.get('content-range') || '';
@@ -3927,8 +3929,12 @@ async function handleErrorLogs(env, corsHeaders, url) {
 }
 
 const BAD_RENTAL_OPEN_MAX_AGE_HOURS = 48;
+const PENDING_REVIEW_OPEN_MAX_AGE_HOURS = 48;
 function badRentalOpenCutoffIso(now = Date.now()) {
   return new Date(now - BAD_RENTAL_OPEN_MAX_AGE_HOURS * 60 * 60 * 1000).toISOString();
+}
+function pendingReviewOpenCutoffIso(now = Date.now()) {
+  return new Date(now - PENDING_REVIEW_OPEN_MAX_AGE_HOURS * 60 * 60 * 1000).toISOString();
 }
 function isOpenBadRentalStatusFilter(statusFilter) {
   const parts = String(statusFilter || '').split(',').map(s => s.trim()).filter(Boolean);
