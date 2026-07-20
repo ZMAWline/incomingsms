@@ -112,6 +112,44 @@
                 setTimeout(() => overlay.querySelector('#_dp-date').focus(), 0);
             });
         }
+        // Type-to-confirm for the highest-risk corrections (vendor / host).
+        // The user must type the NEW value — recognition of what they are
+        // actually changing, not a reflex click.
+        function showTypedConfirm(title, message, requiredText) {
+            return new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.className = 'fixed inset-0 bg-black/70 z-[100] flex items-center justify-center p-4';
+                overlay.innerHTML =
+                    '<div class="bg-dark-800 border border-dark-600 rounded-xl p-6 max-w-md w-full" role="dialog" aria-modal="true">' +
+                    '<h3 class="text-white font-semibold text-lg mb-2"></h3>' +
+                    '<p class="text-gray-300 text-sm mb-4 whitespace-pre-line"></p>' +
+                    '<label class="text-xs text-gray-500 block mb-1">Type <b class="font-mono text-gray-300"></b> to confirm</label>' +
+                    '<input id="_tc-input" type="text" autocomplete="off" spellcheck="false" class="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-200 mb-4 font-mono">' +
+                    '<div class="flex justify-end gap-2">' +
+                    '<button id="_tc-cancel" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">Cancel</button>' +
+                    '<button id="_tc-ok" disabled class="px-4 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded transition disabled:opacity-40 disabled:cursor-not-allowed">Apply correction</button>' +
+                    '</div></div>';
+                overlay.querySelector('h3').textContent = title;
+                overlay.querySelector('p').textContent = message;
+                overlay.querySelector('label b').textContent = requiredText;
+                const input = overlay.querySelector('#_tc-input');
+                input.placeholder = requiredText;
+                const ok = overlay.querySelector('#_tc-ok');
+                document.body.appendChild(overlay);
+                const cleanup = (v) => { document.body.removeChild(overlay); resolve(v); };
+                input.addEventListener('input', () => {
+                    ok.disabled = input.value.trim().toLowerCase() !== String(requiredText).toLowerCase();
+                });
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' && !ok.disabled) cleanup(true);
+                    if (e.key === 'Escape') cleanup(false);
+                });
+                ok.onclick = () => cleanup(true);
+                overlay.querySelector('#_tc-cancel').onclick = () => cleanup(false);
+                overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(false); });
+                setTimeout(() => input.focus(), 0);
+            });
+        }
         function handleConfirm(confirmed) {
             const modal = document.getElementById('confirm-modal');
             if (modal) {
@@ -192,6 +230,53 @@
         /* SIMs table density toggle: compact halves row padding */
         .sims-compact #sims-table td, .sims-compact thead th { padding-top: 0.3rem !important; padding-bottom: 0.3rem !important; }
         .sims-compact #sims-table td { font-size: 0.75rem; }
+        /* ====================================================================
+           SIMs v2 — Command Center home + bicameral provenance badges.
+           SP (service provider / vendor) = FILLED badge; Host = OUTLINED
+           dashed badge. Deliberately different visual languages so the two
+           axes can never be misread as one (SIM #639 lesson).
+           ==================================================================== */
+        .sims-view-hidden { display: none !important; }
+        .badge-sp { display:inline-block; font-size:10px; font-weight:650; letter-spacing:.03em; color:#fff; border-radius:6px !important; padding:2px 7px; white-space:nowrap; }
+        .badge-sp-atomic   { background:#9A3412; }
+        .badge-sp-wing_iot { background:#3730A3; }
+        .badge-sp-helix    { background:#0F766E; }
+        .badge-sp-teltik   { background:#6D28D9; }
+        .badge-sp-unknown  { background:#5B6472; }
+        .badge-host { display:inline-block; font-size:10px; font-weight:600; letter-spacing:.03em; color:var(--mc-soft); background:transparent; border:1px dashed var(--mc-mute); border-radius:6px !important; padding:1px 7px; white-space:nowrap; }
+        .sh-tile { text-align:left; background:var(--mc-paper); border:1px solid var(--mc-hair); border-radius:14px !important; padding:10px 14px; display:flex; flex-direction:column; gap:2px; transition:border-color .12s ease, background-color .12s ease; }
+        .sh-tile:hover { border-color:var(--mc-border); background:var(--mc-lifted); }
+        .sh-tile[aria-pressed="true"] { border-color:var(--ops-accent); }
+        .sh-tile-label { font-size:11px; font-weight:600; color:var(--mc-mute); text-transform:uppercase; letter-spacing:.05em; }
+        .sh-tile-value { font-size:20px; font-weight:650; letter-spacing:-.02em; color:var(--mc-ink); }
+        .sh-tile-hint { font-size:11px; color:var(--mc-mute); }
+        .sh-tile.warn { border-left:3px solid var(--ops-warning); }
+        .sh-tile.warn .sh-tile-value { color:var(--ops-warning); }
+        .sh-tile.bad { border-left:3px solid var(--ops-danger); }
+        .sh-tile.bad .sh-tile-value { color:var(--ops-danger); }
+        .sh-tile.ok .sh-tile-value { color:var(--ops-success); }
+        .sims-home-layout { display:grid; grid-template-columns:220px 1fr; gap:16px; align-items:start; }
+        @media (max-width: 900px) { .sims-home-layout { grid-template-columns:1fr; } }
+        .sh-queue-item { width:100%; display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:10px !important; color:var(--mc-soft); text-align:left; font-size:13px; }
+        .sh-queue-item:hover { background:rgba(20,20,19,.04); }
+        .sh-queue-item[aria-current="true"] { background:var(--ops-accent-soft); color:var(--mc-ink); font-weight:600; }
+        .sh-queue-count { margin-left:auto; font-size:11px; font-family:'JetBrains Mono',monospace; color:var(--mc-mute); background:var(--mc-canvas); border-radius:999px; padding:1px 8px; min-width:26px; text-align:center; }
+        .sh-queue-count.hot { color:var(--ops-danger); background:var(--ops-danger-bg); font-weight:600; }
+        .sh-queue-count.warm { color:var(--ops-warning); background:var(--ops-warning-bg); font-weight:600; }
+        .sh-row { background:var(--mc-paper); border:1px solid var(--mc-hair); border-radius:14px; margin-bottom:6px; display:flex; align-items:center; gap:10px; padding:8px 12px; }
+        .sh-row:hover { border-color:var(--mc-border); box-shadow:var(--mc-shadow-1); }
+        .sh-ident { display:flex; align-items:center; gap:8px; flex-shrink:0; flex-wrap:wrap; }
+        .sh-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
+        .sh-reason { flex:1; font-size:12px; color:var(--mc-soft); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:80px; }
+        .sh-reason.err { color:var(--ops-danger); }
+        .sh-reason.warn { color:var(--ops-warning); }
+        /* Drawer: provenance block + timeline chips */
+        .sd-prov { display:flex; gap:24px; margin-top:8px; width:100%; }
+        .sd-prov-slot { display:flex; flex-direction:column; gap:3px; }
+        .sd-prov-lbl { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; color:var(--mc-mute); }
+        .sd-prov-cap { font-size:11px; color:var(--mc-mute); margin-top:6px; width:100%; }
+        .sd-tl-chip { font-size:11px; padding:2px 10px; border-radius:999px !important; border:1px solid var(--mc-border); background:var(--mc-paper); color:var(--mc-soft); }
+        .sd-tl-chip[aria-pressed="true"] { background:var(--ops-accent); border-color:var(--ops-accent); color:#fff !important; }
         /* ====================================================================
            Mastercard-inspired design system — Canvas Cream / Ink Black
            Single source of theme tokens. All Tailwind dark-* classes are
@@ -1203,8 +1288,37 @@
 
             <!-- SIMs Tab -->
             <div id="tab-sims" class="tab-content hidden">
-                <div id="sim-action-bar" class="quiet-actions hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
+                <div class="flex items-center justify-between mb-4">
+                    <div class="flex items-center gap-1 p-1 bg-dark-800 border border-dark-600 rounded-full w-max" role="tablist" aria-label="SIMs view">
+                        <button id="sims-view-btn-overview" onclick="switchSimsView('overview')" role="tab" class="px-4 py-1.5 text-sm rounded-full transition">Overview</button>
+                        <button id="sims-view-btn-fleet" onclick="switchSimsView('fleet')" role="tab" class="px-4 py-1.5 text-sm rounded-full transition">Fleet</button>
+                    </div>
+                    <span id="sims-home-updated" class="text-xs text-gray-500"></span>
+                </div>
+                <!-- Command Center home: health strip + attention queues + worklist -->
+                <div id="sims-home" class="sims-view-hidden">
+                    <div id="sims-home-strip" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 mb-4" aria-label="Fleet health"></div>
+                    <div class="sims-home-layout">
+                        <nav aria-label="Attention queues">
+                            <div class="text-xs uppercase tracking-wide text-gray-500 px-2 pb-1">Attention</div>
+                            <ul id="sims-home-rail" class="flex flex-col gap-0.5"></ul>
+                        </nav>
+                        <section aria-label="Worklist">
+                            <div class="flex flex-wrap items-center gap-3 mb-3">
+                                <h2 id="sims-home-qtitle" class="text-lg font-semibold text-white">&mdash;</h2>
+                                <span id="sims-home-qsub" class="text-xs text-gray-500"></span>
+                                <span class="ml-auto"></span>
+                                <input id="sims-home-search" type="search" placeholder="Find SIM &mdash; ICCID, number, or #id" aria-label="Find a SIM by ICCID, number, or id" onkeydown="if(event.key==='Enter')simsHomeSearch(this.value)" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 w-64">
+                                <button onclick="loadSimsHome()" title="Refresh queues and counts" class="px-3 py-1.5 text-xs text-gray-400 hover:text-white bg-dark-700 border border-dark-500 rounded-lg transition">Refresh</button>
+                                <button onclick="openSimsQueueInFleet()" title="Open this queue in the Fleet grid for bulk actions and full columns" class="px-3 py-1.5 text-xs text-gray-300 bg-dark-700 border border-dark-500 rounded-lg transition">Open in Fleet &rarr;</button>
+                            </div>
+                            <ul id="sims-home-list"><li class="px-4 py-6 text-center text-sm text-gray-500">Loading&hellip;</li></ul>
+                        </section>
+                    </div>
+                </div>
+                <div id="sim-action-bar" data-sims-fleet class="quiet-actions hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
                     <span id="sim-selected-count" class="text-sm text-gray-300">0 selected</span>
+                    <span id="sim-selected-scope" class="text-xs text-gray-500"></span>
                     <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs rounded transition">Rotate MDN</button>
                     <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs rounded transition">Fix SIM</button>
                     <button onclick="bulkQuery()" class="px-3 py-1.5 text-xs rounded transition">Query</button>
@@ -1225,7 +1339,7 @@
                     </div>
                     <button onclick="bulkDeleteSims()" class="ml-auto px-3 py-1.5 text-xs bg-red-700 hover:bg-red-800 text-white rounded transition">Delete SIMs</button>
                 </div>
-                <div id="rotation-audit-widget" class="hidden mb-4 p-4 bg-dark-800 rounded-xl border border-dark-600 flex flex-wrap items-center gap-4">
+                <div id="rotation-audit-widget" data-sims-fleet class="hidden mb-4 p-4 bg-dark-800 rounded-xl border border-dark-600 flex flex-wrap items-center gap-4">
                     <div class="flex flex-col min-w-0">
                         <span class="text-sm font-semibold text-white">Rotation Audit (today)</span>
                         <span id="rotation-audit-runat" class="text-xs text-gray-500">Loading…</span>
@@ -1237,7 +1351,7 @@
                     </div>
                     <button onclick="reconcileNow()" class="ml-auto px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">Reconcile Now</button>
                 </div>
-                <div class="bg-dark-800 rounded-xl border border-dark-600">
+                <div data-sims-fleet class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
                         <div class="flex flex-wrap items-center justify-between gap-4">
                             <div class="flex items-center gap-3">
@@ -4348,7 +4462,7 @@ set verify_pending; schedule §C.3 poll
             if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
-            if (tabName === 'sims') { loadRotationAudit(); try { syncSimsUrl(); } catch(e){} }
+            if (tabName === 'sims') { loadRotationAudit(); try { initSimsView(); } catch(e){ console.error('initSimsView failed', e); } }
             if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); }
         }
 
@@ -4359,7 +4473,7 @@ set verify_pending; schedule §C.3 poll
             if (tab === 'sims') {
                 try {
                     const had = hydrateSimsFromUrl();
-                    if (had) loadSims(true);
+                    if (had) { switchSimsView('fleet'); loadSims(true); }
                 } catch(e){ console.error('popstate hydrate failed', e); }
             }
         });
@@ -5810,6 +5924,245 @@ set verify_pending; schedule §C.3 poll
             }
             return out;
         }
+
+        // ===== SIMs v2: Command Center home (Overview view) =====
+        // Queues are the existing server presets; counts come from page_size=1
+        // queries (exact totals via Prefer: count=exact). No new endpoints.
+        const SIMS_HOME_QUEUES = [
+            { key: 'any_error',          label: 'Errors',              tone: 'hot',  sort: 'last_rotation_at',    dir: 'desc' },
+            { key: 'stuck_provisioning', label: 'Stuck provisioning',  tone: 'warm', sort: 'activated_at',        dir: 'asc'  },
+            { key: 'not_rotated_today',  label: 'Not rotated today',   tone: 'warm', sort: 'last_mdn_rotated_at', dir: 'asc'  },
+            { key: 'not_notified',       label: 'Not notified',        tone: 'warm', sort: 'last_notified_at',    dir: 'asc'  },
+            { key: 'no_reseller',        label: 'No reseller',         tone: '',     sort: 'activated_at',        dir: 'asc'  },
+            { key: 'auto_paused',        label: 'Auto-rotate paused',  tone: '',     sort: 'id',                  dir: 'desc' },
+        ];
+        let simsHomeState = { queue: 'any_error', counts: {}, totals: {}, rows: [], seq: 0 };
+
+        const SP_LABELS = { atomic: 'Atomic', wing_iot: 'Wing IoT', helix: 'Helix', teltik: 'Teltik' };
+        function spBadgeHtml(vendor) {
+            const v = vendor || 'unknown';
+            const cls = SP_LABELS[v] ? v : 'unknown';
+            return '<span class="badge-sp badge-sp-' + cls + '" title="Service provider (who provides cell service &amp; bills) — NOT where the SIM is hosted">SP: ' + _sdEsc(SP_LABELS[v] || v) + '</span>';
+        }
+        function hostBadgeHtml(host) {
+            return '<span class="badge-host" title="Host (whose server the SIM physically sits on) — independent of the service provider">Host: ' + _sdEsc(host || 'skyline') + '</span>';
+        }
+        const SIM_STATUS_DOT = { active: 'var(--ops-success)', error: 'var(--ops-danger)', provisioning: 'var(--ops-warning)', suspended: 'var(--ops-warning)', canceled: '#98A2B3' };
+
+        function getSimsView() { try { return localStorage.getItem('simsView') || 'overview'; } catch (e) { return 'overview'; } }
+        function switchSimsView(view) {
+            try { localStorage.setItem('simsView', view); } catch (e) {}
+            const home = document.getElementById('sims-home');
+            if (home) home.classList.toggle('sims-view-hidden', view !== 'overview');
+            document.querySelectorAll('[data-sims-fleet]').forEach(function(el) {
+                el.classList.toggle('sims-view-hidden', view !== 'fleet');
+            });
+            const btns = { overview: document.getElementById('sims-view-btn-overview'), fleet: document.getElementById('sims-view-btn-fleet') };
+            for (const k in btns) {
+                if (!btns[k]) continue;
+                btns[k].className = 'px-4 py-1.5 text-sm rounded-full transition ' + (k === view ? 'bg-accent text-white' : 'text-gray-400 hover:text-white');
+                btns[k].setAttribute('aria-selected', k === view ? 'true' : 'false');
+            }
+            if (view === 'overview') loadSimsHome();
+        }
+        function initSimsView() {
+            // Deep-linked fleet filters (URL params) win over the saved view.
+            const hasUrlFilters = location.pathname === '/sims' && location.search.length > 1;
+            const view = hasUrlFilters ? 'fleet' : getSimsView();
+            switchSimsView(view);
+            if (view === 'fleet') { try { syncSimsUrl(); } catch (e) {} }
+        }
+
+        function loadSimsHome() {
+            if (!document.getElementById('sims-home')) return;
+            loadSimsHomeCounts();
+            loadSimsHomeQueue(simsHomeState.queue);
+        }
+        async function loadSimsHomeCounts() {
+            const jobs = [{ key: '__active', params: { status: 'active' } }]
+                .concat(SIMS_HOME_QUEUES.map(function(q) { return { key: q.key, params: { preset: q.key } }; }));
+            await Promise.all(jobs.map(async function(job) {
+                try {
+                    const p = new URLSearchParams(Object.assign({ page: '1', page_size: '1' }, job.params));
+                    const r = await fetch(API_BASE + '/sims/query?' + p.toString());
+                    const d = await r.json();
+                    if (r.ok && !d.error) simsHomeState.counts[job.key] = d.total || 0;
+                } catch (e) {}
+            }));
+            renderSimsHomeStrip();
+            renderSimsHomeRail();
+            const upd = document.getElementById('sims-home-updated');
+            if (upd) upd.textContent = 'Counts updated ' + new Date().toLocaleTimeString();
+        }
+        function _shCount(key) {
+            const c = simsHomeState.counts[key];
+            return (c === undefined) ? '&hellip;' : c.toLocaleString();
+        }
+        function renderSimsHomeStrip() {
+            const el = document.getElementById('sims-home-strip');
+            if (!el) return;
+            const c = simsHomeState.counts;
+            function tile(key, label, hint, tone) {
+                const onclick = key === '__active' ? "switchSimsView('fleet')" : "selectSimsHomeQueue('" + key + "')";
+                const pressed = key === simsHomeState.queue ? 'true' : 'false';
+                return '<button class="sh-tile ' + tone + '" onclick="' + onclick + '" aria-pressed="' + pressed + '">' +
+                    '<span class="sh-tile-label">' + label + '</span>' +
+                    '<span class="sh-tile-value">' + _shCount(key) + '</span>' +
+                    '<span class="sh-tile-hint">' + hint + '</span></button>';
+            }
+            el.innerHTML =
+                tile('__active', 'Active', 'browse in Fleet', 'ok') +
+                tile('any_error', 'Errors', 'error / timeout / mismatch', (c.any_error > 0 ? 'bad' : '')) +
+                tile('stuck_provisioning', 'Stuck provisioning', 'provisioning &gt; 1h', (c.stuck_provisioning > 0 ? 'warn' : '')) +
+                tile('not_notified', 'Not notified', 'AT&amp;T 24h · T-Mo 48h window', (c.not_notified > 0 ? 'warn' : '')) +
+                tile('not_rotated_today', 'Rotation backlog', 'not rotated today (UTC)', (c.not_rotated_today > 0 ? 'warn' : '')) +
+                tile('no_reseller', 'No reseller', 'unassigned lines', '');
+        }
+        function renderSimsHomeRail() {
+            const el = document.getElementById('sims-home-rail');
+            if (!el) return;
+            el.innerHTML = SIMS_HOME_QUEUES.map(function(q) {
+                const cnt = simsHomeState.counts[q.key];
+                const toneCls = (cnt > 0 && q.tone) ? ' ' + q.tone : '';
+                return '<li><button class="sh-queue-item" onclick="selectSimsHomeQueue(\'' + q.key + '\')" aria-current="' + (q.key === simsHomeState.queue ? 'true' : 'false') + '">' +
+                    '<span>' + q.label + '</span>' +
+                    '<span class="sh-queue-count' + toneCls + '">' + _shCount(q.key) + '</span>' +
+                    '</button></li>';
+            }).join('');
+        }
+        function selectSimsHomeQueue(key) {
+            simsHomeState.queue = key;
+            renderSimsHomeRail();
+            renderSimsHomeStrip();
+            loadSimsHomeQueue(key);
+        }
+        async function loadSimsHomeQueue(key) {
+            const q = SIMS_HOME_QUEUES.find(function(x) { return x.key === key; });
+            const list = document.getElementById('sims-home-list');
+            if (!q || !list) return;
+            const seq = ++simsHomeState.seq;
+            const titleEl = document.getElementById('sims-home-qtitle');
+            const subEl = document.getElementById('sims-home-qsub');
+            if (titleEl) titleEl.textContent = q.label;
+            if (subEl) subEl.textContent = 'loading…';
+            list.innerHTML = '<li class="px-4 py-6 text-center text-sm text-gray-500">Loading&hellip;</li>';
+            try {
+                const p = new URLSearchParams({ page: '1', page_size: '25', preset: key, sort: q.sort, dir: q.dir });
+                const r = await fetch(API_BASE + '/sims/query?' + p.toString());
+                const d = await r.json();
+                if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+                if (seq !== simsHomeState.seq) return;
+                const rows = d.rows || [];
+                simsHomeState.rows = rows;
+                simsHomeState.counts[key] = d.total || 0;
+                renderSimsHomeRail();
+                if (subEl) subEl.textContent = (d.total || 0).toLocaleString() + ' SIMs · showing ' + rows.length + ' most urgent';
+                if (!rows.length) {
+                    list.innerHTML = '<li class="px-4 py-8 text-center text-sm text-gray-500 bg-dark-800 border border-dashed border-dark-600 rounded-xl">Queue is empty — nothing needs attention here.</li>';
+                    return;
+                }
+                list.innerHTML = rows.map(function(s) { return renderSimsHomeRow(key, s); }).join('');
+            } catch (e) {
+                if (seq !== simsHomeState.seq) return;
+                list.innerHTML = '<li class="px-4 py-6 text-center text-sm text-red-400">Failed to load queue: ' + _sdEsc(e && e.message ? e.message : e) + '</li>';
+            }
+        }
+        function _shRel(iso) {
+            if (!iso) return null;
+            const ms = Date.now() - new Date(iso).getTime();
+            if (!isFinite(ms)) return null;
+            if (ms < 3600000) return Math.max(1, Math.round(ms / 60000)) + 'm ago';
+            if (ms < 48 * 3600000) return Math.round(ms / 3600000) + 'h ago';
+            return Math.round(ms / 86400000) + 'd ago';
+        }
+        // Reason string: WHY this SIM is in the queue, composed from row fields.
+        function simsHomeReason(key, s) {
+            if (key === 'any_error') {
+                const err = s.last_activation_error || s.last_rotation_error || s.status_reason || 'error status';
+                return { text: s.status + ': ' + String(err).slice(0, 140), cls: 'err' };
+            }
+            if (key === 'stuck_provisioning') {
+                const rel = _shRel(s.activated_at || s.created_at);
+                return { text: 'Provisioning for ' + (rel ? rel.replace(' ago', '') : '?') + (s.msisdn ? ' · MDN assigned' : ' · no MDN yet'), cls: 'warn' };
+            }
+            if (key === 'not_rotated_today') {
+                const rel = _shRel(s.last_mdn_rotated_at);
+                return { text: (rel ? 'Last rotated ' + rel : 'Never rotated') + ' · interval ' + (s.rotation_interval_hours || 24) + 'h', cls: 'warn' };
+            }
+            if (key === 'not_notified') {
+                const rel = _shRel(s.last_notified_at);
+                const win = s.vendor === 'teltik' ? 48 : 24;
+                return { text: (rel ? 'Last notified ' + rel : 'Never notified') + ' · window ' + win + 'h', cls: 'warn' };
+            }
+            if (key === 'no_reseller') {
+                const rel = _shRel(s.activated_at);
+                return { text: (s.status === 'active' ? 'Active' : s.status) + (rel ? ' since ' + rel.replace(' ago', '') : '') + ' · no reseller assigned', cls: '' };
+            }
+            if (key === 'auto_paused') {
+                return { text: 'Auto-rotation paused' + (s.status_reason ? ' · ' + s.status_reason : ''), cls: '' };
+            }
+            return { text: '', cls: '' };
+        }
+        // Recommended per-queue action, reusing the existing single-SIM handlers.
+        function simsHomeActionHtml(key, s) {
+            const btn = function(label, onclick, title) {
+                return '<button onclick="' + onclick + '" class="px-2.5 py-1 text-xs bg-dark-700 border border-dark-500 text-gray-300 rounded-lg transition"' + (title ? ' title="' + title + '"' : '') + '>' + label + '</button>';
+            };
+            if (key === 'any_error' && s.status === 'error' && s.vendor !== 'teltik' && !(s.vendor === 'helix' && !window.HELIX_ENABLED)) {
+                return btn('Retry', 'retryActivation(' + s.id + ')', 'Retry activation');
+            }
+            if (key === 'not_rotated_today' && s.status === 'active') {
+                return btn('Rotate', "simAction(" + s.id + ", 'rotate')", 'Force-rotate now (confirms first)');
+            }
+            if (key === 'not_notified' && s.phone_number && s.reseller_id && s.status === 'active') {
+                return btn('Send online', "sendSimOnline(" + s.id + ", '" + _sdEsc(s.phone_number) + "')", 'Send number.online webhook');
+            }
+            if (key === 'no_reseller') {
+                return btn('Assign', 'assignReseller(' + s.id + ')', 'Assign to a reseller');
+            }
+            if (key === 'auto_paused') {
+                return btn('Resume auto', 'setRotationEligible(' + s.id + ', true)', 'Re-enable automatic rotation');
+            }
+            return '';
+        }
+        function renderSimsHomeRow(key, s) {
+            const reason = simsHomeReason(key, s);
+            const dot = SIM_STATUS_DOT[s.status] || '#98A2B3';
+            const tail = s.iccid ? '&hellip;' + _sdEsc(String(s.iccid).slice(-6)) : '';
+            return '<li class="sh-row">' +
+                '<span class="sh-dot" style="background:' + dot + '" title="' + _sdEsc(s.status || '') + '"></span>' +
+                '<div class="sh-ident">' +
+                '<button onclick="openSimDetail(' + s.id + ', \'details\')" class="font-mono text-sm font-semibold text-gray-200 hover:underline" title="Open dossier">#' + s.id + '</button>' +
+                '<span class="font-mono text-xs text-gray-500" title="' + _sdEsc(s.iccid || '') + '">' + tail + '</span>' +
+                (s.phone_number ? '<span class="text-xs text-gray-400">' + _sdEsc(s.phone_number) + '</span>' : '') +
+                spBadgeHtml(s.vendor) + hostBadgeHtml(s.gateway_host) +
+                '</div>' +
+                '<span class="sh-reason ' + reason.cls + '" title="' + _sdEsc(reason.text) + '">' + _sdEsc(reason.text) + '</span>' +
+                '<div class="flex items-center gap-1.5 flex-shrink-0">' +
+                simsHomeActionHtml(key, s) +
+                '<button onclick="openSimDetail(' + s.id + ', \'details\')" class="px-2.5 py-1 text-xs bg-accent text-white rounded-lg transition" title="Open the full record with timeline and guarded edits">Open</button>' +
+                '</div></li>';
+        }
+        function openSimsQueueInFleet() {
+            const key = simsHomeState.queue;
+            switchSimsView('fleet');
+            if (!simsFilterState.presets.has(key)) toggleSimsPreset(key);
+            else loadSims(true);
+        }
+        function simsHomeSearch(v) {
+            v = (v || '').trim();
+            if (!v) return;
+            switchSimsView('fleet');
+            simsFilterState.presets = new Set();
+            simsFilterState.status = [];
+            simsFilterState.search = v.replace(/^#/, '');
+            const sa = document.getElementById('sims-search');
+            if (sa) sa.value = simsFilterState.search;
+            tableState.sims.page = 1;
+            renderSimsPresetChips();
+            loadSims(true);
+        }
+
 function renderSims() {
   renderSimsPresetChips();
   renderSimsActiveChips();
@@ -5854,7 +6207,7 @@ function renderSims() {
                     'canceled': 'bg-gray-500/20 text-gray-400',
                     'error': 'bg-red-500/20 text-red-400',
                 }[sim.status] || 'bg-gray-500/20 text-gray-400';
-                const vendorBadge = { teltik: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>', atomic: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-blue-500/20 text-blue-300">ATOMIC</span>', wing_iot: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-green-500/20 text-green-300">Wing IoT</span>', helix: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>' }[sim.vendor] || '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">-</span>';
+                const vendorBadge = spBadgeHtml(sim.vendor);
                 return `
                 <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
                     <td class="px-4 py-3"><input type="checkbox" class="sim-cb accent-green-500" value="${sim.id}" aria-label="Select SIM ${sim.id}" onclick="handleSimCbClick(event, this)" onchange="updateSimActionBar()"></td>
@@ -5865,7 +6218,7 @@ function renderSims() {
                     <td class="px-4 py-3">
                         <span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${sim.status}</span>
                     </td>
-                    <td class="px-4 py-3">${vendorBadge}<span class="block text-[10px] text-gray-500 mt-0.5" title="Hosting gateway (where the SIM physically sits)">@ ${sim.gateway_host || 'skyline'}</span></td>
+                    <td class="px-4 py-3">${vendorBadge}<span class="block mt-1">${hostBadgeHtml(sim.gateway_host)}</span></td>
                     <td class="px-4 py-3 text-gray-400">${sim.reseller_name || '-'}</td>
                     <td class="px-4 py-3 text-gray-300">${sim.sms_count || 0}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">${lastSms}</td>
@@ -9937,6 +10290,10 @@ async function sendSimOnline(simId, phoneNumber) {
             const checked = document.querySelectorAll('.sim-cb:checked');
             const bar = document.getElementById('sim-action-bar');
             document.getElementById('sim-selected-count').textContent = checked.length + ' selected';
+            const scope = document.getElementById('sim-selected-scope');
+            if (scope) scope.textContent = checked.length > 0
+                ? 'Applies only to the ' + checked.length + ' checked SIM' + (checked.length === 1 ? '' : 's') + ' on this page — never the whole filter or fleet.'
+                : '';
             bar.classList.toggle('hidden', checked.length === 0);
         }
 
@@ -9961,6 +10318,7 @@ async function sendSimOnline(simId, phoneNumber) {
             } else {
                 confirmMsg = `Run ${action} on ${simIds.length} SIM(s)?`;
             }
+            confirmMsg += '\n\nScope: ' + describeSims(simIds);
             if (!(await showConfirm('Run Action', confirmMsg))) return;
 
             const extraBody = action === 'rotate' ? { force: true } : {};
@@ -12380,9 +12738,12 @@ async function sendSimOnline(simId, phoneNumber) {
 
         function openSimDetail(simId, tab) {
             tab = tab || 'details';
-            const sim = tableState.sims && tableState.sims.data && tableState.sims.data.find(function(s) { return String(s.id) === String(simId); });
+            const sim = (tableState.sims && tableState.sims.data && tableState.sims.data.find(function(s) { return String(s.id) === String(simId); }))
+                || (typeof simsHomeState !== 'undefined' && simsHomeState.rows && simsHomeState.rows.find(function(s) { return String(s.id) === String(simId); }));
             if (!sim) { showToast('SIM #' + simId + ' not in current view — refresh the SIMs list first', 'error'); return; }
             _sdCurrentSim = sim;
+            _sdHistoryEvents = [];
+            _sdHistoryFilter = 'all';
             document.getElementById('sd-title').textContent = 'SIM #' + sim.id;
             document.getElementById('sd-subtitle').textContent = sim.iccid || '';
             renderSimDetailBadges(sim);
@@ -12445,8 +12806,12 @@ async function sendSimOnline(simId, phoneNumber) {
             var vendorClass = ({teltik:'bg-purple-500/20 text-purple-300', atomic:'bg-blue-500/20 text-blue-300', wing_iot:'bg-green-500/20 text-green-300', helix:'bg-gray-500/20 text-gray-400'})[sim.vendor] || 'bg-gray-500/20 text-gray-400';
             el.innerHTML =
                 '<span class="px-2 py-0.5 text-xs font-medium rounded-full ' + statusClass + '">' + _sdEsc(sim.status || '?') + '</span>' +
-                '<span class="px-2 py-0.5 text-xs font-medium rounded ' + vendorClass + '" title="Service provider (who bills / provisions this SIM)">SP: ' + _sdEsc(sim.vendor || 'unknown') + '</span>' +
-                '<span class="px-2 py-0.5 text-xs font-medium rounded bg-slate-500/20 text-slate-300" title="Hosting gateway (where the SIM physically sits)">Host: ' + _sdEsc(sim.gateway_host || 'skyline') + '</span>';
+                (sim.status_reason ? '<span class="text-xs text-gray-500">' + _sdEsc(sim.status_reason) + '</span>' : '') +
+                '<div class="sd-prov">' +
+                '<div class="sd-prov-slot"><span class="sd-prov-lbl">Service provider</span><span>' + spBadgeHtml(sim.vendor) + '</span></div>' +
+                '<div class="sd-prov-slot"><span class="sd-prov-lbl">Host</span><span>' + hostBadgeHtml(sim.gateway_host) + '</span></div>' +
+                '</div>' +
+                '<p class="sd-prov-cap">SP = who provides service &middot; Host = whose server it sits on. Independent axes &mdash; never conflate.</p>';
         }
 
         // ===== Drawer: History tab (merged timeline from /api/sim-history) =====
@@ -12457,31 +12822,51 @@ async function sendSimOnline(simId, phoneNumber) {
                 var resp = await fetch(API_BASE + '/sim-history?sim_id=' + simId);
                 var data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
-                var events = Array.isArray(data.events) ? data.events : [];
-                if (!events.length) {
-                    c.innerHTML = '<p class="text-gray-500 text-sm">No history recorded for this SIM.</p>';
-                    return;
-                }
-                var TYPE_STYLE = {
-                    status:  ['Status',  'bg-yellow-500/20 text-yellow-400'],
-                    edit:    ['Edit',    'bg-blue-500/20 text-blue-300'],
-                    error:   ['Error',   'bg-red-500/20 text-red-400'],
-                    webhook: ['Webhook', 'bg-indigo-500/20 text-indigo-300'],
-                };
-                c.innerHTML = events.map(function(ev) {
-                    var st = TYPE_STYLE[ev.type] || [ev.type, 'bg-gray-500/20 text-gray-400'];
-                    var when = ev.at ? new Date(ev.at).toLocaleString() : '?';
-                    var by = ev.by ? ' <span class="text-gray-500">by ' + _sdEsc(ev.by) + '</span>' : '';
-                    return '<div class="flex items-start gap-3 py-2 border-b border-dark-700">' +
-                        '<span class="px-1.5 py-0.5 text-[10px] font-medium rounded uppercase shrink-0 mt-0.5 ' + st[1] + '">' + _sdEsc(st[0]) + '</span>' +
-                        '<div class="min-w-0 flex-1">' +
-                        '<p class="text-sm text-gray-200 break-words">' + _sdEsc(ev.detail || '') + by + '</p>' +
-                        '<p class="text-xs text-gray-500 mt-0.5">' + _sdEsc(when) + '</p>' +
-                        '</div></div>';
-                }).join('');
+                if (!_sdCurrentSim || String(_sdCurrentSim.id) !== String(simId)) return;
+                _sdHistoryEvents = Array.isArray(data.events) ? data.events : [];
+                _sdRenderHistory();
             } catch (e) {
                 c.innerHTML = '<p class="text-red-400 text-sm">Failed to load history: ' + _sdEsc(e && e.message ? e.message : e) + '</p>';
             }
+        }
+        function _sdSetHistoryFilter(f) {
+            _sdHistoryFilter = f;
+            _sdRenderHistory();
+        }
+        function _sdRenderHistory() {
+            var c = document.getElementById('sd-history-container');
+            var chipsEl = document.getElementById('sd-history-chips');
+            if (!c) return;
+            var events = _sdHistoryEvents;
+            var KINDS = [['all', 'All'], ['status', 'Status'], ['edit', 'Edits'], ['error', 'Errors'], ['webhook', 'Webhooks']];
+            if (chipsEl) {
+                chipsEl.innerHTML = KINDS.map(function(k) {
+                    var n = k[0] === 'all' ? events.length : events.filter(function(e) { return e.type === k[0]; }).length;
+                    return '<button class="sd-tl-chip" onclick="_sdSetHistoryFilter(\'' + k[0] + '\')" aria-pressed="' + (_sdHistoryFilter === k[0] ? 'true' : 'false') + '">' + k[1] + ' (' + n + ')</button>';
+                }).join('');
+            }
+            var shown = _sdHistoryFilter === 'all' ? events : events.filter(function(e) { return e.type === _sdHistoryFilter; });
+            if (!shown.length) {
+                c.innerHTML = '<p class="text-gray-500 text-sm">' + (events.length ? 'No ' + _sdHistoryFilter + ' events for this SIM.' : 'No history recorded for this SIM.') + '</p>';
+                return;
+            }
+            var TYPE_STYLE = {
+                status:  ['Status',  'bg-yellow-500/20 text-yellow-400'],
+                edit:    ['Edit',    'bg-blue-500/20 text-blue-300'],
+                error:   ['Error',   'bg-red-500/20 text-red-400'],
+                webhook: ['Webhook', 'bg-indigo-500/20 text-indigo-300'],
+            };
+            c.innerHTML = shown.map(function(ev) {
+                var st = TYPE_STYLE[ev.type] || [ev.type, 'bg-gray-500/20 text-gray-400'];
+                var when = ev.at ? new Date(ev.at).toLocaleString() : '?';
+                var by = ev.by ? ' <span class="text-gray-500">by ' + _sdEsc(ev.by) + '</span>' : '';
+                return '<div class="flex items-start gap-3 py-2 border-b border-dark-700">' +
+                    '<span class="px-1.5 py-0.5 text-[10px] font-medium rounded uppercase shrink-0 mt-0.5 ' + st[1] + '">' + _sdEsc(st[0]) + '</span>' +
+                    '<div class="min-w-0 flex-1">' +
+                    '<p class="text-sm text-gray-200 break-words">' + _sdEsc(ev.detail || '') + by + '</p>' +
+                    '<p class="text-xs text-gray-500 mt-0.5">' + _sdEsc(when) + '</p>' +
+                    '</div></div>';
+            }).join('');
         }
 
         // ===== Drawer: Edit tab (guarded field correction via /api/update-sim) =====
@@ -12547,11 +12932,23 @@ async function sendSimOnline(simId, phoneNumber) {
                 labels.push(f.key + ': ' + (oldVal == null ? '(empty)' : oldVal) + ' → ' + (newVal == null ? '(empty)' : newVal));
             }
             if (!labels.length) { showToast('No changes to save', 'info'); return; }
-            // Vendor changes get an explicit confirm naming both values (SIM #639 lesson).
+            // Vendor / host changes get a type-to-confirm naming both values
+            // and disambiguating SP vs hosting (SIM #639 lesson).
             if (changes.vendor) {
-                var ok = await showConfirm('Change service provider',
-                    'Change vendor of SIM #' + _sdCurrentSim.id + ' from "' + (changes.vendor.old || 'unknown') + '" to "' + changes.vendor.new + '"? This affects rotation, billing, and notification logic.');
+                var ok = await showTypedConfirm('Change service provider — SIM #' + _sdCurrentSim.id,
+                    'vendor: "' + (changes.vendor.old || 'unknown') + '" → "' + changes.vendor.new + '"\n\n' +
+                    'This changes WHO PROVIDES SERVICE (rotation, billing, and notification logic) — not where the SIM is hosted. ' +
+                    'If you only meant hosting, edit "Hosting gateway" instead. This exact mix-up caused the SIM #639 incident.',
+                    changes.vendor.new);
                 if (!ok) return;
+            }
+            if (changes.gateway_host) {
+                var okHost = await showTypedConfirm('Change hosting gateway — SIM #' + _sdCurrentSim.id,
+                    'gateway_host: "' + (changes.gateway_host.old || 'skyline') + '" → "' + changes.gateway_host.new + '"\n\n' +
+                    'This changes WHOSE SERVER the SIM sits on — the service provider (vendor/carrier) stays unchanged. ' +
+                    'If you meant the service provider, edit "Service provider (vendor)" instead.',
+                    changes.gateway_host.new);
+                if (!okHost) return;
             }
             var btn = document.getElementById('sd-edit-save');
             if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
@@ -12626,6 +13023,11 @@ async function sendSimOnline(simId, phoneNumber) {
                 (canSwap ? '<button onclick="_sdSwap()" class="px-3 py-1.5 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Swap SIM</button>' : '') +
                 '<button onclick="_sdViewLogs()" class="px-3 py-1.5 text-xs bg-dark-600 hover:bg-dark-500 text-gray-300 rounded-lg transition">View Logs</button>' +
                 '</div>';
+            var recentHtml = '<div class="mt-4 pt-3 border-t border-dark-600">' +
+                '<div class="flex items-center justify-between mb-2">' +
+                '<p class="text-xs uppercase tracking-wide text-gray-500">Recent history</p>' +
+                '<button onclick="switchSimDetailTab(\'history\')" class="text-xs text-accent hover:underline">Full timeline &rarr;</button>' +
+                '</div><div id="sd-recent-history" class="text-sm text-gray-500">Loading&hellip;</div></div>';
             document.getElementById('sdtab-details').innerHTML =
                 '<div class="grid grid-cols-2 gap-x-6 gap-y-3 mb-4">' +
                 _sdField('ICCID', '<span class="font-mono">' + (sim.iccid || '-') + '</span>') +
@@ -12643,7 +13045,38 @@ async function sendSimOnline(simId, phoneNumber) {
                 _sdField('Last Notified', sim.last_notified_at ? new Date(sim.last_notified_at).toLocaleString() : '') +
                 _sdField('Last SMS', sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '') +
                 '</div>' +
-                errHtml + actions;
+                errHtml + actions + recentHtml;
+            _sdLoadRecentHistory(sim.id);
+        }
+
+        // Last 5 timeline events inline on the Details tab, so the evidence
+        // sits beside the action buttons (Investigator principle).
+        var _sdHistoryEvents = [];
+        var _sdHistoryFilter = 'all';
+        async function _sdLoadRecentHistory(simId) {
+            var el = document.getElementById('sd-recent-history');
+            if (!el) return;
+            try {
+                var resp = await fetch(API_BASE + '/sim-history?sim_id=' + simId);
+                var data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+                if (!_sdCurrentSim || String(_sdCurrentSim.id) !== String(simId)) return;
+                _sdHistoryEvents = Array.isArray(data.events) ? data.events : [];
+                el = document.getElementById('sd-recent-history');
+                if (!el) return;
+                var events = _sdHistoryEvents.slice(0, 5);
+                if (!events.length) { el.innerHTML = '<p class="text-xs text-gray-500">No history recorded for this SIM.</p>'; return; }
+                el.innerHTML = events.map(function(ev) {
+                    var when = ev.at ? new Date(ev.at).toLocaleString() : '?';
+                    var border = ({ error: 'var(--ops-danger)', edit: 'var(--ops-warning)', status: 'var(--mc-border)', webhook: 'var(--mc-border)' })[ev.type] || 'var(--mc-border)';
+                    return '<div class="flex items-baseline gap-3 py-1 text-xs" style="border-left:2px solid ' + border + ';padding-left:10px">' +
+                        '<span class="font-mono text-gray-500 shrink-0 w-36">' + _sdEsc(when) + '</span>' +
+                        '<span class="text-gray-300 break-words">' + _sdEsc(ev.detail || ev.type || '') + (ev.by ? ' <span class="text-gray-500">by ' + _sdEsc(ev.by) + '</span>' : '') + '</span>' +
+                        '</div>';
+                }).join('');
+            } catch (e) {
+                if (el) el.innerHTML = '<p class="text-xs text-gray-500">History unavailable</p>';
+            }
         }
 
         function renderSimDetailStatus(sim) {
@@ -13648,7 +14081,7 @@ async function sendSimOnline(simId, phoneNumber) {
     <!-- SIM record drawer (right side panel) -->
     <div id="sim-detail-modal" class="hidden fixed inset-0 z-50">
         <div class="absolute inset-0 bg-black/50" onclick="closeSimDetail()"></div>
-        <div class="absolute right-0 top-0 h-full w-full max-w-2xl bg-dark-800 border-l border-dark-600 shadow-2xl flex flex-col" role="dialog" aria-modal="true" aria-labelledby="sd-title">
+        <div class="absolute right-0 top-0 h-full w-full max-w-3xl bg-dark-800 border-l border-dark-600 shadow-2xl flex flex-col" role="dialog" aria-modal="true" aria-labelledby="sd-title">
             <div class="px-5 py-4 border-b border-dark-600 flex justify-between items-start">
                 <div>
                     <h3 id="sd-title" class="text-lg font-semibold text-white">SIM Detail</h3>
@@ -13680,9 +14113,10 @@ async function sendSimOnline(simId, phoneNumber) {
                 <div id="sdtab-billing" class="hidden"></div>
                 <div id="sdtab-history" class="hidden">
                     <div class="flex justify-between items-center mb-3">
-                        <p class="text-sm text-gray-400">Status changes, manual edits, errors, and webhook notifies</p>
+                        <p class="text-sm text-gray-400">Unified timeline &mdash; status changes, manual edits, errors, and webhook notifies</p>
                         <button onclick="if(_sdCurrentSim)loadSimDetailHistory(_sdCurrentSim.id)" class="px-2 py-1 text-xs bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">&#8635; Refresh</button>
                     </div>
+                    <div id="sd-history-chips" class="flex flex-wrap gap-1.5 mb-3" role="group" aria-label="Filter timeline"></div>
                     <div id="sd-history-container"></div>
                 </div>
                 <div id="sdtab-edit" class="hidden"></div>
