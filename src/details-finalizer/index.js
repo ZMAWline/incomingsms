@@ -1203,14 +1203,44 @@ function nyMidnightUtcIso(d = new Date()) {
 }
 
 async function rotationReviewQuery(env, fragment) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${fragment}`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text().catch(() => '')}`);
-  return res.json();
+  const limitMatch = fragment.match(/[?&]limit=(\d+)/);
+  const limitVal = limitMatch ? parseInt(limitMatch[1], 10) : Infinity;
+
+  // Small intentional limits (≤1000) — simple fetch, no pagination needed
+  if (limitVal <= 1000) {
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${fragment}`, {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    });
+    if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text().catch(() => '')}`);
+    return res.json();
+  }
+
+  // Large limits: paginate via Range headers to bypass PostgREST's 1000-row cap
+  const base = fragment.replace(/&limit=\d+/, '');
+  const pageSize = 1000;
+  const all = [];
+  let offset = 0;
+  while (true) {
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${base}`, {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        Range: `${offset}-${offset + pageSize - 1}`,
+        'Range-Unit': 'items',
+      },
+    });
+    if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text().catch(() => '')}`);
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) break;
+    all.push(...data);
+    if (data.length < pageSize) break;
+    offset += pageSize;
+    if (offset > 100000) break; // safety stop
+  }
+  return all;
 }
 
 // Lock acquire: INSERT into cron_runs with status='running'. The partial
