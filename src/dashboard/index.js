@@ -489,6 +489,10 @@ export default {
       return handleTeltikQuery(request, env, corsHeaders);
     }
 
+    if (url.pathname === '/api/teltik-port-status' && request.method === 'POST') {
+      return handleTeltikPortStatusQuery(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/rotation-audit' && request.method === 'GET') {
       return handleRotationAudit(request, env, corsHeaders);
     }
@@ -952,6 +956,7 @@ async function handleSims(env, corsHeaders, url) {
         last_activation_error: sim.last_activation_error || null,
         last_notified_at: sim.last_notified_at || null,
         vendor: sim.vendor || 'unknown',
+        gateway_host: sim.gateway_host || null,
         carrier: sim.carrier || null,
         rotation_interval_hours: sim.rotation_interval_hours || 24,
         rotation_eligible: sim.rotation_eligible !== false,
@@ -2314,6 +2319,84 @@ async function handleTeltikQuery(request, env, corsHeaders) {
     });
   } catch (e) {
     return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+
+async function handleTeltikPortStatusQuery(request, env, corsHeaders) {
+  if (request.method !== 'POST') {
+    return new Response('Method not allowed', { status: 405, headers: corsHeaders });
+  }
+  try {
+    const body = await request.json().catch(() => ({}));
+    const apiKey = env.TELTIK_API_KEY;
+    if (!apiKey) {
+      return new Response(JSON.stringify({ ok: false, error: 'TELTIK_API_KEY not configured' }), {
+        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    let mdn = body.mdn || body.msisdn || body.phone_number || null;
+    let iccid = body.iccid || null;
+    let simId = body.sim_id || null;
+    if (!mdn && (simId || iccid)) {
+      const filter = simId
+        ? 'id=eq.' + encodeURIComponent(String(simId))
+        : 'iccid=eq.' + encodeURIComponent(String(iccid));
+      const rows = await sbGet(env, 'sims?select=id,iccid,sim_numbers(e164)&sim_numbers.valid_to=is.null&' + filter + '&limit=1').catch(() => null);
+      const sim = Array.isArray(rows) && rows[0] ? rows[0] : null;
+      if (sim) {
+        simId = sim.id;
+        iccid = iccid || sim.iccid;
+        mdn = sim.sim_numbers && sim.sim_numbers[0] && sim.sim_numbers[0].e164;
+      }
+    }
+
+    const mdnDigits = toTeltik10Digit(mdn);
+    if (!mdnDigits || mdnDigits.length !== 10) {
+      return new Response(JSON.stringify({ ok: false, error: 'valid 10-digit current MDN required for Teltik port-status', mdn: mdn || null, iccid, sim_id: simId }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
+    const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
+    const psHeaders = {};
+    if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
+    const psRes = await fetch(psFetchUrl, { method: 'GET', headers: psHeaders });
+    const psText = await psRes.text();
+    let psJson = null; try { psJson = JSON.parse(psText); } catch {}
+
+    await logCarrierApiCall(env, {
+      run_id: 'teltik_host_port_status_' + (iccid || simId || mdnDigits) + '_' + Date.now(),
+      step: 'port_status',
+      iccid,
+      imei: null,
+      vendor: 'teltik',
+      request_url: 'https://api.smsgateway.xyz/v1/port-status?mdn=' + encodeURIComponent(mdnDigits),
+      request_method: 'GET',
+      request_body: null,
+      response_status: psRes.status,
+      response_ok: psRes.ok,
+      response_body_text: psText,
+      response_body_json: psJson,
+      error: psRes.ok ? null : 'Teltik port-status HTTP ' + psRes.status,
+    });
+
+    return new Response(JSON.stringify({
+      ok: psRes.ok,
+      http_status: psRes.status,
+      mdn: mdnDigits,
+      iccid,
+      sim_id: simId,
+      response: psJson || psText,
+    }, null, 2), {
+      status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), {
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }

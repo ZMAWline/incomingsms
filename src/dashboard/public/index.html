@@ -9269,14 +9269,8 @@ async function sendSimOnline(simId, phoneNumber) {
             const selected = [...document.querySelectorAll('.sim-cb:checked')];
             if (selected.length === 0) { showToast('Select at least one SIM', 'error'); return; }
 
-            // Single SIM: open the interactive query modal pre-filled
-            if (selected.length === 1) {
-                const simId = parseInt(selected[0].value);
-                const sim = tableState.sims?.data?.find(s => s.id === simId);
-                if (!sim) { showToast('SIM not found', 'error'); return; }
-                querySimCarrier(simId, sim.vendor || 'unknown', sim.mobility_subscription_id || '', sim.iccid || '');
-                return;
-            }
+            // Query selected SIM(s) directly. This picks the carrier API from sims.vendor
+            // and, for Teltik-hosted non-Teltik SIMs, also checks Teltik port-status.
 
             // Multiple SIMs: query each sequentially and show results in sim-action-modal
             const sims = selected.map(cb => tableState.sims?.data?.find(s => s.id === parseInt(cb.value))).filter(Boolean);
@@ -9299,6 +9293,31 @@ async function sendSimOnline(simId, phoneNumber) {
                 ? { mobility_subscription_id: s.mobility_subscription_id || s.iccid || '' }
                 : v === 'atomic' ? { identifier: s.iccid || '' }
                 : { iccid: s.iccid || '' };
+            const _isTeltikHosted = (s) => String(s.gateway_host || '').toLowerCase() === 'teltik';
+            const _formatPortStatusTag = (ps) => {
+                if (!ps) return '';
+                if (!ps.ok) return ' [Teltik port=lookup_failed:' + (ps.error || ('HTTP ' + (ps.http_status || '?'))) + ']';
+                const body = (ps.response && typeof ps.response === 'object') ? ps.response : {};
+                const raw = body.online ?? body.is_online ?? body.registered ?? body.status;
+                const str = typeof raw === 'boolean' ? (raw ? 'online' : 'offline') : (raw == null ? 'unknown' : String(raw));
+                return ' [Teltik port=' + str + ']';
+            };
+            const _teltikHostPortTag = async (s, mdn) => {
+                if (!_isTeltikHosted(s) || String(s.vendor || '').toLowerCase() === 'teltik') return '';
+                const currentMdn = mdn || s.phone_number || '';
+                if (!currentMdn) return ' [Teltik port=not checked:no MDN]';
+                try {
+                    const res = await fetch(API_BASE + '/teltik-port-status', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sim_id: s.id, iccid: s.iccid || '', mdn: currentMdn })
+                    });
+                    const ps = await res.json();
+                    return _formatPortStatusTag(ps);
+                } catch (e) {
+                    return ' [Teltik port=exception:' + (e && e.message ? e.message : e) + ']';
+                }
+            };
 
             for (let _i = 0; _i < sims.length; _i++) {
                 const sim = sims[_i];
@@ -9330,6 +9349,7 @@ async function sendSimOnline(simId, phoneNumber) {
                                     : (wPlan || 'wrong plan');
                                 wNote += ' [rotation_status→failed: stuck on ' + planTag + ']';
                             }
+                            wNote += await _teltikHostPortTag(sim, (r.response && (r.response.mdn || r.response.msisdn)) || sim.phone_number);
                             lines.push(label + ' [wing_iot]: ' + wStatus + wNote);
                         } else {
                             failCount++;
@@ -9370,7 +9390,9 @@ async function sendSimOnline(simId, phoneNumber) {
                             const wr = r.response && r.response.wholeSaleApi && r.response.wholeSaleApi.wholeSaleResponse;
                             const attStatus = (wr && wr.Result && wr.Result.attStatus) ? wr.Result.attStatus : (wr && wr.statusCode ? wr.statusCode : 'OK');
                             okCount++;
-                            const aNote = r.db_update && r.db_update.found ? (r.db_update.status_updated ? ' [status→active]' : '') + (r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '') : '';
+                            let aNote = r.db_update && r.db_update.found ? (r.db_update.status_updated ? ' [status→active]' : '') + (r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '') : '';
+                            const atomicMdn = wr && wr.Result && (wr.Result.MSISDN || wr.Result.msisdn);
+                            aNote += await _teltikHostPortTag(sim, atomicMdn || sim.phone_number);
                             lines.push(label + ' [atomic]: ' + attStatus + aNote);
                         } else {
                             failCount++;
@@ -9388,8 +9410,10 @@ async function sendSimOnline(simId, phoneNumber) {
                         if (r.ok) {
                             const data = Array.isArray(r.helix_response) ? r.helix_response[0] : r.helix_response;
                             const hStatus = (data && data.status) ? data.status : 'OK';
+                            const helixMdn = data && (data.phoneNumber || data.subscriberNumber || data.MDN);
+                            const hNote = await _teltikHostPortTag(sim, helixMdn || sim.phone_number);
                             okCount++;
-                            lines.push(label + ' [helix]: ' + hStatus);
+                            lines.push(label + ' [helix]: ' + hStatus + hNote);
                         } else {
                             failCount++;
                             lines.push(label + ' [helix]: ERROR — ' + (r.error || 'unknown'));
