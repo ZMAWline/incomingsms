@@ -489,10 +489,6 @@ export default {
       return handleTeltikQuery(request, env, corsHeaders);
     }
 
-    if (url.pathname === '/api/teltik-port-status' && request.method === 'POST') {
-      return handleTeltikPortStatusQuery(request, env, corsHeaders);
-    }
-
     if (url.pathname === '/api/rotation-audit' && request.method === 'GET') {
       return handleRotationAudit(request, env, corsHeaders);
     }
@@ -956,7 +952,6 @@ async function handleSims(env, corsHeaders, url) {
         last_activation_error: sim.last_activation_error || null,
         last_notified_at: sim.last_notified_at || null,
         vendor: sim.vendor || 'unknown',
-        gateway_host: sim.gateway_host || null,
         carrier: sim.carrier || null,
         rotation_interval_hours: sim.rotation_interval_hours || 24,
         rotation_eligible: sim.rotation_eligible !== false,
@@ -2273,7 +2268,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
       // Teltik /v1/port-status uses the same MDN format as /reset-port: 10 digits, US.
       const mdnDigits = toTeltik10Digit(resolvedMdn);
       try {
-        const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey);
+        const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
         const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
         const psHeaders = {};
         if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
@@ -2286,7 +2281,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
           iccid,
           imei: null,
           vendor: 'teltik',
-          request_url: 'https://api.smsgateway.xyz/v1/port-status',
+          request_url: 'https://api.smsgateway.xyz/v1/port-status?mdn=' + encodeURIComponent(mdnDigits),
           request_method: 'GET',
           request_body: null,
           response_status: psRes.status,
@@ -2319,127 +2314,6 @@ async function handleTeltikQuery(request, env, corsHeaders) {
     });
   } catch (e) {
     return new Response(JSON.stringify({ error: String(e) }), {
-      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-
-
-async function findLatestTeltikSmsMdn(env, { simId, iccid }) {
-  let q = null;
-  if (simId) {
-    q = 'inbound_sms?select=to_number,received_at,raw&sim_id=eq.' + encodeURIComponent(String(simId))
-      + '&to_number=not.is.null&order=received_at.desc&limit=1';
-  } else if (iccid) {
-    // Fallback for rows where sim_id was not available: raw nickname/alias carried the ICCID.
-    // PostgREST JSON operators are awkward via REST query, so keep this as a narrow raw-text ilike.
-    q = 'inbound_sms?select=to_number,received_at,raw&raw=ilike.' + encodeURIComponent('*' + String(iccid) + '*')
-      + '&to_number=not.is.null&order=received_at.desc&limit=1';
-  }
-  if (!q) return null;
-  const rows = await sbGet(env, q).catch(() => null);
-  const row = Array.isArray(rows) && rows[0] ? rows[0] : null;
-  if (!row || !row.to_number) return null;
-  return { mdn: row.to_number, received_at: row.received_at || null };
-}
-
-async function handleTeltikPortStatusQuery(request, env, corsHeaders) {
-  if (request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405, headers: corsHeaders });
-  }
-  try {
-    const body = await request.json().catch(() => ({}));
-    const apiKey = env.TELTIK_API_KEY;
-    if (!apiKey) {
-      return new Response(JSON.stringify({ ok: false, error: 'TELTIK_API_KEY not configured' }), {
-        status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    let mdn = body.mdn || body.msisdn || body.phone_number || null;
-    let iccid = body.iccid || null;
-    let simId = body.sim_id || null;
-    if (!mdn && (simId || iccid)) {
-      const filter = simId
-        ? 'id=eq.' + encodeURIComponent(String(simId))
-        : 'iccid=eq.' + encodeURIComponent(String(iccid));
-      const rows = await sbGet(env, 'sims?select=id,iccid,sim_numbers(e164)&sim_numbers.valid_to=is.null&' + filter + '&limit=1').catch(() => null);
-      const sim = Array.isArray(rows) && rows[0] ? rows[0] : null;
-      if (sim) {
-        simId = sim.id;
-        iccid = iccid || sim.iccid;
-        mdn = sim.sim_numbers && sim.sim_numbers[0] && sim.sim_numbers[0].e164;
-      }
-    }
-
-    const dbCurrentMdn = mdn || null;
-    const latestTeltikSms = await findLatestTeltikSmsMdn(env, { simId, iccid });
-    if (latestTeltikSms && latestTeltikSms.mdn) mdn = latestTeltikSms.mdn;
-    const mdnSource = latestTeltikSms && latestTeltikSms.mdn ? 'last_teltik_inbound_sms' : 'db_current_mdn';
-
-    const mdnDigits = toTeltik10Digit(mdn);
-    if (!mdnDigits || mdnDigits.length !== 10) {
-      return new Response(JSON.stringify({ ok: false, error: 'valid 10-digit Teltik-known MDN required for Teltik line check', mdn: mdn || null, db_current_mdn: dbCurrentMdn, latest_teltik_sms: latestTeltikSms, iccid, sim_id: simId }), {
-        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    // Hosted non-Teltik SIMs are line-specific by MDN, so first verify Teltik can
-    // see that MDN via get-info. Teltik port-status itself is account/gateway
-    // scoped and takes only apikey; passing mdn returns 404.
-    const giUrl = 'https://api.smsgateway.xyz/v1/get-info?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
-    const giFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + giUrl : giUrl;
-    const giHeaders = {};
-    if (env.RELAY_KEY) giHeaders['x-relay-key'] = env.RELAY_KEY;
-    const giRes = await fetch(giFetchUrl, { method: 'GET', headers: giHeaders });
-    const giText = await giRes.text();
-    let giJson = null; try { giJson = JSON.parse(giText); } catch {}
-    await logCarrierApiCall(env, {
-      run_id: 'teltik_host_get_info_' + (iccid || simId || mdnDigits) + '_' + Date.now(),
-      step: 'get_info', iccid, imei: null, vendor: 'teltik',
-      request_url: 'https://api.smsgateway.xyz/v1/get-info?mdn=' + encodeURIComponent(mdnDigits),
-      request_method: 'GET', request_body: null,
-      response_status: giRes.status, response_ok: giRes.ok,
-      response_body_text: giText, response_body_json: giJson,
-      error: giRes.ok ? null : 'Teltik get-info HTTP ' + giRes.status,
-    });
-
-    const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey);
-    const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
-    const psHeaders = {};
-    if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
-    const psRes = await fetch(psFetchUrl, { method: 'GET', headers: psHeaders });
-    const psText = await psRes.text();
-    let psJson = null; try { psJson = JSON.parse(psText); } catch {}
-    await logCarrierApiCall(env, {
-      run_id: 'teltik_host_port_status_' + (iccid || simId || mdnDigits) + '_' + Date.now(),
-      step: 'port_status', iccid, imei: null, vendor: 'teltik',
-      request_url: 'https://api.smsgateway.xyz/v1/port-status',
-      request_method: 'GET', request_body: null,
-      response_status: psRes.status, response_ok: psRes.ok,
-      response_body_text: psText, response_body_json: psJson,
-      error: psRes.ok ? null : 'Teltik port-status HTTP ' + psRes.status,
-    });
-
-    return new Response(JSON.stringify({
-      ok: giRes.ok && psRes.ok,
-      mdn: mdnDigits,
-      mdn_source: mdnSource,
-      db_current_mdn: dbCurrentMdn,
-      latest_teltik_sms: latestTeltikSms,
-      iccid,
-      sim_id: simId,
-      get_info: { ok: giRes.ok, http_status: giRes.status, response: giJson || giText },
-      port_status: { ok: psRes.ok, http_status: psRes.status, response: psJson || psText },
-      // Back-compat for older frontend parser:
-      http_status: psRes.status,
-      response: psJson || psText,
-    }, null, 2), {
-      status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  } catch (e) {
-    return new Response(JSON.stringify({ ok: false, error: String(e) }), {
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }

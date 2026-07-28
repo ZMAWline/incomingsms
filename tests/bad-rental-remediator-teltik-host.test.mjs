@@ -77,18 +77,3 @@ test('dashboard exposes issue-type filter, sort button, and Teltik offline CSV e
   assert.match(DASHBOARD_HTML, /sortBadRentalsByIssue/);
   assert.match(DASHBOARD_HTML, /downloadTeltikPortOfflineExport/);
 });
-
-
-test('SIM Query uses service provider API and adds Teltik port-status for hosted SIMs', () => {
-  assert.match(DASHBOARD_SRC, /gateway_host:\s*sim\.gateway_host/);
-  assert.match(DASHBOARD_SRC, /handleTeltikPortStatusQuery/);
-  assert.match(DASHBOARD_SRC, /\/api\/teltik-port-status/);
-  assert.match(DASHBOARD_SRC, /get-info\?apikey=.*mdn=/s);
-  assert.match(DASHBOARD_SRC, /port-status\?apikey=/);
-  assert.match(DASHBOARD_SRC, /findLatestTeltikSmsMdn/);
-  assert.match(DASHBOARD_SRC, /mdn_source/);
-  assert.match(DASHBOARD_HTML, /fetchHostedTeltikPortStatus/);
-  assert.match(DASHBOARD_HTML, /_teltikHostPortTag\(sim, atomicMdn \|\| sim\.phone_number\)/);
-  assert.match(DASHBOARD_HTML, /\[Teltik port=/);
-  assert.match(DASHBOARD_HTML, /Teltik host MDN used/);
-});
