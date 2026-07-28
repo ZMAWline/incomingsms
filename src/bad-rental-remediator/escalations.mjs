@@ -32,6 +32,7 @@ export const ESCALATION_FAILURE_TYPES = Object.freeze([
   'helix_unsuspend_failed',
   'atomic_restore_failed',
   'teltik_reset_failed',
+  'teltik_gateway_port_offline',
   'teltik_forward_url_misconfigured',
   'unable_to_reproduce_recommendation',
   'generic',
@@ -51,6 +52,7 @@ export function normalizeFailureType(reason) {
   if (r.startsWith('helix_unsuspend')) return 'helix_unsuspend_failed';
   if (r.startsWith('atomic_restore')) return 'atomic_restore_failed';
   if (r.startsWith('teltik_reset')) return 'teltik_reset_failed';
+  if (r === 'teltik_gateway_port_offline' || r.includes('gateway_port_offline')) return 'teltik_gateway_port_offline';
   if (r.startsWith('teltik_forward')) return 'teltik_forward_url_misconfigured';
   if (r === 'insufficient_evidence' || r === 'insufficient_evidence_no_vendor'
       || r === 'insufficient_evidence_unknown_vendor') return 'generic';

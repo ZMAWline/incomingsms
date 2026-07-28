@@ -626,6 +626,40 @@ test('T8 Teltik: MDN differs → db_sync_upsert', () => {
   assert.equal(r.id, 'T8');
 });
 
+test('T12 Teltik: vendor ICCID differs from DB ICCID → teltik_sync_iccid', () => {
+  const r = classifyVendor({
+    sim: baseSim('teltik', { iccid: '8901OLD0000000000000', status: 'error' }),
+    vendorView: { port_status: 'active', MDN: '+15551112222', iccid: '8901NEW0000000000000' },
+    imeiCheck: { ok: true },
+    webhook: { delivered: true },
+  });
+  assert.equal(r.id, 'T12');
+  assert.equal(r.auto_action, 'teltik_sync_iccid');
+  assert.equal(r.evidence_bundle.vendor_iccid, '8901NEW0000000000000');
+});
+
+test('T12 Teltik: takes precedence over T1 (DB stale) when ICCID also drifted', () => {
+  // status=error would otherwise hit T1 (db_sync_upsert); the ICCID-drift rule
+  // must win so the identity is corrected rather than just the status synced.
+  const r = classifyVendor({
+    sim: baseSim('teltik', { iccid: '8901OLD0000000000000', status: 'error' }),
+    vendorView: { port_status: 'active', MDN: '+15551112222', iccid: '8901NEW0000000000000' },
+    imeiCheck: { ok: true },
+    webhook: { delivered: true },
+  });
+  assert.equal(r.auto_action, 'teltik_sync_iccid');
+});
+
+test('T12 Teltik: matching ICCID does NOT trigger teltik_sync_iccid', () => {
+  const r = classifyVendor({
+    sim: baseSim('teltik', { iccid: '8901SAME000000000000' }),
+    vendorView: { port_status: 'active', MDN: '+15551112222', iccid: '8901SAME000000000000' },
+    imeiCheck: { ok: true },
+    webhook: { delivered: true },
+  });
+  assert.notEqual(r.id, 'T12');
+});
+
 test('T9 Teltik: forward URL misconfigured → escalate (operator-only)', () => {
   const r = classifyVendor({
     sim: baseSim('teltik'),

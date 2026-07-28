@@ -245,6 +245,39 @@ async function handleSetImei(request, env) {
     return json({ ok: false, error: result.error || result.data?.reason || "Skyline API error", skyline_response: result.data, debug: { n, textBody } }, 502);
   }
 
+  // The sim_imei config above is only what goip_get_status (and the dashboard)
+  // report -- it does NOT change what the radio actually broadcasts. Write the
+  // IMEI at the modem level too via AT+EGMR: that is the real device identity the
+  // carrier validates at registration. Both destinations must always be written
+  // together or the two silently drift (dashboard shows one IMEI, network sees
+  // another). EGMR resets the module, so it re-registers with the new IMEI.
+  const atParams = new URLSearchParams({
+    username: gateway.username,
+    password: gateway.password,
+    port: String(portNum),
+    at: `AT+EGMR=1,7,"${imei}"`,
+  });
+  const egmrUrl = `http://${gateway.host}:${apiPort}/goip_send_at.html?${atParams}`;
+  const egmrResult = await bridgeFetch(env, egmrUrl, "GET");
+  const egmrResp = egmrResult.data?.resp || "";
+  const egmrOk = egmrResult.data?.code === 0 && /\bOK\b/.test(egmrResp);
+
+  await logSkylineApiCall(env, {
+    action: "set_imei_egmr",
+    gateway_id,
+    port: `${portNum}.${String(slotNum).padStart(2, "0")}`,
+    requestUrl: egmrUrl.replace(gateway.password, "***"),
+    requestBody: `AT+EGMR=1,7,"${imei}"`,
+    responseStatus: egmrResult.status,
+    responseOk: egmrResult.ok,
+    responseBody: egmrResult.data,
+    error: egmrOk ? null : (egmrResult.error || "EGMR write not confirmed"),
+  });
+
+  if (!egmrOk) {
+    return json({ ok: false, error: "sim_imei config was set but the AT+EGMR modem write failed -- IMEI would drift (config != radio). " + (egmrResult.error || egmrResp || ""), config_set: true, egmr_response: egmrResult.data, debug: { n, imei } }, 502);
+  }
+
   // Persist the IMEI change to flash so it survives reboots (op=save)
   const saveParams = new URLSearchParams({ username: gateway.username, password: gateway.password });
   const saveUrl = `http://${gateway.host}:${apiPort}/goip_send_cmd.html?${saveParams}`;
@@ -262,9 +295,9 @@ async function handleSetImei(request, env) {
     error: saveResult.error,
   });
 
-  const saveOk = saveResult.ok || saveResult.data?.code === 200;
+  const saveOk = saveResult.ok || saveResult.data?.code === 200 || saveResult.data?.code === 0;
 
-  return json({ ok: true, message: `IMEI set on ${gateway.code} port ${portNum} slot ${slotNum} (index ${n})`, save_ok: saveOk, skyline_response: result.data, save_response: saveResult.data, debug: { n, textBody } });
+  return json({ ok: true, message: `IMEI set on ${gateway.code} port ${portNum} slot ${slotNum} (index ${n}) -- sim_imei config + AT+EGMR modem write both applied`, save_ok: saveOk, egmr_ok: egmrOk, skyline_response: result.data, save_response: saveResult.data, debug: { n, textBody } });
 }
 
 async function handlePortStatus(url, env) {

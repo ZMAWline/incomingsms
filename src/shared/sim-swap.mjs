@@ -58,6 +58,23 @@ export function buildSwapSimRequest({ session, msisdn, zipCode, newSim }) {
   };
 }
 
+// swapImei changes the device IMEI AT&T whitelists for the line (the NWIMEI used
+// for network registration validation). MSISDN/BAN/ICCID stay. zipCode must match
+// the PPU zip on the subscriber (we use activation_zip).
+export function buildSwapImeiRequest({ session, msisdn, zipCode, imei }) {
+  return {
+    wholeSaleApi: {
+      session,
+      wholeSaleRequest: {
+        requestType: 'swapImei',
+        MSISDN: msisdn,
+        zipCode,
+        imei,
+      },
+    },
+  };
+}
+
 export function isSwapSuccess(json) {
   return !!(json && json.wholeSaleApi && json.wholeSaleApi.wholeSaleResponse
     && json.wholeSaleApi.wholeSaleResponse.statusCode === '00');

@@ -25,12 +25,17 @@
 //   - 'human_review'         Don't touch. Surface in the report's
 //                            "Failures needing human review" section.
 
+import { isTeltikInvalidIccidError } from './teltik-iccid.mjs';
+
 export const PLAYBOOK = [
   // ── Teltik ──────────────────────────────────────────────────────────────
   {
     id: 'teltik_invalid_iccid',
     vendor: 'teltik',
-    match: (err) => /change-number failed 404/.test(err || '') && /Invalid ICCID/i.test(err || ''),
+    // Shared detector — catches the change-number 404 (body carries "Invalid
+    // ICCID") AND the query-step 404 (error string omits the body). sync_iccid
+    // re-verifies via get-info-by-MDN before patching, so a loose match is safe.
+    match: (err) => isTeltikInvalidIccidError(err),
     action: 'sync_iccid',
     description: 'Teltik swapped the physical SIM card for this line — our DB has the old ICCID. Call /v1/get-info with the MDN to resolve the new ICCID, update sims.iccid, then flip to mdn_pending so the teltik finalizer picks up the current MDN.',
     safe: true,

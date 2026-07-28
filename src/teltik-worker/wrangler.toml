@@ -8,10 +8,17 @@ workers_dev = true
 # Rotation concurrency: 8 lanes (ramped from 4 after the clean first night
 # 2026-06-16) so the nightly cohort clears early in the window.
 TELTIK_ROTATE_CONCURRENCY = "8"
-# Night-migration: defer morning-anchored lines to midnight, 100/day. Set to
-# "off" (or remove) once migration is complete (~14 days). Operator-approved.
+# Night-guard (PERMANENT, was a one-time migration): defer morning-anchored
+# lines to midnight, TELTIK_MIGRATION_BATCH/night. Anchors drift ~15 min/day
+# later (tick-granularity loss on Teltik's hard 48h minimum) and can never move
+# earlier, so without this guard the fleet slowly marches from midnight into
+# the morning. Do NOT set to "off" — see decision-log 2026-07-06.
 TELTIK_NIGHT_MIGRATION = "on"
-TELTIK_MIGRATION_BATCH = "100"
+TELTIK_MIGRATION_BATCH = "150"
+# Late-morning recovery re-anchor: a retried/forced rotation succeeding at NY
+# hour >= this (through 8) gets a next-midnight rotation_hold_until so it
+# rejoins the night cohort instead of anchoring to the morning.
+TELTIK_REANCHOR_FROM_HOUR = "5"
 # INC-2 rental capture: mint a rental (+ record the reseller's rentalId from the
 # number.online 200 response) on every inline Teltik rotation. reseller-sync and
 # details-finalizer already do this on their paths; the inline rotate path here
@@ -19,9 +26,13 @@ TELTIK_MIGRATION_BATCH = "100"
 RENTAL_CAPTURE_ENABLED = "true"
 
 [triggers]
-# 10,40 4-14 UTC — rotation ticks; isInsideRotationWindowNY() narrows to NY 0-8.
-# 0 2 * * * UTC (NY 22:00, before the window) — daily night-migration batch.
-crons = ["10,40 4-14 * * *", "0 2 * * *"]
+# 5,20,35,50 4-14 UTC — rotation ticks every 15 min (was 30); isInsideRotationWindowNY()
+# narrows to NY 0-8. Halving the tick gap halves the per-cycle anchor drift
+# (median was exactly 30 min = one tick: a line just-misses the tick 48h after
+# its last rotation). 15-min spacing stays above the 13-min rotate time budget
+# so ticks never overlap.
+# 0 2 * * * UTC (NY 22:00, before the window) — daily night-guard batch.
+crons = ["5,20,35,50 4-14 * * *", "0 2 * * *"]
 
 [observability.logs]
 enabled = true

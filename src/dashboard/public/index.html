@@ -1900,6 +1900,13 @@
                         <option value="unable_to_reproduce">Unable to reproduce</option>
                         <option value="duplicate">Duplicate</option>
                     </select>
+                    <label class="text-xs text-dark-400 uppercase" for="bad-rentals-issue-filter">Issue type</label>
+                    <select id="bad-rentals-issue-filter" onchange="loadBadRentals()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300">
+                        <option value="all" selected>All issue types</option>
+                        <option value="Teltik gateway port offline">Teltik gateway port offline</option>
+                        <option value="Teltik gateway port reset resolved">Teltik gateway port reset resolved</option>
+                    </select>
+                    <button onclick="downloadTeltikPortOfflineExport()" class="px-3 py-2 text-xs bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition" title="Vendor-ready CSV: report id, current MDN, SIM id, ICCID, host/provider, reseller rental id">Export Teltik offline CSV</button>
                     <span id="bad-rentals-status" class="text-dark-400 text-sm ml-2"></span>
                 </div>
                 <div id="bad-rentals-table-wrap" class="overflow-x-auto rounded-lg border border-dark-600">
@@ -1910,6 +1917,7 @@
                                 <th class="px-4 py-3 font-medium">Reseller</th>
                                 <th class="px-4 py-3 font-medium" title="Reported MDN is what the reseller submitted with the bad-rental report. Current MDN is the SIM's active number now — when they differ, the reported number has been rotated/swapped.">Reported / Current MDN</th>
                                 <th class="px-4 py-3 font-medium">Reason</th>
+                                <th class="px-4 py-3 font-medium"><button onclick="sortBadRentalsByIssue()" class="uppercase hover:text-dark-100" title="Sort current Bad Rental view by issue type">Issue type</button></th>
                                 <th class="px-4 py-3 font-medium">Status</th>
                                 <th class="px-4 py-3 font-medium" title="SIM id + service provider (sims.vendor). Provider is who the line is provisioned with — a Teltik-hosted Atomic SIM still shows Atomic.">SIM / Provider</th>
                                 <th class="px-4 py-3 font-medium" title="Reseller's own rental identifier (from rentals.reseller_rental_id). Falls back to internal rental_id when the reseller didn't echo one.">Reseller Rental ID</th>
@@ -1918,7 +1926,7 @@
                             </tr>
                         </thead>
                         <tbody id="bad-rentals-tbody" class="divide-y divide-dark-700 text-dark-200">
-                            <tr><td colspan="9" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>
+                            <tr><td colspan="10" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -7968,19 +7976,33 @@ async function sendSimOnline(simId, phoneNumber) {
             const statusEl = document.getElementById('bad-rentals-status');
             const tbody = document.getElementById('bad-rentals-tbody');
             const filterSel = document.getElementById('bad-rentals-status-filter');
+            const issueSel = document.getElementById('bad-rentals-issue-filter');
             if (!tbody) return;
-            tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>';
             if (statusEl) statusEl.textContent = '';
             const filterVal = filterSel ? filterSel.value : 'received,in_triage';
+            const issueVal = issueSel ? issueSel.value : 'all';
             const isOpenFilter = filterVal === 'received,in_triage';
             try {
                 const qs = filterVal ? ('?status=' + encodeURIComponent(filterVal)) : '';
                 const resp = await fetch(API_BASE + '/bad-rentals' + qs);
                 if (!resp.ok) throw new Error('API ' + resp.status);
-                const rows = await resp.json();
+                let rows = await resp.json();
+                if (Array.isArray(rows) && issueVal && issueVal !== 'all') {
+                    rows = rows.filter(function(r){ return (r.issue_type || '') === issueVal; });
+                }
+                if (Array.isArray(rows) && window._badRentalsIssueSortDir) {
+                    rows.sort(function(a, b){
+                        const av = (a.issue_type || '').toLowerCase();
+                        const bv = (b.issue_type || '').toLowerCase();
+                        if (av < bv) return window._badRentalsIssueSortDir === 'asc' ? -1 : 1;
+                        if (av > bv) return window._badRentalsIssueSortDir === 'asc' ? 1 : -1;
+                        return (b.id || 0) - (a.id || 0);
+                    });
+                }
                 window._badRentalRowsById = {};
                 if (!Array.isArray(rows) || rows.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-8 text-center text-dark-400">No reports match this filter.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-dark-400">No reports match this filter.</td></tr>';
                     // Badge tracks open reports only — leave it untouched when viewing
                     // a non-open filter so the sidebar count stays accurate.
                     if (badge && isOpenFilter) { badge.textContent = '0'; badge.classList.add('hidden'); }
@@ -7991,7 +8013,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 const filterLabel = filterSel && filterSel.options[filterSel.selectedIndex]
                     ? filterSel.options[filterSel.selectedIndex].text
                     : filterVal;
-                if (statusEl) statusEl.textContent = rows.length + ' report' + (rows.length === 1 ? '' : 's') + ' · filter: ' + filterLabel;
+                const issueLabel = issueVal && issueVal !== 'all' ? (' · issue: ' + issueVal) : '';
+                if (statusEl) statusEl.textContent = rows.length + ' report' + (rows.length === 1 ? '' : 's') + ' · filter: ' + filterLabel + issueLabel;
                 const fmtDt = function(s) {
                     return s ? new Date(s).toLocaleString('en-US', {month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
                 };
@@ -8014,6 +8037,13 @@ async function sendSimOnline(simId, phoneNumber) {
                     window._badRentalRowsById[r.id] = r;
                     const resellerName = (r.resellers && r.resellers.name) ? r.resellers.name : (r.reseller_id || '—');
                     const statusBadge = STATUS_BADGES[r.status] || ('<span class="inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-dark-700 text-dark-200">' + escapeHtml(r.status || '—') + '</span>');
+                    const issueType = r.issue_type || '—';
+                    const issueBadgeClass = r.issue_type === 'Teltik gateway port offline'
+                        ? 'bg-rose-500/20 text-rose-200 border border-rose-500/30'
+                        : (r.issue_type === 'Teltik gateway port reset resolved'
+                            ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/30'
+                            : 'bg-dark-700 text-dark-300 border border-dark-600');
+                    const issueCell = '<span class="inline-block px-2 py-0.5 text-[11px] rounded ' + issueBadgeClass + '" title="Classifier issue type">' + escapeHtml(issueType) + '</span>';
                     const simLink = r.sim_id
                         ? (r.iccid
                             ? '<a href="/sims?search=' + encodeURIComponent(r.iccid) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();" title="Open SIMs page filtered to ICCID ' + escapeHtml(r.iccid) + ' (new tab)" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted">' + escapeHtml(r.sim_id) + '</a>'
@@ -8096,7 +8126,7 @@ async function sendSimOnline(simId, phoneNumber) {
                             : 'no attempts yet';
                         autoSubRow = '<tr class="bg-dark-900/40 border-t-0" data-auto-sub-for="' + escapeHtml(r.id) + '">'
                             + '<td></td>'
-                            + '<td colspan="8" class="px-4 py-1.5 text-[11px] text-dark-300">'
+                            + '<td colspan="9" class="px-4 py-1.5 text-[11px] text-dark-300">'
                             +   '<span class="text-dark-400 uppercase tracking-wide mr-2">Auto attempts:</span>'
                             +   '<span class="font-mono text-dark-200 mr-2">' + escapeHtml(String(autoCount)) + '</span>'
                             +   stateChip
@@ -8109,6 +8139,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         '<td class="px-4 py-3 text-dark-200">' + escapeHtml(resellerName) + '</td>' +
                         '<td class="px-4 py-3 font-mono">' + mdnCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 text-xs" title="' + escapeHtml(r.reason_note || '') + '">' + escapeHtml(r.reason_code || '—') + '</td>' +
+                        '<td class="px-4 py-3 text-dark-300 text-xs">' + issueCell + '</td>' +
                         '<td class="px-4 py-3">' + statusBadge + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + simLink + vendorChip + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + rentalIdCell + '</td>' +
@@ -8117,10 +8148,19 @@ async function sendSimOnline(simId, phoneNumber) {
                     '</tr>' + autoSubRow;
                 }).join('');
             } catch(e) {
-                tbody.innerHTML = '<tr><td colspan="9" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + escapeHtml(e.message) + '</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-4 text-center text-red-400">Error loading reports: ' + escapeHtml(e.message) + '</td></tr>';
                 console.error('[loadBadRentals]', e);
             }
             applyAutoFilterFromActiveChip();
+        }
+
+        function sortBadRentalsByIssue() {
+            window._badRentalsIssueSortDir = window._badRentalsIssueSortDir === 'asc' ? 'desc' : 'asc';
+            loadBadRentals();
+        }
+
+        function downloadTeltikPortOfflineExport() {
+            window.location.href = API_BASE + '/bad-rentals/teltik-port-offline-export';
         }
 
         // ===== Auto-Remediator Reviewer Panel (INC-23 §I.2) =====

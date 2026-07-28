@@ -7,7 +7,7 @@
 import { Env } from './types';
 import { supabaseInsert } from './supabase';
 
-const ATOMIC_PLAN_CODE = 'ATTNOVOICE';
+const ATOMIC_PLAN_CODE = 'EBNOVOICE';
 
 interface AtomicSession {
     userName: string;

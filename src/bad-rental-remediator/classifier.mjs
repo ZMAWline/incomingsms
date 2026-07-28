@@ -37,6 +37,7 @@ export const ALLOWED_ACTIONS = Object.freeze([
   'helix_unsuspend',     // 4.6 reasonCode CR/35
   'teltik_reset_network',
   'teltik_reset_port',
+  'teltik_sync_iccid',   // T12 — DB-only ICCID resync after a physical SIM swap
   'close_duplicate',     // §E
   'escalate',            // operator escalation
   'classify_only',       // record + reschedule, no side-effects
@@ -556,6 +557,24 @@ function classifyTeltik(input) {
     });
   }
 
+  // T12 — DB ICCID differs from Teltik's current ICCID (physical SIM-card swap).
+  // Teltik 404s "Invalid ICCID" on any call keyed by the OLD iccid (change-number,
+  // dashboard query), but the get-info BY MDN above still resolves the line and
+  // returns the NEW iccid. Heal by syncing sims.iccid — the MDN is unchanged, so
+  // there's no number churn and no reseller webhook. DB-only correction; the next
+  // rotation window then rotates the line normally on the new iccid. Placed before
+  // the port/IMEI/MDN branches so the identity is corrected first.
+  if (v.iccid && sim.iccid && String(v.iccid) !== String(sim.iccid)) {
+    return S({
+      id: 'T12', vendor: 'teltik',
+      auto_action: 'teltik_sync_iccid',
+      retry: { max_attempts: 2, cooldown_label: 'n/a' },
+      auto_resolve_when: 'db_matches_vendor_and_sms_verified',
+      on_failure: 'operator',
+      evidence_bundle: { db_iccid: sim.iccid, vendor_iccid: v.iccid },
+    });
+  }
+
   // T9 — forward URL missing/wrong — operator-only (config)
   if (v.forward_url_misconfigured) {
     return S({
@@ -693,6 +712,6 @@ export const ALL_SITUATION_IDS = Object.freeze([
   'A1','A2','A3','A4','A5','A6','A7','A8','A9','A10',
   'W1','W2','W3','W4','W5','W6','W7','W8','W9',
   'H1','H2','H3','H4','H5','H6','H7','H8','H9',
-  'T1','T2','T3','T4','T5','T6','T7','T8','T9','T10','T11',
+  'T1','T2','T3','T4','T5','T6','T7','T8','T9','T10','T11','T12',
   'pending_vendor_read',
 ]);

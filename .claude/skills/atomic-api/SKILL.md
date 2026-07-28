@@ -21,6 +21,7 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
 | 3 | Reconnect | `reconnectSubscriber` | Reconnect a deactivated subscriber |
 | 4 | Swap MSISDN | `swapMSISDN` | Change MDN based on ZIP code |
 | 4b | Swap SIM | `swapSIM` | Change the ICCID on a line (physical SIM swap); MSISDN stays |
+| 4c | Swap IMEI | `swapImei` | Change the device IMEI on file for a line; MSISDN stays |
 | 5 | Update Subscriber Info | `UpdateSubscriberInfo` | Update name/address on subscriber |
 | 6 | Resend OTA Profile | `resendOtaProfile` | Trigger OTA network refresh |
 
@@ -45,7 +46,7 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
 }}
 ```
 
-**Mandatory Plan Code:** Always use `ATTNOVOICE` for activations.
+**Mandatory Plan Code:** Always use `EBNOVOICE` for activations (replaced `ATTNOVOICE` as of 2026-07-06; existing lines may still be on `ATTNOVOICE`).
 
 **Common Identifiers:**
 - `MSISDN` — 10-digit phone number (MDN)
@@ -56,7 +57,7 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
 ## Key Workflows
 
 ### Activation Sequence
-1. **Activate** — POST with SIM, IMEI, name, address, `plan: "ATTNOVOICE"`
+1. **Activate** — POST with SIM, IMEI, name, address, `plan: "EBNOVOICE"`
 2. **Subscriber Inquiry** — Verify activation, get assigned MDN and BAN
 
 ### MDN Change Sequence (Area Code Change)
@@ -102,7 +103,7 @@ Expert in the AT&T ATOMIC Wholesale API for AT&T SIM card activation and subscri
     "streetDirection": "",
     "streetName": "YOUR_STREET_NAME",
     "zip": "YOUR_ZIP",
-    "plan": "ATTNOVOICE",
+    "plan": "EBNOVOICE",
     "portMdn": ""
   }
 }}
@@ -243,6 +244,24 @@ Returns: attStatus, BAN, activationDate, plan info, device info (BLIMEI/NWIMEI),
 ```
 **Note:** Keeps the same MSISDN/BAN and moves the line to `newSim` (the new ICCID). The old ICCID is auto-detached at the carrier -- do **not** send a separate `deactivateSubscriber`. `zipCode` is the subscriber's ZIP on file; if it is wrong, fix it first with `UpdateSubscriberInfo`. `newSim` must be a real ICCID (89-prefixed, 19-21 digits).
 
+### 7c. Swap IMEI (Change Device IMEI on File)
+```json
+{"wholeSaleApi": {
+  "session": {
+    "userName": "ezbiz",
+    "token": "EZ(3928_*=wH)le",
+    "pin": "EZ32726"
+  },
+  "wholeSaleRequest": {
+    "requestType": "swapImei",
+    "MSISDN": "CURRENT_MDN",
+    "zipCode": "PPU_ZIP_CODE",
+    "imei": "NEW_IMEI"
+  }
+}}
+```
+**Note:** Updates the device IMEI AT&T has whitelisted for the line; MSISDN/BAN/ICCID stay the same. `zipCode` **must match the PPU (pay-per-use) zip code** on the subscriber, not just any address zip -- a mismatched zip is rejected. Use this when the IMEI the gateway broadcasts does not match AT&T's `BLIMEI` (visible in `subsriberInquiry`), which causes the device to fail network registration (Skyline port status `st=6`). After a successful swap, trigger `resendOtaProfile` and reset the gateway port so the module re-registers. Verify with `subsriberInquiry` that `BLIMEI` now matches the gateway IMEI.
+
 ### 8. Update Subscriber Information
 ```json
 {"wholeSaleApi": {
@@ -285,7 +304,7 @@ Returns: attStatus, BAN, activationDate, plan info, device info (BLIMEI/NWIMEI),
 ## Critical Enforcement Rules
 
 1. **Only use assigned credentials** (ezbiz / EZ32726)
-2. **Always use plan code `ATTNOVOICE`** for activations
+2. **Always use plan code `EBNOVOICE`** for activations
 3. **Always verify MDN after activation** using Subscriber Inquiry
 4. **Use correct reasonCode** for each status change action (see table above)
 5. **For area code changes:** Update address first, then swap MSISDN

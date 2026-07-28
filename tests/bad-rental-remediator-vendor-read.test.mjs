@@ -70,6 +70,11 @@ test('teltik active + port online → healthy + requirePortOnline extras', () =>
   assert.deepEqual(p.extras, { requirePortOnline: true, portOnline: true });
 });
 
+test('teltik projection surfaces vendor iccid (drives T12 ICCID-drift detection)', () => {
+  const p = vendorViewFromRead('teltik', { ok: true, not_found: false, line_state: 'active', status: 'active', port_status: 'online', MDN: '3073845304', iccid: '8901NEW0000000000000' });
+  assert.equal(p.view.iccid, '8901NEW0000000000000');
+});
+
 test('teltik port not online → not healthy (so port reset can route), extras flags offline', () => {
   const p = vendorViewFromRead('teltik', { ok: true, not_found: false, line_state: 'active', status: 'active', port_status: 'offline', MDN: '3073845304' });
   assert.equal(p.healthy, false);
@@ -113,8 +118,9 @@ test('gatherEvidence populates per-action cooldown maps (prevents carrier re-fir
 test('sims select carries helix/ban identifiers needed by vendor read + actions', () => {
   // The sims query select clause is its own string literal; assert on the
   // select= fragment directly rather than the split `sims?...` prefix.
-  const sel = SRC.match(/select=id,iccid,vendor,status,msisdn,activated_at,gateway_id,port[^'`"\n]*/);
+  const sel = SRC.match(/select=id,iccid,vendor,gateway_host,status,msisdn,activated_at,gateway_id,port[^'`"\n]*/);
   assert.ok(sel, 'expected the sims evidence select clause');
+  assert.ok(/gateway_host/.test(sel[0]), 'sims select must include gateway_host for host-level Teltik port checks');
   assert.ok(/att_ban/.test(sel[0]), 'sims select must include att_ban for helix_ota');
   assert.ok(/mobility_subscription_id/.test(sel[0]), 'sims select must include mobility_subscription_id for helix read');
   assert.ok(/\bimei\b/.test(sel[0]), 'sims select must include imei');

@@ -1,7 +1,8 @@
 import { computeBillingBreakdown, computeResellerUtilization } from '../shared/billing.js';
-import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
+import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, buildSwapImeiRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateChanging } from './api-tester-presets.js';
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
+import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -169,6 +170,10 @@ export default {
 
     if (url.pathname === '/api/bad-rentals') {
       return handleBadRentals(env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/bad-rentals/teltik-port-offline-export' && request.method === 'GET') {
+      return handleTeltikPortOfflineExport(env, corsHeaders);
     }
 
     if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/update') && request.method === 'POST') {
@@ -472,6 +477,12 @@ export default {
     }
     if (url.pathname === '/api/atomic-swap-sim' && request.method === 'POST') {
       return handleAtomicSwapSim(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/atomic-swap-imei' && request.method === 'POST') {
+      return handleAtomicSwapImei(request, env, corsHeaders);
+    }
+    if (url.pathname === '/api/atomic-sub-action' && request.method === 'POST') {
+      return handleAtomicSubAction(request, env, corsHeaders);
     }
 
     if (url.pathname === '/api/teltik-query' && request.method === 'POST') {
@@ -861,7 +872,7 @@ async function handleSims(env, corsHeaders, url) {
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,port,status,vendor,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_rotation_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
+    let query = `sims?select=id,iccid,port,status,vendor,gateway_host,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_rotation_at,activated_at,last_activation_error,last_notified_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
 
     // Apply status filter
     if (statusFilter) {
@@ -2125,6 +2136,52 @@ async function handleHelixQuery(request, env, corsHeaders) {
   }
 }
 
+// Heal a swapped-card Teltik SIM. After Teltik replaces the physical SIM the
+// ICCID changes but the MDN does not, so every call keyed by the OLD ICCID 404s
+// "Invalid ICCID" — but get-info BY MDN still resolves the line and returns the
+// CURRENT ICCID. Adopt it via the shared iccidSwapPatch (no number churn, no
+// reseller webhook). Never throws. `sim` needs { id, iccid, msisdn }.
+async function healTeltikIccidBySim(env, sim) {
+  if (!sim || !sim.id) return { ok: false, reason: 'missing_sim' };
+  if (!env.TELTIK_API_KEY) return { ok: false, reason: 'teltik_key_missing' };
+  const mdn = String(sim.msisdn || '').replace(/\D/g, '').replace(/^1/, '');
+  if (mdn.length !== 10) return { ok: false, reason: 'missing_or_invalid_mdn' };
+  const infoUrl = 'https://api.smsgateway.xyz/v1/get-info?apikey=' + encodeURIComponent(env.TELTIK_API_KEY) + '&mdn=' + encodeURIComponent(mdn);
+  let res, text;
+  try { res = await relayFetch(env, infoUrl, { method: 'GET' }); text = await res.text(); }
+  catch (e) { return { ok: false, reason: 'get_info_exception' }; }
+  let info = null; try { info = JSON.parse(text); } catch {}
+  await logCarrierApiCall(env, {
+    run_id: 'teltik_heal_iccid_' + sim.id + '_' + Date.now(),
+    step: 'sync_iccid', iccid: sim.iccid, imei: null, vendor: 'teltik',
+    request_url: 'https://api.smsgateway.xyz/v1/get-info?mdn=' + encodeURIComponent(mdn),
+    request_method: 'GET', request_body: null,
+    response_status: res.status, response_ok: res.ok,
+    response_body_text: text, response_body_json: info,
+    error: res.ok ? null : ('Teltik get-info HTTP ' + res.status),
+  });
+  if (res.status === 404) return { ok: false, reason: 'line_not_found_deprovisioned' };
+  if (!res.ok || !info) return { ok: false, reason: 'get_info_http_' + res.status };
+  const newIccid = info.iccid || null;
+  if (!newIccid) return { ok: false, reason: 'no_iccid_in_response' };
+  if (newIccid === sim.iccid) return { ok: true, changed: false, iccid: newIccid };
+  const patchRes = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(String(sim.id)), {
+    method: 'PATCH',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(iccidSwapPatch(sim.iccid, newIccid)),
+  });
+  if (!patchRes.ok) {
+    const detail = await patchRes.text().catch(() => '');
+    return { ok: false, reason: 'db_patch_' + patchRes.status, detail: detail.slice(0, 200) };
+  }
+  return { ok: true, changed: true, old_iccid: sim.iccid, new_iccid: newIccid };
+}
+
 async function handleTeltikQuery(request, env, corsHeaders) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405, headers: corsHeaders });
@@ -2169,6 +2226,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
 
     let db_update = null;
     let resolvedMdn = null;
+    let iccid_heal = null;
     if (res.ok && json) {
       const rawMdn = json.msisdn || json.mdn || json.phone_number || '';
       if (rawMdn) {
@@ -2178,6 +2236,18 @@ async function handleTeltikQuery(request, env, corsHeaders) {
         await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
           status: 'error',
           last_rotation_error: 'Teltik query: no MDN in response at ' + new Date().toISOString(),
+        }).catch(() => {});
+      }
+    } else if (isTeltikInvalidIccidResponse(res.status, json || text)) {
+      // Physical SIM-card swap: the old ICCID is dead but the MDN still resolves.
+      // Auto-heal by adopting the line's current ICCID instead of just flagging error.
+      const simRows = await sbGet(env, 'sims?iccid=eq.' + encodeURIComponent(iccid) + '&select=id,iccid,msisdn&limit=1').catch(() => null);
+      const simRow = Array.isArray(simRows) && simRows[0] ? simRows[0] : null;
+      if (simRow) iccid_heal = await healTeltikIccidBySim(env, simRow);
+      if (!(iccid_heal && iccid_heal.ok)) {
+        await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
+          status: 'error',
+          last_rotation_error: 'Teltik query HTTP ' + res.status + ' (Invalid ICCID; heal ' + ((iccid_heal && iccid_heal.reason) || 'unavailable') + ') at ' + new Date().toISOString(),
         }).catch(() => {});
       }
     } else {
@@ -2237,6 +2307,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
       iccid,
       response: json || text,
       db_update,
+      iccid_heal,
       port_status,
     }, null, 2), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -3147,35 +3218,56 @@ async function handleFixSim(request, env, corsHeaders) {
       });
     }
 
-    if (!env.MDN_ROTATOR) {
-      return new Response(JSON.stringify({ error: 'MDN_ROTATOR service binding not configured' }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    // Teltik SIMs can't be fixed via mdn-rotator (it has no Teltik API — Teltik
+    // is delegated to teltik-worker). The dominant Teltik "broken" case is a
+    // physical SIM-card swap → stale ICCID, which we heal in-dashboard via
+    // get-info-by-MDN. Partition: heal teltik here, forward the rest to mdn-rotator.
+    const idList = simIds.map(s => encodeURIComponent(String(s))).join(',');
+    const simRows = await sbGet(env, 'sims?id=in.(' + idList + ')&select=id,iccid,msisdn,vendor').catch(() => null);
+    const rows = Array.isArray(simRows) ? simRows : [];
+    const teltikRows = rows.filter(r => r.vendor === 'teltik');
+    const teltikIds = new Set(teltikRows.map(r => String(r.id)));
+    const otherIds = simIds.filter(s => !teltikIds.has(String(s)));
+
+    const results = [];
+    for (const r of teltikRows) {
+      const heal = await healTeltikIccidBySim(env, r);
+      results.push({ sim_id: r.id, vendor: 'teltik', ok: !!heal.ok, changed: !!heal.changed, new_iccid: heal.new_iccid || null, reason: heal.reason || null });
+    }
+
+    let rotatorRaw = null;
+    if (otherIds.length > 0) {
+      if (!env.MDN_ROTATOR) {
+        return new Response(JSON.stringify({ error: 'MDN_ROTATOR service binding not configured' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      if (!env.ADMIN_RUN_SECRET) {
+        return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+      const workerUrl = 'https://mdn-rotator/fix-sim?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET);
+      const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sim_ids: otherIds })
       });
+      const responseText = await workerResponse.text();
+      try { rotatorRaw = JSON.parse(responseText); } catch {
+        rotatorRaw = { ok: false, error: 'Non-JSON response: ' + responseText.slice(0, 200) };
+      }
+      if (rotatorRaw && Array.isArray(rotatorRaw.results)) results.push(...rotatorRaw.results);
     }
 
-    if (!env.ADMIN_RUN_SECRET) {
-      return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    const workerUrl = `https://mdn-rotator/fix-sim?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
-    const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sim_ids: simIds })
-    });
-
-    const responseText = await workerResponse.text();
-    let result;
-    try { result = JSON.parse(responseText); } catch {
-      result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
-    }
-
-    return new Response(JSON.stringify(result, null, 2), {
-      status: workerResponse.status,
+    return new Response(JSON.stringify({
+      ok: true,
+      results,
+      ...(rotatorRaw && !Array.isArray(rotatorRaw.results) ? { rotator: rotatorRaw } : {}),
+    }, null, 2), {
+      status: 200,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -3935,7 +4027,7 @@ async function handleBadRentals(env, corsHeaders, url) {
       'auto_remediation_state', 'last_auto_attempt_at', 'escalation_reason',
       'resellers(name)',
       'rentals(reseller_rental_id)',
-      'sims(iccid,vendor,carrier,sim_numbers(e164,valid_to))',
+      'sims(iccid,vendor,gateway_host,sim_numbers(e164,valid_to))',
       'report_sim_number:sim_numbers!rental_reports_sim_number_id_fkey(e164,valid_from,valid_to)',
     ].join(',');
     let query = 'rental_reports?select=' + encodeURIComponent(select);
@@ -4005,6 +4097,7 @@ async function handleBadRentals(env, corsHeaders, url) {
         rental_id: r.rental_id,
         remediation_action: r.remediation_action,
         duplicate_of: r.duplicate_of,
+        issue_type: issueTypeForBadRentalRow(r),
         received_at: r.received_at,
         triaged_at: r.triaged_at,
         closed_at: r.closed_at,
@@ -4020,7 +4113,7 @@ async function handleBadRentals(env, corsHeaders, url) {
         resellers: r.resellers || null,
         iccid: r && r.sims ? r.sims.iccid : null,
         vendor: r && r.sims ? r.sims.vendor : null,
-        carrier: r && r.sims ? r.sims.carrier : null,
+        gateway_host: r && r.sims ? r.sims.gateway_host : null,
         reseller_rental_id: resellerRentalId,
         current_e164: currentE164,
         report_sim_number_e164: rsn ? rsn.e164 : null,
@@ -4037,6 +4130,71 @@ async function handleBadRentals(env, corsHeaders, url) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
+}
+
+
+function issueTypeForBadRentalRow(r) {
+  if (!r) return null;
+  if (r.issue_type) return r.issue_type; // forward-compatible if DB column is added later
+  if (r.escalation_reason === 'teltik_gateway_port_offline') return 'Teltik gateway port offline';
+  return null;
+}
+
+async function handleTeltikPortOfflineExport(env, corsHeaders) {
+  try {
+    const select = [
+      'id', 'status', 'sim_id', 'rental_id', 'last_auto_attempt_at',
+      'rentals(reseller_rental_id)',
+      'sims(id,iccid,msisdn,vendor,gateway_host)',
+    ].join(',');
+    const q = 'rental_reports?select=' + encodeURIComponent(select)
+      + '&escalation_reason=eq.' + encodeURIComponent('teltik_gateway_port_offline')
+      + '&order=last_auto_attempt_at.desc.nullslast,received_at.desc&limit=5000';
+    const resp = await supabaseGet(env, q);
+    if (!resp.ok) {
+      const txt = await resp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + resp.status, detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const rows = await resp.json();
+    const header = ['report_id','current_mdn','sim_id','iccid','gateway_host','service_provider','reseller_rental_id','last_auto_attempt_at','issue_type'];
+    const csvRows = [header].concat((Array.isArray(rows) ? rows : []).map(r => {
+      const sim = r.sims || {};
+      return [
+        r.id,
+        sim.msisdn || '',
+        r.sim_id || sim.id || '',
+        sim.iccid || '',
+        sim.gateway_host || '',
+        sim.vendor || '',
+        r.rentals && r.rentals.reseller_rental_id || '',
+        r.last_auto_attempt_at || '',
+        issueTypeForBadRentalRow(r),
+      ];
+    }));
+    const csv = csvRows.map(row => row.map(csvEscape).join(',')).join('\n') + '\n';
+    const fnDate = new Date().toISOString().slice(0, 10);
+    return new Response(csv, {
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="teltik_gateway_port_offline_' + fnDate + '.csv"',
+      },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+function csvEscape(value) {
+  const s = value == null ? '' : String(value);
+  return (s.includes('"') || s.includes(',') || s.includes('\n') || s.includes(String.fromCharCode(13)))
+    ? '"' + s.replace(/"/g, '""') + '"'
+    : s;
 }
 
 // INC-17 / INC-16a — operator pause/resume of the bad-rental auto-remediator.
@@ -4489,7 +4647,6 @@ async function handleBadRentalReport(id, env, corsHeaders) {
       'auto_remediation_state','last_auto_attempt_at','escalation_reason',
       'resellers(name)',
       'rentals(reseller_rental_id)',
-      'sims(iccid,vendor,carrier)',
     ].join(',');
     const repResp = await supabaseGet(env, 'rental_reports?id=eq.' + reportId + '&select=' + encodeURIComponent(reportSelect));
     if (!repResp.ok) {
@@ -7317,6 +7474,154 @@ async function handleAtomicSwapSim(request, env, corsHeaders) {
     }
 
     return json({ ok: true, sim_id: sim.id, old_iccid: sim.iccid, new_iccid: newIccid, msisdn, response: data });
+  } catch (error) {
+    return json({ ok: false, error: String(error) }, 500);
+  }
+}
+
+// POST /api/atomic-swap-imei — set the device IMEI (NWIMEI) AT&T whitelists for an
+// ATOMIC line so it matches what the gateway broadcasts. A line registers iff the
+// gateway-broadcast IMEI == AT&T NWIMEI. MSISDN/BAN/ICCID stay; only sims.imei changes.
+async function handleAtomicSwapImei(request, env, corsHeaders) {
+  const json = (obj, status) => new Response(JSON.stringify(obj), { status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  try {
+    const body = await request.json();
+    const simId = body.sim_id;
+    const newImei = (body.imei == null ? '' : String(body.imei)).trim();
+    if (!simId) return json({ ok: false, error: 'sim_id required' }, 400);
+    if (!/^\d{15}$/.test(newImei)) return json({ ok: false, error: 'imei must be 15 digits' }, 400);
+
+    if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+      return json({ ok: false, error: 'ATOMIC credentials not configured on dashboard worker' }, 500);
+    }
+
+    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,activation_zip,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1');
+    const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
+    if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
+    if (sim.vendor !== 'atomic') return json({ ok: false, error: 'swapImei is only supported for ATOMIC (AT&T) SIMs; this SIM is ' + sim.vendor }, 400);
+    if (sim.status === 'canceled') return json({ ok: false, error: 'SIM is canceled; cannot swap IMEI' }, 400);
+
+    const msisdn = resolveMsisdn(sim);
+    if (!msisdn) return json({ ok: false, error: 'No MSISDN on file for this SIM' }, 400);
+    const zipCode = resolveZip(body.zip_code, sim);
+    if (!zipCode) return json({ ok: false, error: 'ZIP required for swapImei (PPU zip; none on file)' }, 400);
+
+    const apiUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+    const requestBody = buildSwapImeiRequest({
+      session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+      msisdn,
+      zipCode,
+      imei: newImei,
+    });
+
+    const res = await relayFetch(env, apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    const success = res.ok && isSwapSuccess(data);
+    const errMsg = success ? null : swapErrorMessage(data, res.status);
+
+    await logCarrierApiCall(env, {
+      run_id: 'atomic_swapimei_' + sim.iccid + '_' + Date.now(),
+      step: 'swap_imei',
+      iccid: sim.iccid,
+      imei: newImei,
+      vendor: 'atomic',
+      request_url: apiUrl,
+      request_method: 'POST',
+      request_body: requestBody,
+      response_status: res.status,
+      response_ok: res.ok,
+      response_body_text: text,
+      response_body_json: data,
+      error: errMsg,
+    });
+
+    if (!success) {
+      await logSystemError(env, { source: 'dashboard', action: 'swap_imei', sim_id: sim.id, iccid: sim.iccid, error_message: 'ATOMIC swapImei failed: ' + errMsg, error_details: { msisdn, imei: newImei, zipCode, response: data, status: res.status } });
+      return json({ ok: false, error: errMsg, response: data }, res.status >= 400 ? res.status : 502);
+    }
+
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(sim.id)), { imei: newImei });
+
+    return json({ ok: true, sim_id: sim.id, iccid: sim.iccid, msisdn, zipCode, imei: newImei, response: data });
+  } catch (error) {
+    return json({ ok: false, error: String(error) }, 500);
+  }
+}
+
+// POST /api/atomic-sub-action — drive an ATOMIC subscriber lifecycle op for a line.
+// op: suspend|restore|deactivate|reconnect. Used to re-provision lines stuck in
+// network "registration denied" (CEREG 0,3) despite attStatus=Active.
+async function handleAtomicSubAction(request, env, corsHeaders) {
+  const json = (obj, status) => new Response(JSON.stringify(obj), { status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  const OPS = {
+    suspend:    { requestType: 'suspendSubscriber',    reasonCode: 'NPG', status: 'suspended' },
+    restore:    { requestType: 'restoreSubscriber',    reasonCode: 'CR',  status: 'active' },
+    deactivate: { requestType: 'deactivateSubscriber', reasonCode: 'DD',  status: 'canceled' },
+    reconnect:  { requestType: 'reconnectSubscriber',  reasonCode: '',    status: 'active' },
+  };
+  try {
+    const body = await request.json();
+    const simId = body.sim_id;
+    const op = String(body.op || '').trim();
+    if (!simId) return json({ ok: false, error: 'sim_id required' }, 400);
+    if (!OPS[op]) return json({ ok: false, error: 'op must be one of: ' + Object.keys(OPS).join(', ') }, 400);
+    if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+      return json({ ok: false, error: 'ATOMIC credentials not configured on dashboard worker' }, 500);
+    }
+
+    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1');
+    const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
+    if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
+    if (sim.vendor !== 'atomic') return json({ ok: false, error: 'ATOMIC only; this SIM is ' + sim.vendor }, 400);
+    const msisdn = resolveMsisdn(sim);
+    if (!msisdn) return json({ ok: false, error: 'No MSISDN on file for this SIM' }, 400);
+
+    const spec = OPS[op];
+    const apiUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+    const requestBody = {
+      wholeSaleApi: {
+        session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+        wholeSaleRequest: { requestType: spec.requestType, MSISDN: msisdn, reasonCode: spec.reasonCode },
+      },
+    };
+
+    const res = await relayFetch(env, apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(requestBody) });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    const success = res.ok && isSwapSuccess(data);
+    const errMsg = success ? null : swapErrorMessage(data, res.status);
+
+    await logCarrierApiCall(env, {
+      run_id: 'atomic_' + op + '_' + sim.iccid + '_' + Date.now(),
+      step: 'sub_' + op,
+      iccid: sim.iccid,
+      imei: null,
+      vendor: 'atomic',
+      request_url: apiUrl,
+      request_method: 'POST',
+      request_body: requestBody,
+      response_status: res.status,
+      response_ok: res.ok,
+      response_body_text: text,
+      response_body_json: data,
+      error: errMsg,
+    });
+
+    if (!success) {
+      await logSystemError(env, { source: 'dashboard', action: 'sub_' + op, sim_id: sim.id, iccid: sim.iccid, error_message: 'ATOMIC ' + spec.requestType + ' failed: ' + errMsg, error_details: { msisdn, response: data, status: res.status } });
+      return json({ ok: false, error: errMsg, response: data }, res.status >= 400 ? res.status : 502);
+    }
+
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(sim.id)), { status: spec.status });
+    return json({ ok: true, sim_id: sim.id, iccid: sim.iccid, msisdn, op, requestType: spec.requestType, new_status: spec.status, response: data });
   } catch (error) {
     return json({ ok: false, error: String(error) }, 500);
   }

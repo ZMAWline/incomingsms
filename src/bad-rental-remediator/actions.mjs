@@ -59,6 +59,7 @@ export const SAFE_ACTIONS = Object.freeze([
   'helix_unsuspend',
   'teltik_reset_network',
   'teltik_reset_port',
+  'teltik_sync_iccid',
 ]);
 
 const FORBIDDEN_SET = new Set(FORBIDDEN_ACTIONS);
@@ -97,6 +98,7 @@ export async function executeAction(env, ctx) {
     case 'helix_unsuspend':      return execHelixUnsuspend(env, ctx);
     case 'teltik_reset_network': return execTeltikReset(env, ctx, 'teltik_reset_network');
     case 'teltik_reset_port':    return execTeltikReset(env, ctx, 'teltik_reset_port');
+    case 'teltik_sync_iccid':    return execTeltikSyncIccid(env, ctx);
     default:                     return { ok: false, status: 'unsupported_action' };
   }
 }
@@ -488,6 +490,47 @@ async function execTeltikReset(env, ctx, action) {
     }
     return mapVendorResult(r, { mdn10: m10 });
   });
+}
+
+// ---------------------------------------------------------
+// teltik_sync_iccid — T12. A physical SIM-card swap changed the line's ICCID but
+// not its MDN, so every call keyed by the old ICCID 404s "Invalid ICCID". The
+// classifier resolved the line's CURRENT ICCID from a get-info-by-MDN read and
+// passes it as ctx.newIccid; here we patch sims.iccid and clear the rotation-
+// failure state so the next rotation window picks the line up normally. The MDN
+// is unchanged → no sim_numbers row and no reseller webhook (mirrors the rotation
+// playbook's sync_iccid heal). DB-only action — no vendor mutation. Idempotent:
+// re-running once the DB already matches the vendor returns status='noop'.
+// ---------------------------------------------------------
+async function execTeltikSyncIccid(env, ctx) {
+  const sim = ctx.sim;
+  if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
+  const newIccid = ctx.newIccid;
+  if (!newIccid) return { ok: false, status: 'bad_input', errorMessage: 'teltik_sync_iccid_missing_iccid' };
+  if (newIccid === sim.iccid) {
+    return { ok: true, status: 'noop', evidence: { reason: 'iccid_already_matches_vendor', sim_id: sim.id } };
+  }
+  const patch = {
+    iccid: newIccid,
+    status: 'active',
+    rotation_status: 'success',
+    rotation_fail_count: 0,
+    last_rotation_error: null,
+    status_reason: 'ICCID swapped from ' + sim.iccid + ' to ' + newIccid + ' on ' + nowIso(),
+  };
+  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(sim.id), {
+    method: 'PATCH',
+    headers: supabaseHeaders(env, false),
+    body: JSON.stringify(patch),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    return { ok: false, status: 'db_error', errorMessage: 'sims_patch_' + resp.status + ':' + txt };
+  }
+  return {
+    ok: true, status: 'ok',
+    evidence: { sim_id: sim.id, old_iccid: sim.iccid, new_iccid: newIccid },
+  };
 }
 
 // ---------------------------------------------------------

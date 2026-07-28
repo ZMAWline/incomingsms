@@ -24,6 +24,7 @@ import { canAttempt } from './cooldown.mjs';
 import { teltikPortStatus, readVendorView } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import { flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType } from './escalations.mjs';
+import { isTeltikHosted } from '../shared/gateway-host.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const LAST_MAIN_TICK_KEY = 'bad_rental_remediator_last_main_tick';
@@ -43,6 +44,8 @@ const STALE_CLAIM_MS = 10 * 60 * 1000;
 // on the loser). TTL > TICK_BUDGET_MS so a crashed tick releases naturally.
 const TICK_LOCK_KEY = 'bad_rental_remediator_main_tick_lock';
 const TICK_LOCK_TTL_S = 120;
+const ISSUE_TELTIK_GATEWAY_PORT_OFFLINE = 'Teltik gateway port offline';
+const ISSUE_TELTIK_GATEWAY_PORT_RESET_RESOLVED = 'Teltik gateway port reset resolved';
 
 export default {
   async fetch(request, env) {
@@ -423,14 +426,15 @@ async function processReport(env, report) {
 
 function buildEscalationCandidate(report, evidence, classification, exec, attemptNo) {
   const classifierEsc = classification && classification.terminal && classification.outcome === 'escalate';
-  const execFailed = exec && (exec.outcome === 'failed' || exec.outcome === 'verify_pending');
+  const execFailed = exec && (exec.outcome === 'failed' || exec.outcome === 'verify_pending' || exec.outcome === 'escalate');
   const verifyTerm = exec && (exec.gateStatus === 'verify_send_failed' || exec.gateStatus === 'verify_receive_timeout');
-  if (!classifierEsc && !verifyTerm && !(execFailed && classification.escalationReason)) {
+  if (!classifierEsc && !verifyTerm && !(execFailed && (classification.escalationReason || exec.escalationReason))) {
     return null;
   }
   const sim = evidence && evidence.sim || {};
   const rental = evidence && evidence.rental || {};
-  const reason = (classification && classification.escalationReason)
+  const reason = (exec && exec.escalationReason)
+    || (classification && classification.escalationReason)
     || (exec && exec.gateStatus)
     || (exec && exec.execStatus)
     || 'generic';
@@ -559,6 +563,9 @@ async function maybeExecuteAction(env, args) {
     ctx.iccid = (evidence.sim && evidence.sim.iccid) || null;
   } else if (action === 'teltik_reset_network' || action === 'teltik_reset_port') {
     ctx.mdn = (evidence.sim && evidence.sim.current_mdn_e164) || null;
+  } else if (action === 'teltik_sync_iccid') {
+    // T12 — the current ICCID the classifier resolved from the get-info-by-MDN read.
+    ctx.newIccid = (evidence.vendorRead && evidence.vendorRead.view && evidence.vendorRead.view.iccid) || null;
   }
 
   const res = await executeAction(env, ctx);
@@ -590,6 +597,41 @@ async function maybeExecuteAction(env, args) {
       evidence: { exec_status: res.status, ...(res.evidence || {}) },
       errorMessage: null,
       execStatus: res.status,
+    };
+  }
+
+  // TH5: physical Teltik gateway port is offline. This path is keyed by
+  // gateway_host, so Atomic/Wing/etc. SIMs hosted on Teltik are included while
+  // carrier-vendor classification remains separate. Teltik reset-port requires
+  // the CURRENT 10-digit MDN; ctx.mdn is populated from evidence.sim.msisdn.
+  if (classification.mode === 'TH5' && action === 'teltik_reset_port') {
+    if (!res.ok && res.status !== 'noop' && res.status !== 'cached') {
+      return {
+        outcome: 'failed',
+        evidence: { exec_status: res.status, issue_type: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE, ...(res.evidence || {}) },
+        errorMessage: res.errorMessage || 'teltik_gateway_port_reset_failed',
+        execStatus: res.status,
+        escalationReason: 'teltik_gateway_port_offline',
+        issueType: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
+      };
+    }
+    const recheck = await teltikPortStatus(env, { mdn: ctx.mdn });
+    const portOnline = !!(recheck && recheck.online === true);
+    const issueType = portOnline ? ISSUE_TELTIK_GATEWAY_PORT_RESET_RESOLVED : ISSUE_TELTIK_GATEWAY_PORT_OFFLINE;
+    return {
+      outcome: portOnline ? 'remediated' : 'escalate',
+      evidence: {
+        exec_status: res.status,
+        issue_type: issueType,
+        initial_port_status: evidence.teltikHostPortStatus || null,
+        recheck_port_status: recheck || null,
+        ...(res.evidence || {}),
+      },
+      errorMessage: null,
+      terminalReport: portOnline ? { status: 'remediated', remediation_action: 'port_reset' } : null,
+      execStatus: res.status,
+      escalationReason: portOnline ? null : 'teltik_gateway_port_offline',
+      issueType,
     };
   }
 
@@ -735,6 +777,26 @@ async function classifyShared(env, report, evidence) {
     });
   }
 
+  // TH5 — Teltik gateway-host port offline. This intentionally routes by
+  // physical host, not service-provider vendor: an Atomic rental can be hosted
+  // by Teltik and still needs Teltik reset-port. The reset key is current MDN
+  // from sims.msisdn/current_mdn_e164, not the reported/stale MDN or ICCID.
+  if (evidence.sim && isTeltikHosted(evidence.sim) && evidence.teltikHostPortStatus) {
+    const ps = evidence.teltikHostPortStatus;
+    const statusOk = ps.status >= 200 && ps.status < 300;
+    if (statusOk && ps.online === false) {
+      return nonTerminal('TH5', 'teltik_reset_port', 'classify_only', {
+        reason: 'teltik_gateway_port_offline',
+        issue_type: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
+        gateway_host: evidence.sim.gateway_host || null,
+        vendor: evidence.sim.vendor || null,
+        current_mdn: evidence.sim.current_mdn_e164 || null,
+        current_mdn10: mdn10(evidence.sim.current_mdn_e164 || ''),
+        port_status: ps.raw || 'offline',
+      }, 'teltik_gateway_port_offline', ISSUE_TELTIK_GATEWAY_PORT_OFFLINE);
+    }
+  }
+
   // S6 — unknown vendor or evidence too sparse.
   if (!evidence.sim || !evidence.sim.vendor) {
     return terminal('S6', 'escalate', 'escalate', {
@@ -864,6 +926,7 @@ async function gatherEvidence(env, report) {
     simLookupError: null,
     simNumber: null,
     currentSimNumberE164: null,
+    teltikHostPortStatus: null,
     newerOpenReportId: null,
     gatewayOffline: false,
     priorAttempts: 0,
@@ -883,7 +946,7 @@ async function gatherEvidence(env, report) {
     // without a coordinated cross-worker rewrite.
     const r = await supabaseGet(env,
       'sims?id=eq.' + encodeURIComponent(report.sim_id)
-      + '&select=id,iccid,vendor,status,msisdn,activated_at,gateway_id,port,imei,att_ban,mobility_subscription_id&limit=1');
+      + '&select=id,iccid,vendor,gateway_host,status,msisdn,activated_at,gateway_id,port,imei,att_ban,mobility_subscription_id&limit=1');
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) {
@@ -1024,6 +1087,16 @@ async function gatherEvidence(env, report) {
         + ' vendor=' + evidence.sim.vendor + ' error=' + (evidence.vendorRead.error || 'unknown'));
     }
   }
+  // Teltik-hosted port read is independent from carrier vendor read. Atomic or
+  // Wing service-provider SIMs hosted by Teltik still need this host-level
+  // status check and reset path.
+  if (evidence.sim && isTeltikHosted(evidence.sim) && evidence.sim.current_mdn_e164) {
+    try {
+      evidence.teltikHostPortStatus = await teltikPortStatus(env, { mdn: evidence.sim.current_mdn_e164 });
+    } catch (err) {
+      evidence.teltikHostPortStatus = { online: false, status: 0, error: String(err && err.message || err) };
+    }
+  }
   // S5 gateway-offline probe (only if we have gateway+port).
   if (evidence.sim && evidence.sim.gateway_id && evidence.sim.port && env.SKYLINE_GATEWAY) {
     try {
@@ -1071,11 +1144,11 @@ async function skylinePortStatus(env, gatewayId, port) {
 // Classification helpers
 // ---------------------------------------------------------
 
-function terminal(mode, action, outcome, evidenceSummary, escalationReason) {
-  return { mode, action, outcome, evidenceSummary, terminal: true, escalationReason: escalationReason || null };
+function terminal(mode, action, outcome, evidenceSummary, escalationReason, issueType) {
+  return { mode, action, outcome, evidenceSummary, terminal: true, escalationReason: escalationReason || null, issueType: issueType || null };
 }
-function nonTerminal(mode, action, outcome, evidenceSummary) {
-  return { mode, action, outcome, evidenceSummary, terminal: false };
+function nonTerminal(mode, action, outcome, evidenceSummary, escalationReason, issueType) {
+  return { mode, action, outcome, evidenceSummary, terminal: false, escalationReason: escalationReason || null, issueType: issueType || null };
 }
 
 // ---------------------------------------------------------
@@ -1145,6 +1218,9 @@ async function applyClassificationState(env, report, classification, exec) {
     patch.status = 'remediated';
     patch.remediation_action = exec.terminalReport && exec.terminalReport.remediation_action || 'other';
     patch.closed_at = patch.last_auto_attempt_at;
+  } else if (exec && exec.outcome === 'escalate') {
+    patch.auto_remediation_state = 'escalated';
+    patch.escalation_reason = exec.escalationReason || classification.escalationReason || 'operator_review_required';
   } else {
     // Leave queued so next tick picks it up.
     patch.auto_remediation_state = 'queued';

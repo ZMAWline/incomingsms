@@ -20,14 +20,14 @@ import {
 // Failure-type normalization
 // ---------------------------------------------------------
 
-test('ESCALATION_FAILURE_TYPES enumerates the 14 §H.3 types', () => {
-  assert.equal(ESCALATION_FAILURE_TYPES.length, 14);
+test('ESCALATION_FAILURE_TYPES enumerates the bad-rental operator failure types', () => {
+  assert.equal(ESCALATION_FAILURE_TYPES.length, 15);
   for (const t of [
     'verify_send_failed', 'verify_receive_timeout', 'vendor_active_no_sms',
     'vendor_iccid_not_found', 'imei_wrong_type', 'imei_drift_vendor',
     'vendor_cancelled_active_rental', 'wing_w7_dialable_retry_failed',
     'helix_unsuspend_failed', 'atomic_restore_failed', 'teltik_reset_failed',
-    'teltik_forward_url_misconfigured', 'unable_to_reproduce_recommendation',
+    'teltik_gateway_port_offline', 'teltik_forward_url_misconfigured', 'unable_to_reproduce_recommendation',
     'generic',
   ]) assert.ok(ESCALATION_FAILURE_TYPES.includes(t), 'missing ' + t);
 });
@@ -39,6 +39,7 @@ test('normalizeFailureType: pass-through known + alias mapping', () => {
   assert.equal(normalizeFailureType(null), 'generic');
   assert.equal(normalizeFailureType(''), 'generic');
   assert.equal(normalizeFailureType('helix_unsuspend_xyz'), 'helix_unsuspend_failed');
+  assert.equal(normalizeFailureType('teltik_gateway_port_offline'), 'teltik_gateway_port_offline');
 });
 
 // ---------------------------------------------------------

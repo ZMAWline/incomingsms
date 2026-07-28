@@ -110,6 +110,57 @@ test('db_sync_upsert: noop when DB already matches vendor truth', async () => {
 });
 
 // ---------------------------------------------------------
+// teltik_sync_iccid (T12)
+// ---------------------------------------------------------
+
+test('teltik_sync_iccid: patches new iccid + heals rotation state', async () => {
+  const { env, calls, restore } = makeFakeEnv();
+  try {
+    const res = await executeAction(env, {
+      action: 'teltik_sync_iccid',
+      sim: { id: 'sim-9', iccid: '8901OLD0000000000000', status: 'error' },
+      newIccid: '8901NEW0000000000000',
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.status, 'ok');
+    assert.equal(calls.simPatches.length, 1);
+    const body = calls.simPatches[0].body;
+    assert.equal(body.iccid, '8901NEW0000000000000');
+    assert.equal(body.status, 'active');
+    assert.equal(body.rotation_status, 'success');
+    assert.equal(body.rotation_fail_count, 0);
+    assert.equal(body.last_rotation_error, null);
+    assert.match(body.status_reason, /ICCID swapped from 8901OLD0000000000000 to 8901NEW0000000000000/);
+  } finally { restore(); }
+});
+
+test('teltik_sync_iccid: noop when DB iccid already matches vendor', async () => {
+  const { env, calls, restore } = makeFakeEnv();
+  try {
+    const res = await executeAction(env, {
+      action: 'teltik_sync_iccid',
+      sim: { id: 'sim-9', iccid: '8901SAME000000000000' },
+      newIccid: '8901SAME000000000000',
+    });
+    assert.equal(res.status, 'noop');
+    assert.equal(calls.simPatches.length, 0);
+  } finally { restore(); }
+});
+
+test('teltik_sync_iccid: bad_input when no resolved iccid', async () => {
+  const { env, restore } = makeFakeEnv();
+  try {
+    const res = await executeAction(env, {
+      action: 'teltik_sync_iccid',
+      sim: { id: 'sim-9', iccid: '8901OLD0000000000000' },
+      newIccid: null,
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.status, 'bad_input');
+  } finally { restore(); }
+});
+
+// ---------------------------------------------------------
 // resend_online
 // ---------------------------------------------------------
 
