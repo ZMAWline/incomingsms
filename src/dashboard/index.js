@@ -2273,7 +2273,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
       // Teltik /v1/port-status uses the same MDN format as /reset-port: 10 digits, US.
       const mdnDigits = toTeltik10Digit(resolvedMdn);
       try {
-        const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
+        const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey);
         const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
         const psHeaders = {};
         if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
@@ -2286,7 +2286,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
           iccid,
           imei: null,
           vendor: 'teltik',
-          request_url: 'https://api.smsgateway.xyz/v1/port-status?mdn=' + encodeURIComponent(mdnDigits),
+          request_url: 'https://api.smsgateway.xyz/v1/port-status',
           request_method: 'GET',
           request_body: null,
           response_status: psRes.status,
@@ -2356,41 +2356,57 @@ async function handleTeltikPortStatusQuery(request, env, corsHeaders) {
 
     const mdnDigits = toTeltik10Digit(mdn);
     if (!mdnDigits || mdnDigits.length !== 10) {
-      return new Response(JSON.stringify({ ok: false, error: 'valid 10-digit current MDN required for Teltik port-status', mdn: mdn || null, iccid, sim_id: simId }), {
+      return new Response(JSON.stringify({ ok: false, error: 'valid 10-digit current MDN required for Teltik line check', mdn: mdn || null, iccid, sim_id: simId }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
 
-    const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
+    // Hosted non-Teltik SIMs are line-specific by MDN, so first verify Teltik can
+    // see that MDN via get-info. Teltik port-status itself is account/gateway
+    // scoped and takes only apikey; passing mdn returns 404.
+    const giUrl = 'https://api.smsgateway.xyz/v1/get-info?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits);
+    const giFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + giUrl : giUrl;
+    const giHeaders = {};
+    if (env.RELAY_KEY) giHeaders['x-relay-key'] = env.RELAY_KEY;
+    const giRes = await fetch(giFetchUrl, { method: 'GET', headers: giHeaders });
+    const giText = await giRes.text();
+    let giJson = null; try { giJson = JSON.parse(giText); } catch {}
+    await logCarrierApiCall(env, {
+      run_id: 'teltik_host_get_info_' + (iccid || simId || mdnDigits) + '_' + Date.now(),
+      step: 'get_info', iccid, imei: null, vendor: 'teltik',
+      request_url: 'https://api.smsgateway.xyz/v1/get-info?mdn=' + encodeURIComponent(mdnDigits),
+      request_method: 'GET', request_body: null,
+      response_status: giRes.status, response_ok: giRes.ok,
+      response_body_text: giText, response_body_json: giJson,
+      error: giRes.ok ? null : 'Teltik get-info HTTP ' + giRes.status,
+    });
+
+    const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey);
     const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
     const psHeaders = {};
     if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
     const psRes = await fetch(psFetchUrl, { method: 'GET', headers: psHeaders });
     const psText = await psRes.text();
     let psJson = null; try { psJson = JSON.parse(psText); } catch {}
-
     await logCarrierApiCall(env, {
       run_id: 'teltik_host_port_status_' + (iccid || simId || mdnDigits) + '_' + Date.now(),
-      step: 'port_status',
-      iccid,
-      imei: null,
-      vendor: 'teltik',
-      request_url: 'https://api.smsgateway.xyz/v1/port-status?mdn=' + encodeURIComponent(mdnDigits),
-      request_method: 'GET',
-      request_body: null,
-      response_status: psRes.status,
-      response_ok: psRes.ok,
-      response_body_text: psText,
-      response_body_json: psJson,
+      step: 'port_status', iccid, imei: null, vendor: 'teltik',
+      request_url: 'https://api.smsgateway.xyz/v1/port-status',
+      request_method: 'GET', request_body: null,
+      response_status: psRes.status, response_ok: psRes.ok,
+      response_body_text: psText, response_body_json: psJson,
       error: psRes.ok ? null : 'Teltik port-status HTTP ' + psRes.status,
     });
 
     return new Response(JSON.stringify({
-      ok: psRes.ok,
-      http_status: psRes.status,
+      ok: giRes.ok && psRes.ok,
       mdn: mdnDigits,
       iccid,
       sim_id: simId,
+      get_info: { ok: giRes.ok, http_status: giRes.status, response: giJson || giText },
+      port_status: { ok: psRes.ok, http_status: psRes.status, response: psJson || psText },
+      // Back-compat for older frontend parser:
+      http_status: psRes.status,
       response: psJson || psText,
     }, null, 2), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
