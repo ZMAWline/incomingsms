@@ -6415,9 +6415,21 @@ async function sendSimOnline(simId, phoneNumber) {
 
         function formatHostedTeltikDetails(ps) {
             if (!ps) return '';
-            return '\n\n<span class="text-gray-500">--- Teltik host get-info response ---</span>\n'
+            const src = ps.mdn_source ? (' (MDN source: ' + ps.mdn_source + (ps.latest_teltik_sms && ps.latest_teltik_sms.received_at ? ', last SMS ' + ps.latest_teltik_sms.received_at : '') + ')') : '';
+            return '
+
+<span class="text-gray-500">--- Teltik host MDN used' + src + ' ---</span>
+'
+                + JSON.stringify({ mdn: ps.mdn || null, db_current_mdn: ps.db_current_mdn || null, latest_teltik_sms: ps.latest_teltik_sms || null }, null, 2)
+                + '
+
+<span class="text-gray-500">--- Teltik host get-info response ---</span>
+'
                 + JSON.stringify((ps.get_info && ps.get_info.response) || null, null, 2)
-                + '\n\n<span class="text-gray-500">--- Teltik host port-status response ---</span>\n'
+                + '
+
+<span class="text-gray-500">--- Teltik host port-status response ---</span>
+'
                 + JSON.stringify((ps.port_status && ps.port_status.response) || ps.response || null, null, 2);
         }
 

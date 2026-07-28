@@ -85,7 +85,10 @@ test('SIM Query uses service provider API and adds Teltik port-status for hosted
   assert.match(DASHBOARD_SRC, /\/api\/teltik-port-status/);
   assert.match(DASHBOARD_SRC, /get-info\?apikey=.*mdn=/s);
   assert.match(DASHBOARD_SRC, /port-status\?apikey=/);
+  assert.match(DASHBOARD_SRC, /findLatestTeltikSmsMdn/);
+  assert.match(DASHBOARD_SRC, /mdn_source/);
   assert.match(DASHBOARD_HTML, /fetchHostedTeltikPortStatus/);
   assert.match(DASHBOARD_HTML, /_teltikHostPortTag\(sim, atomicMdn \|\| sim\.phone_number\)/);
   assert.match(DASHBOARD_HTML, /\[Teltik port=/);
+  assert.match(DASHBOARD_HTML, /Teltik host MDN used/);
 });

@@ -2325,6 +2325,25 @@ async function handleTeltikQuery(request, env, corsHeaders) {
 }
 
 
+
+async function findLatestTeltikSmsMdn(env, { simId, iccid }) {
+  let q = null;
+  if (simId) {
+    q = 'inbound_sms?select=to_number,received_at,raw&sim_id=eq.' + encodeURIComponent(String(simId))
+      + '&to_number=not.is.null&order=received_at.desc&limit=1';
+  } else if (iccid) {
+    // Fallback for rows where sim_id was not available: raw nickname/alias carried the ICCID.
+    // PostgREST JSON operators are awkward via REST query, so keep this as a narrow raw-text ilike.
+    q = 'inbound_sms?select=to_number,received_at,raw&raw=ilike.' + encodeURIComponent('*' + String(iccid) + '*')
+      + '&to_number=not.is.null&order=received_at.desc&limit=1';
+  }
+  if (!q) return null;
+  const rows = await sbGet(env, q).catch(() => null);
+  const row = Array.isArray(rows) && rows[0] ? rows[0] : null;
+  if (!row || !row.to_number) return null;
+  return { mdn: row.to_number, received_at: row.received_at || null };
+}
+
 async function handleTeltikPortStatusQuery(request, env, corsHeaders) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405, headers: corsHeaders });
@@ -2354,9 +2373,14 @@ async function handleTeltikPortStatusQuery(request, env, corsHeaders) {
       }
     }
 
+    const dbCurrentMdn = mdn || null;
+    const latestTeltikSms = await findLatestTeltikSmsMdn(env, { simId, iccid });
+    if (latestTeltikSms && latestTeltikSms.mdn) mdn = latestTeltikSms.mdn;
+    const mdnSource = latestTeltikSms && latestTeltikSms.mdn ? 'last_teltik_inbound_sms' : 'db_current_mdn';
+
     const mdnDigits = toTeltik10Digit(mdn);
     if (!mdnDigits || mdnDigits.length !== 10) {
-      return new Response(JSON.stringify({ ok: false, error: 'valid 10-digit current MDN required for Teltik line check', mdn: mdn || null, iccid, sim_id: simId }), {
+      return new Response(JSON.stringify({ ok: false, error: 'valid 10-digit Teltik-known MDN required for Teltik line check', mdn: mdn || null, db_current_mdn: dbCurrentMdn, latest_teltik_sms: latestTeltikSms, iccid, sim_id: simId }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
@@ -2401,6 +2425,9 @@ async function handleTeltikPortStatusQuery(request, env, corsHeaders) {
     return new Response(JSON.stringify({
       ok: giRes.ok && psRes.ok,
       mdn: mdnDigits,
+      mdn_source: mdnSource,
+      db_current_mdn: dbCurrentMdn,
+      latest_teltik_sms: latestTeltikSms,
       iccid,
       sim_id: simId,
       get_info: { ok: giRes.ok, http_status: giRes.status, response: giJson || giText },
