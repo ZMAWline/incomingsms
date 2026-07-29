@@ -126,6 +126,16 @@ function makeHarness({ reports, sims = {}, rentals = {}, claimAlwaysFails = fals
       return new Response(JSON.stringify(
         db.attempts.filter(a => String(a.report_id) === String(rid))), { status: 200 });
     }
+    if (u.startsWith('https://atomic.test')) {
+      return new Response(JSON.stringify({
+        wholeSaleApi: {
+          wholeSaleResponse: {
+            statusCode: '00',
+            Result: { attStatus: 'active', MSISDN: '5550006817' },
+          },
+        },
+      }), { status: 200 });
+    }
     if (u.includes('/rental_report_events') && method === 'POST') {
       db.events.push(JSON.parse(init.body));
       return new Response('[]', { status: 201 });
@@ -248,6 +258,52 @@ test('expired sweep dismisses prior-day escalated and verify-pending rows too', 
   } finally { restore(); }
 });
 
+
+
+test('same-day A6 report records skipped_sms_unavailable instead of classify_only while SMS is disabled', async () => {
+  const reports = [{
+    id: 6817, status: 'received', received_at: new Date().toISOString(),
+    sim_id: 'sim-6817', sim_number_id: null, rental_id: 'r-6817', reseller_id: 'rs-1',
+    e164: '+15550006817', auto_remediation_state: null, last_auto_attempt_at: null,
+  }];
+  const { env, db, restore } = makeHarness({
+    reports,
+    sims: {
+      'sim-6817': {
+        id: 'sim-6817', iccid: '8901410327000006817', vendor: 'atomic', gateway_host: null,
+        status: 'active', msisdn: '5550006817', gateway_id: null, port: null,
+      },
+    },
+    rentals: { 'r-6817': { id: 'r-6817', sim_id: 'sim-6817', reseller_id: 'rs-1', reseller_rental_id: 'rr-6817', rental_date: '2026-07-29', minted_at: new Date().toISOString() } },
+  });
+  env.ATOMIC_USERNAME = 'u';
+  env.ATOMIC_TOKEN = 't';
+  env.ATOMIC_PIN = 'p';
+  env.ATOMIC_API_URL = 'https://atomic.test';
+  let resellerSyncCalls = 0;
+  env.RESELLER_SYNC = {
+    async fetch() {
+      resellerSyncCalls++;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    },
+  };
+  try {
+    const result = await runTickViaWorker(env);
+    assert.equal(result.outcomes.skipped_sms_unavailable, 1);
+    assert.equal(result.outcomes.classify_only, undefined);
+    assert.equal(result.attempted, 0, 'SMS-off skip must not consume the real-run budget');
+    assert.equal(resellerSyncCalls, 0, 'resend_online must not fire while verification is impossible');
+
+    const attempts = db.attempts.filter(a => String(a.report_id) === '6817');
+    assert.equal(attempts.length, 1);
+    assert.equal(attempts[0].mode, 'A6');
+    assert.equal(attempts[0].action, 'resend_online');
+    assert.equal(attempts[0].outcome, 'skipped_sms_unavailable');
+    assert.ok(attempts[0].next_review_at, 'row should be paced for later review, not tight-looped');
+    assert.equal(db.reports.get('6817').auto_remediation_state, 'queued');
+  } finally { restore(); }
+});
+
 // ---------------------------------------------------------
 // No infinite loop: rows that never leave the intake window (claim CAS always
 // loses) are bounded by SCAN_CAP, and skips never count as real runs.
@@ -277,8 +333,8 @@ test('runTick terminates via SCAN_CAP when rows never leave the intake window', 
 // ---------------------------------------------------------
 
 test('real-run budget excludes exactly the non-actionable outcomes', () => {
-  assert.ok(/NON_ACTIONABLE_OUTCOMES\s*=\s*new Set\(\[\s*'skipped_not_claimed',\s*'skipped_cooldown',\s*'duplicate'\s*\]\)/.test(SRC),
-    'non-actionable set must cover claim races, cooldown skips and dismissals');
+  assert.ok(/NON_ACTIONABLE_OUTCOMES\s*=\s*new Set\(\[\s*'skipped_not_claimed',\s*'skipped_cooldown',\s*'skipped_sms_unavailable',\s*'duplicate'\s*\]\)/.test(SRC),
+    'non-actionable set must cover claim races, cooldown skips, SMS-off skips and dismissals');
   assert.ok(SRC.includes('if (res.attemptInserted && !NON_ACTIONABLE_OUTCOMES.has(res.outcome)) attempted++;'),
     'attempted must only count real actionable runs');
 });

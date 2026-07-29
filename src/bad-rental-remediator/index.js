@@ -26,6 +26,7 @@ import { mdn10 } from './teltik.mjs';
 import { flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType } from './escalations.mjs';
 import { classifyExpiredReport } from './stale-classifier.mjs';
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
+import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
@@ -43,7 +44,7 @@ const INTAKE_LIMIT = 50;       // real actionable runs per tick (vendor/action/e
 // actionable report behind them every tick. SCAN_CAP bounds total rows
 // fetched per tick so a pathological queue (e.g. claim PATCHes all failing)
 // can never loop forever.
-const NON_ACTIONABLE_OUTCOMES = new Set(['skipped_not_claimed', 'skipped_cooldown', 'duplicate']);
+const NON_ACTIONABLE_OUTCOMES = new Set(['skipped_not_claimed', 'skipped_cooldown', 'skipped_sms_unavailable', 'duplicate']);
 const SCAN_CAP = 400;
 const EXPIRED_OPEN_SWEEP_CAP = 1000;
 // INC-26: a queued row touched within this window is skipped by intake. Rows
@@ -671,6 +672,29 @@ async function maybeExecuteAction(env, args) {
     return { outcome: classification.outcome, evidence: null, errorMessage: null };
   }
 
+  // TEMPORARY (2026-07-29): outbound SMS is globally off, so §C verification
+  // can never pass for actions whose terminal close needs it (resend_online,
+  // db_sync_upsert, OTA/restore/reset — everything routed through
+  // preResolveGate). Checked BEFORE the executor and the cooldown gate:
+  // firing the vendor action would burn its §G max-attempt/cooldown budget
+  // with no way to verify, and a maxed action must not escalate when its only
+  // remaining blocker is the SMS switch. Recorded as a non-terminal
+  // skipped_sms_unavailable bookkeeping row (excluded from summarizeAttempts);
+  // the report requeues and the intake deferral paces retries until SMS is
+  // back. TH5 teltik_reset_port is exempt — its terminal proof is the
+  // port-status recheck, not SMS.
+  const needsSmsVerify = action !== 'close_duplicate' && action !== 'classify_only'
+    && !(classification.mode === 'TH5' && action === 'teltik_reset_port');
+  if (needsSmsVerify && !smsSendingEnabled(env)) {
+    return {
+      outcome: 'skipped_sms_unavailable',
+      evidence: { gate_status: 'sms_unavailable', gate_reason: SMS_UNAVAILABLE_MESSAGE, skipped_action: action },
+      errorMessage: null,
+      execStatus: 'sms_unavailable',
+      gateStatus: 'sms_unavailable',
+    };
+  }
+
   // §G cooldown gate. canAttempt rejects when prior attempts for this action
   // are still inside the cooldown window OR the action's max-attempts cap is
   // reached. INC-26: cooldown_active requeues (intake deferral keeps the row
@@ -832,8 +856,12 @@ async function maybeExecuteAction(env, args) {
   }
 
   // Gate not passed — keep the report in flight, no terminal write.
+  // sms_unavailable maps to its own bookkeeping outcome (never the confusing
+  // classify_only fallback) — belt-and-suspenders for the pre-check above.
   return {
-    outcome: resolveGate.status === 'verify_pending' ? 'verify_pending' : (classification.outcome || 'no_change'),
+    outcome: resolveGate.status === 'verify_pending' ? 'verify_pending'
+           : resolveGate.status === 'sms_unavailable' ? 'skipped_sms_unavailable'
+           : (classification.outcome || 'no_change'),
     evidence: {
       exec_status: res.status,
       gate_status: resolveGate.status,

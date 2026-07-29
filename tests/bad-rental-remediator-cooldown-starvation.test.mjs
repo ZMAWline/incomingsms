@@ -40,6 +40,28 @@ test('summarizeAttempts ignores skipped_cooldown rows for per-action counts and 
   assert.equal(gate.ok, true, 'action with only-skipped history must be attemptable');
 });
 
+test('summarizeAttempts ignores skipped_sms_unavailable rows — SMS-off bookkeeping must not burn action budget', () => {
+  const rows = [
+    { id: 3, action: 'resend_online', attempted_at: '2026-07-29T12:00:00Z', outcome: 'skipped_sms_unavailable' },
+    { id: 2, action: 'resend_online', attempted_at: '2026-07-29T11:00:00Z', outcome: 'skipped_sms_unavailable' },
+    { id: 1, action: 'resend_online', attempted_at: '2026-07-28T10:00:00Z', outcome: 'classify_only' },
+  ];
+  const sum = summarizeAttempts(rows);
+  assert.equal(sum.total, 3);
+  assert.equal(sum.perAction.resend_online, 1, 'skipped_sms_unavailable rows must not count as attempts');
+  assert.equal(sum.lastAt.resend_online, '2026-07-28T10:00:00Z',
+    'lastAt must be the real attempt so the cooldown does not self-refresh while SMS is off');
+
+  // resend_online max is 2 — two SMS-off skips must not exhaust it.
+  const gate = canAttempt({
+    action: 'resend_online',
+    priorAttempts: sum.perAction.resend_online,
+    lastAttemptAt: sum.lastAt.resend_online,
+    now: new Date('2026-07-29T12:05:00Z'),
+  });
+  assert.equal(gate.ok, true, 'action must stay attemptable after SMS-off skips');
+});
+
 test('summarizeAttempts handles empty/null input and rows without action', () => {
   assert.deepEqual(summarizeAttempts(null), { total: 0, perAction: {}, lastAt: {} });
   assert.deepEqual(summarizeAttempts([null, { id: 1 }]).perAction, {});
