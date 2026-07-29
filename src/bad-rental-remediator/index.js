@@ -65,9 +65,11 @@ const TICK_LOCK_KEY = 'bad_rental_remediator_main_tick_lock';
 const TICK_LOCK_TTL_S = 120;
 const ISSUE_TELTIK_GATEWAY_PORT_OFFLINE = 'Teltik gateway port offline';
 // TH5: how long Teltik gets to re-register the port after /reset-port before
-// the recheck (env TELTIK_PORT_RECHECK_WAIT_MS overrides; tests set 0).
+// the deferred recheck pass. NOT slept inside the tick — it drives the
+// attempt's next_review_at and the intake-eligibility backdate so the next
+// tick performs the recheck (env TELTIK_PORT_RECHECK_WAIT_MS overrides;
+// tests set 0).
 const TELTIK_PORT_RECHECK_WAIT_MS = 30_000;
-const ISSUE_TELTIK_GATEWAY_PORT_RESET_RESOLVED = 'Teltik gateway port reset resolved';
 
 export default {
   async fetch(request, env) {
@@ -502,7 +504,9 @@ async function processReport(env, report) {
     outcome: exec.outcome || classification.outcome,
     evidence: mergeEvidence(classification.evidenceSummary, exec.evidence),
     error_message: exec.errorMessage || classification.errorMessage || null,
-    next_review_at: classification.nextReviewAt || null,
+    // Executor may schedule its own review (TH5 deferred port recheck ~30s);
+    // classifier's action-cadence default otherwise.
+    next_review_at: exec.nextReviewAt || classification.nextReviewAt || null,
   });
 
   // Update report-level auto state per classification + executor result.
@@ -804,34 +808,39 @@ async function maybeExecuteAction(env, args) {
         issueType: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
       };
     }
-    // Teltik needs a beat to re-register the port after /reset-port — an
-    // immediate recheck reads the pre-reset state. 30s per the product flow
-    // (Zalmen 2026-07-29, report #6817); env-injectable so tests don't sleep.
-    const waitMs = env.TELTIK_PORT_RECHECK_WAIT_MS !== undefined
+    // Teltik needs a beat to re-register the port after /reset-port — but
+    // sleeping 30s here blocked the whole tick per report and blew the 55s
+    // budget (live tail 2026-07-29 02:55: fetched 50, processed 12). Defer
+    // the recheck instead: record the reset with recheck pending, stamp the
+    // attempt's next_review_at ~30s out, and backdate the report's
+    // last_auto_attempt_at (via intakeEligibleInMs) so fetchOpenReports
+    // re-admits the row after the re-register window, not the full 15m
+    // intake defer. The next eligible pass reads /v1/port-status fresh:
+    // still offline → the classifier sees the prior reset attempt and
+    // escalates teltik_gateway_port_offline without resetting again;
+    // online → TH5 skips and TH2 routes the host resend (resend_online).
+    // A post-reset online port proves the reset worked, NOT that the
+    // reseller has its number back — never close `remediated` off port
+    // state alone.
+    const recheckDelayMs = env.TELTIK_PORT_RECHECK_WAIT_MS !== undefined
       ? Number(env.TELTIK_PORT_RECHECK_WAIT_MS) : TELTIK_PORT_RECHECK_WAIT_MS;
-    if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
-    const recheck = await teltikPortStatus(env);
-    const portOnline = !!(recheck && recheck.online === true);
-    const issueType = portOnline ? ISSUE_TELTIK_GATEWAY_PORT_RESET_RESOLVED : ISSUE_TELTIK_GATEWAY_PORT_OFFLINE;
-    // A recheck-online proves the reset worked, NOT that the reseller has its
-    // number back — never close `remediated` off port state alone. Requeue:
-    // the next tick sees the port online, skips TH5 and routes the host
-    // resend path (TH2 resend_online).
     return {
-      outcome: portOnline ? 'no_change' : 'escalate',
+      outcome: 'no_change',
       evidence: {
         exec_status: res.status,
-        issue_type: issueType,
+        issue_type: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
         initial_port_status: evidence.teltikHostPortStatus || null,
-        recheck_wait_ms: waitMs,
-        recheck_port_status: recheck || null,
+        recheck: 'pending',
+        recheck_delay_ms: recheckDelayMs,
         ...(res.evidence || {}),
       },
       errorMessage: null,
       terminalReport: null,
       execStatus: res.status,
-      escalationReason: portOnline ? null : 'teltik_gateway_port_offline',
-      issueType,
+      escalationReason: null,
+      issueType: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
+      nextReviewAt: new Date(Date.now() + recheckDelayMs).toISOString(),
+      intakeEligibleInMs: recheckDelayMs,
     };
   }
 
@@ -1009,6 +1018,24 @@ async function classifyShared(env, report, evidence) {
     const providerNotActive = String(evidence.sim.vendor || '').toLowerCase() !== 'teltik'
       && !!(vr && vr.ok === true && vr.healthy === false);
     if (statusOk && ps.online === false && !providerNotActive) {
+      // Deferred TH5 recheck pass: a prior counted teltik_reset_port attempt
+      // on this (same-day) report means the reset already fired and the port
+      // is STILL offline after the re-register window — escalate to an
+      // operator without burning another reset. Bookkeeping rows
+      // (skipped_cooldown/skipped_sms_unavailable) are already excluded by
+      // summarizeAttempts, and a failed reset escalated on its own tick.
+      const priorResets = (evidence.priorActionAttempts && evidence.priorActionAttempts.teltik_reset_port) || 0;
+      if (priorResets > 0) {
+        return terminal('TH5', 'escalate', 'escalate', {
+          reason: 'teltik_gateway_port_offline_after_reset',
+          issue_type: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
+          gateway_host: evidence.sim.gateway_host || null,
+          vendor: evidence.sim.vendor || null,
+          port_status: ps.raw || 'offline',
+          prior_reset_attempts: priorResets,
+          last_reset_at: (evidence.lastActionAttemptAt && evidence.lastActionAttemptAt.teltik_reset_port) || null,
+        }, 'teltik_gateway_port_offline', ISSUE_TELTIK_GATEWAY_PORT_OFFLINE);
+      }
       const resetMdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
         || evidence.sim.current_mdn_e164 || '';
       return nonTerminal('TH5', 'teltik_reset_port', 'classify_only', {
@@ -1527,6 +1554,14 @@ async function applyClassificationState(env, report, classification, exec) {
     // Leave queued; the INTAKE_DEFER_MS window in fetchOpenReports keeps this
     // row from re-consuming an intake slot until the deferral elapses.
     patch.auto_remediation_state = 'queued';
+    // Executor asked for an earlier re-run (TH5 deferred port recheck).
+    // rental_reports has no next_review_at column, so shorten the effective
+    // deferral by backdating last_auto_attempt_at: eligible again in
+    // intakeEligibleInMs instead of the full INTAKE_DEFER_MS.
+    if (exec && Number.isFinite(exec.intakeEligibleInMs)) {
+      patch.last_auto_attempt_at =
+        new Date(Date.now() - INTAKE_DEFER_MS + exec.intakeEligibleInMs).toISOString();
+    }
   }
   const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
     method: 'PATCH',
