@@ -20,7 +20,7 @@
 
 import { runVerifyPoll, preResolveGate } from './verify-runner.mjs';
 import { executeAction } from './actions.mjs';
-import { canAttempt } from './cooldown.mjs';
+import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
 import { teltikPortStatus, readVendorView } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import { flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType } from './escalations.mjs';
@@ -35,6 +35,12 @@ const ACTION_DISABLE_SUFFIX = '_disabled';
 const TICK_BUDGET_MS = 55_000; // §G: 60s tick budget, leave headroom.
 const CONCURRENCY = 5;         // §G concurrency cap.
 const INTAKE_LIMIT = 50;       // upper bound per tick.
+// INC-26: a queued row touched within this window is skipped by intake. Rows
+// held only by an action cooldown (1h..24h) were re-fetched every 5-minute
+// tick, recording skipped_cooldown 50× and starving newer reports out of the
+// LIMIT 50 window. rental_reports has no next_review_at column, so defer on
+// last_auto_attempt_at (set on every processed row) instead — schema-free.
+const INTAKE_DEFER_MS = 15 * 60 * 1000;
 // INC-25: any row stuck in `in_progress` past this window with no progress
 // is treated as an abandoned claim from a crashed/raced tick and reset to
 // `queued` at the start of the next tick. 10 minutes is well above the 60s
@@ -516,21 +522,16 @@ async function maybeExecuteAction(env, args) {
     return { outcome: classification.outcome, evidence: null, errorMessage: null };
   }
 
-  // 24h cooldown gate (§G). canAttempt rejects when prior attempts for this
-  // action are still inside the cooldown window OR the action's max-attempts
-  // cap is reached. classify_only / close_duplicate / db_sync_upsert have
-  // cooldownMs=0 so they always pass here; the vendor restore/refresh actions
-  // (INC-16e) are the ones this actually gates.
+  // §G cooldown gate. canAttempt rejects when prior attempts for this action
+  // are still inside the cooldown window OR the action's max-attempts cap is
+  // reached. INC-26: cooldown_active requeues (intake deferral keeps the row
+  // out of the next few ticks); max_attempts_reached escalates — requeueing a
+  // maxed action can never succeed and was starving the queue forever.
   const priorActionAttempts = (evidence.priorActionAttempts && evidence.priorActionAttempts[action]) || 0;
   const lastActionAttemptAt = evidence.lastActionAttemptAt && evidence.lastActionAttemptAt[action] || null;
   const gate = canAttempt({ action, priorAttempts: priorActionAttempts, lastAttemptAt: lastActionAttemptAt, now: new Date() });
   if (!gate.ok) {
-    return {
-      outcome: 'skipped_cooldown',
-      evidence: { cooldown_gate: gate, action, prior_attempts: priorActionAttempts },
-      errorMessage: null,
-      execStatus: 'cooldown_active',
-    };
+    return gateRejection(gate, action, priorActionAttempts);
   }
 
   // For S1 the worker has already cleared §E cancel-guard.
@@ -840,7 +841,10 @@ async function classifyShared(env, report, evidence) {
     imeiCheck: null,
     webhook: { delivered: !!(evidence.webhook && evidence.webhook.delivered) },
     report,
-    priorAttempts: evidence.priorAttempts || 0,
+    // Classifier's priorAttempts drives the classify_only exhaustion branches
+    // (A10 etc.) — feed it real classify_only attempts, not the total row
+    // count, which skipped_cooldown bookkeeping rows inflate (INC-26).
+    priorAttempts: (evidence.priorActionAttempts && evidence.priorActionAttempts.classify_only) || 0,
     cancelGuard,
     recentResellerBadSignal: true,
   });
@@ -1051,22 +1055,20 @@ async function gatherEvidence(env, report) {
   // them the gate always sees 0 attempts and would re-fire live vendor actions
   // every tick (carrier spam). `action` holds the action token (e.g.
   // 'atomic_restore'); `attempted_at` is the timestamp.
+  // INC-26: summarizeAttempts excludes `skipped_cooldown` rows from the
+  // per-action maps — those rows are gate bookkeeping, and counting them
+  // refreshed the cooldown window every tick (never expiring) and burned the
+  // max-attempts budget without any vendor call.
   const ar = await supabaseGet(env,
     'rental_report_remediation_attempts?report_id=eq.' + encodeURIComponent(report.id)
-    + '&select=id,action,attempted_at&order=id.desc&limit=200');
+    + '&select=id,action,attempted_at,outcome&order=id.desc&limit=200');
   if (ar.ok) {
     const rows = await ar.json();
     if (Array.isArray(rows)) {
-      evidence.priorAttempts = rows.length;
-      for (const row of rows) {
-        const act = row && row.action;
-        if (!act) continue;
-        evidence.priorActionAttempts[act] = (evidence.priorActionAttempts[act] || 0) + 1;
-        const at = row.attempted_at || null;
-        if (at && (!evidence.lastActionAttemptAt[act] || at > evidence.lastActionAttemptAt[act])) {
-          evidence.lastActionAttemptAt[act] = at;
-        }
-      }
+      const sum = summarizeAttempts(rows);
+      evidence.priorAttempts = sum.total;
+      evidence.priorActionAttempts = sum.perAction;
+      evidence.lastActionAttemptAt = sum.lastAt;
     }
   }
   // Webhook delivery signal (§C.4.3 + classifier A6/W2/H2/T2). Has a recent
@@ -1229,7 +1231,14 @@ function parseAffectedCount(resp) {
 async function applyClassificationState(env, report, classification, exec) {
   const patch = { last_auto_attempt_at: new Date().toISOString() };
   const execOk = exec && (exec.execStatus === 'ok' || exec.execStatus === 'noop');
-  if (classification.terminal) {
+  // INC-26: an executor-level escalate (incl. max_attempts_reached from the
+  // gate) wins over the classification shape — checked first so a terminal
+  // `duplicate` classification whose close_duplicate is maxed out escalates
+  // instead of silently requeueing forever.
+  if (exec && exec.outcome === 'escalate') {
+    patch.auto_remediation_state = 'escalated';
+    patch.escalation_reason = exec.escalationReason || classification.escalationReason || 'operator_review_required';
+  } else if (classification.terminal) {
     if (classification.outcome === 'escalate') {
       patch.auto_remediation_state = 'escalated';
       if (classification.escalationReason) patch.escalation_reason = classification.escalationReason;
@@ -1255,11 +1264,9 @@ async function applyClassificationState(env, report, classification, exec) {
     patch.status = 'remediated';
     patch.remediation_action = exec.terminalReport && exec.terminalReport.remediation_action || 'other';
     patch.closed_at = patch.last_auto_attempt_at;
-  } else if (exec && exec.outcome === 'escalate') {
-    patch.auto_remediation_state = 'escalated';
-    patch.escalation_reason = exec.escalationReason || classification.escalationReason || 'operator_review_required';
   } else {
-    // Leave queued so next tick picks it up.
+    // Leave queued; the INTAKE_DEFER_MS window in fetchOpenReports keeps this
+    // row from re-consuming an intake slot until the deferral elapses.
     patch.auto_remediation_state = 'queued';
   }
   const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
@@ -1379,11 +1386,21 @@ async function releaseTickLock(env) {
 async function fetchOpenReports(env, limit) {
   // Skip paused / operator_locked / verify_pending / escalated / done — these
   // are not the worker's to touch this tick.
+  //
+  // INC-26 starvation fix, two parts:
+  //   1. Defer rows touched within INTAKE_DEFER_MS (last_auto_attempt_at is
+  //      stamped on every processed row) so a cooldown-held row can't consume
+  //      an intake slot every tick while ineligible.
+  //   2. Order by last_auto_attempt_at nullsfirst so never-tried reports beat
+  //      least-recently-tried ones even when the eligible backlog exceeds
+  //      LIMIT — received_at asc alone let the oldest 50 rows starve the rest.
+  const cutoff = new Date(Date.now() - INTAKE_DEFER_MS).toISOString();
   const select = 'id,reseller_id,sim_id,sim_number_id,rental_id,e164,status,received_at,auto_remediation_state';
   const q = 'rental_reports?status=in.(received,in_triage)'
-    + '&or=(auto_remediation_state.is.null,auto_remediation_state.eq.queued)'
+    + '&and=(or(auto_remediation_state.is.null,auto_remediation_state.eq.queued)'
+    +   ',or(last_auto_attempt_at.is.null,last_auto_attempt_at.lt.' + encodeURIComponent(cutoff) + '))'
     + '&select=' + encodeURIComponent(select)
-    + '&order=received_at.asc&limit=' + limit;
+    + '&order=last_auto_attempt_at.asc.nullsfirst,received_at.asc&limit=' + limit;
   const r = await supabaseGet(env, q);
   if (!r.ok) {
     const txt = await r.text();
