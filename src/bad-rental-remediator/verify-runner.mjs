@@ -26,6 +26,7 @@
 // =========================================================
 
 import { mintNonce, buildVerifyBody, cleanRecheckPredicate } from './verify.mjs';
+import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
 
 const RECEIVE_WINDOW_MS = 5 * 60 * 1000; // §C.3 — 5 min, 30 × 10s polls.
 const SEND_MAX_ATTEMPTS = 3;             // §C.2
@@ -43,6 +44,13 @@ export async function startVerify(env, opts) {
   const { report, sim, attemptNo, sleep = realSleep, now = () => new Date() } = opts;
   if (!report || !report.id) throw new Error('startVerify_missing_report');
   if (!sim || !sim.id || !sim.current_mdn_e164) throw new Error('startVerify_missing_sim');
+  // TEMPORARY: outbound SMS disabled (gateways off) — skip the nonce send
+  // without escalating or recording a failed attempt. The report stays in its
+  // current state and re-verifies once SMS is back on. Single switch in
+  // src/shared/sms-availability.mjs.
+  if (!smsSendingEnabled(env)) {
+    return { ok: false, status: 'sms_unavailable', error: SMS_UNAVAILABLE_MESSAGE };
+  }
   if (!sim.gateway_id || !sim.port) {
     return await recordSendFailed(env, report.id, attemptNo, 'missing_gateway_or_port', null);
   }
