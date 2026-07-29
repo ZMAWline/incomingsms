@@ -81,13 +81,13 @@ function makeFakeEnv({ kv = {}, resellerSyncResponse, inboundSms } = {}) {
 // db_sync_upsert
 // ---------------------------------------------------------
 
-test('db_sync_upsert: patches diff vs current sim columns', async () => {
+test('db_sync_upsert: patches diff vs current sim columns (schema keys: status/msisdn/imei)', async () => {
   const { env, calls, restore } = makeFakeEnv();
   try {
     const res = await executeAction(env, {
       action: 'db_sync_upsert',
-      sim: { id: 'sim-1', status: 'inactive', current_mdn_e164: '+15550001111', imei: '111' },
-      targets: { status: 'active', current_mdn_e164: '+15550001111', imei: '222' },
+      sim: { id: 'sim-1', status: 'inactive', msisdn: '5550001111', imei: '111' },
+      targets: { status: 'active', msisdn: '5550001111', imei: '222' },
     });
     assert.equal(res.ok, true);
     assert.equal(res.status, 'ok');
@@ -96,17 +96,70 @@ test('db_sync_upsert: patches diff vs current sim columns', async () => {
   } finally { restore(); }
 });
 
+test('db_sync_upsert: syncs msisdn (sims has no current_mdn_e164 column)', async () => {
+  const { env, calls, restore } = makeFakeEnv();
+  try {
+    const res = await executeAction(env, {
+      action: 'db_sync_upsert',
+      sim: { id: 'sim-1b', status: 'active', msisdn: '5550001111' },
+      targets: { msisdn: '5550002222' },
+    });
+    assert.equal(res.ok, true);
+    assert.deepEqual(calls.simPatches[0].body, { msisdn: '5550002222' });
+    assert.ok(!('current_mdn_e164' in calls.simPatches[0].body));
+  } finally { restore(); }
+});
+
 test('db_sync_upsert: noop when DB already matches vendor truth', async () => {
   const { env, calls, restore } = makeFakeEnv();
   try {
     const res = await executeAction(env, {
       action: 'db_sync_upsert',
-      sim: { id: 'sim-2', status: 'active', current_mdn_e164: '+15550001111' },
-      targets: { status: 'active', current_mdn_e164: '+15550001111' },
+      sim: { id: 'sim-2', status: 'active', msisdn: '5550001111' },
+      targets: { status: 'active', msisdn: '5550001111' },
     });
     assert.equal(res.status, 'noop');
     assert.equal(calls.simPatches.length, 0);
   } finally { restore(); }
+});
+
+test('db_sync_upsert: worker-built targets from classifier (regression: targets were never built → eternal noop)', async () => {
+  // buildDbSyncTargets is the piece that was missing: classifications carried
+  // no targets, so every db_sync attempt recorded noop and DB-stale reports
+  // cycled forever.
+  const { buildDbSyncTargets } = await import('../src/bad-rental-remediator/classifier.mjs');
+
+  // A2-style: vendor active, DB stale → status sync.
+  const a2 = buildDbSyncTargets(
+    { id: 'A2', auto_action: 'db_sync_upsert' },
+    { status: 'inactive', msisdn: '5550001111' },
+    { attStatus: 'active' },
+  );
+  assert.deepEqual(a2, { status: 'active' });
+
+  // A9-style: vendor MSISDN differs → msisdn sync, normalized to 10 digits.
+  const a9 = buildDbSyncTargets(
+    { id: 'A9', auto_action: 'db_sync_upsert' },
+    { status: 'active', msisdn: '5550001111' },
+    { attStatus: 'active', MSISDN: '+15550002222' },
+  );
+  assert.deepEqual(a9, { msisdn: '5550002222' });
+
+  // T8 must NOT produce an MDN sync (Teltik never attests an MDN — syncing
+  // would write the stale Teltik-known MDN over the DB current one).
+  const t8 = buildDbSyncTargets(
+    { id: 'T8', auto_action: 'db_sync_upsert' },
+    { status: 'active', msisdn: '5550001111' },
+    { MDN: '5550009999' },
+  );
+  assert.equal(t8, null);
+
+  // Non-db_sync situations return null.
+  assert.equal(buildDbSyncTargets({ id: 'A1', auto_action: 'atomic_ota' }, {}, {}), null);
+  // Wired into the worker: classification carries targets to the executor.
+  const SRC = (await import('node:fs')).readFileSync(
+    new URL('../src/bad-rental-remediator/index.js', import.meta.url), 'utf8');
+  assert.match(SRC, /targets:\s*buildDbSyncTargets\(situation, evidence\.sim, vendorView\)/);
 });
 
 // ---------------------------------------------------------

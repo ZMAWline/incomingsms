@@ -259,20 +259,18 @@ async function teltikGet(env, path, mdn) {
 }
 
 // ---------------------------------------------------------
-// Teltik /v1/port-status — used by the T3/T4/T5 §C.4 extra predicate.
-// Returns { online: bool, raw: <state>, status }.
+// Teltik /v1/port-status — used by the T3/T4/T5 §C.4 extra predicate and the
+// TH5 host probe. Per the Teltik API docs the endpoint takes ONLY apikey: it
+// reports account/gateway port registration, not a specific line, so it can
+// never be keyed by MDN or ICCID (the dashboard's handleTeltikQuery was fixed
+// the same way in 40feedb). Returns { online: bool, raw: <state>, status }.
 // ---------------------------------------------------------
-export async function teltikPortStatus(env, { mdn }) {
+export async function teltikPortStatus(env) {
   if (!env.TELTIK_API_KEY) {
     return { online: false, status: 0, error: 'teltik_credentials_missing' };
   }
-  const norm = mdn10(mdn);
-  if (!norm || norm.length !== 10) {
-    return { online: false, status: 0, error: 'teltik_mdn_invalid:' + norm };
-  }
   const url = 'https://api.smsgateway.xyz/v1/port-status'
-    + '?apikey=' + encodeURIComponent(env.TELTIK_API_KEY)
-    + '&mdn=' + encodeURIComponent(norm);
+    + '?apikey=' + encodeURIComponent(env.TELTIK_API_KEY);
   let resp, text;
   try {
     resp = await relayFetch(env, url, { method: 'GET' });
@@ -400,6 +398,12 @@ export async function helixSubscriberDetails(env, { mobilitySubscriptionId }) {
 // Teltik — line state (/v1/get-info) + port state (teltikPortStatus). The port
 // read is left UNSET on any read failure so a transient error never looks like
 // "offline" and triggers a reset.
+//
+// `mdn` must be the TELTIK-KNOWN MDN (latest Teltik inbound SMS destination,
+// falling back to DB current MDN — see src/shared/teltik-known-mdn.mjs):
+// Teltik/TotalTick can still know a line by the first MDN it ever saw because
+// our rotations do not sync back, so keying get-info by the DB current MDN
+// 404s and misclassifies the line as T7 vendor-not-found.
 export async function teltikLineView(env, { mdn }) {
   if (!env.TELTIK_API_KEY) return { ok: false, error: 'teltik_credentials_missing' };
   const norm = mdn10(mdn);
@@ -417,9 +421,13 @@ export async function teltikLineView(env, { mdn }) {
   // Capture the vendor's current ICCID: a get-info BY MDN still resolves a line
   // whose physical SIM card was swapped (the MDN is stable), so json.iccid is the
   // authoritative current ICCID even when our DB holds the now-invalid old one.
-  const out = { ok: true, not_found: false, line_state: lineState, status: lineState, MDN: norm, iccid: json.iccid || null };
+  // queried_mdn (NOT `MDN`): get-info returns {iccid, gateway_id, port} — it
+  // never attests the line's MDN, and the key we passed is the Teltik-known
+  // (possibly rotation-stale) MDN. Reporting it as `MDN` would make T8 "sync"
+  // sims.msisdn back to the stale number.
+  const out = { ok: true, not_found: false, line_state: lineState, status: lineState, queried_mdn: norm, iccid: json.iccid || null };
   // Port state — only trust a positively-read state.
-  const port = await teltikPortStatus(env, { mdn: norm });
+  const port = await teltikPortStatus(env);
   if (port && port.status && port.status >= 200 && port.status < 300) {
     out.port_status = port.online ? 'online' : (port.raw || undefined);
   }
@@ -458,8 +466,12 @@ export function vendorViewFromRead(vendor, read) {
     const portOnline = read.port_status === 'online';
     return {
       view: {
+        // MDN deliberately null: Teltik cannot attest the line's MDN (get-info
+        // is keyed BY mdn and returns only iccid/gateway/port), so T8
+        // MDN-drift detection must never fire off a Teltik read — it would
+        // db_sync the stale Teltik-known MDN over the DB current one.
         not_found: false, line_state: read.line_state, status: read.status,
-        port_status: read.port_status, MDN: read.MDN, iccid: read.iccid || null,
+        port_status: read.port_status, MDN: null, iccid: read.iccid || null,
       },
       healthy: (read.line_state === 'active' || read.line_state === 'activated' || !read.line_state)
         && portOnline,
@@ -472,7 +484,10 @@ export function vendorViewFromRead(vendor, read) {
 // Dispatcher: read the right vendor and project to { ok, view, healthy, extras }.
 // Any failure (unsupported vendor, transient read error, throw) → { ok:false }
 // so the worker passes vendorView=null and the classifier defers safely.
-export async function readVendorView(env, sim) {
+// opts.teltikKnownMdn: the MDN Teltik knows the line by (resolved by the worker
+// from the latest Teltik inbound SMS destination); required for a reliable
+// teltik get-info because the DB current MDN goes stale on Teltik's side.
+export async function readVendorView(env, sim, opts = {}) {
   const vendor = String(sim && sim.vendor || '').toLowerCase();
   try {
     let read;
@@ -490,7 +505,7 @@ export async function readVendorView(env, sim) {
     } else if (vendor === 'helix') {
       read = await helixSubscriberDetails(env, { mobilitySubscriptionId: sim.mobility_subscription_id });
     } else if (vendor === 'teltik') {
-      read = await teltikLineView(env, { mdn: sim.current_mdn_e164 });
+      read = await teltikLineView(env, { mdn: opts.teltikKnownMdn || sim.current_mdn_e164 });
     } else {
       return { ok: false, error: 'unsupported_vendor:' + vendor };
     }

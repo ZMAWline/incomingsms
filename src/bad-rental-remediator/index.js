@@ -25,6 +25,7 @@ import { teltikPortStatus, readVendorView } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import { flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType } from './escalations.mjs';
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
+import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const LAST_MAIN_TICK_KEY = 'bad_rental_remediator_last_main_tick';
@@ -562,7 +563,10 @@ async function maybeExecuteAction(env, args) {
   } else if (action === 'wing_put_dialable') {
     ctx.iccid = (evidence.sim && evidence.sim.iccid) || null;
   } else if (action === 'teltik_reset_network' || action === 'teltik_reset_port') {
-    ctx.mdn = (evidence.sim && evidence.sim.current_mdn_e164) || null;
+    // Teltik reset endpoints are keyed by the MDN Teltik knows the line by —
+    // rotations don't sync back, so prefer the Teltik-known MDN over DB current.
+    ctx.mdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+      || (evidence.sim && evidence.sim.current_mdn_e164) || null;
   } else if (action === 'teltik_sync_iccid') {
     // T12 — the current ICCID the classifier resolved from the get-info-by-MDN read.
     ctx.newIccid = (evidence.vendorRead && evidence.vendorRead.view && evidence.vendorRead.view.iccid) || null;
@@ -602,8 +606,9 @@ async function maybeExecuteAction(env, args) {
 
   // TH5: physical Teltik gateway port is offline. This path is keyed by
   // gateway_host, so Atomic/Wing/etc. SIMs hosted on Teltik are included while
-  // carrier-vendor classification remains separate. Teltik reset-port requires
-  // the CURRENT 10-digit MDN; ctx.mdn is populated from evidence.sim.msisdn.
+  // carrier-vendor classification remains separate. Teltik reset-port is keyed
+  // by the Teltik-known 10-digit MDN (ctx.mdn above); the post-reset recheck
+  // uses account-scoped /v1/port-status (apikey only).
   if (classification.mode === 'TH5' && action === 'teltik_reset_port') {
     if (!res.ok && res.status !== 'noop' && res.status !== 'cached') {
       return {
@@ -615,7 +620,7 @@ async function maybeExecuteAction(env, args) {
         issueType: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
       };
     }
-    const recheck = await teltikPortStatus(env, { mdn: ctx.mdn });
+    const recheck = await teltikPortStatus(env);
     const portOnline = !!(recheck && recheck.online === true);
     const issueType = portOnline ? ISSUE_TELTIK_GATEWAY_PORT_RESET_RESOLVED : ISSUE_TELTIK_GATEWAY_PORT_OFFLINE;
     return {
@@ -779,19 +784,23 @@ async function classifyShared(env, report, evidence) {
 
   // TH5 — Teltik gateway-host port offline. This intentionally routes by
   // physical host, not service-provider vendor: an Atomic rental can be hosted
-  // by Teltik and still needs Teltik reset-port. The reset key is current MDN
-  // from sims.msisdn/current_mdn_e164, not the reported/stale MDN or ICCID.
+  // by Teltik and still needs Teltik reset-port. The reset key is the
+  // TELTIK-KNOWN MDN (latest Teltik inbound SMS destination, falling back to
+  // the SIM's current MDN) — never the reported/stale rental e164 or ICCID.
   if (evidence.sim && isTeltikHosted(evidence.sim) && evidence.teltikHostPortStatus) {
     const ps = evidence.teltikHostPortStatus;
     const statusOk = ps.status >= 200 && ps.status < 300;
     if (statusOk && ps.online === false) {
+      const resetMdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+        || evidence.sim.current_mdn_e164 || '';
       return nonTerminal('TH5', 'teltik_reset_port', 'classify_only', {
         reason: 'teltik_gateway_port_offline',
         issue_type: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
         gateway_host: evidence.sim.gateway_host || null,
         vendor: evidence.sim.vendor || null,
         current_mdn: evidence.sim.current_mdn_e164 || null,
-        current_mdn10: mdn10(evidence.sim.current_mdn_e164 || ''),
+        teltik_known_mdn: evidence.teltikKnownMdn || null,
+        reset_mdn10: mdn10(resetMdn),
         port_status: ps.raw || 'offline',
       }, 'teltik_gateway_port_offline', ISSUE_TELTIK_GATEWAY_PORT_OFFLINE);
     }
@@ -818,7 +827,7 @@ async function classifyShared(env, report, evidence) {
   // (pending_vendor_read / classify_only) instead of acting on a bad read.
   // imeiCheck stays null for now (classifier tolerates null — every IMEI branch
   // is guarded); the IMEI signal is a separate follow-up.
-  const { classifyVendor } = await import('./classifier.mjs');
+  const { classifyVendor, buildDbSyncTargets } = await import('./classifier.mjs');
   const { nextReviewAt }   = await import('./cooldown.mjs');
   const vr = evidence.vendorRead;
   const vendorView = (vr && vr.ok) ? vr.view : null;
@@ -847,6 +856,10 @@ async function classifyShared(env, report, evidence) {
   return {
     mode: situation.id,
     action: situation.auto_action,
+    // Concrete DB patch for db_sync_upsert situations. Without this the
+    // executor saw targets={} and recorded a noop — the "acts but never fixes"
+    // failure that kept DB-stale reports cycling forever.
+    targets: buildDbSyncTargets(situation, evidence.sim, vendorView),
     outcome: isEscalate ? 'escalate'
            : isDuplicate ? 'duplicate'
            : situation.auto_action === 'classify_only' ? 'no_change' : 'classify_only',
@@ -934,6 +947,7 @@ async function gatherEvidence(env, report) {
     lastActionAttemptAt: {},    // per-action latest attempted_at (ISO)
     webhook: { delivered: false, lastDeliveredAt: null },
     vendorRead: null,           // { ok, view, healthy, extras, raw } from readVendorView
+    teltikKnownMdn: null,       // { mdn, source, received_at } — pickTeltikKnownMdn
   };
 
   if (report.sim_id) {
@@ -1073,12 +1087,34 @@ async function gatherEvidence(env, report) {
       }
     }
   }
+  // Teltik-known MDN — the MDN the Teltik side still knows this line by.
+  // Rotations don't sync back to Teltik, so any Teltik per-line call
+  // (/v1/get-info, /v1/reset-port, /v1/reset-network) keyed by the DB current
+  // MDN can 404/miss. Prefer the destination of the latest Teltik-delivered
+  // inbound SMS (port IS NULL rows = teltik-worker inserts); fall back to DB
+  // current MDN only when no such SMS exists. Needed for teltik-vendor SIMs
+  // and for any SIM physically seated in a Teltik gateway (e.g. Atomic-in-Teltik).
+  if (evidence.sim && (String(evidence.sim.vendor || '').toLowerCase() === 'teltik' || isTeltikHosted(evidence.sim))) {
+    let latestTeltikSms = null;
+    try {
+      const r = await supabaseGet(env, latestTeltikSmsQuery(evidence.sim.id));
+      if (r.ok) {
+        const rows = await r.json();
+        if (Array.isArray(rows) && rows.length > 0) latestTeltikSms = rows[0];
+      }
+    } catch (err) {
+      console.log('[Remediator] teltik-known-mdn lookup failed for report ' + report.id + ': ' + err);
+    }
+    evidence.teltikKnownMdn = pickTeltikKnownMdn(latestTeltikSms, evidence.sim.current_mdn_e164);
+  }
   // Live vendor status read — the input the classifier needs to choose a real
   // remediation action. On any failure readVendorView returns { ok:false } and
   // the classifier defers (pending_vendor_read) instead of acting on bad data.
   if (evidence.sim && evidence.sim.vendor) {
     try {
-      evidence.vendorRead = await readVendorView(env, evidence.sim);
+      evidence.vendorRead = await readVendorView(env, evidence.sim, {
+        teltikKnownMdn: evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn || null,
+      });
     } catch (err) {
       evidence.vendorRead = { ok: false, error: String(err && err.message || err) };
     }
@@ -1089,10 +1125,11 @@ async function gatherEvidence(env, report) {
   }
   // Teltik-hosted port read is independent from carrier vendor read. Atomic or
   // Wing service-provider SIMs hosted by Teltik still need this host-level
-  // status check and reset path.
-  if (evidence.sim && isTeltikHosted(evidence.sim) && evidence.sim.current_mdn_e164) {
+  // status check and reset path. /v1/port-status is account/gateway-scoped
+  // (apikey only — no per-line key), so it runs even when the SIM has no MDN.
+  if (evidence.sim && isTeltikHosted(evidence.sim)) {
     try {
-      evidence.teltikHostPortStatus = await teltikPortStatus(env, { mdn: evidence.sim.current_mdn_e164 });
+      evidence.teltikHostPortStatus = await teltikPortStatus(env);
     } catch (err) {
       evidence.teltikHostPortStatus = { online: false, status: 0, error: String(err && err.message || err) };
     }
