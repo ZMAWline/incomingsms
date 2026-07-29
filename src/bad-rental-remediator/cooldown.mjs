@@ -70,6 +70,51 @@ export function canAttempt({ action, priorAttempts, lastAttemptAt, now }) {
   return { ok: true };
 }
 
+// Fold rental_report_remediation_attempts rows into the per-action counts the
+// gate consumes. `skipped_cooldown` rows are bookkeeping (the gate itself
+// rejected — no vendor call happened): counting them as attempts made the
+// cooldown window self-refresh every 5-minute tick and burned the
+// max-attempts budget, which permanently starved the intake queue (INC-26).
+export function summarizeAttempts(rows) {
+  const out = { total: 0, perAction: {}, lastAt: {} };
+  for (const row of rows || []) {
+    if (!row) continue;
+    out.total++;
+    const act = row.action;
+    if (!act || row.outcome === 'skipped_cooldown') continue;
+    out.perAction[act] = (out.perAction[act] || 0) + 1;
+    const at = row.attempted_at || null;
+    if (at && (!out.lastAt[act] || at > out.lastAt[act])) out.lastAt[act] = at;
+  }
+  return out;
+}
+
+// Map a canAttempt rejection to the executor result the worker records.
+// max_attempts_reached is terminal — requeueing can never succeed — so it
+// escalates to an operator instead of consuming an intake slot every tick
+// forever (INC-26). cooldown_active stays a requeue; the intake deferral in
+// fetchOpenReports keeps such rows from hogging slots while ineligible.
+export function gateRejection(gate, action, priorAttempts) {
+  const evidence = { cooldown_gate: gate, action, prior_attempts: priorAttempts };
+  if (gate.reason === 'max_attempts_reached') {
+    return {
+      outcome: 'escalate',
+      evidence,
+      errorMessage: null,
+      execStatus: 'max_attempts_reached',
+      escalationReason: action === 'classify_only'
+        ? 'unable_to_reproduce_recommendation'
+        : action + '_failed',
+    };
+  }
+  return {
+    outcome: 'skipped_cooldown',
+    evidence,
+    errorMessage: null,
+    execStatus: 'cooldown_active',
+  };
+}
+
 export function nextReviewAt({ action, now }) {
   const row = COOLDOWN_TABLE[action];
   if (!row) return null;
