@@ -10,10 +10,15 @@
 //      atomic_ota for a hosted SIM,
 //   3b. port read missing/failed → nonterminal pending_teltik_host_port_read,
 //      no atomic_ota, no resend — retry next tick,
-//   4. port offline → reset-port, wait 30s (env-injectable), recheck:
-//      still offline → escalate teltik_gateway_port_offline;
-//      online → NO remediated close off port state alone — requeue so the
-//      normal resend_online path runs next tick.
+//   4. port offline → reset-port NOW, recheck DEFERRED (no in-tick sleep —
+//      the old synchronous 30s wait per report blew the 55s tick budget):
+//      the attempt records recheck pending with next_review_at ~30s out and
+//      the report's last_auto_attempt_at is backdated so intake re-admits it
+//      after the re-register window instead of the 15m defer. Next pass:
+//      still offline + prior reset attempt → escalate
+//      teltik_gateway_port_offline without resetting again;
+//      online → NO remediated close off port state alone — the normal TH2
+//      resend_online path runs.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -82,10 +87,13 @@ function makeHarness({ attStatus = 'active', portStatuses = [], webhookDelivered
     }
 
     if (u.includes('/rental_reports?status=in.') && method === 'GET') {
+      // Mirror fetchOpenReports' INTAKE_DEFER_MS eligibility so a backdated
+      // last_auto_attempt_at (TH5 deferred recheck) re-admits the row.
       const r = db.report;
+      const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
       const open = (r.status === 'received' || r.status === 'in_triage')
         && (r.auto_remediation_state == null || r.auto_remediation_state === 'queued')
-        && !r.last_auto_attempt_at;
+        && (r.last_auto_attempt_at == null || r.last_auto_attempt_at < cutoff);
       return new Response(JSON.stringify(open ? [r] : []), { status: 200 });
     }
     if (u.includes('/rental_reports?sim_id=eq.') && method === 'GET') {
@@ -232,25 +240,66 @@ test('6817: Teltik host port read unavailable → defer clearly, no A1 atomic_ot
 });
 
 // ---------------------------------------------------------
-// (4a) Port offline → reset-port, wait, recheck still offline → escalate as
-// Teltik port down (NOT deactivated/cancelled — Atomic is active).
+// (4) First TH5 pass: reset fires immediately, NO in-tick sleep. Attempt
+// records recheck pending, next_review_at ~30s out; report requeues with a
+// backdated last_auto_attempt_at so intake re-admits it in ~30s, not 15m.
 // ---------------------------------------------------------
 
-test('6817: Atomic active + Teltik host port offline, recheck still offline → escalated teltik_gateway_port_offline', async () => {
-  const h = makeHarness({ attStatus: 'active', portStatuses: ['offline', 'offline'] });
+test('6817: first TH5 pass resets now, defers the recheck ~30s, never sleeps in the tick', async () => {
+  const h = makeHarness({ attStatus: 'active', portStatuses: ['offline'] });
+  h.env.TELTIK_PORT_RECHECK_WAIT_MS = '30000'; // real product delay — must NOT be slept
   try {
+    const t0 = Date.now();
     await runTickViaWorker(h.env);
+    assert.ok(Date.now() - t0 < 5000, 'tick must not block on the 30s re-register window');
 
     assert.equal(h.resetPortCalls(), 1, 'reset-port must fire for the offline host port');
-    assert.ok(h.portStatusCalls() >= 2, 'port must be rechecked after the reset');
+    assert.equal(h.portStatusCalls(), 1, 'no same-tick recheck — evidence read only');
     assert.equal(h.resellerSyncCalls(), 0, 'no resend while the host port is down');
 
+    assert.equal(h.db.attempts.length, 1);
     const a = h.db.attempts[0];
     assert.equal(a.mode, 'TH5');
     assert.equal(a.action, 'teltik_reset_port');
+    assert.equal(a.outcome, 'no_change');
+    assert.equal(a.evidence.issue_type, 'Teltik gateway port offline');
+    assert.equal(a.evidence.recheck, 'pending');
+    assert.equal(a.evidence.recheck_delay_ms, 30000);
+    const nra = new Date(a.next_review_at).getTime();
+    assert.ok(nra >= t0 + 25000 && nra <= Date.now() + 35000, 'next_review_at must be ~30s out');
+
+    // Requeued and re-eligible in ~30s: last_auto_attempt_at is backdated to
+    // (now - INTAKE_DEFER_MS + 30s), i.e. older than 14 minutes ago but not
+    // past the full 15m cutoff.
+    assert.equal(h.db.report.status, 'received');
+    assert.equal(h.db.report.auto_remediation_state, 'queued');
+    const laa = new Date(h.db.report.last_auto_attempt_at).getTime();
+    assert.ok(laa < Date.now() - 14 * 60 * 1000, 'must be backdated near the intake cutoff');
+    assert.ok(laa > Date.now() - 15 * 60 * 1000, 'must stay ~30s short of eligible');
+  } finally { h.restore(); }
+});
+
+// ---------------------------------------------------------
+// (4a) Deferred recheck pass, port STILL offline → escalate as Teltik port
+// down (NOT deactivated/cancelled — Atomic is active) WITHOUT a second reset.
+// ---------------------------------------------------------
+
+test('6817: recheck pass still offline → escalated teltik_gateway_port_offline, no second reset', async () => {
+  const h = makeHarness({ attStatus: 'active', portStatuses: ['offline', 'offline'] });
+  try {
+    await runTickViaWorker(h.env); // pass 1: reset + recheck pending (wait 0 → immediately eligible)
+    await runTickViaWorker(h.env); // pass 2: deferred recheck
+
+    assert.equal(h.resetPortCalls(), 1, 'reset-port must fire exactly once across both passes');
+    assert.equal(h.resellerSyncCalls(), 0, 'no resend while the host port is down');
+
+    assert.equal(h.db.attempts.length, 2);
+    const a = h.db.attempts[1];
+    assert.equal(a.mode, 'TH5');
+    assert.equal(a.action, 'escalate');
     assert.equal(a.outcome, 'escalate');
     assert.equal(a.evidence.issue_type, 'Teltik gateway port offline');
-    assert.equal(a.evidence.recheck_port_status.online, false);
+    assert.equal(a.evidence.prior_reset_attempts, 1);
 
     assert.equal(h.db.report.auto_remediation_state, 'escalated');
     assert.equal(h.db.report.escalation_reason, 'teltik_gateway_port_offline');
@@ -259,27 +308,32 @@ test('6817: Atomic active + Teltik host port offline, recheck still offline → 
 });
 
 // ---------------------------------------------------------
-// (4b) Port offline → reset-port, recheck online → NO remediated close;
-// report requeues, eligible for the normal resend path next tick.
+// (4b) Deferred recheck pass, port online → NO remediated close off port
+// state alone; the normal TH2 resend_online path runs (SMS still disabled →
+// acted_sms_unverified, report stays open).
 // ---------------------------------------------------------
 
-test('6817: reset-port recheck online → no false remediated closure, report requeued for resend', async () => {
+test('6817: recheck pass online → TH2 resend_online runs, no false remediated closure', async () => {
   const h = makeHarness({ attStatus: 'active', portStatuses: ['offline', 'online'] });
   try {
-    await runTickViaWorker(h.env);
+    await runTickViaWorker(h.env); // pass 1: reset + recheck pending
+    await runTickViaWorker(h.env); // pass 2: port online → TH2 resend
 
-    assert.equal(h.resetPortCalls(), 1);
-    const a = h.db.attempts[0];
-    assert.equal(a.mode, 'TH5');
-    assert.equal(a.action, 'teltik_reset_port');
+    assert.equal(h.resetPortCalls(), 1, 'no second reset once the port is back online');
+    assert.equal(h.resellerSyncCalls(), 1, 'reseller resend must fire on the online recheck pass');
+
+    assert.equal(h.db.attempts.length, 2);
+    assert.equal(h.db.attempts[0].mode, 'TH5');
+    assert.equal(h.db.attempts[0].outcome, 'no_change');
+    const a = h.db.attempts[1];
+    assert.equal(a.mode, 'TH2');
+    assert.equal(a.action, 'resend_online');
     assert.notEqual(a.outcome, 'remediated', 'port-online recheck alone must never close the report');
-    assert.equal(a.outcome, 'no_change');
-    assert.equal(a.evidence.issue_type, 'Teltik gateway port reset resolved');
-    assert.equal(a.evidence.recheck_port_status.online, true);
+    assert.equal(a.outcome, 'acted_sms_unverified');
 
     assert.equal(h.db.report.status, 'received');
     assert.notEqual(h.db.report.status, 'remediated');
-    assert.equal(h.db.report.auto_remediation_state, 'queued', 'requeued so the resend path runs next tick');
+    assert.equal(h.db.report.auto_remediation_state, 'queued');
   } finally { h.restore(); }
 });
 
@@ -301,15 +355,16 @@ test('6817: Atomic suspended + Teltik host port offline → A3 vendor path, not 
 });
 
 // ---------------------------------------------------------
-// Source pins: 30s default wait, injectable for tests; sleep sits between
-// reset and recheck.
+// Source pins: 30s default recheck delay, env-injectable, and NEVER slept
+// inside the tick — deferral goes through next_review_at + the backdated
+// last_auto_attempt_at intake window.
 // ---------------------------------------------------------
 
-test('TH5 recheck waits 30s by default and the wait is env-injectable', () => {
+test('TH5 recheck delay is 30s by default, env-injectable, and never slept in the tick', () => {
   assert.match(SRC, /const TELTIK_PORT_RECHECK_WAIT_MS = 30_000/);
   assert.match(SRC, /env\.TELTIK_PORT_RECHECK_WAIT_MS !== undefined\n\s*\? Number\(env\.TELTIK_PORT_RECHECK_WAIT_MS\) : TELTIK_PORT_RECHECK_WAIT_MS/);
-  const idx = SRC.indexOf('if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));');
-  assert.ok(idx >= 0, 'expected an awaited setTimeout wait');
-  const recheckIdx = SRC.indexOf('const recheck = await teltikPortStatus(env);');
-  assert.ok(recheckIdx > idx, 'wait must happen BEFORE the port recheck');
+  assert.ok(!SRC.includes('setTimeout'), 'the remediator worker must not sleep inside a tick');
+  assert.match(SRC, /recheck: 'pending'/);
+  assert.match(SRC, /intakeEligibleInMs/);
+  assert.match(SRC, /Date\.now\(\) - INTAKE_DEFER_MS \+ exec\.intakeEligibleInMs/);
 });
