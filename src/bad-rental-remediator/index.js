@@ -34,7 +34,16 @@ const ACTION_DISABLE_PREFIX = 'bad_rental_remediator_action_';
 const ACTION_DISABLE_SUFFIX = '_disabled';
 const TICK_BUDGET_MS = 55_000; // §G: 60s tick budget, leave headroom.
 const CONCURRENCY = 5;         // §G concurrency cap.
-const INTAKE_LIMIT = 50;       // upper bound per tick.
+const INTAKE_LIMIT = 50;       // real actionable runs per tick (vendor/action/escalation attempts).
+// INC-27: the 50 budget must count only real runs. Non-actionable rows —
+// skipped_cooldown gate bookkeeping, duplicate/expired/stale DB-only
+// dismissals, lost claim races — are scanned past instead of consuming the
+// budget; without this, 50 stale prior-day reports blocked a same-day
+// actionable report behind them every tick. SCAN_CAP bounds total rows
+// fetched per tick so a pathological queue (e.g. claim PATCHes all failing)
+// can never loop forever.
+const NON_ACTIONABLE_OUTCOMES = new Set(['skipped_not_claimed', 'skipped_cooldown', 'duplicate']);
+const SCAN_CAP = 400;
 // INC-26: a queued row touched within this window is skipped by intake. Rows
 // held only by an action cooldown (1h..24h) were re-fetched every 5-minute
 // tick, recording skipped_cooldown 50× and starving newer reports out of the
@@ -199,25 +208,44 @@ async function runTick(env) {
       console.log('[Remediator] recovered ' + staleRecovered + ' stale in_progress claims back to queued.');
     }
 
-    const reports = await fetchOpenReports(env, INTAKE_LIMIT);
-    reportsFetched = reports.length;
-    console.log('[Remediator] fetched ' + reports.length + ' open reports.');
-
-    for (let i = 0; i < reports.length; i += CONCURRENCY) {
+    // INC-27: keep fetching batches until 50 REAL runs, the queue drains, or
+    // the scan cap / tick budget stops us. Every processed row leaves the
+    // intake window (terminal status, deferred last_auto_attempt_at, or an
+    // in_progress claim by another tick), so re-fetching skips it — and
+    // SCAN_CAP still bounds the loop if a row somehow doesn't.
+    intake:
+    while (attempted < INTAKE_LIMIT && reportsFetched < SCAN_CAP) {
       if (Date.now() - startedAt > TICK_BUDGET_MS) {
         console.log('[Remediator] tick budget exceeded; stopping at ' + processed + '.');
         break;
       }
-      const slice = reports.slice(i, i + CONCURRENCY);
-      const results = await Promise.all(slice.map(r => processReportSafe(env, r)));
-      for (const res of results) {
+      const batchSize = Math.min(INTAKE_LIMIT, SCAN_CAP - reportsFetched);
+      const reports = await fetchOpenReports(env, batchSize);
+      if (reports.length === 0) break;
+      reportsFetched += reports.length;
+      console.log('[Remediator] fetched ' + reports.length + ' open reports (scanned=' + reportsFetched + ').');
+
+      for (const report of reports) {
+        if (attempted >= INTAKE_LIMIT) break intake;
+        if (Date.now() - startedAt > TICK_BUDGET_MS) {
+          console.log('[Remediator] tick budget exceeded; stopping at ' + processed + '.');
+          break intake;
+        }
+        // Process one row at a time so we never fire more than 50 real actions.
+        // Concurrency is intentionally traded for a strict real-run cap; skipped
+        // and duplicate rows are cheap DB bookkeeping and the scan cap bounds
+        // the total pass.
+        const res = await processReportSafe(env, report);
         processed++;
         if (res && res.outcome) {
           outcomes[res.outcome] = (outcomes[res.outcome] || 0) + 1;
-          if (res.attemptInserted) attempted++;
+          // Only real actionable runs consume the budget; dismissals and
+          // skips are counted in processed/outcomes above.
+          if (res.attemptInserted && !NON_ACTIONABLE_OUTCOMES.has(res.outcome)) attempted++;
         }
         if (res && res.escalationCandidate) escalationCandidates.push(res.escalationCandidate);
       }
+      if (reports.length < batchSize) break; // queue drained
     }
   } finally {
     await releaseTickLock(env);
@@ -257,6 +285,7 @@ async function runTick(env) {
     completed_at: new Date(Date.now()).toISOString(),
     processed,
     attempted,
+    scanned: reportsFetched,
     stale_recovered: staleRecovered,
     outcomes,
     escalations: escalationsResult,
@@ -265,7 +294,7 @@ async function runTick(env) {
     dormancy_reason,
   };
   await recordLastTick(env, LAST_MAIN_TICK_KEY, summary);
-  return { processed, attempted, stale_recovered: staleRecovered, outcomes, escalations: escalationsResult, vendorBatch, ms };
+  return { processed, attempted, scanned: reportsFetched, stale_recovered: staleRecovered, outcomes, escalations: escalationsResult, vendorBatch, ms };
 }
 
 async function recordLastTick(env, key, summary) {
@@ -295,6 +324,7 @@ async function buildStatus(env) {
       main_cron: '0 */2 * * *',
       verify_poll_cron: '*/1 * * * *',
       intake_limit: INTAKE_LIMIT,
+      scan_cap: SCAN_CAP,
       concurrency: CONCURRENCY,
       tick_budget_ms: TICK_BUDGET_MS,
     },
