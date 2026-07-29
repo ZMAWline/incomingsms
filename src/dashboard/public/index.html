@@ -8154,12 +8154,15 @@ async function sendSimOnline(simId, phoneNumber) {
                     }
                     const isOpen = (r.status === 'received' || r.status === 'in_triage');
                     const editBtn = '<button onclick="event.stopPropagation();openBadRentalEdit(' + escapeHtml(r.id) + ')" class="px-2 py-1 text-xs rounded bg-dark-700 border border-dark-500 text-gray-200 hover:bg-dark-600 transition">Edit</button>';
+                    const autoState = r.auto_remediation_state || null;
+                    const rerunBtn = isOpen && autoState === 'escalated'
+                        ? '<button onclick="event.stopPropagation();rerunBadRentalAuto(' + escapeHtml(r.id) + ')" class="px-2 py-1 text-xs rounded bg-sky-500/20 text-sky-300 hover:bg-sky-500/30 transition" title="Clear the auto escalation and queue this report for the next reviewer tick">Rerun auto</button>'
+                        : '';
                     const fixBtn = isOpen
                         ? '<button onclick="event.stopPropagation();markBadRentalFixed(' + escapeHtml(r.id) + ')" class="px-2 py-1 text-xs rounded bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 transition">Mark fixed</button>'
                         : '';
-                    const actionCell = '<div class="flex items-center gap-1">' + fixBtn + editBtn + '</div>';
+                    const actionCell = '<div class="flex items-center gap-1">' + rerunBtn + fixBtn + editBtn + '</div>';
                     // INC-23 — auto-remediation sub-row.
-                    const autoState = r.auto_remediation_state || null;
                     const autoCount = r.auto_attempts_count || 0;
                     const autoLastAction  = r.auto_attempts_last_action  || null;
                     const autoLastOutcome = r.auto_attempts_last_outcome || null;
@@ -8489,6 +8492,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
         async function badRentalsTakeOver()    { return badRentalsAutoLockCall('pause-auto',  'Take over'); }
         async function badRentalsResumeAuto()  { return badRentalsAutoLockCall('resume-auto', 'Resume auto'); }
+        async function badRentalsRerunAuto()   { return badRentalsAutoLockCall('rerun-auto', 'Rerun auto'); }
         async function badRentalsAutoLockCall(suffix, label) {
             const modal = document.getElementById('bad-rentals-edit-modal');
             const reportId = modal ? modal.dataset.reportId : null;
@@ -8774,12 +8778,15 @@ async function sendSimOnline(simId, phoneNumber) {
             const resumeBtn = autoState === 'operator_locked'
                 ? '<button onclick="badRentalsReportResumeAuto(' + reportIdAttr + ')" class="px-2.5 py-1 text-[11px] bg-dark-700 hover:bg-dark-600 text-gray-200 rounded" title="Clear operator_locked so auto-remediation resumes">Resume auto</button>'
                 : '';
+            const rerunBtn = autoState === 'escalated'
+                ? '<button onclick="badRentalsReportRerunAuto(' + reportIdAttr + ')" class="px-2.5 py-1 text-[11px] bg-sky-700 hover:bg-sky-600 text-white rounded" title="Clear escalation and queue for the next reviewer tick">Rerun auto</button>'
+                : '';
             const autoControls = '<div class="flex items-center gap-3 flex-wrap">'
                 + '<div class="text-[11px] text-dark-300">'
                 +   '<span class="text-dark-400 uppercase tracking-wide mr-1">state:</span>' + stateChip
                 +   '<span class="ml-3 text-dark-400 uppercase tracking-wide">last attempt:</span> <span class="text-dark-200">' + escapeHtml(autoLast) + '</span>'
                 + '</div>'
-                + '<div class="flex items-center gap-2">' + takeOverBtn + resumeBtn + '</div>'
+                + '<div class="flex items-center gap-2">' + takeOverBtn + resumeBtn + rerunBtn + '</div>'
                 + '<div id="bad-rentals-report-auto-error" class="hidden text-[11px] text-rose-300"></div>'
                 + '</div>';
 
@@ -8832,6 +8839,7 @@ async function sendSimOnline(simId, phoneNumber) {
         // edit-modal handlers but operates on a passed-in reportId).
         async function badRentalsReportTakeOver(reportId)   { return badRentalsReportAutoLockCall(reportId, 'pause-auto',  'Take over'); }
         async function badRentalsReportResumeAuto(reportId) { return badRentalsReportAutoLockCall(reportId, 'resume-auto', 'Resume auto'); }
+        async function badRentalsReportRerunAuto(reportId)  { return rerunBadRentalAuto(reportId, true); }
         async function badRentalsReportAutoLockCall(reportId, suffix, label) {
             const errEl = document.getElementById('bad-rentals-report-auto-error');
             if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
@@ -8904,6 +8912,31 @@ async function sendSimOnline(simId, phoneNumber) {
                     } catch(inner) { console.error('goToSimsBySearch hydrate failed', inner); }
                 }, 50);
             } catch(e) { console.error('goToSimsBySearch failed', e); }
+        }
+
+        async function rerunBadRentalAuto(reportId, keepReportModalOpen) {
+            const msg = 'Queue BRR #' + reportId + ' for another Auto-Remediator review?\n\nThis clears the auto escalation and makes it eligible for the next reviewer tick. It does not guarantee the whole fix finishes instantly.';
+            if (!window.confirm(msg)) return;
+            try {
+                const resp = await fetch(API_BASE + '/bad-rentals/' + encodeURIComponent(reportId) + '/rerun-auto', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ actor: 'dashboard', note: 'operator requested Auto-Remediator rerun from dashboard' }),
+                });
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok) {
+                    const message = (data && data.error) ? data.error : ('HTTP ' + resp.status);
+                    alert('Failed to queue auto rerun: ' + message);
+                    return;
+                }
+                if (typeof showToast === 'function') showToast('BRR #' + reportId + ' queued for auto rerun', 'success');
+                if (keepReportModalOpen && typeof openBadRentalReport === 'function') openBadRentalReport(reportId);
+                if (typeof loadBadRentals === 'function') loadBadRentals();
+                if (typeof loadRemediatorStatus === 'function') loadRemediatorStatus();
+            } catch(e) {
+                alert('Network error: ' + e.message);
+                console.error('[rerunBadRentalAuto]', e);
+            }
         }
 
         async function markBadRentalFixed(reportId) {

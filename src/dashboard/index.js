@@ -202,6 +202,11 @@ export default {
       return handleBadRentalAutoLock(id, null, request, env, corsHeaders);
     }
 
+    if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/rerun-auto') && request.method === 'POST') {
+      const id = url.pathname.slice('/api/bad-rentals/'.length, -('/rerun-auto'.length));
+      return handleBadRentalRerunAuto(id, request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/remediator/status' && request.method === 'GET') {
       return handleRemediatorStatus(env, corsHeaders);
     }
@@ -4381,6 +4386,110 @@ async function handleBadRentalAutoLock(id, targetState, request, env, corsHeader
     } catch (e) {
       console.log('[BadRentalAutoLock] event log insert failed: ' + e);
     }
+    return new Response(JSON.stringify({ ok: true, report: updated[0] || null }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+
+// Requeue the auto-remediator for a still-open bad-rental report — useful after
+// a false escalation (for example BRR #6938's malformed Teltik port-status read).
+// Leaves rental_reports.status untouched, clears the auto escalation marker, and
+// makes the row eligible for the next reviewer tick by clearing last_auto_attempt_at.
+async function handleBadRentalRerunAuto(id, request, env, corsHeaders) {
+  try {
+    const reportId = parseInt(id, 10);
+    if (!Number.isFinite(reportId) || reportId <= 0) {
+      return new Response(JSON.stringify({ error: 'invalid report id' }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    let body = {};
+    try { body = await request.json(); } catch (_) { body = {}; }
+    const actor = body.actor ? String(body.actor).slice(0, 120) : 'operator';
+    const note = body.note ? String(body.note).slice(0, 500) : 'queued for auto-remediator rerun from dashboard';
+
+    const curResp = await supabaseGet(env,
+      'rental_reports?id=eq.' + reportId + '&select=id,status,auto_remediation_state,escalation_reason');
+    if (!curResp.ok) {
+      const txt = await curResp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + curResp.status, detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const curRows = await curResp.json();
+    if (!Array.isArray(curRows) || curRows.length === 0) {
+      return new Response(JSON.stringify({ error: 'report not found' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const cur = curRows[0];
+    if (cur.status !== 'received' && cur.status !== 'in_triage') {
+      return new Response(JSON.stringify({ error: 'report is not open (status=' + cur.status + ')' }), {
+        status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const prevState = cur.auto_remediation_state || null;
+    const prevEscalation = cur.escalation_reason || null;
+    const nowIso = new Date().toISOString();
+    const patch = {
+      auto_remediation_state: 'queued',
+      last_auto_attempt_at: null,
+      escalation_reason: null,
+      updated_at: nowIso,
+    };
+
+    const patchResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_reports?id=eq.${reportId}`, {
+      method: 'PATCH',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body: JSON.stringify(patch),
+    });
+    if (!patchResp.ok) {
+      const txt = await patchResp.text();
+      return new Response(JSON.stringify({ error: 'patch_failed', detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const updated = await patchResp.json();
+
+    try {
+      await fetch(`${env.SUPABASE_URL}/rest/v1/rental_report_events`, {
+        method: 'POST',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal',
+        },
+        body: JSON.stringify({
+          report_id: reportId,
+          from_status: cur.status,
+          to_status: cur.status,
+          actor,
+          note,
+          evidence: {
+            source: 'dashboard_rerun_auto',
+            auto_remediation_state_from: prevState,
+            auto_remediation_state_to: 'queued',
+            escalation_reason_from: prevEscalation,
+          },
+        }),
+      });
+    } catch (e) {
+      console.log('[BadRentalRerunAuto] event log insert failed: ' + e);
+    }
+
     return new Response(JSON.stringify({ ok: true, report: updated[0] || null }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
