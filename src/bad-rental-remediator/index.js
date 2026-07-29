@@ -24,6 +24,7 @@ import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
 import { teltikPortStatus, readVendorView } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import { flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType } from './escalations.mjs';
+import { classifyExpiredReport } from './stale-classifier.mjs';
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
 
@@ -44,6 +45,7 @@ const INTAKE_LIMIT = 50;       // real actionable runs per tick (vendor/action/e
 // can never loop forever.
 const NON_ACTIONABLE_OUTCOMES = new Set(['skipped_not_claimed', 'skipped_cooldown', 'duplicate']);
 const SCAN_CAP = 400;
+const EXPIRED_OPEN_SWEEP_CAP = 1000;
 // INC-26: a queued row touched within this window is skipped by intake. Rows
 // held only by an action cooldown (1h..24h) were re-fetched every 5-minute
 // tick, recording skipped_cooldown 50× and starving newer reports out of the
@@ -196,6 +198,8 @@ async function runTick(env) {
 
   let staleRecovered = 0;
   let processed = 0, attempted = 0;
+  let expiredOpenDismissed = 0;
+  let expiredOpenScanned = 0;
   const outcomes = {};
   const escalationCandidates = [];
   let reportsFetched = 0;
@@ -206,6 +210,20 @@ async function runTick(env) {
     staleRecovered = await recoverStaleClaims(env, STALE_CLAIM_MS);
     if (staleRecovered > 0) {
       console.log('[Remediator] recovered ' + staleRecovered + ' stale in_progress claims back to queued.');
+    }
+
+    // Product rule: any bad-rental report that is not from today's New York
+    // business day should be dismissed, even if it previously landed in an
+    // escalated/verify_pending state. These rows are unsafe to remediate because
+    // MDNs/rentals may already belong to a new rental. Do this DB-only sweep
+    // before normal intake so old escalations do not sit open forever.
+    const expiredSweep = await sweepExpiredOpenReports(env, EXPIRED_OPEN_SWEEP_CAP);
+    expiredOpenDismissed = expiredSweep.dismissed;
+    expiredOpenScanned = expiredSweep.scanned;
+    if (expiredOpenDismissed > 0) {
+      processed += expiredOpenDismissed;
+      outcomes.duplicate = (outcomes.duplicate || 0) + expiredOpenDismissed;
+      console.log('[Remediator] dismissed ' + expiredOpenDismissed + ' expired open reports (scanned=' + expiredOpenScanned + ').');
     }
 
     // INC-27: keep fetching batches until 50 REAL runs, the queue drains, or
@@ -277,7 +295,9 @@ async function runTick(env) {
   const ms = Date.now() - startedAt;
   const dormancy_reason = reportsFetched === 0 ? 'no_open_reports' : null;
   console.log('[Remediator] tick done in ' + ms + 'ms; processed=' + processed
+    + ' attempted=' + attempted
     + ' stale_recovered=' + staleRecovered
+    + ' expired_open_dismissed=' + expiredOpenDismissed
     + ' outcomes=' + JSON.stringify(outcomes)
     + ' escalations=' + JSON.stringify(escalationsResult)
     + ' vendor_batch=' + JSON.stringify(vendorBatch));
@@ -286,6 +306,8 @@ async function runTick(env) {
     processed,
     attempted,
     scanned: reportsFetched,
+    expired_open_dismissed: expiredOpenDismissed,
+    expired_open_scanned: expiredOpenScanned,
     stale_recovered: staleRecovered,
     outcomes,
     escalations: escalationsResult,
@@ -294,7 +316,18 @@ async function runTick(env) {
     dormancy_reason,
   };
   await recordLastTick(env, LAST_MAIN_TICK_KEY, summary);
-  return { processed, attempted, scanned: reportsFetched, stale_recovered: staleRecovered, outcomes, escalations: escalationsResult, vendorBatch, ms };
+  return {
+    processed,
+    attempted,
+    scanned: reportsFetched,
+    expired_open_dismissed: expiredOpenDismissed,
+    expired_open_scanned: expiredOpenScanned,
+    stale_recovered: staleRecovered,
+    outcomes,
+    escalations: escalationsResult,
+    vendorBatch,
+    ms,
+  };
 }
 
 async function recordLastTick(env, key, summary) {
@@ -367,29 +400,47 @@ async function listDisabledActions(env) {
 }
 
 async function fetchOpenCounts(env) {
+  // Count with PostgREST exact counts instead of materializing rows. The old
+  // implementation fetched rows and was capped by the API page limit, so an
+  // operator could see `escalated: 1000` even when the real number was just
+  // "at least 1000". Open counts should only include open report statuses.
   const out = { queued: 0, in_progress: 0, verify_pending: 0, operator_locked: 0, escalated: 0 };
   try {
-    const q = "rental_reports?select=auto_remediation_state&status=in.(received,in_triage,remediated)&auto_remediation_state=in.(queued,in_progress,verify_pending,operator_locked,escalated)";
-    const r = await supabaseGet(env, q);
-    if (!r.ok) return out;
-    const rows = await r.json();
-    if (Array.isArray(rows)) {
-      for (const row of rows) {
-        const s = row.auto_remediation_state;
-        if (s in out) out[s]++;
-      }
-    }
-    // queued also includes the null/unclaimed open reports
-    const q2 = "rental_reports?select=id&status=in.(received,in_triage)&or=(auto_remediation_state.is.null,auto_remediation_state.eq.queued)";
-    const r2 = await supabaseGet(env, q2);
-    if (r2.ok) {
-      const rows2 = await r2.json();
-      if (Array.isArray(rows2)) out.queued = rows2.length;
+    out.queued = await supabaseExactCount(env,
+      'rental_reports?select=id&status=in.(received,in_triage)&or=(auto_remediation_state.is.null,auto_remediation_state.eq.queued)');
+    for (const state of ['in_progress', 'verify_pending', 'operator_locked', 'escalated']) {
+      out[state] = await supabaseExactCount(env,
+        'rental_reports?select=id&status=in.(received,in_triage)&auto_remediation_state=eq.' + state);
     }
   } catch (err) {
     console.log('[Remediator] fetchOpenCounts failed: ' + err);
   }
   return out;
+}
+
+async function sweepExpiredOpenReports(env, limit) {
+  const q = 'rental_reports?status=in.(received,in_triage)'
+    + '&or=(auto_remediation_state.is.null,auto_remediation_state.in.(queued,in_progress,verify_pending,escalated))'
+    + '&select=' + encodeURIComponent('id,reseller_id,sim_id,sim_number_id,rental_id,e164,status,received_at,auto_remediation_state')
+    + '&order=received_at.asc&limit=' + Math.max(1, Math.min(limit || EXPIRED_OPEN_SWEEP_CAP, EXPIRED_OPEN_SWEEP_CAP));
+  const r = await supabaseGet(env, q);
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    console.log('[Remediator] sweepExpiredOpenReports fetch failed: ' + r.status + ' ' + txt);
+    return { scanned: 0, dismissed: 0, failed: 0 };
+  }
+  const rows = await r.json().catch(() => []);
+  if (!Array.isArray(rows) || rows.length === 0) return { scanned: 0, dismissed: 0, failed: 0 };
+  let dismissed = 0;
+  let failed = 0;
+  for (const report of rows) {
+    const expired = classifyExpiredReport(report, new Date());
+    if (!expired) continue;
+    const res = await dismissExpiredReport(env, report, expired);
+    if (res && res.outcome === 'duplicate') dismissed++;
+    else failed++;
+  }
+  return { scanned: rows.length, dismissed, failed };
 }
 
 async function processReportSafe(env, report) {
@@ -422,7 +473,6 @@ async function processReport(env, report) {
   // vendor action against a prior-day report can hit the wrong line. Checked
   // BEFORE gatherEvidence so no vendor read/call ever fires for these.
   // Today's reports fall through untouched (S1..S7/TH5 safeguards intact).
-  const { classifyExpiredReport } = await import('./stale-classifier.mjs');
   const expired = classifyExpiredReport(report, new Date());
   if (expired) {
     return dismissExpiredReport(env, report, expired);
@@ -1547,8 +1597,24 @@ function supabaseHeaders(env, returnRep) {
 
 async function supabaseGet(env, path) {
   return fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
-    headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY },
+    headers: { apikey: env['SUPABASE_SERVICE_ROLE_KEY'], Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY },
   });
+}
+
+async function supabaseExactCount(env, path) {
+  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
+    headers: {
+      apikey: env['SUPABASE_SERVICE_ROLE_KEY'],
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      Prefer: 'count=exact',
+      Range: '0-0',
+    },
+  });
+  if (!resp.ok) return 0;
+  const cr = resp.headers.get('content-range') || '';
+  const m = cr.match(/\/(\d+|\*)$/);
+  if (!m || m[1] === '*') return 0;
+  return parseInt(m[1], 10) || 0;
 }
 
 function json(obj, status) {

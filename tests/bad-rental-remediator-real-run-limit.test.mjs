@@ -61,6 +61,16 @@ function makeHarness({ reports, sims = {}, rentals = {}, claimAlwaysFails = fals
     const method = (init && init.method) || 'GET';
     db.urls.push({ url: u, method });
 
+    // Expired-open sweep fetch: scans all open auto-remediation buckets except
+    // operator_locked so prior-day escalations/verify-pending rows can close too.
+    if (u.includes('/rental_reports?status=in.') && u.includes('auto_remediation_state.in.(queued') && method === 'GET') {
+      const limit = parseInt((u.match(/[?&]limit=(\d+)/) || [])[1] || '1000', 10);
+      const rows = [...db.reports.values()].filter(r =>
+        (r.status === 'received' || r.status === 'in_triage')
+        && (r.auto_remediation_state == null || ['queued', 'in_progress', 'verify_pending', 'escalated'].includes(r.auto_remediation_state)));
+      rows.sort((a, b) => a.received_at < b.received_at ? -1 : a.received_at > b.received_at ? 1 : 0);
+      return new Response(JSON.stringify(rows.slice(0, limit)), { status: 200 });
+    }
     // Intake fetch.
     if (u.includes('/rental_reports?status=in.') && method === 'GET') {
       const limit = parseInt((u.match(/[?&]limit=(\d+)/) || [])[1] || '50', 10);
@@ -192,7 +202,9 @@ test('runTick scans past 50 stale dismissals and still reaches the actionable re
     // All 51 rows processed in ONE tick — the 50 dismissals did not exhaust
     // the intake window.
     assert.equal(result.processed, 51);
-    assert.equal(result.scanned, 51);
+    assert.equal(result.expired_open_dismissed, 50);
+    assert.equal(result.expired_open_scanned, 51);
+    assert.equal(result.scanned, 1);
     assert.equal(result.outcomes.duplicate, 50, 'all stale reports dismissed as duplicate');
     assert.equal(result.outcomes.no_change, 1, 'actionable report classified (S5)');
 
@@ -218,6 +230,24 @@ test('runTick scans past 50 stale dismissals and still reaches the actionable re
   } finally { restore(); }
 });
 
+test('expired sweep dismisses prior-day escalated and verify-pending rows too', async () => {
+  const reports = [
+    { id: 901, status: 'in_triage', received_at: staleReceivedAt(), sim_id: null, sim_number_id: null, rental_id: null, reseller_id: null, e164: null, auto_remediation_state: 'escalated', last_auto_attempt_at: null },
+    { id: 902, status: 'received', received_at: staleReceivedAt(), sim_id: null, sim_number_id: null, rental_id: null, reseller_id: null, e164: null, auto_remediation_state: 'verify_pending', last_auto_attempt_at: null },
+    { id: 903, status: 'received', received_at: new Date().toISOString(), sim_id: null, sim_number_id: null, rental_id: null, reseller_id: null, e164: null, auto_remediation_state: 'escalated', last_auto_attempt_at: null },
+  ];
+  const { env, db, restore } = makeHarness({ reports });
+  try {
+    const result = await runTickViaWorker(env);
+    assert.equal(result.expired_open_dismissed, 2);
+    assert.equal(result.outcomes.duplicate, 2);
+    assert.equal(result.attempted, 0);
+    assert.equal(db.reports.get('901').status, 'duplicate');
+    assert.equal(db.reports.get('902').status, 'duplicate');
+    assert.equal(db.reports.get('903').status, 'received');
+  } finally { restore(); }
+});
+
 // ---------------------------------------------------------
 // No infinite loop: rows that never leave the intake window (claim CAS always
 // loses) are bounded by SCAN_CAP, and skips never count as real runs.
@@ -227,7 +257,7 @@ test('runTick terminates via SCAN_CAP when rows never leave the intake window', 
   const reports = [];
   for (let i = 1; i <= 50; i++) {
     reports.push({
-      id: i, status: 'received', received_at: staleReceivedAt(),
+      id: i, status: 'received', received_at: new Date().toISOString(),
       sim_id: null, sim_number_id: null, rental_id: null, reseller_id: null,
       e164: null, auto_remediation_state: null, last_auto_attempt_at: null,
     });

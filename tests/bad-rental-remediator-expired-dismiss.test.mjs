@@ -113,6 +113,28 @@ test('dismissExpiredReport path contains no vendor call sites', () => {
   assert.ok(SRC.includes('dismissed expired/stale bad-rental report because report is from a prior day and rental/MDN may have moved on'));
 });
 
+test('open-counts use exact counts and exclude closed remediated rows', () => {
+  const start = SRC.indexOf('async function fetchOpenCounts');
+  assert.ok(start !== -1);
+  const body = SRC.slice(start, SRC.indexOf('async function sweepExpiredOpenReports', start));
+  assert.ok(body.includes('supabaseExactCount'), 'counts must use exact PostgREST counts, not capped row materialization');
+  assert.ok(body.includes('status=in.(received,in_triage)'), 'open counts must include only open report statuses');
+  assert.ok(!body.includes('remediated'), 'open counts must not count remediated/closed reports');
+});
+
+test('expired-open sweep includes escalated/verify-pending rows and runs before normal intake', () => {
+  const sweepStart = SRC.indexOf('async function sweepExpiredOpenReports');
+  assert.ok(sweepStart !== -1);
+  const sweepBody = SRC.slice(sweepStart, SRC.indexOf('async function processReportSafe', sweepStart));
+  assert.ok(sweepBody.includes('auto_remediation_state.in.(queued,in_progress,verify_pending,escalated)'),
+    'sweep must cover old escalated and verify-pending rows, not only queued rows');
+  assert.ok(!sweepBody.includes('operator_locked'), 'operator-locked reports should not be auto-closed by the sweep');
+  const runStart = SRC.indexOf('async function runTick');
+  const runBody = SRC.slice(runStart, SRC.indexOf('async function recordLastTick', runStart));
+  assert.ok(runBody.indexOf('sweepExpiredOpenReports') < runBody.indexOf('fetchOpenReports'),
+    'expired sweep must run before normal queued intake');
+});
+
 // ---------------------------------------------------------
 // Event/audit shape — the executed close matches the dashboard manual close.
 // Same fake-env pattern as bad-rental-remediator-actions.test.mjs.
