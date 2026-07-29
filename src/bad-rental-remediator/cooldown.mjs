@@ -75,13 +75,18 @@ export function canAttempt({ action, priorAttempts, lastAttemptAt, now }) {
 // rejected — no vendor call happened): counting them as attempts made the
 // cooldown window self-refresh every 5-minute tick and burned the
 // max-attempts budget, which permanently starved the intake queue (INC-26).
+// `skipped_sms_unavailable` rows are the same shape: the temporary outbound-SMS
+// kill switch skipped the action before any vendor call, so they must not
+// consume the action budget either.
+const BOOKKEEPING_OUTCOMES = new Set(['skipped_cooldown', 'skipped_sms_unavailable']);
+
 export function summarizeAttempts(rows) {
   const out = { total: 0, perAction: {}, lastAt: {} };
   for (const row of rows || []) {
     if (!row) continue;
     out.total++;
     const act = row.action;
-    if (!act || row.outcome === 'skipped_cooldown') continue;
+    if (!act || BOOKKEEPING_OUTCOMES.has(row.outcome)) continue;
     out.perAction[act] = (out.perAction[act] || 0) + 1;
     const at = row.attempted_at || null;
     if (at && (!out.lastAt[act] || at > out.lastAt[act])) out.lastAt[act] = at;
