@@ -64,6 +64,9 @@ const STALE_CLAIM_MS = 10 * 60 * 1000;
 const TICK_LOCK_KEY = 'bad_rental_remediator_main_tick_lock';
 const TICK_LOCK_TTL_S = 120;
 const ISSUE_TELTIK_GATEWAY_PORT_OFFLINE = 'Teltik gateway port offline';
+// TH5: how long Teltik gets to re-register the port after /reset-port before
+// the recheck (env TELTIK_PORT_RECHECK_WAIT_MS overrides; tests set 0).
+const TELTIK_PORT_RECHECK_WAIT_MS = 30_000;
 const ISSUE_TELTIK_GATEWAY_PORT_RESET_RESOLVED = 'Teltik gateway port reset resolved';
 
 export default {
@@ -682,9 +685,16 @@ async function maybeExecuteAction(env, args) {
   // skipped_sms_unavailable bookkeeping row (excluded from summarizeAttempts);
   // the report requeues and the intake deferral paces retries until SMS is
   // back. TH5 teltik_reset_port is exempt — its terminal proof is the
-  // port-status recheck, not SMS.
+  // port-status recheck, not SMS. resend_online on a Teltik-hosted SIM whose
+  // host port is confirmed online is also exempt (Zalmen 2026-07-29, report
+  // #6817): the reseller resend IS the remediation and sends no SMS itself —
+  // it must fire even while §C can't confirm it afterwards; the gate then
+  // records why no terminal close happened and the report stays open.
+  const teltikHostPortOnline = !!(evidence.sim && isTeltikHosted(evidence.sim)
+    && evidence.teltikHostPortStatus && evidence.teltikHostPortStatus.online === true);
   const needsSmsVerify = action !== 'close_duplicate' && action !== 'classify_only'
-    && !(classification.mode === 'TH5' && action === 'teltik_reset_port');
+    && !(classification.mode === 'TH5' && action === 'teltik_reset_port')
+    && !(action === 'resend_online' && teltikHostPortOnline);
   if (needsSmsVerify && !smsSendingEnabled(env)) {
     return {
       outcome: 'skipped_sms_unavailable',
@@ -794,20 +804,31 @@ async function maybeExecuteAction(env, args) {
         issueType: ISSUE_TELTIK_GATEWAY_PORT_OFFLINE,
       };
     }
+    // Teltik needs a beat to re-register the port after /reset-port — an
+    // immediate recheck reads the pre-reset state. 30s per the product flow
+    // (Zalmen 2026-07-29, report #6817); env-injectable so tests don't sleep.
+    const waitMs = env.TELTIK_PORT_RECHECK_WAIT_MS !== undefined
+      ? Number(env.TELTIK_PORT_RECHECK_WAIT_MS) : TELTIK_PORT_RECHECK_WAIT_MS;
+    if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs));
     const recheck = await teltikPortStatus(env);
     const portOnline = !!(recheck && recheck.online === true);
     const issueType = portOnline ? ISSUE_TELTIK_GATEWAY_PORT_RESET_RESOLVED : ISSUE_TELTIK_GATEWAY_PORT_OFFLINE;
+    // A recheck-online proves the reset worked, NOT that the reseller has its
+    // number back — never close `remediated` off port state alone. Requeue:
+    // the next tick sees the port online, skips TH5 and routes the normal
+    // vendor path (e.g. A6 resend_online).
     return {
-      outcome: portOnline ? 'remediated' : 'escalate',
+      outcome: portOnline ? 'no_change' : 'escalate',
       evidence: {
         exec_status: res.status,
         issue_type: issueType,
         initial_port_status: evidence.teltikHostPortStatus || null,
+        recheck_wait_ms: waitMs,
         recheck_port_status: recheck || null,
         ...(res.evidence || {}),
       },
       errorMessage: null,
-      terminalReport: portOnline ? { status: 'remediated', remediation_action: 'port_reset' } : null,
+      terminalReport: null,
       execStatus: res.status,
       escalationReason: portOnline ? null : 'teltik_gateway_port_offline',
       issueType,
@@ -836,7 +857,13 @@ async function maybeExecuteAction(env, args) {
     sim: evidence.sim,
     vendorRead: classification.vendorReadHealth || null,
     autoAction: { completed: true, error: null },
-    webhookDelivered: !!(evidence.webhook && evidence.webhook.delivered),
+    // For resend_online the resend IS the webhook delivery attempt, so a
+    // successful executor run satisfies §C.4's webhook predicate — pre-action
+    // evidence necessarily saw no delivery (that's why A6 fired). Without this
+    // the gate dies at predicate_failed and the exempted resend records
+    // classify_only instead of acted_sms_unverified.
+    webhookDelivered: (action === 'resend_online' && res.ok)
+      || !!(evidence.webhook && evidence.webhook.delivered),
     situationExtras: classification.situationExtras || null,
     attemptNo,
   });
@@ -856,11 +883,14 @@ async function maybeExecuteAction(env, args) {
   }
 
   // Gate not passed — keep the report in flight, no terminal write.
-  // sms_unavailable maps to its own bookkeeping outcome (never the confusing
-  // classify_only fallback) — belt-and-suspenders for the pre-check above.
+  // sms_unavailable HERE means the action DID run (we're past the executor)
+  // but §C can't confirm it while outbound SMS is off — distinct from the
+  // pre-exec skipped_sms_unavailable (nothing ran; budget-exempt bookkeeping).
+  // acted_sms_unverified is NOT budget-exempt: the exempted resend_online must
+  // consume its §G attempts or it would re-fire every eligible tick.
   return {
     outcome: resolveGate.status === 'verify_pending' ? 'verify_pending'
-           : resolveGate.status === 'sms_unavailable' ? 'skipped_sms_unavailable'
+           : resolveGate.status === 'sms_unavailable' ? 'acted_sms_unverified'
            : (classification.outcome || 'no_change'),
     evidence: {
       exec_status: res.status,
@@ -968,7 +998,17 @@ async function classifyShared(env, report, evidence) {
   if (evidence.sim && isTeltikHosted(evidence.sim) && evidence.teltikHostPortStatus) {
     const ps = evidence.teltikHostPortStatus;
     const statusOk = ps.status >= 200 && ps.status < 300;
-    if (statusOk && ps.online === false) {
+    // Provider-first (Zalmen 2026-07-29, report #6817): when a clean carrier
+    // read says the line is NOT active (suspended/cancelled/not found), the
+    // vendor classifier owns the report (A3/A4/A5...) — a dead line explains
+    // the outage better than the host port and a Teltik reset can't fix it.
+    // Port-offline wins only with provider-active evidence, or when no usable
+    // read exists. Teltik-vendor SIMs are exempt from this gate: their
+    // `healthy` already folds in this same port state.
+    const vr = evidence.vendorRead;
+    const providerNotActive = String(evidence.sim.vendor || '').toLowerCase() !== 'teltik'
+      && !!(vr && vr.ok === true && vr.healthy === false);
+    if (statusOk && ps.online === false && !providerNotActive) {
       const resetMdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
         || evidence.sim.current_mdn_e164 || '';
       return nonTerminal('TH5', 'teltik_reset_port', 'classify_only', {
@@ -980,6 +1020,7 @@ async function classifyShared(env, report, evidence) {
         teltik_known_mdn: evidence.teltikKnownMdn || null,
         reset_mdn10: mdn10(resetMdn),
         port_status: ps.raw || 'offline',
+        provider_active: (vr && vr.ok === true) ? !!vr.healthy : null,
       }, 'teltik_gateway_port_offline', ISSUE_TELTIK_GATEWAY_PORT_OFFLINE);
     }
   }
