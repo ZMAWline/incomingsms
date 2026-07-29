@@ -36,6 +36,45 @@ export function normalizeE164(s) {
   return t;
 }
 
+// ---------------------------------------------------------
+// Product rule (Zalmen, 2026-07-29, PR #26): a bad-rental report not from
+// today is dismissed immediately — the MDN has rotated and a new rental
+// started, so any vendor action keyed off yesterday's report can hit the
+// wrong line. "Today" is the New York day, matching the repo convention
+// (en-CA + America/New_York, same as teltik-worker / details-finalizer).
+// ---------------------------------------------------------
+
+export function nyDayOf(d) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(d);
+}
+
+export function isPriorNyDay(atIso, now) {
+  if (!atIso) return false;
+  const t = new Date(atIso);
+  if (isNaN(t.getTime())) return false;
+  return nyDayOf(t) < nyDayOf(now);
+}
+
+// Returns a terminal close_duplicate classification for a prior-day report,
+// or null when the report is from today (or received_at is missing/garbled —
+// never dismiss on unparseable evidence; the normal pipeline handles it).
+export function classifyExpiredReport(report, now) {
+  if (!report || !isPriorNyDay(report.received_at, now)) return null;
+  return {
+    mode: 'S8',
+    action: 'close_duplicate',
+    outcome: 'duplicate',
+    evidenceSummary: {
+      reason: 'expired_prior_day_report',
+      received_at: report.received_at,
+      report_ny_day: nyDayOf(new Date(report.received_at)),
+      today_ny_day: nyDayOf(now),
+    },
+    terminal: true,
+    escalationReason: null,
+  };
+}
+
 export function classifyStaleContext({ report, evidence }) {
   if (!report || !evidence) return null;
 

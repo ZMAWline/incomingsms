@@ -387,6 +387,17 @@ async function processReport(env, report) {
     return { outcome: 'skipped_not_claimed', attemptInserted: false };
   }
 
+  // Product rule (Zalmen, 2026-07-29): reports not from today (New York day)
+  // are dismissed immediately — MDN rotated and a new rental started, so
+  // vendor action against a prior-day report can hit the wrong line. Checked
+  // BEFORE gatherEvidence so no vendor read/call ever fires for these.
+  // Today's reports fall through untouched (S1..S7/TH5 safeguards intact).
+  const { classifyExpiredReport } = await import('./stale-classifier.mjs');
+  const expired = classifyExpiredReport(report, new Date());
+  if (expired) {
+    return dismissExpiredReport(env, report, expired);
+  }
+
   const evidence = await gatherEvidence(env, report);
   const classification = await classifyShared(env, report, evidence);
 
@@ -420,6 +431,64 @@ async function processReport(env, report) {
     mode: classification.mode,
     attemptInserted: true,
     escalationCandidate,
+  };
+}
+
+// ---------------------------------------------------------
+// Prior-day (expired) report dismissal — DB-only, no vendor calls.
+//
+// Reuses the close_duplicate executor so rental_reports.status='duplicate',
+// closed_at/triaged_at semantics and the rental_report_events row match the
+// dashboard's manual close exactly; applyClassificationState then mirrors
+// auto_remediation_state='done'. On executor failure the row requeues and the
+// next tick retries — never escalates, never touches a vendor.
+// ---------------------------------------------------------
+
+const EXPIRED_DISMISS_NOTE = 'dismissed expired/stale bad-rental report because report is from a prior day and rental/MDN may have moved on';
+
+async function dismissExpiredReport(env, report, classification) {
+  // Light DB-only attempt count — gatherEvidence is skipped on this path.
+  let attemptNo = 1;
+  const ar = await supabaseGet(env,
+    'rental_report_remediation_attempts?report_id=eq.' + encodeURIComponent(report.id)
+    + '&select=id&limit=200');
+  if (ar.ok) {
+    const rows = await ar.json().catch(() => []);
+    if (Array.isArray(rows)) attemptNo = rows.length + 1;
+  }
+
+  const res = await executeAction(env, {
+    action: 'close_duplicate',
+    report,
+    situationId: classification.mode,
+    evidenceBundle: classification.evidenceSummary,
+    note: EXPIRED_DISMISS_NOTE,
+  });
+  const exec = res.ok
+    ? { outcome: 'duplicate', execStatus: res.status, errorMessage: null,
+        evidence: { exec_status: res.status, ...(res.evidence || {}) } }
+    : { outcome: 'failed', execStatus: res.status,
+        errorMessage: res.errorMessage || 'close_duplicate_failed',
+        evidence: { exec_status: res.status, ...(res.evidence || {}) } };
+
+  await insertAttempt(env, {
+    report_id: report.id,
+    attempt_no: attemptNo,
+    mode: classification.mode,
+    action: classification.action,
+    outcome: exec.outcome,
+    evidence: mergeEvidence(classification.evidenceSummary, exec.evidence),
+    error_message: exec.errorMessage,
+    next_review_at: null,
+  });
+
+  await applyClassificationState(env, report, classification, exec);
+
+  return {
+    outcome: exec.outcome,
+    mode: classification.mode,
+    attemptInserted: true,
+    escalationCandidate: null,
   };
 }
 
