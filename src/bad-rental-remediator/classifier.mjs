@@ -699,6 +699,36 @@ function pendingVendorRead(vendor, sim) {
   });
 }
 
+// Build the concrete DB patch for a db_sync_upsert situation from the live
+// vendor read. Without this the worker passed targets={} and every db_sync
+// attempt recorded a `noop` — the classifier "acted" but nothing ever synced.
+// Keys match the real `sims` schema: `status` and `msisdn` (10-digit national;
+// there is no current_mdn_e164 column — INC-25 column trap). Returns null when
+// the situation is not a db_sync or nothing concrete can be derived.
+export function buildDbSyncTargets(situation, sim, vendorView) {
+  if (!situation || situation.auto_action !== 'db_sync_upsert' || !vendorView) return null;
+  const t = {};
+  switch (situation.id) {
+    // Vendor healthy, DB status stale → sync status to vendor truth.
+    case 'A2': case 'W1': case 'H1': case 'T1':
+      t.status = 'active';
+      break;
+    // MDN drift: vendor-attested MDN differs from DB → sync sims.msisdn.
+    // Teltik (T8) is deliberately absent: Teltik never attests an MDN
+    // (vendorViewFromRead pins view.MDN=null), so there is nothing to sync to.
+    // ponytail: sims.msisdn only; sim_numbers history stays rotation-domain.
+    case 'A9': case 'W6': case 'H7': {
+      const vendorMdn = vendorView.MSISDN || vendorView.subscriberNumber || vendorView.MDN || null;
+      const m = normalizeMdn(vendorMdn);
+      if (m && m.length === 10 && m !== normalizeMdn(sim && sim.msisdn)) t.msisdn = m;
+      break;
+    }
+    default:
+      break;
+  }
+  return Object.keys(t).length ? t : null;
+}
+
 // Strip non-digits and drop leading country digit so E.164 vs 10-digit compare cleanly.
 export function normalizeMdn(input) {
   if (input === null || input === undefined) return null;

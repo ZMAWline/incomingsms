@@ -189,9 +189,12 @@ export async function actionDisabledByKv(env, action) {
 // ---------------------------------------------------------
 // db_sync_upsert — write SIM truth from vendor read.
 //
-// ctx.targets is the subset of (status, current_mdn_e164, imei) the worker
-// wants to sync. Idempotent at (sim_id): an upsert that would change nothing
-// returns status='noop' so the attempt row records the deliberate skip.
+// ctx.targets is the subset of (status, msisdn, imei) the worker wants to sync
+// (built by classifier.mjs buildDbSyncTargets from the live vendor read). Keys
+// match the real `sims` schema: the MDN column is `msisdn` (10-digit national)
+// — there is no current_mdn_e164 column (INC-25 column trap; patching it 400s).
+// Idempotent at (sim_id): an upsert that would change nothing returns
+// status='noop' so the attempt row records the deliberate skip.
 // ---------------------------------------------------------
 
 async function execDbSyncUpsert(env, ctx) {
@@ -199,9 +202,9 @@ async function execDbSyncUpsert(env, ctx) {
   if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
   const targets = ctx.targets || {};
   const patch = {};
-  if (targets.status            && targets.status            !== sim.status)            patch.status = targets.status;
-  if (targets.current_mdn_e164  && targets.current_mdn_e164  !== sim.current_mdn_e164)  patch.current_mdn_e164 = targets.current_mdn_e164;
-  if (targets.imei              && targets.imei              !== sim.imei)              patch.imei = targets.imei;
+  if (targets.status && targets.status !== sim.status) patch.status = targets.status;
+  if (targets.msisdn && targets.msisdn !== sim.msisdn) patch.msisdn = targets.msisdn;
+  if (targets.imei   && targets.imei   !== sim.imei)   patch.imei = targets.imei;
 
   if (Object.keys(patch).length === 0) {
     return { ok: true, status: 'noop', evidence: { reason: 'db_already_matches_vendor', sim_id: sim.id } };
@@ -218,7 +221,7 @@ async function execDbSyncUpsert(env, ctx) {
   }
   return {
     ok: true, status: 'ok',
-    evidence: { sim_id: sim.id, patch, prior: pick(sim, ['status','current_mdn_e164','imei']) },
+    evidence: { sim_id: sim.id, patch, prior: pick(sim, ['status','msisdn','imei']) },
   };
 }
 
