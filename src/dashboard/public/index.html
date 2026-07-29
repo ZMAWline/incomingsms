@@ -8308,6 +8308,56 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
+        function formatRemediatorRunResult(data, httpOk) {
+            const payload = data || {};
+            const result = payload.result || payload;
+            const lines = [];
+            const ms = Number(result.ms || payload.ms || 0);
+            const seconds = Number.isFinite(ms) && ms > 0 ? (ms / 1000).toFixed(1) + 's' : null;
+            const processed = Number(result.processed || 0);
+            const attempted = Number(result.attempted || 0);
+            const outcomes = result.outcomes || {};
+            const outcomeEntries = Object.entries(outcomes).filter(([, v]) => Number(v || 0) > 0);
+            const duplicateCount = Number(outcomes.duplicate || 0);
+            const staleRecovered = Number(result.stale_recovered || 0);
+            const escalations = result.escalations || {};
+            const vendorBatch = result.vendorBatch || {};
+            const openedTickets = Number((vendorBatch && vendorBatch.opened) || escalations.posted || 0);
+            const disabledVendors = Array.isArray(vendorBatch.vendors)
+                ? vendorBatch.vendors.filter(v => v && v.enabled === false).map(v => ({
+                    atomic: 'Atomic', wing_iot: 'Wing IoT', helix: 'Helix', teltik: 'Teltik'
+                }[v.vendor] || v.vendor)).filter(Boolean)
+                : [];
+
+            if (!httpOk || payload.ok === false || payload.error) {
+                lines.push('Review did not complete: ' + (payload.error || result.error || ('HTTP ' + (payload.status || 'error'))));
+            } else {
+                lines.push('Review complete: ' + processed + ' report' + (processed === 1 ? '' : 's') + ' processed' + (seconds ? ' in ' + seconds : '') + '.');
+            }
+
+            if (duplicateCount > 0) {
+                lines.push('Actions taken: ' + duplicateCount + ' old/expired report' + (duplicateCount === 1 ? ' was' : 's were') + ' dismissed as stale duplicates.');
+            }
+            const nonDuplicate = outcomeEntries.filter(([k]) => k !== 'duplicate');
+            if (nonDuplicate.length > 0) {
+                lines.push('Other outcomes: ' + nonDuplicate.map(([k, v]) => k + '=' + v).join(', ') + '.');
+            }
+            if (attempted !== processed) {
+                lines.push('Attempted: ' + attempted + ' of ' + processed + ' fetched reports.');
+            }
+            if (staleRecovered > 0) {
+                lines.push('Recovered stale in-triage rows: ' + staleRecovered + '.');
+            }
+            lines.push(openedTickets > 0 ? ('Tickets opened: ' + openedTickets + '.') : 'Tickets: none opened.');
+            if (disabledVendors.length > 0) {
+                lines.push('Vendor batch escalation: off for ' + disabledVendors.join(', ') + '.');
+            }
+            if (vendorBatch.tickId) {
+                lines.push('Tick: ' + vendorBatch.tickId + '.');
+            }
+            return lines.join('\n');
+        }
+
         async function remediatorRunNow() {
             if (!confirm('Trigger an immediate Auto-Remediator main tick now?\n\nThis runs the same logic as the 2-hour cron once. Reviewer kill-switch must be enabled or the tick will short-circuit.')) return;
             const out = document.getElementById('remediator-run-result');
@@ -8319,7 +8369,13 @@ async function sendSimOnline(simId, phoneNumber) {
                     body: JSON.stringify({ actor: 'dashboard' }),
                 });
                 const data = await resp.json();
-                if (out) out.textContent = JSON.stringify(data, null, 2);
+                if (out) {
+                    const summary = formatRemediatorRunResult(data, resp.ok);
+                    const raw = escapeHtml(JSON.stringify(data, null, 2));
+                    out.innerHTML = '<div class="whitespace-pre-wrap">' + escapeHtml(summary) + '</div>'
+                        + '<details class="mt-2 text-dark-400"><summary class="cursor-pointer hover:text-gray-300">Raw JSON</summary>'
+                        + '<pre class="mt-2 overflow-x-auto whitespace-pre-wrap">' + raw + '</pre></details>';
+                }
                 loadRemediatorStatus();
                 loadBadRentals();
             } catch (e) {
