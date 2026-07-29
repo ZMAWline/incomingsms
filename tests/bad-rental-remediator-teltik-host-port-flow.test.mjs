@@ -4,8 +4,12 @@
 //      provider-active evidence; a suspended/cancelled line routes to the
 //      vendor classifier (A3/A4) instead,
 //   2. Teltik host port checked before resend_online,
-//   3. port online → resend_online fires even while outbound SMS verification
-//      is disabled (the resend is the remediation; it sends no SMS),
+//   3. port online → TH2 resend_online fires even while outbound SMS
+//      verification is disabled (the resend is the remediation; it sends no
+//      SMS), REGARDLESS of stale webhook-delivered evidence — never A1
+//      atomic_ota for a hosted SIM,
+//   3b. port read missing/failed → nonterminal pending_teltik_host_port_read,
+//      no atomic_ota, no resend — retry next tick,
 //   4. port offline → reset-port, wait 30s (env-injectable), recheck:
 //      still offline → escalate teltik_gateway_port_offline;
 //      online → NO remediated close off port state alone — requeue so the
@@ -36,7 +40,7 @@ async function importWorker() {
 // Atomic-vendor SIM whose gateway_host is teltik.
 // ---------------------------------------------------------
 
-function makeHarness({ attStatus = 'active', portStatuses = [] } = {}) {
+function makeHarness({ attStatus = 'active', portStatuses = [], webhookDelivered = false } = {}) {
   const db = { report: null, attempts: [], urls: [] };
   db.report = {
     id: 6817, status: 'received', received_at: new Date().toISOString(),
@@ -62,6 +66,7 @@ function makeHarness({ attStatus = 'active', portStatuses = [] } = {}) {
     if (u.includes('api.smsgateway.xyz/v1/port-status')) {
       const state = portStatuses[Math.min(portStatusCalls, portStatuses.length - 1)];
       portStatusCalls++;
+      if (state === 'error') return new Response(JSON.stringify({ success: false, error: 'port_read_failed' }), { status: 500 });
       return new Response(JSON.stringify({ success: true, status: state }), { status: 200 });
     }
     if (u.includes('api.smsgateway.xyz/v1/reset-port')) {
@@ -85,6 +90,9 @@ function makeHarness({ attStatus = 'active', portStatuses = [] } = {}) {
     }
     if (u.includes('/rental_reports?sim_id=eq.') && method === 'GET') {
       return new Response('[]', { status: 200 });
+    }
+    if (u.includes('/webhook_deliveries?') && method === 'GET') {
+      return new Response(JSON.stringify(webhookDelivered ? [{ delivered_at: new Date().toISOString() }] : []), { status: 200 });
     }
     if (u.includes('/rental_reports?auto_remediation_state=eq.in_progress') && method === 'PATCH') {
       return new Response('[]', { status: 200 });
@@ -177,7 +185,7 @@ test('6817: Atomic active + Teltik host port online → resend_online executes d
 
     assert.equal(h.db.attempts.length, 1);
     const a = h.db.attempts[0];
-    assert.equal(a.mode, 'A6');
+    assert.equal(a.mode, 'TH2');
     assert.equal(a.action, 'resend_online');
     assert.equal(a.outcome, 'acted_sms_unverified', 'the resend ran but §C cannot confirm it while SMS is off');
     assert.equal(a.evidence.exec_status, 'ok');
@@ -185,6 +193,40 @@ test('6817: Atomic active + Teltik host port online → resend_online executes d
 
     // No terminal close off an unverifiable resend — report stays open/queued.
     assert.equal(h.db.report.status, 'received');
+    assert.equal(h.db.report.auto_remediation_state, 'queued');
+  } finally { h.restore(); }
+});
+
+test('6817: stale webhook-delivered evidence still uses host resend, never A1 atomic_ota', async () => {
+  const h = makeHarness({ attStatus: 'active', portStatuses: ['online'], webhookDelivered: true });
+  try {
+    await runTickViaWorker(h.env);
+
+    assert.equal(h.resellerSyncCalls(), 1, 'reseller resend must fire when provider and host port are clean');
+    const a = h.db.attempts[0];
+    assert.equal(a.mode, 'TH2');
+    assert.equal(a.action, 'resend_online');
+    assert.equal(a.outcome, 'acted_sms_unverified');
+    assert.notEqual(a.mode, 'A1');
+    assert.notEqual(a.action, 'atomic_ota');
+    assert.equal(a.evidence.webhook_delivered, true);
+  } finally { h.restore(); }
+});
+
+test('6817: Teltik host port read unavailable → defer clearly, no A1 atomic_ota', async () => {
+  const h = makeHarness({ attStatus: 'active', portStatuses: ['error'] });
+  try {
+    await runTickViaWorker(h.env);
+
+    assert.equal(h.resellerSyncCalls(), 0, 'no resend until the host port read is usable');
+    assert.equal(h.resetPortCalls(), 0, 'no reset when port state is unknown, not known-offline');
+    const a = h.db.attempts[0];
+    assert.equal(a.mode, 'TH2');
+    assert.equal(a.action, 'classify_only');
+    assert.equal(a.outcome, 'no_change');
+    assert.equal(a.evidence.pending_reason, 'pending_teltik_host_port_read');
+    assert.notEqual(a.mode, 'A1');
+    assert.notEqual(a.action, 'atomic_ota');
     assert.equal(h.db.report.auto_remediation_state, 'queued');
   } finally { h.restore(); }
 });

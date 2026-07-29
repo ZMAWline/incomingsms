@@ -815,8 +815,8 @@ async function maybeExecuteAction(env, args) {
     const issueType = portOnline ? ISSUE_TELTIK_GATEWAY_PORT_RESET_RESOLVED : ISSUE_TELTIK_GATEWAY_PORT_OFFLINE;
     // A recheck-online proves the reset worked, NOT that the reseller has its
     // number back — never close `remediated` off port state alone. Requeue:
-    // the next tick sees the port online, skips TH5 and routes the normal
-    // vendor path (e.g. A6 resend_online).
+    // the next tick sees the port online, skips TH5 and routes the host
+    // resend path (TH2 resend_online).
     return {
       outcome: portOnline ? 'no_change' : 'escalate',
       evidence: {
@@ -1022,6 +1022,47 @@ async function classifyShared(env, report, evidence) {
         port_status: ps.raw || 'offline',
         provider_active: (vr && vr.ok === true) ? !!vr.healthy : null,
       }, 'teltik_gateway_port_offline', ISSUE_TELTIK_GATEWAY_PORT_OFFLINE);
+    }
+  }
+
+  // TH2 — non-Teltik-provider SIM hosted on a Teltik/Celtic gateway, provider
+  // active (Zalmen 2026-07-29, report #6817). The HOST path owns remediation
+  // BEFORE the vendor classifier: stale webhook-delivered evidence otherwise
+  // routes A1 atomic_ota, which the SMS kill switch skips forever. Port
+  // confirmed online → resend/resync the reseller (the resend IS the fix and
+  // sends no SMS itself), regardless of webhook delivered/missing. No usable
+  // port read → defer nonterminal (pending_teltik_host_port_read) so the next
+  // tick retries — never atomic_ota on an unknown host port. Port offline is
+  // TH5 above; provider not active is the vendor classifier's (A3/A4/...).
+  if (evidence.sim && isTeltikHosted(evidence.sim)
+      && String(evidence.sim.vendor || '').toLowerCase() !== 'teltik'
+      && evidence.vendorRead && evidence.vendorRead.ok === true
+      && evidence.vendorRead.healthy === true) {
+    const ps = evidence.teltikHostPortStatus;
+    const portReadOk = !!(ps && ps.status >= 200 && ps.status < 300);
+    if (portReadOk && ps.online === true) {
+      const { nextReviewAt } = await import('./cooldown.mjs');
+      return {
+        ...nonTerminal('TH2', 'resend_online', 'classify_only', {
+          reason: 'teltik_host_port_online_resend',
+          gateway_host: evidence.sim.gateway_host || null,
+          vendor: evidence.sim.vendor || null,
+          port_status: ps.raw || 'online',
+          webhook_delivered: !!(evidence.webhook && evidence.webhook.delivered),
+        }),
+        nextReviewAt: nextReviewAt({ action: 'resend_online', now: new Date() }),
+        vendorReadHealth: { healthy: true },
+        situationExtras: evidence.vendorRead.extras || null,
+      };
+    }
+    if (!portReadOk) {
+      return nonTerminal('TH2', 'classify_only', 'no_change', {
+        reason: 'pending_teltik_host_port_read',
+        pending_reason: 'pending_teltik_host_port_read',
+        gateway_host: evidence.sim.gateway_host || null,
+        vendor: evidence.sim.vendor || null,
+        port_read: ps || null,
+      });
     }
   }
 
