@@ -136,6 +136,9 @@ function makeFakeEnv({ skylineResponses = [], inbound = [] } = {}) {
     SUPABASE_URL: 'https://example.supabase.co',
     SUPABASE_SERVICE_ROLE_KEY: 'srv',
     SKYLINE_SECRET: 'secret',
+    // These fixtures exercise the real send path; bypass the temporary
+    // outbound-SMS kill switch (see tests/sms-disable.test.mjs for the guard).
+    SMS_SENDING_ENABLED: 'true',
     SKYLINE_GATEWAY: {
       async fetch(req) {
         calls.skyline.push({ url: req.url, body: await req.text() });

@@ -4,6 +4,8 @@
 // Other workers call this via service bindings.
 // =========================================================
 
+import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from "../shared/sms-availability.mjs";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -62,6 +64,12 @@ export default {
 /* ================= ROUTE HANDLERS ================= */
 
 async function handleSendSms(request, env) {
+  // TEMPORARY: gateways powered off — refuse before any gateway/provider call.
+  // See src/shared/sms-availability.mjs for the single re-enable switch.
+  if (!smsSendingEnabled(env)) {
+    return json({ ok: false, code: "sms_unavailable", error: SMS_UNAVAILABLE_MESSAGE }, 503);
+  }
+
   const body = await request.json();
   const { gateway_id, port, to, message, smstype, coding } = body;
 
