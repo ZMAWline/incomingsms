@@ -260,17 +260,24 @@ async function teltikGet(env, path, mdn) {
 
 // ---------------------------------------------------------
 // Teltik /v1/port-status — used by the T3/T4/T5 §C.4 extra predicate and the
-// TH5 host probe. Per the Teltik API docs the endpoint takes ONLY apikey: it
-// reports account/gateway port registration, not a specific line, so it can
-// never be keyed by MDN or ICCID (the dashboard's handleTeltikQuery was fixed
-// the same way in 40feedb). Returns { online: bool, raw: <state>, status }.
+// TH5 host probe. The endpoint is keyed by apikey + mdn (10-digit, same
+// Teltik-known MDN as /v1/get-info and /v1/reset-port — NEVER ICCID); calling
+// it without mdn is HTTP 400 "Please provide mdn parameter" (live BRR #6938).
+// A missing/invalid MDN returns status:0 (unusable read) so callers defer —
+// a read failure must never look like the port is offline.
+// Returns { online: bool, raw: <state>, status }.
 // ---------------------------------------------------------
-export async function teltikPortStatus(env) {
+export async function teltikPortStatus(env, { mdn } = {}) {
   if (!env.TELTIK_API_KEY) {
     return { online: false, status: 0, error: 'teltik_credentials_missing' };
   }
+  const norm = mdn10(mdn);
+  if (!norm || norm.length !== 10) {
+    return { online: false, status: 0, error: 'teltik_mdn_invalid:' + norm };
+  }
   const url = 'https://api.smsgateway.xyz/v1/port-status'
-    + '?apikey=' + encodeURIComponent(env.TELTIK_API_KEY);
+    + '?apikey=' + encodeURIComponent(env.TELTIK_API_KEY)
+    + '&mdn=' + encodeURIComponent(norm);
   let resp, text;
   try {
     resp = await relayFetch(env, url, { method: 'GET' });
@@ -426,8 +433,9 @@ export async function teltikLineView(env, { mdn }) {
   // (possibly rotation-stale) MDN. Reporting it as `MDN` would make T8 "sync"
   // sims.msisdn back to the stale number.
   const out = { ok: true, not_found: false, line_state: lineState, status: lineState, queried_mdn: norm, iccid: json.iccid || null };
-  // Port state — only trust a positively-read state.
-  const port = await teltikPortStatus(env);
+  // Port state — keyed by the same Teltik-known MDN; only trust a
+  // positively-read state.
+  const port = await teltikPortStatus(env, { mdn: norm });
   if (port && port.status && port.status >= 200 && port.status < 300) {
     out.port_status = port.online ? 'online' : (port.raw || undefined);
   }

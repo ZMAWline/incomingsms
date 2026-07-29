@@ -54,18 +54,21 @@ test('remediator resolves the Teltik-known MDN from latest Teltik inbound SMS', 
   assert.match(REMEDIATOR_SRC, /teltikKnownMdn: evidence\.teltikKnownMdn && evidence\.teltikKnownMdn\.mdn \|\| null/);
 });
 
-test('remediator Teltik /v1/port-status is never called with an mdn param', () => {
+test('remediator Teltik /v1/port-status is called with MDN, never ICCID', () => {
   const psLines = VENDOR_SRC.split('\n');
   const idx = psLines.findIndex(l => l.includes('api.smsgateway.xyz/v1/port-status'));
   assert.ok(idx >= 0, 'expected port-status call in remediator vendor.mjs');
-  // The URL is built across the following concatenation lines — none may add mdn.
-  const urlBlock = psLines.slice(idx, idx + 3).join('\n');
-  assert.doesNotMatch(urlBlock, /mdn/i, 'port-status must take only apikey: ' + urlBlock.trim());
-  // The host probe no longer gates on the SIM having a current MDN.
-  assert.match(REMEDIATOR_SRC, /isTeltikHosted\(evidence\.sim\)\) \{\n\s*try \{\n\s*evidence\.teltikHostPortStatus = await teltikPortStatus\(env\);/);
+  const urlBlock = psLines.slice(idx, idx + 6).join('\n');
+  assert.match(urlBlock, /&mdn=' \+ encodeURIComponent\(norm\)/, 'port-status must include normalized Teltik-known MDN');
+  assert.doesNotMatch(urlBlock, /iccid/i, 'port-status must never be keyed by ICCID');
+  assert.ok(
+    REMEDIATOR_SRC.includes('evidence.teltikHostPortStatus = await teltikPortStatus(env, {')
+      && REMEDIATOR_SRC.includes('mdn: (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)'),
+    'host probe must pass the Teltik-known MDN into port-status'
+  );
 });
 
-test('teltik vendor read keys get-info by the Teltik-known MDN and port-status by apikey only', async () => {
+test('teltik vendor read keys get-info and port-status by the Teltik-known MDN', async () => {
   const { readVendorView } = await import('../src/bad-rental-remediator/vendor.mjs');
   const calls = [];
   const orig = globalThis.fetch;
@@ -89,7 +92,9 @@ test('teltik vendor read keys get-info by the Teltik-known MDN and port-status b
     assert.doesNotMatch(getInfo, /9995550000/, 'get-info must not use the stale DB MDN when a Teltik-known MDN exists');
     const portStatus = calls.find(u => u.includes('/v1/port-status'));
     assert.ok(portStatus, 'expected a port-status probe');
-    assert.doesNotMatch(portStatus, /mdn/i, 'port-status takes apikey only');
+    assert.match(portStatus, /mdn=3075550101/, 'port-status must use the same Teltik-known MDN');
+    assert.doesNotMatch(portStatus, /9995550000/, 'port-status must not use the stale DB MDN when a Teltik-known MDN exists');
+    assert.doesNotMatch(portStatus, /8901OLD/, 'port-status must never use ICCID');
     // Teltik never attests an MDN — view.MDN must be null so T8 cannot sync
     // the stale Teltik-known MDN over the DB current one.
     assert.equal(res.view.MDN, null);

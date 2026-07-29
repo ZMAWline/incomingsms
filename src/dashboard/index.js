@@ -2266,40 +2266,47 @@ async function handleTeltikQuery(request, env, corsHeaders) {
     }
 
     // Operator UI expects Query to also surface /v1/port-status so an offline
-    // gateway is visible. Per Teltik docs, /v1/port-status takes only apikey —
-    // it reports account/gateway port registration, not a specific line — so it
-    // runs even when no MDN resolved. Failure here is non-fatal.
+    // gateway is visible. Live Teltik now requires mdn here too (BRR #6938);
+    // use the MDN resolved from get-phone-number and never ICCID. Failure here
+    // is non-fatal, but no valid MDN means we must skip instead of making a
+    // malformed apikey-only request.
     let port_status = null;
-    try {
-      const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey);
-      const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
-      const psHeaders = {};
-      if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
-      const psRes = await fetch(psFetchUrl, { method: 'GET', headers: psHeaders });
-      const psText = await psRes.text();
-      let psJson = null; try { psJson = JSON.parse(psText); } catch {}
-      await logCarrierApiCall(env, {
-        run_id: 'teltik_port_status_' + iccid + '_' + Date.now(),
-        step: 'port_status',
-        iccid,
-        imei: null,
-        vendor: 'teltik',
-        request_url: 'https://api.smsgateway.xyz/v1/port-status',
-        request_method: 'GET',
-        request_body: null,
-        response_status: psRes.status,
-        response_ok: psRes.ok,
-        response_body_text: psText,
-        response_body_json: psJson,
-        error: psRes.ok ? null : 'Teltik port-status HTTP ' + psRes.status,
-      });
-      port_status = {
-        ok: psRes.ok,
-        http_status: psRes.status,
-        response: psJson || psText,
-      };
-    } catch (e) {
-      port_status = { ok: false, error: 'port-status exception: ' + (e && e.message ? e.message : String(e)) };
+    const portStatusMdn = toTeltik10Digit(resolvedMdn);
+    if (!portStatusMdn || portStatusMdn.length !== 10) {
+      port_status = { ok: false, skipped: true, error: 'no valid Teltik-known MDN — port-status skipped' };
+    } else {
+      try {
+        const psUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey)
+          + '&mdn=' + encodeURIComponent(portStatusMdn);
+        const psFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + psUrl : psUrl;
+        const psHeaders = {};
+        if (env.RELAY_KEY) psHeaders['x-relay-key'] = env.RELAY_KEY;
+        const psRes = await fetch(psFetchUrl, { method: 'GET', headers: psHeaders });
+        const psText = await psRes.text();
+        let psJson = null; try { psJson = JSON.parse(psText); } catch {}
+        await logCarrierApiCall(env, {
+          run_id: 'teltik_port_status_' + iccid + '_' + Date.now(),
+          step: 'port_status',
+          iccid,
+          imei: null,
+          vendor: 'teltik',
+          request_url: 'https://api.smsgateway.xyz/v1/port-status?mdn=' + encodeURIComponent(portStatusMdn),
+          request_method: 'GET',
+          request_body: null,
+          response_status: psRes.status,
+          response_ok: psRes.ok,
+          response_body_text: psText,
+          response_body_json: psJson,
+          error: psRes.ok ? null : 'Teltik port-status HTTP ' + psRes.status,
+        });
+        port_status = {
+          ok: psRes.ok,
+          http_status: psRes.status,
+          response: psJson || psText,
+        };
+      } catch (e) {
+        port_status = { ok: false, error: 'port-status exception: ' + (e && e.message ? e.message : String(e)) };
+      }
     }
 
     return new Response(JSON.stringify({
@@ -2327,12 +2334,10 @@ async function handleTeltikQuery(request, env, corsHeaders) {
 //
 // MDN rule: Teltik/TotalTick may still know the line by the first MDN it ever
 // saw — our rotations don't sync back to Teltik (inbound SMS matches by
-// ICCID-in-alias for the same reason). So the line lookup (/v1/get-info, which
-// takes mdn) uses the Teltik-known MDN: the destination of the latest
-// Teltik-delivered inbound SMS for this SIM, falling back to our DB current
-// MDN only when no such SMS exists. /v1/port-status takes only apikey
-// (account/gateway scope — it cannot be run per-MDN or per-ICCID), so it is
-// fetched as-is.
+// ICCID-in-alias for the same reason). Both /v1/get-info and /v1/port-status
+// use the Teltik-known MDN: the destination of the latest Teltik-delivered
+// inbound SMS for this SIM, falling back to our DB current MDN only when no such
+// SMS exists. Never key Teltik host-port status by ICCID.
 async function handleTeltikHostCheck(request, env, corsHeaders) {
   try {
     const body = await request.json().catch(() => ({}));
@@ -2396,10 +2401,14 @@ async function handleTeltikHostCheck(request, env, corsHeaders) {
         'https://api.smsgateway.xyz/v1/get-info?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits));
     }
 
-    // Account/gateway port status — apikey only.
-    const port_status = await teltikGet('port_status',
-      'https://api.smsgateway.xyz/v1/port-status',
-      'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey));
+    let port_status = null;
+    if (mdnDigits && mdnDigits.length === 10) {
+      port_status = await teltikGet('port_status',
+        'https://api.smsgateway.xyz/v1/port-status?mdn=' + encodeURIComponent(mdnDigits),
+        'https://api.smsgateway.xyz/v1/port-status?apikey=' + encodeURIComponent(apiKey) + '&mdn=' + encodeURIComponent(mdnDigits));
+    } else {
+      port_status = { ok: false, skipped: true, error: 'no valid Teltik-known MDN — port-status skipped' };
+    }
 
     return new Response(JSON.stringify({
       ok: (get_info ? get_info.ok : true) && port_status.ok,
