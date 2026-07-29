@@ -72,14 +72,11 @@ test('Teltik-hosted non-Teltik SIM query appends Teltik host checks', () => {
   assert.match(DASHBOARD_HTML, /teltikHostDetailsBlock\(currentCarrierQuerySim\)/);
   assert.match(DASHBOARD_HTML, /_teltikHostTag\(sim\)/);
 });
-
-test('Teltik /v1/port-status is never called with an mdn param; get-info carries it', () => {
-  const psLines = DASHBOARD_SRC.split('\n')
-    .filter(l => l.includes('api.smsgateway.xyz/v1/port-status'));
-  assert.ok(psLines.length >= 2, 'expected port-status calls in dashboard worker');
-  for (const line of psLines) {
-    assert.doesNotMatch(line, /mdn/i, 'port-status must take only apikey: ' + line.trim());
-  }
+test('Teltik /v1/port-status carries MDN and never ICCID; get-info carries MDN too', () => {
+  assert.match(DASHBOARD_SRC, /v1\/port-status\?apikey=' \+ encodeURIComponent\(apiKey\)\n\s*\+ '&mdn=' \+ encodeURIComponent\(portStatusMdn\)/);
+  assert.match(DASHBOARD_SRC, /v1\/port-status\?apikey=' \+ encodeURIComponent\(apiKey\) \+ '&mdn=' \+ encodeURIComponent\(mdnDigits\)/);
+  assert.doesNotMatch(DASHBOARD_SRC, /port-status\?[^\n]+iccid/i, 'port-status must never be keyed by ICCID');
+  assert.match(DASHBOARD_SRC, /no valid Teltik-known MDN — port-status skipped/);
   // Line-specific Teltik context comes from get-info by the Teltik-known MDN.
   assert.match(DASHBOARD_SRC, /get-info\?apikey=' \+ encodeURIComponent\(apiKey\) \+ '&mdn=/);
 });

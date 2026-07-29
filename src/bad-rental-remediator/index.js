@@ -795,8 +795,8 @@ async function maybeExecuteAction(env, args) {
   // TH5: physical Teltik gateway port is offline. This path is keyed by
   // gateway_host, so Atomic/Wing/etc. SIMs hosted on Teltik are included while
   // carrier-vendor classification remains separate. Teltik reset-port is keyed
-  // by the Teltik-known 10-digit MDN (ctx.mdn above); the post-reset recheck
-  // uses account-scoped /v1/port-status (apikey only).
+  // by the Teltik-known 10-digit MDN (ctx.mdn above); the deferred post-reset
+  // recheck re-reads /v1/port-status keyed by that same MDN next pass.
   if (classification.mode === 'TH5' && action === 'teltik_reset_port') {
     if (!res.ok && res.status !== 'noop' && res.status !== 'cached') {
       return {
@@ -1413,11 +1413,17 @@ async function gatherEvidence(env, report) {
   }
   // Teltik-hosted port read is independent from carrier vendor read. Atomic or
   // Wing service-provider SIMs hosted by Teltik still need this host-level
-  // status check and reset path. /v1/port-status is account/gateway-scoped
-  // (apikey only — no per-line key), so it runs even when the SIM has no MDN.
+  // status check and reset path. /v1/port-status is keyed by the Teltik-known
+  // 10-digit MDN (same as get-info/reset-port — BRR #6938: without mdn Teltik
+  // returns HTTP 400 "Please provide mdn parameter"). No usable MDN → the
+  // wrapper returns status:0 (unusable read) and TH2 defers
+  // pending_teltik_host_port_read.
   if (evidence.sim && isTeltikHosted(evidence.sim)) {
     try {
-      evidence.teltikHostPortStatus = await teltikPortStatus(env);
+      evidence.teltikHostPortStatus = await teltikPortStatus(env, {
+        mdn: (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+          || evidence.sim.current_mdn_e164 || null,
+      });
     } catch (err) {
       evidence.teltikHostPortStatus = { online: false, status: 0, error: String(err && err.message || err) };
     }
