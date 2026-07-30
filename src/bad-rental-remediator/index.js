@@ -916,26 +916,33 @@ async function maybeExecuteAction(env, args) {
     const readOk = !!(recheck && recheck.status >= 200 && recheck.status < 300);
     const portOnline = readOk && recheck.online === true;
 
-    // For Teltik-hosted Atomic/Wing/etc. lines, a successful resend_online is
-    // only a reseller notification, not proof of SMS receipt. This branch must
-    // not be the first-line path for no_sms_received reports (those classify as
-    // TH2/classify_only above), and it never closes from provider-active + port
-    // online alone; keep the report queued with explicit evidence.
+    // For Teltik-hosted Atomic/Wing/etc. lines, the safe resend rule has
+    // already required provider healthy + host port online before selecting
+    // resend_online (TH2). A successful resend is therefore allowed even when
+    // outbound §C SMS probes are disabled; it is still recorded as
+    // acted_sms_unverified instead of terminal remediated because number.online
+    // is a reseller notification, not proof of renter SMS receipt.
     if (action === 'resend_online' && portOnline) {
       return {
         outcome: 'acted_sms_unverified',
         evidence: {
           exec_status: res.status,
-          gate_status: smsSendingEnabled(env) ? 'teltik_host_port_online' : 'sms_unavailable',
+          gate_status: smsSendingEnabled(env) ? 'provider_and_teltik_host_healthy' : 'sms_unavailable',
           gate_reason: smsSendingEnabled(env) ? null : SMS_UNAVAILABLE_MESSAGE,
-          webhook_delivered: !!(evidence.webhook && evidence.webhook.delivered),
+          safe_to_resend_online: true,
+          provider_status: 'healthy',
+          provider_vendor: evidence.sim.vendor || null,
+          host_status: 'healthy',
+          host_provider: 'teltik',
+          webhook_delivered_before_resend: !!(evidence.webhook && evidence.webhook.delivered),
           teltik_host_mdn: hostMdn,
           teltik_host_port_status: recheck || null,
+          ...(classification.evidenceSummary || {}),
           ...(res.evidence || {}),
         },
         errorMessage: null,
         execStatus: res.status,
-        gateStatus: smsSendingEnabled(env) ? 'teltik_host_port_online_unverified' : 'sms_unavailable',
+        gateStatus: smsSendingEnabled(env) ? 'provider_and_teltik_host_healthy' : 'sms_unavailable',
       };
     }
 
@@ -1158,15 +1165,16 @@ async function classifyShared(env, report, evidence) {
 
   // TH2 — non-Teltik-provider SIM hosted on a Teltik/Celtic gateway, provider
   // active. The HOST path owns assessment BEFORE the vendor classifier: stale
-  // webhook-delivered evidence otherwise routes A1 atomic_ota, which the SMS
-  // kill switch skips forever. Port confirmed online proves only provider/host
-  // health; it is NOT proof that the renter can receive SMS. For a
-  // no_sms_received report, never resend `number.online` as first-line
-  // remediation — record the diagnostic state and leave the report queued for
-  // real SMS-path assessment/repair. No usable port read → defer nonterminal
-  // (pending_teltik_host_port_read) so the next tick retries — never atomic_ota
-  // on an unknown host port. Port offline is TH5 above; provider not active is
-  // the vendor classifier's (A3/A4/...).
+  // webhook-delivered evidence otherwise routes A1 atomic_ota. Zalmen's
+  // 2026-07-30 rule: for bad-rental reports, `number.online` is allowed only
+  // after BOTH sides are proven healthy — provider/carrier read OK and host
+  // port online. This branch is exactly that proof for Atomic/Wing/Helix lines
+  // physically hosted on Teltik: keep provider identity separate, use the
+  // Teltik-known host MDN for the Teltik port read, and then resend the online
+  // webhook as a reseller sync/notification. No usable port read → defer
+  // nonterminal (pending_teltik_host_port_read) so the next tick retries — never
+  // atomic_ota/resend on an unknown host port. Port offline is TH5 above;
+  // provider not active is the vendor classifier's (A3/A4/...).
   if (evidence.sim && isTeltikHosted(evidence.sim)
       && String(evidence.sim.vendor || '').toLowerCase() !== 'teltik'
       && evidence.vendorRead && evidence.vendorRead.ok === true
@@ -1175,17 +1183,24 @@ async function classifyShared(env, report, evidence) {
     const portReadOk = !!(ps && ps.status >= 200 && ps.status < 300);
     if (portReadOk && ps.online === true) {
       const { nextReviewAt } = await import('./cooldown.mjs');
+      const hostMdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+        || evidence.sim.current_mdn_e164 || null;
       return {
-        ...nonTerminal('TH2', 'classify_only', 'no_change', {
-          reason: 'teltik_host_sms_unverified',
-          pending_reason: 'sms_receipt_unverified_no_online_notification',
-          disallowed_action: 'resend_online',
+        ...nonTerminal('TH2', 'resend_online', 'no_change', {
+          reason: 'provider_and_host_healthy_resend_online_safe',
+          safe_to_resend_online: true,
+          provider_status: 'healthy',
+          provider_vendor: evidence.sim.vendor || null,
+          provider_read: evidence.vendorRead.view || null,
+          host_status: 'healthy',
+          host_provider: 'teltik',
           gateway_host: evidence.sim.gateway_host || null,
-          vendor: evidence.sim.vendor || null,
+          teltik_host_mdn: hostMdn,
+          teltik_known_mdn: evidence.teltikKnownMdn || null,
           port_status: ps.raw || 'online',
-          webhook_delivered: !!(evidence.webhook && evidence.webhook.delivered),
+          webhook_delivered_before_resend: !!(evidence.webhook && evidence.webhook.delivered),
         }),
-        nextReviewAt: nextReviewAt({ action: 'classify_only', now: new Date() }),
+        nextReviewAt: nextReviewAt({ action: 'resend_online', now: new Date() }),
         vendorReadHealth: { healthy: true },
         situationExtras: evidence.vendorRead.extras || null,
       };
