@@ -4,10 +4,10 @@
 //      provider-active evidence; a suspended/cancelled line routes to the
 //      vendor classifier (A3/A4) instead,
 //   2. Teltik host port checked before resend_online,
-//   3. port online → TH2 resend_online fires even while outbound SMS
-//      verification is disabled (the resend is the remediation; it sends no
-//      SMS), REGARDLESS of stale webhook-delivered evidence — never A1
-//      atomic_ota for a hosted SIM,
+//   3. port online + provider healthy → TH2 resend_online fires even while
+//      outbound SMS verification is disabled (number.online is the safe reseller
+//      notification after both carrier and host are healthy), REGARDLESS of stale
+//      webhook-delivered evidence — never A1 atomic_ota for a hosted SIM,
 //   3b. port read missing/failed → nonterminal pending_teltik_host_port_read,
 //      no atomic_ota, no resend — retry next tick,
 //   4. port offline → reset-port NOW, recheck DEFERRED (no in-tick sleep —
@@ -181,49 +181,52 @@ async function runTickViaWorker(env) {
 }
 
 // ---------------------------------------------------------
-// (3) Port online + provider active is only assessment evidence. It must not
-// tell the reseller `number.online` as first-line remediation for a
-// no_sms_received complaint.
+// (3) Carrier/provider OK + host OK is the only safe path to resend
+// `number.online` for a no_sms_received bad-rental report.
 // ---------------------------------------------------------
 
-test('7182: Atomic active + Teltik host port online → classify diagnostic, no first-line resend_online', async () => {
+test('7182: Atomic active + Teltik host port online → resend_online after both health checks', async () => {
   const h = makeHarness({ attStatus: 'active', portStatuses: ['online'] });
   try {
     await runTickViaWorker(h.env);
 
-    assert.equal(h.resellerSyncCalls(), 0, 'must not send number.online before proving/fixing SMS receipt');
+    assert.equal(h.resellerSyncCalls(), 1, 'carrier OK + host OK must send number.online');
     assert.equal(h.resetPortCalls(), 0, 'no reset when the port is already online');
 
     assert.equal(h.db.attempts.length, 1);
     const a = h.db.attempts[0];
     assert.equal(a.mode, 'TH2');
-    assert.equal(a.action, 'classify_only');
-    assert.equal(a.outcome, 'no_change');
-    assert.equal(a.evidence.reason, 'teltik_host_sms_unverified');
-    assert.equal(a.evidence.pending_reason, 'sms_receipt_unverified_no_online_notification');
-    assert.equal(a.evidence.disallowed_action, 'resend_online');
+    assert.equal(a.action, 'resend_online');
+    assert.equal(a.outcome, 'acted_sms_unverified');
+    assert.equal(a.evidence.reason, 'provider_and_host_healthy_resend_online_safe');
+    assert.equal(a.evidence.safe_to_resend_online, true);
+    assert.equal(a.evidence.provider_vendor, 'atomic');
+    assert.equal(a.evidence.provider_status, 'healthy');
+    assert.equal(a.evidence.host_provider, 'teltik');
+    assert.equal(a.evidence.host_status, 'healthy');
+    assert.equal(a.evidence.teltik_host_mdn, '+15550006817');
+    assert.equal(a.evidence.sim_id, 'sim-6817');
 
-    // No terminal close off host/provider health alone — report stays open/queued.
+    // Resend is not a terminal proof of SMS receipt — report stays open/queued.
     assert.equal(h.db.report.status, 'received');
     assert.equal(h.db.report.auto_remediation_state, 'queued');
   } finally { h.restore(); }
 });
 
-test('7182: stale webhook-delivered evidence still records TH2 diagnostic, never resend_online or A1 atomic_ota', async () => {
+test('7182: stale webhook-delivered evidence still uses TH2 safe resend, never A1 atomic_ota', async () => {
   const h = makeHarness({ attStatus: 'active', portStatuses: ['online'], webhookDelivered: true });
   try {
     await runTickViaWorker(h.env);
 
-    assert.equal(h.resellerSyncCalls(), 0, 'delivered webhook history is not SMS receipt proof');
+    assert.equal(h.resellerSyncCalls(), 1, 'safe resend is allowed after provider+host health even with stale webhook history');
     const a = h.db.attempts[0];
     assert.equal(a.mode, 'TH2');
-    assert.equal(a.action, 'classify_only');
-    assert.equal(a.outcome, 'no_change');
+    assert.equal(a.action, 'resend_online');
+    assert.equal(a.outcome, 'acted_sms_unverified');
     assert.notEqual(a.mode, 'A1');
     assert.notEqual(a.action, 'atomic_ota');
-    assert.notEqual(a.action, 'resend_online');
-    assert.equal(a.evidence.webhook_delivered, true);
-    assert.equal(a.evidence.pending_reason, 'sms_receipt_unverified_no_online_notification');
+    assert.equal(a.evidence.webhook_delivered_before_resend, true);
+    assert.equal(a.evidence.safe_to_resend_online, true);
   } finally { h.restore(); }
 });
 
@@ -314,29 +317,30 @@ test('6817: recheck pass still offline → escalated teltik_gateway_port_offline
 });
 
 // ---------------------------------------------------------
-// (4b) Deferred recheck pass, port online → NO remediated close off port
-// state alone and NO reseller `number.online`; TH2 records that SMS receipt is
-// still unverified and leaves the report open.
+// (4b) Deferred recheck pass, port online → provider+host now healthy, so the
+// safe `number.online` resend runs. It still does not terminally close off port
+// state alone; the report remains open/queued for SMS receipt verification.
 // ---------------------------------------------------------
 
-test('7182: recheck pass online → TH2 diagnostic, no false remediated closure or online resend', async () => {
-  const h = makeHarness({ attStatus: 'active', portStatuses: ['offline', 'online'] });
+test('7182: recheck pass online → safe online resend, no false remediated closure', async () => {
+  const h = makeHarness({ attStatus: 'active', portStatuses: ['offline', 'online', 'online'] });
   try {
     await runTickViaWorker(h.env); // pass 1: reset + recheck pending
-    await runTickViaWorker(h.env); // pass 2: port online → TH2 diagnostic
+    await runTickViaWorker(h.env); // pass 2: port online → TH2 safe resend
 
     assert.equal(h.resetPortCalls(), 1, 'no second reset once the port is back online');
-    assert.equal(h.resellerSyncCalls(), 0, 'port-online recheck alone must not send number.online');
+    assert.equal(h.resellerSyncCalls(), 1, 'provider+host healthy after recheck must send number.online');
 
     assert.equal(h.db.attempts.length, 2);
     assert.equal(h.db.attempts[0].mode, 'TH5');
     assert.equal(h.db.attempts[0].outcome, 'no_change');
     const a = h.db.attempts[1];
     assert.equal(a.mode, 'TH2');
-    assert.equal(a.action, 'classify_only');
+    assert.equal(a.action, 'resend_online');
     assert.notEqual(a.outcome, 'remediated', 'port-online recheck alone must never close the report');
-    assert.equal(a.outcome, 'no_change');
-    assert.equal(a.evidence.reason, 'teltik_host_sms_unverified');
+    assert.equal(a.outcome, 'acted_sms_unverified');
+    assert.equal(a.evidence.safe_to_resend_online, true);
+    assert.equal(a.evidence.reason, 'provider_and_host_healthy_resend_online_safe');
 
     assert.equal(h.db.report.status, 'received');
     assert.notEqual(h.db.report.status, 'remediated');
@@ -345,8 +349,26 @@ test('7182: recheck pass online → TH2 diagnostic, no false remediated closure 
 });
 
 // ---------------------------------------------------------
-// (1) Provider NOT active → vendor classifier owns the report; TH5 must not
-// fire off the offline host port.
+// (1) Provider NOT active → vendor classifier owns the report even when the
+// host is OK; no reseller online notification until the carrier side is healthy.
+// ---------------------------------------------------------
+
+test('7182: Atomic suspended + Teltik host port online → no resend, carrier path used', async () => {
+  const h = makeHarness({ attStatus: 'suspended', portStatuses: ['online'] });
+  try {
+    await runTickViaWorker(h.env);
+
+    assert.equal(h.resellerSyncCalls(), 0, 'carrier NOT OK + host OK must not send number.online');
+    assert.equal(h.resetPortCalls(), 0, 'host is online; no Teltik reset');
+    const a = h.db.attempts[0];
+    assert.equal(a.mode, 'A3');
+    assert.equal(a.action, 'atomic_restore');
+  } finally { h.restore(); }
+});
+
+// ---------------------------------------------------------
+// (1b) Provider NOT active + host offline still belongs to the carrier path;
+// TH5 must not fire off the offline host port.
 // ---------------------------------------------------------
 
 test('6817: Atomic suspended + Teltik host port offline → A3 vendor path, not TH5', async () => {
