@@ -244,6 +244,18 @@ export async function runVerifyPoll(env) {
       if (out === 'match') matched++;
       else if (out === 'timeout') timedOut++;
       else if (out === 'still_pending') stillPending++;
+      else if (out === 'no_pending') {
+        // Row is stamped verify_pending but has no nonce/sent_at (crashed
+        // mid-transition or manual edit). Nothing will ever resolve it —
+        // release it back to queued so the main tick re-evaluates instead of
+        // letting it sit stuck forever.
+        await patchReport(env, r.id, {
+          auto_remediation_state: 'queued',
+          verify_pending_nonce: null,
+          verify_pending_sent_at: null,
+        });
+        console.log('[VerifyPoll] report ' + r.id + ' had verify_pending state without nonce; reset to queued.');
+      }
     } catch (err) {
       console.log('[VerifyPoll] report ' + r.id + ' error: ' + err);
     }

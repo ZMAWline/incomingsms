@@ -21,13 +21,14 @@ import {
 // ---------------------------------------------------------
 
 test('ESCALATION_FAILURE_TYPES enumerates the bad-rental operator failure types', () => {
-  assert.equal(ESCALATION_FAILURE_TYPES.length, 15);
+  assert.equal(ESCALATION_FAILURE_TYPES.length, 17);
   for (const t of [
     'verify_send_failed', 'verify_receive_timeout', 'vendor_active_no_sms',
     'vendor_iccid_not_found', 'imei_wrong_type', 'imei_drift_vendor',
     'vendor_cancelled_active_rental', 'wing_w7_dialable_retry_failed',
     'helix_unsuspend_failed', 'atomic_restore_failed', 'teltik_reset_failed',
     'teltik_gateway_port_offline', 'teltik_forward_url_misconfigured', 'unable_to_reproduce_recommendation',
+    'vendor_read_failed', 'vendor_mdn_drift',
     'generic',
   ]) assert.ok(ESCALATION_FAILURE_TYPES.includes(t), 'missing ' + t);
 });
