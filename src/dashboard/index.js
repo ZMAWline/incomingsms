@@ -4349,12 +4349,7 @@ async function handleBadRentalAutoLock(id, targetState, request, env, corsHeader
 
     const patchResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_reports?id=eq.${reportId}`, {
       method: 'PATCH',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=representation',
-      },
+      headers: sbHeaders,
       body: JSON.stringify(patch),
     });
     if (!patchResp.ok) {
@@ -4438,10 +4433,41 @@ async function handleBadRentalRerunAuto(id, request, env, corsHeaders) {
     const prevState = cur.auto_remediation_state || null;
     const prevEscalation = cur.escalation_reason || null;
     const nowIso = new Date().toISOString();
+    const sbHeaders = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    };
+
+    // Fresh attempt-budget marker. The remediator stops counting per-action
+    // attempts at the newest operator_requeue marker, so a report escalated by
+    // a fixed automation bug can actually run again instead of immediately
+    // tripping max_attempts_reached.
+    const markerResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_report_remediation_attempts`, {
+      method: 'POST',
+      headers: { ...sbHeaders, Prefer: 'return=minimal' },
+      body: JSON.stringify({
+        report_id: reportId,
+        attempt_no: 0,
+        mode: 'operator',
+        action: 'operator_requeue',
+        outcome: 'requeued',
+        evidence: { source: 'dashboard_rerun_auto', actor, prev_state: prevState, prev_escalation_reason: prevEscalation },
+      }),
+    });
+    if (!markerResp.ok) {
+      const txt = await markerResp.text().catch(() => '');
+      return new Response(JSON.stringify({ error: 'marker_insert_failed', detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
     const patch = {
       auto_remediation_state: 'queued',
       last_auto_attempt_at: null,
       escalation_reason: null,
+      next_review_at: null,
       updated_at: nowIso,
     };
 

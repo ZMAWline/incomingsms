@@ -35,6 +35,8 @@ export const ESCALATION_FAILURE_TYPES = Object.freeze([
   'teltik_gateway_port_offline',
   'teltik_forward_url_misconfigured',
   'unable_to_reproduce_recommendation',
+  'vendor_read_failed',
+  'vendor_mdn_drift',
   'generic',
 ]);
 

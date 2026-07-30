@@ -505,9 +505,11 @@ export async function readVendorView(env, sim, opts = {}) {
       // is stale — which is exactly the MDN-drift case these reports are about.
       // ICCID is stable; the vendor returns the CURRENT MSISDN, and the
       // classifier's A9 then detects the drift and db_sync_upserts it.
+      // Fallback read is by MSISDN — Atomic wants 10 digits, not E.164
+      // (raw "+1..." yields statusCode 512 Invalid MSISDN).
       read = sim.iccid
         ? await atomicSubscriberInquiry(env, { iccid: sim.iccid })
-        : await atomicSubscriberInquiry(env, { msisdn: sim.current_mdn_e164 });
+        : await atomicSubscriberInquiry(env, { msisdn: mdn10(sim.current_mdn_e164 || '') });
     } else if (vendor === 'wing_iot') {
       read = await wingGetDevice(env, { iccid: sim.iccid });
     } else if (vendor === 'helix') {

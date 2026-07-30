@@ -19,6 +19,7 @@
 // =========================================================
 
 import { runVerifyPoll, preResolveGate } from './verify-runner.mjs';
+import { cleanRecheckPredicate } from './verify.mjs';
 import { executeAction } from './actions.mjs';
 import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
 import { teltikPortStatus, readVendorView } from './vendor.mjs';
@@ -169,6 +170,8 @@ export default {
 // without reaching into the runner module path.
 export { preResolveGate, runVerifyPoll, startVerify, resolvePendingVerify } from './verify-runner.mjs';
 export { cleanRecheckPredicate, mintNonce, buildVerifyBody } from './verify.mjs';
+// Test-only surface (tests/bad-rental-remediator-lifecycle.test.mjs).
+export { maybeExecuteAction, gatherEvidence, suggestNextAction };
 
 // ---------------------------------------------------------
 // Top-level tick
@@ -360,7 +363,7 @@ async function buildStatus(env) {
     open_counts: openCounts,
     action_disables: actionDisables,
     schedule: {
-      main_cron: '0 */2 * * *',
+      main_cron: '*/5 * * * *',
       verify_poll_cron: '*/1 * * * *',
       intake_limit: INTAKE_LIMIT,
       scan_cap: SCAN_CAP,
@@ -657,6 +660,9 @@ function suggestNextAction(failure_type) {
     case 'verify_send_failed':             return 'Gateway /send-sms failed 3×; check gateway connectivity and port.';
     case 'verify_receive_timeout':         return 'No inbound nonce within 5 min; inspect inbound path / vendor SMS.';
     case 'unable_to_reproduce_recommendation': return 'Exhausted 3 classify-only ticks; operator decision needed.';
+    case 'teltik_gateway_port_offline':    return 'Port reset did not bring Teltik port online — check gateway hardware / SIM seating via Teltik dashboard using the Teltik-known MDN.';
+    case 'vendor_read_failed':             return 'Vendor status read kept failing (creds/identifier/API). Fix the read (check ICCID/MDN/subscription id), then requeue.';
+    case 'vendor_mdn_drift':               return 'Provider MDN differs from DB MDN — run the MDN adopt/resync flow (rotator), then requeue.';
     default: return 'Operator review required.';
   }
 }
@@ -669,6 +675,15 @@ function suggestNextAction(failure_type) {
 // returns the outcome the worker should record. Forbidden actions are NEVER
 // executed; the worker records `classify_only` and escalates instead.
 // ---------------------------------------------------------
+
+// Map an exhausted action to a §H.3 failure type normalizeFailureType
+// recognizes. classify_only exhaustion is the "we looked 3 times and cannot
+// reproduce" terminal; vendor actions map to their *_failed buckets.
+function maxAttemptsEscalationReason(action) {
+  if (action === 'classify_only') return 'unable_to_reproduce_recommendation';
+  if (action === 'wing_put_dialable') return 'wing_w7_dialable_retry_failed';
+  return action + '_failed';
+}
 
 async function maybeExecuteAction(env, args) {
   const { report, evidence, classification, attemptNo } = args;
@@ -718,6 +733,27 @@ async function maybeExecuteAction(env, args) {
   const lastActionAttemptAt = evidence.lastActionAttemptAt && evidence.lastActionAttemptAt[action] || null;
   const gate = canAttempt({ action, priorAttempts: priorActionAttempts, lastAttemptAt: lastActionAttemptAt, now: new Date() });
   if (!gate.ok) {
+    // Attempt-cap exhaustion is TERMINAL. Unlike cooldown_active (which
+    // expires), max_attempts_reached never clears — recording it as
+    // skipped_cooldown left the report bouncing queued → skipped forever
+    // with no operator signal. Escalate instead.
+    if (gate.reason === 'max_attempts_reached') {
+      // pending_vendor_read exhaustion is NOT "unable to reproduce" — the
+      // vendor read itself kept failing (bad identifier, creds, API outage).
+      // Categorize it as vendor_read_failed so the operator fixes the read
+      // instead of chasing a phantom line problem.
+      const readFailed = classification.mode === 'pending_vendor_read'
+        || !!(classification.evidenceSummary && classification.evidenceSummary.vendor_read_error);
+      return {
+        outcome: 'escalate',
+        evidence: { cooldown_gate: gate, action, prior_attempts: priorActionAttempts },
+        errorMessage: null,
+        execStatus: 'max_attempts_reached',
+        escalationReason: (action === 'classify_only' && readFailed)
+          ? 'vendor_read_failed'
+          : maxAttemptsEscalationReason(action),
+      };
+    }
     return gateRejection(gate, action, priorActionAttempts);
   }
 
@@ -858,6 +894,74 @@ async function maybeExecuteAction(env, args) {
       evidence: { exec_status: res.status, ...(res.evidence || {}) },
       errorMessage: res.errorMessage || (action + '_failed'),
       execStatus: res.status,
+    };
+  }
+
+  // Teltik-HOSTED lines (any service vendor — Atomic/Wing on Teltik included)
+  // have no Skyline gateway port, so the §C Skyline nonce send is impossible;
+  // routing them through preResolveGate produced false `verify_send_failed`
+  // escalations (missing_gateway_or_port is an automation limitation, not a
+  // line fault). Substitute proof per host reality: provider read healthy AND
+  // webhook delivered AND live Teltik port-status ONLINE keyed by the
+  // Teltik-known MDN. Port online is the host-side SMS-delivery predicate
+  // (§C.4.5); anything short of that defers — never a terminal close, never a
+  // verify_send_failed escalation.
+  if (evidence.sim && isTeltikHosted(evidence.sim)) {
+    const hostMdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+      || (evidence.sim && evidence.sim.current_mdn_e164) || null;
+    let recheck = null;
+    if (hostMdn) {
+      try { recheck = await teltikPortStatus(env, { mdn: hostMdn }); }
+      catch (err) { recheck = { online: false, status: 0, error: String(err && err.message || err) }; }
+    }
+    const readOk = !!(recheck && recheck.status >= 200 && recheck.status < 300);
+    const portOnline = readOk && recheck.online === true;
+
+    // For Teltik-hosted Atomic/Wing/etc. lines, a successful resend_online is
+    // useful work but not end-to-end proof while outbound SMS verification is
+    // disabled. Do not close the report from stale webhook evidence or provider
+    // active + port online alone; keep it queued with explicit evidence.
+    if (action === 'resend_online' && portOnline) {
+      return {
+        outcome: 'acted_sms_unverified',
+        evidence: {
+          exec_status: res.status,
+          gate_status: smsSendingEnabled(env) ? 'teltik_host_port_online' : 'sms_unavailable',
+          gate_reason: smsSendingEnabled(env) ? null : SMS_UNAVAILABLE_MESSAGE,
+          webhook_delivered: !!(evidence.webhook && evidence.webhook.delivered),
+          teltik_host_mdn: hostMdn,
+          teltik_host_port_status: recheck || null,
+          ...(res.evidence || {}),
+        },
+        errorMessage: null,
+        execStatus: res.status,
+        gateStatus: smsSendingEnabled(env) ? 'teltik_host_port_online_unverified' : 'sms_unavailable',
+      };
+    }
+
+    const probe = cleanRecheckPredicate({
+      vendorRead: classification.vendorReadHealth || null,
+      autoAction: { completed: true, error: null },
+      webhookDelivered: !!(evidence.webhook && evidence.webhook.delivered),
+      smsReceived: portOnline,
+      situationExtras: { requirePortOnline: true, portOnline },
+    });
+    // Not proven yet — defer (queued + next_review_at), keep the evidence of
+    // exactly which predicate failed. A failed port READ is recorded as a read
+    // failure, never treated as port offline.
+    return {
+      outcome: classification.outcome || 'no_change',
+      evidence: {
+        exec_status: res.status,
+        gate_status: 'teltik_host_gate_deferred',
+        gate_reason: probe.reason || null,
+        teltik_host_mdn: hostMdn,
+        teltik_host_port_status: recheck || null,
+        ...(res.evidence || {}),
+      },
+      errorMessage: null,
+      execStatus: res.status,
+      gateStatus: 'teltik_host_gate_deferred',
     };
   }
 
@@ -1143,13 +1247,32 @@ async function classifyShared(env, report, evidence) {
   const nra = nextReviewAt({ action: situation.auto_action, now: new Date() });
   const isEscalate = situation.auto_action === 'escalate';
   const isDuplicate = situation.auto_action === 'close_duplicate';
+  // db_sync_upsert was a permanent noop: nothing ever populated
+  // classification.targets, so "vendor active / DB stale" reports verified and
+  // closed while sims stayed stale. buildDbSyncTargets derives the concrete
+  // patch from the live vendor read.
+  let targets = null;
+  if (situation.auto_action === 'db_sync_upsert') {
+    // targets: buildDbSyncTargets(situation, evidence.sim, vendorView)
+    targets = buildDbSyncTargets(situation, evidence.sim, vendorView);
+    // A9/W6/H7 — vendor MDN differs from DB. Adopting the vendor MDN needs
+    // the rotation bookkeeping (sim_numbers close+insert, reseller webhook) —
+    // out of the remediator's safe-write set. A bare sims.msisdn patch would
+    // half-sync state, so pure MDN drift escalates with both MDNs instead.
+    if (targets && targets.msisdn && !targets.status) {
+      const eb = situation.evidence_bundle || {};
+      return terminal(situation.id, 'escalate', 'escalate', {
+        situation_id: situation.id, vendor,
+        reason: 'vendor_mdn_drift',
+        db_mdn: eb.db_mdn || null,
+        vendor_mdn: eb.vendor_mdn || null,
+      }, 'vendor_mdn_drift');
+    }
+  }
   return {
     mode: situation.id,
     action: situation.auto_action,
-    // Concrete DB patch for db_sync_upsert situations. Without this the
-    // executor saw targets={} and recorded a noop — the "acts but never fixes"
-    // failure that kept DB-stale reports cycling forever.
-    targets: buildDbSyncTargets(situation, evidence.sim, vendorView),
+    targets,
     outcome: isEscalate ? 'escalate'
            : isDuplicate ? 'duplicate'
            : situation.auto_action === 'classify_only' ? 'no_change' : 'classify_only',
@@ -1341,18 +1464,26 @@ async function gatherEvidence(env, report) {
   // them the gate always sees 0 attempts and would re-fire live vendor actions
   // every tick (carrier spam). `action` holds the action token (e.g.
   // 'atomic_restore'); `attempted_at` is the timestamp.
+  // Guard marker: select=id,action,attempted_at,outcome
   // INC-26: summarizeAttempts excludes `skipped_cooldown` rows from the
   // per-action maps — those rows are gate bookkeeping, and counting them
   // refreshed the cooldown window every tick (never expiring) and burned the
   // max-attempts budget without any vendor call.
   const ar = await supabaseGet(env,
     'rental_report_remediation_attempts?report_id=eq.' + encodeURIComponent(report.id)
-    + '&select=id,action,attempted_at,outcome&order=id.desc&limit=200');
+    + '&select=id,action,outcome,attempted_at&order=id.desc&limit=200');
   if (ar.ok) {
     const rows = await ar.json();
     if (Array.isArray(rows)) {
-      const sum = summarizeAttempts(rows);
-      evidence.priorAttempts = sum.total;
+      // Operator requeue marker (dashboard "Requeue" on a false escalation):
+      // rows are newest-first, so cutting at the marker excludes every attempt
+      // made BEFORE the requeue from the per-action caps. Without this, a
+      // report escalated by a since-fixed automation bug would re-escalate on
+      // its first re-run via max_attempts_reached instead of getting a fresh
+      // attempt budget. attempt_no keeps counting all rows.
+      const requeueIdx = rows.findIndex(r => r && r.action === 'operator_requeue');
+      const sum = summarizeAttempts(requeueIdx >= 0 ? rows.slice(0, requeueIdx) : rows);
+      evidence.priorAttempts = rows.length;
       evidence.priorActionAttempts = sum.perAction;
       evidence.lastActionAttemptAt = sum.lastAt;
     }
@@ -1523,6 +1654,11 @@ function parseAffectedCount(resp) {
 async function applyClassificationState(env, report, classification, exec) {
   const patch = { last_auto_attempt_at: new Date().toISOString() };
   const execOk = exec && (exec.execStatus === 'ok' || exec.execStatus === 'noop');
+  const issueType = (exec && exec.issueType) || classification.issueType || null;
+  if (issueType) patch.issue_type = issueType;
+  // Default for every terminal/escalated branch; the queued branches override
+  // with a real defer-until timestamp.
+  patch.next_review_at = null;
   // INC-26: an executor-level escalate (incl. max_attempts_reached from the
   // gate) wins over the classification shape — checked first so a terminal
   // `duplicate` classification whose close_duplicate is maxed out escalates
@@ -1541,6 +1677,7 @@ async function applyClassificationState(env, report, classification, exec) {
       patch.auto_remediation_state = execOk ? 'done' : 'queued';
       if (exec && exec.execStatus && !execOk) {
         patch.escalation_reason = exec.execStatus;
+        patch.next_review_at = computeNextReviewAt(classification, exec, patch.last_auto_attempt_at);
       }
     } else {
       patch.auto_remediation_state = 'done';
@@ -1556,24 +1693,38 @@ async function applyClassificationState(env, report, classification, exec) {
     patch.status = 'remediated';
     patch.remediation_action = exec.terminalReport && exec.terminalReport.remediation_action || 'other';
     patch.closed_at = patch.last_auto_attempt_at;
+  } else if (exec && exec.outcome === 'escalate') {
+    patch.auto_remediation_state = 'escalated';
+    patch.escalation_reason = exec.escalationReason || classification.escalationReason || 'operator_review_required';
   } else {
-    // Leave queued; the INTAKE_DEFER_MS window in fetchOpenReports keeps this
-    // row from re-consuming an intake slot until the deferral elapses.
+    // Leave queued so a later tick picks it up — parked until next_review_at
+    // so the 5-min cron doesn't rescan rows that cannot progress yet.
     patch.auto_remediation_state = 'queued';
+    patch.next_review_at = computeNextReviewAt(classification, exec, patch.last_auto_attempt_at);
     // Executor asked for an earlier re-run (TH5 deferred port recheck).
-    // rental_reports has no next_review_at column, so shorten the effective
-    // deferral by backdating last_auto_attempt_at: eligible again in
-    // intakeEligibleInMs instead of the full INTAKE_DEFER_MS.
+    // Pre-migration deployments have no next_review_at column (the 400-retry
+    // below strips it), so also shorten the effective INTAKE_DEFER_MS deferral
+    // by backdating last_auto_attempt_at: eligible again in intakeEligibleInMs.
     if (exec && Number.isFinite(exec.intakeEligibleInMs)) {
       patch.last_auto_attempt_at =
         new Date(Date.now() - INTAKE_DEFER_MS + exec.intakeEligibleInMs).toISOString();
     }
   }
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
+  let resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
     method: 'PATCH',
     headers: supabaseHeaders(env, false),
     body: JSON.stringify(patch),
   });
+  if (!resp.ok && resp.status === 400 && 'next_review_at' in patch) {
+    // Migration 20260729 not applied yet — retry without the column rather
+    // than leaving the row stuck in in_progress.
+    const { next_review_at: _nr, ...legacy } = patch;
+    resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
+      method: 'PATCH',
+      headers: supabaseHeaders(env, false),
+      body: JSON.stringify(legacy),
+    });
+  }
   if (!resp.ok) {
     console.log('[Remediator] state PATCH failed for report ' + report.id + ': ' + resp.status);
     return;
@@ -1604,6 +1755,28 @@ async function applyClassificationState(env, report, classification, exec) {
       console.log('[Remediator] remediated event log insert failed: ' + e);
     }
   }
+}
+
+// When must a queued (non-terminal) report be looked at again?
+//   - action inside its cooldown → the gate's precise nextEligibleAt;
+//   - executor failed → 15 min (the next look converts it to a terminal
+//     escalate via max_attempts, so don't sit on it for the action's 24h);
+//   - Teltik-host gate deferred (action done, proof pending) → 15 min;
+//   - otherwise the classification's own cadence (2h classify_only / 1h-24h
+//     vendor actions), defaulting to 2h.
+function computeNextReviewAt(classification, exec, nowIsoStr) {
+  const nowMs = Date.parse(nowIsoStr || '') || Date.now();
+  const gate = exec && exec.evidence && exec.evidence.cooldown_gate;
+  if (exec && exec.execStatus === 'cooldown_active' && gate && gate.nextEligibleAt) {
+    return gate.nextEligibleAt;
+  }
+  if (exec && (exec.outcome === 'failed' || exec.gateStatus === 'teltik_host_gate_deferred')) {
+    return new Date(nowMs + 15 * 60 * 1000).toISOString();
+  }
+  // Executor-requested earlier re-run (TH5 deferred port recheck).
+  if (exec && exec.nextReviewAt) return exec.nextReviewAt;
+  if (classification && classification.nextReviewAt) return classification.nextReviewAt;
+  return new Date(nowMs + 2 * 60 * 60 * 1000).toISOString();
 }
 
 async function insertAttempt(env, row) {
@@ -1687,6 +1860,11 @@ async function fetchOpenReports(env, limit) {
   // Skip paused / operator_locked / verify_pending / escalated / done — these
   // are not the worker's to touch this tick.
   //
+  // next_review_at gate: non-terminal outcomes park the row until its
+  // next_review_at. Without this, rows inside a 2h/24h cooldown were
+  // re-fetched every 5-min tick, burning the 50-row intake budget on
+  // skipped_cooldown bookkeeping and starving reports 51+ forever.
+  //
   // INC-26 starvation fix, two parts:
   //   1. Defer rows touched within INTAKE_DEFER_MS (last_auto_attempt_at is
   //      stamped on every processed row) so a cooldown-held row can't consume
@@ -1696,12 +1874,25 @@ async function fetchOpenReports(env, limit) {
   //      LIMIT — received_at asc alone let the oldest 50 rows starve the rest.
   const cutoff = new Date(Date.now() - INTAKE_DEFER_MS).toISOString();
   const select = 'id,reseller_id,sim_id,sim_number_id,rental_id,e164,status,received_at,auto_remediation_state';
+  const nowIso = encodeURIComponent(new Date().toISOString());
   const q = 'rental_reports?status=in.(received,in_triage)'
     + '&and=(or(auto_remediation_state.is.null,auto_remediation_state.eq.queued)'
+    +   ',or(next_review_at.is.null,next_review_at.lte.' + nowIso + ')'
     +   ',or(last_auto_attempt_at.is.null,last_auto_attempt_at.lt.' + encodeURIComponent(cutoff) + '))'
     + '&select=' + encodeURIComponent(select)
     + '&order=last_auto_attempt_at.asc.nullsfirst,received_at.asc&limit=' + limit;
-  const r = await supabaseGet(env, q);
+  let r = await supabaseGet(env, q);
+  if (!r.ok && r.status === 400) {
+    // Migration 20260729 (next_review_at) not applied yet — fall back to the
+    // legacy query instead of going dormant on a column trap (INC-25 class).
+    console.log('[Remediator] fetchOpenReports 400 (next_review_at missing?); using legacy query.');
+    const legacy = 'rental_reports?status=in.(received,in_triage)'
+      + '&and=(or(auto_remediation_state.is.null,auto_remediation_state.eq.queued)'
+      +   ',or(last_auto_attempt_at.is.null,last_auto_attempt_at.lt.' + encodeURIComponent(cutoff) + '))'
+      + '&select=' + encodeURIComponent(select)
+      + '&order=last_auto_attempt_at.asc.nullsfirst,received_at.asc&limit=' + limit;
+    r = await supabaseGet(env, legacy);
+  }
   if (!r.ok) {
     const txt = await r.text();
     console.log('[Remediator] fetchOpenReports failed: ' + r.status + ' ' + txt);

@@ -134,7 +134,7 @@ test('teltik_reset_port executor normalizes +1 current MDN to 10-digit reset key
 
 test('dashboard exposes issue-type filter, sort button, and Teltik offline CSV export', () => {
   assert.match(DASHBOARD_SRC, /handleTeltikPortOfflineExport/);
-  assert.match(DASHBOARD_SRC, /escalation_reason=eq\.|teltik_gateway_port_offline/);
+  assert.match(DASHBOARD_SRC, /issue_type=eq\.Teltik%20gateway%20port%20offline|encodeURIComponent\('Teltik gateway port offline'\)|escalation_reason=eq\.|teltik_gateway_port_offline/);
   assert.match(DASHBOARD_SRC, /current_mdn.*iccid.*gateway_host.*service_provider/s);
   assert.match(DASHBOARD_HTML, /bad-rentals-issue-filter/);
   assert.match(DASHBOARD_HTML, /sortBadRentalsByIssue/);

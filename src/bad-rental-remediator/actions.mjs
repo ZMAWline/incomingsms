@@ -200,11 +200,14 @@ export async function actionDisabledByKv(env, action) {
 async function execDbSyncUpsert(env, ctx) {
   const sim = ctx.sim;
   if (!sim || !sim.id) return { ok: false, status: 'bad_input', errorMessage: 'missing sim' };
+  // `sims` has no current_mdn_e164 column (INC-25 column trap) — the MDN
+  // column is `msisdn` (10-digit national). Targets are built by classifyShared
+  // from the live vendor read.
   const targets = ctx.targets || {};
   const patch = {};
   if (targets.status && targets.status !== sim.status) patch.status = targets.status;
   if (targets.msisdn && targets.msisdn !== sim.msisdn) patch.msisdn = targets.msisdn;
-  if (targets.imei   && targets.imei   !== sim.imei)   patch.imei = targets.imei;
+  if (targets.imei   && targets.imei   !== sim.imei)   patch.imei   = targets.imei;
 
   if (Object.keys(patch).length === 0) {
     return { ok: true, status: 'noop', evidence: { reason: 'db_already_matches_vendor', sim_id: sim.id } };
