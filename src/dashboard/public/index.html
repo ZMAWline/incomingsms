@@ -8184,15 +8184,23 @@ async function sendSimOnline(simId, phoneNumber) {
                         const stateChip = autoState
                             ? '<span class="inline-block px-1.5 py-0.5 text-[10px] font-medium rounded ' + stateBadgeColor + '" title="auto_remediation_state">' + escapeHtml(autoState) + '</span>'
                             : '';
+                        const actionLabel = autoLastAction === 'resend_online'
+                            ? 'notified reseller (number.online)'
+                            : (autoLastAction === 'classify_only'
+                                ? 'assessed / diagnostic only'
+                                : (autoLastAction || '?'));
+                        const outcomeLabel = autoLastOutcome === 'acted_sms_unverified'
+                            ? 'notified, SMS receipt unverified'
+                            : (autoLastOutcome || '?');
                         const lastTxt = autoCount > 0
-                            ? 'last: ' + escapeHtml(autoLastAction || '?') + ' → ' + escapeHtml(autoLastOutcome || '?')
+                            ? 'last: ' + escapeHtml(actionLabel) + ' → ' + escapeHtml(outcomeLabel)
                                 + (autoLastMode ? ' (' + escapeHtml(autoLastMode) + ')' : '')
                                 + (autoLastAt ? ' · ' + escapeHtml(fmtDt(autoLastAt)) : '')
                             : 'no attempts yet';
                         autoSubRow = '<tr class="bg-dark-900/40 border-t-0" data-auto-sub-for="' + escapeHtml(r.id) + '">'
                             + '<td></td>'
                             + '<td colspan="9" class="px-4 py-1.5 text-[11px] text-dark-300">'
-                            +   '<span class="text-dark-400 uppercase tracking-wide mr-2">Auto attempts:</span>'
+                            +   '<span class="text-dark-400 uppercase tracking-wide mr-2" title="Separates diagnostics/assessment from reseller notifications">Auto assessment/actions:</span>'
                             +   '<span class="font-mono text-dark-200 mr-2">' + escapeHtml(String(autoCount)) + '</span>'
                             +   stateChip
                             +   '<span class="ml-2">' + lastTxt + '</span>'

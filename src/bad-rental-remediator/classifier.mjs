@@ -223,6 +223,7 @@ function classifyAtomic(input) {
 
   // A6 — vendor active, webhook missing
   if (!wh.delivered) {
+    if (isNoSmsReceivedBadReport(input)) return deferOnlineNotification('A6', 'atomic', wh);
     return S({
       id: 'A6', vendor: 'atomic',
       auto_action: 'resend_online',
@@ -351,6 +352,7 @@ function classifyWing(input) {
 
   // W2 — active, webhook missing
   if (!wh.delivered) {
+    if (isNoSmsReceivedBadReport(input)) return deferOnlineNotification('W2', 'wing_iot', wh);
     return S({
       id: 'W2', vendor: 'wing_iot',
       auto_action: 'resend_online',
@@ -363,6 +365,7 @@ function classifyWing(input) {
 
   // W3 — active, dialable, webhook delivered, reseller still bad
   if (input.recentResellerBadSignal) {
+    if (isNoSmsReceivedBadReport(input)) return deferOnlineNotification('W3', 'wing_iot', wh);
     return S({
       id: 'W3', vendor: 'wing_iot',
       // Wing has no OTA — fall back to resend_online + §C SMS verify.
@@ -486,6 +489,7 @@ function classifyHelix(input) {
 
   // H2 — active, webhook missing
   if (!wh.delivered) {
+    if (isNoSmsReceivedBadReport(input)) return deferOnlineNotification('H2', 'helix', wh);
     return S({
       id: 'H2', vendor: 'helix',
       auto_action: 'resend_online',
@@ -649,6 +653,7 @@ function classifyTeltik(input) {
 
   // T2 — webhook missing
   if (!wh.delivered) {
+    if (isNoSmsReceivedBadReport(input)) return deferOnlineNotification('T2', 'teltik', wh);
     return S({
       id: 'T2', vendor: 'teltik',
       auto_action: 'resend_online',
@@ -696,6 +701,27 @@ function pendingVendorRead(vendor, sim) {
     auto_resolve_when: 'n/a',
     on_failure: 'operator',
     evidence_bundle: { db_status: sim.status || null },
+  });
+}
+
+function isNoSmsReceivedBadReport(input) {
+  return !!(input && input.recentResellerBadSignal
+    && input.report && input.report.reason_code === 'no_sms_received');
+}
+
+function deferOnlineNotification(id, vendor, webhook) {
+  return S({
+    id, vendor,
+    auto_action: 'classify_only',
+    retry: { max_attempts: 3, cooldown_label: '2h' },
+    auto_resolve_when: 'n/a',
+    on_failure: 'operator',
+    evidence_bundle: {
+      reason: 'sms_receipt_unverified',
+      pending_reason: 'sms_receipt_unverified_no_online_notification',
+      disallowed_action: 'resend_online',
+      webhook: webhook || null,
+    },
   });
 }
 
