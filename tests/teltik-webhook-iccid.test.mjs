@@ -30,6 +30,10 @@ function mockFetch(opts, calls) {
       return new Response(JSON.stringify(opts.simByIccid ? [opts.simByIccid] : []), { status: 200 });
     }
     if (u.includes('/rest/v1/sim_numbers')) {
+      if (u.includes('sim_id=eq.')) {
+        calls.push({ kind: 'current_number_lookup', url: u });
+        return new Response(JSON.stringify(opts.currentNumberBySimId ? [{ e164: opts.currentNumberBySimId }] : []), { status: 200 });
+      }
       calls.push({ kind: 'mdn_lookup', url: u });
       return new Response(JSON.stringify(opts.simIdByMdn ? [{ sim_id: opts.simIdByMdn }] : []), { status: 200 });
     }
@@ -91,6 +95,31 @@ test('nickname ICCID matches sims.iccid even when payload MDN points elsewhere',
   assert.equal(ins.body[0].sim_id, 42);
   // MDN lookup must not even run when the ICCID matched
   assert.equal(calls.some(c => c.kind === 'mdn_lookup'), false);
+});
+
+test('hosted ICCID match writes active DB number while preserving payload MDN', async () => {
+  const payloadMdn = '19175550579';
+  const activeDbNumber = '+19175554089';
+  const { calls } = await run(
+    { destination: payloadMdn, origin: '32665', message: 'hosted code', nickname: `Hosted ${ATOMIC_ICCID}` },
+    {
+      simByIccid: { id: 42, iccid: ATOMIC_ICCID },
+      simIdByMdn: 777,
+      currentNumberBySimId: activeDbNumber,
+      webhookUrl: 'https://reseller.example.com/hook',
+    }
+  );
+
+  const ins = calls.find(c => c.kind === 'inbound_insert');
+  assert.equal(ins.body[0].sim_id, 42);
+  assert.equal(ins.body[0].to_number, activeDbNumber);
+  assert.equal(ins.body[0].raw.destination, payloadMdn);
+  assert.equal(calls.some(c => c.kind === 'mdn_lookup'), false);
+
+  const hook = calls.find(c => c.kind === 'reseller_webhook');
+  assert.equal(hook.body.data.sim_id, 42);
+  assert.equal(hook.body.data.number, activeDbNumber);
+  assert.equal(hook.body.data.teltik_destination, '+19175550579');
 });
 
 test('fallback by MDN still works when payload has no alias/nickname', async () => {

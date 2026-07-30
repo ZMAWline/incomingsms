@@ -614,6 +614,7 @@ export async function processTeltikSmsItem(body, env) {
 
   let simId = null;
   let iccid = null;
+  let matchedByIccid = false;
   if (aliasIccid) {
     const simRows = await supabaseGetArray(
       env,
@@ -622,6 +623,7 @@ export async function processTeltikSmsItem(body, env) {
     if (simRows[0]) {
       simId = simRows[0].id;
       iccid = simRows[0].iccid;
+      matchedByIccid = true;
     } else {
       console.log(`[Webhook] alias ICCID ${aliasIccid} not in sims — falling back to MDN lookup`);
       iccid = aliasIccid; // still the true SIM identity per Teltik; forward it
@@ -637,11 +639,27 @@ export async function processTeltikSmsItem(body, env) {
     simId = simNumbers[0]?.sim_id || null;
   }
 
+  let canonicalNumber = mdn || null;
+  if (matchedByIccid && simId) {
+    // Teltik-hosted foreign-vendor SIMs can deliver a stale/host MDN in the
+    // payload. Once ICCID resolves the SIM, customer-facing paths must use the
+    // active DB sim_number, not the Teltik host MDN. Keep the payload MDN in raw
+    // (and reseller evidence below), but do not treat it as canonical.
+    const activeNumbers = await supabaseGetArray(
+      env,
+      `sim_numbers?sim_id=eq.${simId}&valid_to=is.null&select=e164&limit=1`
+    );
+    canonicalNumber = activeNumbers[0]?.e164 || null;
+    if (!canonicalNumber) {
+      console.log(`[Webhook] ICCID ${iccid || aliasIccid} resolved sim_id=${simId} but has no active sim_numbers row; not using payload MDN as canonical`);
+    }
+  }
+
   // Generate deterministic message ID for dedup
   const messageId = await generateMessageIdAsync({
     eventType: 'sms.received',
     simId,
-    number: mdn,
+    number: canonicalNumber,
     from: '',
     body: smsBody,
     timestamp: receivedAt,
@@ -660,7 +678,7 @@ export async function processTeltikSmsItem(body, env) {
   // Insert into inbound_sms
   const insRes = await supabaseInsert(env, 'inbound_sms', [{
     sim_id: simId,
-    to_number: mdn || null,
+    to_number: canonicalNumber,
     from_number: fromNumber,
     body: smsBody,
     received_at: receivedAt,
@@ -689,12 +707,13 @@ export async function processTeltikSmsItem(body, env) {
         created_at: new Date().toISOString(),
         data: {
           sim_id: simId,
-          number: mdn,
+          number: canonicalNumber,
           from: fromNumber,
           message: smsBody,
           received_at: receivedAt,
           iccid,
           port: null,
+          teltik_destination: mdn || null,
         },
       }, {
         messageId,
