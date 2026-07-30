@@ -300,11 +300,18 @@ test('runTick drains a mixed batch: every eligible report fixed, categorized, or
   assert.match(intake.url, /next_review_at\.is\.null,next_review_at\.lte\./);
   assert.match(intake.url, /auto_remediation_state\.is\.null,auto_remediation_state\.eq\.queued/);
 
-  // R101 — Teltik-hosted Atomic with host port online: resend runs but does
-  // not falsely close/remediate while SMS verification is unavailable.
+  // R101 — Teltik-hosted Atomic with host port online: host/provider health
+  // is assessment evidence only. Do not notify reseller `number.online` or
+  // falsely close/remediate before SMS receipt is proved/fixed.
   const p101 = lastPatch(writes, 101, p => p.auto_remediation_state);
   assert.equal(p101.auto_remediation_state, 'queued');
-  assert.ok(writes.attempts.some(a => a.report_id === 101 && a.outcome === 'acted_sms_unverified'));
+  assert.ok(writes.attempts.some(a => a.report_id === 101
+    && a.mode === 'TH2'
+    && a.action === 'classify_only'
+    && a.outcome === 'no_change'
+    && a.evidence && a.evidence.disallowed_action === 'resend_online'));
+  assert.ok(!writes.attempts.some(a => a.report_id === 101 && a.action === 'resend_online'),
+    'no first-line number.online notification for Teltik-hosted line');
   assert.ok(!writes.attempts.some(a => a.report_id === 101 && a.outcome === 'verify_send_failed'),
     'no false verify_send_failed for Teltik-hosted line');
 

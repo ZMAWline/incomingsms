@@ -704,11 +704,10 @@ async function maybeExecuteAction(env, args) {
   // skipped_sms_unavailable bookkeeping row (excluded from summarizeAttempts);
   // the report requeues and the intake deferral paces retries until SMS is
   // back. TH5 teltik_reset_port is exempt — its terminal proof is the
-  // port-status recheck, not SMS. resend_online on a Teltik-hosted SIM whose
-  // host port is confirmed online is also exempt (Zalmen 2026-07-29, report
-  // #6817): the reseller resend IS the remediation and sends no SMS itself —
-  // it must fire even while §C can't confirm it afterwards; the gate then
-  // records why no terminal close happened and the report stays open.
+  // port-status recheck, not SMS. A remaining resend_online exemption for
+  // Teltik-hosted SIMs is notification-only and must not be used for
+  // no_sms_received diagnosis; classifyShared/classifyVendor route those bad
+  // reports to classify_only diagnostics until SMS receipt is proved or fixed.
   const teltikHostPortOnline = !!(evidence.sim && isTeltikHosted(evidence.sim)
     && evidence.teltikHostPortStatus && evidence.teltikHostPortStatus.online === true);
   const needsSmsVerify = action !== 'close_duplicate' && action !== 'classify_only'
@@ -822,7 +821,7 @@ async function maybeExecuteAction(env, args) {
   if (action === 'classify_only') {
     return {
       outcome: classification.outcome || 'no_change',
-      evidence: { exec_status: res.status, ...(res.evidence || {}) },
+      evidence: { exec_status: res.status, ...(res.evidence || {}), ...(classification.evidenceSummary || {}) },
       errorMessage: null,
       execStatus: res.status,
     };
@@ -854,7 +853,7 @@ async function maybeExecuteAction(env, args) {
     // intake defer. The next eligible pass reads /v1/port-status fresh:
     // still offline → the classifier sees the prior reset attempt and
     // escalates teltik_gateway_port_offline without resetting again;
-    // online → TH5 skips and TH2 routes the host resend (resend_online).
+    // online → TH5 skips and TH2 records SMS receipt as still unverified.
     // A post-reset online port proves the reset worked, NOT that the
     // reseller has its number back — never close `remediated` off port
     // state alone.
@@ -918,9 +917,10 @@ async function maybeExecuteAction(env, args) {
     const portOnline = readOk && recheck.online === true;
 
     // For Teltik-hosted Atomic/Wing/etc. lines, a successful resend_online is
-    // useful work but not end-to-end proof while outbound SMS verification is
-    // disabled. Do not close the report from stale webhook evidence or provider
-    // active + port online alone; keep it queued with explicit evidence.
+    // only a reseller notification, not proof of SMS receipt. This branch must
+    // not be the first-line path for no_sms_received reports (those classify as
+    // TH2/classify_only above), and it never closes from provider-active + port
+    // online alone; keep the report queued with explicit evidence.
     if (action === 'resend_online' && portOnline) {
       return {
         outcome: 'acted_sms_unverified',
@@ -1157,14 +1157,16 @@ async function classifyShared(env, report, evidence) {
   }
 
   // TH2 — non-Teltik-provider SIM hosted on a Teltik/Celtic gateway, provider
-  // active (Zalmen 2026-07-29, report #6817). The HOST path owns remediation
-  // BEFORE the vendor classifier: stale webhook-delivered evidence otherwise
-  // routes A1 atomic_ota, which the SMS kill switch skips forever. Port
-  // confirmed online → resend/resync the reseller (the resend IS the fix and
-  // sends no SMS itself), regardless of webhook delivered/missing. No usable
-  // port read → defer nonterminal (pending_teltik_host_port_read) so the next
-  // tick retries — never atomic_ota on an unknown host port. Port offline is
-  // TH5 above; provider not active is the vendor classifier's (A3/A4/...).
+  // active. The HOST path owns assessment BEFORE the vendor classifier: stale
+  // webhook-delivered evidence otherwise routes A1 atomic_ota, which the SMS
+  // kill switch skips forever. Port confirmed online proves only provider/host
+  // health; it is NOT proof that the renter can receive SMS. For a
+  // no_sms_received report, never resend `number.online` as first-line
+  // remediation — record the diagnostic state and leave the report queued for
+  // real SMS-path assessment/repair. No usable port read → defer nonterminal
+  // (pending_teltik_host_port_read) so the next tick retries — never atomic_ota
+  // on an unknown host port. Port offline is TH5 above; provider not active is
+  // the vendor classifier's (A3/A4/...).
   if (evidence.sim && isTeltikHosted(evidence.sim)
       && String(evidence.sim.vendor || '').toLowerCase() !== 'teltik'
       && evidence.vendorRead && evidence.vendorRead.ok === true
@@ -1174,14 +1176,16 @@ async function classifyShared(env, report, evidence) {
     if (portReadOk && ps.online === true) {
       const { nextReviewAt } = await import('./cooldown.mjs');
       return {
-        ...nonTerminal('TH2', 'resend_online', 'classify_only', {
-          reason: 'teltik_host_port_online_resend',
+        ...nonTerminal('TH2', 'classify_only', 'no_change', {
+          reason: 'teltik_host_sms_unverified',
+          pending_reason: 'sms_receipt_unverified_no_online_notification',
+          disallowed_action: 'resend_online',
           gateway_host: evidence.sim.gateway_host || null,
           vendor: evidence.sim.vendor || null,
           port_status: ps.raw || 'online',
           webhook_delivered: !!(evidence.webhook && evidence.webhook.delivered),
         }),
-        nextReviewAt: nextReviewAt({ action: 'resend_online', now: new Date() }),
+        nextReviewAt: nextReviewAt({ action: 'classify_only', now: new Date() }),
         vendorReadHealth: { healthy: true },
         situationExtras: evidence.vendorRead.extras || null,
       };
@@ -1873,7 +1877,7 @@ async function fetchOpenReports(env, limit) {
   //      least-recently-tried ones even when the eligible backlog exceeds
   //      LIMIT — received_at asc alone let the oldest 50 rows starve the rest.
   const cutoff = new Date(Date.now() - INTAKE_DEFER_MS).toISOString();
-  const select = 'id,reseller_id,sim_id,sim_number_id,rental_id,e164,status,received_at,auto_remediation_state';
+  const select = 'id,reseller_id,sim_id,sim_number_id,rental_id,e164,reason_code,attempts,status,received_at,auto_remediation_state';
   const nowIso = encodeURIComponent(new Date().toISOString());
   const q = 'rental_reports?status=in.(received,in_triage)'
     + '&and=(or(auto_remediation_state.is.null,auto_remediation_state.eq.queued)'

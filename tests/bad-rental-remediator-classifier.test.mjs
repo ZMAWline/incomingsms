@@ -282,6 +282,21 @@ test('A6 Atomic: vendor active, webhook missing → resend_online (2 try, 1h)', 
   assert.equal(r.retry.max_attempts, 2);
 });
 
+test('A6 Atomic: no_sms_received report with active provider does not resend number.online before proof/fix', () => {
+  const r = classifyVendor({
+    sim: baseSim('atomic'),
+    vendorView: { attStatus: 'Active' },
+    imeiCheck: { ok: true },
+    webhook: { delivered: false },
+    report: { reason_code: 'no_sms_received', attempts: 9 },
+    recentResellerBadSignal: true,
+  });
+  assert.equal(r.id, 'A6');
+  assert.equal(r.auto_action, 'classify_only');
+  assert.equal(r.evidence_bundle.pending_reason, 'sms_receipt_unverified_no_online_notification');
+  assert.equal(r.evidence_bundle.disallowed_action, 'resend_online');
+});
+
 test('A7 Atomic: IMEI drift vendor (correct type) → db_sync_upsert', () => {
   const r = classifyVendor({
     sim: baseSim('atomic'),
@@ -377,6 +392,20 @@ test('W3 Wing: active dialable + delivered + reseller bad → resend_online (no 
   });
   assert.equal(r.id, 'W3');
   assert.equal(r.auto_action, 'resend_online');
+});
+
+test('W3 Wing: no_sms_received report records diagnostic instead of reseller online notice', () => {
+  const r = classifyVendor({
+    sim: baseSim('wing_iot'),
+    vendorView: { status: 'Activated', communicationPlan: WING_DIAL },
+    imeiCheck: { ok: true },
+    webhook: { delivered: true },
+    report: { reason_code: 'no_sms_received', attempts: 9 },
+    recentResellerBadSignal: true,
+  });
+  assert.equal(r.id, 'W3');
+  assert.equal(r.auto_action, 'classify_only');
+  assert.equal(r.evidence_bundle.pending_reason, 'sms_receipt_unverified_no_online_notification');
 });
 
 test('W4 Wing: not Activated → escalate', () => {
@@ -563,6 +592,20 @@ test('T2 Teltik: webhook missing → resend_online', () => {
     webhook: { delivered: false },
   });
   assert.equal(r.id, 'T2');
+});
+
+test('T2 Teltik: no_sms_received report does not resend number.online before line proof', () => {
+  const r = classifyVendor({
+    sim: baseSim('teltik'),
+    vendorView: { port_status: 'active' },
+    imeiCheck: { ok: true },
+    webhook: { delivered: false },
+    report: { reason_code: 'no_sms_received', attempts: 9 },
+    recentResellerBadSignal: true,
+  });
+  assert.equal(r.id, 'T2');
+  assert.equal(r.auto_action, 'classify_only');
+  assert.equal(r.evidence_bundle.pending_reason, 'sms_receipt_unverified_no_online_notification');
 });
 
 test('T3 Teltik: healthy + delivered + reseller bad → teltik_reset_network', () => {
