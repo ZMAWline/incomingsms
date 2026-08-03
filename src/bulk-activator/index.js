@@ -1,4 +1,5 @@
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
+import { buildAtomicActivateRequest, normalizePhone10, parseCsv, validateActivationSim } from '../shared/activation-bulk.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -41,6 +42,9 @@ export default {
     const iImei = header.indexOf('imei');
     const iReseller = header.indexOf('reseller_id');
     const iStatus = header.indexOf('status');
+    const iVendor = header.indexOf('vendor');
+    const iPortIn = header.indexOf('port_in');
+    const iPortMdn = header.indexOf('port_mdn');
 
     if ([iIccid, iImei, iReseller, iStatus].some(i => i < 0)) {
       return new Response('CSV missing required headers (iccid, imei, reseller_id, status)', { status: 400 });
@@ -54,22 +58,27 @@ export default {
     const runId = `csv_${Date.now()}`;
     let queued = 0;
     let validationErrors = 0;
+    const rowErrors = [];
 
     for (const r of toProcess) {
-      const iccid = String(r[iIccid] || '').trim();
-      const imei = String(r[iImei] || '').trim();
-      const resellerId = parseInt(String(r[iReseller] || '').trim(), 10);
-      if (!iccid || !imei || !Number.isFinite(resellerId)) {
+      const checked = validateActivationSim({
+        iccid: String(r[iIccid] || '').trim(),
+        imei: String(r[iImei] || '').trim(),
+        reseller_id: String(r[iReseller] || '').trim(),
+        vendor: iVendor >= 0 ? String(r[iVendor] || '').trim() : 'atomic',
+        port_in: iPortIn >= 0 ? String(r[iPortIn] || '').trim() : '',
+        port_mdn: iPortMdn >= 0 ? String(r[iPortMdn] || '').trim() : '',
+      }, { defaultVendor: 'atomic' });
+      if (!checked.ok) {
         validationErrors++;
+        rowErrors.push(...checked.errors);
         continue;
       }
-      // Default vendor is 'atomic' for new AT&T activations
-      const vendor = 'atomic';
-      await env.ACTIVATION_QUEUE.send({ iccid, imei, reseller_id: resellerId, run_id: runId, vendor });
+      await env.ACTIVATION_QUEUE.send({ ...checked.sim, run_id: runId });
       queued++;
     }
 
-    return json({ ok: true, queued, validation_errors: validationErrors, run_id: runId });
+    return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, run_id: runId });
   },
 
   // ── Queue consumer — one SIM at a time, routes by vendor ─────────────────
@@ -94,7 +103,7 @@ export default {
     }
 
     for (const msg of batch.messages) {
-      const { iccid, imei, reseller_id: resellerId, run_id: runId, vendor = 'atomic' } = msg.body;
+      const { iccid, imei, reseller_id: resellerId, run_id: runId, vendor = 'atomic', port_mdn: portMdn = '' } = msg.body;
       try {
         // Skip if already activated (check for sub_id or msisdn based on vendor)
         const existing = await supabaseSelect(
@@ -111,7 +120,7 @@ export default {
         let result;
         switch (vendor) {
           case 'atomic':
-            result = await activateViaAtomic(env, iccid, imei, runId);
+            result = await activateViaAtomic(env, iccid, imei, runId, { portMdn });
             break;
           case 'wing_iot':
             result = await activateViaWingIot(env, iccid, runId);
@@ -164,27 +173,23 @@ async function handleActivateJson(request, env) {
   const runId = `json_${Date.now()}`;
   let queued = 0;
   let validationErrors = 0;
+  const rowErrors = [];
 
   // Default vendor from request body, or 'atomic' for AT&T
   const defaultVendor = body.vendor || 'atomic';
 
-  for (const sim of sims) {
-    const iccid = String(sim.iccid || '').trim();
-    const imei = String(sim.imei || '').trim();
-    const resellerId = parseInt(String(sim.reseller_id || ''), 10);
-    // Per-SIM vendor override, fallback to default
-    const vendor = sim.vendor || defaultVendor;
-
-    // IMEI not required for wing_iot
-    if (!iccid || (!imei && vendor !== 'wing_iot') || !Number.isFinite(resellerId)) {
+  for (let i = 0; i < sims.length; i++) {
+    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor });
+    if (!checked.ok) {
       validationErrors++;
+      rowErrors.push(...checked.errors);
       continue;
     }
-    await env.ACTIVATION_QUEUE.send({ iccid, imei, reseller_id: resellerId, run_id: runId, vendor });
+    await env.ACTIVATION_QUEUE.send({ ...checked.sim, run_id: runId });
     queued++;
   }
 
-  return json({ ok: true, queued, validation_errors: validationErrors, attempted: sims.length, run_id: runId });
+  return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, attempted: sims.length, run_id: runId });
 }
 
 /* ── Relay fetch helper (routes through VPS to avoid CF-to-CF blocking) ─────── */
@@ -204,36 +209,21 @@ function relayFetch(env, url, init) {
 
 /* ── Vendor-specific activation functions ──────────────────────────────────── */
 
-async function activateViaAtomic(env, iccid, imei, runId) {
+async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
   // ATOMIC activation - returns MSISDN immediately
   const addr = await pickNextPpuAddress(env, {});
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
-  const requestBody = {
-    wholeSaleApi: {
-      session: {
-        userName: env.ATOMIC_USERNAME,
-        token: env.ATOMIC_TOKEN,
-        pin: env.ATOMIC_PIN,
-      },
-      wholeSaleRequest: {
-        requestType: 'Activate',
-        partnerTransactionId: `act_${Date.now()}`,
-        imei,
-        sim: iccid,
-        eSim: 'N',
-        EID: '',
-        BAN: '',
-        firstName: 'SUB',
-        lastName: 'NINE',
-        streetNumber: addr.streetNumber,
-        streetDirection: addr.streetDirection || '',
-        streetName: addr.streetName,
-        zip: addr.zipCode,
-        plan: 'EBNOVOICE',
-        portMdn: '',
-      },
+  const requestBody = buildAtomicActivateRequest({
+    session: {
+      userName: env.ATOMIC_USERNAME,
+      token: env.ATOMIC_TOKEN,
+      pin: env.ATOMIC_PIN,
     },
-  };
+    iccid,
+    imei,
+    address: addr,
+    portMdn: normalizePhone10(options.portMdn || options.port_mdn || ''),
+  });
 
   const res = await relayFetch(env, url, {
     method: 'POST',
@@ -620,29 +610,6 @@ async function logCarrierApiCall(env, logData) {
 // Backward compatibility alias
 async function logHelixApiCall(env, logData) {
   return logCarrierApiCall(env, { ...logData, vendor: 'helix' });
-}
-
-/* ── CSV parser ─────────────────────────────────────────────────────────────── */
-
-function parseCsv(text) {
-  const rows = [];
-  let row = [], cur = '', inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inQuotes) {
-      if (c === '"') {
-        if (text[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
-      } else { cur += c; }
-    } else {
-      if (c === '"') inQuotes = true;
-      else if (c === ',') { row.push(cur); cur = ''; }
-      else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
-      else if (c !== '\r') { cur += c; }
-    }
-  }
-  row.push(cur);
-  rows.push(row);
-  return rows.filter(r => r.some(v => String(v).trim() !== ''));
 }
 
 function normalizeRow(row, len) {
