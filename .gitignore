@@ -3,8 +3,6 @@
 .wrangler/
 dist/
 worker/
-src/dashboard/.preview/
-src/dashboard/dashboard-pr-*.wrangler.toml
 
 # Node modules
 node_modules/
