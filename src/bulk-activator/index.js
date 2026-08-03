@@ -45,6 +45,8 @@ export default {
     const iVendor = header.indexOf('vendor');
     const iPortIn = header.indexOf('port_in');
     const iPortMdn = header.indexOf('port_mdn');
+    const iPortAccountNumber = header.indexOf('port_account_number');
+    const iPortPin = header.indexOf('port_pin');
 
     if ([iIccid, iImei, iReseller, iStatus].some(i => i < 0)) {
       return new Response('CSV missing required headers (iccid, imei, reseller_id, status)', { status: 400 });
@@ -68,6 +70,8 @@ export default {
         vendor: iVendor >= 0 ? String(r[iVendor] || '').trim() : 'atomic',
         port_in: iPortIn >= 0 ? String(r[iPortIn] || '').trim() : '',
         port_mdn: iPortMdn >= 0 ? String(r[iPortMdn] || '').trim() : '',
+        port_account_number: iPortAccountNumber >= 0 ? String(r[iPortAccountNumber] || '').trim() : '',
+        port_pin: iPortPin >= 0 ? String(r[iPortPin] || '').trim() : '',
       }, { defaultVendor: 'atomic' });
       if (!checked.ok) {
         validationErrors++;
@@ -103,7 +107,16 @@ export default {
     }
 
     for (const msg of batch.messages) {
-      const { iccid, imei, reseller_id: resellerId, run_id: runId, vendor = 'atomic', port_mdn: portMdn = '' } = msg.body;
+      const {
+        iccid,
+        imei,
+        reseller_id: resellerId,
+        run_id: runId,
+        vendor = 'atomic',
+        port_mdn: portMdn = '',
+        port_account_number: portAccountNumber = '',
+        port_pin: portPin = '',
+      } = msg.body;
       try {
         // Skip if already activated (check for sub_id or msisdn based on vendor)
         const existing = await supabaseSelect(
@@ -120,7 +133,7 @@ export default {
         let result;
         switch (vendor) {
           case 'atomic':
-            result = await activateViaAtomic(env, iccid, imei, runId, { portMdn });
+            result = await activateViaAtomic(env, iccid, imei, runId, { portMdn, portAccountNumber, portPin });
             break;
           case 'wing_iot':
             result = await activateViaWingIot(env, iccid, runId);
@@ -213,6 +226,12 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
   // ATOMIC activation - returns MSISDN immediately
   const addr = await pickNextPpuAddress(env, {});
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const normalizedPortMdn = normalizePhone10(options.portMdn || options.port_mdn || '');
+  const portAccountNumber = String(options.portAccountNumber || options.port_account_number || '').trim();
+  const portPin = String(options.portPin || options.port_pin || '').trim();
+  if (normalizedPortMdn && (!portAccountNumber || !portPin)) {
+    throw new Error('ATOMIC port-in activation requires port account number and port PIN before carrier submission');
+  }
   const requestBody = buildAtomicActivateRequest({
     session: {
       userName: env.ATOMIC_USERNAME,
@@ -222,8 +241,19 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
     iccid,
     imei,
     address: addr,
-    portMdn: normalizePhone10(options.portMdn || options.port_mdn || ''),
+    portMdn: normalizedPortMdn,
   });
+  const loggedRequestBody = normalizedPortMdn
+    ? {
+        carrierRequest: requestBody,
+        operatorPortContext: {
+          note: 'Atomic Activate mapping in repo documents only portMdn; account/PIN are validated and preserved here but not sent to carrier until API field names are confirmed.',
+          port_mdn: normalizedPortMdn,
+          port_account_number: portAccountNumber,
+          port_pin: portPin,
+        },
+      }
+    : requestBody;
 
   const res = await relayFetch(env, url, {
     method: 'POST',
@@ -243,7 +273,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
     vendor: 'atomic',
     request_url: url,
     request_method: 'POST',
-    request_body: requestBody,
+    request_body: loggedRequestBody,
     response_status: res.status,
     response_ok: res.ok,
     response_body_text: responseText,

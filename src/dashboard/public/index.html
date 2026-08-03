@@ -3797,7 +3797,17 @@ set verify_pending; schedule §C.3 poll
                 <div id="activate-port-fields" class="hidden mb-4 p-3 rounded-lg border border-dark-600 bg-dark-900/60">
                     <label class="block text-sm text-gray-300 mb-1">Port MDN <span class="text-red-400">*</span></label>
                     <input id="activate-port-mdn" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="2125550199">
-                    <p class="text-xs text-gray-500 mt-2">Required for single port-in. Normalized to 10 digits before submitting. Atomic docs available in this repo only expose portMdn on Activate; no extra port credentials are currently supported by the request shape.</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Port account number <span class="text-red-400">*</span></label>
+                            <input id="activate-port-account-number" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="Account number">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Port PIN / passcode <span class="text-red-400">*</span></label>
+                            <input id="activate-port-pin" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="PIN or passcode">
+                        </div>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-2">Required for single port-in. MDN is normalized to 10 digits before submitting. Atomic docs available in this repo only expose portMdn on Activate; account/PIN are validated and preserved in queue/log context until exact carrier field names are confirmed.</p>
                 </div>
                 <div class="mb-4 p-3 rounded-lg border border-dark-600 bg-dark-900/40">
                     <div class="flex flex-wrap items-center gap-3">
@@ -3805,7 +3815,7 @@ set verify_pending; schedule §C.3 poll
                         <input id="activate-csv-file" type="file" accept=".csv,text/csv" class="text-sm text-gray-300">
                         <button type="button" onclick="downloadActivationTemplate()" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Download CSV Template</button>
                     </div>
-                    <p class="text-xs text-gray-500 mt-2">CSV headers: iccid, imei, reseller_id, vendor, port_in, port_mdn. The review step blocks submission if any row is invalid.</p>
+                    <p class="text-xs text-gray-500 mt-2">CSV headers: iccid, imei, reseller_id, vendor, port_in, port_mdn, port_account_number, port_pin. The review step blocks submission if any row is invalid.</p>
                 </div>
                 <p class="text-sm text-gray-400 mb-3">Paste from spreadsheet or enter one SIM per line:</p>
                 <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631&#9;123456789012345&#9;1
@@ -6105,6 +6115,8 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('activate-modal').classList.add('hidden');
             document.getElementById('activate-input').value = '';
             document.getElementById('activate-port-mdn').value = '';
+            document.getElementById('activate-port-account-number').value = '';
+            document.getElementById('activate-port-pin').value = '';
             document.getElementById('activate-port-in').checked = false;
             document.getElementById('activate-csv-file').value = '';
             const review = document.getElementById('activate-review');
@@ -6112,7 +6124,7 @@ async function sendSimOnline(simId, phoneNumber) {
             updateActivatePortInUi();
         }
 
-        const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn'];
+        const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin'];
         function normalizeActivationPhone10(value) {
             const digits = String(value || '').replace(/\D/g, '');
             return digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
@@ -6147,7 +6159,9 @@ async function sendSimOnline(simId, phoneNumber) {
                 reseller_id: parseInt(String(row.reseller_id || '').trim(), 10),
                 vendor: String(row.vendor || defaultVendor || 'atomic').trim() || 'atomic',
                 port_in: activationFlag(row.port_in),
-                port_mdn: ''
+                port_mdn: '',
+                port_account_number: '',
+                port_pin: ''
             };
             const errors = [];
             const prefix = rowNumber ? 'Row ' + rowNumber + ': ' : '';
@@ -6159,13 +6173,19 @@ async function sendSimOnline(simId, phoneNumber) {
                 const mdn = normalizeActivationPhone10(row.port_mdn || row.portMdn || '');
                 if (!/^\d{10}$/.test(mdn)) errors.push(prefix + 'port_mdn is required for port-in and must normalize to 10 digits');
                 else sim.port_mdn = mdn;
+                const portAccountNumber = String(row.port_account_number || row.portAccountNumber || '').trim();
+                if (!portAccountNumber) errors.push(prefix + 'port_account_number is required for port-in');
+                else sim.port_account_number = portAccountNumber;
+                const portPin = String(row.port_pin || row.portPin || row.port_passcode || row.portPasscode || '').trim();
+                if (!portPin) errors.push(prefix + 'port_pin is required for port-in');
+                else sim.port_pin = portPin;
             }
             return { ok: errors.length === 0, sim, errors };
         }
         function buildActivationCsvTemplate() {
             return ACTIVATION_CSV_HEADERS.join(',') + '\n' +
-                '89014103271467425631,123456789012345,1,atomic,false,\n' +
-                '89014103271467425632,123456789012346,1,atomic,true,2125550199\n';
+                '89014103271467425631,123456789012345,1,atomic,false,,,\n' +
+                '89014103271467425632,123456789012346,1,atomic,true,2125550199,ACCT12345,1234\n';
         }
         function downloadActivationTemplate() {
             const blob = new Blob([buildActivationCsvTemplate()], { type: 'text/csv' });
@@ -6259,7 +6279,9 @@ async function sendSimOnline(simId, phoneNumber) {
                         reseller_id: resellerId,
                         vendor,
                         port_in: manualPortIn ? 'true' : 'false',
-                        port_mdn: manualPortIn ? document.getElementById('activate-port-mdn').value : ''
+                        port_mdn: manualPortIn ? document.getElementById('activate-port-mdn').value : '',
+                        port_account_number: manualPortIn ? document.getElementById('activate-port-account-number').value : '',
+                        port_pin: manualPortIn ? document.getElementById('activate-port-pin').value : ''
                     }, i + 1, vendor);
                     if (checked.ok) sims.push(checked.sim);
                     else errors.push.apply(errors, checked.errors);

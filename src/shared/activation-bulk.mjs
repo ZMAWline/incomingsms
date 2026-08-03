@@ -1,4 +1,4 @@
-export const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn'];
+export const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin'];
 
 const TRUTHY = new Set(['1', 'true', 'yes', 'y', 'port', 'port_in', 'on']);
 const FALSY = new Set(['', '0', 'false', 'no', 'n', 'new', 'new_number', 'off']);
@@ -65,6 +65,8 @@ export function validateActivationSim(input, options = {}) {
     vendor: String(input?.vendor || defaultVendor || 'atomic').trim() || 'atomic',
     port_in: parseBooleanFlag(input?.port_in ?? input?.portIn),
     port_mdn: '',
+    port_account_number: '',
+    port_pin: '',
   };
   const errors = [];
 
@@ -79,6 +81,18 @@ export function validateActivationSim(input, options = {}) {
       errors.push(prefix + 'port_mdn is required for port-in and must normalize to 10 digits');
     } else {
       sim.port_mdn = normalized;
+    }
+    const portAccountNumber = String(input?.port_account_number ?? input?.portAccountNumber ?? '').trim();
+    if (!portAccountNumber) {
+      errors.push(prefix + 'port_account_number is required for port-in');
+    } else {
+      sim.port_account_number = portAccountNumber;
+    }
+    const portPin = String(input?.port_pin ?? input?.portPin ?? input?.port_passcode ?? input?.portPasscode ?? '').trim();
+    if (!portPin) {
+      errors.push(prefix + 'port_pin is required for port-in');
+    } else {
+      sim.port_pin = portPin;
     }
   }
 
@@ -107,6 +121,8 @@ export function parseActivationCsv(text, options = {}) {
       vendor: valueAt(row, header, 'vendor') || defaultVendor,
       port_in: valueAt(row, header, 'port_in'),
       port_mdn: valueAt(row, header, 'port_mdn'),
+      port_account_number: valueAt(row, header, 'port_account_number'),
+      port_pin: valueAt(row, header, 'port_pin'),
     };
     const result = validateActivationSim(candidate, { rowNumber, defaultVendor });
     if (result.ok) valid.push({ row: rowNumber, sim: result.sim });
@@ -124,8 +140,8 @@ export function csvEscape(value) {
 export function buildActivationCsvTemplate() {
   const rows = [
     ACTIVATION_CSV_HEADERS,
-    ['89014103271467425631', '123456789012345', '1', 'atomic', 'false', ''],
-    ['89014103271467425632', '123456789012346', '1', 'atomic', 'true', '2125550199'],
+    ['89014103271467425631', '123456789012345', '1', 'atomic', 'false', '', '', ''],
+    ['89014103271467425632', '123456789012346', '1', 'atomic', 'true', '2125550199', 'ACCT12345', '1234'],
   ];
   return rows.map(row => row.map(csvEscape).join(',')).join('\n') + '\n';
 }
