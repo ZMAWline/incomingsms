@@ -1,0 +1,206 @@
+name: Dashboard PR Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    paths:
+      - 'src/dashboard/**'
+      - 'src/shared/**'
+      - 'tests/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'scripts/deploy-dashboard-preview.mjs'
+      - '.github/workflows/dashboard-pr-preview.yml'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to deploy or clean up'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref/SHA to check out for deploy; omit for current branch'
+        required: false
+        type: string
+      cleanup:
+        description: 'Delete the preview Worker instead of deploying'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: dashboard-pr-preview-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+  WORKERS_DEV_SUBDOMAIN: ${{ vars.WORKERS_DEV_SUBDOMAIN || 'zalmen-531' }}
+
+jobs:
+  deploy-preview:
+    name: Deploy dashboard preview
+    if: github.event_name == 'workflow_dispatch' && inputs.cleanup == false || github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      DASHBOARD_AUTH: ${{ secrets.DASHBOARD_PREVIEW_AUTH || secrets.DASHBOARD_TEST_AUTH }}
+      SUPABASE_URL: ${{ secrets.DASHBOARD_PREVIEW_SUPABASE_URL || secrets.DASHBOARD_TEST_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.DASHBOARD_PREVIEW_SUPABASE_SERVICE_ROLE_KEY || secrets.DASHBOARD_TEST_SUPABASE_SERVICE_ROLE_KEY }}
+      ADMIN_RUN_SECRET: ${{ secrets.DASHBOARD_PREVIEW_ADMIN_RUN_SECRET || secrets.DASHBOARD_TEST_ADMIN_RUN_SECRET }}
+      BULK_RUN_SECRET: ${{ secrets.DASHBOARD_PREVIEW_BULK_RUN_SECRET || secrets.DASHBOARD_TEST_BULK_RUN_SECRET }}
+      CANCEL_SECRET: ${{ secrets.DASHBOARD_PREVIEW_CANCEL_SECRET || secrets.DASHBOARD_TEST_CANCEL_SECRET }}
+      FINALIZER_RUN_SECRET: ${{ secrets.DASHBOARD_PREVIEW_FINALIZER_RUN_SECRET || secrets.DASHBOARD_TEST_FINALIZER_RUN_SECRET }}
+      STATUS_SECRET: ${{ secrets.DASHBOARD_PREVIEW_STATUS_SECRET || secrets.DASHBOARD_TEST_STATUS_SECRET }}
+      SYNC_SECRET: ${{ secrets.DASHBOARD_PREVIEW_SYNC_SECRET || secrets.DASHBOARD_TEST_SYNC_SECRET }}
+      RELAY_URL: ${{ secrets.DASHBOARD_PREVIEW_RELAY_URL || secrets.DASHBOARD_TEST_RELAY_URL }}
+      RELAY_KEY: ${{ secrets.DASHBOARD_PREVIEW_RELAY_KEY || secrets.DASHBOARD_TEST_RELAY_KEY }}
+      HX_TOKEN_URL: ${{ secrets.DASHBOARD_PREVIEW_HX_TOKEN_URL || secrets.DASHBOARD_TEST_HX_TOKEN_URL }}
+      HX_CLIENT_ID: ${{ secrets.DASHBOARD_PREVIEW_HX_CLIENT_ID || secrets.DASHBOARD_TEST_HX_CLIENT_ID }}
+      HX_AUDIENCE: ${{ secrets.DASHBOARD_PREVIEW_HX_AUDIENCE || secrets.DASHBOARD_TEST_HX_AUDIENCE }}
+      HX_GRANT_USERNAME: ${{ secrets.DASHBOARD_PREVIEW_HX_GRANT_USERNAME || secrets.DASHBOARD_TEST_HX_GRANT_USERNAME }}
+      HX_GRANT_PASSWORD: ${{ secrets.DASHBOARD_PREVIEW_HX_GRANT_PASSWORD || secrets.DASHBOARD_TEST_HX_GRANT_PASSWORD }}
+    steps:
+      - name: Check out PR code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install npm dependencies
+        run: npm ci || npm install
+
+      - name: Run dashboard-safe tests
+        run: npm test
+
+      - name: Generate preview Wrangler config
+        id: preview
+        run: node scripts/deploy-dashboard-preview.mjs generate --pr "$PR_NUMBER" --sha "${{ github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Prepare preview/test secrets and fail closed if required values are missing
+        id: secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const names = [
+            'DASHBOARD_AUTH',
+            'SUPABASE_URL',
+            'SUPABASE_SERVICE_ROLE_KEY',
+            'ADMIN_RUN_SECRET',
+            'BULK_RUN_SECRET',
+            'CANCEL_SECRET',
+            'FINALIZER_RUN_SECRET',
+            'STATUS_SECRET',
+            'SYNC_SECRET',
+            'RELAY_URL',
+            'RELAY_KEY',
+            'HX_TOKEN_URL',
+            'HX_CLIENT_ID',
+            'HX_AUDIENCE',
+            'HX_GRANT_USERNAME',
+            'HX_GRANT_PASSWORD',
+          ];
+          const required = ['DASHBOARD_AUTH', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
+          const values = {};
+          const missingRequired = [];
+          for (const name of names) {
+            if (process.env[name]) values[name] = process.env[name];
+            else if (required.includes(name)) missingRequired.push(name);
+          }
+          fs.writeFileSync('/tmp/dashboard-preview-secrets.json', JSON.stringify(values));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `secret_count=${Object.keys(values).length}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `missing_required=${missingRequired.join(',')}\n`);
+          if (missingRequired.length) {
+            console.error(`Missing required login/test secrets: ${missingRequired.join(', ')}`);
+            process.exit(1);
+          }
+          NODE
+
+      - name: Dry-run preview deploy
+        run: node scripts/deploy-dashboard-preview.mjs deploy --dry-run --pr "$PR_NUMBER" --sha "${{ github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Deploy preview Worker
+        run: node scripts/deploy-dashboard-preview.mjs deploy --pr "$PR_NUMBER" --sha "${{ github.event.pull_request.head.sha || github.sha }}"
+
+      - name: Upload preview/test secrets to preview Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler secret bulk /tmp/dashboard-preview-secrets.json --config "${{ steps.preview.outputs.config_path }}"
+
+      - name: Smoke-test preview auth challenge
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /tmp/dashboard-preview-body.txt -w '%{http_code}' --max-time 30 '${{ steps.preview.outputs.preview_url }}/')
+          test "$code" = "401"
+          grep -qi 'WWW-Authenticate' <(curl -sS -I --max-time 30 '${{ steps.preview.outputs.preview_url }}/')
+
+      - name: Comment preview URL on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const previewUrl = '${{ steps.preview.outputs.preview_url }}';
+            const sha = '${{ github.event.pull_request.head.sha }}';
+            const body = [
+              'Dashboard preview deployed.',
+              '',
+              `Preview URL: ${previewUrl}`,
+              `Commit: ${sha}`,
+              '',
+              'What to test:',
+              '- Log in with the dashboard preview/test credentials.',
+              '- Exercise the changed dashboard flow and confirm API calls use preview/test resources.',
+              '- Do not use production data or production carrier credentials from this preview.',
+              '',
+              'Safety: this preview Worker is generated from `src/dashboard/wrangler.toml` `[env.test]`, so service bindings target `*-test` workers. Destructive/carrier actions are only safe if the configured preview/test secrets point at test-safe resources.',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+  cleanup-preview:
+    name: Delete dashboard preview
+    if: github.event_name == 'workflow_dispatch' && inputs.cleanup == true || github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.base.sha || github.sha }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Delete preview Worker
+        run: node scripts/deploy-dashboard-preview.mjs delete --pr "$PR_NUMBER"
+
+      - name: Comment cleanup on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Deleted dashboard preview Worker \`dashboard-pr-${process.env.PR_NUMBER}\` after PR close.`,
+            });
