@@ -3781,16 +3781,47 @@ set verify_pending; schedule §C.3 poll
             <div class="p-5">
                 <div class="flex items-center gap-3 mb-4">
                     <label class="text-sm text-gray-400">Vendor:</label>
-                    <select id="activate-vendor" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                    <select id="activate-vendor" onchange="updateActivatePortInUi()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                         <option value="atomic" selected>ATOMIC (AT&T)</option>
                         <option value="wing_iot">Wing IoT (AT&T IoT)</option>
                         <option value="helix">Helix (legacy AT&T)</option>
                     </select>
                 </div>
+                <label class="flex items-center justify-between gap-3 p-3 mb-3 rounded-lg border border-orange-500/30 bg-orange-500/10">
+                    <span>
+                        <span class="block text-sm font-semibold text-orange-300">Port in existing number</span>
+                        <span class="block text-xs text-orange-200/80">ATOMIC only. This sends live carrier port details; CSV bulk rows can mix new-number and port-in activations.</span>
+                    </span>
+                    <input id="activate-port-in" type="checkbox" onchange="updateActivatePortInUi()" class="h-5 w-5 accent-orange-500">
+                </label>
+                <div id="activate-port-fields" class="hidden mb-4 p-3 rounded-lg border border-dark-600 bg-dark-900/60">
+                    <label class="block text-sm text-gray-300 mb-1">Port MDN <span class="text-red-400">*</span></label>
+                    <input id="activate-port-mdn" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="2125550199">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Port account number <span class="text-red-400">*</span></label>
+                            <input id="activate-port-account-number" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="Account number">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Port PIN / passcode <span class="text-red-400">*</span></label>
+                            <input id="activate-port-pin" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="PIN or passcode">
+                        </div>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-2">Required for single port-in. MDN is normalized to 10 digits before submitting. Atomic docs available in this repo only expose portMdn on Activate; account/PIN are validated and preserved in queue/log context until exact carrier field names are confirmed.</p>
+                </div>
+                <div class="mb-4 p-3 rounded-lg border border-dark-600 bg-dark-900/40">
+                    <div class="flex flex-wrap items-center gap-3">
+                        <label class="text-sm text-gray-400" for="activate-csv-file">Bulk CSV:</label>
+                        <input id="activate-csv-file" type="file" accept=".csv,text/csv" class="text-sm text-gray-300">
+                        <button type="button" onclick="downloadActivationTemplate()" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Download CSV Template</button>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-2">CSV headers: iccid, imei, reseller_id, vendor, port_in, port_mdn, port_account_number, port_pin. The review step blocks submission if any row is invalid.</p>
+                </div>
                 <p class="text-sm text-gray-400 mb-3">Paste from spreadsheet or enter one SIM per line:</p>
                 <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631&#9;123456789012345&#9;1
 89014103271467425632&#9;123456789012346&#9;1"></textarea>
-                <p class="text-xs text-gray-500 mt-2">3 columns: ICCID (20 digits), IMEI (15 digits or blank for Wing IoT), Reseller ID — tab or comma separated</p>
+                <p class="text-xs text-gray-500 mt-2">Manual paste columns: ICCID (20 digits), IMEI (15 digits or blank for Wing IoT), Reseller ID — tab or comma separated. Use the switch above for one ATOMIC port-in row.</p>
+                <div id="activate-review" class="hidden mt-4 p-3 rounded-lg border border-dark-600 bg-dark-900/70 text-xs text-gray-300 max-h-48 overflow-auto"></div>
             </div>
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
                 <button onclick="hideActivateModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-white transition">Cancel</button>
@@ -6083,49 +6114,182 @@ async function sendSimOnline(simId, phoneNumber) {
         function hideActivateModal() {
             document.getElementById('activate-modal').classList.add('hidden');
             document.getElementById('activate-input').value = '';
+            document.getElementById('activate-port-mdn').value = '';
+            document.getElementById('activate-port-account-number').value = '';
+            document.getElementById('activate-port-pin').value = '';
+            document.getElementById('activate-port-in').checked = false;
+            document.getElementById('activate-csv-file').value = '';
+            const review = document.getElementById('activate-review');
+            if (review) { review.classList.add('hidden'); review.textContent = ''; }
+            updateActivatePortInUi();
+        }
+
+        const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin'];
+        function normalizeActivationPhone10(value) {
+            const digits = String(value || '').replace(/\D/g, '');
+            return digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+        }
+        function activationFlag(value) {
+            return ['1','true','yes','y','port','port_in','on'].includes(String(value || '').trim().toLowerCase());
+        }
+        function parseActivationCsvText(text) {
+            const rows = [];
+            let row = [], cur = '', inQuotes = false;
+            text = String(text || '');
+            for (let i = 0; i < text.length; i++) {
+                const c = text[i];
+                if (inQuotes) {
+                    if (c === '"') {
+                        if (text[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
+                    } else cur += c;
+                } else {
+                    if (c === '"') inQuotes = true;
+                    else if (c === ',') { row.push(cur); cur = ''; }
+                    else if (c === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+                    else if (c !== '\r') cur += c;
+                }
+            }
+            row.push(cur); rows.push(row);
+            return rows.filter(r => r.some(v => String(v).trim() !== ''));
+        }
+        function validateActivationRow(row, rowNumber, defaultVendor) {
+            const sim = {
+                iccid: String(row.iccid || '').trim(),
+                imei: String(row.imei || '').trim(),
+                reseller_id: parseInt(String(row.reseller_id || '').trim(), 10),
+                vendor: String(row.vendor || defaultVendor || 'atomic').trim() || 'atomic',
+                port_in: activationFlag(row.port_in),
+                port_mdn: '',
+                port_account_number: '',
+                port_pin: ''
+            };
+            const errors = [];
+            const prefix = rowNumber ? 'Row ' + rowNumber + ': ' : '';
+            if (!/^\d{19,20}$/.test(sim.iccid)) errors.push(prefix + 'Invalid ICCID (expected 19-20 digits)');
+            if (sim.vendor !== 'wing_iot' && !/^\d{15}$/.test(sim.imei)) errors.push(prefix + 'Invalid IMEI (expected 15 digits)');
+            if (!Number.isFinite(sim.reseller_id)) errors.push(prefix + 'Invalid reseller_id (must be a number)');
+            if (sim.port_in) {
+                if (sim.vendor !== 'atomic') errors.push(prefix + 'Port-in is currently supported only for ATOMIC activations');
+                const mdn = normalizeActivationPhone10(row.port_mdn || row.portMdn || '');
+                if (!/^\d{10}$/.test(mdn)) errors.push(prefix + 'port_mdn is required for port-in and must normalize to 10 digits');
+                else sim.port_mdn = mdn;
+                const portAccountNumber = String(row.port_account_number || row.portAccountNumber || '').trim();
+                if (!portAccountNumber) errors.push(prefix + 'port_account_number is required for port-in');
+                else sim.port_account_number = portAccountNumber;
+                const portPin = String(row.port_pin || row.portPin || row.port_passcode || row.portPasscode || '').trim();
+                if (!portPin) errors.push(prefix + 'port_pin is required for port-in');
+                else sim.port_pin = portPin;
+            }
+            return { ok: errors.length === 0, sim, errors };
+        }
+        function buildActivationCsvTemplate() {
+            return ACTIVATION_CSV_HEADERS.join(',') + '\n' +
+                '89014103271467425631,123456789012345,1,atomic,false,,,\n' +
+                '89014103271467425632,123456789012346,1,atomic,true,2125550199,ACCT12345,1234\n';
+        }
+        function downloadActivationTemplate() {
+            const blob = new Blob([buildActivationCsvTemplate()], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'atomic-activation-template.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        function updateActivatePortInUi() {
+            const vendor = document.getElementById('activate-vendor')?.value || 'atomic';
+            const checked = !!document.getElementById('activate-port-in')?.checked;
+            const fields = document.getElementById('activate-port-fields');
+            if (fields) fields.classList.toggle('hidden', !(checked && vendor === 'atomic'));
+            if (checked && vendor !== 'atomic') {
+                document.getElementById('activate-port-in').checked = false;
+                showToast('Port-in is currently supported only for ATOMIC activations', 'error');
+            }
+        }
+        function renderActivationReview(summary) {
+            const el = document.getElementById('activate-review');
+            if (!el) return;
+            el.classList.remove('hidden');
+            const lines = [
+                'Review before live carrier submission:',
+                'Rows: ' + summary.total + ' | Valid: ' + summary.valid + ' | Port-in: ' + summary.portIn + ' | Invalid: ' + summary.invalid
+            ];
+            if (summary.errors && summary.errors.length) lines.push('', summary.errors.slice(0, 20).join('\n'));
+            el.textContent = lines.join('\n');
+        }
+        async function readActivationCsvFile() {
+            const file = document.getElementById('activate-csv-file')?.files?.[0];
+            return file ? await file.text() : '';
         }
 
         async function activateSims() {
             const input = document.getElementById('activate-input').value.trim();
-            if (!input) {
+            const csvText = await readActivationCsvFile();
+            if (!input && !csvText) {
                 showToast('Please enter at least one SIM', 'error');
                 return;
             }
 
-            // Parse pasted data (tab-separated from spreadsheet, or comma-separated)
-            const lines = input.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+            const vendor = document.getElementById('activate-vendor').value;
             const sims = [];
             const errors = [];
+            let sourceLabel = 'manual row(s)';
 
-            for (let i = 0; i < lines.length; i++) {
-                const delimiter = lines[i].includes('\t') ? '\t' : ',';
-                const parts = lines[i].split(delimiter).map(p => p.trim());
-                if (parts.length !== 3) {
-                    errors.push(`Line ${i + 1}: Invalid format (expected 3 columns)`);
-                    continue;
+            if (csvText) {
+                sourceLabel = 'CSV row(s)';
+                const rows = parseActivationCsvText(csvText);
+                if (rows.length < 2) {
+                    errors.push('CSV is empty or missing a header row');
+                } else {
+                    const header = rows[0].map(h => String(h || '').trim().toLowerCase().replace(/[\s-]+/g, '_'));
+                    for (const required of ['iccid', 'imei', 'reseller_id']) {
+                        if (!header.includes(required)) errors.push('CSV missing required header: ' + required);
+                    }
+                    if (errors.length === 0) {
+                        rows.slice(1).forEach(function(raw, idx) {
+                            const row = {};
+                            header.forEach(function(h, j) { row[h] = String(raw[j] || '').trim(); });
+                            const checked = validateActivationRow(row, idx + 2, vendor);
+                            if (checked.ok) sims.push(checked.sim);
+                            else errors.push.apply(errors, checked.errors);
+                        });
+                    }
+                }
+            } else {
+                // Parse pasted data (tab-separated from spreadsheet, or comma-separated)
+                const lines = input.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+                const manualPortIn = !!document.getElementById('activate-port-in').checked;
+                if (manualPortIn && lines.length !== 1) {
+                    errors.push('Manual port-in accepts exactly one SIM row. Use CSV for mixed/bulk port-in activations.');
                 }
 
-                const [iccid, imei, resellerId] = parts;
-
-                if (iccid.length < 19 || iccid.length > 20) {
-                    errors.push(`Line ${i + 1}: Invalid ICCID length`);
-                    continue;
+                for (let i = 0; i < lines.length; i++) {
+                    const delimiter = lines[i].includes('\t') ? '\t' : ',';
+                    const parts = lines[i].split(delimiter).map(p => p.trim());
+                    if (parts.length !== 3) {
+                        errors.push(`Line ${i + 1}: Invalid format (expected 3 columns)`);
+                        continue;
+                    }
+                    const [iccid, imei, resellerId] = parts;
+                    const checked = validateActivationRow({
+                        iccid,
+                        imei,
+                        reseller_id: resellerId,
+                        vendor,
+                        port_in: manualPortIn ? 'true' : 'false',
+                        port_mdn: manualPortIn ? document.getElementById('activate-port-mdn').value : '',
+                        port_account_number: manualPortIn ? document.getElementById('activate-port-account-number').value : '',
+                        port_pin: manualPortIn ? document.getElementById('activate-port-pin').value : ''
+                    }, i + 1, vendor);
+                    if (checked.ok) sims.push(checked.sim);
+                    else errors.push.apply(errors, checked.errors);
                 }
-
-                const vendor = document.getElementById('activate-vendor').value;
-                if (vendor !== 'wing_iot' && imei.length !== 15) {
-                    errors.push(`Line ${i + 1}: Invalid IMEI length (must be 15 digits)`);
-                    continue;
-                }
-
-                const resellerIdNum = parseInt(resellerId);
-                if (!Number.isFinite(resellerIdNum)) {
-                    errors.push(`Line ${i + 1}: Invalid reseller_id (must be a number)`);
-                    continue;
-                }
-
-                sims.push({ iccid, imei, reseller_id: resellerIdNum });
             }
+
+            const portInCount = sims.filter(s => s.port_in).length;
+            renderActivationReview({ total: sims.length + errors.length, valid: sims.length, portIn: portInCount, invalid: errors.length, errors });
 
             if (errors.length > 0) {
                 showToast(`Validation errors: ${errors[0]}`, 'error');
@@ -6137,8 +6301,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
 
-            const vendorLabel = { atomic: 'ATOMIC', wing_iot: 'Wing IoT', helix: 'Helix' }[document.getElementById('activate-vendor').value] || 'carrier';
-            if (!(await showConfirm('Activate SIMs', `Are you sure you want to activate ${sims.length} SIM(s) via ${vendorLabel}?`))) {
+            const vendorLabel = { atomic: 'ATOMIC', wing_iot: 'Wing IoT', helix: 'Helix' }[vendor] || 'carrier';
+            if (!(await showConfirm('Activate SIMs', `Review confirmed: activate ${sims.length} ${sourceLabel} via ${vendorLabel}? Port-in rows: ${portInCount}. This submits live carrier calls.`))) {
                 return;
             }
 
@@ -6149,7 +6313,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const response = await fetch(`${API_BASE}/activate`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sims, vendor: document.getElementById('activate-vendor').value })
+                    body: JSON.stringify({ sims, vendor })
                 });
 
                 const result = await response.json();

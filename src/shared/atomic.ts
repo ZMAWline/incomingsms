@@ -130,10 +130,17 @@ export async function atomicActivate(
         streetNumber: string;
         streetName: string;
         zip: string;
+        portMdn?: string;
         partnerTransactionId?: string;
     },
     runId: string
 ): Promise<{ msisdn: string; ban: string; status: string }> {
+    const portMdnDigits = String(data.portMdn || '').replace(/\D/g, '');
+    const normalizedPortMdn = portMdnDigits.length === 11 && portMdnDigits.startsWith('1') ? portMdnDigits.slice(1) : portMdnDigits;
+    if (data.portMdn && !/^\d{10}$/.test(normalizedPortMdn)) {
+        throw new Error('ATOMIC Activate portMdn must normalize to 10 digits');
+    }
+
     const response = await atomicRequest(env, 'Activate', {
         partnerTransactionId: data.partnerTransactionId || `act_${Date.now()}`,
         imei: data.imei,
@@ -148,7 +155,7 @@ export async function atomicActivate(
         streetName: data.streetName,
         zip: data.zip,
         plan: ATOMIC_PLAN_CODE,
-        portMdn: '',
+        portMdn: normalizedPortMdn || '',
     }, { runId, step: 'activate', iccid: data.iccid, imei: data.imei });
 
     const result = response.wholeSaleApi.wholeSaleResponse.Result;
