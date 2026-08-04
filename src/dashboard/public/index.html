@@ -6179,6 +6179,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 const portPin = String(row.port_pin || row.portPin || row.port_passcode || row.portPasscode || '').trim();
                 if (!portPin) errors.push(prefix + 'port_pin is required for port-in');
                 else sim.port_pin = portPin;
+                // Mirrors server-side block in src/shared/activation-bulk.mjs — keep in sync.
+                errors.push(prefix + 'ATOMIC port-in is not yet available: the carrier API field names for port account number/PIN are unconfirmed, so port-in submissions are blocked to avoid activating a new number instead. Submit without port_in, or wait until port-in support is enabled.');
             }
             return { ok: errors.length === 0, sim, errors };
         }
