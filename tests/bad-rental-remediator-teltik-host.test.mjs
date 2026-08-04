@@ -62,8 +62,8 @@ test('remediator Teltik /v1/port-status is called with MDN, never ICCID', () => 
   assert.match(urlBlock, /&mdn=' \+ encodeURIComponent\(norm\)/, 'port-status must include normalized Teltik-known MDN');
   assert.doesNotMatch(urlBlock, /iccid/i, 'port-status must never be keyed by ICCID');
   assert.ok(
-    REMEDIATOR_SRC.includes('evidence.teltikHostPortStatus = await teltikPortStatus(env, {')
-      && REMEDIATOR_SRC.includes('mdn: (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)'),
+    REMEDIATOR_SRC.includes('evidence.teltikHostPortStatus = await teltikPortStatus(env, { mdn: hostReadMdn })')
+      && REMEDIATOR_SRC.includes('const hostReadMdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)'),
     'host probe must pass the Teltik-known MDN into port-status'
   );
 });

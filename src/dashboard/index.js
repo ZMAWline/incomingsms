@@ -4,6 +4,7 @@ import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateCh
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
+import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep } from '../shared/hosting-port-status.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -497,6 +498,9 @@ export default {
     if (url.pathname === '/api/teltik-host-check' && request.method === 'POST') {
       return handleTeltikHostCheck(request, env, corsHeaders);
     }
+    if (url.pathname === '/api/hosting-port-status/run' && request.method === 'POST') {
+      return handleHostingPortStatusRun(request, env, corsHeaders);
+    }
 
     if (url.pathname === '/api/rotation-audit' && request.method === 'GET') {
       return handleRotationAudit(request, env, corsHeaders);
@@ -539,6 +543,20 @@ export default {
     }
     // Serve HTML dashboard for all non-API paths (SPA routing)
     return serveApp(env);
+  },
+
+  // 12h Teltik hosting port-status sweep (wrangler.toml [triggers]). Records
+  // through the same canonical recorder as manual checks, so cron + manual
+  // runs feed one uptime history.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      runHostingPortSweep(env, { source: 'cron' })
+        .then(s => console.log('[HostPort] cron sweep done: ' + JSON.stringify({
+          total: s.total, online: s.online, offline: s.offline,
+          unknown: s.unknown, error: s.error, truncated: s.truncated,
+        })))
+        .catch(e => console.log('[HostPort] cron sweep failed: ' + (e && e.message || e)))
+    );
   },
 };
 
@@ -932,8 +950,39 @@ async function handleSims(env, corsHeaders, url) {
       }
     }
 
+    // Latest persisted Teltik hosting port status + uptime stats, derived from
+    // the canonical hosting_port_status_checks history across ALL check
+    // sources. Missing RPC/table (pre-migration) degrades to nulls.
+    const hostPortMap = {}; // sim_id -> get_hosting_port_status_summary row
+    const teltikHostedIds = filteredSims
+      .filter(s => s.gateway_host === 'teltik' || (!s.gateway_host && s.vendor === 'teltik'))
+      .map(s => s.id);
+    if (teltikHostedIds.length > 0) {
+      const CHUNK = 500;
+      const hpChunks = [];
+      for (let i = 0; i < teltikHostedIds.length; i += CHUNK) hpChunks.push(teltikHostedIds.slice(i, i + CHUNK));
+      const hpUrl = env.SUPABASE_URL + '/rest/v1/rpc/get_hosting_port_status_summary';
+      const hpHeaders = {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      };
+      try {
+        const hpResponses = await Promise.all(hpChunks.map(chunk =>
+          fetch(hpUrl, { method: 'POST', headers: hpHeaders, body: JSON.stringify({ sim_ids: chunk }) })
+            .then(r => r.ok ? r.json() : null)
+        ));
+        for (const rows of hpResponses) {
+          if (!Array.isArray(rows)) continue;
+          for (const row of rows) hostPortMap[row.sim_id] = row;
+        }
+      } catch (_) { /* pre-migration or transient RPC failure: no host-port data */ }
+    }
+
     const formatted = filteredSims.map(sim => {
       const smsStat = smsMap[sim.id] || { count: 0, last_received: null };
+      const hp = hostPortMap[sim.id] || null;
 
       // Extract reseller info
       const resellerSim = sim.reseller_sims?.[0];
@@ -965,6 +1014,16 @@ async function handleSims(env, corsHeaders, url) {
         carrier: sim.carrier || null,
         rotation_interval_hours: sim.rotation_interval_hours || 24,
         rotation_eligible: sim.rotation_eligible !== false,
+        hosting_port_state: hp ? hp.last_state : null,
+        hosting_port_checked_at: hp ? hp.last_checked_at : null,
+        hosting_port_source: hp ? hp.last_source : null,
+        hosting_port_mdn: hp ? hp.last_mdn : null,
+        hosting_port_mdn_source: hp ? hp.last_mdn_source : null,
+        hosting_port_error: hp ? hp.last_error : null,
+        hosting_port_checks_24h: hp ? hp.checks_24h : 0,
+        hosting_port_online_24h: hp ? hp.online_24h : 0,
+        hosting_port_checks_7d: hp ? hp.checks_7d : 0,
+        hosting_port_online_7d: hp ? hp.online_7d : 0,
       };
     });
 
@@ -2330,6 +2389,30 @@ async function handleTeltikQuery(request, env, corsHeaders) {
       }
     }
 
+    // Canonical hosting port-status history (task t_a71decd6): every Query for
+    // a Teltik-vendor SIM records its /v1/port-status read. Failed/skipped
+    // reads record as error, never offline.
+    try {
+      const hpsSimRows = await sbGet(env, 'sims?iccid=eq.' + encodeURIComponent(iccid) + '&select=id,vendor,gateway_host&limit=1').catch(() => null);
+      const hpsSim = Array.isArray(hpsSimRows) && hpsSimRows[0] ? hpsSimRows[0] : null;
+      const psHttp = (port_status && port_status.http_status) || null;
+      const psBody = port_status && typeof port_status.response === 'object' ? port_status.response
+        : (port_status && port_status.response != null ? { raw: port_status.response } : null);
+      await recordHostingPortCheck(env, buildHostingPortCheckRow({
+        sim_id: hpsSim ? hpsSim.id : null,
+        iccid,
+        vendor: (hpsSim && hpsSim.vendor) || 'teltik',
+        gateway_host: (hpsSim && hpsSim.gateway_host) || 'teltik',
+        mdn: portStatusMdn && portStatusMdn.length === 10 ? portStatusMdn : null,
+        mdn_source: portStatusMdn && portStatusMdn.length === 10 ? 'teltik_get_phone_number' : null,
+        source: 'single_query',
+        http_status: psHttp,
+        state: normalizeHostPortState(psHttp, psBody),
+        raw: psBody,
+        error: (port_status && (port_status.error || (!port_status.ok && psHttp ? 'Teltik port-status HTTP ' + psHttp : null))) || null,
+      }));
+    } catch (_) { /* recording must not break Query */ }
+
     return new Response(JSON.stringify({
       ok: res.ok,
       status: res.status,
@@ -2372,11 +2455,16 @@ async function handleTeltikHostCheck(request, env, corsHeaders) {
     let simId = body.sim_id || null;
     const iccid = body.iccid || null;
     let dbCurrentMdn = body.mdn || null;
-    if (!simId && iccid) {
-      const rows = await sbGet(env, 'sims?select=id,iccid,sim_numbers(e164)&sim_numbers.valid_to=is.null&iccid=eq.' + encodeURIComponent(String(iccid)) + '&limit=1').catch(() => null);
+    let simVendor = body.vendor || null;
+    let simGatewayHost = body.gateway_host || null;
+    if ((!simId && iccid) || (simId && !simVendor)) {
+      const filter = simId ? 'id=eq.' + encodeURIComponent(String(simId)) : 'iccid=eq.' + encodeURIComponent(String(iccid));
+      const rows = await sbGet(env, 'sims?select=id,iccid,vendor,gateway_host,sim_numbers(e164)&sim_numbers.valid_to=is.null&' + filter + '&limit=1').catch(() => null);
       const sim = Array.isArray(rows) && rows[0] ? rows[0] : null;
       if (sim) {
         simId = sim.id;
+        simVendor = simVendor || sim.vendor || null;
+        simGatewayHost = simGatewayHost || sim.gateway_host || null;
         if (!dbCurrentMdn) dbCurrentMdn = (sim.sim_numbers && sim.sim_numbers[0] && sim.sim_numbers[0].e164) || null;
       }
     }
@@ -2431,6 +2519,22 @@ async function handleTeltikHostCheck(request, env, corsHeaders) {
       port_status = { ok: false, skipped: true, error: 'no valid Teltik-known MDN — port-status skipped' };
     }
 
+    // Canonical hosting port-status history (task t_a71decd6). Failed/skipped
+    // reads record as error, never offline.
+    await recordHostingPortCheck(env, buildHostingPortCheckRow({
+      sim_id: simId,
+      iccid,
+      vendor: simVendor,
+      gateway_host: simGatewayHost || 'teltik',
+      mdn: mdnDigits && mdnDigits.length === 10 ? mdnDigits : null,
+      mdn_source: picked ? picked.source : null,
+      source: body.source === 'manual_bulk' ? 'manual_bulk' : 'single_query',
+      http_status: port_status.http_status || null,
+      state: normalizeHostPortState(port_status.http_status, typeof port_status.response === 'object' ? port_status.response : null),
+      raw: typeof port_status.response === 'object' ? port_status.response : (port_status.response != null ? { raw: port_status.response } : null),
+      error: port_status.ok ? null : (port_status.error || 'Teltik port-status HTTP ' + port_status.http_status),
+    }));
+
     return new Response(JSON.stringify({
       ok: (get_info ? get_info.ok : true) && port_status.ok,
       sim_id: simId,
@@ -2447,6 +2551,28 @@ async function handleTeltikHostCheck(request, env, corsHeaders) {
   } catch (e) {
     return new Response(JSON.stringify({ ok: false, error: String(e) }), {
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+// POST /api/hosting-port-status/run — operator/bulk/manual sweep of Teltik
+// hosting port status. Body: { sim_ids?: number[], source?: 'manual_bulk'|'manual_sweep' }.
+// With sim_ids: checks exactly those SIMs (Sims bulk action). Without: sweeps
+// every active Teltik-hosted SIM (same code path as the 12h cron). All checks
+// persist through the shared recorder, so manual runs count in uptime stats.
+async function handleHostingPortStatusRun(request, env, corsHeaders) {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const simIds = Array.isArray(body.sim_ids) && body.sim_ids.length > 0 ? body.sim_ids : null;
+    const source = body.source === 'manual_bulk' ? 'manual_bulk' : 'manual_sweep';
+    const summary = await runHostingPortSweep(env, { simIds, source });
+    return new Response(JSON.stringify(summary, null, 2), {
+      status: summary.ok ? 200 : 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
 }

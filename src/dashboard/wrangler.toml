@@ -4,6 +4,10 @@ compatibility_date = "2024-01-01"
 account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
+# 12h Teltik hosting port-status sweep (scheduled handler in index.js).
+[triggers]
+crons = ["0 */12 * * *"]
+
 [vars]
 WING_EXPECTED_RATE = "5.00"
 
@@ -71,6 +75,10 @@ service = "bad-rental-remediator"
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "dashboard-test"
+
+# No automatic sweeps in test — manual /api/hosting-port-status/run only.
+[env.test.triggers]
+crons = []
 
 [env.test.vars]
 WING_EXPECTED_RATE = "5.00"
