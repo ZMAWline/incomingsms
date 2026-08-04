@@ -290,6 +290,19 @@ test('bulk Port Status action runs, summarizes and refreshes latest status', () 
   assert.match(fn.slice(0, fn.indexOf('\n        }')), /loadSims\(true\)/);
 });
 
+test('Workers page Run Hosting Port Check button sweeps all hosted SIMs', () => {
+  assert.match(DASHBOARD_HTML, /onclick="runHostingPortCheck\(\)"/, 'Worker Controls card wired');
+  assert.match(DASHBOARD_HTML, /Run Hosting Port Check/);
+  const fn = DASHBOARD_HTML.slice(DASHBOARD_HTML.indexOf('async function runHostingPortCheck'));
+  const body = fn.slice(0, fn.indexOf('\n        }'));
+  assert.match(body, /showConfirm\(/, 'confirms before running');
+  assert.match(body, /\/hosting-port-status\/run/);
+  assert.match(body, /source: 'manual_sweep'/);
+  assert.doesNotMatch(body, /sim_ids/, 'no sim_ids = full server-side sweep');
+  assert.match(body, /wrong_mdn_retries/, 'summary includes wrong-MDN retries');
+  assert.match(body, /loadSims\(true\)/, 'refreshes Sims so Host Port column updates');
+});
+
 test('Rotation Audit widget removed from Sims page', () => {
   assert.doesNotMatch(DASHBOARD_HTML, /rotation-audit-widget/);
   assert.doesNotMatch(DASHBOARD_HTML, /loadRotationAudit/);
