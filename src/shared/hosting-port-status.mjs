@@ -96,32 +96,71 @@ export async function recordHostingPortCheck(env, row) {
   }
 }
 
-// Raw Teltik /v1/port-status read. Returns { http_status, body, state, error }.
-export async function readTeltikPortStatus(env, mdn) {
-  if (!env.TELTIK_API_KEY) {
-    return { http_status: null, body: null, state: 'error', error: 'teltik_credentials_missing' };
-  }
-  const norm = toTeltik10Digit(mdn);
-  if (norm.length !== 10) {
-    return { http_status: null, body: null, state: 'error', error: 'no valid Teltik-known MDN — port-status skipped' };
-  }
-  const url = 'https://api.smsgateway.xyz/v1/port-status'
-    + '?apikey=' + encodeURIComponent(env.TELTIK_API_KEY)
-    + '&mdn=' + encodeURIComponent(norm);
-  let resp, text;
+// Mirror one port-status attempt into carrier_api_logs so it shows in the
+// dashboard API Logs alongside other Teltik calls. API key and relay key are
+// redacted. Never throws — logging must not break the check.
+async function logPortStatusCarrierApi(env, iccid, requestUrl, out) {
   try {
-    resp = await fetch(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) });
-    text = await resp.text();
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
+      method: 'POST',
+      headers: { ...sbHeaders(env), Prefer: 'return=minimal' },
+      body: JSON.stringify({
+        run_id: 'port_status_' + (iccid || 'unknown') + '_' + Date.now(),
+        step: 'port_status',
+        iccid: iccid || null,
+        imei: null,
+        vendor: 'teltik',
+        request_url: requestUrl,
+        request_method: 'GET',
+        request_headers: env.RELAY_KEY ? { 'x-relay-key': '[REDACTED]' } : null,
+        request_body: null,
+        response_status: out.http_status,
+        response_ok: out.http_status != null && out.http_status >= 200 && out.http_status < 300,
+        response_body_text: out.body == null ? null : JSON.stringify(out.body).slice(0, 5000),
+        response_body_json: out.body,
+        error: out.error || null,
+        created_at: new Date().toISOString(),
+      }),
+    });
+    if (!resp.ok) console.log('[HostPort] carrier_api_logs mirror failed HTTP ' + resp.status);
   } catch (e) {
-    return { http_status: null, body: null, state: 'error', error: 'port-status exception: ' + (e && e.message || e) };
+    console.log('[HostPort] carrier_api_logs mirror exception: ' + (e && e.message || e));
   }
-  let body = null;
-  try { body = JSON.parse(text); } catch { body = { raw: text }; }
-  const state = normalizeHostPortState(resp.status, body);
-  return {
-    http_status: resp.status, body, state, mdn10: norm,
-    error: resp.ok ? null : 'Teltik port-status HTTP ' + resp.status,
-  };
+}
+
+// Raw Teltik /v1/port-status read. Returns { http_status, body, state, error }.
+// Every attempt (including credential/MDN skips and exceptions) is also
+// mirrored to carrier_api_logs; pass meta.iccid when known.
+export async function readTeltikPortStatus(env, mdn, meta = {}) {
+  const norm = toTeltik10Digit(mdn);
+  const redactedUrl = 'https://api.smsgateway.xyz/v1/port-status?apikey=***&mdn=' + encodeURIComponent(norm);
+  let out;
+  if (!env.TELTIK_API_KEY) {
+    out = { http_status: null, body: null, state: 'error', error: 'teltik_credentials_missing' };
+  } else if (norm.length !== 10) {
+    out = { http_status: null, body: null, state: 'error', error: 'no valid Teltik-known MDN — port-status skipped' };
+  } else {
+    const url = 'https://api.smsgateway.xyz/v1/port-status'
+      + '?apikey=' + encodeURIComponent(env.TELTIK_API_KEY)
+      + '&mdn=' + encodeURIComponent(norm);
+    let resp, text;
+    try {
+      resp = await fetch(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) });
+      text = await resp.text();
+    } catch (e) {
+      out = { http_status: null, body: null, state: 'error', error: 'port-status exception: ' + (e && e.message || e) };
+    }
+    if (!out) {
+      let body = null;
+      try { body = JSON.parse(text); } catch { body = { raw: text }; }
+      out = {
+        http_status: resp.status, body, state: normalizeHostPortState(resp.status, body), mdn10: norm,
+        error: resp.ok ? null : 'Teltik port-status HTTP ' + resp.status,
+      };
+    }
+  }
+  await logPortStatusCarrierApi(env, meta.iccid, redactedUrl, out);
+  return out;
 }
 
 // Resolve the Teltik-known MDN for a SIM (latest raw Teltik inbound SMS
@@ -153,7 +192,7 @@ export async function checkAndRecordTeltikHostPort(env, sim, { source } = {}) {
   let attempt = 1;
   let mdn = picked ? picked.mdn : null;
   let mdnSource = picked ? picked.source : null;
-  let read = await readTeltikPortStatus(env, mdn);
+  let read = await readTeltikPortStatus(env, mdn, { iccid: sim.iccid });
   await recordHostingPortCheck(env, buildHostingPortCheckRow({
     ...base, mdn: read.mdn10 || mdn, mdn_source: mdnSource, attempt,
     http_status: read.http_status, state: read.state, raw: read.body, error: read.error,
@@ -173,7 +212,7 @@ export async function checkAndRecordTeltikHostPort(env, sim, { source } = {}) {
         retried = true;
         mdn = lookedUp;
         mdnSource = 'teltik_get_phone_number_retry';
-        read = await readTeltikPortStatus(env, mdn);
+        read = await readTeltikPortStatus(env, mdn, { iccid: sim.iccid });
         await recordHostingPortCheck(env, buildHostingPortCheckRow({
           ...base, mdn: lookedUp, mdn_source: mdnSource, attempt,
           http_status: read.http_status, state: read.state, raw: read.body, error: read.error,

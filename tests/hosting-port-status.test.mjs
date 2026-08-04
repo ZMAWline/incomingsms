@@ -14,6 +14,7 @@ import {
   buildHostingPortCheckRow,
   toTeltik10Digit,
   checkAndRecordTeltikHostPort,
+  readTeltikPortStatus,
   runHostingPortSweep,
   CHECK_SOURCES,
 } from '../src/shared/hosting-port-status.mjs';
@@ -79,7 +80,7 @@ const jsonResp = (body, status = 200) => new Response(JSON.stringify(body), {
   status, headers: { 'Content-Type': 'application/json' },
 });
 
-function mockFetch(posted, { firstMdnFails = false } = {}) {
+function mockFetch(posted, { firstMdnFails = false, apiLogs = [] } = {}) {
   return async (url, opts = {}) => {
     url = String(url);
     if (url.includes('/rest/v1/inbound_sms')) {
@@ -87,6 +88,10 @@ function mockFetch(posted, { firstMdnFails = false } = {}) {
     }
     if (url.includes('/rest/v1/hosting_port_status_checks')) {
       posted.push(JSON.parse(opts.body));
+      return new Response(null, { status: 201 });
+    }
+    if (url.includes('/rest/v1/carrier_api_logs')) {
+      apiLogs.push(JSON.parse(opts.body));
       return new Response(null, { status: 201 });
     }
     if (url.includes('/rest/v1/sims')) {
@@ -109,8 +114,9 @@ const ENV = { SUPABASE_URL: 'https://sb.example', SUPABASE_SERVICE_ROLE_KEY: 'ke
 
 test('checkAndRecordTeltikHostPort records via canonical recorder, keyed by payload MDN', async () => {
   const posted = [];
+  const apiLogs = [];
   const orig = globalThis.fetch;
-  globalThis.fetch = mockFetch(posted);
+  globalThis.fetch = mockFetch(posted, { apiLogs });
   try {
     const r = await checkAndRecordTeltikHostPort(ENV,
       { id: 1, iccid: 'ICC1', vendor: 'atomic', gateway_host: 'teltik', db_current_mdn: '+15550001111' },
@@ -122,13 +128,25 @@ test('checkAndRecordTeltikHostPort records via canonical recorder, keyed by payl
     assert.equal(posted[0].mdn_source, 'teltik_inbound_sms_payload_mdn');
     assert.equal(posted[0].vendor, 'atomic', 'service vendor preserved for Teltik-hosted Atomic SIM');
     assert.equal(posted[0].source, 'single_query');
+    // Attempt also mirrored into carrier_api_logs (dashboard API Logs).
+    assert.equal(apiLogs.length, 1);
+    assert.equal(apiLogs[0].vendor, 'teltik');
+    assert.equal(apiLogs[0].step, 'port_status');
+    assert.equal(apiLogs[0].iccid, 'ICC1');
+    assert.equal(apiLogs[0].request_method, 'GET');
+    assert.equal(apiLogs[0].response_status, 200);
+    assert.equal(apiLogs[0].response_ok, true);
+    assert.deepEqual(apiLogs[0].response_body_json, { port_status: 'online' });
+    assert.match(apiLogs[0].request_url, /apikey=\*\*\*&mdn=9175550101/);
+    assert.ok(!JSON.stringify(apiLogs).includes(ENV.TELTIK_API_KEY), 'API key never stored');
   } finally { globalThis.fetch = orig; }
 });
 
 test('wrong-MDN read records error (never offline), retries via ICCID lookup, records both attempts', async () => {
   const posted = [];
+  const apiLogs = [];
   const orig = globalThis.fetch;
-  globalThis.fetch = mockFetch(posted, { firstMdnFails: true });
+  globalThis.fetch = mockFetch(posted, { firstMdnFails: true, apiLogs });
   try {
     const r = await checkAndRecordTeltikHostPort(ENV,
       { id: 1, iccid: 'ICC1', vendor: 'atomic', gateway_host: 'teltik', db_current_mdn: null },
@@ -144,6 +162,34 @@ test('wrong-MDN read records error (never offline), retries via ICCID lookup, re
     assert.equal(posted[1].mdn_source, 'teltik_get_phone_number_retry');
     assert.equal(r.state, 'online');
     assert.equal(r.retried, true);
+    // Both attempts mirrored to carrier_api_logs, including the failed one.
+    assert.equal(apiLogs.length, 2);
+    assert.equal(apiLogs[0].response_status, 400);
+    assert.equal(apiLogs[0].response_ok, false);
+    assert.equal(apiLogs[0].error, 'Teltik port-status HTTP 400');
+    assert.equal(apiLogs[1].response_status, 200);
+    assert.equal(apiLogs[1].response_ok, true);
+    assert.match(apiLogs[1].request_url, /mdn=9175550999/);
+    assert.ok(apiLogs.every(l => l.step === 'port_status' && l.iccid === 'ICC1' && l.request_url.includes('apikey=***')));
+  } finally { globalThis.fetch = orig; }
+});
+
+test('skipped/error attempts (missing credentials) still mirror to carrier_api_logs without breaking the check', async () => {
+  const apiLogs = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = mockFetch([], { apiLogs });
+  try {
+    const r = await readTeltikPortStatus({ ...ENV, TELTIK_API_KEY: undefined }, '9175550101', { iccid: 'ICC9' });
+    assert.equal(r.state, 'error');
+    assert.equal(apiLogs.length, 1);
+    assert.equal(apiLogs[0].iccid, 'ICC9');
+    assert.equal(apiLogs[0].response_status, null);
+    assert.equal(apiLogs[0].response_ok, false);
+    assert.equal(apiLogs[0].error, 'teltik_credentials_missing');
+    // Logging failure never breaks the check itself.
+    globalThis.fetch = async () => { throw new Error('supabase down'); };
+    const r2 = await readTeltikPortStatus({ ...ENV, TELTIK_API_KEY: undefined }, '9175550101', { iccid: 'ICC9' });
+    assert.equal(r2.state, 'error');
   } finally { globalThis.fetch = orig; }
 });
 
@@ -188,6 +234,8 @@ test('migration creates the canonical table, indexes and summary RPC idempotentl
 test('all Teltik port-status call sites route through the shared recorder', () => {
   // Single place that writes the table: the shared module.
   assert.match(SHARED_SRC, /\/rest\/v1\/hosting_port_status_checks/);
+  // Shared module also mirrors every port-status attempt to carrier_api_logs.
+  assert.match(SHARED_SRC, /\/rest\/v1\/carrier_api_logs/);
   assert.doesNotMatch(DASHBOARD_SRC, /rest\/v1\/hosting_port_status_checks/, 'dashboard uses the shared recorder, not direct table writes');
   assert.doesNotMatch(REMEDIATOR_SRC, /rest\/v1\/hosting_port_status_checks/, 'remediator uses the shared recorder, not direct table writes');
   // Dashboard: teltik-query + teltik-host-check + sweep all record.
