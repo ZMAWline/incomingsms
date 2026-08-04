@@ -1528,9 +1528,9 @@ async function gatherEvidence(env, report) {
   // Teltik-known MDN — the MDN the Teltik side still knows this line by.
   // Rotations don't sync back to Teltik, so any Teltik per-line call
   // (/v1/get-info, /v1/reset-port, /v1/reset-network) keyed by the DB current
-  // MDN can 404/miss. Prefer the destination of the latest Teltik-delivered
-  // inbound SMS (port IS NULL rows = teltik-worker inserts); fall back to DB
-  // current MDN only when no such SMS exists. Needed for teltik-vendor SIMs
+  // MDN can 404/miss. Prefer the raw payload destination of the latest
+  // Teltik-delivered inbound SMS (port IS NULL rows = teltik-worker inserts);
+  // fall back to DB current MDN only when no such SMS payload MDN exists. Needed for teltik-vendor SIMs
   // and for any SIM physically seated in a Teltik gateway (e.g. Atomic-in-Teltik).
   if (evidence.sim && (String(evidence.sim.vendor || '').toLowerCase() === 'teltik' || isTeltikHosted(evidence.sim))) {
     let latestTeltikSms = null;

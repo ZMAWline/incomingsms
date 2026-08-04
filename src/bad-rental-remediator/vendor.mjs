@@ -406,8 +406,8 @@ export async function helixSubscriberDetails(env, { mobilitySubscriptionId }) {
 // read is left UNSET on any read failure so a transient error never looks like
 // "offline" and triggers a reset.
 //
-// `mdn` must be the TELTIK-KNOWN MDN (latest Teltik inbound SMS destination,
-// falling back to DB current MDN — see src/shared/teltik-known-mdn.mjs):
+// `mdn` must be the TELTIK-KNOWN MDN (latest raw Teltik inbound SMS payload
+// destination, falling back to DB current MDN — see src/shared/teltik-known-mdn.mjs):
 // Teltik/TotalTick can still know a line by the first MDN it ever saw because
 // our rotations do not sync back, so keying get-info by the DB current MDN
 // 404s and misclassifies the line as T7 vendor-not-found.

@@ -171,12 +171,16 @@ const ATTEMPT_ROWS = [
   { id: 1, action: 'classify_only',     outcome: 'no_change',        attempted_at: '2026-07-26T10:00:00Z' },
 ];
 
-test('Teltik-hosted stale-MDN: port read keys on latest inbound_sms.to_number, and skipped_cooldown rows do not count as attempts', async () => {
+test('Teltik-hosted stale-MDN: port read keys on latest raw SMS payload MDN, and skipped_cooldown rows do not count as attempts', async () => {
   const orig = globalThis.fetch;
   const calls = stubFetch([
     ['/rest/v1/sims?', [SIM_ROW]],
     ['/rest/v1/rental_report_remediation_attempts', ATTEMPT_ROWS],
-    ['/rest/v1/inbound_sms', [{ to_number: '3075559999', received_at: '2026-07-27T12:00:00Z' }]],
+    ['/rest/v1/inbound_sms', [{
+      to_number: '3075552222', // canonical/customer number; not the Teltik API key
+      raw: { destination: '3075559999' },
+      received_at: '2026-07-27T12:00:00Z',
+    }]],
     ['/v1/port-status', { port_status: 'offline' }],
   ]);
   try {
@@ -184,11 +188,12 @@ test('Teltik-hosted stale-MDN: port read keys on latest inbound_sms.to_number, a
       { SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'srk', TELTIK_API_KEY: 'k' },
       { id: 101, sim_id: 42 });
 
-    // Patch C/D — Teltik-known MDN wins over stale sims.msisdn.
+    // Patch C/D — raw Teltik payload MDN wins over stale sims.msisdn and canonical to_number.
     assert.equal(evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn, '3075559999');
     const portCall = calls.find(u => u.includes('/v1/port-status'));
     assert.ok(portCall, 'port-status probe fired');
     assert.match(portCall, /mdn=3075559999/);
+    assert.doesNotMatch(portCall, /3075552222/);
     assert.doesNotMatch(portCall, /3075551111/);
     assert.equal(evidence.teltikHostPortStatus.online, false);
 

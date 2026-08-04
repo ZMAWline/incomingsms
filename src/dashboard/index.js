@@ -2146,15 +2146,31 @@ async function handleHelixQuery(request, env, corsHeaders) {
   }
 }
 
+async function resolveTeltikKnownMdnForSim(env, sim, dbCurrentMdn) {
+  if (!sim || !sim.id) return pickTeltikKnownMdn(null, dbCurrentMdn || null);
+  let latestTeltikSms = null;
+  try {
+    const rows = await sbGet(env, latestTeltikSmsQuery(sim.id));
+    latestTeltikSms = Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch (_) {
+    latestTeltikSms = null;
+  }
+  return pickTeltikKnownMdn(latestTeltikSms, dbCurrentMdn || null);
+}
+
 // Heal a swapped-card Teltik SIM. After Teltik replaces the physical SIM the
 // ICCID changes but the MDN does not, so every call keyed by the OLD ICCID 404s
 // "Invalid ICCID" — but get-info BY MDN still resolves the line and returns the
 // CURRENT ICCID. Adopt it via the shared iccidSwapPatch (no number churn, no
-// reseller webhook). Never throws. `sim` needs { id, iccid, msisdn }.
+// reseller webhook). Teltik get-info is keyed by the Teltik-known MDN: the
+// latest raw Teltik inbound SMS payload destination, falling back to DB msisdn
+// only when no Teltik SMS payload MDN exists. Never throws. `sim` needs { id, iccid, msisdn }.
 async function healTeltikIccidBySim(env, sim) {
   if (!sim || !sim.id) return { ok: false, reason: 'missing_sim' };
   if (!env.TELTIK_API_KEY) return { ok: false, reason: 'teltik_key_missing' };
-  const mdn = String(sim.msisdn || '').replace(/\D/g, '').replace(/^1/, '');
+  const dbCurrentMdn = sim.msisdn ? '+1' + String(sim.msisdn).replace(/\D/g, '').replace(/^1/, '') : null;
+  const picked = await resolveTeltikKnownMdnForSim(env, sim, dbCurrentMdn);
+  const mdn = picked ? toTeltik10Digit(picked.mdn) : '';
   if (mdn.length !== 10) return { ok: false, reason: 'missing_or_invalid_mdn' };
   const infoUrl = 'https://api.smsgateway.xyz/v1/get-info?apikey=' + encodeURIComponent(env.TELTIK_API_KEY) + '&mdn=' + encodeURIComponent(mdn);
   let res, text;
@@ -2174,7 +2190,7 @@ async function healTeltikIccidBySim(env, sim) {
   if (!res.ok || !info) return { ok: false, reason: 'get_info_http_' + res.status };
   const newIccid = info.iccid || null;
   if (!newIccid) return { ok: false, reason: 'no_iccid_in_response' };
-  if (newIccid === sim.iccid) return { ok: true, changed: false, iccid: newIccid };
+  if (newIccid === sim.iccid) return { ok: true, changed: false, iccid: newIccid, mdn_source: picked ? picked.source : null };
   const patchRes = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(String(sim.id)), {
     method: 'PATCH',
     headers: {
@@ -2189,7 +2205,7 @@ async function healTeltikIccidBySim(env, sim) {
     const detail = await patchRes.text().catch(() => '');
     return { ok: false, reason: 'db_patch_' + patchRes.status, detail: detail.slice(0, 200) };
   }
-  return { ok: true, changed: true, old_iccid: sim.iccid, new_iccid: newIccid };
+  return { ok: true, changed: true, old_iccid: sim.iccid, new_iccid: newIccid, mdn_source: picked ? picked.source : null };
 }
 
 async function handleTeltikQuery(request, env, corsHeaders) {
@@ -2340,9 +2356,9 @@ async function handleTeltikQuery(request, env, corsHeaders) {
 // MDN rule: Teltik/TotalTick may still know the line by the first MDN it ever
 // saw — our rotations don't sync back to Teltik (inbound SMS matches by
 // ICCID-in-alias for the same reason). Both /v1/get-info and /v1/port-status
-// use the Teltik-known MDN: the destination of the latest Teltik-delivered
-// inbound SMS for this SIM, falling back to our DB current MDN only when no such
-// SMS exists. Never key Teltik host-port status by ICCID.
+// use the Teltik-known MDN: the raw payload destination of the latest
+// Teltik-delivered inbound SMS for this SIM, falling back to our DB current MDN
+// only when no such SMS payload MDN exists. Never key Teltik host-port status by ICCID.
 async function handleTeltikHostCheck(request, env, corsHeaders) {
   try {
     const body = await request.json().catch(() => ({}));
@@ -5485,32 +5501,16 @@ async function handleSimAction(request, env, corsHeaders) {
         const apiKey = env.TELTIK_API_KEY;
         if (!apiKey) return new Response(JSON.stringify({ ok: false, error: 'TELTIK_API_KEY not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
-        // Resolve MDN: prefer DB, fall back to live Teltik /v1/get-phone-number lookup
-        // by ICCID so a stale or missing sim_numbers row doesn't break the operator action.
-        let rawMdn = row.sim_numbers && row.sim_numbers[0] && row.sim_numbers[0].e164;
-        let mdnSource = 'db';
-        let mdnLookupError = null;
-        if (!rawMdn && row.iccid) {
-          try {
-            const gpUrl = `https://api.smsgateway.xyz/v1/get-phone-number/?apikey=${encodeURIComponent(apiKey)}&iccid=${encodeURIComponent(row.iccid)}`;
-            const gpFetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + gpUrl : gpUrl;
-            const gpHeaders = {};
-            if (env.RELAY_KEY) gpHeaders['x-relay-key'] = env.RELAY_KEY;
-            const gpRes = await fetch(gpFetchUrl, { method: 'GET', headers: gpHeaders });
-            const gpText = await gpRes.text();
-            let gpJson = null; try { gpJson = JSON.parse(gpText); } catch {}
-            if (gpRes.ok && gpJson) {
-              rawMdn = gpJson.msisdn || gpJson.mdn || gpJson.phone_number || null;
-              if (rawMdn) mdnSource = 'teltik_live';
-            } else {
-              mdnLookupError = `get-phone-number HTTP ${gpRes.status}: ${(gpJson && (gpJson.message || gpJson.error)) || gpText.slice(0, 120)}`;
-            }
-          } catch (e) {
-            mdnLookupError = `get-phone-number exception: ${e && e.message ? e.message : String(e)}`;
-          }
-        }
+        // Resolve MDN for Teltik API calls: use the MDN Teltik still knows the
+        // line by — latest raw Teltik inbound SMS payload destination first,
+        // DB current MDN only as fallback. Do NOT use get-phone-number/current DB MDN as the
+        // reset key after rotations; Teltik can reject it as Invalid MDN.
+        const dbCurrentMdn = row.sim_numbers && row.sim_numbers[0] && row.sim_numbers[0].e164;
+        const picked = await resolveTeltikKnownMdnForSim(env, { id: sim_id, iccid: row.iccid }, dbCurrentMdn);
+        const rawMdn = picked && picked.mdn;
+        const mdnSource = picked ? picked.source : null;
         if (!rawMdn) {
-          const err = `No MDN for Teltik SIM ${row.iccid}, cannot reset port` + (mdnLookupError ? ` (${mdnLookupError})` : '');
+          const err = `No Teltik-known MDN for Teltik SIM ${row.iccid}, cannot reset port`;
           return new Response(JSON.stringify({ ok: false, error: err, action, sim_id, iccid: row.iccid, vendor: 'teltik' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         }
         // Teltik /reset-port requires the bare 10-digit US number — not +1XXXXXXXXXX
