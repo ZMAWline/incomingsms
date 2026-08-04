@@ -293,3 +293,132 @@ export async function runHostingPortSweep(env, { simIds = null, source = 'manual
   await Promise.all(workers);
   return summary;
 }
+
+// --- Durable full-sweep jobs ----------------------------------------------
+// The Workers-page "Hosting Port Check" enqueues one hosting_port_status_jobs
+// row and returns immediately; the dashboard's 1-minute scheduled tick drains
+// the oldest pending job one bounded batch per tick via
+// processHostingPortJobs(). Offsets/totals persist after every batch, so the
+// sweep never depends on a browser staying open and a crashed batch resumes
+// where it stopped. Lifecycle: queued (ready for next batch) -> running
+// (batch in flight) -> queued -> ... -> done | failed | cancelled.
+// ponytail: optimistic-PATCH claim + updated_at lease, no queue infra; move
+// to Cloudflare Queues if batch cadence ever needs to beat one per minute.
+
+export const JOB_LEASE_MS = 15 * 60 * 1000; // stale-running takeover; > max batch runtime
+
+const EMPTY_JOB_TOTALS = { checked: 0, online: 0, offline: 0, unknown: 0, error: 0, wrong_mdn_retries: 0 };
+
+// Enqueue a full-sweep job. One pending sweep at a time: if a queued/running
+// job already exists, returns it instead of stacking duplicates.
+export async function enqueueHostingPortJob(env, { source = 'manual_sweep', maxSims = 200, createdBy = null } = {}) {
+  try {
+    const pendingResp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs'
+      + '?select=id,status&status=in.(queued,running)&order=created_at.asc&limit=1', { headers: sbHeaders(env) });
+    const pending = pendingResp.ok ? await pendingResp.json() : null;
+    if (Array.isArray(pending) && pending[0]) {
+      return { ok: true, job_id: pending[0].id, status: pending[0].status, already_pending: true };
+    }
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs', {
+      method: 'POST',
+      headers: { ...sbHeaders(env), Prefer: 'return=representation' },
+      body: JSON.stringify({ source, max_sims: maxSims, created_by: createdBy }),
+    });
+    const rows = resp.ok ? await resp.json() : null;
+    if (!Array.isArray(rows) || !rows[0]) return { ok: false, error: 'job insert failed HTTP ' + resp.status };
+    return { ok: true, job_id: rows[0].id, status: rows[0].status, already_pending: false };
+  } catch (e) {
+    return { ok: false, error: 'enqueue exception: ' + (e && e.message || e) };
+  }
+}
+
+export async function getHostingPortJob(env, jobId) {
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?id=eq.'
+      + encodeURIComponent(jobId) + '&limit=1', { headers: sbHeaders(env) });
+    const rows = resp.ok ? await resp.json() : null;
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+async function patchHostingPortJob(env, filter, patch) {
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?' + filter, {
+      method: 'PATCH',
+      headers: { ...sbHeaders(env), Prefer: 'return=representation' },
+      body: JSON.stringify(patch),
+    });
+    const rows = resp.ok ? await resp.json().catch(() => null) : null;
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Drain pending jobs: claim the oldest claimable job (queued, or running with
+// a stale lease) and run ONE bounded batch, persisting next_offset/totals so
+// the next scheduled tick continues exactly where this one stopped.
+export async function processHostingPortJobs(env, { maxJobs = 1, leaseMs = JOB_LEASE_MS } = {}) {
+  const out = { claimed: 0, batches: 0, finished: 0, failed: 0 };
+  for (let n = 0; n < maxJobs; n++) {
+    const staleIso = new Date(Date.now() - leaseMs).toISOString();
+    const claimable = 'or=(status.eq.queued,and(status.eq.running,updated_at.lt.' + staleIso + '))';
+    let job = null;
+    try {
+      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?select=*&'
+        + claimable + '&order=created_at.asc&limit=1', { headers: sbHeaders(env) });
+      const rows = resp.ok ? await resp.json() : null;
+      job = Array.isArray(rows) && rows[0] ? rows[0] : null;
+    } catch { job = null; }
+    if (!job) break;
+
+    // Optimistic claim: the PATCH filter repeats the claimable condition, so
+    // only one concurrent tick wins; losers get an empty result and move on.
+    const nowIso = new Date().toISOString();
+    const claimed = await patchHostingPortJob(env, 'id=eq.' + job.id + '&' + claimable, {
+      status: 'running', started_at: job.started_at || nowIso, updated_at: nowIso,
+    });
+    if (!claimed) continue;
+    out.claimed++;
+
+    const summary = await runHostingPortSweep(env, {
+      source: CHECK_SOURCES.includes(claimed.source) ? claimed.source : 'manual_sweep',
+      offset: claimed.next_offset || 0,
+      maxSims: claimed.max_sims || 200,
+    });
+    const doneIso = new Date().toISOString();
+    if (!summary.ok) {
+      out.failed++;
+      await patchHostingPortJob(env, 'id=eq.' + job.id, {
+        status: 'failed', error: summary.error || 'sweep failed', finished_at: doneIso, updated_at: doneIso,
+      });
+      continue;
+    }
+
+    const prev = { ...EMPTY_JOB_TOTALS, ...(claimed.totals || {}) };
+    const totals = {
+      checked: prev.checked + (summary.total || 0),
+      online: prev.online + (summary.online || 0),
+      offline: prev.offline + (summary.offline || 0),
+      unknown: prev.unknown + (summary.unknown || 0),
+      error: prev.error + (summary.error || 0),
+      wrong_mdn_retries: prev.wrong_mdn_retries + (summary.wrong_mdn_retries || 0),
+    };
+    const done = summary.has_more !== true;
+    out.batches++;
+    if (done) out.finished++;
+    await patchHostingPortJob(env, 'id=eq.' + job.id, {
+      status: done ? 'done' : 'queued',
+      next_offset: summary.next_offset,
+      total_available: summary.total_available != null ? summary.total_available : claimed.total_available,
+      totals,
+      batches: (claimed.batches || 0) + 1,
+      error: null,
+      finished_at: done ? doneIso : null,
+      updated_at: doneIso,
+    });
+  }
+  return out;
+}

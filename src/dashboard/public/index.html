@@ -5628,64 +5628,79 @@ set verify_pending; schedule §C.3 poll
             }
         }
 
-        // Worker Controls: run Teltik hosting port-status for ALL active
-        // Teltik-hosted SIMs. The server caps each run at 200 SIMs, so this
-        // loops id-ordered batches (offset/next_offset) until has_more=false,
-        // showing cumulative progress in the action modal instead of a toast.
+        // Worker Controls: enqueue a durable SERVER-SIDE sweep of all active
+        // Teltik-hosted SIMs. The dashboard worker's 1-minute scheduled tick
+        // drains the job in batches of 200 and persists progress in
+        // hosting_port_status_jobs, so the sweep keeps running even if this
+        // page or the whole browser is closed. No browser-side batch loop.
         async function runHostingPortCheck() {
-            if (!(await showConfirm('Hosting Port Check', 'Run Teltik hosting port-status for all active Teltik-hosted SIMs? Runs in batches of 200.'))) return;
+            if (!(await showConfirm('Hosting Port Check', 'Run Teltik hosting port-status for all active Teltik-hosted SIMs? The sweep runs on the server in batches of 200 and continues even if you close this page or browser.'))) return;
             const output = document.getElementById('sim-action-output');
             document.getElementById('sim-action-title').textContent = 'Hosting Port Check';
             document.getElementById('sim-action-logs-section').classList.add('hidden');
-            output.textContent = 'Starting batched sweep…';
+            output.textContent = 'Enqueuing server-side sweep job…';
             output.classList.remove('hidden');
             document.getElementById('sim-action-modal').classList.remove('hidden');
-            const totals = { checked: 0, online: 0, offline: 0, unknown: 0, error: 0, wrong_mdn_retries: 0, total_available: null };
-            const render = (status) => {
+            try {
+                const res = await fetch(API_BASE + '/hosting-port-status/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ source: 'manual_sweep', async: true })
+                });
+                const data = await res.json();
+                if (!res.ok || data.ok === false || !data.job_id) {
+                    output.textContent = 'Failed to enqueue sweep job: ' + (data.error || res.status);
+                    showToast('Hosting port check failed to start', 'error');
+                    return;
+                }
+                pollHostingPortJob(data.job_id, output, data.already_pending);
+            } catch (e) {
+                output.textContent = 'Hosting port check error: ' + e;
+            }
+        }
+
+        // Display-only polling of a durable sweep job while this page is open.
+        // Closing the page stops the polling, never the job — the server keeps
+        // draining batches on its scheduled tick.
+        function pollHostingPortJob(jobId, output, alreadyPending) {
+            const render = (job, note) => {
+                const t = Object.assign({ checked: 0, online: 0, offline: 0, unknown: 0, error: 0, wrong_mdn_retries: 0 }, (job && job.totals) || {});
                 output.textContent = [
-                    status,
+                    note,
+                    'Job ' + jobId + ' — status: ' + (job ? job.status : 'queued'),
+                    'Runs server-side; continues even if you close this page or browser.',
                     '',
-                    'Checked: ' + totals.checked + (totals.total_available ? ' / ' + totals.total_available : ''),
-                    'Online: ' + totals.online,
-                    'Offline: ' + totals.offline,
-                    'Unknown: ' + totals.unknown,
-                    'Errors: ' + totals.error,
-                    'Wrong-MDN retries: ' + totals.wrong_mdn_retries,
+                    'Checked: ' + t.checked + (job && job.total_available ? ' / ' + job.total_available : ''),
+                    'Online: ' + t.online,
+                    'Offline: ' + t.offline,
+                    'Unknown: ' + t.unknown,
+                    'Errors: ' + t.error,
+                    'Wrong-MDN retries: ' + t.wrong_mdn_retries,
                 ].join(String.fromCharCode(10));
             };
-            try {
-                let offset = 0, hasMore = true, batches = 0;
-                while (hasMore && batches < 100) { // safety stop: 100 batches = 20k SIMs
-                    batches++;
-                    render('Running batch ' + batches + ' (offset ' + offset + ')…');
-                    const res = await fetch(API_BASE + '/hosting-port-status/run', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ source: 'manual_sweep', offset: offset, max_sims: 200 })
-                    });
+            render(null, alreadyPending
+                ? 'A sweep job was already pending — showing its progress.'
+                : 'Job enqueued — the next scheduled tick (within 1 minute) starts checking.');
+            const timer = setInterval(async () => {
+                try {
+                    const res = await fetch(API_BASE + '/hosting-port-status/jobs/' + jobId);
                     const data = await res.json();
-                    if (!res.ok || data.ok === false) {
-                        render('Batch ' + batches + ' failed: ' + (data.error || res.status));
-                        showToast('Hosting port check failed: ' + (data.error || res.status), 'error');
-                        return;
+                    if (!res.ok || !data.ok || !data.job) return; // transient poll failure — job unaffected
+                    const job = data.job;
+                    render(job, 'Batches done: ' + (job.batches || 0));
+                    if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
+                        clearInterval(timer);
+                        if (job.status === 'done') {
+                            const t = job.totals || {};
+                            showToast('Port check: ' + (t.checked || 0) + ' checked — ' + (t.online || 0) + ' online, '
+                                + (t.offline || 0) + ' offline, ' + ((t.unknown || 0) + (t.error || 0)) + ' unknown/error', 'success');
+                            loadSims(true);
+                        } else {
+                            showToast('Hosting port sweep ' + job.status + (job.error ? ': ' + job.error : ''), 'error');
+                        }
                     }
-                    totals.checked += data.total || 0;
-                    totals.online += data.online || 0;
-                    totals.offline += data.offline || 0;
-                    totals.unknown += data.unknown || 0;
-                    totals.error += data.error || 0;
-                    totals.wrong_mdn_retries += data.wrong_mdn_retries || 0;
-                    if (data.total_available) totals.total_available = data.total_available;
-                    hasMore = data.has_more === true && Number.isInteger(data.next_offset) && data.next_offset > offset;
-                    offset = Number.isInteger(data.next_offset) ? data.next_offset : offset + (data.total || 0);
-                }
-                render('Done — ' + totals.checked + ' SIM(s) checked in ' + batches + ' batch(es).');
-                showToast('Port check: ' + totals.checked + ' checked — ' + totals.online + ' online, '
-                    + totals.offline + ' offline, ' + (totals.unknown + totals.error) + ' unknown/error', 'success');
-                loadSims(true);
-            } catch (e) {
-                render('Hosting port check error: ' + e);
-            }
+                } catch (e) { /* transient poll failure — job unaffected */ }
+            }, 5000);
         }
 
                 let lastSimsFetchedAt = 0;

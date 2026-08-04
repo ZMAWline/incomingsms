@@ -22,6 +22,7 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = (...p) => fs.readFileSync(path.join(__dirname, '..', ...p), 'utf8');
 const MIGRATION = read('migrations', '20260804_hosting_port_status_checks.sql');
+const JOBS_MIGRATION = read('migrations', '20260804_hosting_port_status_jobs.sql');
 const DASHBOARD_SRC = read('src', 'dashboard', 'index.js');
 const DASHBOARD_HTML = read('src', 'dashboard', 'public', 'index.html');
 const DASHBOARD_TOML = read('src', 'dashboard', 'wrangler.toml');
@@ -270,6 +271,16 @@ test('migration creates the canonical table, indexes and summary RPC idempotentl
   assert.match(MIGRATION, /interval '7 days'/);
 });
 
+// Deep column/behavior coverage lives in tests/hosting-port-status-jobs.test.mjs;
+// this pins the durable-sweep table's key constraints and claim indexes.
+test('jobs migration creates hosting_port_status_jobs with status/source checks and claim indexes', () => {
+  assert.match(JOBS_MIGRATION, /CREATE TABLE IF NOT EXISTS hosting_port_status_jobs/);
+  assert.match(JOBS_MIGRATION, /CHECK \(status IN \('queued','running','done','failed','cancelled'\)\)/);
+  assert.match(JOBS_MIGRATION, /CHECK \(source IN \('cron','manual_bulk','manual_sweep','single_query','bad_rental_remediator'\)\)/);
+  assert.match(JOBS_MIGRATION, /CREATE INDEX IF NOT EXISTS idx_hpsj_status_created_at/);
+  assert.match(JOBS_MIGRATION, /CREATE INDEX IF NOT EXISTS idx_hpsj_updated_at/);
+});
+
 // --- wiring: every source records to the same canonical history ------------
 
 test('all Teltik port-status call sites route through the shared recorder', () => {
@@ -280,7 +291,7 @@ test('all Teltik port-status call sites route through the shared recorder', () =
   assert.doesNotMatch(DASHBOARD_SRC, /rest\/v1\/hosting_port_status_checks/, 'dashboard uses the shared recorder, not direct table writes');
   assert.doesNotMatch(REMEDIATOR_SRC, /rest\/v1\/hosting_port_status_checks/, 'remediator uses the shared recorder, not direct table writes');
   // Dashboard: teltik-query + teltik-host-check + sweep all record.
-  assert.match(DASHBOARD_SRC, /import \{ recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep \} from '\.\.\/shared\/hosting-port-status\.mjs'/);
+  assert.match(DASHBOARD_SRC, /import \{ recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, processHostingPortJobs \} from '\.\.\/shared\/hosting-port-status\.mjs'/);
   const dashboardRecordCalls = (DASHBOARD_SRC.match(/recordHostingPortCheck\(env,/g) || []).length;
   assert.ok(dashboardRecordCalls >= 2, 'teltik-query and teltik-host-check both record (got ' + dashboardRecordCalls + ')');
   // Remediator: both evidence read and resend-gate recheck record.
@@ -290,9 +301,11 @@ test('all Teltik port-status call sites route through the shared recorder', () =
 });
 
 test('12h cron + manual run endpoint exist and share the sweep implementation', () => {
-  assert.match(DASHBOARD_TOML, /\[triggers\]\ncrons = \["0 \*\/12 \* \* \*"\]/);
+  assert.match(DASHBOARD_TOML, /\[triggers\]\ncrons = \["0 \*\/12 \* \* \*", "\* \* \* \* \*"\]/);
   assert.match(DASHBOARD_TOML, /\[env\.test\.triggers\]\ncrons = \[\]/);
   assert.match(DASHBOARD_SRC, /async scheduled\(event, env, ctx\)/);
+  // Full automatic sweep stays bounded to the 12h schedule — never every minute.
+  assert.match(DASHBOARD_SRC, /if \(event\.cron === '0 \*\/12 \* \* \*'\) \{/);
   assert.match(DASHBOARD_SRC, /runHostingPortSweep\(env, \{ source: 'cron' \}\)/);
   assert.match(DASHBOARD_SRC, /\/api\/hosting-port-status\/run/);
   assert.match(DASHBOARD_SRC, /handleHostingPortStatusRun/);
@@ -331,17 +344,19 @@ test('bulk Port Status action runs, summarizes and refreshes latest status', () 
   assert.match(fn.slice(0, fn.indexOf('\n        }')), /loadSims\(true\)/);
 });
 
-test('Workers page Run Hosting Port Check button sweeps all hosted SIMs', () => {
+test('Workers page Run Hosting Port Check button enqueues a durable server-side job', () => {
   assert.match(DASHBOARD_HTML, /onclick="runHostingPortCheck\(\)"/, 'Worker Controls card wired');
   assert.match(DASHBOARD_HTML, /Run Hosting Port Check/);
   const fn = DASHBOARD_HTML.slice(DASHBOARD_HTML.indexOf('async function runHostingPortCheck'));
   const body = fn.slice(0, fn.indexOf('\n        }'));
   assert.match(body, /showConfirm\(/, 'confirms before running');
   assert.match(body, /\/hosting-port-status\/run/);
-  assert.match(body, /source: 'manual_sweep'/);
+  assert.match(body, /source: 'manual_sweep', async: true/, 'enqueues the durable job, no browser batch loop');
   assert.doesNotMatch(body, /sim_ids/, 'no sim_ids = full server-side sweep');
-  assert.match(body, /wrong_mdn_retries/, 'summary includes wrong-MDN retries');
-  assert.match(body, /loadSims\(true\)/, 'refreshes Sims so Host Port column updates');
+  assert.doesNotMatch(body, /while \(/, 'no browser-side batch loop');
+  assert.doesNotMatch(body, /next_offset/, 'offset paging moved server-side');
+  assert.match(body, /continues even if you close this page/, 'confirm text says the job outlives the browser');
+  assert.match(body, /pollHostingPortJob\(/, 'polls job progress while the page is open');
 });
 
 test('Rotation Audit widget removed from Sims page', () => {

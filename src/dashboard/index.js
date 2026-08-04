@@ -4,7 +4,7 @@ import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateCh
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
-import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep } from '../shared/hosting-port-status.mjs';
+import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -501,6 +501,10 @@ export default {
     if (url.pathname === '/api/hosting-port-status/run' && request.method === 'POST') {
       return handleHostingPortStatusRun(request, env, corsHeaders);
     }
+    if (url.pathname.startsWith('/api/hosting-port-status/jobs/') && request.method === 'GET') {
+      const jobId = url.pathname.slice('/api/hosting-port-status/jobs/'.length);
+      return handleHostingPortStatusJobGet(jobId, env, corsHeaders);
+    }
 
     if (url.pathname === '/api/rotation-audit' && request.method === 'GET') {
       return handleRotationAudit(request, env, corsHeaders);
@@ -545,17 +549,26 @@ export default {
     return serveApp(env);
   },
 
-  // 12h Teltik hosting port-status sweep (wrangler.toml [triggers]). Records
-  // through the same canonical recorder as manual checks, so cron + manual
-  // runs feed one uptime history.
+  // Two schedules (wrangler.toml [triggers]): the 12h cron runs the capped
+  // automatic sweep; the 1-minute tick drains queued Workers-page Hosting
+  // Port Check jobs one bounded batch per tick, so a manual full sweep
+  // continues even after the operator's browser closes. Both record through
+  // the same canonical recorder, so cron + manual runs feed one history.
   async scheduled(event, env, ctx) {
+    if (event.cron === '0 */12 * * *') {
+      ctx.waitUntil(
+        runHostingPortSweep(env, { source: 'cron' })
+          .then(s => console.log('[HostPort] cron sweep done: ' + JSON.stringify({
+            total: s.total, online: s.online, offline: s.offline,
+            unknown: s.unknown, error: s.error, truncated: s.truncated,
+          })))
+          .catch(e => console.log('[HostPort] cron sweep failed: ' + (e && e.message || e)))
+      );
+    }
     ctx.waitUntil(
-      runHostingPortSweep(env, { source: 'cron' })
-        .then(s => console.log('[HostPort] cron sweep done: ' + JSON.stringify({
-          total: s.total, online: s.online, offline: s.offline,
-          unknown: s.unknown, error: s.error, truncated: s.truncated,
-        })))
-        .catch(e => console.log('[HostPort] cron sweep failed: ' + (e && e.message || e)))
+      processHostingPortJobs(env, { maxJobs: 1 })
+        .then(r => { if (r.claimed) console.log('[HostPort] job drain: ' + JSON.stringify(r)); })
+        .catch(e => console.log('[HostPort] job drain failed: ' + (e && e.message || e)))
     );
   },
 };
@@ -2570,10 +2583,43 @@ async function handleHostingPortStatusRun(request, env, corsHeaders) {
     const offset = Number.isInteger(body.offset) && body.offset >= 0 ? body.offset : 0;
     const maxSims = Number.isInteger(body.max_sims) && body.max_sims >= 1 && body.max_sims <= 500
       ? body.max_sims : 200;
+    // Durable full sweep: { source: 'manual_sweep', async: true } enqueues a
+    // hosting_port_status_jobs row and returns immediately; the 1-minute
+    // scheduled tick drains it batch by batch server-side, independent of the
+    // browser. Synchronous single-batch mode below stays for sim_ids bulk
+    // checks and tests.
+    if (body.async === true && !simIds) {
+      const job = await enqueueHostingPortJob(env, { source: 'manual_sweep', maxSims, createdBy: 'dashboard' });
+      return new Response(JSON.stringify(job), {
+        status: job.ok ? 202 : 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
     const summary = await runHostingPortSweep(env, { simIds, source, offset, maxSims });
     return new Response(JSON.stringify(summary, null, 2), {
       status: summary.ok ? 200 : 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+// GET /api/hosting-port-status/jobs/:id — poll a durable sweep job. Polling
+// is display-only: the job advances on the scheduled tick whether or not
+// anyone is watching.
+async function handleHostingPortStatusJobGet(jobId, env, corsHeaders) {
+  try {
+    const job = await getHostingPortJob(env, jobId);
+    if (!job) {
+      return new Response(JSON.stringify({ ok: false, error: 'job not found' }), {
+        status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true, job }), {
+      status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (e) {
     return new Response(JSON.stringify({ ok: false, error: String(e) }), {
