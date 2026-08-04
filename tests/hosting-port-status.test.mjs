@@ -211,6 +211,47 @@ test('runHostingPortSweep checks all Teltik-hosted SIMs and records with the giv
   } finally { globalThis.fetch = orig; }
 });
 
+test('full sweep pages by stable id order: offset batches never repeat and report has_more/next_offset', async () => {
+  const FLEET = [1, 2, 3, 4, 5].map(id => ({ id, iccid: 'ICC' + id, vendor: 'teltik', gateway_host: null, sim_numbers: [] }));
+  const posted = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    if (url.includes('/rest/v1/hosting_port_status_checks')) { posted.push(JSON.parse(opts.body)); return new Response(null, { status: 201 }); }
+    if (url.includes('/rest/v1/carrier_api_logs')) return new Response(null, { status: 201 });
+    if (url.includes('/rest/v1/sims')) {
+      const params = new URL(url).searchParams;
+      assert.equal(params.get('order'), 'id.asc', 'stable ordering so offset batches never repeat');
+      const off = Number(params.get('offset'));
+      const lim = Number(params.get('limit'));
+      const page = FLEET.slice(off, off + lim);
+      return new Response(JSON.stringify(page), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'Content-Range': off + '-' + (off + page.length - 1) + '/' + FLEET.length },
+      });
+    }
+    if (url.includes('/v1/port-status')) return new Response(JSON.stringify({ port_status: 'online' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const checkedIds = [];
+    let offset = 0, hasMore = true, batches = 0;
+    while (hasMore) {
+      const s = await runHostingPortSweep(ENV, { maxSims: 2, offset });
+      assert.equal(s.ok, true);
+      assert.equal(s.offset, offset);
+      assert.equal(s.next_offset, offset + s.total);
+      assert.equal(s.total_available, 5, 'total fleet size surfaced for progress UI');
+      checkedIds.push(...s.results.map(r => r.sim_id));
+      hasMore = s.has_more;
+      offset = s.next_offset;
+      batches++;
+    }
+    assert.equal(batches, 3, '5 SIMs at maxSims=2 walk in 3 batches');
+    assert.deepEqual(checkedIds, [1, 2, 3, 4, 5], 'every SIM checked exactly once — no repeated first page');
+    assert.equal(posted.length, 5);
+  } finally { globalThis.fetch = orig; }
+});
+
 // --- migration schema ------------------------------------------------------
 
 test('migration creates the canonical table, indexes and summary RPC idempotently', () => {

@@ -231,23 +231,37 @@ export async function checkAndRecordTeltikHostPort(env, sim, { source } = {}) {
 // Sweep all (or the given) Teltik-hosted SIMs with bounded concurrency.
 // Used by the dashboard 12h cron, the operator manual run and the Sims bulk
 // action — all three record through the same recorder above.
-// ponytail: hard cap MAX_SIMS per run; slice + follow-up run if fleet outgrows it.
-export async function runHostingPortSweep(env, { simIds = null, source = 'manual_sweep', concurrency = 5, maxSims = 200 } = {}) {
+// Full sweeps page by { offset, maxSims } over a stable id ordering so callers
+// (Workers-page manual run) can walk the whole fleet in bounded batches;
+// summary reports { offset, next_offset, has_more, total_available } for that.
+// ponytail: hard cap MAX_SIMS per run; cron stays a single capped slice.
+export async function runHostingPortSweep(env, { simIds = null, source = 'manual_sweep', concurrency = 5, maxSims = 200, offset = 0 } = {}) {
+  if (!Number.isInteger(offset) || offset < 0) offset = 0;
+  if (!Number.isInteger(maxSims) || maxSims < 1) maxSims = 200;
   // gatewayHostOf() semantics in PostgREST: explicit teltik host, or no
   // explicit host and teltik vendor.
   let query = 'sims?select=id,iccid,vendor,gateway_host,status,sim_numbers(e164)'
     + '&sim_numbers.valid_to=is.null'
     + '&or=(gateway_host.eq.teltik,and(gateway_host.is.null,vendor.eq.teltik))';
-  if (Array.isArray(simIds) && simIds.length > 0) {
-    query += '&id=in.(' + simIds.map(Number).filter(Number.isFinite).join(',') + ')';
+  const fullSweep = !(Array.isArray(simIds) && simIds.length > 0);
+  if (!fullSweep) {
+    query += '&id=in.(' + simIds.map(Number).filter(Number.isFinite).join(',') + ')&limit=1000';
   } else {
-    query += '&status=eq.active'; // full sweeps only track live lines
+    // Full sweeps only track live lines. Stable id order + offset paging so
+    // batch N+1 never re-checks batch N; fetch maxSims+1 to detect has_more.
+    query += '&status=eq.active&order=id.asc&offset=' + offset + '&limit=' + (maxSims + 1);
   }
   let sims = [];
+  let totalAvailable = null;
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + query + '&limit=1000', { headers: sbHeaders(env) });
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + query, {
+      headers: { ...sbHeaders(env), Prefer: 'count=exact' },
+    });
     const rows = resp.ok ? await resp.json() : null;
     if (Array.isArray(rows)) sims = rows;
+    const range = resp.headers && resp.headers.get ? resp.headers.get('content-range') : null;
+    const m = range && range.match(/\/(\d+)\s*$/);
+    if (m) totalAvailable = Number(m[1]);
   } catch (e) {
     return { ok: false, error: 'sims_query_failed: ' + (e && e.message || e) };
   }
@@ -257,6 +271,9 @@ export async function runHostingPortSweep(env, { simIds = null, source = 'manual
 
   const summary = {
     ok: true, source, total: sims.length, truncated,
+    offset, next_offset: offset + sims.length,
+    has_more: fullSweep && truncated,
+    total_available: totalAvailable,
     online: 0, offline: 0, unknown: 0, error: 0, wrong_mdn_retries: 0,
     results: [],
   };

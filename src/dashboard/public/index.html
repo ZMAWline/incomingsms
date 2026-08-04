@@ -5629,28 +5629,62 @@ set verify_pending; schedule §C.3 poll
         }
 
         // Worker Controls: run Teltik hosting port-status for ALL active
-        // Teltik-hosted SIMs (no sim_ids = server-side full sweep).
+        // Teltik-hosted SIMs. The server caps each run at 200 SIMs, so this
+        // loops id-ordered batches (offset/next_offset) until has_more=false,
+        // showing cumulative progress in the action modal instead of a toast.
         async function runHostingPortCheck() {
-            if (!(await showConfirm('Hosting Port Check', 'Run Teltik hosting port-status for all active Teltik-hosted SIMs?'))) return;
-            showToast('Running hosting port check...', 'info');
+            if (!(await showConfirm('Hosting Port Check', 'Run Teltik hosting port-status for all active Teltik-hosted SIMs? Runs in batches of 200.'))) return;
+            const output = document.getElementById('sim-action-output');
+            document.getElementById('sim-action-title').textContent = 'Hosting Port Check';
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            output.textContent = 'Starting batched sweep…';
+            output.classList.remove('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+            const totals = { checked: 0, online: 0, offline: 0, unknown: 0, error: 0, wrong_mdn_retries: 0, total_available: null };
+            const render = (status) => {
+                output.textContent = [
+                    status,
+                    '',
+                    'Checked: ' + totals.checked + (totals.total_available ? ' / ' + totals.total_available : ''),
+                    'Online: ' + totals.online,
+                    'Offline: ' + totals.offline,
+                    'Unknown: ' + totals.unknown,
+                    'Errors: ' + totals.error,
+                    'Wrong-MDN retries: ' + totals.wrong_mdn_retries,
+                ].join(String.fromCharCode(10));
+            };
             try {
-                const res = await fetch(API_BASE + '/hosting-port-status/run', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ source: 'manual_sweep' })
-                });
-                const data = await res.json();
-                if (!res.ok || data.ok === false) {
-                    showToast('Hosting port check failed: ' + (data.error || res.status), 'error');
-                    return;
+                let offset = 0, hasMore = true, batches = 0;
+                while (hasMore && batches < 100) { // safety stop: 100 batches = 20k SIMs
+                    batches++;
+                    render('Running batch ' + batches + ' (offset ' + offset + ')…');
+                    const res = await fetch(API_BASE + '/hosting-port-status/run', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ source: 'manual_sweep', offset: offset, max_sims: 200 })
+                    });
+                    const data = await res.json();
+                    if (!res.ok || data.ok === false) {
+                        render('Batch ' + batches + ' failed: ' + (data.error || res.status));
+                        showToast('Hosting port check failed: ' + (data.error || res.status), 'error');
+                        return;
+                    }
+                    totals.checked += data.total || 0;
+                    totals.online += data.online || 0;
+                    totals.offline += data.offline || 0;
+                    totals.unknown += data.unknown || 0;
+                    totals.error += data.error || 0;
+                    totals.wrong_mdn_retries += data.wrong_mdn_retries || 0;
+                    if (data.total_available) totals.total_available = data.total_available;
+                    hasMore = data.has_more === true && Number.isInteger(data.next_offset) && data.next_offset > offset;
+                    offset = Number.isInteger(data.next_offset) ? data.next_offset : offset + (data.total || 0);
                 }
-                showToast('Port check: ' + (data.total || 0) + ' checked — '
-                    + (data.online || 0) + ' online, ' + (data.offline || 0) + ' offline, '
-                    + (data.unknown || 0) + ' unknown, ' + (data.error || 0) + ' errors, '
-                    + (data.wrong_mdn_retries || 0) + ' wrong-MDN retries', 'success');
+                render('Done — ' + totals.checked + ' SIM(s) checked in ' + batches + ' batch(es).');
+                showToast('Port check: ' + totals.checked + ' checked — ' + totals.online + ' online, '
+                    + totals.offline + ' offline, ' + (totals.unknown + totals.error) + ' unknown/error', 'success');
                 loadSims(true);
             } catch (e) {
-                showToast('Hosting port check error: ' + e, 'error');
+                render('Hosting port check error: ' + e);
             }
         }
 

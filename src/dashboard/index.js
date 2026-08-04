@@ -2556,16 +2556,21 @@ async function handleTeltikHostCheck(request, env, corsHeaders) {
 }
 
 // POST /api/hosting-port-status/run — operator/bulk/manual sweep of Teltik
-// hosting port status. Body: { sim_ids?: number[], source?: 'manual_bulk'|'manual_sweep' }.
-// With sim_ids: checks exactly those SIMs (Sims bulk action). Without: sweeps
-// every active Teltik-hosted SIM (same code path as the 12h cron). All checks
-// persist through the shared recorder, so manual runs count in uptime stats.
+// hosting port status. Body: { sim_ids?: number[], source?: 'manual_bulk'|'manual_sweep',
+// offset?: number, max_sims?: number }. With sim_ids: checks exactly those SIMs
+// (Sims bulk action). Without: sweeps active Teltik-hosted SIMs in a stable
+// id-ordered batch at { offset, max_sims } — the Workers-page full run loops
+// batches until has_more=false. All checks persist through the shared recorder,
+// so manual runs count in uptime stats.
 async function handleHostingPortStatusRun(request, env, corsHeaders) {
   try {
     const body = await request.json().catch(() => ({}));
     const simIds = Array.isArray(body.sim_ids) && body.sim_ids.length > 0 ? body.sim_ids : null;
     const source = body.source === 'manual_bulk' ? 'manual_bulk' : 'manual_sweep';
-    const summary = await runHostingPortSweep(env, { simIds, source });
+    const offset = Number.isInteger(body.offset) && body.offset >= 0 ? body.offset : 0;
+    const maxSims = Number.isInteger(body.max_sims) && body.max_sims >= 1 && body.max_sims <= 500
+      ? body.max_sims : 200;
+    const summary = await runHostingPortSweep(env, { simIds, source, offset, maxSims });
     return new Response(JSON.stringify(summary, null, 2), {
       status: summary.ok ? 200 : 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
