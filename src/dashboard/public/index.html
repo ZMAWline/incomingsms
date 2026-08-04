@@ -1179,6 +1179,7 @@
                     <button onclick="bulkSimAction('rotate')" class="px-3 py-1.5 text-xs rounded transition">Rotate MDN</button>
                     <button onclick="bulkSimAction('fix')" class="px-3 py-1.5 text-xs rounded transition">Fix SIM</button>
                     <button onclick="bulkQuery()" class="px-3 py-1.5 text-xs rounded transition">Query</button>
+                    <button onclick="bulkPortStatus()" class="px-3 py-1.5 text-xs rounded transition" title="Run Teltik hosting port-status for selected Teltik-hosted SIMs">Port Status</button>
                     <button onclick="bulkSendOnline()" class="px-3 py-1.5 text-xs rounded transition">Send Online</button>
                     <button onclick="showBulkSendSmsModal()" class="px-3 py-1.5 text-xs rounded transition">Send SMS</button>
                     <div class="relative">
@@ -1195,18 +1196,6 @@
                         </div>
                     </div>
                     <button onclick="bulkDeleteSims()" class="ml-auto px-3 py-1.5 text-xs bg-red-700 hover:bg-red-800 text-white rounded transition">Delete SIMs</button>
-                </div>
-                <div id="rotation-audit-widget" class="hidden mb-4 p-4 bg-dark-800 rounded-xl border border-dark-600 flex flex-wrap items-center gap-4">
-                    <div class="flex flex-col min-w-0">
-                        <span class="text-sm font-semibold text-white">Rotation Audit (today)</span>
-                        <span id="rotation-audit-runat" class="text-xs text-gray-500">Loading…</span>
-                    </div>
-                    <div class="flex items-center gap-2">
-                        <button id="rotation-audit-a" onclick="showRotationAuditBucket('a')" class="px-3 py-1.5 text-xs rounded transition bg-dark-700 text-gray-400" title="Stuck mdn_pending">A: <span id="rotation-audit-a-count">–</span></button>
-                        <button id="rotation-audit-b" onclick="showRotationAuditBucket('b')" class="px-3 py-1.5 text-xs rounded transition bg-dark-700 text-gray-400" title="Rotated, not notified">B: <span id="rotation-audit-b-count">–</span></button>
-                        <button id="rotation-audit-c" onclick="showRotationAuditBucket('c')" class="px-3 py-1.5 text-xs rounded transition bg-dark-700 text-gray-400" title="Eligible, not attempted in 24h">C: <span id="rotation-audit-c-count">–</span></button>
-                    </div>
-                    <button onclick="reconcileNow()" class="ml-auto px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition">Reconcile Now</button>
                 </div>
                 <div class="bg-dark-800 rounded-xl border border-dark-600">
                     <div class="px-5 py-4 border-b border-dark-600">
@@ -1266,6 +1255,7 @@
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','phone_number')">Phone <span class="sort-arrow" data-table="sims" data-col="phone_number"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','status')">Status <span class="sort-arrow" data-table="sims" data-col="status"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','vendor')">Vendor <span class="sort-arrow" data-table="sims" data-col="vendor"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','hosting_port_state')" title="Latest persisted Teltik hosting port status (any source: cron, bulk, query, remediator)">Host Port <span class="sort-arrow" data-table="sims" data-col="hosting_port_state"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
@@ -1276,7 +1266,7 @@
                                 </tr>
                             </thead>
                             <tbody id="sims-table" class="text-sm">
-                                <tr><td colspan="14" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="15" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     <div id="sims-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
@@ -4348,7 +4338,7 @@ set verify_pending; schedule §C.3 poll
             if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
-            if (tabName === 'sims') { loadRotationAudit(); try { syncSimsUrl(); } catch(e){} }
+            if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} }
             if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); }
         }
 
@@ -4868,6 +4858,7 @@ set verify_pending; schedule §C.3 poll
                 gateway_code: 'Gateway',
                 iccid: 'ICCID',
                 vendor: 'Vendor',
+                hosting_port_state: 'Host Port',
                 reseller_name: 'Reseller',
                 sms_count: 'SMS',
                 last_sms_received: 'Last SMS',
@@ -5185,9 +5176,6 @@ set verify_pending; schedule §C.3 poll
                 console.error('Error loading resellers:', error);
             }
         }
-
-        let lastRotationAudit = null;
-
 
         // ─── Rotation Reviews tab ───────────────────────────────────────────
         let _pendingReplyId = null;
@@ -5544,74 +5532,91 @@ set verify_pending; schedule §C.3 poll
         // Kick off once after boot
         setTimeout(refreshReviewBadge, 2000);
 
-        async function loadRotationAudit() {
-          try {
-            const res = await fetch(API_BASE + '/rotation-audit');
-            if (!res.ok) return;
-            const payload = await res.json();
-            const latest = payload.latest;
-            lastRotationAudit = latest;
-            const widget = document.getElementById('rotation-audit-widget');
-            if (!widget) return;
-            if (!latest) {
-              widget.classList.add('hidden');
-              return;
-            }
-            widget.classList.remove('hidden');
-            document.getElementById('rotation-audit-a-count').textContent = latest.bucket_a_count;
-            document.getElementById('rotation-audit-b-count').textContent = latest.bucket_b_count;
-            document.getElementById('rotation-audit-c-count').textContent = latest.bucket_c_count;
-            const runAt = new Date(latest.run_at);
-            document.getElementById('rotation-audit-runat').textContent = 'Last run: ' + runAt.toLocaleString() + ' (' + (latest.trigger || '?') + ')';
-            const colorBtn = function(id, count, activeCls) {
-              const btn = document.getElementById(id);
-              if (!btn) return;
-              btn.className = 'px-3 py-1.5 text-xs rounded transition ' + (count > 0 ? activeCls : 'bg-dark-700 text-gray-400');
-            };
-            colorBtn('rotation-audit-a', latest.bucket_a_count, 'bg-red-600 hover:bg-red-700 text-white');
-            colorBtn('rotation-audit-b', latest.bucket_b_count, 'bg-orange-600 hover:bg-orange-700 text-white');
-            colorBtn('rotation-audit-c', latest.bucket_c_count, 'bg-gray-600 hover:bg-gray-500 text-white');
-          } catch (e) {
-            console.error('loadRotationAudit failed:', e);
-          }
+        // ===== Teltik hosting port status (Sims table) =====
+        function isTeltikHostedSim(sim) {
+            return sim.gateway_host === 'teltik' || (!sim.gateway_host && sim.vendor === 'teltik');
+        }
+        // Latest persisted Hosting Port Status across ALL sources (cron, bulk,
+        // SIM query, remediator) + uptime stats, straight from /api/sims.
+        function hostPortCell(sim) {
+            if (!isTeltikHostedSim(sim)) return '<span class="text-gray-600">&mdash;</span>';
+            const st = sim.hosting_port_state;
+            if (!st) return '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-500" title="No hosting port-status check recorded yet">never checked</span>';
+            const cls = {
+                online: 'bg-accent/20 text-accent',
+                offline: 'bg-red-500/20 text-red-400',
+                unknown: 'bg-gray-500/20 text-gray-400',
+                error: 'bg-yellow-500/20 text-yellow-400',
+            }[st] || 'bg-gray-500/20 text-gray-400';
+            const checked = sim.hosting_port_checked_at ? new Date(sim.hosting_port_checked_at).toLocaleString() : '?';
+            const up24 = sim.hosting_port_checks_24h > 0 ? Math.round(100 * sim.hosting_port_online_24h / sim.hosting_port_checks_24h) + '%' : null;
+            const up7  = sim.hosting_port_checks_7d  > 0 ? Math.round(100 * sim.hosting_port_online_7d  / sim.hosting_port_checks_7d)  + '%' : null;
+            const tipLines = [
+                'Teltik hosting port status: ' + st,
+                'Checked: ' + checked,
+                'Source: ' + (sim.hosting_port_source || '?'),
+                'Teltik MDN: ' + (sim.hosting_port_mdn || '?') + ' via ' + (sim.hosting_port_mdn_source || '?'),
+            ];
+            if (sim.hosting_port_error) tipLines.push('Error: ' + sim.hosting_port_error);
+            if (up24) tipLines.push('Uptime 24h: ' + up24 + ' (' + sim.hosting_port_checks_24h + ' checks)');
+            if (up7)  tipLines.push('Uptime 7d: '  + up7  + ' (' + sim.hosting_port_checks_7d  + ' checks)');
+            const tip = tipLines.join('&#10;').replace(/"/g, '&quot;');
+            return '<div title="' + tip + '">'
+                + '<span class="px-1.5 py-0.5 text-xs font-medium rounded ' + cls + '">' + st + '</span>'
+                + '<div class="text-[10px] text-gray-500 mt-0.5">' + (up24 ? '24h ' + up24 + ' &middot; ' : '') + checked + '</div>'
+                + '</div>';
         }
 
-        function showRotationAuditBucket(bucket) {
-          if (!lastRotationAudit) return;
-          const ids = lastRotationAudit['bucket_' + bucket + '_sim_ids'] || [];
-          const count = lastRotationAudit['bucket_' + bucket + '_count'] || 0;
-          const labels = { a: 'Stuck mdn_pending', b: 'Rotated, not notified', c: 'Eligible, not attempted in 24h' };
-          if (count === 0) {
-            showToast('Bucket ' + bucket.toUpperCase() + ': empty', 'info');
-            return;
-          }
-          const searchEl = document.getElementById('sims-search');
-          if (searchEl) {
-            searchEl.value = ids.join(', ');
-            searchEl.dispatchEvent(new Event('input'));
-            showToast(labels[bucket] + ': ' + count + ' SIMs (filtered in table)', 'info');
-          } else {
-            showToast(labels[bucket] + ' (' + count + '): ' + ids.join(', '), 'info');
-          }
-        }
+        // Bulk action: run Teltik hosting port-status for the selected SIMs.
+        // Persists via the shared recorder server-side and refreshes the table
+        // so the Host Port column shows the new latest status.
+        async function bulkPortStatus() {
+            const selectedIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
+            if (selectedIds.length === 0) { showToast('Select at least one SIM', 'error'); return; }
+            const sims = selectedIds.map(id => tableState.sims?.data?.find(s => s.id === id)).filter(Boolean);
+            const hosted = sims.filter(isTeltikHostedSim);
+            const skipped = sims.length - hosted.length;
+            if (hosted.length === 0) { showToast('None of the selected SIMs are Teltik-hosted', 'error'); return; }
 
-        async function reconcileNow() {
-          const ok = await showConfirm('Reconcile Now?', 'Runs post-rotation reconciliation immediately. Hard caps: ≤60 AT&T GETs, ≤60 webhook POSTs, 0 plan-change PUTs, 90s wall-clock. Bypasses RECONCILIATION_ENABLED flag.');
-          if (!ok) return;
-          showToast('Running reconciliation…', 'info');
-          try {
-            const res = await fetch(API_BASE + '/rotation-audit/run', { method: 'POST' });
-            const data = await res.json();
-            if (data.ok && data.result) {
-              const r = data.result;
-              showToast('Reconcile done — A=' + (r.bucket_a_count || 0) + ' B=' + (r.bucket_b_count || 0) + ' C=' + (r.bucket_c_count || 0) + ' (' + (r.duration_ms || 0) + 'ms)', 'success');
-              await loadRotationAudit();
-            } else {
-              showToast('Reconcile failed: ' + (data.error || JSON.stringify(data.result || data)), 'error');
+            const output = document.getElementById('sim-action-output');
+            document.getElementById('sim-action-title').textContent = 'Port Status — ' + hosted.length + ' SIM(s)';
+            output.textContent = 'Checking Teltik hosting port status…' + (skipped ? ' (' + skipped + ' non-Teltik-hosted skipped)' : '');
+            output.classList.remove('hidden');
+            document.getElementById('sim-action-logs-section').classList.add('hidden');
+            document.getElementById('sim-action-modal').classList.remove('hidden');
+
+            try {
+                const res = await fetch(API_BASE + '/hosting-port-status/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sim_ids: hosted.map(s => s.id), source: 'manual_bulk' })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.ok) {
+                    output.textContent = 'Port-status run failed: ' + (data.error || res.status);
+                    return;
+                }
+                const lines = [
+                    'Checked: ' + data.total + (skipped ? ' (' + skipped + ' non-Teltik-hosted skipped)' : ''),
+                    'Online: ' + (data.online || 0),
+                    'Offline: ' + (data.offline || 0),
+                    'Unknown: ' + (data.unknown || 0),
+                    'Errors: ' + (data.error || 0),
+                    'Wrong-MDN retries: ' + (data.wrong_mdn_retries || 0),
+                    '',
+                ];
+                for (const r of data.results || []) {
+                    lines.push('SIM #' + r.sim_id + ' (' + (r.iccid || '?') + '): ' + r.state
+                        + (r.retried ? ' [retried via ICCID lookup]' : '')
+                        + (r.error ? ' — ' + r.error : ''));
+                }
+                output.textContent = lines.join(String.fromCharCode(10));
+                showToast('Port status: ' + (data.online || 0) + ' online, ' + (data.offline || 0) + ' offline, '
+                    + ((data.unknown || 0) + (data.error || 0)) + ' unknown/error', 'success');
+                loadSims(true);
+            } catch (e) {
+                output.textContent = 'Port-status run error: ' + e;
             }
-          } catch (e) {
-            showToast('Reconcile error: ' + e, 'error');
-          }
         }
 
                 let lastSimsFetchedAt = 0;
@@ -5725,9 +5730,9 @@ function renderSims() {
                     || fs.vendors.length || fs.gateways.length || fs.resellerIds.length
                     || fs.presets.size > 0 || fs.activatedFrom || fs.activatedTo || fs.search;
                 if (hasFilters) {
-                    tbody.innerHTML = '<tr><td colspan="14" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="15" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';
                 } else {
-                    tbody.innerHTML = '<tr><td colspan="14" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="15" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
                 }
                 applySimsColumnVisibility();
                 return;
@@ -5756,6 +5761,7 @@ function renderSims() {
                         <span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${sim.status}</span>
                     </td>
                     <td class="px-4 py-3">${vendorBadge}</td>
+                    <td class="px-4 py-3">${hostPortCell(sim)}</td>
                     <td class="px-4 py-3 text-gray-400">${sim.reseller_name || '-'}</td>
                     <td class="px-4 py-3 text-gray-300">${sim.sms_count || 0}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">${lastSms}</td>
@@ -5764,13 +5770,10 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-500 text-xs">${sim.last_notified_at ? `<button onclick="viewSimWebhooks(${sim.id})" class="text-indigo-400 hover:text-indigo-300 hover:underline" title="Show number.online deliveries sent for this SIM">${new Date(sim.last_notified_at).toLocaleString()}</button>` : '-'}</td>
                     <td class="px-4 py-3 whitespace-nowrap">
                         ${canSendOnline ? `<button onclick="sendSimOnline(${sim.id}, '${sim.phone_number}')" class="px-2 py-1 text-xs bg-indigo-600 hover:bg-indigo-700 text-white rounded transition mr-1">Online</button>` : ''}
-                        ${sim.status === 'active' ? (['teltik', 'wing_iot'].includes(sim.vendor) ? `<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="OTA not available for ${sim.vendor === 'teltik' ? 'Teltik' : 'Wing IoT'}">OTA</button>` : (sim.vendor === 'helix' && !window.HELIX_ENABLED) ? `<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Helix is disabled">OTA</button>` : `<button onclick="simAction(${sim.id}, 'ota_refresh')" class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition mr-1">OTA</button>`) : ''}
                         ${sim.status === 'error' ? (sim.vendor === 'teltik' ? `<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Retry not available for Teltik">Retry</button>` : (sim.vendor === 'helix' && !window.HELIX_ENABLED) ? `<button disabled class="px-2 py-1 text-xs bg-gray-700 text-gray-500 rounded mr-1 cursor-not-allowed" title="Helix is disabled">Retry</button>` : `<button onclick="retryActivation(${sim.id})" class="px-2 py-1 text-xs bg-yellow-600 hover:bg-yellow-700 text-white rounded transition mr-1">Retry</button>`) : ''}
                         ${sim.reseller_id ? `<button onclick="unassignReseller(${sim.id})" class="px-2 py-1 text-xs bg-purple-600 hover:bg-purple-700 text-white rounded transition" title="Unassign from reseller">Unassign</button>` : `<button onclick="assignReseller(${sim.id})" class="px-2 py-1 text-xs bg-green-700 hover:bg-green-800 text-white rounded transition" title="Assign to reseller">Assign</button>`}
-                        ${(sim.gateway_id && sim.port) ? `<button onclick="openSimDetail(${sim.id}, 'imei')" class="px-2 py-1 text-xs bg-orange-600 hover:bg-orange-700 text-white rounded transition ml-1" title="Change IMEI">IMEI</button>` : ''}
                         ${`<button onclick="openSimDetail(${sim.id}, 'status')" class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-500 text-white rounded transition ml-1">Status</button>`}
                         ${`<button onclick="deleteSim(${sim.id}, '${sim.iccid}')" class="px-2 py-1 text-xs bg-red-700 hover:bg-red-600 text-white rounded transition ml-1" title="Delete this SIM permanently">Del</button>`}
-                        ${`<button onclick="setRotationEligible(${sim.id}, ${!(sim.rotation_eligible === false)})" class="px-2 py-1 text-xs rounded transition ml-1 ${(sim.rotation_eligible === false) ? 'bg-slate-600 hover:bg-slate-500 text-gray-200' : 'bg-green-700 hover:bg-green-600 text-white'}" title="Toggle automatic rotation for this SIM">${(sim.rotation_eligible === false) ? 'Auto: Off' : 'Auto: On'}</button>`}
                     </td>
                 </tr>
                 `;
@@ -5795,7 +5798,7 @@ function renderSims() {
                 const s = String(v);
                 return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
             };
-            const header = ['ID','Gateway','Port','ICCID','Phone','Verification','Status','Vendor','Reseller','SMS','Last SMS','Last Rotated','Activated','Last Notified'];
+            const header = ['ID','Gateway','Port','ICCID','Phone','Verification','Status','Vendor','Host Port','Host Port Checked','Reseller','SMS','Last SMS','Last Rotated','Activated','Last Notified'];
             const lines = [header.join(',')];
             for (const s of rows) {
                 lines.push([
@@ -5807,6 +5810,8 @@ function renderSims() {
                     esc(s.verification_status || ''),
                     esc(s.status || ''),
                     esc(s.vendor || ''),
+                    esc(s.hosting_port_state || ''),
+                    esc(s.hosting_port_checked_at || ''),
                     esc(s.reseller_name || ''),
                     esc(s.sms_count != null ? s.sms_count : 0),
                     esc(s.last_sms_received || ''),
@@ -6585,7 +6590,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const res = await fetch(API_BASE + '/teltik-host-check', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sim_id: sim.id, iccid: sim.iccid || '', mdn: sim.phone_number || '' })
+                body: JSON.stringify({ sim_id: sim.id, iccid: sim.iccid || '', mdn: sim.phone_number || '', vendor: sim.vendor || '', gateway_host: sim.gateway_host || '' })
             });
             return res.json();
         }
@@ -9473,25 +9478,6 @@ async function sendSimOnline(simId, phoneNumber) {
         function hideSimActionModal() {
             document.getElementById('sim-action-modal').classList.add('hidden');
             document.getElementById('sim-action-output').classList.remove('hidden');
-        }
-
-        async function setRotationEligible(simId, eligible) {
-            try {
-                const res = await fetch(API_BASE + '/set-rotation-eligible', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sim_ids: [simId], eligible: eligible })
-                });
-                const data = await res.json();
-                if (!res.ok || !data.ok) {
-                    showToast('Failed: ' + (data.error || res.status), 'error');
-                    return;
-                }
-                showToast('SIM #' + simId + ' auto-rotate ' + (eligible ? 'ON' : 'OFF'), 'success');
-                loadSims(true);
-            } catch (e) {
-                showToast('Error: ' + (e && e.message ? e.message : e), 'error');
-            }
         }
 
         async function bulkSetRotationEligible(eligible) {

@@ -29,6 +29,7 @@ import { classifyExpiredReport } from './stale-classifier.mjs';
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
+import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState } from '../shared/hosting-port-status.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const LAST_MAIN_TICK_KEY = 'bad_rental_remediator_last_main_tick';
@@ -912,6 +913,9 @@ async function maybeExecuteAction(env, args) {
     if (hostMdn) {
       try { recheck = await teltikPortStatus(env, { mdn: hostMdn }); }
       catch (err) { recheck = { online: false, status: 0, error: String(err && err.message || err) }; }
+      await recordHostPortRead(env, evidence.sim, hostMdn,
+        (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn) ? evidence.teltikKnownMdn.source : 'db_current_mdn',
+        recheck);
     }
     const readOk = !!(recheck && recheck.status >= 200 && recheck.status < 300);
     const portOnline = readOk && recheck.online === true;
@@ -1569,14 +1573,17 @@ async function gatherEvidence(env, report) {
   // wrapper returns status:0 (unusable read) and TH2 defers
   // pending_teltik_host_port_read.
   if (evidence.sim && isTeltikHosted(evidence.sim)) {
+    const hostReadMdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+      || evidence.sim.current_mdn_e164 || null;
+    const hostReadMdnSource = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+      ? evidence.teltikKnownMdn.source
+      : (evidence.sim.current_mdn_e164 ? 'db_current_mdn' : null);
     try {
-      evidence.teltikHostPortStatus = await teltikPortStatus(env, {
-        mdn: (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
-          || evidence.sim.current_mdn_e164 || null,
-      });
+      evidence.teltikHostPortStatus = await teltikPortStatus(env, { mdn: hostReadMdn });
     } catch (err) {
       evidence.teltikHostPortStatus = { online: false, status: 0, error: String(err && err.message || err) };
     }
+    await recordHostPortRead(env, evidence.sim, hostReadMdn, hostReadMdnSource, evidence.teltikHostPortStatus);
   }
   // S5 gateway-offline probe (only if we have gateway+port).
   if (evidence.sim && evidence.sim.gateway_id && evidence.sim.port && env.SKYLINE_GATEWAY) {
@@ -1605,6 +1612,26 @@ function msisdnToE164(msisdn) {
   if (s.length === 10) return '+1' + s;
   if (s.length === 11 && s.startsWith('1')) return '+' + s;
   return s.startsWith('+') ? s : null;
+}
+
+// Record a Teltik host port read into the canonical hosting_port_status_checks
+// history (task t_a71decd6). ps is teltikPortStatus()'s return; a status:0
+// unusable read records as error, never offline. Never throws.
+async function recordHostPortRead(env, sim, mdn, mdnSource, ps) {
+  if (!sim || !ps) return;
+  await recordHostingPortCheck(env, buildHostingPortCheckRow({
+    sim_id: sim.id || null,
+    iccid: sim.iccid || null,
+    vendor: sim.vendor || null,
+    gateway_host: sim.gateway_host || 'teltik',
+    mdn: mdn ? mdn10(mdn) || mdn : null,
+    mdn_source: mdnSource || null,
+    source: 'bad_rental_remediator',
+    http_status: ps.status || null,
+    state: normalizeHostPortState(ps.status, ps.body),
+    raw: ps.body || null,
+    error: ps.error || (ps.status && (ps.status < 200 || ps.status >= 300) ? 'teltik_port_status_http_' + ps.status : null),
+  }));
 }
 
 async function skylinePortStatus(env, gatewayId, port) {
