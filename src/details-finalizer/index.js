@@ -13,6 +13,7 @@ import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { PLAYBOOK, classifyFailure, UNCLASSIFIED_BUCKET } from '../shared/rotation-playbook.mjs';
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { iccidSwapPatch } from '../shared/teltik-iccid.mjs';
+import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
@@ -1848,12 +1849,16 @@ async function runRotationReview(env, opts = {}) {
         }
       } else if (entry.action === 'sync_iccid' && !dryRun) {
         for (const sim of sims) {
-          if (!sim.msisdn) {
-            await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', 'no msisdn on SIM record');
+          const pickedMdn = await resolveTeltikKnownMdnForFinalizer(env, sim);
+          const mdn = pickedMdn && pickedMdn.mdn ? String(pickedMdn.mdn).replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '') : '';
+          if (!mdn || mdn.length !== 10) {
+            await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', 'no Teltik-known MDN for SIM record');
             continue;
           }
           try {
-            const mdn = `1${sim.msisdn}`; // sims.msisdn is bare 10-digit; get-info wants 11-digit
+            // get-info must use the Teltik-known MDN (latest raw Teltik inbound
+            // SMS payload destination, DB msisdn only as fallback), not the DB
+            // current MDN after rotations.
             const infoRes = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${env.TELTIK_API_KEY}&mdn=${encodeURIComponent(mdn)}`);
             if (!infoRes.ok) {
               await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', `get-info ${infoRes.status}`);
@@ -2473,6 +2478,21 @@ async function hxSubscriberDetails(env, token, mobilitySubscriptionId) {
   const data = await res.json();
   if (!res.ok) throw new Error(`subscriber_details failed ${res.status}`);
   return data;
+}
+
+async function resolveTeltikKnownMdnForFinalizer(env, sim) {
+  const digits = String((sim && sim.msisdn) || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+  const dbCurrentMdn = digits.length === 10 ? '+1' + digits : null;
+  let latestTeltikSms = null;
+  if (sim && sim.id) {
+    try {
+      const rows = await supabaseSelect(env, latestTeltikSmsQuery(sim.id));
+      latestTeltikSms = Array.isArray(rows) && rows[0] ? rows[0] : null;
+    } catch (_) {
+      latestTeltikSms = null;
+    }
+  }
+  return pickTeltikKnownMdn(latestTeltikSms, dbCurrentMdn);
 }
 
 /* ── Supabase ─────────────────────────────────────────────────────────────── */

@@ -15,23 +15,33 @@ const DASHBOARD_HTML = fs.readFileSync(
   path.join(__dirname, '..', 'src', 'dashboard', 'public', 'index.html'),
   'utf8'
 );
+const DETAILS_FINALIZER_SRC = fs.readFileSync(
+  path.join(__dirname, '..', 'src', 'details-finalizer', 'index.js'),
+  'utf8'
+);
 
-test('latest Teltik inbound SMS MDN is preferred over DB current MDN', () => {
+test('latest raw Teltik inbound SMS payload MDN is preferred over DB/current/canonical MDNs', () => {
   const picked = pickTeltikKnownMdn(
-    { to_number: '+13075550101', received_at: '2026-07-27T00:00:00Z' },
-    '+19995550000'
+    {
+      to_number: '+199****0000', // canonical DB/current number; not a Teltik API key
+      raw: { destination: '19175550101' },
+      received_at: '2026-07-27T00:00:00Z',
+    },
+    '+199****0000'
   );
-  assert.equal(picked.mdn, '+13075550101');
-  assert.equal(picked.source, 'teltik_inbound_sms');
+  assert.equal(picked.mdn, '19175550101');
+  assert.equal(picked.source, 'teltik_inbound_sms_payload_mdn');
   assert.equal(picked.received_at, '2026-07-27T00:00:00Z');
 });
 
 test('DB current MDN is only a fallback when no Teltik inbound SMS exists', () => {
-  const picked = pickTeltikKnownMdn(null, '+19995550000');
-  assert.equal(picked.mdn, '+19995550000');
+  const picked = pickTeltikKnownMdn(null, 'DB_CURRENT_MDN');
+  assert.equal(picked.mdn, 'DB_CURRENT_MDN');
   assert.equal(picked.source, 'db_current_mdn');
-  // A row without a destination number cannot be used either.
-  const fromEmptyRow = pickTeltikKnownMdn({ to_number: null }, '+19995550000');
+  // A row without a raw payload destination cannot be used either — to_number
+  // may be our canonical DB number and must not become the Teltik API key.
+  const fromEmptyRow = pickTeltikKnownMdn({ to_number: 'CANONICAL_TO_NUMBER', raw: {} }, 'DB_CURRENT_MDN');
+  assert.equal(fromEmptyRow.mdn, 'DB_CURRENT_MDN');
   assert.equal(fromEmptyRow.source, 'db_current_mdn');
   assert.equal(pickTeltikKnownMdn(null, null), null);
 });
@@ -42,7 +52,8 @@ test('latest-SMS lookup targets Teltik-delivered rows for the SIM, newest first'
   assert.match(q, /sim_id=eq\.42/);
   // Teltik webhook rows are the ones without a physical port.
   assert.match(q, /port=is\.null/);
-  assert.match(q, /to_number=not\.is\.null/);
+  assert.match(q, /select=to_number,received_at,raw/);
+  assert.match(q, /raw=not\.is\.null/);
   assert.match(q, /order=received_at\.desc/);
   assert.match(q, /limit=1/);
 });
@@ -86,4 +97,21 @@ test('host check reports which MDN source was used', () => {
   assert.match(DASHBOARD_SRC, /latest_teltik_sms/);
   assert.match(DASHBOARD_HTML, /teltikHostMdnSourceLabel/);
   assert.match(DASHBOARD_HTML, /Teltik-known MDN/);
+});
+
+test('dashboard manual Teltik reset and ICCID heal use shared Teltik-known payload-MDN resolver', () => {
+  assert.match(DASHBOARD_SRC, /resolveTeltikKnownMdnForSim/);
+  assert.match(DASHBOARD_SRC, /latestTeltikSmsQuery\(sim\.id\)/);
+  assert.match(DASHBOARD_SRC, /resolveTeltikKnownMdnForSim\(env, \{ id: sim_id, iccid: row\.iccid \}/);
+  assert.match(DASHBOARD_SRC, /const picked = await resolveTeltikKnownMdnForSim/);
+  assert.doesNotMatch(DASHBOARD_SRC, /Resolve MDN: prefer DB/);
+  assert.doesNotMatch(DASHBOARD_SRC, /mdnSource = 'teltik_live'/);
+});
+
+test('details-finalizer Teltik sync_iccid uses shared Teltik-known payload-MDN resolver', () => {
+  assert.match(DETAILS_FINALIZER_SRC, /pickTeltikKnownMdn, latestTeltikSmsQuery/);
+  assert.match(DETAILS_FINALIZER_SRC, /resolveTeltikKnownMdnForFinalizer/);
+  assert.match(DETAILS_FINALIZER_SRC, /latestTeltikSmsQuery\(sim\.id\)/);
+  assert.match(DETAILS_FINALIZER_SRC, /const pickedMdn = await resolveTeltikKnownMdnForFinalizer\(env, sim\)/);
+  assert.doesNotMatch(DETAILS_FINALIZER_SRC, /const mdn = `1\$\{sim\.msisdn\}`/);
 });
