@@ -65,6 +65,23 @@ export function buildHostingPortCheckRow({
 
 // --- IO helpers -----------------------------------------------------------
 
+// Teltik/relay calls can hang until the Worker invocation itself is killed —
+// then the batch never finishes and the job's progress/failure PATCH never
+// runs (the production stuck-job mode: running, batches=0, next_offset=0).
+// Bounding every vendor fetch turns a hang into a normal caught exception,
+// which records as an 'error' attempt and lets the batch move on.
+export const VENDOR_FETCH_TIMEOUT_MS = 15_000;
+
+export async function fetchWithTimeout(url, opts = {}, timeoutMs = VENDOR_FETCH_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error('vendor fetch timeout after ' + timeoutMs + 'ms')), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function relayUrl(env, url) {
   return env.RELAY_URL ? env.RELAY_URL + '/' + url : url;
 }
@@ -145,7 +162,7 @@ export async function readTeltikPortStatus(env, mdn, meta = {}) {
       + '&mdn=' + encodeURIComponent(norm);
     let resp, text;
     try {
-      resp = await fetch(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) });
+      resp = await fetchWithTimeout(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) });
       text = await resp.text();
     } catch (e) {
       out = { http_status: null, body: null, state: 'error', error: 'port-status exception: ' + (e && e.message || e) };
@@ -204,7 +221,7 @@ export async function checkAndRecordTeltikHostPort(env, sim, { source } = {}) {
     try {
       const lookupUrl = 'https://api.smsgateway.xyz/v1/get-phone-number/?apikey='
         + encodeURIComponent(env.TELTIK_API_KEY) + '&iccid=' + encodeURIComponent(sim.iccid);
-      const resp = await fetch(relayUrl(env, lookupUrl), { method: 'GET', headers: relayHeaders(env) });
+      const resp = await fetchWithTimeout(relayUrl(env, lookupUrl), { method: 'GET', headers: relayHeaders(env) });
       const json = resp.ok ? await resp.json().catch(() => null) : null;
       const lookedUp = toTeltik10Digit(json && (json.msisdn || json.mdn || json.phone_number));
       if (lookedUp.length === 10 && lookedUp !== toTeltik10Digit(mdn)) {
@@ -308,12 +325,18 @@ export async function runHostingPortSweep(env, { simIds = null, source = 'manual
 export const JOB_LEASE_MS = 3 * 60 * 1000; // stale-running takeover; > max batch runtime
 
 // Async job batches must finish one scheduled tick well inside Cloudflare's
-// per-invocation subrequest budget. Each SIM costs ~4-6 subrequests (MDN
-// lookup, port-status, check insert, api-log mirror, optional retry), so a
-// 200-SIM batch blows the ~1000-subrequest cap and the progress PATCH itself
-// dies — the job then sits 'running' with nothing persisted. 25 SIMs ≈ 150
-// subrequests: safe. Sync manual/bulk runs keep their own caps.
-export const ASYNC_JOB_MAX_SIMS = 25;
+// per-invocation subrequest budget AND wall-clock limit. Each SIM costs ~4-6
+// subrequests (MDN lookup, port-status, check insert, api-log mirror,
+// optional retry), so a 200-SIM batch blows the ~1000-subrequest cap and the
+// progress PATCH itself dies — the job then sits 'running' with nothing
+// persisted. 10 SIMs ≈ 60 subrequests and, with VENDOR_FETCH_TIMEOUT_MS
+// bounding every vendor call, a worst-case batch still finishes inside the
+// tick. Sync manual/bulk runs keep their own caps.
+export const ASYNC_JOB_MAX_SIMS = 10;
+// Async batches also run at lower sweep concurrency than manual runs: keeps
+// simultaneous open vendor connections small so a scheduled tick stays under
+// runtime/subrequest pressure even when Teltik is slow.
+export const ASYNC_JOB_CONCURRENCY = 3;
 
 const EMPTY_JOB_TOTALS = { checked: 0, online: 0, offline: 0, unknown: 0, error: 0, wrong_mdn_retries: 0 };
 
@@ -407,14 +430,16 @@ export async function processHostingPortJobs(env, { maxJobs = 1, leaseMs = JOB_L
     if (!claimed) continue;
     out.claimed++;
 
-    // Clamp at processing time too: heals pre-clamp jobs already in the table
-    // with max_sims=200, which can never finish a batch under the subrequest cap.
+    // Clamp at processing time too: heals jobs already in the table with a
+    // larger max_sims (pre-clamp 200, or 25 from before the cap was lowered),
+    // which risk never finishing a batch under the subrequest cap.
     let summary;
     try {
       summary = await runHostingPortSweep(env, {
         source: CHECK_SOURCES.includes(claimed.source) ? claimed.source : 'manual_sweep',
         offset: claimed.next_offset || 0,
         maxSims: Math.min(claimed.max_sims || ASYNC_JOB_MAX_SIMS, ASYNC_JOB_MAX_SIMS),
+        concurrency: ASYNC_JOB_CONCURRENCY,
       });
     } catch (e) {
       summary = { ok: false, error: 'sweep exception: ' + (e && e.message || e) };

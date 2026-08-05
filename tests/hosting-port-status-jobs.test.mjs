@@ -16,6 +16,7 @@ import {
   processHostingPortJobs,
   JOB_LEASE_MS,
   ASYNC_JOB_MAX_SIMS,
+  ASYNC_JOB_CONCURRENCY,
 } from '../src/shared/hosting-port-status.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -138,7 +139,7 @@ test('async job max_sims is clamped to ASYNC_JOB_MAX_SIMS at enqueue', async () 
   const orig = globalThis.fetch;
   globalThis.fetch = jobsMock(state);
   try {
-    assert.equal(ASYNC_JOB_MAX_SIMS, 25);
+    assert.equal(ASYNC_JOB_MAX_SIMS, 10);
     // The dashboard /run endpoint accepts max_sims up to 500 for sync batches;
     // async jobs must never inherit that, or one tick blows the subrequest cap.
     const job = await enqueueHostingPortJob(ENV, { maxSims: 200 });
@@ -231,7 +232,7 @@ test('a pre-clamp job stuck with max_sims=200 is processed in clamped batches', 
     });
     const out = await processHostingPortJobs(ENV, { maxJobs: 1 });
     assert.deepEqual(out, { claimed: 1, batches: 1, finished: 0, failed: 0 });
-    assert.equal(state.jobs[0].next_offset, ASYNC_JOB_MAX_SIMS, 'batch clamped to 25 despite stored max_sims=200');
+    assert.equal(state.jobs[0].next_offset, ASYNC_JOB_MAX_SIMS, 'batch clamped to 10 despite stored max_sims=200');
     assert.equal(state.jobs[0].totals.checked, ASYNC_JOB_MAX_SIMS);
     assert.equal(state.jobs[0].status, 'queued');
   } finally { globalThis.fetch = orig; }
@@ -256,6 +257,30 @@ test('a batch whose progress PATCH fails is marked failed, not left running fore
 
 test('lease is 3 minutes so a crashed batch is reclaimed quickly', () => {
   assert.equal(JOB_LEASE_MS, 3 * 60 * 1000);
+});
+
+test('async job batches sweep at low concurrency so one tick stays under runtime pressure', async () => {
+  assert.equal(ASYNC_JOB_CONCURRENCY, 3);
+  const state = { jobs: [], posted: [], fleet: makeFleet(10) };
+  const base = jobsMock(state);
+  let inFlight = 0, peak = 0;
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).includes('/v1/port-status')) {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise(r => setTimeout(r, 5));
+      inFlight--;
+    }
+    return base(url, opts);
+  };
+  try {
+    await enqueueHostingPortJob(ENV, {});
+    await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.equal(state.posted.length, ASYNC_JOB_MAX_SIMS, 'full clamped batch of 10 processed in one tick');
+    assert.ok(peak >= 2 && peak <= ASYNC_JOB_CONCURRENCY,
+      'peak concurrent port-status reads ' + peak + ' bounded by ASYNC_JOB_CONCURRENCY');
+  } finally { globalThis.fetch = orig; }
 });
 
 test('a batch whose sims query fails marks the job failed with the error', async () => {

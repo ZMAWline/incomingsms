@@ -5641,12 +5641,12 @@ set verify_pending; schedule §C.3 poll
 
         // Worker Controls: enqueue a durable SERVER-SIDE sweep of all active
         // Teltik-hosted SIMs. The dashboard worker's 1-minute scheduled tick
-        // drains the job in batches of 25 (one batch per tick, sized to fit
+        // drains the job in batches of 10 (one batch per tick, sized to fit
         // Cloudflare subrequest limits) and persists progress in
         // hosting_port_status_jobs, so the sweep keeps running even if this
         // page or the whole browser is closed. No browser-side batch loop.
         async function runHostingPortCheck() {
-            if (!(await showConfirm('Hosting Port Check', 'Run Teltik hosting port-status for all active Teltik-hosted SIMs? The sweep runs on the server at ~25 SIMs per minute and continues even if you close this page or browser.'))) return;
+            if (!(await showConfirm('Hosting Port Check', 'Run Teltik hosting port-status for all active Teltik-hosted SIMs? The sweep runs on the server at ~10 SIMs per minute and continues even if you close this page or browser.'))) return;
             const output = document.getElementById('sim-action-output');
             document.getElementById('sim-action-title').textContent = 'Hosting Port Check';
             document.getElementById('sim-action-logs-section').classList.add('hidden');

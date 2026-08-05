@@ -17,6 +17,7 @@ import {
   readTeltikPortStatus,
   runHostingPortSweep,
   CHECK_SOURCES,
+  fetchWithTimeout,
 } from '../src/shared/hosting-port-status.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -192,6 +193,51 @@ test('skipped/error attempts (missing credentials) still mirror to carrier_api_l
     const r2 = await readTeltikPortStatus({ ...ENV, TELTIK_API_KEY: undefined }, '9175550101', { iccid: 'ICC9' });
     assert.equal(r2.state, 'error');
   } finally { globalThis.fetch = orig; }
+});
+
+// --- vendor fetch timeout --------------------------------------------------
+// Teltik/relay can hang until the Worker invocation is killed, so the job's
+// progress/failure PATCH never runs. Every vendor fetch must be AbortController-
+// bounded so a hang becomes a normal recorded error attempt.
+
+test('fetchWithTimeout aborts a hung vendor fetch instead of hanging forever', async () => {
+  const orig = globalThis.fetch;
+  // Hung socket simulation: the promise only ever settles via the abort signal.
+  globalThis.fetch = (url, opts = {}) => new Promise((_, reject) => {
+    opts.signal.addEventListener('abort', () => reject(opts.signal.reason || new Error('aborted')));
+  });
+  try {
+    await assert.rejects(() => fetchWithTimeout('https://api.smsgateway.xyz/v1/port-status', {}, 25), /timeout/);
+  } finally { globalThis.fetch = orig; }
+});
+
+test('a timed-out port-status read records a normal error attempt, still mirrored to API logs', async () => {
+  const apiLogs = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    url = String(url);
+    if (url.includes('/v1/port-status')) {
+      const e = new Error('vendor fetch timeout after 15000ms');
+      e.name = 'AbortError';
+      throw e;
+    }
+    if (url.includes('/rest/v1/carrier_api_logs')) { apiLogs.push(JSON.parse(opts.body)); return new Response(null, { status: 201 }); }
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const r = await readTeltikPortStatus(ENV, '9175550101', { iccid: 'ICC1' });
+    assert.equal(r.state, 'error', 'timeout is error, never offline and never a hang');
+    assert.match(r.error, /timeout/);
+    assert.equal(apiLogs.length, 1);
+    assert.match(apiLogs[0].error, /timeout/);
+  } finally { globalThis.fetch = orig; }
+});
+
+test('both Teltik call sites (port-status and get-phone-number retry) go through fetchWithTimeout', () => {
+  assert.match(SHARED_SRC, /const ctrl = new AbortController\(\)/);
+  assert.match(SHARED_SRC, /signal: ctrl\.signal/);
+  assert.match(SHARED_SRC, /await fetchWithTimeout\(relayUrl\(env, url\)/);
+  assert.match(SHARED_SRC, /await fetchWithTimeout\(relayUrl\(env, lookupUrl\)/);
 });
 
 test('runHostingPortSweep checks all Teltik-hosted SIMs and records with the given source', async () => {
