@@ -71,6 +71,9 @@ function jobsMock(state) {
             : jsonResp([]);
         }
         Object.assign(j, body);
+        // state.emptyRepresentation mirrors the other live PostgREST shape:
+        // 200 with body [] even though the row updated (no Content-Range help).
+        if (state.emptyRepresentation) return jsonResp([]);
         return state.noRepresentation
           ? new Response(null, { status: 204, headers: { 'Content-Range': '0-0/*' } })
           : jsonResp([j]);
@@ -239,6 +242,52 @@ test('PATCH answered with 204/empty body (live PostgREST) still claims, progress
     out = await processHostingPortJobs(ENV, { maxJobs: 1 });
     assert.deepEqual(out, { claimed: 0, batches: 0, finished: 0, failed: 0 }, 'lost race backs off');
     assert.equal(state.posted.length, 3, 'no SIM double-checked');
+  } finally { globalThis.fetch = orig; }
+});
+
+test('PATCH answered 200 [] even though the row updated (live prod) still drains the job', async () => {
+  // Second production shape: PATCH applies (status flips to running) but the
+  // representation comes back as an empty array. Treating [] as lost-race left
+  // the job stuck running. The refetch-and-verify fallback must recover the
+  // row because it matches the patch just sent.
+  const state = { jobs: [], posted: [], fleet: makeFleet(3), emptyRepresentation: true };
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    await enqueueHostingPortJob(ENV, { maxSims: 2 });
+    let out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 1, batches: 1, finished: 0, failed: 0 });
+    assert.equal(state.jobs[0].status, 'queued', 'progress persisted, not stuck running');
+    assert.equal(state.jobs[0].next_offset, 2);
+    out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 1, batches: 1, finished: 1, failed: 0 });
+    assert.equal(state.jobs[0].status, 'done');
+    assert.equal(state.posted.length, 3, 'every SIM checked');
+  } finally { globalThis.fetch = orig; }
+});
+
+test('PATCH answered 200 [] on a genuinely lost claim race does not double-claim', async () => {
+  // [] from an applied patch and [] from a lost race are indistinguishable at
+  // the response level — only the refetched row's fields tell them apart. The
+  // loser's refetch sees the winner's updated_at and must return null.
+  const state = { jobs: [], posted: [], fleet: makeFleet(1), emptyRepresentation: true };
+  const orig = globalThis.fetch;
+  const base = jobsMock(state);
+  globalThis.fetch = async (url, opts = {}) => {
+    // Another tick wins the claim between our SELECT and our claim PATCH,
+    // stamping its own (deliberately distinct) updated_at.
+    if ((opts.method || 'GET').toUpperCase() === 'PATCH' && state.jobs[0]) {
+      state.jobs[0].status = 'running';
+      state.jobs[0].updated_at = new Date(Date.now() + 60_000).toISOString();
+    }
+    return base(url, opts);
+  };
+  try {
+    await enqueueHostingPortJob(ENV, {});
+    const out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 0, batches: 0, finished: 0, failed: 0 }, 'lost race backs off');
+    assert.equal(state.jobs[0].status, 'running', 'winner keeps the job');
+    assert.equal(state.posted.length, 0, 'no SIM double-checked');
   } finally { globalThis.fetch = orig; }
 });
 

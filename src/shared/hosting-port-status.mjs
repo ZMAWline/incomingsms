@@ -390,6 +390,20 @@ export async function getHostingPortJob(env, jobId) {
   }
 }
 
+// The refetched row only counts as "our PATCH applied" if it reflects the key
+// fields we just sent — otherwise a concurrent tick's PATCH is what we're
+// looking at (lost claim race) and the caller must back off.
+function rowMatchesPatch(row, patch) {
+  if (!row) return false;
+  for (const k of ['status', 'next_offset', 'batches']) {
+    if (patch[k] !== undefined && row[k] !== patch[k]) return false;
+  }
+  // Timestamp compared by value: PostgREST may echo '+00:00' where we sent 'Z'.
+  if (patch.updated_at !== undefined
+    && Date.parse(row.updated_at) !== Date.parse(patch.updated_at)) return false;
+  return true;
+}
+
 async function patchHostingPortJob(env, filter, patch) {
   try {
     const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?' + filter, {
@@ -399,17 +413,18 @@ async function patchHostingPortJob(env, filter, patch) {
     });
     if (!resp.ok) return null;
     const rows = await resp.json().catch(() => null);
-    // A JSON array is an honored return=representation: [] means the filter
-    // matched nothing (lost claim race) — stay null so the loser backs off.
-    if (Array.isArray(rows)) return rows[0] || null;
-    // Live PostgREST ignores return=representation on PATCH here (204/empty
-    // body even though rows updated), which left claimed jobs stuck 'running'.
-    // Refetch by id so callers get the actual updated row. Content-Range '*/*'
-    // on a 204 means 0 rows updated — a lost claim race, not a missing body.
+    if (Array.isArray(rows) && rows[0]) return rows[0];
+    // Live PostgREST ignores return=representation on PATCH here — 204/empty
+    // body AND 200 [] have both been seen even when the row DID update, which
+    // left claimed jobs stuck 'running'. Content-Range '*/*' means 0 rows
+    // updated for certain — lost race, back off. Anything else: refetch by id
+    // and trust the row only if it matches the patch we just sent.
     const range = resp.headers.get('content-range');
     if (range && range.startsWith('*')) return null;
     const id = /(?:^|&)id=eq\.([^&]+)/.exec(filter);
-    return id ? await getHostingPortJob(env, decodeURIComponent(id[1])) : null;
+    if (!id) return null;
+    const row = await getHostingPortJob(env, decodeURIComponent(id[1]));
+    return rowMatchesPatch(row, patch) ? row : null;
   } catch {
     return null;
   }
