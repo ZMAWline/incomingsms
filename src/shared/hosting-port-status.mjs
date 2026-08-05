@@ -397,8 +397,19 @@ async function patchHostingPortJob(env, filter, patch) {
       headers: { ...sbHeaders(env), Prefer: 'return=representation' },
       body: JSON.stringify(patch),
     });
-    const rows = resp.ok ? await resp.json().catch(() => null) : null;
-    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+    if (!resp.ok) return null;
+    const rows = await resp.json().catch(() => null);
+    // A JSON array is an honored return=representation: [] means the filter
+    // matched nothing (lost claim race) — stay null so the loser backs off.
+    if (Array.isArray(rows)) return rows[0] || null;
+    // Live PostgREST ignores return=representation on PATCH here (204/empty
+    // body even though rows updated), which left claimed jobs stuck 'running'.
+    // Refetch by id so callers get the actual updated row. Content-Range '*/*'
+    // on a 204 means 0 rows updated — a lost claim race, not a missing body.
+    const range = resp.headers.get('content-range');
+    if (range && range.startsWith('*')) return null;
+    const id = /(?:^|&)id=eq\.([^&]+)/.exec(filter);
+    return id ? await getHostingPortJob(env, decodeURIComponent(id[1])) : null;
   } catch {
     return null;
   }

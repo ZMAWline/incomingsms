@@ -62,9 +62,18 @@ function jobsMock(state) {
         // budget exhausted after a big batch) for the chosen patch bodies.
         if (state.failPatch && state.failPatch(body)) return new Response('boom', { status: 500 });
         const j = state.jobs.find(x => x.id === decodeURIComponent(idMatch[1]));
-        if (!j || (staleMatch && !claimable(j))) return jsonResp([]);
+        // state.noRepresentation mirrors live PostgREST, which ignores
+        // Prefer: return=representation on PATCH: 204 empty body, with
+        // Content-Range distinguishing rows-updated from filter-matched-zero.
+        if (!j || (staleMatch && !claimable(j))) {
+          return state.noRepresentation
+            ? new Response(null, { status: 204, headers: { 'Content-Range': '*/*' } })
+            : jsonResp([]);
+        }
         Object.assign(j, body);
-        return jsonResp([j]);
+        return state.noRepresentation
+          ? new Response(null, { status: 204, headers: { 'Content-Range': '0-0/*' } })
+          : jsonResp([j]);
       }
       if (idMatch) {
         const j = state.jobs.find(x => x.id === decodeURIComponent(idMatch[1]));
@@ -192,6 +201,44 @@ test('processHostingPortJobs drains one bounded batch per tick, persisting offse
     out = await processHostingPortJobs(ENV, { maxJobs: 1 });
     assert.deepEqual(out, { claimed: 0, batches: 0, finished: 0, failed: 0 });
     assert.equal((await getHostingPortJob(ENV, job_id)).status, 'done');
+  } finally { globalThis.fetch = orig; }
+});
+
+test('PATCH answered with 204/empty body (live PostgREST) still claims, progresses, and drains the job', async () => {
+  // Production stuck-job root cause: PostgREST ignored return=representation,
+  // patchHostingPortJob saw no row, treated the successful claim as lost, and
+  // left the job status=running forever. The fallback refetch must recover the
+  // row so the drain proceeds.
+  const state = { jobs: [], posted: [], fleet: makeFleet(3), noRepresentation: true };
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    await enqueueHostingPortJob(ENV, { maxSims: 2 });
+    let out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 1, batches: 1, finished: 0, failed: 0 });
+    assert.equal(state.jobs[0].status, 'queued', 'progress persisted, not stuck running');
+    assert.equal(state.jobs[0].next_offset, 2);
+    out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 1, batches: 1, finished: 1, failed: 0 });
+    assert.equal(state.jobs[0].status, 'done');
+    assert.equal(state.posted.length, 3, 'every SIM checked');
+
+    // Content-Range */* (zero rows updated) is a lost claim race, not a missing
+    // body — the loser must not refetch itself into a double claim.
+    state.jobs[0].status = 'queued';
+    state.jobs[0].finished_at = null;
+    const base = jobsMock(state);
+    globalThis.fetch = async (url, opts = {}) => {
+      // Another tick wins the claim between our SELECT and our claim PATCH.
+      if ((opts.method || 'GET').toUpperCase() === 'PATCH') {
+        state.jobs[0].status = 'running';
+        state.jobs[0].updated_at = new Date().toISOString();
+      }
+      return base(url, opts);
+    };
+    out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 0, batches: 0, finished: 0, failed: 0 }, 'lost race backs off');
+    assert.equal(state.posted.length, 3, 'no SIM double-checked');
   } finally { globalThis.fetch = orig; }
 });
 
