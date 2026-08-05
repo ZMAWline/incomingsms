@@ -373,6 +373,18 @@ test('scheduled handler drains jobs every tick but full-sweeps only on the 12h c
   assert.ok(scheduled.indexOf('processHostingPortJobs') > cronBlockEnd, 'job drain runs on every tick');
 });
 
+test('scheduled handler awaits the drain and sweep — no ctx.waitUntil fire-and-forget', () => {
+  // ctx.waitUntil drains were dropped in prod before persisting progress/logs:
+  // the job PATCHed to running but no batch results ever landed. Both the
+  // 1-minute drain and the 12h sweep must be awaited so the scheduled event
+  // stays alive until the batch commits.
+  const start = DASHBOARD_SRC.indexOf('async scheduled(event, env, ctx)');
+  const scheduled = DASHBOARD_SRC.slice(start, DASHBOARD_SRC.indexOf('\n  },', start));
+  assert.ok(!scheduled.includes('waitUntil'), 'no ctx.waitUntil in scheduled handler');
+  assert.match(scheduled, /await processHostingPortJobs\(env, \{ maxJobs: 1 \}\)/);
+  assert.match(scheduled, /await runHostingPortSweep\(env, \{ source: 'cron' \}\)/);
+});
+
 test('Workers page polls job status but the job itself runs server-side', () => {
   assert.match(DASHBOARD_HTML, /function pollHostingPortJob\(/);
   assert.match(DASHBOARD_HTML, /\/hosting-port-status\/jobs\/'? \+ jobId/);

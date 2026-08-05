@@ -558,22 +558,21 @@ export default {
   // Port Check jobs one bounded batch per tick, so a manual full sweep
   // continues even after the operator's browser closes. Both record through
   // the same canonical recorder, so cron + manual runs feed one history.
+  // Awaited (not ctx.waitUntil): fire-and-forget drains were observed to be
+  // dropped before persisting progress/logs; awaiting keeps the scheduled
+  // event alive until the batch commits.
   async scheduled(event, env, ctx) {
     if (event.cron === '0 */12 * * *') {
-      ctx.waitUntil(
-        runHostingPortSweep(env, { source: 'cron' })
-          .then(s => console.log('[HostPort] cron sweep done: ' + JSON.stringify({
-            total: s.total, online: s.online, offline: s.offline,
-            unknown: s.unknown, error: s.error, truncated: s.truncated,
-          })))
-          .catch(e => console.log('[HostPort] cron sweep failed: ' + (e && e.message || e)))
-      );
+      await runHostingPortSweep(env, { source: 'cron' })
+        .then(s => console.log('[HostPort] cron sweep done: ' + JSON.stringify({
+          total: s.total, online: s.online, offline: s.offline,
+          unknown: s.unknown, error: s.error, truncated: s.truncated,
+        })))
+        .catch(e => console.log('[HostPort] cron sweep failed: ' + (e && e.message || e)));
     }
-    ctx.waitUntil(
-      processHostingPortJobs(env, { maxJobs: 1 })
-        .then(r => { if (r.claimed) console.log('[HostPort] job drain: ' + JSON.stringify(r)); })
-        .catch(e => console.log('[HostPort] job drain failed: ' + (e && e.message || e)))
-    );
+    await processHostingPortJobs(env, { maxJobs: 1 })
+      .then(r => { if (r.claimed) console.log('[HostPort] job drain: ' + JSON.stringify(r)); })
+      .catch(e => console.log('[HostPort] job drain failed: ' + (e && e.message || e)));
   },
 };
 
