@@ -482,7 +482,7 @@ test('Workers tab shows recent jobs on open and resumes watching active jobs', (
   assert.match(DASHBOARD_HTML, /\/hosting-port-status\/jobs\?limit=5/);
   assert.match(DASHBOARD_HTML, /id="hosting-port-jobs-card"/);
   assert.match(DASHBOARD_HTML, /tabName === 'workers'\) loadHostingPortJobs\(\)/, 'card refreshes on every Workers tab open');
-  assert.match(DASHBOARD_HTML, /setTimeout\(loadHostingPortJobs, 5000\)/, 'keeps polling while a job is queued/running');
+  assert.match(DASHBOARD_HTML, /setTimeout\(loadHostingPortJobs, 10000\)/, 'keeps polling while a job is queued/running');
 });
 
 test('scheduled handler drains jobs every tick but full-sweeps only on the 12h cron', () => {

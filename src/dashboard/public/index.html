@@ -1408,7 +1408,7 @@
                          them on every Workers tab open. -->
                     <div id="hosting-port-jobs-card" class="hidden md:col-span-2 lg:col-span-3 p-4 rounded-lg bg-dark-700 border border-dark-500">
                         <div class="flex items-center justify-between mb-2">
-                            <p class="font-medium text-white text-sm">Hosting Port Check — recent jobs</p>
+                            <p class="font-medium text-white text-sm">Recent Host Port Runs</p>
                             <button onclick="loadHostingPortJobs()" class="text-xs text-gray-400 hover:text-white transition">Refresh</button>
                         </div>
                         <pre id="hosting-port-jobs-body" class="text-xs text-gray-300 font-mono whitespace-pre-wrap m-0"></pre>
@@ -5692,14 +5692,15 @@ set verify_pending; schedule §C.3 poll
                     const t = Object.assign({ checked: 0, online: 0, offline: 0, unknown: 0, error: 0 }, j.totals || {});
                     return String(j.id).slice(0, 8) + '  ' + j.status.toUpperCase()
                         + '  batches ' + (j.batches || 0)
-                        + '  checked ' + t.checked + (j.total_available ? '/' + j.total_available : '')
+                        + '  offset ' + (j.next_offset || 0) + (j.total_available ? '/' + j.total_available : '')
+                        + '  checked ' + t.checked
                         + '  online ' + t.online + '  offline ' + t.offline
                         + '  unknown/error ' + (t.unknown + t.error)
-                        + '  ' + String(j.created_at || '').replace('T', ' ').slice(0, 16)
+                        + '  updated ' + String(j.updated_at || j.created_at || '').replace('T', ' ').slice(0, 16)
                         + (j.error ? '\n          error: ' + j.error : '');
                 }).join('\n');
                 if (jobs.some(j => j.status === 'queued' || j.status === 'running')) {
-                    hostingPortJobsTimer = setTimeout(loadHostingPortJobs, 5000);
+                    hostingPortJobsTimer = setTimeout(loadHostingPortJobs, 10000);
                 }
             } catch (e) { /* transient — refreshed on next tab open or timer */ }
         }
