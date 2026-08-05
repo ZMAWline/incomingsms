@@ -415,12 +415,11 @@ async function patchHostingPortJob(env, filter, patch) {
     const rows = await resp.json().catch(() => null);
     if (Array.isArray(rows) && rows[0]) return rows[0];
     // Live PostgREST ignores return=representation on PATCH here — 204/empty
-    // body AND 200 [] have both been seen even when the row DID update, which
-    // left claimed jobs stuck 'running'. Content-Range '*/*' means 0 rows
-    // updated for certain — lost race, back off. Anything else: refetch by id
-    // and trust the row only if it matches the patch we just sent.
-    const range = resp.headers.get('content-range');
-    if (range && range.startsWith('*')) return null;
+    // body AND 200 [] have both been seen even when the row DID update, and
+    // Content-Range '*/*' has appeared on applied patches too, so no response
+    // shape short-circuits. Always refetch by id and trust the row only if it
+    // matches the patch we just sent — a lost race shows the rival's fields
+    // and fails rowMatchesPatch.
     const id = /(?:^|&)id=eq\.([^&]+)/.exec(filter);
     if (!id) return null;
     const row = await getHostingPortJob(env, decodeURIComponent(id[1]));

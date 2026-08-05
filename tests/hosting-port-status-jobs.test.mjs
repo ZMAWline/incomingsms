@@ -63,8 +63,9 @@ function jobsMock(state) {
         if (state.failPatch && state.failPatch(body)) return new Response('boom', { status: 500 });
         const j = state.jobs.find(x => x.id === decodeURIComponent(idMatch[1]));
         // state.noRepresentation mirrors live PostgREST, which ignores
-        // Prefer: return=representation on PATCH: 204 empty body, with
-        // Content-Range distinguishing rows-updated from filter-matched-zero.
+        // Prefer: return=representation on PATCH: 204 empty body. Live has
+        // returned Content-Range '*/*' even on applied patches, so the header
+        // cannot distinguish rows-updated from filter-matched-zero.
         if (!j || (staleMatch && !claimable(j))) {
           return state.noRepresentation
             ? new Response(null, { status: 204, headers: { 'Content-Range': '*/*' } })
@@ -72,10 +73,13 @@ function jobsMock(state) {
         }
         Object.assign(j, body);
         // state.emptyRepresentation mirrors the other live PostgREST shape:
-        // 200 with body [] even though the row updated (no Content-Range help).
+        // 200 with body [] even though the row updated.
         if (state.emptyRepresentation) return jsonResp([]);
         return state.noRepresentation
-          ? new Response(null, { status: 204, headers: { 'Content-Range': '0-0/*' } })
+          ? new Response(null, {
+              status: 204,
+              headers: { 'Content-Range': state.starContentRange ? '*/*' : '0-0/*' },
+            })
           : jsonResp([j]);
       }
       if (idMatch) {
@@ -226,16 +230,18 @@ test('PATCH answered with 204/empty body (live PostgREST) still claims, progress
     assert.equal(state.jobs[0].status, 'done');
     assert.equal(state.posted.length, 3, 'every SIM checked');
 
-    // Content-Range */* (zero rows updated) is a lost claim race, not a missing
-    // body — the loser must not refetch itself into a double claim.
+    // Content-Range */* on a genuinely lost claim race: no header short-circuit
+    // anymore — the loser refetches, sees the winner's fields, and the
+    // rowMatchesPatch mismatch stops the double claim.
     state.jobs[0].status = 'queued';
     state.jobs[0].finished_at = null;
     const base = jobsMock(state);
     globalThis.fetch = async (url, opts = {}) => {
-      // Another tick wins the claim between our SELECT and our claim PATCH.
+      // Another tick wins the claim between our SELECT and our claim PATCH,
+      // stamping its own (deliberately distinct) updated_at.
       if ((opts.method || 'GET').toUpperCase() === 'PATCH') {
         state.jobs[0].status = 'running';
-        state.jobs[0].updated_at = new Date().toISOString();
+        state.jobs[0].updated_at = new Date(Date.now() + 60_000).toISOString();
       }
       return base(url, opts);
     };
@@ -251,6 +257,27 @@ test('PATCH answered 200 [] even though the row updated (live prod) still drains
   // the job stuck running. The refetch-and-verify fallback must recover the
   // row because it matches the patch just sent.
   const state = { jobs: [], posted: [], fleet: makeFleet(3), emptyRepresentation: true };
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    await enqueueHostingPortJob(ENV, { maxSims: 2 });
+    let out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 1, batches: 1, finished: 0, failed: 0 });
+    assert.equal(state.jobs[0].status, 'queued', 'progress persisted, not stuck running');
+    assert.equal(state.jobs[0].next_offset, 2);
+    out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 1, batches: 1, finished: 1, failed: 0 });
+    assert.equal(state.jobs[0].status, 'done');
+    assert.equal(state.posted.length, 3, 'every SIM checked');
+  } finally { globalThis.fetch = orig; }
+});
+
+test('PATCH answered 204 with Content-Range */* even though the row updated (live prod) still drains the job', async () => {
+  // Third production shape: PATCH applies (row flips to running) but live
+  // PostgREST answers 204 with Content-Range */*. The old header short-circuit
+  // treated that as lost-race-for-certain and left the job stuck running. Now
+  // the refetch-and-verify fallback must recover the row.
+  const state = { jobs: [], posted: [], fleet: makeFleet(3), noRepresentation: true, starContentRange: true };
   const orig = globalThis.fetch;
   globalThis.fetch = jobsMock(state);
   try {
