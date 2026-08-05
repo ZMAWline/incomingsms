@@ -4,7 +4,7 @@ import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateCh
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
-import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
+import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -500,6 +500,10 @@ export default {
     }
     if (url.pathname === '/api/hosting-port-status/run' && request.method === 'POST') {
       return handleHostingPortStatusRun(request, env, corsHeaders);
+    }
+    // Exact /jobs list route must be matched before the /jobs/:id prefix route.
+    if (url.pathname === '/api/hosting-port-status/jobs' && request.method === 'GET') {
+      return handleHostingPortStatusJobsList(url, env, corsHeaders);
     }
     if (url.pathname.startsWith('/api/hosting-port-status/jobs/') && request.method === 'GET') {
       const jobId = url.pathname.slice('/api/hosting-port-status/jobs/'.length);
@@ -2586,8 +2590,9 @@ async function handleHostingPortStatusRun(request, env, corsHeaders) {
     // Durable full sweep: { source: 'manual_sweep', async: true } enqueues a
     // hosting_port_status_jobs row and returns immediately; the 1-minute
     // scheduled tick drains it batch by batch server-side, independent of the
-    // browser. Synchronous single-batch mode below stays for sim_ids bulk
-    // checks and tests.
+    // browser. enqueueHostingPortJob clamps max_sims to ASYNC_JOB_MAX_SIMS so
+    // one tick's batch fits Cloudflare's subrequest budget. Synchronous
+    // single-batch mode below stays for sim_ids bulk checks and tests.
     if (body.async === true && !simIds) {
       const job = await enqueueHostingPortJob(env, { source: 'manual_sweep', maxSims, createdBy: 'dashboard' });
       return new Response(JSON.stringify(job), {
@@ -2599,6 +2604,23 @@ async function handleHostingPortStatusRun(request, env, corsHeaders) {
     return new Response(JSON.stringify(summary, null, 2), {
       status: summary.ok ? 200 : 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+// GET /api/hosting-port-status/jobs?limit=5 — recent durable sweep jobs,
+// newest first, so the Workers page can rediscover an in-flight sweep after
+// the browser was closed and reopened.
+async function handleHostingPortStatusJobsList(url, env, corsHeaders) {
+  try {
+    const limit = Number(url.searchParams.get('limit'));
+    const jobs = await listHostingPortJobs(env, { limit: Number.isInteger(limit) ? limit : 5 });
+    return new Response(JSON.stringify({ ok: true, jobs }), {
+      status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (e) {
     return new Response(JSON.stringify({ ok: false, error: String(e) }), {

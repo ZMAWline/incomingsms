@@ -305,13 +305,23 @@ export async function runHostingPortSweep(env, { simIds = null, source = 'manual
 // ponytail: optimistic-PATCH claim + updated_at lease, no queue infra; move
 // to Cloudflare Queues if batch cadence ever needs to beat one per minute.
 
-export const JOB_LEASE_MS = 15 * 60 * 1000; // stale-running takeover; > max batch runtime
+export const JOB_LEASE_MS = 3 * 60 * 1000; // stale-running takeover; > max batch runtime
+
+// Async job batches must finish one scheduled tick well inside Cloudflare's
+// per-invocation subrequest budget. Each SIM costs ~4-6 subrequests (MDN
+// lookup, port-status, check insert, api-log mirror, optional retry), so a
+// 200-SIM batch blows the ~1000-subrequest cap and the progress PATCH itself
+// dies — the job then sits 'running' with nothing persisted. 25 SIMs ≈ 150
+// subrequests: safe. Sync manual/bulk runs keep their own caps.
+export const ASYNC_JOB_MAX_SIMS = 25;
 
 const EMPTY_JOB_TOTALS = { checked: 0, online: 0, offline: 0, unknown: 0, error: 0, wrong_mdn_retries: 0 };
 
 // Enqueue a full-sweep job. One pending sweep at a time: if a queued/running
 // job already exists, returns it instead of stacking duplicates.
-export async function enqueueHostingPortJob(env, { source = 'manual_sweep', maxSims = 200, createdBy = null } = {}) {
+export async function enqueueHostingPortJob(env, { source = 'manual_sweep', maxSims = ASYNC_JOB_MAX_SIMS, createdBy = null } = {}) {
+  if (!Number.isInteger(maxSims) || maxSims < 1) maxSims = ASYNC_JOB_MAX_SIMS;
+  maxSims = Math.min(maxSims, ASYNC_JOB_MAX_SIMS);
   try {
     const pendingResp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs'
       + '?select=id,status&status=in.(queued,running)&order=created_at.asc&limit=1', { headers: sbHeaders(env) });
@@ -329,6 +339,20 @@ export async function enqueueHostingPortJob(env, { source = 'manual_sweep', maxS
     return { ok: true, job_id: rows[0].id, status: rows[0].status, already_pending: false };
   } catch (e) {
     return { ok: false, error: 'enqueue exception: ' + (e && e.message || e) };
+  }
+}
+
+// Recent jobs, newest first — Workers page uses this to rediscover an
+// in-flight sweep after a page reload.
+export async function listHostingPortJobs(env, { limit = 5 } = {}) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) limit = 5;
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs'
+      + '?select=*&order=created_at.desc&limit=' + limit, { headers: sbHeaders(env) });
+    const rows = resp.ok ? await resp.json() : null;
+    return Array.isArray(rows) ? rows : [];
+  } catch {
+    return [];
   }
 }
 
@@ -383,11 +407,18 @@ export async function processHostingPortJobs(env, { maxJobs = 1, leaseMs = JOB_L
     if (!claimed) continue;
     out.claimed++;
 
-    const summary = await runHostingPortSweep(env, {
-      source: CHECK_SOURCES.includes(claimed.source) ? claimed.source : 'manual_sweep',
-      offset: claimed.next_offset || 0,
-      maxSims: claimed.max_sims || 200,
-    });
+    // Clamp at processing time too: heals pre-clamp jobs already in the table
+    // with max_sims=200, which can never finish a batch under the subrequest cap.
+    let summary;
+    try {
+      summary = await runHostingPortSweep(env, {
+        source: CHECK_SOURCES.includes(claimed.source) ? claimed.source : 'manual_sweep',
+        offset: claimed.next_offset || 0,
+        maxSims: Math.min(claimed.max_sims || ASYNC_JOB_MAX_SIMS, ASYNC_JOB_MAX_SIMS),
+      });
+    } catch (e) {
+      summary = { ok: false, error: 'sweep exception: ' + (e && e.message || e) };
+    }
     const doneIso = new Date().toISOString();
     if (!summary.ok) {
       out.failed++;
@@ -407,9 +438,7 @@ export async function processHostingPortJobs(env, { maxJobs = 1, leaseMs = JOB_L
       wrong_mdn_retries: prev.wrong_mdn_retries + (summary.wrong_mdn_retries || 0),
     };
     const done = summary.has_more !== true;
-    out.batches++;
-    if (done) out.finished++;
-    await patchHostingPortJob(env, 'id=eq.' + job.id, {
+    const saved = await patchHostingPortJob(env, 'id=eq.' + job.id, {
       status: done ? 'done' : 'queued',
       next_offset: summary.next_offset,
       total_available: summary.total_available != null ? summary.total_available : claimed.total_available,
@@ -419,6 +448,19 @@ export async function processHostingPortJobs(env, { maxJobs = 1, leaseMs = JOB_L
       finished_at: done ? doneIso : null,
       updated_at: doneIso,
     });
+    if (!saved) {
+      // Progress PATCH failed after the batch ran: without this the job stays
+      // 'running' forever (the original production stuck-job mode). Mark it
+      // failed; if even that PATCH dies, the (now 3-min) lease reclaims it.
+      out.failed++;
+      await patchHostingPortJob(env, 'id=eq.' + job.id, {
+        status: 'failed', error: 'progress_persist_failed after batch ' + ((claimed.batches || 0) + 1),
+        finished_at: doneIso, updated_at: doneIso,
+      });
+      continue;
+    }
+    out.batches++;
+    if (done) out.finished++;
   }
   return out;
 }

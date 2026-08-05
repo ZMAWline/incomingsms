@@ -291,7 +291,11 @@ test('all Teltik port-status call sites route through the shared recorder', () =
   assert.doesNotMatch(DASHBOARD_SRC, /rest\/v1\/hosting_port_status_checks/, 'dashboard uses the shared recorder, not direct table writes');
   assert.doesNotMatch(REMEDIATOR_SRC, /rest\/v1\/hosting_port_status_checks/, 'remediator uses the shared recorder, not direct table writes');
   // Dashboard: teltik-query + teltik-host-check + sweep all record.
-  assert.match(DASHBOARD_SRC, /import \{ recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, processHostingPortJobs \} from '\.\.\/shared\/hosting-port-status\.mjs'/);
+  const dashboardImport = DASHBOARD_SRC.match(/import \{([^}]+)\} from '\.\.\/shared\/hosting-port-status\.mjs'/);
+  assert.ok(dashboardImport, 'dashboard imports the shared recorder module');
+  for (const name of ['recordHostingPortCheck', 'buildHostingPortCheckRow', 'normalizeHostPortState', 'runHostingPortSweep', 'enqueueHostingPortJob', 'getHostingPortJob', 'processHostingPortJobs']) {
+    assert.ok(dashboardImport[1].includes(name), 'dashboard imports ' + name + ' from shared recorder');
+  }
   const dashboardRecordCalls = (DASHBOARD_SRC.match(/recordHostingPortCheck\(env,/g) || []).length;
   assert.ok(dashboardRecordCalls >= 2, 'teltik-query and teltik-host-check both record (got ' + dashboardRecordCalls + ')');
   // Remediator: both evidence read and resend-gate recheck record.

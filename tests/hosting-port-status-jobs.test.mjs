@@ -12,8 +12,10 @@ import { fileURLToPath } from 'node:url';
 import {
   enqueueHostingPortJob,
   getHostingPortJob,
+  listHostingPortJobs,
   processHostingPortJobs,
   JOB_LEASE_MS,
+  ASYNC_JOB_MAX_SIMS,
 } from '../src/shared/hosting-port-status.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,14 +56,22 @@ function jobsMock(state) {
         || (j.status === 'running' && j.updated_at < decodeURIComponent(staleMatch[1]));
       const idMatch = url.match(/id=eq\.([^&]+)/);
       if (method === 'PATCH') {
+        const body = JSON.parse(opts.body);
+        // state.failPatch simulates the PATCH itself dying (e.g. subrequest
+        // budget exhausted after a big batch) for the chosen patch bodies.
+        if (state.failPatch && state.failPatch(body)) return new Response('boom', { status: 500 });
         const j = state.jobs.find(x => x.id === decodeURIComponent(idMatch[1]));
         if (!j || (staleMatch && !claimable(j))) return jsonResp([]);
-        Object.assign(j, JSON.parse(opts.body));
+        Object.assign(j, body);
         return jsonResp([j]);
       }
       if (idMatch) {
         const j = state.jobs.find(x => x.id === decodeURIComponent(idMatch[1]));
         return jsonResp(j ? [j] : []);
+      }
+      if (url.includes('order=created_at.desc')) {
+        const lim = Number(new URL(url).searchParams.get('limit')) || 5;
+        return jsonResp([...state.jobs].reverse().slice(0, lim));
       }
       if (url.includes('status=in.(queued,running)')) {
         return jsonResp(state.jobs.filter(j => j.status === 'queued' || j.status === 'running').slice(0, 1));
@@ -120,6 +130,20 @@ test('enqueueHostingPortJob creates one job and dedupes while a sweep is pending
     const job = await getHostingPortJob(ENV, first.job_id);
     assert.equal(job.id, first.job_id);
     assert.equal(job.status, 'queued');
+  } finally { globalThis.fetch = orig; }
+});
+
+test('async job max_sims is clamped to ASYNC_JOB_MAX_SIMS at enqueue', async () => {
+  const state = { jobs: [], posted: [], fleet: [] };
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    assert.equal(ASYNC_JOB_MAX_SIMS, 25);
+    // The dashboard /run endpoint accepts max_sims up to 500 for sync batches;
+    // async jobs must never inherit that, or one tick blows the subrequest cap.
+    const job = await enqueueHostingPortJob(ENV, { maxSims: 200 });
+    assert.equal(job.ok, true);
+    assert.equal(state.jobs[0].max_sims, ASYNC_JOB_MAX_SIMS);
   } finally { globalThis.fetch = orig; }
 });
 
@@ -191,6 +215,49 @@ test('a running job with a fresh lease is not double-claimed; a stale one is rec
   } finally { globalThis.fetch = orig; }
 });
 
+test('a pre-clamp job stuck with max_sims=200 is processed in clamped batches', async () => {
+  const state = { jobs: [], posted: [], fleet: makeFleet(30) };
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    // Row shaped like the production stuck job: enqueued before the clamp
+    // existed, so max_sims=200 is already persisted.
+    state.jobs.push({
+      id: 'legacy-1', source: 'manual_sweep', status: 'queued', next_offset: 0,
+      max_sims: 200, batches: 0, total_available: null,
+      totals: { checked: 0, online: 0, offline: 0, unknown: 0, error: 0, wrong_mdn_retries: 0 },
+      error: null, created_by: null, started_at: null, finished_at: null,
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    });
+    const out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 1, batches: 1, finished: 0, failed: 0 });
+    assert.equal(state.jobs[0].next_offset, ASYNC_JOB_MAX_SIMS, 'batch clamped to 25 despite stored max_sims=200');
+    assert.equal(state.jobs[0].totals.checked, ASYNC_JOB_MAX_SIMS);
+    assert.equal(state.jobs[0].status, 'queued');
+  } finally { globalThis.fetch = orig; }
+});
+
+test('a batch whose progress PATCH fails is marked failed, not left running forever', async () => {
+  const state = { jobs: [], posted: [], fleet: makeFleet(1) };
+  // Fail only the progress-persist PATCH (the one carrying next_offset) — the
+  // production stuck-job mode; the claim and the failed-marking PATCH succeed.
+  state.failPatch = b => b.next_offset != null;
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    await enqueueHostingPortJob(ENV, {});
+    const out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.deepEqual(out, { claimed: 1, batches: 0, finished: 0, failed: 1 });
+    assert.equal(state.jobs[0].status, 'failed');
+    assert.match(state.jobs[0].error, /progress_persist_failed/);
+    assert.ok(state.jobs[0].finished_at);
+  } finally { globalThis.fetch = orig; }
+});
+
+test('lease is 3 minutes so a crashed batch is reclaimed quickly', () => {
+  assert.equal(JOB_LEASE_MS, 3 * 60 * 1000);
+});
+
 test('a batch whose sims query fails marks the job failed with the error', async () => {
   const state = { jobs: [], posted: [], fleet: makeFleet(3), simsDown: true };
   const orig = globalThis.fetch;
@@ -202,6 +269,21 @@ test('a batch whose sims query fails marks the job failed with the error', async
     assert.equal(state.jobs[0].status, 'failed');
     assert.match(state.jobs[0].error, /sims_query_failed/);
     assert.ok(state.jobs[0].finished_at);
+  } finally { globalThis.fetch = orig; }
+});
+
+test('listHostingPortJobs returns recent jobs newest first', async () => {
+  const state = { jobs: [], posted: [], fleet: [] };
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    const a = await enqueueHostingPortJob(ENV, {});
+    state.jobs[0].status = 'done'; // free the dedupe slot for a second job
+    const b = await enqueueHostingPortJob(ENV, {});
+    const jobs = await listHostingPortJobs(ENV, { limit: 5 });
+    assert.equal(jobs.length, 2);
+    assert.equal(jobs[0].id, b.job_id, 'newest first');
+    assert.equal(jobs[1].id, a.job_id);
   } finally { globalThis.fetch = orig; }
 });
 
@@ -234,6 +316,25 @@ test('GET /api/hosting-port-status/jobs/:id polling endpoint exists', () => {
   assert.match(DASHBOARD_SRC, /url\.pathname\.startsWith\('\/api\/hosting-port-status\/jobs\/'\)/);
   assert.match(DASHBOARD_SRC, /handleHostingPortStatusJobGet/);
   assert.match(DASHBOARD_SRC, /getHostingPortJob\(env, jobId\)/);
+});
+
+test('GET /api/hosting-port-status/jobs recent-jobs endpoint exists, matched before /jobs/:id', () => {
+  assert.match(DASHBOARD_SRC, /url\.pathname === '\/api\/hosting-port-status\/jobs' && request\.method === 'GET'/);
+  assert.match(DASHBOARD_SRC, /handleHostingPortStatusJobsList/);
+  assert.match(DASHBOARD_SRC, /listHostingPortJobs\(env/);
+  assert.ok(
+    DASHBOARD_SRC.indexOf("url.pathname === '/api/hosting-port-status/jobs'")
+      < DASHBOARD_SRC.indexOf("url.pathname.startsWith('/api/hosting-port-status/jobs/')"),
+    'exact list route is matched before the :id prefix route',
+  );
+});
+
+test('Workers tab shows recent jobs on open and resumes watching active jobs', () => {
+  assert.match(DASHBOARD_HTML, /function loadHostingPortJobs\(/);
+  assert.match(DASHBOARD_HTML, /\/hosting-port-status\/jobs\?limit=5/);
+  assert.match(DASHBOARD_HTML, /id="hosting-port-jobs-card"/);
+  assert.match(DASHBOARD_HTML, /tabName === 'workers'\) loadHostingPortJobs\(\)/, 'card refreshes on every Workers tab open');
+  assert.match(DASHBOARD_HTML, /setTimeout\(loadHostingPortJobs, 5000\)/, 'keeps polling while a job is queued/running');
 });
 
 test('scheduled handler drains jobs every tick but full-sweeps only on the 12h cron', () => {
