@@ -45,6 +45,7 @@ import {
   teltikResetNetwork, teltikResetPort,
 } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
+import { HEALTHY_EVIDENCE_OUTCOME, HEALTHY_EVIDENCE_REASON } from './healthy-evidence.mjs';
 
 export const SAFE_ACTIONS = Object.freeze([
   'db_sync_upsert',
@@ -60,6 +61,9 @@ export const SAFE_ACTIONS = Object.freeze([
   'teltik_reset_network',
   'teltik_reset_port',
   'teltik_sync_iccid',
+  // HE1 — DB-only terminal close for reports proven healthy by the
+  // healthy-evidence gate. Touches no vendor and no gateway.
+  'healthy_evidence_auto_resolve',
 ]);
 
 const FORBIDDEN_SET = new Set(FORBIDDEN_ACTIONS);
@@ -99,6 +103,7 @@ export async function executeAction(env, ctx) {
     case 'teltik_reset_network': return execTeltikReset(env, ctx, 'teltik_reset_network');
     case 'teltik_reset_port':    return execTeltikReset(env, ctx, 'teltik_reset_port');
     case 'teltik_sync_iccid':    return execTeltikSyncIccid(env, ctx);
+    case 'healthy_evidence_auto_resolve': return execHealthyEvidenceAutoResolve(env, ctx);
     default:                     return { ok: false, status: 'unsupported_action' };
   }
 }
@@ -356,6 +361,115 @@ async function execCloseDuplicate(env, ctx) {
     ok: true, status: 'ok',
     terminalReport: { status: 'duplicate', duplicate_of: duplicateOf },
     evidence: { report_id: report.id, from_status: fromStatus, duplicate_of: duplicateOf },
+  };
+}
+
+// ---------------------------------------------------------
+// healthy_evidence_auto_resolve (HE1) — terminal `remediated` close for a
+// report the healthy-evidence gate proved healthy. DB-ONLY: no vendor call, no
+// gateway call, no reseller SMS. Mirrors close_duplicate's write shape so the
+// timeline is indistinguishable from an operator close.
+//
+// rental_reports.remediation_action is CHECK-constrained to
+// (rotated|port_reset|sim_replaced|mdn_swapped|other), so the column carries
+// 'other' and the EXPLICIT action/reason
+// (healthy_evidence_auto_resolved / confirmed_working) lives in the
+// rental_report_events evidence + the attempt row the worker writes. Both are
+// queryable; neither needs a migration to land first.
+// ---------------------------------------------------------
+
+async function execHealthyEvidenceAutoResolve(env, ctx) {
+  const report = ctx.report;
+  if (!report || report.id === null || report.id === undefined) {
+    return { ok: false, status: 'bad_input', errorMessage: 'missing report' };
+  }
+  const healthy = ctx.healthyEvidence || null;
+  if (!healthy || healthy.passed !== true) {
+    // Defence in depth: this executor may only ever run behind a PASSED gate.
+    return { ok: false, status: 'bad_input', errorMessage: 'healthy_evidence_not_proven' };
+  }
+  const nowIso = new Date().toISOString();
+
+  const curResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
+    + encodeURIComponent(report.id) + '&select=id,status,triaged_at,closed_at', {
+    headers: supabaseHeaders(env, false),
+  });
+  if (!curResp.ok) {
+    return { ok: false, status: 'db_error', errorMessage: 'cur_get_' + curResp.status };
+  }
+  const curRows = await curResp.json().catch(() => []);
+  const cur = (Array.isArray(curRows) && curRows.length) ? curRows[0] : {};
+  const fromStatus = cur.status || report.status || null;
+
+  const patch = {
+    status: 'remediated',
+    remediation_action: 'other',
+    updated_at: nowIso,
+    closed_at: cur.closed_at || nowIso,
+  };
+  if (fromStatus === 'received' && !cur.triaged_at) patch.triaged_at = nowIso;
+
+  const patchResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
+    + encodeURIComponent(report.id), {
+    method: 'PATCH',
+    headers: supabaseHeaders(env, false),
+    body: JSON.stringify(patch),
+  });
+  if (!patchResp.ok) {
+    const txt = await patchResp.text().catch(() => '');
+    return { ok: false, status: 'db_error', errorMessage: 'rental_reports_patch_' + patchResp.status + ':' + txt };
+  }
+
+  // Audit event — carries the evidence IDs and timestamps behind the close.
+  const evidence = {
+    source: 'auto_remediator',
+    action: HEALTHY_EVIDENCE_OUTCOME,
+    resolution_reason: HEALTHY_EVIDENCE_REASON,
+    healthy_evidence: healthy,
+    evidence_ids: {
+      report_id: report.id,
+      rental_id: report.rental_id != null ? report.rental_id : null,
+      sim_id: report.sim_id != null ? report.sim_id : null,
+      inbound_sms_id: (healthy.usage && healthy.usage.sms && healthy.usage.sms.inbound_sms_id) || null,
+    },
+    evidence_timestamps: {
+      report_received_at: report.received_at || null,
+      inbound_sms_received_at: (healthy.usage && healthy.usage.sms && healthy.usage.sms.received_at) || null,
+      host_port_checked_at: (healthy.host && healthy.host.checked_at) || null,
+      evaluated_at: healthy.evaluated_at || null,
+      resolved_at: nowIso,
+    },
+  };
+  if (ctx.evidenceBundle) evidence.classifier = ctx.evidenceBundle;
+  try {
+    await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+      method: 'POST',
+      headers: supabaseHeaders(env, false),
+      body: JSON.stringify({
+        report_id: report.id,
+        from_status: fromStatus,
+        to_status: 'remediated',
+        actor: 'auto-remediator',
+        note: ('auto-remediator ' + HEALTHY_EVIDENCE_OUTCOME + ': ' + HEALTHY_EVIDENCE_REASON
+          + ' (provider + host + inbound-SMS proof)').slice(0, 500),
+        evidence,
+      }),
+    });
+  } catch (e) {
+    console.log('[Actions] healthy_evidence_auto_resolve event log insert failed: ' + e);
+  }
+
+  return {
+    ok: true, status: 'ok',
+    terminalReport: { status: 'remediated', remediation_action: 'other' },
+    evidence: {
+      report_id: report.id,
+      from_status: fromStatus,
+      resolution: HEALTHY_EVIDENCE_OUTCOME,
+      resolution_reason: HEALTHY_EVIDENCE_REASON,
+      evidence_ids: evidence.evidence_ids,
+      evidence_timestamps: evidence.evidence_timestamps,
+    },
   };
 }
 

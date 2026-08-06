@@ -1915,8 +1915,22 @@
                         <option value="Teltik gateway port offline">Teltik gateway port offline</option>
                         <option value="Teltik gateway port reset resolved">Teltik gateway port reset resolved</option>
                     </select>
-                    <button onclick="downloadTeltikPortOfflineExport()" class="px-3 py-2 text-xs bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition" title="Vendor-ready CSV: report id, current MDN, SIM id, ICCID, host/provider, reseller rental id">Export Teltik offline CSV</button>
                     <span id="bad-rentals-status" class="text-dark-400 text-sm ml-2"></span>
+                </div>
+                <!-- Escalation export (t_732f6de4). Deterministic by New York date
+                     range — never by whatever rows the table happens to show. -->
+                <div class="flex flex-wrap items-center gap-2 mb-4 p-3 rounded-lg border border-dark-600 bg-dark-800/40">
+                    <span class="text-xs text-dark-400 uppercase tracking-wide">Escalation export (NY dates)</span>
+                    <label class="text-xs text-dark-400" for="bad-rentals-export-start">From</label>
+                    <input id="bad-rentals-export-start" type="date" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1.5 text-gray-300">
+                    <label class="text-xs text-dark-400" for="bad-rentals-export-end">To</label>
+                    <input id="bad-rentals-export-end" type="date" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1.5 text-gray-300">
+                    <label class="text-xs text-dark-400 flex items-center gap-1" title="Off = only SIMs that need escalation. On = every reported SIM in the range, including the ones with no fault found.">
+                        <input id="bad-rentals-export-all" type="checkbox" class="align-middle"> include no-fault rows
+                    </label>
+                    <button onclick="exportBadRentalEscalations('today')" class="px-3 py-2 text-xs bg-cyan-700 border border-cyan-600 rounded-lg text-white hover:bg-cyan-600 transition" title="Everything reported today (America/New_York) that needs escalating, split by service provider and gateway host">Needs escalation today</button>
+                    <button onclick="exportBadRentalEscalations('range')" class="px-3 py-2 text-xs bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition" title="CSV per SIM: service provider vs gateway host, MDNs, ICCID, report ids/timestamps in NY time, cohort, provider + host evidence, inbound SMS evidence, recommended escalation target and ask">Export selected range</button>
+                    <span id="bad-rentals-export-status" class="text-dark-400 text-xs"></span>
                 </div>
                 <div id="bad-rentals-table-wrap" class="overflow-x-auto rounded-lg border border-dark-600">
                     <table class="w-full text-sm text-left">
@@ -8339,6 +8353,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const filterSel = document.getElementById('bad-rentals-status-filter');
             const issueSel = document.getElementById('bad-rentals-issue-filter');
             if (!tbody) return;
+            initBadRentalExportDates();
             tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>';
             if (statusEl) statusEl.textContent = '';
             const filterVal = filterSel ? filterSel.value : 'received,in_triage';
@@ -8531,8 +8546,110 @@ async function sendSimOnline(simId, phoneNumber) {
             loadBadRentals();
         }
 
+        // ===== Bad Rental escalation export (t_732f6de4) =====
+        // Deterministic by New York date range, never by the rows currently on
+        // screen. Downloads through fetch+blob so the button can report loading,
+        // the row count, the filename it saved, or a plain-English failure —
+        // the old window.location.href version failed silently.
+
+        function nyTodayDate() {
+            try {
+                return new Intl.DateTimeFormat('en-CA', {
+                    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+                }).format(new Date());
+            } catch (e) {
+                return new Date().toISOString().slice(0, 10);
+            }
+        }
+
+        function initBadRentalExportDates() {
+            const startEl = document.getElementById('bad-rentals-export-start');
+            const endEl = document.getElementById('bad-rentals-export-end');
+            const today = nyTodayDate();
+            if (startEl && !startEl.value) startEl.value = today;
+            if (endEl && !endEl.value) endEl.value = today;
+        }
+
+        function setBadRentalExportStatus(text, tone) {
+            const el = document.getElementById('bad-rentals-export-status');
+            if (!el) return;
+            el.textContent = text || '';
+            el.className = 'text-xs '
+                + (tone === 'error' ? 'text-red-400' : tone === 'success' ? 'text-green-400' : 'text-dark-400');
+        }
+
+        function filenameFromDisposition(disposition, fallback) {
+            if (!disposition) return fallback;
+            const m = /filename="?([^";]+)"?/i.exec(disposition);
+            return m && m[1] ? m[1] : fallback;
+        }
+
+        async function exportBadRentalEscalations(mode) {
+            initBadRentalExportDates();
+            const startEl = document.getElementById('bad-rentals-export-start');
+            const endEl = document.getElementById('bad-rentals-export-end');
+            const allEl = document.getElementById('bad-rentals-export-all');
+            const today = nyTodayDate();
+            let start = mode === 'today' ? today : (startEl && startEl.value) || today;
+            let end = mode === 'today' ? today : (endEl && endEl.value) || start;
+            if (mode === 'today') {
+                if (startEl) startEl.value = today;
+                if (endEl) endEl.value = today;
+            }
+            if (end < start) {
+                setBadRentalExportStatus('End date ' + end + ' is before start date ' + start + '.', 'error');
+                return;
+            }
+            const buttons = Array.from(document.querySelectorAll('[onclick^="exportBadRentalEscalations"]'));
+            buttons.forEach(b => { b.disabled = true; b.classList.add('opacity-50'); });
+            setBadRentalExportStatus('Building export for ' + (start === end ? start : start + ' → ' + end) + ' (NY)…');
+            try {
+                const qs = '?start=' + encodeURIComponent(start)
+                    + '&end=' + encodeURIComponent(end)
+                    + '&tz=America/New_York'
+                    + '&scope=' + (allEl && allEl.checked ? 'all' : 'needs_escalation');
+                const resp = await fetch(API_BASE + '/bad-rentals/escalation-export' + qs);
+                if (!resp.ok) {
+                    let msg = 'HTTP ' + resp.status;
+                    try {
+                        const err = await resp.json();
+                        msg = (err && (err.message || err.error)) || msg;
+                    } catch (e) { /* non-JSON error body — keep the status */ }
+                    setBadRentalExportStatus('Export failed: ' + msg, 'error');
+                    return;
+                }
+                const count = resp.headers.get('X-Escalation-Row-Count');
+                const notes = resp.headers.get('X-Escalation-Notes');
+                const filename = filenameFromDisposition(
+                    resp.headers.get('Content-Disposition'),
+                    'bad_rental_escalations_' + start + '_to_' + end + '_ny.csv');
+                const blob = await resp.blob();
+                const objectUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = objectUrl;
+                a.download = filename;
+                a.click();
+                URL.revokeObjectURL(objectUrl);
+                const n = count == null ? '?' : count;
+                if (String(count) === '0') {
+                    setBadRentalExportStatus('No SIMs need escalation for '
+                        + (start === end ? start : start + ' → ' + end) + ' (NY). Empty CSV saved as ' + filename + '.', 'success');
+                } else {
+                    setBadRentalExportStatus('Downloaded ' + filename + ' — ' + n + ' SIM(s) needing escalation'
+                        + (notes ? ' · ' + notes : ''), 'success');
+                }
+            } catch (error) {
+                setBadRentalExportStatus('Export failed: ' + (error && error.message ? error.message : String(error)), 'error');
+                console.error('[exportBadRentalEscalations]', error);
+            } finally {
+                buttons.forEach(b => { b.disabled = false; b.classList.remove('opacity-50'); });
+            }
+        }
+
+        // Kept for any bookmarked call site: the old narrow endpoint still
+        // exists as a server-side alias for the escalation export.
         function downloadTeltikPortOfflineExport() {
-            window.location.href = API_BASE + '/bad-rentals/teltik-port-offline-export';
+            return exportBadRentalEscalations('range');
         }
 
         // ===== Auto-Remediator Reviewer Panel (INC-23 §I.2) =====

@@ -47,9 +47,10 @@ test('TH5 reset uses Teltik-known MDN (fallback current SIM MDN), never reported
 
 test('remediator resolves the Teltik-known MDN from latest Teltik inbound SMS', () => {
   // Same shared rule the dashboard host-check uses (40feedb): prefer the
-  // latest Teltik-delivered inbound SMS destination over the DB current MDN.
-  assert.match(REMEDIATOR_SRC, /pickTeltikKnownMdn\(latestTeltikSms, evidence\.sim\.current_mdn_e164\)/);
-  assert.match(REMEDIATOR_SRC, /latestTeltikSmsQuery\(evidence\.sim\.id\)/);
+  // latest Teltik-delivered inbound SMS destination, then read-only inventory,
+  // over the DB current MDN.
+  assert.match(REMEDIATOR_SRC, /resolveTeltikKnownMdn\(env, \{\n\s*id: evidence\.sim\.id,\n\s*iccid: evidence\.sim\.iccid,\n\s*current_mdn_e164: evidence\.sim\.current_mdn_e164,/);
+  assert.doesNotMatch(REMEDIATOR_SRC, /pickTeltikKnownMdn\(latestTeltikSms, evidence\.sim\.current_mdn_e164\)/);
   // The vendor read is keyed by it too (teltik get-info).
   assert.match(REMEDIATOR_SRC, /teltikKnownMdn: evidence\.teltikKnownMdn && evidence\.teltikKnownMdn\.mdn \|\| null/);
 });

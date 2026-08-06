@@ -29,6 +29,7 @@ const DASHBOARD_HTML = read('src', 'dashboard', 'public', 'index.html');
 const DASHBOARD_TOML = read('src', 'dashboard', 'wrangler.toml');
 const REMEDIATOR_SRC = read('src', 'bad-rental-remediator', 'index.js');
 const SHARED_SRC = read('src', 'shared', 'hosting-port-status.mjs');
+const TELTIK_KNOWN_SRC = read('src', 'shared', 'teltik-known-mdn.mjs');
 
 // --- normalization: errors are never offline -------------------------------
 
@@ -161,7 +162,7 @@ test('wrong-MDN read records error (never offline), retries via ICCID lookup, re
     assert.equal(posted[1].attempt, 2);
     assert.equal(posted[1].state, 'online');
     assert.equal(posted[1].mdn, '9175550999');
-    assert.equal(posted[1].mdn_source, 'teltik_get_phone_number_retry');
+    assert.equal(posted[1].mdn_source, 'teltik_get_phone_number_inventory_retry');
     assert.equal(r.state, 'online');
     assert.equal(r.retried, true);
     // Both attempts mirrored to carrier_api_logs, including the failed one.
@@ -237,7 +238,9 @@ test('both Teltik call sites (port-status and get-phone-number retry) go through
   assert.match(SHARED_SRC, /const ctrl = new AbortController\(\)/);
   assert.match(SHARED_SRC, /signal: ctrl\.signal/);
   assert.match(SHARED_SRC, /await fetchWithTimeout\(relayUrl\(env, url\)/);
-  assert.match(SHARED_SRC, /await fetchWithTimeout\(relayUrl\(env, lookupUrl\)/);
+  assert.match(SHARED_SRC, /teltikInventoryLookup\(env/);
+  assert.match(TELTIK_KNOWN_SRC, /get-phone-number/);
+  assert.match(TELTIK_KNOWN_SRC, /await fetchWithTimeout\(relayUrl\(env, url\)/);
 });
 
 test('runHostingPortSweep checks all Teltik-hosted SIMs and records with the given source', async () => {

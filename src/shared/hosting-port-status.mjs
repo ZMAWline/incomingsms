@@ -16,12 +16,18 @@
 //
 // Provider-vs-host rule: sims.vendor stays the SERVICE PROVIDER
 // (atomic/wing_iot/teltik/helix); gateway_host='teltik' is the HOST. Checks
-// are keyed by the Teltik-known MDN (latest raw Teltik inbound SMS payload
-// destination via pickTeltikKnownMdn), never by ICCID, and never write the
-// resolved Teltik MDN back onto the SIM.
+// are keyed by the Teltik-known MDN resolved by the ONE shared resolver
+// (shared/teltik-known-mdn.mjs: raw inbound-SMS payload MDN → READ-ONLY Teltik
+// inventory → DB current MDN), never by ICCID, and never write the resolved
+// Teltik MDN back onto the SIM.
 // =========================================================
 
-import { pickTeltikKnownMdn, latestTeltikSmsQuery } from './teltik-known-mdn.mjs';
+import {
+  resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn,
+  teltikInventoryLookup,
+  isInventoryMdnSource,
+  retryMdnSource,
+} from './teltik-known-mdn.mjs';
 
 export const CHECK_SOURCES = ['cron', 'manual_bulk', 'manual_sweep', 'single_query', 'bad_rental_remediator'];
 
@@ -180,23 +186,18 @@ export async function readTeltikPortStatus(env, mdn, meta = {}) {
   return out;
 }
 
-// Resolve the Teltik-known MDN for a SIM (latest raw Teltik inbound SMS
-// payload destination; DB current MDN only as fallback). Never throws.
+// Resolve the Teltik-known MDN for a SIM. Thin wrapper over THE shared
+// resolver (payload MDN → Teltik inventory → DB current MDN); kept under this
+// name because callers and tests import it from here. Never throws.
 export async function resolveTeltikKnownMdn(env, sim) {
-  let latestTeltikSms = null;
-  if (sim && sim.id) {
-    try {
-      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + latestTeltikSmsQuery(sim.id), { headers: sbHeaders(env) });
-      const rows = resp.ok ? await resp.json() : null;
-      latestTeltikSms = Array.isArray(rows) && rows[0] ? rows[0] : null;
-    } catch { latestTeltikSms = null; }
-  }
-  return pickTeltikKnownMdn(latestTeltikSms, (sim && sim.db_current_mdn) || null);
+  return resolveSharedTeltikKnownMdn(env, sim || {});
 }
 
 // Full check for one SIM: resolve Teltik-known MDN, read port-status, record.
-// Wrong-MDN/error reads retry ONCE via get-phone-number-by-ICCID when it
-// yields a different MDN; both attempts are recorded for auditing.
+// The first attempt already prefers a Teltik inventory MDN over the DB current
+// MDN, so the retry below only exists for the case where the first read was
+// keyed by something the inventory never confirmed (payload MDN, or a DB MDN
+// resolved without any inventory lookup). Both attempts are recorded.
 // sim: { id, iccid, vendor, gateway_host, db_current_mdn }.
 // Returns { state, http_status, mdn, mdn_source, attempts, retried, error }.
 export async function checkAndRecordTeltikHostPort(env, sim, { source } = {}) {
@@ -215,27 +216,27 @@ export async function checkAndRecordTeltikHostPort(env, sim, { source } = {}) {
     http_status: read.http_status, state: read.state, raw: read.body, error: read.error,
   }));
 
-  // Retry path: read failed and Teltik may know the line by another MDN.
+  // Retry path: the read failed and Teltik may know the line by another MDN.
+  // Skipped when the first attempt was ALREADY keyed by an inventory MDN, or
+  // when resolution ran the inventory and it came up empty (db_current_mdn_
+  // unconfirmed) — repeating the same read-only lookup can only return the
+  // same answer, and every extra vendor call costs a subrequest.
+  const inventoryAlreadyRan = isInventoryMdnSource(mdnSource)
+    || Boolean(picked && picked.inventory && picked.inventory.ran);
   let retried = false;
-  if (read.state === 'error' && sim.iccid && env.TELTIK_API_KEY) {
-    try {
-      const lookupUrl = 'https://api.smsgateway.xyz/v1/get-phone-number/?apikey='
-        + encodeURIComponent(env.TELTIK_API_KEY) + '&iccid=' + encodeURIComponent(sim.iccid);
-      const resp = await fetchWithTimeout(relayUrl(env, lookupUrl), { method: 'GET', headers: relayHeaders(env) });
-      const json = resp.ok ? await resp.json().catch(() => null) : null;
-      const lookedUp = toTeltik10Digit(json && (json.msisdn || json.mdn || json.phone_number));
-      if (lookedUp.length === 10 && lookedUp !== toTeltik10Digit(mdn)) {
-        attempt = 2;
-        retried = true;
-        mdn = lookedUp;
-        mdnSource = 'teltik_get_phone_number_retry';
-        read = await readTeltikPortStatus(env, mdn, { iccid: sim.iccid });
-        await recordHostingPortCheck(env, buildHostingPortCheckRow({
-          ...base, mdn: lookedUp, mdn_source: mdnSource, attempt,
-          http_status: read.http_status, state: read.state, raw: read.body, error: read.error,
-        }));
-      }
-    } catch { /* retry lookup is best-effort */ }
+  if (read.state === 'error' && !inventoryAlreadyRan && sim.iccid && env.TELTIK_API_KEY) {
+    const lookup = await teltikInventoryLookup(env, { iccid: sim.iccid, mdn: sim.db_current_mdn || null });
+    if (lookup.mdn10 && lookup.mdn10 !== toTeltik10Digit(mdn)) {
+      attempt = 2;
+      retried = true;
+      mdn = lookup.mdn10;
+      mdnSource = retryMdnSource(lookup.source);
+      read = await readTeltikPortStatus(env, mdn, { iccid: sim.iccid });
+      await recordHostingPortCheck(env, buildHostingPortCheckRow({
+        ...base, mdn: lookup.mdn10, mdn_source: mdnSource, attempt,
+        http_status: read.http_status, state: read.state, raw: read.body, error: read.error,
+      }));
+    }
   }
 
   return {

@@ -207,7 +207,7 @@ test('Teltik-hosted stale-MDN: port read keys on latest raw SMS payload MDN, and
   }
 });
 
-test('non-Teltik-hosted SIM: no inbound_sms lookup, no Teltik port probe', async () => {
+test('non-Teltik-hosted SIM: no Teltik-known-MDN lookup, no Teltik port probe', async () => {
   const orig = globalThis.fetch;
   const calls = stubFetch([
     ['/rest/v1/sims?', [{ ...SIM_ROW, gateway_host: 'skyline' }]],
@@ -218,8 +218,19 @@ test('non-Teltik-hosted SIM: no inbound_sms lookup, no Teltik port probe', async
       { id: 102, sim_id: 42 });
     assert.equal(evidence.teltikKnownMdn, null);
     assert.equal(evidence.teltikHostPortStatus, null);
-    assert.ok(!calls.some(u => u.includes('inbound_sms')));
+    // The Teltik-known-MDN read (raw payload destination, port IS NULL rows)
+    // is Teltik-only and must not fire for a Skyline-hosted SIM.
+    assert.ok(!calls.some(u => u.includes('inbound_sms') && u.includes('port=is.null')));
     assert.ok(!calls.some(u => u.includes('port-status')));
+    // The HE1 usage-proof read is host-agnostic — a Skyline-hosted line can be
+    // proven healthy by its own inbound traffic too — so it DOES fire here.
+    const proofCall = calls.find(u => u.includes('inbound_sms') && u.includes('received_at=gte.'));
+    assert.ok(proofCall, 'healthy-evidence usage proof read fired');
+    assert.match(proofCall, /sim_id=eq\.42/);
+    // Bounded at BOTH ends: order=received_at.desc + limit returns the newest
+    // rows, so without an upper bound a busy SIM's post-window traffic would
+    // crowd the in-window proof out of the candidate set entirely.
+    assert.match(proofCall, /received_at=lte\./);
   } finally {
     globalThis.fetch = orig;
   }

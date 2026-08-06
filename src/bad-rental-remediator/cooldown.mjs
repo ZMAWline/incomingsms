@@ -45,6 +45,10 @@ export const COOLDOWN_TABLE = Object.freeze({
   verify_send_sms:      { maxAttempts: 3, cooldownMs: 60 * S,  label: '60s' },
   classify_only:        { maxAttempts: 3, cooldownMs: 2 * H,   label: '2h' },
   close_duplicate:      { maxAttempts: 1, cooldownMs: 0,       label: 'n/a' },
+  // HE1 — terminal DB-only close on proven-healthy evidence. One shot: if the
+  // close write fails the report requeues and the gate re-proves from fresh
+  // reads rather than replaying a stale verdict.
+  healthy_evidence_auto_resolve: { maxAttempts: 1, cooldownMs: 0, label: 'n/a' },
   escalate:             { maxAttempts: 1, cooldownMs: 0,       label: 'n/a' },
 });
 
@@ -160,6 +164,8 @@ export function idempotencyKey(action, ctx = {}) {
       return 'classify_only:' + req(ctx, 'report_id') + ':' + req(ctx, 'mode');
     case 'close_duplicate':
       return 'close_duplicate:' + req(ctx, 'report_id');
+    case 'healthy_evidence_auto_resolve':
+      return 'healthy_evidence_auto_resolve:' + req(ctx, 'report_id');
     case 'escalate':
       return 'escalate:' + req(ctx, 'report_id') + ':' + (ctx.reason || 'generic');
     default:

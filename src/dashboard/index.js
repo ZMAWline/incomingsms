@@ -3,7 +3,7 @@ import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, build
 import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateChanging } from './api-tester-presets.js';
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
-import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
+import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/teltik-known-mdn.mjs';
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 
 function normalizeImeiPoolPort(port) {
@@ -174,8 +174,19 @@ export default {
       return handleBadRentals(env, corsHeaders, url);
     }
 
+    // Daily escalation export — deterministic by NY date range, split by
+    // service provider and gateway host. See handleBadRentalEscalationExport.
+    if (url.pathname === '/api/bad-rentals/escalation-export' && request.method === 'GET') {
+      return handleBadRentalEscalationExport(env, corsHeaders, url);
+    }
+
+    // Compatibility alias for the original narrow export.
     if (url.pathname === '/api/bad-rentals/teltik-port-offline-export' && request.method === 'GET') {
-      return handleTeltikPortOfflineExport(env, corsHeaders);
+      return handleTeltikPortOfflineExport(env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/bad-rentals/healthy-evidence-summary' && request.method === 'GET') {
+      return handleHealthyEvidenceSummary(env, corsHeaders, url);
     }
 
     if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/update') && request.method === 'POST') {
@@ -2222,15 +2233,10 @@ async function handleHelixQuery(request, env, corsHeaders) {
 }
 
 async function resolveTeltikKnownMdnForSim(env, sim, dbCurrentMdn) {
-  if (!sim || !sim.id) return pickTeltikKnownMdn(null, dbCurrentMdn || null);
-  let latestTeltikSms = null;
-  try {
-    const rows = await sbGet(env, latestTeltikSmsQuery(sim.id));
-    latestTeltikSms = Array.isArray(rows) && rows[0] ? rows[0] : null;
-  } catch (_) {
-    latestTeltikSms = null;
-  }
-  return pickTeltikKnownMdn(latestTeltikSms, dbCurrentMdn || null);
+  return resolveSharedTeltikKnownMdn(env, {
+    ...(sim || {}),
+    db_current_mdn: dbCurrentMdn || (sim && (sim.db_current_mdn || sim.current_mdn_e164)) || null,
+  });
 }
 
 // Heal a swapped-card Teltik SIM. After Teltik replaces the physical SIM the
@@ -2327,11 +2333,13 @@ async function handleTeltikQuery(request, env, corsHeaders) {
 
     let db_update = null;
     let resolvedMdn = null;
+    let resolvedMdnSource = null;
     let iccid_heal = null;
     if (res.ok && json) {
       const rawMdn = json.msisdn || json.mdn || json.phone_number || '';
       if (rawMdn) {
         resolvedMdn = rawMdn;
+        resolvedMdnSource = 'teltik_get_phone_number_inventory';
         db_update = await syncActiveSim(env, iccid, { mdn: rawMdn, activatedAt: null });
       } else {
         await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
@@ -2420,7 +2428,7 @@ async function handleTeltikQuery(request, env, corsHeaders) {
         vendor: (hpsSim && hpsSim.vendor) || 'teltik',
         gateway_host: (hpsSim && hpsSim.gateway_host) || 'teltik',
         mdn: portStatusMdn && portStatusMdn.length === 10 ? portStatusMdn : null,
-        mdn_source: portStatusMdn && portStatusMdn.length === 10 ? 'teltik_get_phone_number' : null,
+        mdn_source: portStatusMdn && portStatusMdn.length === 10 ? resolvedMdnSource : null,
         source: 'single_query',
         http_status: psHttp,
         state: normalizeHostPortState(psHttp, psBody),
@@ -2485,12 +2493,7 @@ async function handleTeltikHostCheck(request, env, corsHeaders) {
       }
     }
 
-    let latestTeltikSms = null;
-    if (simId) {
-      const rows = await sbGet(env, latestTeltikSmsQuery(simId)).catch(() => null);
-      latestTeltikSms = Array.isArray(rows) && rows[0] ? rows[0] : null;
-    }
-    const picked = pickTeltikKnownMdn(latestTeltikSms, dbCurrentMdn);
+    const picked = await resolveTeltikKnownMdnForSim(env, { id: simId, iccid }, dbCurrentMdn);
     const mdnDigits = picked ? toTeltik10Digit(picked.mdn) : null;
 
     const teltikGet = async (step, loggedUrl, fullUrl) => {
@@ -2558,7 +2561,9 @@ async function handleTeltikHostCheck(request, env, corsHeaders) {
       mdn: mdnDigits || null,
       mdn_source: picked ? picked.source : null,
       db_current_mdn: dbCurrentMdn,
-      latest_teltik_sms: latestTeltikSms,
+      latest_teltik_sms: picked && picked.source === 'teltik_inbound_sms_payload_mdn'
+        ? { received_at: picked.received_at || null } : null,
+      mdn_resolution: picked ? { source: picked.source, trail: picked.trail || null, inventory: picked.inventory || null } : null,
       get_info: get_info || { ok: false, skipped: true, error: 'no valid Teltik-known MDN — get-info skipped' },
       port_status,
     }, null, 2), {
@@ -4339,9 +4344,29 @@ async function handleErrorLogs(env, corsHeaders, url) {
 async function handleBadRentals(env, corsHeaders, url) {
   try {
     const statusParam = url.searchParams.get('status');
-    const includeAll = statusParam === 'all';
-    const statusFilter = (statusParam && !includeAll) ? statusParam : 'received,in_triage';
+    // ?auto_resolution implies a closed-report view (auto-resolved reports are
+    // status='remediated'), so without an explicit ?status we must not apply the
+    // default open-only filter — it would hide every matching row.
+    const autoResolutionParam = (url.searchParams.get('auto_resolution') || '').trim();
+    const includeAll = statusParam === 'all' || (!statusParam && !!autoResolutionParam);
+    const statusFilter = (statusParam && statusParam !== 'all') ? statusParam : 'received,in_triage';
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10) || 200, 1000);
+    // Bad-rental reviewer auto-resolutions (HE1). The remediator records the
+    // explicit action/reason on the ATTEMPT row rather than on
+    // rental_reports.remediation_action, whose CHECK constraint only allows
+    // (rotated|port_reset|sim_replaced|mdn_swapped|other). So filtering by
+    // ?auto_resolution=healthy_evidence_auto_resolved resolves report ids from
+    // rental_report_remediation_attempts first, then constrains the list query.
+    const autoResolution = autoResolutionParam;
+    let autoResolutionIds = null;
+    if (autoResolution) {
+      autoResolutionIds = await fetchAutoResolvedReportIds(env, autoResolution);
+      if (autoResolutionIds.length === 0) {
+        return new Response(JSON.stringify([]), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+    }
     // Embeds:
     //   resellers(name)                       — operator label
     //   rentals(reseller_rental_id)           — reseller's own id when echoed
@@ -4363,6 +4388,9 @@ async function handleBadRentals(env, corsHeaders, url) {
     let query = 'rental_reports?select=' + encodeURIComponent(select);
     if (!includeAll) {
       query += '&status=in.(' + encodeURIComponent(statusFilter) + ')';
+    }
+    if (autoResolutionIds) {
+      query += '&id=in.(' + encodeURIComponent(autoResolutionIds.join(',')) + ')';
     }
     query += '&sims.sim_numbers.valid_to=is.null'
       + '&order=received_at.desc&limit=' + limit;
@@ -4398,9 +4426,16 @@ async function handleBadRentals(env, corsHeaders, url) {
                   last_outcome: a.outcome || null,
                   last_attempted_at: a.attempted_at || null,
                   last_mode: a.mode || null,
+                  auto_resolution: null,
+                  auto_resolved_at: null,
                 };
               }
               attemptSummary[k].count += 1;
+              // Rows arrive newest-first, so the first match is the resolving attempt.
+              if (a.outcome === HEALTHY_EVIDENCE_OUTCOME && !attemptSummary[k].auto_resolution) {
+                attemptSummary[k].auto_resolution = HEALTHY_EVIDENCE_OUTCOME;
+                attemptSummary[k].auto_resolved_at = a.attempted_at || null;
+              }
             }
           }
         }
@@ -4440,6 +4475,10 @@ async function handleBadRentals(env, corsHeaders, url) {
         auto_attempts_last_outcome: s ? s.last_outcome : null,
         auto_attempts_last_attempted_at: s ? s.last_attempted_at : null,
         auto_attempts_last_mode: s ? s.last_mode : null,
+        auto_resolution: s ? s.auto_resolution : null,
+        auto_resolution_reason: (s && s.auto_resolution === HEALTHY_EVIDENCE_OUTCOME)
+          ? HEALTHY_EVIDENCE_REASON : null,
+        auto_resolved_at: s ? s.auto_resolved_at : null,
         resellers: r.resellers || null,
         iccid: r && r.sims ? r.sims.iccid : null,
         vendor: r && r.sims ? r.sims.vendor : null,
@@ -4463,6 +4502,164 @@ async function handleBadRentals(env, corsHeaders, url) {
 }
 
 
+// Bad Rental Review auto-resolution vocabulary. Mirrors
+// src/bad-rental-remediator/healthy-evidence.mjs — the remediator writes these
+// on the attempt row (action/outcome) and in the rental_report_events evidence.
+const HEALTHY_EVIDENCE_OUTCOME = 'healthy_evidence_auto_resolved';
+const HEALTHY_EVIDENCE_REASON  = 'confirmed_working';
+const HEALTHY_EVIDENCE_ACTION  = 'healthy_evidence_auto_resolve';
+
+// An `id=in.(...)` filter is spliced into a GET URL, so the id list has to
+// stay inside the request-line limits of the Workers runtime and of PostgREST's
+// proxy. HE1's whole premise is that a LARGE share of the queue is noise, so
+// the auto-resolved set grows without bound — 5000 ids would build a ~40KB URL
+// and fail with a 414 rather than returning fewer rows. Chunk (summary) or cap
+// (list) at this size instead.
+const MAX_REPORT_ID_FILTER = 500;
+
+function chunkIds(ids, size = MAX_REPORT_ID_FILTER) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += size) out.push(ids.slice(i, i + size));
+  return out;
+}
+
+// Report ids whose remediation attempts carry the given auto-resolution
+// outcome. Unknown/unsupported values return [] rather than an unfiltered
+// list, so a typo can never silently widen the result set.
+//
+// Attempts come back newest-first, so when there are more auto-resolutions
+// than one URL can carry we keep the MOST RECENT MAX_REPORT_ID_FILTER of them
+// — which is what a received_at.desc list view wants anyway — and log the drop
+// rather than truncating silently.
+async function fetchAutoResolvedReportIds(env, outcome) {
+  if (outcome !== HEALTHY_EVIDENCE_OUTCOME) return [];
+  try {
+    const resp = await supabaseGet(env,
+      'rental_report_remediation_attempts?outcome=eq.' + encodeURIComponent(outcome)
+      + '&select=report_id&order=attempted_at.desc&limit=5000');
+    if (!resp.ok) return [];
+    const rows = await resp.json();
+    if (!Array.isArray(rows)) return [];
+    const seen = new Set();
+    for (const r of rows) {
+      if (r && r.report_id != null) seen.add(r.report_id);
+    }
+    // Set iteration is insertion order, i.e. newest attempt first.
+    const ids = [...seen];
+    if (ids.length > MAX_REPORT_ID_FILTER) {
+      console.log('[fetchAutoResolvedReportIds] ' + ids.length + ' auto-resolved reports;'
+        + ' returning the ' + MAX_REPORT_ID_FILTER + ' most recent to keep the id filter in one URL');
+      return ids.slice(0, MAX_REPORT_ID_FILTER);
+    }
+    return ids;
+  } catch (e) {
+    console.log('[fetchAutoResolvedReportIds] failed: ' + e);
+    return [];
+  }
+}
+
+// GET /api/bad-rentals/healthy-evidence-summary?days=7
+//
+// Operator rollup for reports the reviewer closed on proven-healthy evidence
+// (provider Active + host port ONLINE + inbound-SMS usage proof). Answers
+// "how much of the bad-rental queue is noise, and on which vendors/hosts".
+// Customer numbers are never included — report/SIM ids and timestamps only.
+async function handleHealthyEvidenceSummary(env, corsHeaders, url) {
+  try {
+    const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '7', 10) || 7, 1), 90);
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const aResp = await supabaseGet(env,
+      'rental_report_remediation_attempts?outcome=eq.' + encodeURIComponent(HEALTHY_EVIDENCE_OUTCOME)
+      + '&attempted_at=gte.' + encodeURIComponent(since)
+      + '&select=report_id,action,outcome,mode,attempted_at&order=attempted_at.desc&limit=5000');
+    if (!aResp.ok) {
+      const txt = await aResp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + aResp.status, detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const attempts = await aResp.json();
+    const rows = Array.isArray(attempts) ? attempts : [];
+    // One entry per report (newest attempt wins).
+    const byReport = new Map();
+    for (const a of rows) {
+      if (!a || a.report_id == null) continue;
+      if (!byReport.has(a.report_id)) {
+        byReport.set(a.report_id, {
+          report_id: a.report_id,
+          resolved_at: a.attempted_at || null,
+          action: a.action || HEALTHY_EVIDENCE_ACTION,
+          mode: a.mode || null,
+        });
+      }
+    }
+    const ids = [...byReport.keys()];
+    const summary = {
+      resolution: HEALTHY_EVIDENCE_OUTCOME,
+      reason: HEALTHY_EVIDENCE_REASON,
+      window_days: days,
+      since,
+      total: ids.length,
+      by_vendor: {},
+      by_gateway_host: {},
+      by_status: {},
+      reports: [],
+    };
+    if (ids.length === 0) {
+      return new Response(JSON.stringify(summary), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const select = ['id', 'status', 'sim_id', 'rental_id', 'received_at', 'closed_at',
+      'auto_remediation_state', 'remediation_action',
+      'rentals(reseller_rental_id)', 'sims(vendor,gateway_host)'].join(',');
+    // Chunked, not capped: this is a rollup, so every auto-resolved report in
+    // the window has to be counted. One `id=in.(...)` per MAX_REPORT_ID_FILTER
+    // ids keeps each request line short enough to survive.
+    const reportRows = [];
+    for (const chunk of chunkIds(ids)) {
+      const rResp = await supabaseGet(env,
+        'rental_reports?select=' + encodeURIComponent(select)
+        + '&id=in.(' + encodeURIComponent(chunk.join(',')) + ')'
+        + '&order=closed_at.desc.nullslast&limit=' + MAX_REPORT_ID_FILTER);
+      if (!rResp.ok) continue;
+      const part = await rResp.json().catch(() => []);
+      if (Array.isArray(part)) reportRows.push(...part);
+    }
+    for (const r of (Array.isArray(reportRows) ? reportRows : [])) {
+      const meta = byReport.get(r.id) || {};
+      const vendor = (r.sims && r.sims.vendor) || 'unknown';
+      const host = (r.sims && r.sims.gateway_host) || 'unknown';
+      const status = r.status || 'unknown';
+      summary.by_vendor[vendor] = (summary.by_vendor[vendor] || 0) + 1;
+      summary.by_gateway_host[host] = (summary.by_gateway_host[host] || 0) + 1;
+      summary.by_status[status] = (summary.by_status[status] || 0) + 1;
+      summary.reports.push({
+        report_id: r.id,
+        status: r.status,
+        auto_remediation_state: r.auto_remediation_state || null,
+        remediation_action: r.remediation_action || null,
+        auto_resolution: HEALTHY_EVIDENCE_OUTCOME,
+        auto_resolution_reason: HEALTHY_EVIDENCE_REASON,
+        resolved_at: meta.resolved_at || r.closed_at || null,
+        received_at: r.received_at || null,
+        sim_id: r.sim_id || null,
+        rental_id: r.rental_id || null,
+        reseller_rental_id: (r.rentals && r.rentals.reseller_rental_id) || null,
+        vendor,
+        gateway_host: host,
+      });
+    }
+    return new Response(JSON.stringify(summary), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
 function issueTypeForBadRentalRow(r) {
   if (!r) return null;
   if (r.issue_type) return r.issue_type; // forward-compatible if DB column is added later
@@ -4470,53 +4667,841 @@ function issueTypeForBadRentalRow(r) {
   return null;
 }
 
-async function handleTeltikPortOfflineExport(env, corsHeaders) {
+// Compatibility alias for the original "Export Teltik offline CSV" endpoint.
+//
+// The old handler had no date range (it swept every report ever written), a
+// UTC "today" in the filename and only the host-offline escalation reason, so
+// it could not answer "what needs escalation today". It now delegates to the
+// deterministic escalation export below, pre-filtered to the host-offline
+// escalation reason and defaulting to the last 30 New York days when the
+// caller passes no range. Existing links keep working; they just get the
+// richer, provider-vs-host separated CSV.
+async function handleTeltikPortOfflineExport(env, corsHeaders, url) {
+  const target = new URL(url ? url.toString() : 'https://dashboard/api/bad-rentals/teltik-port-offline-export');
+  if (!target.searchParams.get('escalation_reason')) {
+    target.searchParams.set('escalation_reason', 'teltik_gateway_port_offline');
+  }
+  if (!target.searchParams.get('start') && !target.searchParams.get('end') && !target.searchParams.get('days')) {
+    target.searchParams.set('days', '30');
+  }
+  return handleBadRentalEscalationExport(env, corsHeaders, target);
+}
+
+// =========================================================
+// Bad Rental Review — daily escalation export (t_732f6de4)
+//
+// Answers, for any New York date range, "which numbers/SIMs need escalating,
+// and to whom": every SIM with bad-rental reports in the range, grouped per
+// SIM, split by SERVICE PROVIDER (sims.vendor — Atomic/AT&T, Teltik, Wing,
+// Helix) and GATEWAY HOST (sims.gateway_host — the physical gateway). The two
+// axes are never collapsed: an Atomic-provider line seated in a Teltik gateway
+// escalates to Atomic for the provider claim and to Teltik for the host claim,
+// and is never reported as a "Teltik line".
+//
+// Cohorts follow the 2026-08-06 Atomic bad-rental audit:
+//   C1a  zero inbound SMS in the window (and none ever) while the provider
+//        reads Active + host port OFFLINE          → provider primary + host
+//   C1b  zero inbound SMS while the host cannot report state (port-status
+//        HTTP 400 though get-info resolves)        → joint provider + host
+//   C3   line demonstrably delivered SMS in the window but the host port reads
+//        OFFLINE now (reset already returned no_change) → host
+//   C4   provider healthy + host online + traffic flowing → NOT escalated
+//
+// Everything is filtered on UTC instants derived from the NY date range, so
+// the result never depends on which rows the Bad Rentals table happens to be
+// showing or on which page filters are active.
+// =========================================================
+
+const ESCALATION_EXPORT_TZ = 'America/New_York';
+const ESCALATION_EXPORT_MAX_DAYS = 92;
+const ESCALATION_EXPORT_REPORT_LIMIT = 5000;
+const ESCALATION_EXPORT_ATTEMPT_LIMIT = 5000;
+const ESCALATION_EXPORT_INBOUND_PAGE = 1000;
+const ESCALATION_EXPORT_INBOUND_MAX_PAGES = 20;
+const ESCALATION_EXPORT_EVER_PROBE_LIMIT = 250;
+// Port-status checks are sparse (12h cron + on-demand reads), so look a little
+// before the window for the newest state rather than reporting "never checked".
+const ESCALATION_EXPORT_HOST_LOOKBACK_MS = 3 * 24 * 60 * 60 * 1000;
+
+// --- New York (or any IANA zone) date maths, no dependencies ---------------
+
+// Milliseconds to ADD to a UTC instant to get the wall clock in `tz`
+// (negative for New York). Derived from Intl so DST is handled by the runtime.
+function tzOffsetMsAt(utcMs, tz) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const parts = {};
+  for (const p of dtf.formatToParts(new Date(utcMs))) parts[p.type] = p.value;
+  const asUtc = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    Number(parts.hour) % 24, Number(parts.minute), Number(parts.second));
+  return asUtc - utcMs;
+}
+
+// The UTC instant at which the given local calendar day starts in `tz`.
+// Two passes so a day that starts on a DST transition still resolves.
+function zonedDayStartUtcMs(dateStr, tz) {
+  const base = Date.parse(String(dateStr) + 'T00:00:00Z');
+  if (!Number.isFinite(base)) return NaN;
+  let ts = base - tzOffsetMsAt(base, tz);
+  ts = base - tzOffsetMsAt(ts, tz);
+  return ts;
+}
+
+// 'YYYY-MM-DD' for a UTC instant, in `tz`.
+function zonedDateString(utcMs, tz) {
+  const dtf = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  const parts = {};
+  for (const p of dtf.formatToParts(new Date(utcMs))) parts[p.type] = p.value;
+  return parts.year + '-' + parts.month + '-' + parts.day;
+}
+
+// 'YYYY-MM-DD HH:mm' in `tz` — the operator-facing timestamp format. Returns
+// '' for anything unparseable so a CSV cell is never the string "Invalid Date".
+function formatZonedTimestamp(value, tz) {
+  if (!value) return '';
+  const ms = value instanceof Date ? value.getTime() : Date.parse(String(value));
+  if (!Number.isFinite(ms)) return '';
+  const dtf = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
+  const parts = {};
+  for (const p of dtf.formatToParts(new Date(ms))) parts[p.type] = p.value;
+  return parts.year + '-' + parts.month + '-' + parts.day
+    + ' ' + (Number(parts.hour) % 24 + '').padStart(2, '0') + ':' + parts.minute;
+}
+
+function addDaysToDateString(dateStr, days) {
+  const ms = Date.parse(String(dateStr) + 'T00:00:00Z');
+  if (!Number.isFinite(ms)) return dateStr;
+  return new Date(ms + days * 86400000).toISOString().slice(0, 10);
+}
+
+const ESCALATION_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// Resolve ?start/?end/?days/?tz into UTC instants. No parameters at all means
+// "needs escalation today" — the current NY day. Returns { error, message }
+// with a plain-English message the UI can show verbatim.
+function parseEscalationExportRange(url, nowMs) {
+  const tz = (url.searchParams.get('tz') || '').trim() || ESCALATION_EXPORT_TZ;
   try {
-    const select = [
-      'id', 'status', 'sim_id', 'rental_id', 'last_auto_attempt_at',
-      'rentals(reseller_rental_id)',
-      'sims(id,iccid,msisdn,vendor,gateway_host)',
-    ].join(',');
-    const q = 'rental_reports?select=' + encodeURIComponent(select)
-      + '&escalation_reason=eq.' + encodeURIComponent('teltik_gateway_port_offline')
-      + '&order=last_auto_attempt_at.desc.nullslast,received_at.desc&limit=5000';
-    const resp = await supabaseGet(env, q);
-    if (!resp.ok) {
-      const txt = await resp.text();
-      return new Response(JSON.stringify({ error: 'supabase_' + resp.status, detail: txt }), {
-        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+  } catch (e) {
+    return { error: 'invalid_tz', message: 'Unknown time zone "' + tz + '". Try America/New_York.' };
+  }
+
+  const today = zonedDateString(nowMs, tz);
+  let start = (url.searchParams.get('start') || '').trim();
+  let end = (url.searchParams.get('end') || '').trim();
+  const daysParam = (url.searchParams.get('days') || '').trim();
+
+  if (!start && !end && daysParam) {
+    const n = parseInt(daysParam, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      return { error: 'invalid_days', message: '?days must be a whole number of days, 1 or more (got "' + daysParam + '").' };
+    }
+    end = today;
+    start = addDaysToDateString(today, -(Math.min(n, ESCALATION_EXPORT_MAX_DAYS) - 1));
+  }
+  if (!start && !end) { start = today; end = today; }
+  if (start && !end) end = start;
+  if (end && !start) start = end;
+
+  if (!ESCALATION_DATE_RE.test(start)) {
+    return { error: 'invalid_start', message: 'Start date must look like YYYY-MM-DD (got "' + start + '").' };
+  }
+  if (!ESCALATION_DATE_RE.test(end)) {
+    return { error: 'invalid_end', message: 'End date must look like YYYY-MM-DD (got "' + end + '").' };
+  }
+  if (end < start) {
+    return { error: 'end_before_start', message: 'End date ' + end + ' is before start date ' + start + '.' };
+  }
+
+  const startMs = zonedDayStartUtcMs(start, tz);
+  const endMs = zonedDayStartUtcMs(addDaysToDateString(end, 1), tz);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+    return { error: 'invalid_range', message: 'Could not resolve ' + start + ' → ' + end + ' in ' + tz + '.' };
+  }
+  const days = Math.round((endMs - startMs) / 86400000);
+  if (days > ESCALATION_EXPORT_MAX_DAYS) {
+    return {
+      error: 'range_too_large',
+      message: 'That range covers ' + days + ' days; the maximum is ' + ESCALATION_EXPORT_MAX_DAYS + '.',
+    };
+  }
+  return {
+    tz, start, end, days,
+    start_utc: new Date(startMs).toISOString(),
+    end_utc: new Date(endMs).toISOString(),
+    start_ms: startMs, end_ms: endMs,
+    is_today: start === today && end === today,
+  };
+}
+
+// --- Labels ---------------------------------------------------------------
+
+// SERVICE PROVIDER label — sims.vendor, the carrier account the line is
+// provisioned on. Never derived from the gateway host.
+function escalationProviderLabel(vendor) {
+  const v = String(vendor || '').toLowerCase();
+  if (v === 'atomic') return 'Atomic / AT&T (service provider)';
+  if (v === 'wing_iot') return 'Wing IoT / AT&T (service provider)';
+  if (v === 'helix') return 'Helix / T-Mobile (service provider)';
+  if (v === 'teltik') return 'Teltik (service provider)';
+  return (v || 'unknown') + ' (service provider)';
+}
+
+// GATEWAY HOST label — the physical gateway, independent of the provider.
+function escalationHostLabel(host) {
+  const h = String(host || '').toLowerCase();
+  if (h === 'teltik') return 'Teltik (gateway host)';
+  if (h === 'skyline') return 'Skyline (gateway host)';
+  return (h || 'unknown') + ' (gateway host)';
+}
+
+function mask4(value) {
+  const digits = String(value == null ? '' : value).replace(/\D/g, '');
+  return digits.length >= 4 ? '****' + digits.slice(-4) : '';
+}
+
+// --- Cohort classification (pure) -----------------------------------------
+
+// Decide whether one SIM's group of reports needs escalation, which cohort it
+// falls in, and who owns it. Provider and host verdicts are computed
+// independently and can both fire (C1a/C1b are joint escalations).
+function classifyEscalationGroup(group) {
+  const g = group || {};
+  const vendor = String(g.vendor || '').toLowerCase() || 'unknown';
+  const host = String(g.gateway_host || '').toLowerCase() || 'unknown';
+  const reasons = new Set((g.escalation_reasons || []).map(r => String(r || '').toLowerCase()).filter(Boolean));
+  const hostCheck = g.host_check || null;
+  const hostState = hostCheck ? String(hostCheck.state || '').toLowerCase() : '';
+  const httpStatus = hostCheck && hostCheck.http_status != null ? Number(hostCheck.http_status) : null;
+  const inbound = g.inbound || {};
+  const inboundCount = Number(inbound.count_in_window || 0);
+  const inboundEver = inbound.ever === true ? true : (inbound.ever === false ? false : null);
+  const resetNoChange = !!g.reset_no_change || reasons.has('teltik_reset_failed');
+
+  // ---- host verdict ----
+  let hostIssue = null;
+  if (hostState === 'offline' || reasons.has('teltik_gateway_port_offline')) {
+    hostIssue = 'teltik_gateway_port_offline';
+  } else if (hostState === 'error' && httpStatus === 400) {
+    hostIssue = 'host_port_status_http_400';
+  } else if (hostState === 'error' || hostState === 'unknown') {
+    hostIssue = 'host_unobservable';
+  } else if (reasons.has('teltik_forward_url_misconfigured')) {
+    hostIssue = 'teltik_forward_url_misconfigured';
+  } else if (resetNoChange) {
+    hostIssue = 'teltik_reset_failed';
+  }
+
+  // ---- provider verdict ----
+  // Zero inbound SMS in the window is only a PROVIDER claim when the line has
+  // also never carried traffic (or we could not establish that it has): a line
+  // that demonstrably delivered SMS is a host-side story, not a provider one.
+  const PROVIDER_REASONS = [
+    'vendor_active_no_sms', 'vendor_iccid_not_found', 'vendor_cancelled_active_rental',
+    'imei_wrong_type', 'imei_drift_vendor', 'atomic_restore_failed', 'helix_unsuspend_failed',
+    'wing_w7_dialable_retry_failed', 'wing_not_activated', 'vendor_mdn_drift', 'vendor_read_failed',
+  ];
+  let providerIssue = null;
+  if (inboundCount === 0 && inboundEver !== true) {
+    providerIssue = 'vendor_active_no_sms';
+  } else {
+    const hit = PROVIDER_REASONS.find(r => reasons.has(r));
+    if (hit) providerIssue = hit === 'wing_not_activated' ? 'wing_w7_dialable_retry_failed' : hit;
+  }
+
+  // ---- cohort ----
+  let cohort;
+  let classification;
+  if (providerIssue === 'vendor_active_no_sms' && hostIssue === 'teltik_gateway_port_offline') {
+    cohort = 'C1a_zero_inbound_host_port_offline';
+    classification = 'Zero inbound SMS in window' + (inboundEver === false ? ' and none ever received' : '')
+      + '; host reports the port OFFLINE';
+  } else if (providerIssue === 'vendor_active_no_sms' && hostIssue === 'host_port_status_http_400') {
+    cohort = 'C1b_zero_inbound_host_port_status_400';
+    classification = 'Zero inbound SMS in window' + (inboundEver === false ? ' and none ever received' : '')
+      + '; host port-status returns HTTP 400 while get-info resolves the line';
+  } else if (providerIssue === 'vendor_active_no_sms' && hostIssue) {
+    cohort = 'C1b_zero_inbound_host_unobservable';
+    classification = 'Zero inbound SMS in window; host state could not be established (' + hostIssue + ')';
+  } else if (providerIssue === 'vendor_active_no_sms') {
+    cohort = 'P1_zero_inbound_host_reads_healthy';
+    classification = 'Zero inbound SMS in window while the host port reads healthy — provider side owns this';
+  } else if (providerIssue) {
+    cohort = 'P2_provider_' + providerIssue;
+    classification = 'Provider-side failure recorded by the reviewer: ' + providerIssue;
+  } else if (hostIssue === 'teltik_gateway_port_offline') {
+    cohort = 'C3_host_port_offline_line_proven_good';
+    classification = 'Line delivered ' + inboundCount + ' inbound SMS in window but the host port reads OFFLINE now';
+  } else if (hostIssue === 'teltik_reset_failed') {
+    cohort = 'H2_host_reset_failed_no_change';
+    classification = 'Host port reset ran and returned no_change / failed';
+  } else if (hostIssue) {
+    cohort = 'H3_host_unobservable_line_proven_good';
+    classification = 'Line delivered ' + inboundCount + ' inbound SMS in window but the host cannot report port state ('
+      + hostIssue + ')';
+  } else {
+    cohort = 'C4_no_fault_found';
+    classification = 'Provider healthy, host port online, ' + inboundCount + ' inbound SMS in window — no line fault found';
+  }
+
+  const escalate = !!(providerIssue || hostIssue);
+  const providerTarget = providerIssue ? escalationProviderLabel(vendor) : '';
+  const hostTarget = hostIssue ? escalationHostLabel(host) : '';
+  const recommendedTarget = providerTarget && hostTarget
+    ? providerTarget + ' + ' + hostTarget
+    : (providerTarget || hostTarget || '');
+
+  // Failure type in the §H.3 vocabulary (escalations.mjs). When both sides
+  // fire, the provider claim is primary — that matches the audit's ownership.
+  const failureType = providerIssue || (hostIssue === 'host_port_status_http_400' ? 'teltik_gateway_port_offline' : hostIssue) || '';
+
+  // Confidence: how strongly the evidence supports the PRIMARY claim
+  // (failure_type). An unproven "never delivered" claim is capped at low even
+  // when the host read is definitive — the 2026-06-30 Atomic escalation was
+  // argued on evidence that did not hold, and this export must not repeat it.
+  let confidence = 'medium';
+  if (!escalate) confidence = 'n/a';
+  else if (providerIssue === 'vendor_active_no_sms' && inboundEver === null) confidence = 'low';
+  else if (providerIssue === 'vendor_active_no_sms' && inboundEver === false && hostState) confidence = 'high';
+  else if (!providerIssue && hostIssue === 'teltik_gateway_port_offline' && hostState === 'offline') confidence = 'high';
+
+  const providerName = escalationProviderLabel(vendor).replace(' (service provider)', '');
+  const hostName = escalationHostLabel(host).replace(' (gateway host)', '');
+  let action;
+  if (cohort.startsWith('C1a')) {
+    action = 'Escalate to ' + providerName + ': line reads Active but has carried no inbound SMS'
+      + (inboundEver === false ? ' since activation' : ' in this window')
+      + ' — ask for an HSS/provisioning attach trace on this ICCID. In parallel ask ' + hostName
+      + ' why the port is OFFLINE / whether the SIM is seated.';
+  } else if (cohort.startsWith('C1b')) {
+    action = 'Joint escalation. ' + hostName + ': /v1/port-status fails for this line while /v1/get-info resolves it'
+      + (httpStatus ? ' (HTTP ' + httpStatus + ')' : '') + ' — ask why, and whether the line is seated in a gateway port. '
+      + providerName + ': no inbound SMS' + (inboundEver === false ? ' since activation' : ' in this window')
+      + ' though the line reads Active — ask for an attach trace.';
+  } else if (cohort.startsWith('P1')) {
+    action = 'Escalate to ' + providerName + ': host port reads healthy yet no inbound SMS landed'
+      + (inboundEver === false ? ' since activation' : ' in this window') + '. Ask for an attach/delivery trace on this ICCID.';
+  } else if (cohort.startsWith('P2')) {
+    action = 'Escalate to ' + providerName + ': reviewer recorded ' + providerIssue + '. Attach the reviewer evidence below.';
+  } else if (cohort.startsWith('C3')) {
+    action = 'Escalate to ' + hostName + ': the line demonstrably delivered SMS in this window but the port reads OFFLINE now'
+      + (resetNoChange ? ' and a port reset already returned no_change' : '')
+      + ' — ask why a reset does not restore a port for a line that worked hours earlier.';
+  } else if (cohort.startsWith('H2')) {
+    action = 'Escalate to ' + hostName + ': port reset returned no_change / failed. Do not loop more resets — ask for a manual port check.';
+  } else if (cohort.startsWith('H3')) {
+    action = 'Escalate to ' + hostName + ': port state cannot be read for this line'
+      + (httpStatus ? ' (port-status HTTP ' + httpStatus + ')' : '') + ' — ask why the read fails.';
+  } else {
+    action = 'No escalation — provider and host both read healthy and traffic flowed. Treat the report as noise.';
+  }
+
+  return {
+    escalate,
+    cohort,
+    classification,
+    failure_type: failureType,
+    confidence,
+    provider_issue: providerIssue || '',
+    host_issue: hostIssue || '',
+    provider_escalation_target: providerTarget,
+    host_escalation_target: hostTarget,
+    recommended_escalation_target: recommendedTarget,
+    recommended_action: action,
+  };
+}
+
+// --- CSV shape ------------------------------------------------------------
+
+const ESCALATION_EXPORT_COLUMNS = [
+  'sim_id',
+  'service_provider',
+  'gateway_host',
+  'provider_host',
+  'reseller',
+  'reseller_rental_ids',
+  'current_mdn',
+  'teltik_known_host_mdn',
+  'iccid',
+  'report_ids',
+  'report_count',
+  'first_report_at_ny',
+  'last_report_at_ny',
+  'cohort',
+  'classification',
+  'failure_type',
+  'confidence',
+  'escalation_reasons',
+  'report_statuses',
+  'reason_codes',
+  'provider_evidence',
+  'host_evidence',
+  'inbound_sms_count_window',
+  'inbound_sms_last_at_ny',
+  'inbound_sms_ever',
+  'inbound_sms_window_ny',
+  'auto_attempts_count',
+  'auto_attempts_last',
+  'provider_escalation_target',
+  'host_escalation_target',
+  'recommended_escalation_target',
+  'recommended_action',
+];
+
+function escalationExportCsv(rows) {
+  const lines = [ESCALATION_EXPORT_COLUMNS.join(',')];
+  for (const row of rows) {
+    lines.push(ESCALATION_EXPORT_COLUMNS.map(c => csvEscape(row[c])).join(','));
+  }
+  return lines.join('\n') + '\n';
+}
+
+// bad_rental_escalations_2026-08-06_ny.csv (single day) or
+// bad_rental_escalations_2026-08-01_to_2026-08-06_ny.csv (range).
+function buildEscalationExportFilename(range, filters) {
+  const span = range.start === range.end ? range.start : range.start + '_to_' + range.end;
+  const scope = filters && filters.scope === 'all' ? 'all_' : '';
+  const reason = filters && filters.escalation_reason
+    ? String(filters.escalation_reason).replace(/[^a-z0-9_]+/gi, '_') + '_'
+    : '';
+  return 'bad_rental_escalations_' + scope + reason + span + '_ny.csv';
+}
+
+// --- Evidence assembly (pure) ---------------------------------------------
+
+// Group reports by SIM and fold in attempts / host checks / inbound evidence,
+// then classify. Pure so the whole shape is unit-testable without any IO.
+function buildEscalationExportRows({ reports, attempts, hostChecks, inbound, everKnown, range, filters }) {
+  const f = filters || {};
+  const attemptsByReport = new Map();
+  for (const a of (attempts || [])) {
+    if (!a || a.report_id == null) continue;
+    const key = String(a.report_id);
+    if (!attemptsByReport.has(key)) attemptsByReport.set(key, []);
+    attemptsByReport.get(key).push(a);
+  }
+  const hostBySim = new Map();
+  for (const c of (hostChecks || [])) {
+    if (!c || c.sim_id == null) continue;
+    const key = String(c.sim_id);
+    const prev = hostBySim.get(key);
+    const at = Date.parse(c.checked_at || '') || 0;
+    if (!prev || at > prev._at) {
+      hostBySim.set(key, { ...c, _at: at, teltik_mdn: prev && prev.teltik_mdn ? prev.teltik_mdn : null });
+    }
+    // Teltik-known host MDN: the newest check that did NOT fall back to our own
+    // current MDN (which is the provider's number, not the host's).
+    const cur = hostBySim.get(key);
+    const src = String(c.mdn_source || '').toLowerCase();
+    if (c.mdn && src && src !== 'db_current_mdn' && !cur.teltik_mdn) cur.teltik_mdn = c.mdn;
+  }
+  const inboundBySim = new Map();
+  for (const [simId, v] of (inbound instanceof Map ? inbound : new Map(Object.entries(inbound || {})))) {
+    inboundBySim.set(String(simId), v);
+  }
+
+  const groups = new Map();
+  for (const r of (reports || [])) {
+    if (!r) continue;
+    const sim = r.sims || {};
+    const vendor = String(sim.vendor || '').toLowerCase();
+    const gatewayHost = String(sim.gateway_host || '').toLowerCase()
+      || (vendor === 'teltik' ? 'teltik' : (vendor ? 'skyline' : ''));
+    if (f.vendor && vendor !== f.vendor) continue;
+    if (f.gateway_host && gatewayHost !== f.gateway_host) continue;
+
+    const simId = r.sim_id != null ? r.sim_id : (sim.id != null ? sim.id : null);
+    const key = simId != null ? 'sim:' + simId : (sim.iccid ? 'iccid:' + sim.iccid : 'report:' + r.id);
+    let g = groups.get(key);
+    if (!g) {
+      const currentE164 = Array.isArray(sim.sim_numbers) && sim.sim_numbers[0]
+        ? sim.sim_numbers[0].e164 : null;
+      g = {
+        key, sim_id: simId, vendor: vendor || 'unknown', gateway_host: gatewayHost || 'unknown',
+        iccid: sim.iccid || '', current_mdn: currentE164 || sim.msisdn || '',
+        resellers: new Set(), reseller_rental_ids: new Set(),
+        report_ids: [], statuses: new Set(), reason_codes: new Set(),
+        escalation_reasons: new Set(),
+        first_report_at: null, last_report_at: null,
+        attempt_count: 0, last_attempt: null, reset_no_change: false,
+      };
+      groups.set(key, g);
+    }
+    g.report_ids.push(r.id);
+    if (r.resellers && r.resellers.name) g.resellers.add(r.resellers.name);
+    if (r.rentals && r.rentals.reseller_rental_id) g.reseller_rental_ids.add(String(r.rentals.reseller_rental_id));
+    if (r.status) g.statuses.add(r.status);
+    if (r.reason_code) g.reason_codes.add(r.reason_code);
+    if (r.escalation_reason) g.escalation_reasons.add(r.escalation_reason);
+    if (r.received_at) {
+      if (!g.first_report_at || r.received_at < g.first_report_at) g.first_report_at = r.received_at;
+      if (!g.last_report_at || r.received_at > g.last_report_at) g.last_report_at = r.received_at;
+    }
+    for (const a of (attemptsByReport.get(String(r.id)) || [])) {
+      g.attempt_count += 1;
+      const at = a.attempted_at || '';
+      if (!g.last_attempt || at > (g.last_attempt.attempted_at || '')) g.last_attempt = a;
+      const action = String(a.action || '').toLowerCase();
+      const outcome = String(a.outcome || '').toLowerCase();
+      if (action.includes('reset') && (outcome === 'no_change' || outcome === 'failed' || outcome === 'error')) {
+        g.reset_no_change = true;
+      }
+    }
+  }
+
+  const tz = range.tz;
+  const windowLabel = range.start === range.end ? range.start + ' (NY)' : range.start + ' → ' + range.end + ' (NY)';
+  const rows = [];
+  for (const g of groups.values()) {
+    const hostCheck = g.sim_id != null ? (hostBySim.get(String(g.sim_id)) || null) : null;
+    const inb = (g.sim_id != null ? inboundBySim.get(String(g.sim_id)) : null) || { count: 0, last_at: null };
+    const everEntry = g.sim_id != null && everKnown
+      ? (everKnown instanceof Map ? everKnown.get(String(g.sim_id)) : everKnown[String(g.sim_id)])
+      : undefined;
+    const ever = inb.count > 0 ? true : (everEntry === undefined ? null : !!everEntry);
+
+    const verdict = classifyEscalationGroup({
+      vendor: g.vendor,
+      gateway_host: g.gateway_host,
+      escalation_reasons: [...g.escalation_reasons],
+      host_check: hostCheck,
+      inbound: { count_in_window: inb.count, ever },
+      reset_no_change: g.reset_no_change,
+    });
+
+    const providerEvidence = [
+      'service provider=' + g.vendor,
+      'reports=' + g.report_ids.length + (g.reason_codes.size ? ' (' + [...g.reason_codes].join('|') + ')' : ''),
+      'inbound SMS in window=' + inb.count,
+      'inbound SMS ever=' + (ever === null ? 'unknown' : (ever ? 'yes' : 'no')),
+      g.escalation_reasons.size ? 'reviewer escalation_reason=' + [...g.escalation_reasons].join('|') : '',
+    ].filter(Boolean).join('; ');
+
+    const hostEvidence = [
+      'gateway host=' + g.gateway_host,
+      hostCheck
+        ? 'port-status ' + (hostCheck.state || 'unknown')
+          + (hostCheck.http_status != null ? ' HTTP ' + hostCheck.http_status : '')
+          + ' at ' + formatZonedTimestamp(hostCheck.checked_at, tz) + ' NY'
+          + (hostCheck.mdn ? ' (mdn ' + mask4(hostCheck.mdn) + ', source ' + (hostCheck.mdn_source || 'unknown') + ')' : '')
+          + (hostCheck.error ? ' err=' + String(hostCheck.error).slice(0, 120) : '')
+        : 'no port-status check recorded in the lookback window',
+      g.reset_no_change ? 'port reset returned no_change/failed' : '',
+    ].filter(Boolean).join('; ');
+
+    const lastAttempt = g.last_attempt
+      ? (g.last_attempt.action || '?') + ' → ' + (g.last_attempt.outcome || '?')
+        + (g.last_attempt.mode ? ' [' + g.last_attempt.mode + ']' : '')
+        + ' at ' + formatZonedTimestamp(g.last_attempt.attempted_at, tz) + ' NY'
+      : '';
+
+    rows.push({
+      sim_id: g.sim_id == null ? '' : g.sim_id,
+      service_provider: g.vendor,
+      gateway_host: g.gateway_host,
+      provider_host: g.vendor + ' on ' + g.gateway_host,
+      reseller: [...g.resellers].join(' | '),
+      reseller_rental_ids: [...g.reseller_rental_ids].join(' '),
+      current_mdn: g.current_mdn || '',
+      teltik_known_host_mdn: (hostCheck && hostCheck.teltik_mdn) || '',
+      iccid: g.iccid || '',
+      report_ids: g.report_ids.join(' '),
+      report_count: g.report_ids.length,
+      first_report_at_ny: formatZonedTimestamp(g.first_report_at, tz),
+      last_report_at_ny: formatZonedTimestamp(g.last_report_at, tz),
+      cohort: verdict.cohort,
+      classification: verdict.classification,
+      failure_type: verdict.failure_type,
+      confidence: verdict.confidence,
+      escalation_reasons: [...g.escalation_reasons].join(' '),
+      report_statuses: [...g.statuses].join(' '),
+      reason_codes: [...g.reason_codes].join(' '),
+      provider_evidence: providerEvidence,
+      host_evidence: hostEvidence,
+      inbound_sms_count_window: inb.count,
+      inbound_sms_last_at_ny: formatZonedTimestamp(inb.last_at, tz),
+      inbound_sms_ever: ever === null ? 'unknown' : (ever ? 'yes' : 'no'),
+      inbound_sms_window_ny: windowLabel,
+      auto_attempts_count: g.attempt_count,
+      auto_attempts_last: lastAttempt,
+      provider_escalation_target: verdict.provider_escalation_target,
+      host_escalation_target: verdict.host_escalation_target,
+      recommended_escalation_target: verdict.recommended_escalation_target,
+      recommended_action: verdict.recommended_action,
+      _escalate: verdict.escalate,
+    });
+  }
+
+  const kept = f.scope === 'all' ? rows : rows.filter(r => r._escalate);
+  // Escalation-needed first, then the noisiest SIMs, then a stable id order.
+  kept.sort((a, b) => {
+    if (a.cohort !== b.cohort) return a.cohort < b.cohort ? -1 : 1;
+    if (b.report_count !== a.report_count) return b.report_count - a.report_count;
+    return String(a.sim_id).localeCompare(String(b.sim_id));
+  });
+
+  const totals = {
+    sims_in_range: rows.length,
+    rows: kept.length,
+    needs_escalation: rows.filter(r => r._escalate).length,
+    no_fault_found: rows.filter(r => !r._escalate).length,
+    by_cohort: {}, by_service_provider: {}, by_gateway_host: {}, by_provider_host: {},
+    by_escalation_target: {},
+  };
+  for (const r of kept) {
+    totals.by_cohort[r.cohort] = (totals.by_cohort[r.cohort] || 0) + 1;
+    totals.by_service_provider[r.service_provider] = (totals.by_service_provider[r.service_provider] || 0) + 1;
+    totals.by_gateway_host[r.gateway_host] = (totals.by_gateway_host[r.gateway_host] || 0) + 1;
+    totals.by_provider_host[r.provider_host] = (totals.by_provider_host[r.provider_host] || 0) + 1;
+    if (r.recommended_escalation_target) {
+      totals.by_escalation_target[r.recommended_escalation_target] =
+        (totals.by_escalation_target[r.recommended_escalation_target] || 0) + 1;
+    }
+  }
+  return { rows: kept, totals };
+}
+
+// --- Evidence fetching ----------------------------------------------------
+
+async function fetchEscalationExportAttempts(env, reportIds) {
+  const out = [];
+  if (!reportIds.length) return { ok: true, rows: out, truncated: false, error: null };
+  let truncated = false;
+  for (let i = 0; i < reportIds.length; i += 200) {
+    const chunk = reportIds.slice(i, i + 200);
+    const resp = await supabaseGet(env, 'rental_report_remediation_attempts?report_id=in.'
+      + encodeURIComponent('(' + chunk.join(',') + ')')
+      + '&select=report_id,action,outcome,mode,attempted_at'
+      + '&order=attempted_at.desc&limit=' + ESCALATION_EXPORT_ATTEMPT_LIMIT);
+    if (!resp.ok) return { ok: false, rows: out, truncated, error: 'attempts_http_' + resp.status };
+    const rows = await resp.json().catch(() => null);
+    if (!Array.isArray(rows)) return { ok: false, rows: out, truncated, error: 'attempts_bad_payload' };
+    if (rows.length >= ESCALATION_EXPORT_ATTEMPT_LIMIT) truncated = true;
+    out.push(...rows);
+  }
+  return { ok: true, rows: out, truncated, error: null };
+}
+
+async function fetchEscalationExportHostChecks(env, simIds, sinceIso) {
+  const out = [];
+  if (!simIds.length) return { ok: true, rows: out, truncated: false, error: null };
+  let truncated = false;
+  for (let i = 0; i < simIds.length; i += 50) {
+    const chunk = simIds.slice(i, i + 50);
+    const resp = await supabaseGet(env, 'hosting_port_status_checks?sim_id=in.'
+      + encodeURIComponent('(' + chunk.join(',') + ')')
+      + '&checked_at=gte.' + encodeURIComponent(sinceIso)
+      + '&select=sim_id,state,http_status,error,mdn,mdn_source,checked_at,gateway_host,vendor'
+      + '&order=checked_at.desc&limit=1000');
+    if (!resp.ok) return { ok: false, rows: out, truncated, error: 'host_checks_http_' + resp.status };
+    const rows = await resp.json().catch(() => null);
+    if (!Array.isArray(rows)) return { ok: false, rows: out, truncated, error: 'host_checks_bad_payload' };
+    if (rows.length >= 1000) truncated = true;
+    out.push(...rows);
+  }
+  return { ok: true, rows: out, truncated, error: null };
+}
+
+// Inbound SMS actually delivered to each SIM inside the window — the one
+// signal that comes from our own ingest rather than a vendor's self-report.
+async function fetchEscalationExportInbound(env, simIds, startIso, endIso) {
+  const counts = new Map();
+  if (!simIds.length) return { ok: true, counts, truncated: false, error: null };
+  let truncated = false;
+  for (let i = 0; i < simIds.length; i += 100) {
+    const chunk = simIds.slice(i, i + 100);
+    for (let page = 0; page < ESCALATION_EXPORT_INBOUND_MAX_PAGES; page++) {
+      const resp = await supabaseGet(env, 'inbound_sms?sim_id=in.'
+        + encodeURIComponent('(' + chunk.join(',') + ')')
+        + '&received_at=gte.' + encodeURIComponent(startIso)
+        + '&received_at=lt.' + encodeURIComponent(endIso)
+        + '&select=sim_id,received_at&order=received_at.desc'
+        + '&limit=' + ESCALATION_EXPORT_INBOUND_PAGE + '&offset=' + (page * ESCALATION_EXPORT_INBOUND_PAGE));
+      if (!resp.ok) return { ok: false, counts, truncated, error: 'inbound_http_' + resp.status };
+      const rows = await resp.json().catch(() => null);
+      if (!Array.isArray(rows)) return { ok: false, counts, truncated, error: 'inbound_bad_payload' };
+      for (const row of rows) {
+        if (!row || row.sim_id == null) continue;
+        const key = String(row.sim_id);
+        const cur = counts.get(key) || { count: 0, last_at: null };
+        cur.count += 1;
+        if (!cur.last_at || (row.received_at && row.received_at > cur.last_at)) cur.last_at = row.received_at || cur.last_at;
+        counts.set(key, cur);
+      }
+      if (rows.length < ESCALATION_EXPORT_INBOUND_PAGE) break;
+      if (page === ESCALATION_EXPORT_INBOUND_MAX_PAGES - 1) truncated = true;
+    }
+  }
+  return { ok: true, counts, truncated, error: null };
+}
+
+// "Has this SIM EVER carried an inbound SMS?" — one bounded existence probe per
+// candidate SIM. Only asked for SIMs with zero traffic in the window, because
+// that is the only place the answer changes the cohort. Unprobed SIMs stay
+// 'unknown' rather than being reported as never-delivered.
+async function probeEscalationInboundEver(env, simIds, limit) {
+  const known = new Map();
+  const ids = simIds.slice(0, limit);
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(6, ids.length || 1) }, async () => {
+    while (idx < ids.length) {
+      const id = ids[idx++];
+      try {
+        const resp = await supabaseGet(env, 'inbound_sms?sim_id=eq.' + encodeURIComponent(id) + '&select=id&limit=1');
+        if (!resp.ok) continue;
+        const rows = await resp.json().catch(() => null);
+        if (Array.isArray(rows)) known.set(String(id), rows.length > 0);
+      } catch (e) {
+        // A failed probe must never read as "never delivered" — leave unknown.
+      }
+    }
+  });
+  await Promise.all(workers);
+  return { known, probed: ids.length, skipped: Math.max(0, simIds.length - ids.length) };
+}
+
+// --- Handler --------------------------------------------------------------
+
+async function handleBadRentalEscalationExport(env, corsHeaders, url) {
+  try {
+    const range = parseEscalationExportRange(url, Date.now());
+    if (range.error) {
+      return new Response(JSON.stringify({ error: range.error, message: range.message }), {
+        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
-    const rows = await resp.json();
-    const header = ['report_id','current_mdn','sim_id','iccid','gateway_host','service_provider','reseller_rental_id','last_auto_attempt_at','issue_type'];
-    const csvRows = [header].concat((Array.isArray(rows) ? rows : []).map(r => {
-      const sim = r.sims || {};
-      return [
-        r.id,
-        sim.msisdn || '',
-        r.sim_id || sim.id || '',
-        sim.iccid || '',
-        sim.gateway_host || '',
-        sim.vendor || '',
-        r.rentals && r.rentals.reseller_rental_id || '',
-        r.last_auto_attempt_at || '',
-        issueTypeForBadRentalRow(r),
-      ];
-    }));
-    const csv = csvRows.map(row => row.map(csvEscape).join(',')).join('\n') + '\n';
-    const fnDate = new Date().toISOString().slice(0, 10);
-    return new Response(csv, {
+    const format = (url.searchParams.get('format') || 'csv').toLowerCase() === 'json' ? 'json' : 'csv';
+    const filters = {
+      scope: (url.searchParams.get('scope') || '').toLowerCase() === 'all' ? 'all' : 'needs_escalation',
+      escalation_reason: (url.searchParams.get('escalation_reason') || '').trim(),
+      vendor: (url.searchParams.get('vendor') || '').trim().toLowerCase(),
+      gateway_host: (url.searchParams.get('gateway_host') || '').trim().toLowerCase(),
+    };
+
+    const select = [
+      'id', 'status', 'reason_code', 'received_at', 'sim_id', 'rental_id',
+      'escalation_reason', 'auto_remediation_state', 'last_auto_attempt_at',
+      'resellers(name)',
+      'rentals(reseller_rental_id)',
+      'sims(id,iccid,msisdn,vendor,gateway_host,sim_numbers(e164,valid_to))',
+    ].join(',');
+    let query = 'rental_reports?select=' + encodeURIComponent(select)
+      + '&received_at=gte.' + encodeURIComponent(range.start_utc)
+      + '&received_at=lt.' + encodeURIComponent(range.end_utc)
+      + '&sims.sim_numbers.valid_to=is.null';
+    if (filters.escalation_reason) {
+      query += '&escalation_reason=eq.' + encodeURIComponent(filters.escalation_reason);
+    }
+    query += '&order=received_at.asc&limit=' + ESCALATION_EXPORT_REPORT_LIMIT;
+
+    const resp = await supabaseGet(env, query);
+    if (!resp.ok) {
+      const txt = await resp.text();
+      return new Response(JSON.stringify({
+        error: 'supabase_' + resp.status,
+        message: 'Could not read bad-rental reports for ' + range.start + ' → ' + range.end + '.',
+        detail: txt.slice(0, 500),
+      }), { status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    const reports = await resp.json().catch(() => []);
+    const reportRows = Array.isArray(reports) ? reports : [];
+    const reportsTruncated = reportRows.length >= ESCALATION_EXPORT_REPORT_LIMIT;
+
+    const reportIds = reportRows.map(r => r && r.id).filter(x => x != null);
+    const simIds = [...new Set(reportRows
+      .map(r => (r && r.sim_id != null) ? r.sim_id : (r && r.sims && r.sims.id != null ? r.sims.id : null))
+      .filter(x => x != null))];
+
+    const notes = [];
+    const [attempts, hostChecks, inbound] = await Promise.all([
+      fetchEscalationExportAttempts(env, reportIds),
+      fetchEscalationExportHostChecks(env, simIds, new Date(range.start_ms - ESCALATION_EXPORT_HOST_LOOKBACK_MS).toISOString()),
+      fetchEscalationExportInbound(env, simIds, range.start_utc, range.end_utc),
+    ]);
+    if (!attempts.ok) notes.push('remediation attempts unavailable (' + attempts.error + ')');
+    if (!hostChecks.ok) notes.push('host port-status history unavailable (' + hostChecks.error + ')');
+    if (!inbound.ok) notes.push('inbound SMS evidence unavailable (' + inbound.error + ')');
+    if (attempts.truncated) notes.push('remediation attempts truncated at the query limit');
+    if (hostChecks.truncated) notes.push('host port-status history truncated at the query limit');
+    if (inbound.truncated) notes.push('inbound SMS evidence truncated at the query limit');
+    if (reportsTruncated) notes.push('report list truncated at ' + ESCALATION_EXPORT_REPORT_LIMIT + ' rows — narrow the date range');
+
+    // Only SIMs with no traffic in the window need the "ever delivered" probe.
+    let everKnown = new Map();
+    if (inbound.ok) {
+      const zeroSims = simIds.filter(id => !inbound.counts.get(String(id)));
+      const probe = await probeEscalationInboundEver(env, zeroSims, ESCALATION_EXPORT_EVER_PROBE_LIMIT);
+      everKnown = probe.known;
+      if (probe.skipped > 0) {
+        notes.push(probe.skipped + ' SIM(s) not probed for lifetime inbound SMS (cap '
+          + ESCALATION_EXPORT_EVER_PROBE_LIMIT + ') — reported as unknown');
+      }
+    }
+
+    const { rows, totals } = buildEscalationExportRows({
+      reports: reportRows,
+      attempts: attempts.rows,
+      hostChecks: hostChecks.rows,
+      inbound: inbound.counts,
+      everKnown,
+      range,
+      filters,
+    });
+
+    const meta = {
+      range: {
+        tz: range.tz, start: range.start, end: range.end, days: range.days,
+        start_utc: range.start_utc, end_utc: range.end_utc, is_today: range.is_today,
+      },
+      filters,
+      totals,
+      notes,
+      reports_in_range: reportRows.length,
+    };
+    const filename = buildEscalationExportFilename(range, filters);
+
+    if (format === 'json') {
+      return new Response(JSON.stringify({
+        ...meta,
+        filename,
+        columns: ESCALATION_EXPORT_COLUMNS,
+        rows: rows.map(r => {
+          const out = {};
+          for (const c of ESCALATION_EXPORT_COLUMNS) out[c] = r[c];
+          return out;
+        }),
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    return new Response(escalationExportCsv(rows), {
       headers: {
         ...corsHeaders,
         'Content-Type': 'text/csv; charset=utf-8',
-        'Content-Disposition': 'attachment; filename="teltik_gateway_port_offline_' + fnDate + '.csv"',
+        'Content-Disposition': 'attachment; filename="' + filename + '"',
+        'X-Escalation-Row-Count': String(rows.length),
+        'X-Escalation-Range': range.start + '..' + range.end,
+        'X-Escalation-Tz': range.tz,
+        'X-Escalation-Notes': notes.join('; ').slice(0, 400),
+        'Access-Control-Expose-Headers':
+          'Content-Disposition, X-Escalation-Row-Count, X-Escalation-Range, X-Escalation-Tz, X-Escalation-Notes',
       },
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return new Response(JSON.stringify({
+      error: 'escalation_export_failed',
+      message: String(error && error.message || error),
+    }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
 

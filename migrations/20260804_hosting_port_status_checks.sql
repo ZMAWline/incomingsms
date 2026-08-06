@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS hosting_port_status_checks (
   vendor      text,                            -- SERVICE PROVIDER (atomic/wing_iot/teltik/helix), never inferred from host
   gateway_host text NOT NULL DEFAULT 'teltik', -- physical host
   mdn         text,                            -- resolved Teltik-known MDN used for the call (10-digit)
-  mdn_source  text,                            -- teltik_inbound_sms_payload_mdn | db_current_mdn | teltik_get_phone_number_retry
+  mdn_source  text,                            -- e.g. teltik_inbound_sms_payload_mdn | teltik_get_phone_number_inventory | teltik_all_lines_inventory | db_current_mdn_unconfirmed | *_retry
   source      text NOT NULL,                   -- cron | manual_bulk | manual_sweep | single_query | bad_rental_remediator
   attempt     smallint NOT NULL DEFAULT 1,     -- 1 = first read, 2 = wrong-MDN retry
   http_status integer,                         -- NULL when no HTTP response (exception / skipped)

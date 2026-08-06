@@ -39,6 +39,7 @@ export const ALLOWED_ACTIONS = Object.freeze([
   'teltik_reset_port',
   'teltik_sync_iccid',   // T12 — DB-only ICCID resync after a physical SIM swap
   'close_duplicate',     // §E
+  'healthy_evidence_auto_resolve', // HE1 — close `remediated` on proven-healthy evidence
   'escalate',            // operator escalation
   'classify_only',       // record + reschedule, no side-effects
 ]);
