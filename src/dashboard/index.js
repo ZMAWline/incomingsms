@@ -178,6 +178,11 @@ export default {
       return handleTeltikPortOfflineExport(env, corsHeaders);
     }
 
+    // HE1 rollup — reports auto-resolved on proven-healthy evidence.
+    if (url.pathname === '/api/bad-rentals/healthy-evidence-summary' && request.method === 'GET') {
+      return handleHealthyEvidenceSummary(env, corsHeaders, url);
+    }
+
     if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/update') && request.method === 'POST') {
       const id = url.pathname.slice('/api/bad-rentals/'.length, -('/update'.length));
       return handleUpdateBadRental(id, request, env, corsHeaders);
@@ -4339,9 +4344,28 @@ async function handleErrorLogs(env, corsHeaders, url) {
 async function handleBadRentals(env, corsHeaders, url) {
   try {
     const statusParam = url.searchParams.get('status');
-    const includeAll = statusParam === 'all';
-    const statusFilter = (statusParam && !includeAll) ? statusParam : 'received,in_triage';
+    // ?auto_resolution implies a closed-report view (auto-resolved reports are
+    // status='remediated'), so without an explicit ?status we must not apply the
+    // default open-only filter — it would hide every matching row.
+    const autoResolution = (url.searchParams.get('auto_resolution') || '').trim();
+    const includeAll = statusParam === 'all' || (!statusParam && !!autoResolution);
+    const statusFilter = (statusParam && statusParam !== 'all') ? statusParam : 'received,in_triage';
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10) || 200, 1000);
+    // Bad-rental reviewer auto-resolutions (HE1). The remediator records the
+    // explicit action/reason on the ATTEMPT row rather than on
+    // rental_reports.remediation_action, whose CHECK constraint only allows
+    // (rotated|port_reset|sim_replaced|mdn_swapped|other). So filtering by
+    // ?auto_resolution=healthy_evidence_auto_resolved resolves report ids from
+    // rental_report_remediation_attempts first, then constrains the list query.
+    let autoResolutionIds = null;
+    if (autoResolution) {
+      autoResolutionIds = await fetchAutoResolvedReportIds(env, autoResolution);
+      if (autoResolutionIds.length === 0) {
+        return new Response(JSON.stringify([]), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+    }
     // Embeds:
     //   resellers(name)                       — operator label
     //   rentals(reseller_rental_id)           — reseller's own id when echoed
@@ -4363,6 +4387,9 @@ async function handleBadRentals(env, corsHeaders, url) {
     let query = 'rental_reports?select=' + encodeURIComponent(select);
     if (!includeAll) {
       query += '&status=in.(' + encodeURIComponent(statusFilter) + ')';
+    }
+    if (autoResolutionIds) {
+      query += '&id=in.(' + encodeURIComponent(autoResolutionIds.join(',')) + ')';
     }
     query += '&sims.sim_numbers.valid_to=is.null'
       + '&order=received_at.desc&limit=' + limit;
@@ -4398,9 +4425,16 @@ async function handleBadRentals(env, corsHeaders, url) {
                   last_outcome: a.outcome || null,
                   last_attempted_at: a.attempted_at || null,
                   last_mode: a.mode || null,
+                  auto_resolution: null,
+                  auto_resolved_at: null,
                 };
               }
               attemptSummary[k].count += 1;
+              // Rows arrive newest-first, so the first match is the resolving attempt.
+              if (a.outcome === HEALTHY_EVIDENCE_OUTCOME && !attemptSummary[k].auto_resolution) {
+                attemptSummary[k].auto_resolution = HEALTHY_EVIDENCE_OUTCOME;
+                attemptSummary[k].auto_resolved_at = a.attempted_at || null;
+              }
             }
           }
         }
@@ -4440,6 +4474,10 @@ async function handleBadRentals(env, corsHeaders, url) {
         auto_attempts_last_outcome: s ? s.last_outcome : null,
         auto_attempts_last_attempted_at: s ? s.last_attempted_at : null,
         auto_attempts_last_mode: s ? s.last_mode : null,
+        auto_resolution: s ? s.auto_resolution : null,
+        auto_resolution_reason: (s && s.auto_resolution === HEALTHY_EVIDENCE_OUTCOME)
+          ? HEALTHY_EVIDENCE_REASON : null,
+        auto_resolved_at: s ? s.auto_resolved_at : null,
         resellers: r.resellers || null,
         iccid: r && r.sims ? r.sims.iccid : null,
         vendor: r && r.sims ? r.sims.vendor : null,
@@ -4462,6 +4500,164 @@ async function handleBadRentals(env, corsHeaders, url) {
   }
 }
 
+
+// Bad Rental Review auto-resolution vocabulary. Mirrors
+// src/bad-rental-remediator/healthy-evidence.mjs — the remediator writes these
+// on the attempt row (action/outcome) and in the rental_report_events evidence.
+const HEALTHY_EVIDENCE_OUTCOME = 'healthy_evidence_auto_resolved';
+const HEALTHY_EVIDENCE_REASON  = 'confirmed_working';
+const HEALTHY_EVIDENCE_ACTION  = 'healthy_evidence_auto_resolve';
+
+// An `id=in.(...)` filter is spliced into a GET URL, so the id list has to
+// stay inside the request-line limits of the Workers runtime and of PostgREST's
+// proxy. HE1's whole premise is that a LARGE share of the queue is noise, so
+// the auto-resolved set grows without bound — 5000 ids would build a ~40KB URL
+// and fail with a 414 rather than returning fewer rows. Chunk (summary) or cap
+// (list) at this size instead.
+const MAX_REPORT_ID_FILTER = 500;
+
+function chunkIds(ids, size = MAX_REPORT_ID_FILTER) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += size) out.push(ids.slice(i, i + size));
+  return out;
+}
+
+// Report ids whose remediation attempts carry the given auto-resolution
+// outcome. Unknown/unsupported values return [] rather than an unfiltered
+// list, so a typo can never silently widen the result set.
+//
+// Attempts come back newest-first, so when there are more auto-resolutions
+// than one URL can carry we keep the MOST RECENT MAX_REPORT_ID_FILTER of them
+// — which is what a received_at.desc list view wants anyway — and log the drop
+// rather than truncating silently.
+async function fetchAutoResolvedReportIds(env, outcome) {
+  if (outcome !== HEALTHY_EVIDENCE_OUTCOME) return [];
+  try {
+    const resp = await supabaseGet(env,
+      'rental_report_remediation_attempts?outcome=eq.' + encodeURIComponent(outcome)
+      + '&select=report_id&order=attempted_at.desc&limit=5000');
+    if (!resp.ok) return [];
+    const rows = await resp.json();
+    if (!Array.isArray(rows)) return [];
+    const seen = new Set();
+    for (const r of rows) {
+      if (r && r.report_id != null) seen.add(r.report_id);
+    }
+    // Set iteration is insertion order, i.e. newest attempt first.
+    const ids = [...seen];
+    if (ids.length > MAX_REPORT_ID_FILTER) {
+      console.log('[fetchAutoResolvedReportIds] ' + ids.length + ' auto-resolved reports;'
+        + ' returning the ' + MAX_REPORT_ID_FILTER + ' most recent to keep the id filter in one URL');
+      return ids.slice(0, MAX_REPORT_ID_FILTER);
+    }
+    return ids;
+  } catch (e) {
+    console.log('[fetchAutoResolvedReportIds] failed: ' + e);
+    return [];
+  }
+}
+
+// GET /api/bad-rentals/healthy-evidence-summary?days=7
+//
+// Operator rollup for reports the reviewer closed on proven-healthy evidence
+// (provider Active + host port ONLINE + inbound-SMS usage proof). Answers
+// "how much of the bad-rental queue is noise, and on which vendors/hosts".
+// Customer numbers are never included — report/SIM ids and timestamps only.
+async function handleHealthyEvidenceSummary(env, corsHeaders, url) {
+  try {
+    const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '7', 10) || 7, 1), 90);
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const aResp = await supabaseGet(env,
+      'rental_report_remediation_attempts?outcome=eq.' + encodeURIComponent(HEALTHY_EVIDENCE_OUTCOME)
+      + '&attempted_at=gte.' + encodeURIComponent(since)
+      + '&select=report_id,action,outcome,mode,attempted_at&order=attempted_at.desc&limit=5000');
+    if (!aResp.ok) {
+      const txt = await aResp.text();
+      return new Response(JSON.stringify({ error: 'supabase_' + aResp.status, detail: txt }), {
+        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const attempts = await aResp.json();
+    const rows = Array.isArray(attempts) ? attempts : [];
+    // One entry per report (newest attempt wins).
+    const byReport = new Map();
+    for (const a of rows) {
+      if (!a || a.report_id == null) continue;
+      if (!byReport.has(a.report_id)) {
+        byReport.set(a.report_id, {
+          report_id: a.report_id,
+          resolved_at: a.attempted_at || null,
+          action: a.action || HEALTHY_EVIDENCE_ACTION,
+          mode: a.mode || null,
+        });
+      }
+    }
+    const ids = [...byReport.keys()];
+    const summary = {
+      resolution: HEALTHY_EVIDENCE_OUTCOME,
+      reason: HEALTHY_EVIDENCE_REASON,
+      window_days: days,
+      since,
+      total: ids.length,
+      by_vendor: {},
+      by_gateway_host: {},
+      by_status: {},
+      reports: [],
+    };
+    if (ids.length === 0) {
+      return new Response(JSON.stringify(summary), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+    const select = ['id', 'status', 'sim_id', 'rental_id', 'received_at', 'closed_at',
+      'auto_remediation_state', 'remediation_action',
+      'rentals(reseller_rental_id)', 'sims(vendor,gateway_host)'].join(',');
+    // Chunked, not capped: this is a rollup, so every auto-resolved report in
+    // the window has to be counted. One `id=in.(...)` per MAX_REPORT_ID_FILTER
+    // ids keeps each request line short enough to survive.
+    const reportRows = [];
+    for (const chunk of chunkIds(ids)) {
+      const rResp = await supabaseGet(env,
+        'rental_reports?select=' + encodeURIComponent(select)
+        + '&id=in.(' + encodeURIComponent(chunk.join(',')) + ')'
+        + '&order=closed_at.desc.nullslast&limit=' + MAX_REPORT_ID_FILTER);
+      if (!rResp.ok) continue;
+      const part = await rResp.json().catch(() => []);
+      if (Array.isArray(part)) reportRows.push(...part);
+    }
+    for (const r of reportRows) {
+      const meta = byReport.get(r.id) || {};
+      const vendor = (r.sims && r.sims.vendor) || 'unknown';
+      const host = (r.sims && r.sims.gateway_host) || 'unknown';
+      const status = r.status || 'unknown';
+      summary.by_vendor[vendor] = (summary.by_vendor[vendor] || 0) + 1;
+      summary.by_gateway_host[host] = (summary.by_gateway_host[host] || 0) + 1;
+      summary.by_status[status] = (summary.by_status[status] || 0) + 1;
+      summary.reports.push({
+        report_id: r.id,
+        status: r.status,
+        auto_remediation_state: r.auto_remediation_state || null,
+        remediation_action: r.remediation_action || null,
+        auto_resolution: HEALTHY_EVIDENCE_OUTCOME,
+        auto_resolution_reason: HEALTHY_EVIDENCE_REASON,
+        resolved_at: meta.resolved_at || r.closed_at || null,
+        received_at: r.received_at || null,
+        sim_id: r.sim_id || null,
+        rental_id: r.rental_id || null,
+        reseller_rental_id: (r.rentals && r.rentals.reseller_rental_id) || null,
+        vendor,
+        gateway_host: host,
+      });
+    }
+    return new Response(JSON.stringify(summary), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
 
 function issueTypeForBadRentalRow(r) {
   if (!r) return null;

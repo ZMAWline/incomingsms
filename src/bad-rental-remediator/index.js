@@ -30,6 +30,10 @@ import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState } from '../shared/hosting-port-status.mjs';
+import {
+  evaluateHealthyEvidence, proofWindow,
+  HEALTHY_EVIDENCE_MODE, HEALTHY_EVIDENCE_ACTION, HEALTHY_EVIDENCE_OUTCOME, HEALTHY_EVIDENCE_REASON,
+} from './healthy-evidence.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const LAST_MAIN_TICK_KEY = 'bad_rental_remediator_last_main_tick';
@@ -72,6 +76,17 @@ const ISSUE_TELTIK_GATEWAY_PORT_OFFLINE = 'Teltik gateway port offline';
 // tick performs the recheck (env TELTIK_PORT_RECHECK_WAIT_MS overrides;
 // tests set 0).
 const TELTIK_PORT_RECHECK_WAIT_MS = 30_000;
+// HE1 usage-proof lookback. We fetch inbound SMS well BEYOND the proof window
+// on purpose: healthy-evidence.mjs needs to distinguish "no traffic at all"
+// from "traffic, but stale / addressed to a retired number", and that
+// distinction is what keeps a different-rental message from auto-resolving
+// today's report.
+const INBOUND_PROOF_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+const INBOUND_PROOF_LIMIT = 25;
+// §3 post-proof notification. number.online is a reseller SYNC signal, not a
+// remediation: it may only be sent AFTER the HE1 gate has already proved the
+// line healthy. Off unless explicitly enabled.
+const HEALTHY_EVIDENCE_NOTIFY_KEYS = ['HEALTHY_EVIDENCE_NOTIFY_RESEND'];
 
 export default {
   async fetch(request, env) {
@@ -711,7 +726,12 @@ async function maybeExecuteAction(env, args) {
   // reports to classify_only diagnostics until SMS receipt is proved or fixed.
   const teltikHostPortOnline = !!(evidence.sim && isTeltikHosted(evidence.sim)
     && evidence.teltikHostPortStatus && evidence.teltikHostPortStatus.online === true);
+  // HEALTHY_EVIDENCE_ACTION is exempt: its proof is an inbound SMS that ALREADY
+  // arrived plus live provider/host reads. Sending an outbound nonce would add
+  // nothing, and blocking the close on the outbound kill switch would strand
+  // provably-healthy reports in the queue.
   const needsSmsVerify = action !== 'close_duplicate' && action !== 'classify_only'
+    && action !== HEALTHY_EVIDENCE_ACTION
     && !(classification.mode === 'TH5' && action === 'teltik_reset_port')
     && !(action === 'resend_online' && teltikHostPortOnline);
   if (needsSmsVerify && !smsSendingEnabled(env)) {
@@ -791,6 +811,10 @@ async function maybeExecuteAction(env, args) {
     // rotations don't sync back, so prefer the Teltik-known MDN over DB current.
     ctx.mdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
       || (evidence.sim && evidence.sim.current_mdn_e164) || null;
+  } else if (action === HEALTHY_EVIDENCE_ACTION) {
+    // The executor re-checks that the gate actually passed before it writes.
+    ctx.healthyEvidence = classification.healthyEvidence
+      || (evidence.healthyEvidenceGate && evidence.healthyEvidenceGate.summary) || null;
   } else if (action === 'teltik_sync_iccid') {
     // T12 — the current ICCID the classifier resolved from the get-info-by-MDN read.
     ctx.newIccid = (evidence.vendorRead && evidence.vendorRead.view && evidence.vendorRead.view.iccid) || null;
@@ -814,6 +838,38 @@ async function maybeExecuteAction(env, args) {
       outcome: 'failed',
       evidence: { exec_status: res.status, ...(res.evidence || {}) },
       errorMessage: res.errorMessage || 'close_duplicate_failed',
+      execStatus: res.status,
+    };
+  }
+
+  // HE1 — terminal healthy-evidence close. Handled here, ABOVE the Teltik-host
+  // and §C gate branches: the proof is already complete, so neither a nonce
+  // send nor another port read may gate it.
+  if (action === HEALTHY_EVIDENCE_ACTION) {
+    if (!res.ok) {
+      return {
+        outcome: 'failed',
+        evidence: { exec_status: res.status, ...(res.evidence || {}), ...(classification.evidenceSummary || {}) },
+        errorMessage: res.errorMessage || 'healthy_evidence_auto_resolve_failed',
+        execStatus: res.status,
+      };
+    }
+    // §3 — post-proof reseller notification ONLY. number.online is sent after
+    // the close, never as first-line remediation, and a failed notification
+    // never un-resolves a proven-healthy report.
+    const notify = await maybeNotifyOnlineAfterProof(env, { report, evidence, classification, attemptNo });
+    return {
+      outcome: HEALTHY_EVIDENCE_OUTCOME,
+      evidence: {
+        exec_status: res.status,
+        resolution: HEALTHY_EVIDENCE_OUTCOME,
+        resolution_reason: HEALTHY_EVIDENCE_REASON,
+        post_proof_notification: notify,
+        ...(res.evidence || {}),
+        ...(classification.evidenceSummary || {}),
+      },
+      errorMessage: null,
+      terminalReport: res.terminalReport || { status: 'remediated', remediation_action: 'other' },
       execStatus: res.status,
     };
   }
@@ -1028,6 +1084,45 @@ async function maybeExecuteAction(env, args) {
   };
 }
 
+// §3 — optional post-proof `number.online` resend.
+//
+// Deliberately NOT remediation: it runs only after the HE1 gate has already
+// closed the report, so it can never be the system's first response to a bad
+// report. Default OFF; enable with env HEALTHY_EVIDENCE_NOTIFY_RESEND=true (or
+// the same-named KV key). Any failure is recorded and swallowed.
+function healthyEvidenceNotifyEnabled(env) {
+  for (const key of HEALTHY_EVIDENCE_NOTIFY_KEYS) {
+    const v = env && env[key];
+    if (v === true || v === 'true' || v === '1') return true;
+  }
+  return false;
+}
+
+async function maybeNotifyOnlineAfterProof(env, { report, evidence, classification, attemptNo }) {
+  if (!healthyEvidenceNotifyEnabled(env)) {
+    return { sent: false, skipped: 'disabled', reason: 'post_proof_notification_disabled' };
+  }
+  try {
+    const res = await executeAction(env, {
+      action: 'resend_online',
+      report,
+      sim: evidence.sim,
+      situationId: HEALTHY_EVIDENCE_MODE,
+      evidenceBundle: classification.evidenceSummary,
+      attemptNo,
+    });
+    return {
+      sent: !!res.ok,
+      skipped: null,
+      status: res.status || null,
+      error: res.ok ? null : (res.errorMessage || 'resend_online_failed'),
+      note: 'post_proof_notification_only',
+    };
+  } catch (err) {
+    return { sent: false, skipped: null, status: 'error', error: String(err && err.message || err) };
+  }
+}
+
 function mergeEvidence(a, b) {
   if (!a && !b) return {};
   if (!a) return b;
@@ -1050,7 +1145,22 @@ function mergeEvidence(a, b) {
 // and let the report sit for next tick.
 // ---------------------------------------------------------
 
+// Wrapper: run the situation ladder, then attach the HE1 verdict to whatever
+// classification came back. Every attempt row for a report that reached the
+// gate therefore carries WHICH evidence class was missing — so a report that
+// escalates says "host unknown" or "no inbound proof" instead of leaving the
+// operator to guess why it was not auto-resolved.
 async function classifyShared(env, report, evidence) {
+  const verdict = await classifySharedLadder(env, report, evidence);
+  const gate = evidence && evidence.healthyEvidenceGate;
+  if (!verdict || !gate || verdict.mode === HEALTHY_EVIDENCE_MODE) return verdict;
+  return {
+    ...verdict,
+    evidenceSummary: { ...(verdict.evidenceSummary || {}), healthy_evidence: gate.summary },
+  };
+}
+
+async function classifySharedLadder(env, report, evidence) {
   // S2 — already replaced. rental.sim_id has moved on from report.sim_id.
   if (evidence.rental && evidence.rental.sim_id && report.sim_id
       && evidence.rental.sim_id !== report.sim_id) {
@@ -1112,6 +1222,37 @@ async function classifyShared(env, report, evidence) {
       gateway_id: evidence.sim.gateway_id || null,
       port: evidence.sim.port || null,
     });
+  }
+
+  // HE1 — HEALTHY EVIDENCE GATE (healthy-but-noisy reports).
+  //
+  // Runs AFTER the wrong-context dismissals (S2/S3/S7-stale/S4/S1 — a report
+  // about a replaced, duplicated, historical or cancelled line is not "noisy",
+  // it is misaddressed) and BEFORE every escalation or vendor write below.
+  // That ordering is the whole point: nothing unsafe fires at a line we can
+  // prove is working.
+  //
+  // All three evidence classes must hold — provider Active, host port ONLINE
+  // (Teltik-known MDN when gateway_host='teltik'), and an inbound SMS inside
+  // this report's/rental's window on a canonical number for this SIM. Any
+  // missing or unknown layer falls through untouched: the ladder below then
+  // classifies it precisely (TH5 port offline, TH2 pending host read, vendor
+  // A*/W*/H*/T* situations), with the gate's own reason attached by the
+  // wrapper above.
+  const healthy = evaluateHealthyEvidence({ report, evidence, now: new Date() });
+  evidence.healthyEvidenceGate = healthy;
+  if (healthy.passed) {
+    return {
+      ...terminal(HEALTHY_EVIDENCE_MODE, HEALTHY_EVIDENCE_ACTION, HEALTHY_EVIDENCE_OUTCOME, {
+        situation_id: HEALTHY_EVIDENCE_MODE,
+        reason: HEALTHY_EVIDENCE_REASON,
+        resolution_reason: HEALTHY_EVIDENCE_REASON,
+        vendor: (evidence.sim && evidence.sim.vendor) || null,
+        gateway_host: (evidence.sim && evidence.sim.gateway_host) || null,
+        healthy_evidence: healthy.summary,
+      }),
+      healthyEvidence: healthy.summary,
+    };
   }
 
   // TH5 — Teltik gateway-host port offline. This intentionally routes by
@@ -1384,6 +1525,10 @@ async function gatherEvidence(env, report) {
     webhook: { delivered: false, lastDeliveredAt: null },
     vendorRead: null,           // { ok, view, healthy, extras, raw } from readVendorView
     teltikKnownMdn: null,       // { mdn, source, received_at } — pickTeltikKnownMdn
+    teltikHostPortMdn: null,    // the MDN the host port read was actually keyed by
+    teltikHostPortMdnSource: null,
+    inboundProof: null,         // { ok, rows, error } — HE1 usage-proof candidates
+    healthyEvidenceGate: null,  // evaluateHealthyEvidence() verdict (set in classifyShared)
   };
 
   if (report.sim_id) {
@@ -1583,7 +1728,52 @@ async function gatherEvidence(env, report) {
     } catch (err) {
       evidence.teltikHostPortStatus = { online: false, status: 0, error: String(err && err.message || err) };
     }
+    // Stamp the provenance of THIS read. The HE1 host gate refuses to treat a
+    // port read as proof unless it was keyed by the Teltik-known MDN and taken
+    // recently — without these two fields it cannot tell correct-MDN evidence
+    // from a read against a number Teltik may no longer associate with the line.
+    if (evidence.teltikHostPortStatus && typeof evidence.teltikHostPortStatus === 'object') {
+      evidence.teltikHostPortStatus.checked_at = new Date().toISOString();
+    }
+    evidence.teltikHostPortMdn = hostReadMdn;
+    evidence.teltikHostPortMdnSource = hostReadMdnSource;
     await recordHostPortRead(env, evidence.sim, hostReadMdn, hostReadMdnSource, evidence.teltikHostPortStatus);
+  }
+  // HE1 usage proof — recent inbound SMS for THIS SIM. DB-only, one indexed
+  // query. Matching/window logic lives in healthy-evidence.mjs (pure); this
+  // just supplies candidates plus an explicit read-failure marker, because
+  // "the read failed" must never be mistaken for "the line received nothing".
+  if (report.sim_id) {
+    const window = proofWindow({ report, rental: evidence.rental, now: new Date() });
+    const anchorMs = window ? window.endMs : Date.now();
+    const since = new Date(anchorMs - INBOUND_PROOF_LOOKBACK_MS).toISOString();
+    // Upper-bound the read at the window end. `order=received_at.desc` +
+    // limit returns the NEWEST rows, so on a busy SIM whose report is being
+    // worked late (requeue, backlog) an unbounded read hands the gate 25
+    // messages that all postdate the window and the real in-window proof is
+    // never even fetched — the report then reads as "no proof" and escalates.
+    // Bounding at the window end keeps the ability to see stale traffic BELOW
+    // the window (the `inbound_sms_outside_report_window` signal) while making
+    // sure in-window rows are always in the candidate set.
+    const until = new Date(anchorMs).toISOString();
+    try {
+      const r = await supabaseGet(env,
+        'inbound_sms?sim_id=eq.' + encodeURIComponent(report.sim_id)
+        + '&received_at=gte.' + encodeURIComponent(since)
+        + '&received_at=lte.' + encodeURIComponent(until)
+        + '&select=id,sim_id,to_number,from_number,received_at,port'
+        + '&order=received_at.desc&limit=' + INBOUND_PROOF_LIMIT);
+      if (r.ok) {
+        const rows = await r.json().catch(() => []);
+        evidence.inboundProof = { ok: true, rows: Array.isArray(rows) ? rows : [], error: null };
+      } else {
+        let body = '';
+        try { body = await r.text(); } catch { body = ''; }
+        evidence.inboundProof = { ok: false, rows: [], error: 'inbound_sms_http_' + r.status + ':' + body.slice(0, 120) };
+      }
+    } catch (err) {
+      evidence.inboundProof = { ok: false, rows: [], error: String(err && err.message || err) };
+    }
   }
   // S5 gateway-offline probe (only if we have gateway+port).
   if (evidence.sim && evidence.sim.gateway_id && evidence.sim.port && env.SKYLINE_GATEWAY) {
@@ -1716,6 +1906,15 @@ async function applyClassificationState(env, report, classification, exec) {
     if (classification.outcome === 'escalate') {
       patch.auto_remediation_state = 'escalated';
       if (classification.escalationReason) patch.escalation_reason = classification.escalationReason;
+    } else if (classification.outcome === HEALTHY_EVIDENCE_OUTCOME) {
+      // The executor already wrote status='remediated' + closed_at and the
+      // audit event (mirroring close_duplicate). Only the auto state is ours.
+      // A failed close requeues so the gate re-proves from fresh reads.
+      patch.auto_remediation_state = execOk ? 'done' : 'queued';
+      if (exec && exec.execStatus && !execOk) {
+        patch.escalation_reason = exec.execStatus;
+        patch.next_review_at = computeNextReviewAt(classification, exec, patch.last_auto_attempt_at);
+      }
     } else if (classification.outcome === 'duplicate') {
       // INC-16d: close_duplicate executor already wrote rental_reports.status
       // = 'duplicate' and inserted the rental_report_events row matching the

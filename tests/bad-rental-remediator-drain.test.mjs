@@ -300,20 +300,40 @@ test('runTick drains a mixed batch: every eligible report fixed, categorized, or
   assert.match(intake.url, /next_review_at\.is\.null,next_review_at\.lte\./);
   assert.match(intake.url, /auto_remediation_state\.is\.null,auto_remediation_state\.eq\.queued/);
 
-  // R101 — Teltik-hosted Atomic with host port online: carrier+host health
-  // are both proven, so the safe number.online reseller notification fires.
-  // It still must not falsely close/remediate before SMS receipt is proved.
+  // R101 — Teltik-hosted Atomic with Atomic ACTIVE, host port online AND an
+  // inbound SMS on the canonical number inside the report window. All three
+  // HE1 evidence classes hold, so the report is a healthy-but-noisy complaint:
+  // it closes `remediated` on proof (HE1) instead of firing the TH2
+  // number.online resend first and sitting queued for SMS verification.
   const p101 = lastPatch(writes, 101, p => p.auto_remediation_state);
-  assert.equal(p101.auto_remediation_state, 'queued');
-  assert.ok(writes.attempts.some(a => a.report_id === 101
-    && a.mode === 'TH2'
-    && a.action === 'resend_online'
-    && a.outcome === 'acted_sms_unverified'
-    && a.evidence && a.evidence.safe_to_resend_online === true
-    && a.evidence.provider_vendor === 'atomic'
-    && a.evidence.host_provider === 'teltik'));
+  assert.equal(p101.auto_remediation_state, 'done');
+  const a101 = writes.attempts.find(a => a.report_id === 101);
+  assert.ok(a101, 'an attempt row was written for 101');
+  assert.equal(a101.mode, 'HE1');
+  assert.equal(a101.action, 'healthy_evidence_auto_resolve');
+  assert.equal(a101.outcome, 'healthy_evidence_auto_resolved');
+  assert.equal(a101.evidence.resolution_reason, 'confirmed_working');
+  // Provider and host stay SEPARATE facts on the evidence: Atomic is the
+  // service provider, Teltik is only the gateway host.
+  assert.equal(a101.evidence.healthy_evidence.provider.vendor, 'atomic');
+  assert.equal(a101.evidence.healthy_evidence.host.host, 'teltik');
+  assert.equal(a101.evidence.healthy_evidence.usage.ok, true);
+  // §3: no blind resend before proof, and the post-proof notification is off
+  // by default — nothing was sent at this line at all.
+  assert.equal(a101.evidence.post_proof_notification.skipped, 'disabled');
+  assert.ok(!writes.attempts.some(a => a.report_id === 101 && a.action === 'resend_online'),
+    'HE1 closes on proof; no resend_online fires ahead of it');
   assert.ok(!writes.attempts.some(a => a.report_id === 101 && a.outcome === 'verify_send_failed'),
     'no false verify_send_failed for Teltik-hosted line');
+  // The report row itself is the DB-constrained terminal close shape.
+  const close101 = lastPatch(writes, 101, p => p.status === 'remediated');
+  assert.ok(close101, 'report 101 closed remediated');
+  assert.equal(close101.remediation_action, 'other',
+    'remediation_action is CHECK-constrained; the explicit reason rides the attempt/event');
+  assert.ok(writes.events.some(e => e.report_id === 101
+    && e.to_status === 'remediated'
+    && e.evidence && e.evidence.action === 'healthy_evidence_auto_resolved'
+    && e.evidence.resolution_reason === 'confirmed_working'));
 
   // R102 — port offline: reset-port fired with the Teltik-known MDN, then
   // the nonblocking PR #34 path defers the port recheck instead of sleeping or
