@@ -101,9 +101,10 @@ test('host check reports which MDN source was used', () => {
 
 test('dashboard manual Teltik reset and ICCID heal use shared Teltik-known payload-MDN resolver', () => {
   assert.match(DASHBOARD_SRC, /resolveTeltikKnownMdnForSim/);
-  assert.match(DASHBOARD_SRC, /latestTeltikSmsQuery\(sim\.id\)/);
+  assert.match(DASHBOARD_SRC, /resolveSharedTeltikKnownMdn\(env/);
   assert.match(DASHBOARD_SRC, /resolveTeltikKnownMdnForSim\(env, \{ id: sim_id, iccid: row\.iccid \}/);
   assert.match(DASHBOARD_SRC, /const picked = await resolveTeltikKnownMdnForSim/);
+  assert.doesNotMatch(DASHBOARD_SRC, /pickTeltikKnownMdn/);
   assert.doesNotMatch(DASHBOARD_SRC, /Resolve MDN: prefer DB/);
   assert.doesNotMatch(DASHBOARD_SRC, /mdnSource = 'teltik_live'/);
 });

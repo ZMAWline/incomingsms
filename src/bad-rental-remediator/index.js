@@ -24,11 +24,14 @@ import { executeAction } from './actions.mjs';
 import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
 import { teltikPortStatus, readVendorView } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
-import { flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType } from './escalations.mjs';
+import {
+  flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType,
+  fetchEscalationBacklog, drainQueuedEscalations, DRAIN_DEFAULT_LIMIT,
+} from './escalations.mjs';
 import { classifyExpiredReport } from './stale-classifier.mjs';
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
-import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
+import { resolveTeltikKnownMdn } from '../shared/teltik-known-mdn.mjs';
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState } from '../shared/hosting-port-status.mjs';
 import {
   evaluateHealthyEvidence, proofWindow,
@@ -106,6 +109,28 @@ export default {
       }
       const status = await buildStatus(env);
       return json({ ok: true, status }, 200);
+    }
+    // Escalation delivery backlog. Counts only — line_items carry MDNs and
+    // ICCIDs and never leave the worker through this route.
+    if (url.pathname === '/escalations/backlog') {
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return json({ ok: false, error: 'unauthorized' }, 401);
+      }
+      return json({ ok: true, backlog: await fetchEscalationBacklog(env) }, 200);
+    }
+    // Out-of-band drain of rows postEscalation left queued. Dry-run unless
+    // `confirm=1`, so the default answer to "what would this post?" costs
+    // nothing and posts nothing.
+    if (url.pathname === '/escalations/drain' && request.method === 'POST') {
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return json({ ok: false, error: 'unauthorized' }, 401);
+      }
+      const confirm = url.searchParams.get('confirm') === '1';
+      const limit = parseInt(url.searchParams.get('limit') || '', 10) || DRAIN_DEFAULT_LIMIT;
+      const result = await drainQueuedEscalations(env, { limit, dryRun: !confirm });
+      return json({ ok: result.ok !== false, result }, result.ok === false ? 503 : 200);
     }
     if (url.pathname === '/kill-switch' && request.method === 'POST') {
       const secret = url.searchParams.get('secret') || '';
@@ -317,6 +342,22 @@ async function runTick(env) {
     console.log('[Remediator] vendor-batch error: ' + err);
   }
 
+  // Escalation rows that never reached Paperclip stay `queued` forever. Read
+  // the depth every tick (one exact count) so a stuck sink shows up in the
+  // logs and in `/status` -> last_main_tick instead of accumulating silently.
+  let escalationBacklog = null;
+  try {
+    escalationBacklog = await fetchEscalationBacklog(env, { detail: false });
+    if (escalationBacklog && escalationBacklog.alert) {
+      console.log('[Remediator] ESCALATION SINK BLOCKED: ' + escalationBacklog.total
+        + ' undelivered operator_escalations; missing env '
+        + (escalationBacklog.sink.missing_env || []).join(',')
+        + ' — drain via POST /escalations/drain?confirm=1 once provisioned.');
+    }
+  } catch (err) {
+    console.log('[Remediator] escalation backlog probe error: ' + err);
+  }
+
   const ms = Date.now() - startedAt;
   const dormancy_reason = reportsFetched === 0 ? 'no_open_reports' : null;
   console.log('[Remediator] tick done in ' + ms + 'ms; processed=' + processed
@@ -336,6 +377,7 @@ async function runTick(env) {
     stale_recovered: staleRecovered,
     outcomes,
     escalations: escalationsResult,
+    escalation_backlog: escalationBacklog,
     vendorBatch,
     ms,
     dormancy_reason,
@@ -350,6 +392,7 @@ async function runTick(env) {
     stale_recovered: staleRecovered,
     outcomes,
     escalations: escalationsResult,
+    escalation_backlog: escalationBacklog,
     vendorBatch,
     ms,
   };
@@ -366,11 +409,12 @@ async function recordLastTick(env, key, summary) {
 
 async function buildStatus(env) {
   const enabled = await killSwitchEnabled(env);
-  const [lastMain, lastVerify, openCounts, actionDisables] = await Promise.all([
+  const [lastMain, lastVerify, openCounts, actionDisables, escalationBacklog] = await Promise.all([
     readJsonKv(env, LAST_MAIN_TICK_KEY),
     readJsonKv(env, LAST_VERIFY_POLL_KEY),
     fetchOpenCounts(env),
     listDisabledActions(env),
+    fetchEscalationBacklog(env).catch(err => ({ error: String(err).slice(0, 200) })),
   ]);
   return {
     kill_switch: enabled ? 'enabled' : 'disabled',
@@ -378,6 +422,7 @@ async function buildStatus(env) {
     last_verify_poll: lastVerify,
     open_counts: openCounts,
     action_disables: actionDisables,
+    escalation_backlog: escalationBacklog,
     schedule: {
       main_cron: '*/5 * * * *',
       verify_poll_cron: '*/1 * * * *',
@@ -1149,7 +1194,7 @@ function mergeEvidence(a, b) {
 // classification came back. Every attempt row for a report that reached the
 // gate therefore carries WHICH evidence class was missing — so a report that
 // escalates says "host unknown" or "no inbound proof" instead of leaving the
-// operator to guess why it was not auto-resolved.
+// operator to guess why it was not auto-resolved (§4).
 async function classifyShared(env, report, evidence) {
   const verdict = await classifySharedLadder(env, report, evidence);
   const gate = evidence && evidence.healthyEvidenceGate;
@@ -1524,7 +1569,7 @@ async function gatherEvidence(env, report) {
     lastActionAttemptAt: {},    // per-action latest attempted_at (ISO)
     webhook: { delivered: false, lastDeliveredAt: null },
     vendorRead: null,           // { ok, view, healthy, extras, raw } from readVendorView
-    teltikKnownMdn: null,       // { mdn, source, received_at } — pickTeltikKnownMdn
+    teltikKnownMdn: null,       // { mdn, source, received_at } — shared Teltik-known MDN resolver
     teltikHostPortMdn: null,    // the MDN the host port read was actually keyed by
     teltikHostPortMdnSource: null,
     inboundProof: null,         // { ok, rows, error } — HE1 usage-proof candidates
@@ -1677,22 +1722,21 @@ async function gatherEvidence(env, report) {
   // Teltik-known MDN — the MDN the Teltik side still knows this line by.
   // Rotations don't sync back to Teltik, so any Teltik per-line call
   // (/v1/get-info, /v1/reset-port, /v1/reset-network) keyed by the DB current
-  // MDN can 404/miss. Prefer the raw payload destination of the latest
-  // Teltik-delivered inbound SMS (port IS NULL rows = teltik-worker inserts);
-  // fall back to DB current MDN only when no such SMS payload MDN exists. Needed for teltik-vendor SIMs
+  // MDN can 404/miss. Use the shared resolver for every Teltik per-line call:
+  // latest raw Teltik inbound payload MDN → read-only Teltik inventory lookup
+  // → DB current MDN as explicit final fallback. Needed for teltik-vendor SIMs
   // and for any SIM physically seated in a Teltik gateway (e.g. Atomic-in-Teltik).
   if (evidence.sim && (String(evidence.sim.vendor || '').toLowerCase() === 'teltik' || isTeltikHosted(evidence.sim))) {
-    let latestTeltikSms = null;
     try {
-      const r = await supabaseGet(env, latestTeltikSmsQuery(evidence.sim.id));
-      if (r.ok) {
-        const rows = await r.json();
-        if (Array.isArray(rows) && rows.length > 0) latestTeltikSms = rows[0];
-      }
+      evidence.teltikKnownMdn = await resolveTeltikKnownMdn(env, {
+        id: evidence.sim.id,
+        iccid: evidence.sim.iccid,
+        current_mdn_e164: evidence.sim.current_mdn_e164,
+      });
     } catch (err) {
       console.log('[Remediator] teltik-known-mdn lookup failed for report ' + report.id + ': ' + err);
+      evidence.teltikKnownMdn = null;
     }
-    evidence.teltikKnownMdn = pickTeltikKnownMdn(latestTeltikSms, evidence.sim.current_mdn_e164);
   }
   // Live vendor status read — the input the classifier needs to choose a real
   // remediation action. On any failure readVendorView returns { ok:false } and
@@ -1720,7 +1764,7 @@ async function gatherEvidence(env, report) {
   if (evidence.sim && isTeltikHosted(evidence.sim)) {
     const hostReadMdn = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
       || evidence.sim.current_mdn_e164 || null;
-    const hostReadMdnSource = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+    const hostReadMdnSource = evidence.teltikKnownMdn
       ? evidence.teltikKnownMdn.source
       : (evidence.sim.current_mdn_e164 ? 'db_current_mdn' : null);
     try {

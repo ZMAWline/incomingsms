@@ -5,15 +5,22 @@ import assert from 'node:assert/strict';
 
 import {
   ESCALATION_FAILURE_TYPES,
+  ESCALATION_SINK,
+  LEGACY_CREDENTIALS_ERROR,
   normalizeFailureType,
   groupEscalations,
   computeTickId,
   buildEscalationIssue,
+  buildInboxSummary,
   buildVendorBatchIssue,
+  buildIssueForRow,
+  deliverEscalation,
+  drainQueuedEscalations,
+  fetchEscalationBacklog,
   flushEscalations,
+  missingPaperclipCredentials,
   maybeOpenVendorBatchTickets,
   reserveEscalation,
-  postEscalation,
 } from '../src/bad-rental-remediator/escalations.mjs';
 
 // ---------------------------------------------------------
@@ -164,6 +171,9 @@ function buildEnvWithFakeFetch({ insertConflicts = {} } = {}) {
     if (u.includes('/rest/v1/operator_escalations') && init && init.method === 'PATCH') {
       return new Response(null, { status: 200 });
     }
+    if (u.includes('/rest/v1/pending_review_items') && init && init.method === 'POST') {
+      return new Response(JSON.stringify([{ id: 'PRI-' + calls.length }]), { status: 201, headers: { 'Content-Type': 'application/json' } });
+    }
     if (u.includes('/api/issues')) {
       return new Response(JSON.stringify({ id: 'INC-AUTO-1' }), { status: 201, headers: { 'Content-Type': 'application/json' } });
     }
@@ -187,7 +197,7 @@ function buildEnvWithFakeFetch({ insertConflicts = {} } = {}) {
   };
 }
 
-test('flushEscalations: groups by (vendor,failure_type), POSTs one issue per batch', async () => {
+test('flushEscalations: groups by (vendor,failure_type), delivers one inbox item per batch', async () => {
   const { env, calls, restore } = buildEnvWithFakeFetch();
   try {
     const result = await flushEscalations(env, {
@@ -200,9 +210,9 @@ test('flushEscalations: groups by (vendor,failure_type), POSTs one issue per bat
     });
     assert.equal(result.batches, 2);
     assert.equal(result.reserved, 2);
-    assert.equal(result.posted, 2);
-    const posts = calls.filter(c => c.method === 'POST' && c.url.includes('/api/issues'));
-    assert.equal(posts.length, 2);
+    assert.equal(result.delivered, 2);
+    const inboxPosts = calls.filter(c => c.method === 'POST' && c.url.includes('/pending_review_items'));
+    assert.equal(inboxPosts.length, 2);
   } finally { restore(); }
 });
 
@@ -219,12 +229,12 @@ test('flushEscalations: 409 on UNIQUE conflict → skipped_dedup, no Paperclip P
       ],
     });
     assert.equal(result.skipped_dedup, 1);
-    assert.equal(result.posted, 0);
+    assert.equal(result.delivered, 0);
     assert.equal(calls.filter(c => c.url.includes('/api/issues')).length, 0);
   } finally { restore(); }
 });
 
-test('flushEscalations: missing PAPERCLIP creds → reservation kept, POST skipped', async () => {
+test('flushEscalations: Paperclip creds are not required for inbox delivery', async () => {
   const { env, calls, restore } = buildEnvWithFakeFetch();
   delete env.PAPERCLIP_API_URL;
   delete env.PAPERCLIP_API_KEY;
@@ -234,9 +244,170 @@ test('flushEscalations: missing PAPERCLIP creds → reservation kept, POST skipp
       candidates: [{ vendor: 'helix', failure_type: 'helix_unsuspend_failed', line_item: { report_id: 1 } }],
     });
     assert.equal(result.reserved, 1);
-    assert.equal(result.posted, 0);
+    assert.equal(result.delivered, 1);
+    assert.equal(calls.filter(c => c.url.includes('/pending_review_items')).length, 1);
     assert.equal(calls.filter(c => c.url.includes('/api/issues')).length, 0);
   } finally { restore(); }
+});
+
+test('missingPaperclipCredentials: Paperclip is no longer required', () => {
+  assert.deepEqual(missingPaperclipCredentials({}), []);
+  assert.deepEqual(missingPaperclipCredentials({ PAPERCLIP_API_URL: 'https://paperclip.example' }), []);
+  assert.deepEqual(missingPaperclipCredentials({ PAPERCLIP_API_URL: 'https://paperclip.example', PAPERCLIP_API_KEY: 'pck' }), []);
+});
+
+test('fetchEscalationBacklog: returns aggregate counts only and raises action alert', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    assert.ok(String(url).includes('/rest/v1/operator_escalations?status=not.in.(delivered,posted)'));
+    assert.equal(init.headers.Prefer, 'count=exact');
+    return new Response(JSON.stringify([
+      { id: 1, status: 'queued', last_error: 'paperclip_credentials_missing', failure_type: 'verify_send_failed', vendor: 'atomic', created_at: '2026-08-01T00:00:00Z' },
+      { id: 2, status: 'queued', last_error: 'paperclip_credentials_missing', failure_type: 'generic', vendor: 'teltik', created_at: '2026-08-02T00:00:00Z' },
+    ]), { status: 200, headers: { 'Content-Type': 'application/json', 'content-range': '0-1/2' } });
+  };
+  try {
+    const out = await fetchEscalationBacklog({ SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'srv' });
+    assert.equal(out.total, 2);
+    assert.equal(out.by_vendor.atomic, 1);
+    assert.equal(out.by_failure_type.generic, 1);
+    assert.equal(out.needs_action, 2);
+    assert.equal(out.legacy_paperclip_rows, 2);
+    assert.equal(out.alert, true);
+    assert.equal(out.sink.external_credentials_required, false);
+    assert.equal(JSON.stringify(out).includes('line_items'), false);
+    assert.equal(JSON.stringify(out).includes('+1555'), false);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test('drainQueuedEscalations: dry-run needs no Paperclip creds and does not PATCH rows', async () => {
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method || 'GET', body: init.body || null });
+    return new Response(JSON.stringify([
+      { id: 1, status: 'queued', last_error: 'paperclip_credentials_missing', failure_type: 'verify_send_failed', vendor: 'atomic', created_at: '2026-08-01T00:00:00Z' },
+    ]), { status: 200, headers: { 'Content-Type': 'application/json', 'content-range': '0-0/1' } });
+  };
+  try {
+    const out = await drainQueuedEscalations({ SUPABASE_URL: 'https://example.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'srv' }, { dryRun: true });
+    assert.equal(out.ok, true);
+    assert.equal(out.delivered, 0);
+    assert.equal(out.planned.length, 1);
+    assert.equal(calls.some(c => c.method === 'PATCH'), false);
+    assert.equal(calls.some(c => c.url.includes('/api/issues')), false);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test('drainQueuedEscalations: dry-run previews counts without posting PII-bearing bodies', async () => {
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method || 'GET', body: init.body || null });
+    const u = String(url);
+    if (u.includes('status=not.in.(delivered,posted)')) {
+      return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json', 'content-range': '*/0' } });
+    }
+    if (u.includes('status=in.(queued,post_failed,delivery_failed)')) {
+      return new Response(JSON.stringify([
+        {
+          id: 9,
+          tick_id: '2026-08-01T00:00:00.000Z',
+          vendor: 'atomic',
+          failure_type: 'verify_send_failed',
+          status: 'queued',
+          last_error: 'paperclip_credentials_missing',
+          report_ids: [101, 102],
+          line_items: [{ report_id: 101, current_mdn: '+15551234567', iccid: '89014103211118510720' }],
+          paperclip_issue_id: null,
+          created_at: '2026-08-01T00:00:00Z',
+        },
+      ]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response('not stubbed', { status: 500 });
+  };
+  try {
+    const out = await drainQueuedEscalations({
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'srv',
+      PAPERCLIP_API_URL: 'https://paperclip.example.com',
+      PAPERCLIP_API_KEY: 'pck',
+    }, { dryRun: true, limit: 500 });
+    assert.equal(out.ok, true);
+    assert.equal(out.dry_run, true);
+    assert.equal(out.limit, 200); // clamped
+    assert.equal(out.planned.length, 1);
+    assert.equal(out.planned[0].report_count, 2);
+    assert.equal(out.planned[0].line_item_count, 1);
+    assert.equal(JSON.stringify(out.planned).includes('+15551234567'), false);
+    assert.equal(JSON.stringify(out.planned).includes('89014103211118510720'), false);
+    assert.equal(calls.some(c => c.url.includes('/api/issues')), false);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test('drainQueuedEscalations: posts one issue and stamps row, skipping already-posted rows', async () => {
+  const calls = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method || 'GET', body: init.body || null });
+    const u = String(url);
+    if (u.includes('status=not.in.(delivered,posted)')) {
+      return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json', 'content-range': '*/0' } });
+    }
+    if (u.includes('status=in.(queued,post_failed,delivery_failed)')) {
+      return new Response(JSON.stringify([
+        {
+          id: 10,
+          tick_id: '2026-08-01T00:00:00.000Z',
+          vendor: 'atomic',
+          failure_type: 'verify_send_failed',
+          status: 'queued',
+          last_error: 'paperclip_credentials_missing',
+          report_ids: [101],
+          line_items: [{ report_id: 101, current_mdn: '+155****4567', iccid: '8901410...0720' }],
+          paperclip_issue_id: null,
+        },
+        { id: 11, status: 'post_failed', paperclip_issue_id: 'INC-OLD' },
+      ]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (u.includes('/pending_review_items')) {
+      return new Response(JSON.stringify([{ id: 'PRI-10' }]), { status: 201, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (u.includes('/rest/v1/operator_escalations') && init.method === 'PATCH') {
+      return new Response(null, { status: 204 });
+    }
+    return new Response('not stubbed', { status: 500 });
+  };
+  try {
+    const out = await drainQueuedEscalations({
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'srv',
+      PAPERCLIP_API_URL: 'https://paperclip.example.com',
+      PAPERCLIP_API_KEY: 'pck',
+    }, { dryRun: false, limit: 2 });
+    assert.equal(out.delivered, 1);
+    assert.equal(out.skipped, 1);
+    assert.equal(calls.filter(c => c.url.includes('/pending_review_items')).length, 1);
+    const patch = calls.find(c => c.method === 'PATCH');
+    assert.ok(patch, 'expected row update');
+    const patchBody = JSON.parse(patch.body);
+    assert.equal(patchBody.status, 'delivered');
+    assert.match(patchBody.paperclip_issue_id, /^inbox:/);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test('buildIssueForRow: rebuilds vendor_batch payload from stored ICCID rows', () => {
+  const issue = buildIssueForRow({
+    tick_id: '2026-08-01T00:00:00.000Z',
+    vendor: 'atomic',
+    failure_type: 'vendor_batch',
+    paperclip_parent_id: 'INC-16',
+    line_items: [{ iccid: 'A' }, { iccid: 'B' }, { iccid: null }],
+  });
+  assert.ok(issue.title.includes('vendor-batch'));
+  assert.ok(issue.body.includes('`A`'));
+  assert.ok(issue.body.includes('`B`'));
+  assert.equal(issue.body.includes('rental_id'), false);
 });
 
 // ---------------------------------------------------------
@@ -266,13 +437,13 @@ test('maybeOpenVendorBatchTickets: toggle on + 5 ICCIDs → exactly one ticket',
   try {
     const result = await maybeOpenVendorBatchTickets(env, { now: new Date('2026-06-09T03:00:00Z') });
     assert.equal(result.opened, 1);
-    const issuesPosted = calls.filter(c => c.url.includes('/api/issues'));
-    assert.equal(issuesPosted.length, 1);
-    const body = JSON.parse(issuesPosted[0].body);
-    assert.ok(body.title.includes('atomic'));
-    assert.ok(body.body.includes('ICCID-1') === false); // sims-stub returns A..E
-    assert.ok(body.body.includes('`A`'));
-    assert.ok(body.body.includes('`E`'));
+    const inboxPosted = calls.filter(c => c.url.includes('/pending_review_items'));
+    assert.equal(inboxPosted.length, 1);
+    const body = JSON.parse(inboxPosted[0].body)[0];
+    assert.ok(body.summary.includes('atomic'));
+    assert.ok(body.details_md.includes('ICCID-1') === false); // sims-stub returns A..E
+    assert.ok(body.details_md.includes('`A`'));
+    assert.ok(body.details_md.includes('`E`'));
   } finally { restore(); }
 });
 

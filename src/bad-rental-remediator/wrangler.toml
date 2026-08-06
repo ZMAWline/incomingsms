@@ -42,6 +42,20 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 #   PAPERCLIP_API_KEY          bearer token
 #   ESCALATION_PARENT_ISSUE_ID optional INC-XX parent for the auto-generated batch issues
 #
+# STATUS 2026-08-06: neither secret has ever been set on this worker, so every
+# escalation batch since 2026-06-09 sits queued/paperclip_credentials_missing.
+# Project migration record: the project moved OFF Paperclip on 2026-07-02 to
+# the `incomingsms` kanban board, so the operator-visible sink today is the
+# pending_review_items inbox bridge in reserveEscalation, not this POST.
+# Provision only if a Paperclip-compatible endpoint still exists:
+#   npx wrangler secret put PAPERCLIP_API_URL -c src/bad-rental-remediator/wrangler.toml
+#   npx wrangler secret put PAPERCLIP_API_KEY -c src/bad-rental-remediator/wrangler.toml
+# Then drain the backlog in bounded batches (dry-run first — omit confirm=1):
+#   curl -X POST "$WORKER/escalations/drain?secret=$ADMIN_RUN_SECRET&limit=25"
+#   curl -X POST "$WORKER/escalations/drain?secret=$ADMIN_RUN_SECRET&limit=25&confirm=1"
+# Depth is visible without credentials at GET /escalations/backlog and in
+# /status -> escalation_backlog.
+#
 # Service bindings used during shared-situation classification.
 # RESELLER_SYNC: resend webhook + check rental status (cancel-guard §E).
 # SKYLINE_GATEWAY: gateway port-status for S5; /send-sms wired in INC-16c.

@@ -40,7 +40,12 @@ function makeReport(id, simId, rentalId, e164) {
   return {
     id, reseller_id: 'rs1', sim_id: simId, sim_number_id: null,
     rental_id: rentalId, e164, status: 'received',
-    received_at: iso(NOW - 6 * H), auto_remediation_state: null,
+    // Keep this mixed-batch fixture on the current New York day while leaving
+    // the synthetic inbound SMS (NOW-1h) inside HE1's report-anchored proof
+    // window. A previous 6h-old timestamp became prior-day just after midnight
+    // NY, so the expired-report sweep dismissed the rows before this test
+    // reached the remediation-drain path it is meant to exercise.
+    received_at: iso(NOW - 90 * 60 * 1000), auto_remediation_state: null,
   };
 }
 
