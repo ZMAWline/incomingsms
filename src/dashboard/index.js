@@ -185,6 +185,7 @@ export default {
       return handleTeltikPortOfflineExport(env, corsHeaders, url);
     }
 
+    // HE1 rollup — reports auto-resolved on proven-healthy evidence.
     if (url.pathname === '/api/bad-rentals/healthy-evidence-summary' && request.method === 'GET') {
       return handleHealthyEvidenceSummary(env, corsHeaders, url);
     }
@@ -4347,8 +4348,8 @@ async function handleBadRentals(env, corsHeaders, url) {
     // ?auto_resolution implies a closed-report view (auto-resolved reports are
     // status='remediated'), so without an explicit ?status we must not apply the
     // default open-only filter — it would hide every matching row.
-    const autoResolutionParam = (url.searchParams.get('auto_resolution') || '').trim();
-    const includeAll = statusParam === 'all' || (!statusParam && !!autoResolutionParam);
+    const autoResolution = (url.searchParams.get('auto_resolution') || '').trim();
+    const includeAll = statusParam === 'all' || (!statusParam && !!autoResolution);
     const statusFilter = (statusParam && statusParam !== 'all') ? statusParam : 'received,in_triage';
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10) || 200, 1000);
     // Bad-rental reviewer auto-resolutions (HE1). The remediator records the
@@ -4357,7 +4358,6 @@ async function handleBadRentals(env, corsHeaders, url) {
     // (rotated|port_reset|sim_replaced|mdn_swapped|other). So filtering by
     // ?auto_resolution=healthy_evidence_auto_resolved resolves report ids from
     // rental_report_remediation_attempts first, then constrains the list query.
-    const autoResolution = autoResolutionParam;
     let autoResolutionIds = null;
     if (autoResolution) {
       autoResolutionIds = await fetchAutoResolvedReportIds(env, autoResolution);
@@ -4626,7 +4626,7 @@ async function handleHealthyEvidenceSummary(env, corsHeaders, url) {
       const part = await rResp.json().catch(() => []);
       if (Array.isArray(part)) reportRows.push(...part);
     }
-    for (const r of (Array.isArray(reportRows) ? reportRows : [])) {
+    for (const r of reportRows) {
       const meta = byReport.get(r.id) || {};
       const vendor = (r.sims && r.sims.vendor) || 'unknown';
       const host = (r.sims && r.sims.gateway_host) || 'unknown';

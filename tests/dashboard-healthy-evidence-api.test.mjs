@@ -171,12 +171,12 @@ test('a failed attempts query yields no ids rather than an unfiltered report lis
 
 test('handleBadRentals wires the auto_resolution filter and exposes the resolution per row', () => {
   // Filter plumbing.
-  assert.match(SRC, /const autoResolutionParam = \(url\.searchParams\.get\('auto_resolution'\) \|\| ''\)\.trim\(\);/);
+  assert.match(SRC, /const autoResolution = \(url\.searchParams\.get\('auto_resolution'\) \|\| ''\)\.trim\(\);/);
   assert.match(SRC, /autoResolutionIds = await fetchAutoResolvedReportIds\(env, autoResolution\);/);
   assert.match(SRC, /query \+= '&id=in\.\(' \+ encodeURIComponent\(autoResolutionIds\.join\(','\)\) \+ '\)';/);
   // Auto-resolved reports are status='remediated', so ?auto_resolution without
   // an explicit ?status must not fall back to the open-only default filter.
-  assert.match(SRC, /const includeAll = statusParam === 'all' \|\| \(!statusParam && !!autoResolutionParam\);/);
+  assert.match(SRC, /const includeAll = statusParam === 'all' \|\| \(!statusParam && !!autoResolution\);/);
   // Per-row exposure.
   assert.match(SRC, /auto_resolution: s \? s\.auto_resolution : null,/);
   assert.match(SRC, /auto_resolution_reason: \(s && s\.auto_resolution === HEALTHY_EVIDENCE_OUTCOME\)/);

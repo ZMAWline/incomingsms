@@ -1915,6 +1915,14 @@
                         <option value="Teltik gateway port offline">Teltik gateway port offline</option>
                         <option value="Teltik gateway port reset resolved">Teltik gateway port reset resolved</option>
                     </select>
+                    <!-- HE1 — auto-resolved view. Opt-in and additive: it never removes
+                         remediated rows from the Status filter above. -->
+                    <label class="flex items-center gap-2 text-xs text-dark-300 cursor-pointer" for="bad-rentals-healthy-evidence-filter" title="Show only reports the auto-reviewer closed on proven-healthy evidence (provider Active + host port ONLINE + inbound-SMS proof). These are already status=remediated, so while this is on the Status filter is not applied.">
+                        <input id="bad-rentals-healthy-evidence-filter" type="checkbox" onchange="loadBadRentals()" class="accent-emerald-500">
+                        <span class="uppercase">Auto-resolved (healthy evidence) only</span>
+                    </label>
+                    <button onclick="downloadTeltikPortOfflineExport()" class="px-3 py-2 text-xs bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition" title="Vendor-ready CSV: report id, current MDN, SIM id, ICCID, host/provider, reseller rental id">Export Teltik offline CSV</button>
+                    <span id="bad-rentals-healthy-evidence-summary" class="hidden text-xs px-2 py-1 rounded bg-teal-500/10 text-teal-200 border border-teal-500/30"></span>
                     <span id="bad-rentals-status" class="text-dark-400 text-sm ml-2"></span>
                 </div>
                 <!-- Escalation export (t_732f6de4). Deterministic by New York date
@@ -8345,6 +8353,68 @@ async function sendSimOnline(simId, phoneNumber) {
             `;
         }
 
+        // ===== HE1 — healthy-evidence auto-resolutions =====
+        // Vocabulary mirrors src/bad-rental-remediator/healthy-evidence.mjs: the
+        // reviewer closes a report with outcome healthy_evidence_auto_resolved /
+        // reason confirmed_working when the line proves healthy (provider Active +
+        // host port ONLINE + inbound-SMS usage). /api/bad-rentals surfaces this per
+        // row as auto_resolution / auto_resolution_reason / auto_resolved_at.
+
+        // Auto-resolved reports are already status='remediated', so sending the
+        // open-by-default Status filter alongside ?auto_resolution would return
+        // nothing. In the auto-resolved view we send ?auto_resolution alone and let
+        // the API widen the status set; the Status select keeps its value for when
+        // the operator switches back.
+        function badRentalsQueryString(filterVal, healthyEvidenceOnly) {
+            if (healthyEvidenceOnly) return '?auto_resolution=healthy_evidence_auto_resolved';
+            return filterVal ? ('?status=' + encodeURIComponent(filterVal)) : '';
+        }
+
+        // Row badge — shown next to the status badge so an auto-resolution is
+        // visible in every view, not just the auto-resolved one.
+        function badRentalAutoResolutionChip(r, fmtDt) {
+            if (!r || r.auto_resolution !== 'healthy_evidence_auto_resolved') return '';
+            const reason = r.auto_resolution_reason || 'confirmed_working';
+            const at = r.auto_resolved_at ? (fmtDt ? fmtDt(r.auto_resolved_at) : r.auto_resolved_at) : null;
+            const title = 'Auto-resolved by the reviewer on proven-healthy evidence · reason: ' + reason
+                + (at ? ' · resolved ' + at : ' · resolved at unknown');
+            return '<div class="mt-1"><span class="inline-block px-1.5 py-0.5 text-[10px] font-medium rounded bg-teal-500/20 text-teal-200 border border-teal-500/30" title="'
+                + escapeHtml(title) + '">Auto-resolved · healthy evidence</span></div>';
+        }
+
+        // Same fact spelled out on the auto-assessment sub-row, where the operator
+        // reads the attempt history.
+        function badRentalAutoResolutionDetail(r, fmtDt) {
+            if (!r || r.auto_resolution !== 'healthy_evidence_auto_resolved') return '';
+            const reason = r.auto_resolution_reason || 'confirmed_working';
+            const at = r.auto_resolved_at ? (fmtDt ? fmtDt(r.auto_resolved_at) : r.auto_resolved_at) : null;
+            return '<span class="ml-2 text-teal-200">auto-resolved: ' + escapeHtml(reason)
+                + (at ? ' · ' + escapeHtml(at) : '') + '</span>';
+        }
+
+        // Compact rollup chip beside the filters. Best-effort — the report list must
+        // still render when the summary endpoint is unavailable.
+        async function loadHealthyEvidenceSummary() {
+            const el = document.getElementById('bad-rentals-healthy-evidence-summary');
+            if (!el) return;
+            try {
+                const resp = await fetch(API_BASE + '/bad-rentals/healthy-evidence-summary?days=7');
+                if (!resp.ok) throw new Error('API ' + resp.status);
+                const s = await resp.json();
+                const days = (s && s.window_days) || 7;
+                const total = (s && typeof s.total === 'number') ? s.total : 0;
+                const byVendor = (s && s.by_vendor) || {};
+                const vendorParts = Object.keys(byVendor).map(function(v){ return v + ' ' + byVendor[v]; });
+                el.textContent = 'Auto-resolved (healthy evidence): ' + total + ' in ' + days + 'd';
+                el.title = 'Reports closed on proven-healthy evidence, reason ' + ((s && s.reason) || 'confirmed_working')
+                    + (vendorParts.length ? ' · by provider: ' + vendorParts.join(', ') : '');
+                el.classList.remove('hidden');
+            } catch (e) {
+                el.classList.add('hidden');
+                console.error('[loadHealthyEvidenceSummary]', e);
+            }
+        }
+
         // ===== Errors Tab =====
         async function loadBadRentals() {
             const badge = document.getElementById('bad-rentals-badge');
@@ -8352,15 +8422,23 @@ async function sendSimOnline(simId, phoneNumber) {
             const tbody = document.getElementById('bad-rentals-tbody');
             const filterSel = document.getElementById('bad-rentals-status-filter');
             const issueSel = document.getElementById('bad-rentals-issue-filter');
+            const heSel = document.getElementById('bad-rentals-healthy-evidence-filter');
             if (!tbody) return;
             initBadRentalExportDates();
             tbody.innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-dark-400">Loading&hellip;</td></tr>';
             if (statusEl) statusEl.textContent = '';
             const filterVal = filterSel ? filterSel.value : 'received,in_triage';
             const issueVal = issueSel ? issueSel.value : 'all';
-            const isOpenFilter = filterVal === 'received,in_triage';
+            const heOnly = !!(heSel && heSel.checked);
+            // Status is ignored server-side in the auto-resolved view — grey it out
+            // rather than leave a control that silently does nothing.
+            if (filterSel) filterSel.disabled = heOnly;
+            // The sidebar badge counts OPEN reports; the auto-resolved view is closed
+            // reports, so it must not write to the badge.
+            const isOpenFilter = filterVal === 'received,in_triage' && !heOnly;
+            loadHealthyEvidenceSummary();
             try {
-                const qs = filterVal ? ('?status=' + encodeURIComponent(filterVal)) : '';
+                const qs = badRentalsQueryString(filterVal, heOnly);
                 const resp = await fetch(API_BASE + '/bad-rentals' + qs);
                 if (!resp.ok) throw new Error('API ' + resp.status);
                 let rows = await resp.json();
@@ -8390,7 +8468,8 @@ async function sendSimOnline(simId, phoneNumber) {
                     ? filterSel.options[filterSel.selectedIndex].text
                     : filterVal;
                 const issueLabel = issueVal && issueVal !== 'all' ? (' · issue: ' + issueVal) : '';
-                if (statusEl) statusEl.textContent = rows.length + ' report' + (rows.length === 1 ? '' : 's') + ' · filter: ' + filterLabel + issueLabel;
+                const viewLabel = heOnly ? 'auto-resolved (healthy evidence), any status' : filterLabel;
+                if (statusEl) statusEl.textContent = rows.length + ' report' + (rows.length === 1 ? '' : 's') + ' · filter: ' + viewLabel + issueLabel;
                 const fmtDt = function(s) {
                     return s ? new Date(s).toLocaleString('en-US', {month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
                 };
@@ -8502,10 +8581,14 @@ async function sendSimOnline(simId, phoneNumber) {
                             ? 'notified reseller (number.online)'
                             : (autoLastAction === 'classify_only'
                                 ? 'assessed / diagnostic only'
-                                : (autoLastAction || '?'));
+                                : (autoLastAction === 'healthy_evidence_auto_resolve'
+                                    ? 'verified healthy, closed report'
+                                    : (autoLastAction || '?')));
                         const outcomeLabel = autoLastOutcome === 'acted_sms_unverified'
                             ? 'notified, SMS receipt unverified'
-                            : (autoLastOutcome || '?');
+                            : (autoLastOutcome === 'healthy_evidence_auto_resolved'
+                                ? 'auto-resolved on healthy evidence'
+                                : (autoLastOutcome || '?'));
                         const lastTxt = autoCount > 0
                             ? 'last: ' + escapeHtml(actionLabel) + ' → ' + escapeHtml(outcomeLabel)
                                 + (autoLastMode ? ' (' + escapeHtml(autoLastMode) + ')' : '')
@@ -8518,6 +8601,7 @@ async function sendSimOnline(simId, phoneNumber) {
                             +   '<span class="font-mono text-dark-200 mr-2">' + escapeHtml(String(autoCount)) + '</span>'
                             +   stateChip
                             +   '<span class="ml-2">' + lastTxt + '</span>'
+                            +   badRentalAutoResolutionDetail(r, fmtDt)
                             + '</td>'
                             + '</tr>';
                     }
@@ -8527,7 +8611,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         '<td class="px-4 py-3 font-mono">' + mdnCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 text-xs" title="' + escapeHtml(r.reason_note || '') + '">' + escapeHtml(r.reason_code || '—') + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 text-xs">' + issueCell + '</td>' +
-                        '<td class="px-4 py-3">' + statusBadge + '</td>' +
+                        '<td class="px-4 py-3">' + statusBadge + badRentalAutoResolutionChip(r, fmtDt) + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + simLink + vendorChip + '</td>' +
                         '<td class="px-4 py-3 text-dark-300 font-mono text-xs">' + rentalIdCell + '</td>' +
                         '<td class="px-4 py-3 text-dark-400 text-xs">' + escapeHtml(fmtDt(r.received_at)) + '</td>' +
