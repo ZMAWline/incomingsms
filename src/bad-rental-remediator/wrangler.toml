@@ -4,16 +4,18 @@ compatibility_date = "2024-01-01"
 account_id = "5313f8b98e20a8915418b2683ad7278c"
 workers_dev = true
 
-# Cron every 2h per Plan v4 §G. The kill-switch KV `bad_rental_remediator_enabled`
+# Cron every 15m (Plan v4 §G baseline was 2h). The kill-switch KV `bad_rental_remediator_enabled`
 # defaults missing/false until the classifier (INC-16b) and SMS verify (INC-16c)
 # ship; until then the worker only classifies into shared situations and returns
 # no_change for everything else.
 [triggers]
-# 5-min intake (§G; was 2h — sped up 2026-06-12 so resellers wait minutes, not
-# hours, for a fix) + 1-min §C receive-poll for verify_pending reports (INC-19).
+# 15-min intake (§G; 2h -> */5 on 2026-06-12 so resellers wait minutes, not
+# hours, for a fix; */5 -> */15 on 2026-08-06 per t_deb61006) + 1-min §C
+# receive-poll for verify_pending reports (INC-19), which stays at */1 because
+# the §C nonce window is only 5 min.
 # Escalation batching still dedups on 2h tick_id slots (computeTickId), so the
-# faster intake does NOT multiply Paperclip tickets.
-crons = ["*/5 * * * *", "*/1 * * * *"]
+# intake cadence does NOT change Paperclip ticket volume.
+crons = ["*/15 * * * *", "*/1 * * * *"]
 
 # Kill-switch + cooldown state. Same KV namespace as token cache for now to
 # avoid bootstrapping a new namespace; the keyspace is namespaced by prefix

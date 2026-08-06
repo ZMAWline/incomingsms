@@ -156,10 +156,10 @@ export default {
     // Two cron expressions are registered (§G):
     //   - '*/1 * * * *'  → §C receive-poll: walk verify_pending reports, look
     //                      for the nonce in inbound_sms, timeout-then-escalate.
-    //   - '*/5 * * * *'  → main intake tick (S1..S6 + vendor classifier).
-    //                      (Was 2h; sped up 2026-06-12. Tick lock + claim CAS
-    //                      make the higher frequency safe; idle ticks are one
-    //                      indexed query.)
+    //   - '*/15 * * * *' → main intake tick (S1..S6 + vendor classifier).
+    //                      (2h → */5 on 2026-06-12, → */15 on 2026-08-06.
+    //                      Tick lock + claim CAS make any frequency safe;
+    //                      idle ticks are one indexed query.)
     // event.cron is the literal expression the trigger fired on.
     const cron = (event && event.cron) || '';
     if (cron === '*/1 * * * *') {
@@ -424,7 +424,7 @@ async function buildStatus(env) {
     action_disables: actionDisables,
     escalation_backlog: escalationBacklog,
     schedule: {
-      main_cron: '*/5 * * * *',
+      main_cron: '*/15 * * * *',
       verify_poll_cron: '*/1 * * * *',
       intake_limit: INTAKE_LIMIT,
       scan_cap: SCAN_CAP,
@@ -1987,7 +1987,7 @@ async function applyClassificationState(env, report, classification, exec) {
     patch.escalation_reason = exec.escalationReason || classification.escalationReason || 'operator_review_required';
   } else {
     // Leave queued so a later tick picks it up — parked until next_review_at
-    // so the 5-min cron doesn't rescan rows that cannot progress yet.
+    // so the intake cron doesn't rescan rows that cannot progress yet.
     patch.auto_remediation_state = 'queued';
     patch.next_review_at = computeNextReviewAt(classification, exec, patch.last_auto_attempt_at);
     // Executor asked for an earlier re-run (TH5 deferred port recheck).
