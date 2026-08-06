@@ -147,16 +147,53 @@ function safeJson(v) {
 }
 
 // ---------------------------------------------------------
-// DB-backed dedup + Paperclip POST.
+// DB-backed dedup + IncomingSMS-owned delivery.
 //
 // reserveEscalation: tries to insert one operator_escalations row per
 // (tick_id, vendor, failure_type). On UNIQUE violation returns null —
-// another tick / retry already claimed this batch.
+// another tick / retry already claimed this batch. That row is the durable
+// queue + audit record and is never deleted by this module.
 //
-// postEscalation: attempts Paperclip API call; updates the row to
-// 'posted' on success, 'post_failed' with last_error on failure.
-// Returns { ok, issueId }.
+// deliverEscalation: writes the batch notice into the operator inbox
+// (pending_review_items) and stamps the row 'delivered' with the inbox
+// reference. On failure the row goes 'delivery_failed' with last_error and
+// stays drainable. Returns { ok, ref }.
+//
+// Schema note: `operator_escalations` predates the Paperclip removal, so the
+// reference columns still carry their original names. `paperclip_issue_id`
+// now holds the IncomingSMS delivery ref ('inbox:<pending_review_items.id>')
+// and `paperclip_parent_id` the optional kanban parent ref. Keeping the
+// column names avoids a migration on a table that already holds production
+// audit rows; nothing outside this module reads them.
 // ---------------------------------------------------------
+
+// Where a delivered escalation lands. No external credential, no external
+// service: both tables are IncomingSMS-owned.
+export const ESCALATION_SINK = Object.freeze({
+  name: 'incomingsms_operator_inbox',
+  queue_table: 'operator_escalations',
+  inbox_table: 'pending_review_items',
+  inbox_kind: 'bad_rental_escalation',
+  external_credentials_required: false,
+});
+
+// 'posted' is the legacy terminal status from the Paperclip era; rows that
+// reached the old sink stay delivered and must never be re-delivered.
+export const DELIVERED_STATUSES = Object.freeze(['delivered', 'posted']);
+export const DELIVERY_FAILED_STATUS = 'delivery_failed';
+// Legacy last_error on every row the dead Paperclip sink left behind. Kept
+// only so the backlog can label those rows as drainable history — it is NOT
+// a blocker any more.
+export const LEGACY_CREDENTIALS_ERROR = 'paperclip_credentials_missing';
+
+// Compatibility surface for older imports. The Paperclip sink is removed, so
+// these intentionally do not require or report any Paperclip env variables.
+export const PAPERCLIP_CREDENTIAL_KEYS = Object.freeze([]);
+export const CREDENTIALS_MISSING_ERROR = LEGACY_CREDENTIALS_ERROR;
+
+export function missingPaperclipCredentials(env) {
+  return [];
+}
 
 export async function reserveEscalation(env, batch) {
   const row = {
@@ -184,98 +221,75 @@ export async function reserveEscalation(env, batch) {
     throw new Error('reserveEscalation failed ' + resp.status + ' ' + txt);
   }
   const rows = await resp.json().catch(() => []);
-  const reserved = Array.isArray(rows) && rows[0] || null;
+  return Array.isArray(rows) && rows[0] || null;
+}
 
-  // Bridge into the operator's dashboard inbox (pending_review_items — the
-  // same widget the rotation review uses), so bad-rental escalations and
-  // rotation escalations live in ONE place. The reserve above is the dedup
-  // gate, so this fires exactly once per (tick, vendor, failure_type) batch.
-  // Best-effort: an inbox-write failure must never block the escalation path.
-  if (reserved) {
-    const ids = (batch.report_ids || []).slice(0, 20).join(', ');
-    const sims = (batch.line_items || []).slice(0, 10)
-      .map(li => (li && (li.sim_id != null ? `#${li.sim_id}` : li.iccid)) || '?').join(', ');
-    await fetch(env.SUPABASE_URL + '/rest/v1/pending_review_items', {
+// One-line, identifier-free headline for the inbox list view. The full
+// operator-facing detail (ICCIDs, MDNs, attempts) lives in details_md, which
+// only the dashboard's escalation drawer renders.
+export function buildInboxSummary(row) {
+  const reports = Array.isArray(row.report_ids) ? row.report_ids.length : 0;
+  const lines = Array.isArray(row.line_items) ? row.line_items.length : 0;
+  const n = reports || lines;
+  return 'bad-rental ' + row.vendor + '/' + row.failure_type + ': '
+    + n + ' ' + (reports ? 'report' : 'SIM') + (n === 1 ? '' : 's') + ' need operator';
+}
+
+// Deliver a reserved batch into the operator inbox. The reserve above is the
+// dedup gate, so this runs exactly once per (tick, vendor, failure_type)
+// batch; the drainer re-runs it only for rows with no delivery ref yet.
+export async function deliverEscalation(env, reservedRow, notice) {
+  let inboxResp;
+  try {
+    inboxResp = await fetch(env.SUPABASE_URL + '/rest/v1/pending_review_items', {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
         'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
+        Prefer: 'return=representation',
       },
       body: JSON.stringify([{
-        kind: 'bad_rental_escalation',
-        summary: `bad-rental ${batch.vendor}/${batch.failure_type}: ${(batch.report_ids || []).length} report(s)`,
-        details_md: `**Vendor:** ${batch.vendor}\n**Failure type:** ${batch.failure_type}\n**Reports:** ${ids}\n**SIMs:** ${sims}\n\n_Escalated by bad-rental-remediator (operator_escalations id ${reserved.id})._`,
+        kind: ESCALATION_SINK.inbox_kind,
+        summary: buildInboxSummary(reservedRow),
+        details_md: notice.body,
         status: 'open',
       }]),
-    }).catch(err => console.error('[Escalate] inbox bridge failed: ' + err));
-  }
-  return reserved;
-}
-
-// The two secrets postEscalation needs before it can talk to Paperclip. Kept
-// as data (not an inline `if`) so the drainer and the /status surface report
-// exactly the same names an operator must `wrangler secret put`.
-export const PAPERCLIP_CREDENTIAL_KEYS = Object.freeze(['PAPERCLIP_API_URL', 'PAPERCLIP_API_KEY']);
-export const CREDENTIALS_MISSING_ERROR = 'paperclip_credentials_missing';
-
-export function missingPaperclipCredentials(env) {
-  return PAPERCLIP_CREDENTIAL_KEYS.filter(k => !env || !env[k]);
-}
-
-export async function postEscalation(env, reservedRow, issuePayload) {
-  if (missingPaperclipCredentials(env).length > 0) {
-    await updateEscalationRow(env, reservedRow.id, {
-      status: 'queued',
-      last_error: CREDENTIALS_MISSING_ERROR,
-      updated_at: new Date().toISOString(),
-    });
-    return { ok: false, error: CREDENTIALS_MISSING_ERROR };
-  }
-  const reqBody = {
-    title: issuePayload.title,
-    body: issuePayload.body,
-    parent_id: reservedRow.paperclip_parent_id || null,
-    labels: ['auto-remediator', reservedRow.vendor, reservedRow.failure_type],
-  };
-  let httpResp;
-  try {
-    httpResp = await fetch(env.PAPERCLIP_API_URL.replace(/\/+$/, '') + '/api/issues', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + env.PAPERCLIP_API_KEY,
-      },
-      body: JSON.stringify(reqBody),
     });
   } catch (err) {
-    await updateEscalationRow(env, reservedRow.id, {
-      status: 'post_failed',
-      last_error: 'paperclip_fetch_error: ' + String(err).slice(0, 200),
-      updated_at: new Date().toISOString(),
-    });
-    return { ok: false, error: 'paperclip_fetch_error' };
+    await markDeliveryFailed(env, reservedRow.id, 'inbox_fetch_error: ' + String(err).slice(0, 200));
+    return { ok: false, error: 'inbox_fetch_error' };
   }
-  if (!httpResp.ok) {
-    const txt = await httpResp.text().catch(() => '');
-    await updateEscalationRow(env, reservedRow.id, {
-      status: 'post_failed',
-      last_error: 'paperclip_http_' + httpResp.status + ': ' + txt.slice(0, 200),
-      updated_at: new Date().toISOString(),
-    });
-    return { ok: false, error: 'paperclip_http_' + httpResp.status };
+  if (!inboxResp.ok) {
+    const txt = await inboxResp.text().catch(() => '');
+    await markDeliveryFailed(env, reservedRow.id, 'inbox_http_' + inboxResp.status + ': ' + txt.slice(0, 200));
+    return { ok: false, error: 'inbox_http_' + inboxResp.status };
   }
-  const data = await httpResp.json().catch(() => ({}));
-  const issueId = data && (data.id || data.issue_id || data.issueId) || null;
+  const created = await inboxResp.json().catch(() => []);
+  const itemId = Array.isArray(created) && created[0] && created[0].id != null ? created[0].id : null;
+  // Always stamp a non-null ref: it is the drainer's "already delivered"
+  // guard, so an inbox row we cannot name must still close out the queue row.
+  const ref = 'inbox:' + (itemId != null ? itemId : 'unknown');
   await updateEscalationRow(env, reservedRow.id, {
-    status: 'posted',
-    paperclip_issue_id: issueId,
+    status: 'delivered',
+    paperclip_issue_id: ref,
     posted_at: new Date().toISOString(),
     last_error: null,
     updated_at: new Date().toISOString(),
   });
-  return { ok: true, issueId };
+  return { ok: true, ref, inbox_item_id: itemId };
+}
+
+export async function postEscalation(env, reservedRow, notice) {
+  return deliverEscalation(env, reservedRow, notice);
+}
+
+async function markDeliveryFailed(env, id, lastError) {
+  return updateEscalationRow(env, id, {
+    status: DELIVERY_FAILED_STATUS,
+    last_error: lastError,
+    updated_at: new Date().toISOString(),
+  });
 }
 
 async function updateEscalationRow(env, id, patch) {
@@ -299,11 +313,11 @@ async function updateEscalationRow(env, id, patch) {
 
 export async function flushEscalations(env, { now = new Date(), candidates, parentIssueId } = {}) {
   if (!candidates || candidates.length === 0) {
-    return { batches: 0, posted: 0, reserved: 0, skipped_dedup: 0 };
+    return { batches: 0, delivered: 0, reserved: 0, skipped_dedup: 0 };
   }
   const tickId = computeTickId(now);
   const grouped = groupEscalations(candidates);
-  let posted = 0, reserved = 0, skipped = 0;
+  let delivered = 0, reserved = 0, skipped = 0;
   for (const g of grouped) {
     const row = await reserveEscalation(env, {
       tick_id: tickId,
@@ -315,17 +329,17 @@ export async function flushEscalations(env, { now = new Date(), candidates, pare
     });
     if (!row) { skipped++; continue; }
     reserved++;
-    const issuePayload = buildEscalationIssue({
+    const notice = buildEscalationIssue({
       vendor: g.vendor,
       failure_type: g.failure_type,
       items: g.items,
       tickId,
       parentIssueId,
     });
-    const post = await postEscalation(env, row, issuePayload);
-    if (post.ok) posted++;
+    const res = await deliverEscalation(env, row, notice);
+    if (res.ok) delivered++;
   }
-  return { batches: grouped.length, posted, reserved, skipped_dedup: skipped, tickId };
+  return { batches: grouped.length, delivered, reserved, skipped_dedup: skipped, tickId };
 }
 
 // ---------------------------------------------------------
@@ -373,10 +387,10 @@ export async function maybeOpenVendorBatchTickets(env, { now = new Date(), paren
       results.push({ vendor, enabled: true, count: iccids.length, skipped_dedup: true });
       continue;
     }
-    const issuePayload = buildVendorBatchIssue({ vendor, iccids, tickId, parentIssueId });
-    const post = await postEscalation(env, reserved, issuePayload);
-    if (post.ok) opened++;
-    results.push({ vendor, enabled: true, count: iccids.length, posted: post.ok });
+    const notice = buildVendorBatchIssue({ vendor, iccids, tickId, parentIssueId });
+    const res = await deliverEscalation(env, reserved, notice);
+    if (res.ok) opened++;
+    results.push({ vendor, enabled: true, count: iccids.length, delivered: res.ok });
   }
   return { vendors: results, opened, tickId };
 }
@@ -403,28 +417,32 @@ export function buildVendorBatchIssue({ vendor, iccids, tickId, parentIssueId })
 // ---------------------------------------------------------
 // Backlog visibility + out-of-band drain.
 //
-// postEscalation deliberately leaves a row `queued` when the Paperclip
-// secrets are absent, so nothing is lost. The failure mode that bit us is
-// that nothing ever LOOKED at those rows again: every tick reserved more
-// batches and the queue grew unbounded and unreported.
+// Every tick reserves batches and delivers them immediately, so a healthy
+// backlog is empty. Anything left is a row that failed to reach the inbox,
+// plus the historical rows the dead Paperclip sink stranded — both are
+// action-needed, and both are drainable with no external credential.
 //
 // fetchEscalationBacklog is the read side (wired into /status and into every
 // tick summary). drainQueuedEscalations is the retry side — bounded,
-// admin-triggered, and idempotent, so it can be run once the secrets exist
-// without minting a duplicate issue for a row that already posted.
+// admin-triggered, and idempotent, so re-running it never files a second
+// inbox item for a row that already delivered.
 // ---------------------------------------------------------
 
 const BACKLOG_SAMPLE_CAP = 1000;
 export const DRAIN_DEFAULT_LIMIT = 25;
 export const DRAIN_MAX_LIMIT = 200;
 
+// Undelivered = anything not in DELIVERED_STATUSES. Shared by the backlog
+// read and the drain candidate query so the two can never disagree.
+const UNDELIVERED_FILTER = 'status=not.in.(' + DELIVERED_STATUSES.join(',') + ')';
+const DRAIN_STATUS_FILTER = 'status=in.(queued,post_failed,' + DELIVERY_FAILED_STATUS + ')';
+
 // Nothing here may include line-item content: vendor / failure_type / counts
 // only. line_items carry MDNs and ICCIDs and this shape lands in KV and in
 // the /status JSON.
 export async function fetchEscalationBacklog(env, { detail = true } = {}) {
-  const missing = missingPaperclipCredentials(env);
-  const sink = { paperclip_configured: missing.length === 0, missing_env: missing };
-  const base = 'operator_escalations?status=neq.posted';
+  const sink = { ...ESCALATION_SINK };
+  const base = 'operator_escalations?' + UNDELIVERED_FILTER;
   const select = detail
     ? '&select=' + encodeURIComponent('id,status,last_error,failure_type,vendor,created_at')
       + '&order=created_at.asc&limit=' + BACKLOG_SAMPLE_CAP
@@ -448,7 +466,7 @@ export async function fetchEscalationBacklog(env, { detail = true } = {}) {
   }
   const total = parseContentRangeTotal(resp.headers && resp.headers.get('content-range'));
   if (!detail) {
-    return { total, sink, alert: total > 0 && !sink.paperclip_configured };
+    return { total, sink, alert: total > 0 };
   }
   const rows = await resp.json().catch(() => []);
   const list = Array.isArray(rows) ? rows : [];
@@ -460,22 +478,30 @@ export async function fetchEscalationBacklog(env, { detail = true } = {}) {
     }
     return out;
   };
-  const blocked = list.filter(r => r && r.last_error === CREDENTIALS_MISSING_ERROR).length;
+  const deliveryFailed = list.filter(r => r && (r.status === DELIVERY_FAILED_STATUS || r.status === 'post_failed')).length;
+  const legacy = list.filter(r => r && r.last_error === LEGACY_CREDENTIALS_ERROR).length;
   const oldest = list.length ? list[0].created_at : null;
+  const undelivered = total != null ? total : list.length;
   return {
-    total: total != null ? total : list.length,
+    total: undelivered,
     sampled: list.length,
     truncated: list.length >= BACKLOG_SAMPLE_CAP,
     by_status: tally('status'),
     by_last_error: tally('last_error'),
     by_failure_type: tally('failure_type'),
     by_vendor: tally('vendor'),
-    blocked_on_credentials: blocked,
+    // Rows an operator has to act on, split by why. `legacy_paperclip_rows`
+    // is history awaiting a drain, not a live blocker — the sink needs no
+    // credential now, so draining is the whole remedy.
+    needs_action: undelivered,
+    delivery_failed: deliveryFailed,
+    legacy_paperclip_rows: legacy,
     oldest_created_at: oldest,
     sink,
-    // The whole point of this module's rework: a non-empty credential-blocked
+    // The whole point of this module's rework: a non-empty undelivered
     // backlog is an alarm, not a steady state.
-    alert: blocked > 0 || (!sink.paperclip_configured && (total || list.length) > 0),
+    alert: undelivered > 0,
+    remedy: undelivered > 0 ? 'POST /escalations/drain?confirm=1 (dry-run first)' : null,
   };
 }
 
@@ -508,30 +534,19 @@ export function buildIssueForRow(row) {
   });
 }
 
-// Bounded retry over rows postEscalation left behind. NOT wired to the cron:
-// a backlog that accumulated for weeks would post hundreds of issues the
-// instant the secrets landed, so draining stays an explicit operator action.
+// Bounded retry over rows delivery left behind — including every row the
+// removed Paperclip sink stranded. NOT wired to the cron: a backlog that
+// accumulated for weeks would file hundreds of inbox items at once, so
+// draining stays an explicit, bounded operator action over production rows.
 //
-// Duplication safety: only rows with `paperclip_issue_id IS NULL` and a
-// non-posted status are candidates, and postEscalation stamps the id +
-// status='posted' before we move on. A row that already produced an issue is
-// skipped even if it is somehow re-fetched.
+// Duplication safety: only rows with no delivery ref (`paperclip_issue_id IS
+// NULL`) and an undelivered status are candidates, and deliverEscalation
+// stamps the ref + status='delivered' before we move on. A row that already
+// produced an inbox item is skipped even if it is somehow re-fetched.
 export async function drainQueuedEscalations(env, { limit = DRAIN_DEFAULT_LIMIT, dryRun = false } = {}) {
-  const missing = missingPaperclipCredentials(env);
   const backlog = await fetchEscalationBacklog(env, { detail: true });
-  if (missing.length > 0) {
-    // Deliberately do NOT touch the rows: rewriting last_error on every
-    // attempt would churn updated_at and hide how long the backlog has sat.
-    return {
-      ok: false,
-      reason: CREDENTIALS_MISSING_ERROR,
-      missing_env: missing,
-      posted: 0, failed: 0, skipped: 0, planned: [],
-      backlog,
-    };
-  }
   const n = Math.max(1, Math.min(Number(limit) || DRAIN_DEFAULT_LIMIT, DRAIN_MAX_LIMIT));
-  const q = 'operator_escalations?status=in.(queued,post_failed)&paperclip_issue_id=is.null'
+  const q = 'operator_escalations?' + DRAIN_STATUS_FILTER + '&paperclip_issue_id=is.null'
     + '&select=*&order=created_at.asc&limit=' + n;
   const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + q, {
     headers: {
@@ -544,17 +559,17 @@ export async function drainQueuedEscalations(env, { limit = DRAIN_DEFAULT_LIMIT,
     return {
       ok: false,
       reason: 'backlog_fetch_failed_' + resp.status + ': ' + txt.slice(0, 200),
-      posted: 0, failed: 0, skipped: 0, planned: [], backlog,
+      delivered: 0, failed: 0, skipped: 0, planned: [], backlog,
     };
   }
   const rows = await resp.json().catch(() => []);
   const candidates = Array.isArray(rows) ? rows : [];
-  let posted = 0, failed = 0, skipped = 0;
+  let delivered = 0, failed = 0, skipped = 0;
   const planned = [];
   const errors = {};
   for (const row of candidates) {
-    if (!row || row.status === 'posted' || row.paperclip_issue_id) { skipped++; continue; }
-    const issuePayload = buildIssueForRow(row);
+    if (!row || DELIVERED_STATUSES.includes(row.status) || row.paperclip_issue_id) { skipped++; continue; }
+    const notice = buildIssueForRow(row);
     if (dryRun) {
       // Identifier-free preview: counts, never line-item content.
       planned.push({
@@ -570,8 +585,8 @@ export async function drainQueuedEscalations(env, { limit = DRAIN_DEFAULT_LIMIT,
       });
       continue;
     }
-    const res = await postEscalation(env, row, issuePayload);
-    if (res.ok) posted++;
+    const res = await deliverEscalation(env, row, notice);
+    if (res.ok) delivered++;
     else { failed++; errors[res.error] = (errors[res.error] || 0) + 1; }
   }
   return {
@@ -579,7 +594,7 @@ export async function drainQueuedEscalations(env, { limit = DRAIN_DEFAULT_LIMIT,
     dry_run: !!dryRun,
     limit: n,
     candidates: candidates.length,
-    posted, failed, skipped,
+    delivered, failed, skipped,
     errors,
     planned,
     backlog,
