@@ -196,6 +196,12 @@ export default {
       return handleHealthyEvidenceSummary(env, corsHeaders, url);
     }
 
+    // R2 — operator_escalations backlog (legacy queued rows the old Paperclip
+    // sink never delivered, plus anything currently failing delivery).
+    if (url.pathname === '/api/bad-rentals/escalations' && request.method === 'GET') {
+      return handleBadRentalEscalationsBacklog(env, corsHeaders);
+    }
+
     if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/update') && request.method === 'POST') {
       const id = url.pathname.slice('/api/bad-rentals/'.length, -('/update'.length));
       return handleUpdateBadRental(id, request, env, corsHeaders);
@@ -3434,6 +3440,30 @@ async function handleCatchupSweepRun(request, env, corsHeaders) {
   }
 }
 
+// R8 (t_f479e342) — for kind === 'bad_rental_escalation' rows only, parse
+// the first "### Report <id>" / "vendor: `<v>`" / "situation: `<id>`" line
+// item out of details_md (format from
+// src/bad-rental-remediator/escalations.mjs renderLineItem) so the inbox can
+// link straight to the report. Other kinds pass through unchanged.
+function enrichPendingItemRow(row) {
+  if (!row || row.kind !== 'bad_rental_escalation') return row;
+  const md = typeof row.details_md === 'string' ? row.details_md : '';
+  const reportMatch = md.match(/###\s*Report\s+(\d+)/);
+  const vendorMatch = md.match(/vendor:\s*`([^`]+)`/);
+  const situationMatch = md.match(/situation:\s*`([^`]+)`/);
+  const reportId = reportMatch ? parseInt(reportMatch[1], 10) : null;
+  const situationId = situationMatch ? situationMatch[1] : null;
+  return {
+    ...row,
+    brr: {
+      report_id: Number.isFinite(reportId) ? reportId : null,
+      vendor: vendorMatch ? vendorMatch[1] : null,
+      situation_id: situationId,
+      issue_label: brrIssueLabel(situationId, null),
+    },
+  };
+}
+
 async function handlePendingItemsList(request, env, corsHeaders) {
   try {
     const url = new URL(request.url);
@@ -3446,7 +3476,13 @@ async function handlePendingItemsList(request, env, corsHeaders) {
     };
     const filter = status === 'all' ? '' : '&status=eq.' + encodeURIComponent(status);
     const res = await fetch(base + 'pending_review_items?select=*' + filter + '&order=created_at.desc&limit=' + limit, { headers });
-    const rows = res.ok ? await res.json() : [];
+    const rawRows = res.ok ? await res.json() : [];
+    // R8 — kind-specific enrichment: bad_rental_escalation rows are
+    // otherwise generic inbox items with no link back to the report they
+    // describe. details_md is self-contained (built by
+    // bad-rental-remediator/escalations.mjs renderLineItem), so a cheap
+    // regex scan avoids an extra join.
+    const rows = Array.isArray(rawRows) ? rawRows.map(enrichPendingItemRow) : rawRows;
     // Also return count of open items for the sidebar badge
     const countRes = await fetch(base + 'pending_review_items?status=eq.open&select=id&limit=1', {
       headers: { ...headers, Prefer: 'count=exact' }
@@ -4457,6 +4493,16 @@ async function handleBadRentals(env, corsHeaders, url) {
         : null;
       const resellerRentalId = r && r.rentals ? r.rentals.reseller_rental_id : null;
       const rsn = r && r.report_sim_number ? r.report_sim_number : null;
+      // t_f479e342 — issue classification + manual next step, derived from the
+      // same attempts summary already fetched above (no extra query).
+      const issueLabel = brrIssueLabel(s ? s.last_mode : null, r.escalation_reason || null);
+      const escalationLabel = brrEscalationLabel(r.escalation_reason || null);
+      const syntheticLatestAttempt = s ? { mode: s.last_mode, outcome: s.last_outcome } : null;
+      const manualNextSteps = brrManualNextStep(
+        { status: r.status, auto_remediation_state: r.auto_remediation_state, escalation_reason: r.escalation_reason,
+          vendor: r && r.sims ? r.sims.vendor : null, gateway_host: r && r.sims ? r.sims.gateway_host : null },
+        syntheticLatestAttempt ? [syntheticLatestAttempt] : [],
+        null);
       return {
         id: r.id,
         reseller_id: r.reseller_id,
@@ -4470,6 +4516,9 @@ async function handleBadRentals(env, corsHeaders, url) {
         remediation_action: r.remediation_action,
         duplicate_of: r.duplicate_of,
         issue_type: issueTypeForBadRentalRow(r),
+        issue_label: issueLabel,
+        escalation_label: escalationLabel,
+        manual_next_step: brrManualNextStepSummary(manualNextSteps),
         received_at: r.received_at,
         triaged_at: r.triaged_at,
         closed_at: r.closed_at,
@@ -4672,6 +4721,335 @@ function issueTypeForBadRentalRow(r) {
   if (r.issue_type) return r.issue_type; // forward-compatible if DB column is added later
   if (r.escalation_reason === 'teltik_gateway_port_offline') return 'Teltik gateway port offline';
   return null;
+}
+
+// ── BRR issue classification + manual next steps (t_f479e342) ──────────────
+// Mode → human label. Source of truth: Guide tab §F tables (index.html
+// auto-rem-* rows) and classifier.mjs situation ids (A1-10, W1-9, H1-9,
+// T1-12, S1-6, TH1-5, HE1). One flat table: situation-mode keys (short alnum
+// codes like 'A1'/'T5'/'TH2') and escalation_reason keys (multi-word
+// snake_case strings like 'teltik_gateway_port_offline') never collide, so
+// both live here and issue_label can probe the same table with either key.
+const BRR_SITUATION_LABELS = {
+  // Shared/system situations (S-series) — classifySharedLadder in
+  // src/bad-rental-remediator/index.js, runs ahead of the vendor classifier.
+  S1: 'Cancelled/retired SIM — cancel-guard escalate or close duplicate',
+  S2: 'Duplicate — rental already moved to a different SIM',
+  S3: 'Duplicate of a newer open report on the same SIM',
+  S4: 'No active rental row at report time',
+  S5: 'Gateway/port offline — classify-only, deferred',
+  S6: 'Insufficient evidence — unknown/missing vendor',
+  // Teltik gateway-host situations (TH-series) — run ahead of the vendor
+  // classifier for every gateway_host=teltik SIM, independent of vendor.
+  TH1: 'Teltik host port check pending',
+  TH2: 'Teltik host + provider healthy — safe to resend online notification',
+  TH3: 'Teltik host port reset scheduled',
+  TH4: 'Teltik host port reset in progress',
+  TH5: 'Teltik gateway port offline — reset attempted, escalates on repeat',
+  // Healthy-evidence auto-resolution.
+  HE1: 'Proven healthy (provider active + host online + inbound SMS) — auto-resolved',
+  // Atomic (AT&T) — A1-A10.
+  A1: 'Atomic: Active + webhook delivered + reseller still reports bad — OTA refresh',
+  A2: 'Atomic: vendor Active, DB status stale',
+  A3: 'Atomic: subscriber Suspended',
+  A4: 'Atomic: subscriber Cancelled/Deactivated',
+  A5: 'Atomic: ICCID not found at vendor',
+  A6: 'Atomic: Active, webhook not delivered',
+  A7: 'Atomic: vendor IMEI differs from DB (same type)',
+  A8: 'Atomic: IMEI wrong type',
+  A9: 'Atomic: MDN differs DB vs vendor',
+  A10: 'Atomic: unable to reproduce after SMS verify',
+  // Wing IoT — W1-W9.
+  W1: 'Wing: Activated + dialable, DB status stale',
+  W2: 'Wing: Active dialable, webhook not delivered',
+  W3: 'Wing: Active dialable + recent reseller report',
+  W4: 'Wing: status not Activated',
+  W5: 'Wing: ICCID not found at vendor',
+  W6: 'Wing: MDN differs DB vs vendor',
+  W7: 'Wing: plan mode wrong (non-dialable)',
+  W8: 'Wing: IMEI wrong type',
+  W9: 'Wing: unable to reproduce after SMS verify',
+  // Helix (T-Mobile) — H1-H9.
+  H1: 'Helix: Active, DB status stale',
+  H2: 'Helix: Active, webhook not delivered',
+  H3: 'Helix: Active + delivered + recent reseller report',
+  H4: 'Helix: Suspended',
+  H5: 'Helix: Cancelled',
+  H6: 'Helix: not found at vendor',
+  H7: 'Helix: MDN differs DB vs vendor',
+  H8: 'Helix: IMEI wrong type or drift',
+  H9: 'Helix: unable to reproduce after SMS verify',
+  // Teltik — T1-T12.
+  T1: 'Teltik: healthy, DB status stale',
+  T2: 'Teltik: healthy, webhook not delivered',
+  T3: 'Teltik: healthy + delivered + recent reseller report',
+  T4: 'Teltik: port stuck pending/in-progress > 6h',
+  T5: 'Teltik: gateway port offline',
+  T6: 'Teltik: line suspended/cancelled at vendor',
+  T7: 'Teltik: ICCID/MDN not found at vendor',
+  T8: 'Teltik: MDN differs DB vs vendor',
+  T9: 'Teltik: forward URL missing/misconfigured',
+  T10: 'Teltik: IMEI check failed',
+  T11: 'Teltik: unable to reproduce after SMS verify',
+  T12: 'Teltik: ICCID drifted (physical SIM swap) — DB resynced',
+  pending_vendor_read: 'Waiting on first vendor read — classify-only tick',
+  // escalation_reason strings — rental_reports.escalation_reason and
+  // operator_escalations.failure_type share this vocabulary.
+  vendor_iccid_not_found: 'ICCID unknown to vendor',
+  vendor_cancelled_active_rental: 'Vendor shows cancelled/deactivated but an active rental still references it',
+  unable_to_reproduce_recommendation: 'Unable to reproduce after repeated SMS-verify ticks',
+  imei_wrong_type: 'IMEI is the wrong type for this vendor/gateway',
+  imei_drift_vendor: 'Vendor IMEI does not match DB',
+  imei_drift_gateway: 'Gateway IMEI does not match DB',
+  imei_check_failed: 'IMEI check failed',
+  teltik_forward_url_misconfigured: 'Teltik forward URL missing/misconfigured',
+  teltik_gateway_port_offline: 'Teltik gateway port offline',
+  teltik_reset_failed: 'Teltik port reset attempted and failed',
+  wing_not_activated: 'Wing IoT status is not Activated',
+  insufficient_evidence: 'Insufficient evidence to classify automatically',
+  operator_review_required: 'Auto-reviewer could not classify — needs manual review',
+  paperclip_credentials_missing: 'Legacy escalation never delivered to the inbox (dead Paperclip sink)',
+  verify_send_failed: 'SMS verification probe failed to send',
+  verify_receive_timeout: 'SMS verification probe sent but no receipt within the window',
+};
+
+// issue_label: prefer the latest attempt's situation mode, fall back to the
+// report's escalation_reason. Returns null when neither is in the table.
+function brrIssueLabel(latestMode, escalationReason) {
+  if (latestMode && BRR_SITUATION_LABELS[latestMode]) return BRR_SITUATION_LABELS[latestMode];
+  if (escalationReason && BRR_SITUATION_LABELS[escalationReason]) return BRR_SITUATION_LABELS[escalationReason];
+  return null;
+}
+
+function brrEscalationLabel(escalationReason) {
+  if (!escalationReason) return null;
+  return BRR_SITUATION_LABELS[escalationReason] || null;
+}
+
+// escalation_reason → concrete reviewer action. Mirrors the root-cause map
+// §3 stuck-state matrix: what to click/check, not just what broke.
+function brrEscalationReasonSteps(reason, vendor, gatewayHost) {
+  switch (reason) {
+    case 'teltik_gateway_port_offline':
+      return [{
+        action: 'Seat the line in a Teltik gateway port or replace the SIM',
+        detail: 'Teltik line not seated in a gateway port (gateway_id:0/port:null); reset-port cannot fix this. '
+          + 'Seat the line in the Teltik portal or replace the SIM, then "Mark fixed" or "Rerun auto".',
+      }];
+    case 'vendor_iccid_not_found':
+      return [{
+        action: 'Verify SIM identity with the vendor',
+        detail: 'ICCID unknown to ' + (vendor || 'the vendor') + ' — verify SIM identity/provisioning before retrying.',
+      }];
+    case 'paperclip_credentials_missing':
+      return [{
+        action: 'Drain the legacy escalation backlog',
+        detail: 'Legacy escalation never delivered to the inbox (dead Paperclip sink). '
+          + 'Run POST /escalations/drain on the remediator or check the escalations backlog for this report.',
+      }];
+    case 'unable_to_reproduce_recommendation':
+      return [{
+        action: 'Manually verify the line',
+        detail: 'Auto-reviewer could not reproduce the issue after repeated SMS-verify ticks. Check the line manually before closing.',
+      }];
+    case 'vendor_cancelled_active_rental':
+      return [{
+        action: 'Resolve cancelled-vendor / active-rental conflict',
+        detail: 'Vendor shows the line cancelled/deactivated but an active rental still references it — reconcile before closing.',
+      }];
+    case 'imei_wrong_type':
+      return [{
+        action: 'Correct IMEI (operator-only)',
+        detail: 'IMEI is the wrong type for this vendor' + (gatewayHost ? '/' + gatewayHost : '') + ' — IMEI writes are never automated; fix manually.',
+      }];
+    case 'imei_drift_vendor':
+    case 'imei_drift_gateway':
+      return [{
+        action: 'Reconcile IMEI drift',
+        detail: 'Vendor/gateway IMEI does not match the DB — operator-only fix.',
+      }];
+    case 'teltik_forward_url_misconfigured':
+      return [{
+        action: 'Fix Teltik forward URL',
+        detail: 'Teltik forward URL is missing/misconfigured for this line — a config change is operator-only.',
+      }];
+    case 'wing_not_activated':
+      return [{
+        action: 'Investigate Wing activation state',
+        detail: 'Wing IoT status is not Activated — check the Wing portal.',
+      }];
+    case 'insufficient_evidence':
+      return [{
+        action: 'Manually gather evidence',
+        detail: 'Auto-reviewer had too little evidence to classify (unknown/missing vendor) — check the SIM record manually.',
+      }];
+    case 'teltik_reset_failed':
+      return [{
+        action: 'Check Teltik port manually',
+        detail: 'A Teltik port reset was attempted and failed — check the port in the Teltik portal.',
+      }];
+    default:
+      return reason
+        ? [{
+          action: 'Review escalation reason',
+          detail: 'escalation_reason=' + reason + (gatewayHost ? ' on host ' + gatewayHost : '') + ' — check the Guide tab for this situation.',
+        }]
+        : [];
+  }
+}
+
+// Mode+outcome-specific guidance layered on top of the escalation-reason
+// guidance above — applies even when the report is not (yet) escalated,
+// e.g. a classify_only loop that keeps re-queuing without resolving.
+function brrAttemptModeStep(attempt) {
+  if (!attempt || !attempt.mode) return null;
+  const mode = attempt.mode;
+  const outcome = attempt.outcome;
+  if (mode === 'TH2' && outcome === 'no_change') {
+    return {
+      action: 'Take over if this repeats for hours',
+      detail: 'Still waiting on the Teltik host port read — TH2 has no distinct auto-cap. '
+        + 'If this repeats for hours, take over and check Teltik port seating manually.',
+    };
+  }
+  if (mode === 'TH5' && outcome === 'escalate') {
+    return {
+      action: 'Follow up on the failed port reset',
+      detail: 'TH5: port reset attempted and failed — escalated for operator follow-up.',
+    };
+  }
+  return null;
+}
+
+// brrManualNextStep(report, attempts, escalationPipeline) → [{action, detail}]
+//
+// Pure and deterministic (no fetch) so it's directly testable. `report` needs
+// status/auto_remediation_state/escalation_reason (+ optional vendor/
+// gateway_host for message context). `attempts` is the attempts list —
+// newest first, only attempts[0] is consulted. `escalationPipeline` is the
+// optional { rows, total } shape from the operator_escalations lookup; when
+// present and non-empty it adds a pointer to the Escalation pipeline block.
+function brrManualNextStep(report, attempts, escalationPipeline) {
+  const r = report || {};
+  const state = r.auto_remediation_state || null;
+  const reason = r.escalation_reason || null;
+  const list = Array.isArray(attempts) ? attempts : [];
+  const latest = list.length ? list[0] : null;
+  const vendor = r.vendor || null;
+  const gatewayHost = r.gateway_host || null;
+  const steps = [];
+
+  // Terminal / no-action states — nothing left for a reviewer to do.
+  if (r.status === 'remediated' || r.status === 'duplicate' || state === 'done') {
+    return steps;
+  }
+
+  if (state === 'operator_locked') {
+    steps.push({
+      action: 'Resume auto or continue manual remediation',
+      detail: 'Report is operator-locked (auto-remediation paused). Work it manually, '
+        + 'or click "Resume auto" to hand it back to the auto-reviewer.',
+    });
+    return steps;
+  }
+
+  if (state === 'verify_pending') {
+    steps.push({
+      action: 'Wait for SMS verification',
+      detail: 'The auto-reviewer applied a fix and is waiting to confirm inbound SMS. No action needed unless this repeats for hours.',
+    });
+    return steps;
+  }
+
+  if (state === 'escalated') {
+    steps.push(...brrEscalationReasonSteps(reason, vendor, gatewayHost));
+    if (!steps.length) {
+      steps.push({
+        action: 'Review manually',
+        detail: 'Escalated with no specific reason recorded — check the attempts table and Guide tab for the last mode.',
+      });
+    }
+  } else {
+    // No blocking condition yet — default is "nothing to do", refined below
+    // by the latest attempt's mode/outcome when one gives a sharper hint.
+    steps.push({
+      action: 'No action needed yet',
+      detail: 'Auto-reviewer will retry on the next 15-minute tick; nothing to do yet.',
+    });
+  }
+
+  const modeStep = brrAttemptModeStep(latest);
+  if (modeStep) {
+    // A specific mode-based hint is strictly more actionable than the
+    // generic queued placeholder, so replace it rather than stack both.
+    if (steps.length === 1 && steps[0].action === 'No action needed yet') steps.length = 0;
+    steps.push(modeStep);
+  }
+
+  if (escalationPipeline && typeof escalationPipeline.total === 'number' && escalationPipeline.total > 0) {
+    steps.push({
+      action: 'Check the escalation pipeline',
+      detail: escalationPipeline.total + ' operator_escalations row(s) reference this report — see the Escalation pipeline block below.',
+    });
+  }
+
+  return steps;
+}
+
+// One-line summary for the list view — the primary step's action + detail,
+// or null when there's nothing to surface.
+function brrManualNextStepSummary(steps) {
+  if (!Array.isArray(steps) || !steps.length) return null;
+  const s = steps[0];
+  if (!s) return null;
+  return s.detail ? (s.action + ' — ' + s.detail) : s.action;
+}
+
+// Fetch operator_escalations rows referencing this report (array-contains on
+// report_ids). Tolerates any failure — the report modal must still render.
+async function fetchBadRentalEscalationPipeline(env, reportId) {
+  try {
+    const select = ['id', 'status', 'last_error', 'failure_type', 'vendor', 'created_at', 'updated_at', 'paperclip_issue_id'].join(',');
+    const resp = await supabaseGet(env,
+      'operator_escalations?report_ids=cs.' + encodeURIComponent('{' + reportId + '}')
+      + '&select=' + encodeURIComponent(select)
+      + '&order=created_at.desc&limit=20');
+    if (!resp.ok) {
+      const txt = await resp.text();
+      return { rows: [], total: 0, error: 'supabase_' + resp.status + ': ' + txt.slice(0, 200) };
+    }
+    const rows = await resp.json();
+    const list = Array.isArray(rows) ? rows : [];
+    return { rows: list, total: list.length };
+  } catch (e) {
+    return { rows: [], total: 0, error: String(e) };
+  }
+}
+
+// GET /api/bad-rentals/escalations — proxied operator_escalations backlog
+// from the remediator's own /escalations/backlog (R2: surface the 300+
+// legacy queued rows that are otherwise invisible to the dashboard).
+// Tolerates a missing BAD_RENTAL_REMEDIATOR service binding (e.g. the vm-lift
+// test harness, or a dashboard deploy without the binding wired) by
+// returning a graceful { ok:false, error:'unavailable' } shape rather than
+// throwing.
+async function handleBadRentalEscalationsBacklog(env, corsHeaders) {
+  if (!env.BAD_RENTAL_REMEDIATOR) {
+    return new Response(JSON.stringify({ ok: false, error: 'unavailable' }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+  const secret = remediatorSecret(env);
+  const r = await callRemediator(env, '/escalations/backlog?secret=' + encodeURIComponent(secret), { method: 'GET' });
+  if (!r.ok || !r.body) {
+    return new Response(JSON.stringify({ ok: false, error: 'unavailable', detail: (r.body && r.body.error) || null }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+  const backlog = r.body.backlog || null;
+  return new Response(JSON.stringify({ ok: true, backlog }), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
 }
 
 // Compatibility alias for the original "Export Teltik offline CSV" endpoint.
@@ -6187,7 +6565,21 @@ async function handleBadRentalReport(id, env, corsHeaders) {
       }
     } catch (_) { /* tolerate any shape */ }
 
-    return new Response(JSON.stringify({ report, events, attempts, escalation, storage_note: storageNote }), {
+    // t_f479e342 — issue classification + reviewer next steps + escalation
+    // pipeline (R2: surface operator_escalations rows referencing this report).
+    const escalationPipeline = await fetchBadRentalEscalationPipeline(env, reportId);
+    const latestAttempt = attempts.length ? attempts[0] : null;
+    const issueLabel = brrIssueLabel(latestAttempt ? latestAttempt.mode : null, report.escalation_reason || null);
+    const escalationLabel = brrEscalationLabel(report.escalation_reason || null);
+    const manualNextSteps = brrManualNextStep(report, attempts, escalationPipeline);
+
+    return new Response(JSON.stringify({
+      report, events, attempts, escalation, storage_note: storageNote,
+      issue_label: issueLabel,
+      escalation_label: escalationLabel,
+      manual_next_steps: manualNextSteps,
+      escalation_pipeline: escalationPipeline,
+    }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {

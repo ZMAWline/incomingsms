@@ -170,13 +170,16 @@ test('a failed attempts query yields no ids rather than an unfiltered report lis
 });
 
 test('handleBadRentals wires the auto_resolution filter and exposes the resolution per row', () => {
-  // Filter plumbing.
-  assert.match(SRC, /const autoResolution = \(url\.searchParams\.get\('auto_resolution'\) \|\| ''\)\.trim\(\);/);
+  // Filter plumbing. (Param renamed autoResolution → autoResolutionParam by
+  // the prod-deployed 2026-08-07 carry-over; alias const keeps the fetch path
+  // unchanged, so these assertions match the shipped code.)
+  assert.match(SRC, /const autoResolutionParam = \(url\.searchParams\.get\('auto_resolution'\) \|\| ''\)\.trim\(\);/);
+  assert.match(SRC, /const autoResolution = autoResolutionParam;/);
   assert.match(SRC, /autoResolutionIds = await fetchAutoResolvedReportIds\(env, autoResolution\);/);
   assert.match(SRC, /query \+= '&id=in\.\(' \+ encodeURIComponent\(autoResolutionIds\.join\(','\)\) \+ '\)';/);
   // Auto-resolved reports are status='remediated', so ?auto_resolution without
   // an explicit ?status must not fall back to the open-only default filter.
-  assert.match(SRC, /const includeAll = statusParam === 'all' \|\| \(!statusParam && !!autoResolution\);/);
+  assert.match(SRC, /const includeAll = statusParam === 'all' \|\| \(!statusParam && !!autoResolutionParam\);/);
   // Per-row exposure.
   assert.match(SRC, /auto_resolution: s \? s\.auto_resolution : null,/);
   assert.match(SRC, /auto_resolution_reason: \(s && s\.auto_resolution === HEALTHY_EVIDENCE_OUTCOME\)/);

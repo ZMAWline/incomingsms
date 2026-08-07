@@ -1842,6 +1842,10 @@
                     <button onclick="loadBadRentals()" class="px-3 py-2 text-sm bg-dark-700 border border-dark-500 rounded-lg text-gray-300 hover:bg-dark-600 transition">Refresh</button>
                 </div>
 
+                <!-- t_f479e342 (R2) — operator_escalations backlog status line. Hidden
+                     entirely when the endpoint is unavailable so the tab still works. -->
+                <div id="bad-rentals-escalations-backlog" class="hidden mb-4 text-xs"></div>
+
                 <!-- Auto-Remediator Reviewer Panel (INC-23 §I.2) -->
                 <div id="remediator-panel" class="mb-6 p-4 bg-dark-800 border border-dark-600 rounded-xl">
                     <div class="flex items-center justify-between mb-3">
@@ -4375,7 +4379,7 @@ set verify_pending; schedule §C.3 poll
             if (tabName === 'imei-pool') loadImeiPool();
             if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
             if (tabName === 'errors') loadErrors();
-            if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); }
+            if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); loadBadRentalEscalationsBacklog(); }
             if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
             if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
             if (tabName === 'sms-usage') loadSmsUsage();
@@ -5459,7 +5463,13 @@ set verify_pending; schedule §C.3 poll
                 }
                 listEl.innerHTML = data.rows.map(it => {
                     const ago = timeAgo(new Date(it.created_at));
-                    const kindBadge = `<span class="text-xs px-2 py-0.5 rounded bg-dark-700 text-dark-300">${it.kind}</span>`;
+                    const isBrrEscalation = it.kind === 'bad_rental_escalation';
+                    // t_f479e342 (R8) — bad_rental_escalation gets a styled badge instead
+                    // of the generic kind label, since it's the one kind an operator
+                    // needs to jump straight to a report from.
+                    const kindBadge = isBrrEscalation
+                        ? '<span class="text-xs px-2 py-0.5 rounded bg-rose-700/40 text-rose-200 font-medium">Bad rental escalation</span>'
+                        : `<span class="text-xs px-2 py-0.5 rounded bg-dark-700 text-dark-300">${escapeHtml(it.kind)}</span>`;
                     const statusBadge = it.status === 'open'         ? '<span class="text-xs px-2 py-0.5 rounded bg-red-700/40 text-red-300">open</span>'
                                       : it.status === 'answered'     ? '<span class="text-xs px-2 py-0.5 rounded bg-blue-700/40 text-blue-300">answered</span>'
                                       : it.status === 'acknowledged' ? '<span class="text-xs px-2 py-0.5 rounded bg-green-700/40 text-green-300">ack</span>'
@@ -5468,6 +5478,22 @@ set verify_pending; schedule §C.3 poll
                     const respondedNote = it.operator_response
                         ? `<div class="mt-2 pl-3 border-l-2 border-blue-500/40 text-xs text-blue-200/80">You: ${escapeHtml(it.operator_response)}</div>`
                         : '';
+                    // t_f479e342 (R8) — vendor chip + a Report # link straight into the
+                    // report modal, using the brr.report_id the backend parsed out of
+                    // details_md. openBadRentalReport is a global handler on a modal
+                    // element outside any tab-content, so it opens from any tab.
+                    let brrLine = '';
+                    if (isBrrEscalation && it.brr) {
+                        const vendorChip = it.brr.vendor
+                            ? `<span class="text-xs px-1.5 py-0.5 rounded bg-dark-700 text-dark-300 mr-1">${escapeHtml(it.brr.vendor)}</span>`
+                            : '';
+                        const reportLink = it.brr.report_id
+                            ? `<a onclick="openBadRentalReport(${escapeAttr(String(it.brr.report_id))})" class="text-xs text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">Report #${escapeHtml(it.brr.report_id)}</a>`
+                            : '';
+                        if (vendorChip || reportLink) {
+                            brrLine = `<div class="mt-1">${vendorChip}${reportLink}</div>`;
+                        }
+                    }
                     const actions = it.status === 'open' ? `
                         <button onclick="openPendingReply(${it.id}, '${escapeAttr(it.summary)}')" class="px-2 py-1 text-xs bg-accent hover:bg-green-700 text-white rounded">Reply</button>
                         <button onclick="respondPending(${it.id}, 'acknowledge')" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 text-gray-200 rounded">Ack</button>
@@ -5479,6 +5505,7 @@ set verify_pending; schedule §C.3 poll
                             <div class="flex-1 min-w-0">
                                 <div class="flex items-center gap-2 mb-1">${kindBadge}${statusBadge}<span class="text-xs text-dark-400">${ago}</span></div>
                                 <div class="text-sm text-gray-200">${escapeHtml(it.summary)}</div>
+                                ${brrLine}
                                 ${respondedNote}
                             </div>
                             <div class="flex flex-wrap gap-1 flex-shrink-0">${actions}</div>
@@ -8594,6 +8621,20 @@ async function sendSimOnline(simId, phoneNumber) {
                                 + (autoLastMode ? ' (' + escapeHtml(autoLastMode) + ')' : '')
                                 + (autoLastAt ? ' · ' + escapeHtml(fmtDt(autoLastAt)) : '')
                             : 'no attempts yet';
+                        // t_f479e342 — issue/escalation labels + a one-line "Next:" hint so
+                        // reviewers see what to do without opening the report modal.
+                        const issueLabelTxt = r.issue_label || issueType;
+                        const labelLine = (issueLabelTxt && issueLabelTxt !== '—')
+                            ? '<div class="mt-0.5 text-dark-300">' + escapeHtml(issueLabelTxt)
+                                + (r.escalation_label ? ' <span class="text-dark-500">·</span> ' + escapeHtml(r.escalation_label) : '')
+                                + '</div>'
+                            : '';
+                        let nextStepLine = '';
+                        if (r.manual_next_step && autoState === 'escalated') {
+                            const full = String(r.manual_next_step);
+                            const short = full.length > 120 ? full.slice(0, 120) + '…' : full;
+                            nextStepLine = '<div class="mt-0.5 text-rose-300" title="' + escapeAttr(full) + '">Next: ' + escapeHtml(short) + '</div>';
+                        }
                         autoSubRow = '<tr class="bg-dark-900/40 border-t-0" data-auto-sub-for="' + escapeHtml(r.id) + '">'
                             + '<td></td>'
                             + '<td colspan="9" class="px-4 py-1.5 text-[11px] text-dark-300">'
@@ -8602,6 +8643,8 @@ async function sendSimOnline(simId, phoneNumber) {
                             +   stateChip
                             +   '<span class="ml-2">' + lastTxt + '</span>'
                             +   badRentalAutoResolutionDetail(r, fmtDt)
+                            +   labelLine
+                            +   nextStepLine
                             + '</td>'
                             + '</tr>';
                     }
@@ -8623,6 +8666,34 @@ async function sendSimOnline(simId, phoneNumber) {
                 console.error('[loadBadRentals]', e);
             }
             applyAutoFilterFromActiveChip();
+        }
+
+        // t_f479e342 (R2) — operator_escalations backlog status line. Tolerant
+        // by design: an unavailable/error response just hides the line rather
+        // than breaking the tab (the remediator service binding may not be
+        // wired in every environment).
+        async function loadBadRentalEscalationsBacklog() {
+            const el = document.getElementById('bad-rentals-escalations-backlog');
+            if (!el) return;
+            el.classList.add('hidden');
+            el.innerHTML = '';
+            try {
+                const resp = await fetch(API_BASE + '/bad-rentals/escalations');
+                const data = await resp.json().catch(function(){ return {}; });
+                if (!resp.ok || !data || !data.ok || !data.backlog) return;
+                const b = data.backlog;
+                const total = b.total || 0;
+                const legacy = b.legacy_paperclip_rows || 0;
+                const oldest = b.oldest_created_at ? new Date(b.oldest_created_at).toLocaleString() : null;
+                const parts = [total + ' queued escalation' + (total === 1 ? '' : 's')];
+                if (legacy) parts.push(legacy + ' legacy paperclip_credentials_missing');
+                if (oldest) parts.push('oldest ' + oldest);
+                const tone = b.alert ? 'text-rose-300' : 'text-dark-400';
+                el.className = 'mb-4 text-xs ' + tone;
+                el.textContent = parts.join(' · ');
+            } catch (e) {
+                console.error('[loadBadRentalEscalationsBacklog]', e);
+            }
         }
 
         function sortBadRentalsByIssue() {
@@ -9242,11 +9313,24 @@ async function sendSimOnline(simId, phoneNumber) {
                     const modeAnchor = a.mode
                         ? '<a href="#auto-rem-' + escapeHtml(a.mode) + '" data-auto-rem-jump="' + escapeHtml(a.mode) + '" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(a.mode) + '</a>'
                         : '—';
+                    let evidenceJson = '';
                     let evidenceTip = '';
                     if (a.evidence && typeof a.evidence === 'object') {
-                        try { evidenceTip = JSON.stringify(a.evidence); } catch(_) { evidenceTip = ''; }
+                        try { evidenceJson = JSON.stringify(a.evidence, null, 2); evidenceTip = JSON.stringify(a.evidence); } catch(_) { evidenceJson = ''; evidenceTip = ''; }
                     }
                     const actionCell = '<span title="' + escapeHtml(evidenceTip) + '">' + escapeHtml(a.action || '—') + '</span>';
+                    // t_f479e342 (Deliverable 3d) — evidence is jsonb and operator-facing;
+                    // keep it available as raw JSON in an expandable row, not just a tooltip.
+                    const evidenceRow = evidenceJson
+                        ? '<tr class="bg-dark-900/30">'
+                            + '<td></td>'
+                            + '<td colspan="6" class="px-2 pb-2">'
+                            +   '<details><summary class="cursor-pointer text-[10px] text-dark-400 hover:text-dark-200">Evidence</summary>'
+                            +     '<pre class="mt-1 p-2 bg-dark-900 border border-dark-700 rounded text-[10px] text-dark-300 overflow-x-auto">' + escapeHtml(evidenceJson) + '</pre>'
+                            +   '</details>'
+                            + '</td>'
+                          + '</tr>'
+                        : '';
                     attemptsHtml += '<tr class="hover:bg-dark-700/30">'
                         + '<td class="px-2 py-1.5 font-mono text-dark-400">' + escapeHtml(String(a.attempt_no != null ? a.attempt_no : '—')) + '</td>'
                         + '<td class="px-2 py-1.5 font-mono text-dark-200">' + modeAnchor + '</td>'
@@ -9255,7 +9339,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         + '<td class="px-2 py-1.5 text-dark-300">' + escapeHtml(fmt(a.attempted_at)) + '</td>'
                         + '<td class="px-2 py-1.5 text-dark-400">' + (a.next_review_at ? escapeHtml(fmt(a.next_review_at)) : '<span class="text-dark-600">—</span>') + '</td>'
                         + '<td class="px-2 py-1.5 text-rose-300/90">' + (a.error_message ? escapeHtml(String(a.error_message).slice(0, 200)) : '<span class="text-dark-600">—</span>') + '</td>'
-                        + '</tr>';
+                        + '</tr>' + evidenceRow;
                 }
                 attemptsHtml += '</tbody></table></div>';
             }
@@ -9317,9 +9401,102 @@ async function sendSimOnline(simId, phoneNumber) {
                     + '</div>';
             }
 
+            // t_f479e342 (Deliverable 3.2a) — Issue classification block: the
+            // human-readable mode/reason labels the backend derives from
+            // BRR_SITUATION_LABELS, plus a jump link to the Guide §F row.
+            const issueLabel = (data && data.issue_label) || null;
+            const escalationLabelTxt = (data && data.escalation_label) || null;
+            const latestMode = attempts.length ? attempts[0].mode : null;
+            const modeJumpLink = latestMode
+                ? ' (<a href="#auto-rem-' + escapeHtml(latestMode) + '" data-auto-rem-jump="' + escapeHtml(latestMode) + '" class="text-cyan-300 hover:text-cyan-200 underline decoration-dotted cursor-pointer">' + escapeHtml(latestMode) + '</a>)'
+                : '';
+            const classificationBlock = '<div class="mb-4 p-3 rounded border border-dark-700 bg-dark-900/40">'
+                + '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Issue classification</div>'
+                + '<dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-xs">'
+                +   '<dt class="text-dark-400 uppercase tracking-wide text-[10px] py-0.5">Issue</dt>'
+                +   '<dd class="text-dark-100 py-0.5">' + (issueLabel ? escapeHtml(issueLabel) : '<span class="text-dark-500">—</span>') + modeJumpLink + '</dd>'
+                +   '<dt class="text-dark-400 uppercase tracking-wide text-[10px] py-0.5">Issue type</dt>'
+                +   '<dd class="text-dark-100 py-0.5">' + val(r.issue_type) + '</dd>'
+                +   '<dt class="text-dark-400 uppercase tracking-wide text-[10px] py-0.5">Escalation reason</dt>'
+                +   '<dd class="text-dark-100 py-0.5">' + (escalationLabelTxt ? escapeHtml(escalationLabelTxt) : val(r.escalation_reason)) + '</dd>'
+                + '</dl>'
+                + '</div>';
+
+            // t_f479e342 (Deliverable 3.2b) — Reviewer next steps: numbered,
+            // actionable lines. Hidden entirely when the backend returns none
+            // (e.g. remediated/duplicate reports have nothing left to do).
+            const manualNextSteps = (data && Array.isArray(data.manual_next_steps)) ? data.manual_next_steps : [];
+            let nextStepsBlock = '';
+            if (manualNextSteps.length) {
+                let stepsHtml = '<ol class="list-decimal list-inside space-y-1.5">';
+                for (let i = 0; i < manualNextSteps.length; i++) {
+                    const step = manualNextSteps[i] || {};
+                    const action = step.action ? escapeHtml(step.action) : ('Step ' + (i + 1));
+                    const detail = step.detail ? '<div class="ml-4 text-dark-300">' + escapeHtml(step.detail) + '</div>' : '';
+                    stepsHtml += '<li class="text-rose-100"><span class="font-semibold">' + action + '</span>' + detail + '</li>';
+                }
+                stepsHtml += '</ol>';
+                nextStepsBlock = '<div class="mb-4 p-3 rounded border border-rose-500/40 bg-rose-500/10">'
+                    + '<div class="text-[10px] uppercase tracking-wide font-semibold text-rose-200 mb-2">Reviewer next steps</div>'
+                    + stepsHtml
+                    + '</div>';
+            }
+
+            // t_f479e342 (Deliverable 3.2c / R2) — Escalation pipeline:
+            // operator_escalations rows referencing this report.
+            const escalationPipeline = (data && data.escalation_pipeline) || null;
+            let pipelineHtml;
+            if (!escalationPipeline || escalationPipeline.error) {
+                pipelineHtml = '<div class="text-dark-500">'
+                    + (escalationPipeline && escalationPipeline.error ? 'Failed to load: ' + escapeHtml(escalationPipeline.error) : 'Unavailable.')
+                    + '</div>';
+            } else if (!escalationPipeline.total) {
+                pipelineHtml = '<div class="text-dark-500">No operator_escalations rows for this report.</div>';
+            } else {
+                const pipeStatusColor = (function(s){
+                    switch (s) {
+                        case 'delivered':      return 'bg-emerald-500/20 text-emerald-200';
+                        case 'delivery_failed':return 'bg-rose-500/20 text-rose-200';
+                        case 'queued':         return 'bg-amber-500/20 text-amber-200';
+                        default:               return 'bg-dark-700 text-dark-200';
+                    }
+                });
+                pipelineHtml = '<div class="overflow-x-auto rounded border border-dark-700">'
+                    + '<table class="w-full text-[11px]">'
+                    +   '<thead class="bg-dark-900 text-dark-400 uppercase tracking-wide text-[10px]">'
+                    +     '<tr>'
+                    +       '<th class="px-2 py-1.5 text-left">Status</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Failure type</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Vendor</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Last error</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Created</th>'
+                    +       '<th class="px-2 py-1.5 text-left">Inbox ref</th>'
+                    +     '</tr>'
+                    +   '</thead>'
+                    +   '<tbody class="divide-y divide-dark-700">'
+                    +   (escalationPipeline.rows || []).map(function(row){
+                            const statusChip = '<span class="inline-block px-1.5 py-0.5 rounded ' + pipeStatusColor(row.status) + '">' + escapeHtml(row.status || '—') + '</span>';
+                            return '<tr class="hover:bg-dark-700/30">'
+                                + '<td class="px-2 py-1.5">' + statusChip + '</td>'
+                                + '<td class="px-2 py-1.5 text-dark-200">' + val(row.failure_type) + '</td>'
+                                + '<td class="px-2 py-1.5 text-dark-200">' + val(row.vendor) + '</td>'
+                                + '<td class="px-2 py-1.5 text-rose-300/90">' + (row.last_error ? escapeHtml(String(row.last_error).slice(0, 200)) : '<span class="text-dark-600">—</span>') + '</td>'
+                                + '<td class="px-2 py-1.5 text-dark-300">' + escapeHtml(fmt(row.created_at)) + '</td>'
+                                + '<td class="px-2 py-1.5 text-dark-300 font-mono">' + val(row.paperclip_issue_id) + '</td>'
+                                + '</tr>';
+                        }).join('')
+                    + '</tbody></table></div>';
+            }
+            const pipelineBlock = '<div class="mb-4">'
+                + '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Escalation pipeline</div>'
+                + pipelineHtml
+                + '</div>';
+
             return ''
                 + legacyBanner
                 + escalationBlock
+                + classificationBlock
+                + nextStepsBlock
                 + '<div class="mb-4 p-3 rounded border border-dark-700 bg-dark-900/40">'
                 +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Auto-remediation</div>'
                 +   autoControls
@@ -9328,6 +9505,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Auto-remediation attempts (rental_report_remediation_attempts)</div>'
                 +   attemptsHtml
                 + '</div>'
+                + pipelineBlock
                 + '<div class="mb-4">'
                 +   '<div class="text-[10px] uppercase tracking-wide font-semibold text-dark-300 mb-2">Parsed report fields</div>'
                 +   fieldsHtml
