@@ -25,6 +25,13 @@ export default {
       return handleGatewayStatus(request, env);
     }
 
+    // Public daily Bad Rental escalation CSV — no operator credentials, so it
+    // can be fetched by anything that can't hold Basic-auth. Must also run
+    // BEFORE the auth gate below. See handlePublicBadRentalEscalationToday.
+    if (url.pathname === '/public/bad-rental-escalations-today.csv' && request.method === 'GET') {
+      return handlePublicBadRentalEscalationToday(env);
+    }
+
     // Basic auth check
     const authHeader = request.headers.get('Authorization');
     if (!authHeader || !checkAuth(authHeader, env)) {
@@ -4685,6 +4692,20 @@ async function handleTeltikPortOfflineExport(env, corsHeaders, url) {
     target.searchParams.set('days', '30');
   }
   return handleBadRentalEscalationExport(env, corsHeaders, target);
+}
+
+// Public, unauthenticated alias of the escalation export, fixed to today's
+// New York day. Delegates to the same handleBadRentalEscalationExport used by
+// the authenticated route so the CSV shape/content rules never diverge; the
+// incoming request URL is never passed through, so this route can't be used
+// to pull arbitrary date ranges, formats, or scopes — only today's CSV.
+async function handlePublicBadRentalEscalationToday(env) {
+  const cors = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  };
+  const todayUrl = new URL('https://dashboard/api/bad-rentals/escalation-export');
+  return handleBadRentalEscalationExport(env, cors, todayUrl);
 }
 
 // =========================================================
