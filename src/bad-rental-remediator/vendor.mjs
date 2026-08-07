@@ -527,6 +527,35 @@ export async function readVendorView(env, sim, opts = {}) {
   }
 }
 
+// Teltik /v1/get-info raw seating check (R3) — unlike teltikLineView (which
+// collapses the response to line_state/port_status for the vendor-classifier
+// projection), this surfaces gateway_id/port straight from the vendor so TH5
+// can tell "line not seated in any gateway port" (gateway_id:0, port:null —
+// reset-port can never fix that) apart from "seated but the port is down"
+// (reset-port is the right move). Only called as a confirmatory read once a
+// port-status probe already came back offline — never on the healthy path.
+export async function teltikGetInfo(env, { mdn } = {}) {
+  if (!env.TELTIK_API_KEY) return { ok: false, error: 'teltik_credentials_missing' };
+  const norm = mdn10(mdn);
+  if (!norm || norm.length !== 10) return { ok: false, error: 'teltik_mdn_invalid:' + norm };
+  const url = 'https://api.smsgateway.xyz/v1/get-info'
+    + '?apikey=' + encodeURIComponent(env.TELTIK_API_KEY)
+    + '&mdn=' + encodeURIComponent(norm);
+  let resp, text;
+  try { resp = await relayFetch(env, url, { method: 'GET' }); text = await resp.text(); }
+  catch (err) { return { ok: false, error: String(err && err.message || err) }; }
+  if (resp.status === 404) return { ok: true, not_found: true, status: resp.status };
+  if (!resp.ok) return { ok: false, error: 'teltik_http_' + resp.status, status: resp.status };
+  let json = null; try { json = JSON.parse(text); } catch { json = {}; }
+  return {
+    ok: true, not_found: false, status: resp.status,
+    gateway_id: ('gateway_id' in json) ? json.gateway_id : undefined,
+    port: ('port' in json) ? json.port : undefined,
+    iccid: json.iccid || null,
+    line_state: String(json.line_state || json.status || json.state || '').toLowerCase() || null,
+  };
+}
+
 // ---------------------------------------------------------
 // Plumbing
 // ---------------------------------------------------------

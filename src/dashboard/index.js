@@ -197,6 +197,13 @@ export default {
       return handleHealthyEvidenceSummary(env, corsHeaders, url);
     }
 
+    // R2 — read-only operator_escalations backlog counts. The dashboard never
+    // read this table before (the 323 legacy rows were invisible to every
+    // dashboard UI surface); this is the minimal visibility fix.
+    if (url.pathname === '/api/bad-rentals/escalation-backlog' && request.method === 'GET') {
+      return handleBadRentalEscalationBacklog(env, corsHeaders);
+    }
+
     if (url.pathname.startsWith('/api/bad-rentals/') && url.pathname.endsWith('/update') && request.method === 'POST') {
       const id = url.pathname.slice('/api/bad-rentals/'.length, -('/update'.length));
       return handleUpdateBadRental(id, request, env, corsHeaders);
@@ -4562,6 +4569,50 @@ async function fetchAutoResolvedReportIds(env, outcome) {
   } catch (e) {
     console.log('[fetchAutoResolvedReportIds] failed: ' + e);
     return [];
+  }
+}
+
+// GET /api/bad-rentals/escalation-backlog
+//
+// R2 — read-only operator_escalations counts (queued, delivery_failed,
+// delivered, total, oldest created_at). The remediator worker's own
+// backlog fetcher stays the source of truth for the drain logic; this is
+// just visibility so an operator does not need to hit the worker's admin
+// JSON endpoint directly to see the same numbers. Counts only — no
+// line_item content (MDNs/ICCIDs) crosses this route.
+async function handleBadRentalEscalationBacklog(env, corsHeaders) {
+  try {
+    const countFor = async (filter) => {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/operator_escalations?select=id${filter}`, {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          Prefer: 'count=exact',
+          Range: '0-0',
+        },
+      });
+      const m = (res.headers.get('content-range') || '').match(/\/(\d+|\*)$/);
+      return m && m[1] !== '*' ? parseInt(m[1], 10) : 0;
+    };
+    const [queued, deliveryFailed, delivered, total] = await Promise.all([
+      countFor('&status=eq.queued'),
+      countFor('&status=in.(delivery_failed,post_failed)'),
+      countFor('&status=in.(delivered,posted)'),
+      countFor(''),
+    ]);
+    const oldestRes = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/operator_escalations?select=created_at&status=not.in.(delivered,posted)&order=created_at.asc&limit=1`,
+      { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } },
+    );
+    const oldestRows = oldestRes.ok ? await oldestRes.json().catch(() => []) : [];
+    const oldest_created_at = Array.isArray(oldestRows) && oldestRows[0] ? oldestRows[0].created_at : null;
+    return new Response(JSON.stringify({
+      queued, delivery_failed: deliveryFailed, delivered, total, oldest_created_at,
+    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), {
+      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
   }
 }
 
