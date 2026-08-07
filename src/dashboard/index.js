@@ -25,6 +25,13 @@ export default {
       return handleGatewayStatus(request, env);
     }
 
+    // Public daily Bad Rental escalation CSV — no operator credentials, so it
+    // can be fetched by anything that can't hold Basic-auth. Must also run
+    // BEFORE the auth gate below. See handlePublicBadRentalEscalationToday.
+    if (url.pathname === '/public/bad-rental-escalations-today.csv' && request.method === 'GET') {
+      return handlePublicBadRentalEscalationToday(env);
+    }
+
     // Basic auth check
     const authHeader = request.headers.get('Authorization');
     if (!authHeader || !checkAuth(authHeader, env)) {
@@ -185,7 +192,6 @@ export default {
       return handleTeltikPortOfflineExport(env, corsHeaders, url);
     }
 
-    // HE1 rollup — reports auto-resolved on proven-healthy evidence.
     if (url.pathname === '/api/bad-rentals/healthy-evidence-summary' && request.method === 'GET') {
       return handleHealthyEvidenceSummary(env, corsHeaders, url);
     }
@@ -4348,8 +4354,8 @@ async function handleBadRentals(env, corsHeaders, url) {
     // ?auto_resolution implies a closed-report view (auto-resolved reports are
     // status='remediated'), so without an explicit ?status we must not apply the
     // default open-only filter — it would hide every matching row.
-    const autoResolution = (url.searchParams.get('auto_resolution') || '').trim();
-    const includeAll = statusParam === 'all' || (!statusParam && !!autoResolution);
+    const autoResolutionParam = (url.searchParams.get('auto_resolution') || '').trim();
+    const includeAll = statusParam === 'all' || (!statusParam && !!autoResolutionParam);
     const statusFilter = (statusParam && statusParam !== 'all') ? statusParam : 'received,in_triage';
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '200', 10) || 200, 1000);
     // Bad-rental reviewer auto-resolutions (HE1). The remediator records the
@@ -4358,6 +4364,7 @@ async function handleBadRentals(env, corsHeaders, url) {
     // (rotated|port_reset|sim_replaced|mdn_swapped|other). So filtering by
     // ?auto_resolution=healthy_evidence_auto_resolved resolves report ids from
     // rental_report_remediation_attempts first, then constrains the list query.
+    const autoResolution = autoResolutionParam;
     let autoResolutionIds = null;
     if (autoResolution) {
       autoResolutionIds = await fetchAutoResolvedReportIds(env, autoResolution);
@@ -4626,7 +4633,7 @@ async function handleHealthyEvidenceSummary(env, corsHeaders, url) {
       const part = await rResp.json().catch(() => []);
       if (Array.isArray(part)) reportRows.push(...part);
     }
-    for (const r of reportRows) {
+    for (const r of (Array.isArray(reportRows) ? reportRows : [])) {
       const meta = byReport.get(r.id) || {};
       const vendor = (r.sims && r.sims.vendor) || 'unknown';
       const host = (r.sims && r.sims.gateway_host) || 'unknown';
@@ -4685,6 +4692,20 @@ async function handleTeltikPortOfflineExport(env, corsHeaders, url) {
     target.searchParams.set('days', '30');
   }
   return handleBadRentalEscalationExport(env, corsHeaders, target);
+}
+
+// Public, unauthenticated alias of the escalation export, fixed to today's
+// New York day. Delegates to the same handleBadRentalEscalationExport used by
+// the authenticated route so the CSV shape/content rules never diverge; the
+// incoming request URL is never passed through, so this route can't be used
+// to pull arbitrary date ranges, formats, or scopes — only today's CSV.
+async function handlePublicBadRentalEscalationToday(env) {
+  const cors = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  };
+  const todayUrl = new URL('https://dashboard/api/bad-rentals/escalation-export');
+  return handleBadRentalEscalationExport(env, cors, todayUrl);
 }
 
 // =========================================================

@@ -70,6 +70,7 @@ function makeSandbox(routes) {
     extractFn('async function supabaseGet(env, path) {'),
     extractFn('function csvEscape(value) {'),
     extractFn('async function handleTeltikPortOfflineExport(env, corsHeaders, url) {'),
+    extractFn('async function handlePublicBadRentalEscalationToday(env) {'),
     extractEscalationRegion(),
   ].join('\n\n');
   vm.runInContext(code, sandbox);
@@ -579,6 +580,91 @@ test('the old teltik-port-offline export still works and now carries a date rang
   const disposition = resp.headers.get('Content-Disposition');
   assert.match(disposition, /teltik_gateway_port_offline/);
   assert.match(disposition, /_to_\d{4}-\d{2}-\d{2}_ny\.csv/, 'filename carries the resolved NY range');
+});
+
+// ---------------------------------------------------------
+// Public, unauthenticated daily CSV
+// ---------------------------------------------------------
+
+test('the public escalation CSV route is registered before the operator auth gate and needs no Authorization header', () => {
+  const routeIdx = SRC.indexOf("url.pathname === '/public/bad-rental-escalations-today.csv'");
+  const authGateIdx = SRC.indexOf('// Basic auth check');
+  assert.notEqual(routeIdx, -1, 'public route not registered');
+  assert.notEqual(authGateIdx, -1, 'auth gate marker not found');
+  assert.ok(routeIdx < authGateIdx, 'public route must be checked before the Basic-auth gate');
+  assert.match(SRC, /return handlePublicBadRentalEscalationToday\(env\);/,
+    'the route must call the public handler with only env — no request/url, so it cannot honor query overrides');
+});
+
+test('the public handler ignores query overrides and always queries "today" in New York', async () => {
+  const now = Date.now();
+  const { sandbox: rangeSandbox } = makeSandbox([]);
+  const today = rangeSandbox.parseEscalationExportRange(exportUrl(''), now);
+  assert.equal(today.error, undefined);
+
+  const { sandbox, calls } = makeSandbox(fixtureRoutes({ reports: [] }));
+  const resp = await sandbox.handlePublicBadRentalEscalationToday(ENV);
+  assert.equal(resp.status, 200);
+
+  const reportCall = decodeURIComponent(calls.find(c => c.includes('/rental_reports?select=')));
+  assert.ok(reportCall.includes('received_at=gte.' + today.start_utc), 'range starts at today (NY) UTC start');
+  assert.ok(reportCall.includes('received_at=lt.' + today.end_utc), 'range ends at today (NY) UTC end');
+  assert.ok(!reportCall.includes('escalation_reason=eq.'), 'no reason filter — the public export is unfiltered');
+});
+
+test('the public CSV matches the authenticated export\'s zero-row shape when nothing needs escalating today', async () => {
+  const now = Date.now();
+  const { sandbox: rangeSandbox } = makeSandbox([]);
+  const today = rangeSandbox.parseEscalationExportRange(exportUrl(''), now);
+
+  const publicRun = makeSandbox(fixtureRoutes({ reports: [] }));
+  const publicResp = await publicRun.sandbox.handlePublicBadRentalEscalationToday(ENV);
+
+  const authRun = makeSandbox(fixtureRoutes({ reports: [] }));
+  const authResp = await authRun.sandbox.handleBadRentalEscalationExport(
+    ENV, {}, exportUrl('?start=' + today.start + '&end=' + today.end));
+
+  assert.equal(publicResp.status, 200);
+  assert.equal(publicResp.headers.get('X-Escalation-Row-Count'), '0');
+  assert.match(publicResp.headers.get('Content-Type'), /text\/csv/);
+  assert.equal(publicResp.headers.get('Content-Disposition'), authResp.headers.get('Content-Disposition'));
+
+  const publicCsv = await publicResp.text();
+  const authCsv = await authResp.text();
+  assert.equal(publicCsv, authCsv, 'same source of truth, same output');
+  assert.equal(parseCsv(publicCsv).length, 1, 'header row only — no error, no crash on an empty day');
+});
+
+test('the public CSV matches the authenticated export\'s content for a day with an escalation', async () => {
+  const now = Date.now();
+  const { sandbox: rangeSandbox } = makeSandbox([]);
+  const today = rangeSandbox.parseEscalationExportRange(exportUrl(''), now);
+
+  // Reuses sim 640's fixture wiring (HOST_CHECKS/EVER/INBOUND_IN_WINDOW), the
+  // same C1a scenario as the REPORTS fixture above, so this exercises real
+  // cohort classification rather than an isolated stub.
+  const report = {
+    id: 9001, status: 'in_triage', reason_code: 'no_sms_received',
+    received_at: new Date(today.start_ms + 60 * 60 * 1000).toISOString(),
+    sim_id: 640, rental_id: 'r-900',
+    escalation_reason: 'teltik_gateway_port_offline', auto_remediation_state: 'escalated', last_auto_attempt_at: null,
+    resellers: { name: 'TrustOTP' }, rentals: { reseller_rental_id: 'rr-900' },
+    sims: simRow({ id: 640, iccid: '89014103211118431688459', vendor: 'atomic', gateway_host: 'teltik', e164: '+13105552678' }),
+  };
+
+  const publicRun = makeSandbox(fixtureRoutes({ reports: [report] }));
+  const publicResp = await publicRun.sandbox.handlePublicBadRentalEscalationToday(ENV);
+
+  const authRun = makeSandbox(fixtureRoutes({ reports: [report] }));
+  const authResp = await authRun.sandbox.handleBadRentalEscalationExport(
+    ENV, {}, exportUrl('?start=' + today.start + '&end=' + today.end));
+
+  assert.equal(publicResp.headers.get('X-Escalation-Row-Count'), '1');
+  const publicRows = csvObjects(await publicResp.text());
+  const authRows = csvObjects(await authResp.text());
+  assert.deepEqual(publicRows, authRows, 'identical rows through the same deterministic source of truth');
+  assert.equal(publicRows[0].sim_id, '640');
+  assert.equal(publicRows[0].cohort, 'C1a_zero_inbound_host_port_offline');
 });
 
 // ---------------------------------------------------------
