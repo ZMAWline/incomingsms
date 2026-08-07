@@ -22,7 +22,7 @@ import { runVerifyPoll, preResolveGate } from './verify-runner.mjs';
 import { cleanRecheckPredicate } from './verify.mjs';
 import { executeAction } from './actions.mjs';
 import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
-import { teltikPortStatus, readVendorView } from './vendor.mjs';
+import { teltikPortStatus, readVendorView, teltikGetInfo } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import {
   flushEscalations, maybeOpenVendorBatchTickets, normalizeFailureType,
@@ -72,7 +72,35 @@ const STALE_CLAIM_MS = 10 * 60 * 1000;
 // on the loser). TTL > TICK_BUDGET_MS so a crashed tick releases naturally.
 const TICK_LOCK_KEY = 'bad_rental_remediator_main_tick_lock';
 const TICK_LOCK_TTL_S = 120;
+// R5: KV flag written whenever a tick has to fall back to the pre-migration
+// next_review_at-free query/patch shape (schema drift — the 20260729 column
+// missing). Not sticky across ticks: each tick overwrites it with its own
+// count, so /status always reflects current health rather than one historical
+// blip.
+const NEXT_REVIEW_FALLBACK_KV_KEY = 'bad_rental_remediator_next_review_at_migration_missing';
+// R5: a report that has been reprocessed this many times with no terminal
+// state is stuck for some reason the classifier itself never named (schema
+// drift dropping the next_review_at gate, or any other loop this repo hasn't
+// seen yet) — escalate instead of retrying forever. Under healthy next_review_at
+// gating a report only reprocesses at its cooldown cadence (1h-24h for vendor
+// actions, 2h for classify_only), so 8 real passes is already many hours to
+// days of genuine stuckness, never a false positive from normal cadence.
+const REPROCESSING_LOOP_CAP = 8;
 const ISSUE_TELTIK_GATEWAY_PORT_OFFLINE = 'Teltik gateway port offline';
+// R1: distinct exhaustion reasons for TH2/S5 classify_only loops, mirroring
+// the vendor classifier's A10/W9/H9/T11 priorClassifyOnly>=2 pattern so a
+// report stuck on "can't read the port" or "gateway offline" gets its own
+// operator-facing category instead of riding the shared classify_only cap
+// to a generic unable_to_reproduce_recommendation.
+const ISSUE_TELTIK_HOST_PORT_READ_FAILED = 'Teltik host port read failed';
+const ISSUE_GATEWAY_PORT_OFFLINE_UNRESOLVED = 'Gateway port offline unresolved';
+// R3: a Teltik-hosted line whose get-info read shows gateway_id 0 / port null
+// is not physically seated in any gateway port — reset-port can never fix
+// that, so it gets its own distinct escalation instead of looping resets.
+const ISSUE_TELTIK_LINE_NOT_SEATED = 'Teltik line not seated in gateway';
+// R6: PreResolveGate actions that succeeded but cannot be SMS-verified while
+// the global outbound-SMS kill switch is on.
+const ISSUE_VERIFY_SMS_DISABLED = 'Verify impossible: SMS sending disabled';
 // TH5: how long Teltik gets to re-register the port after /reset-port before
 // the deferred recheck pass. NOT slept inside the tick — it drives the
 // attempt's next_review_at and the intake-eligibility backdate so the next
@@ -90,6 +118,12 @@ const INBOUND_PROOF_LIMIT = 25;
 // remediation: it may only be sent AFTER the HE1 gate has already proved the
 // line healthy. Off unless explicitly enabled.
 const HEALTHY_EVIDENCE_NOTIFY_KEYS = ['HEALTHY_EVIDENCE_NOTIFY_RESEND'];
+
+// R5: per-tick counter of next_review_at 400-fallback engagements. Module
+// scope (not threaded through every call in the report chain) is safe here
+// because the KV tick lock already serializes real tick work — reset at the
+// top of every runTick, read at the end for the summary + KV alert.
+let nextReviewAtFallbackCount = 0;
 
 export default {
   async fetch(request, env) {
@@ -220,6 +254,7 @@ export { maybeExecuteAction, gatherEvidence, suggestNextAction };
 
 async function runTick(env) {
   const startedAt = Date.now();
+  nextReviewAtFallbackCount = 0;
   if (!(await killSwitchEnabled(env))) {
     console.log('[Remediator] kill-switch disabled; skipping tick.');
     const out = { skipped: 'kill_switch_off', processed: 0 };
@@ -250,6 +285,7 @@ async function runTick(env) {
   let processed = 0, attempted = 0;
   let expiredOpenDismissed = 0;
   let expiredOpenScanned = 0;
+  let escalationInboxAgedOut = { scanned: 0, aged_out: 0, failed: 0 };
   const outcomes = {};
   const escalationCandidates = [];
   let reportsFetched = 0;
@@ -275,6 +311,10 @@ async function runTick(env) {
       outcomes.duplicate = (outcomes.duplicate || 0) + expiredOpenDismissed;
       console.log('[Remediator] dismissed ' + expiredOpenDismissed + ' expired open reports (scanned=' + expiredOpenScanned + ').');
     }
+
+    // R8: age out stale bad_rental_escalation inbox items (30d, no operator
+    // engagement). DB-only, bounded, never deletes rows.
+    escalationInboxAgedOut = await sweepAgedOutEscalationInboxItems(env, ESCALATION_INBOX_AGE_OUT_CAP);
 
     // INC-27: keep fetching batches until 50 REAL runs, the queue drains, or
     // the scan cap / tick budget stops us. Every processed row leaves the
@@ -342,6 +382,21 @@ async function runTick(env) {
     console.log('[Remediator] vendor-batch error: ' + err);
   }
 
+  // R2: bounded automated drain of legacy/undelivered operator_escalations
+  // rows into the inbox, every tick. Historically nothing ever drained the
+  // pre-retarget backlog automatically — only the manual admin endpoint
+  // (still available below, unchanged). Bounded to DRAIN_DEFAULT_LIMIT (25,
+  // matching the manual default) so even a large historical backlog never
+  // bursts hundreds of inbox items in one tick; kill-switch already gates
+  // this whole tail section via the early return at the top of runTick.
+  let escalationDrain = { ok: true, delivered: 0, failed: 0, skipped: 0, candidates: 0 };
+  try {
+    escalationDrain = await drainQueuedEscalations(env, { limit: DRAIN_DEFAULT_LIMIT, dryRun: false });
+  } catch (err) {
+    console.log('[Remediator] escalation drain error: ' + err);
+    escalationDrain = { ok: false, error: String(err) };
+  }
+
   // Escalation rows that never reached Paperclip stay `queued` forever. Read
   // the depth every tick (one exact count) so a stuck sink shows up in the
   // logs and in `/status` -> last_main_tick instead of accumulating silently.
@@ -358,6 +413,36 @@ async function runTick(env) {
     console.log('[Remediator] escalation backlog probe error: ' + err);
   }
 
+  // R5: surface next_review_at 400-fallback engagements loudly. A non-sticky
+  // per-tick KV flag (this tick's own count/status only) so /status reflects
+  // current health rather than one historical blip.
+  if (env.REMEDIATOR_KV) {
+    try {
+      await env.REMEDIATOR_KV.put(NEXT_REVIEW_FALLBACK_KV_KEY, JSON.stringify({
+        checked_at: new Date().toISOString(),
+        fallback_engaged: nextReviewAtFallbackCount > 0,
+        count: nextReviewAtFallbackCount,
+      }));
+    } catch (err) {
+      console.log('[Remediator] next_review_at fallback KV write failed: ' + err);
+    }
+  }
+  if (nextReviewAtFallbackCount > 0) {
+    console.log('[Remediator] ALERT: next_review_at migration column missing — '
+      + nextReviewAtFallbackCount + ' fallback(s) this tick reverted to the legacy '
+      + 'schema-free query/patch shape (INTAKE_DEFER_MS cadence only).');
+  }
+
+  // R2: drained/delivered/failed/remaining counts for the tick summary.
+  // "remaining" reads the post-drain backlog total captured just above.
+  const escalationDrainSummary = {
+    drained: escalationDrain.candidates || 0,
+    delivered: escalationDrain.delivered || 0,
+    failed: escalationDrain.failed || 0,
+    remaining: (escalationBacklog && typeof escalationBacklog.total === 'number') ? escalationBacklog.total : null,
+    ok: escalationDrain.ok !== false,
+  };
+
   const ms = Date.now() - startedAt;
   const dormancy_reason = reportsFetched === 0 ? 'no_open_reports' : null;
   console.log('[Remediator] tick done in ' + ms + 'ms; processed=' + processed
@@ -366,7 +451,9 @@ async function runTick(env) {
     + ' expired_open_dismissed=' + expiredOpenDismissed
     + ' outcomes=' + JSON.stringify(outcomes)
     + ' escalations=' + JSON.stringify(escalationsResult)
-    + ' vendor_batch=' + JSON.stringify(vendorBatch));
+    + ' escalation_drain=' + JSON.stringify(escalationDrainSummary)
+    + ' vendor_batch=' + JSON.stringify(vendorBatch)
+    + ' next_review_at_fallback_count=' + nextReviewAtFallbackCount);
   const summary = {
     completed_at: new Date(Date.now()).toISOString(),
     processed,
@@ -377,10 +464,13 @@ async function runTick(env) {
     stale_recovered: staleRecovered,
     outcomes,
     escalations: escalationsResult,
+    escalation_drain: escalationDrainSummary,
     escalation_backlog: escalationBacklog,
+    escalation_inbox_aged_out: escalationInboxAgedOut,
     vendorBatch,
     ms,
     dormancy_reason,
+    next_review_at_fallback_count: nextReviewAtFallbackCount,
   };
   await recordLastTick(env, LAST_MAIN_TICK_KEY, summary);
   return {
@@ -392,9 +482,12 @@ async function runTick(env) {
     stale_recovered: staleRecovered,
     outcomes,
     escalations: escalationsResult,
+    escalation_drain: escalationDrainSummary,
     escalation_backlog: escalationBacklog,
+    escalation_inbox_aged_out: escalationInboxAgedOut,
     vendorBatch,
     ms,
+    next_review_at_fallback_count: nextReviewAtFallbackCount,
   };
 }
 
@@ -513,6 +606,67 @@ async function sweepExpiredOpenReports(env, limit) {
   return { scanned: rows.length, dismissed, failed };
 }
 
+// R8 — inbox lifecycle age-out (worker side). A `pending_review_items` row
+// of kind='bad_rental_escalation' that has sat `open` for 30+ days with no
+// operator engagement (agent_seen_at/resolved_at both null) is stale noise,
+// not an active item — 350 such rows existed in prod, oldest from 06-23,
+// none ever answered. Never deletes rows; uses the table's PROVEN status
+// vocabulary (open/answered/acknowledged/snoozed/dismissed — see
+// handlePendingItemRespond) rather than inventing an 'expired' status.
+const ESCALATION_INBOX_AGE_OUT_MS = 30 * 24 * 60 * 60 * 1000;
+const ESCALATION_INBOX_AGE_OUT_CAP = 200;
+const ESCALATION_INBOX_AGE_OUT_NOTE = 'auto-aged-out 30d (no operator response within 30 days)';
+
+async function sweepAgedOutEscalationInboxItems(env, limit) {
+  const cutoff = new Date(Date.now() - ESCALATION_INBOX_AGE_OUT_MS).toISOString();
+  const q = 'pending_review_items?kind=eq.bad_rental_escalation&status=eq.open'
+    + '&agent_seen_at=is.null&resolved_at=is.null'
+    + '&created_at=lt.' + encodeURIComponent(cutoff)
+    + '&select=id,created_at&order=created_at.asc&limit='
+    + Math.max(1, Math.min(limit || ESCALATION_INBOX_AGE_OUT_CAP, ESCALATION_INBOX_AGE_OUT_CAP));
+  let r;
+  try {
+    r = await supabaseGet(env, q);
+  } catch (err) {
+    console.log('[Remediator] sweepAgedOutEscalationInboxItems fetch error: ' + err);
+    return { scanned: 0, aged_out: 0, failed: 0 };
+  }
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    console.log('[Remediator] sweepAgedOutEscalationInboxItems fetch failed: ' + r.status + ' ' + txt);
+    return { scanned: 0, aged_out: 0, failed: 0 };
+  }
+  const rows = await r.json().catch(() => []);
+  if (!Array.isArray(rows) || rows.length === 0) return { scanned: 0, aged_out: 0, failed: 0 };
+  const nowIso = new Date().toISOString();
+  let agedOut = 0, failed = 0;
+  for (const row of rows) {
+    try {
+      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/pending_review_items?id=eq.' + encodeURIComponent(row.id), {
+        method: 'PATCH',
+        headers: supabaseHeaders(env, false),
+        body: JSON.stringify({
+          status: 'dismissed',
+          resolved_at: nowIso,
+          operator_response: ESCALATION_INBOX_AGE_OUT_NOTE,
+        }),
+      });
+      if (resp.ok) agedOut++;
+      else {
+        failed++;
+        console.log('[Remediator] escalation inbox age-out PATCH failed for ' + row.id + ': ' + resp.status);
+      }
+    } catch (err) {
+      failed++;
+      console.log('[Remediator] escalation inbox age-out error for ' + row.id + ': ' + err);
+    }
+  }
+  if (agedOut > 0) {
+    console.log('[Remediator] aged out ' + agedOut + ' stale bad_rental_escalation inbox item(s) (30d, no operator response).');
+  }
+  return { scanned: rows.length, aged_out: agedOut, failed };
+}
+
 async function processReportSafe(env, report) {
   try {
     return await processReport(env, report);
@@ -522,7 +676,7 @@ async function processReportSafe(env, report) {
     // `in_progress`, the row would otherwise leak forever and need the next
     // tick's stale-claim sweep to recover. Try a best-effort reset back to
     // `queued` so the next tick picks it up immediately.
-    try { await releaseClaimedToQueued(env, report.id); } catch (_) { /* swallow */ }
+    try { await releaseClaimedToQueued(env, report.id, report.status); } catch (_) { /* swallow */ }
     return { outcome: 'error', error: String(err) };
   }
 }
@@ -549,7 +703,30 @@ async function processReport(env, report) {
   }
 
   const evidence = await gatherEvidence(env, report);
-  const classification = await classifyShared(env, report, evidence);
+  let classification = await classifyShared(env, report, evidence);
+
+  // R5 robust fix: a report that reprocessed this many times without ever
+  // reaching a terminal state is stuck for a reason no classifier branch
+  // named — most concretely the next_review_at 400-fallback silently
+  // reverting a row to the 15-min INTAKE_DEFER_MS cadence forever (STUCK-2).
+  // Escalate instead of continuing to loop; keep the migration-compat path
+  // (fetchOpenReports/applyClassificationState) working, just bounded+loud.
+  if (!classification.terminal && (evidence.priorAttempts || 0) >= REPROCESSING_LOOP_CAP) {
+    classification = {
+      ...classification,
+      terminal: true,
+      action: 'escalate',
+      outcome: 'escalate',
+      escalationReason: 'reprocessing_loop',
+      issueType: 'Reprocessing loop guard tripped',
+      evidenceSummary: {
+        ...(classification.evidenceSummary || {}),
+        reprocessing_loop: true,
+        prior_mode: classification.mode,
+        prior_attempts: evidence.priorAttempts,
+      },
+    };
+  }
 
   const attemptNo = (evidence.priorAttempts || 0) + 1;
 
@@ -724,6 +901,11 @@ function suggestNextAction(failure_type) {
     case 'teltik_gateway_port_offline':    return 'Port reset did not bring Teltik port online — check gateway hardware / SIM seating via Teltik dashboard using the Teltik-known MDN.';
     case 'vendor_read_failed':             return 'Vendor status read kept failing (creds/identifier/API). Fix the read (check ICCID/MDN/subscription id), then requeue.';
     case 'vendor_mdn_drift':               return 'Provider MDN differs from DB MDN — run the MDN adopt/resync flow (rotator), then requeue.';
+    case 'teltik_host_port_read_failed':   return 'Teltik host port-status read kept failing (missing/invalid MDN or API outage) — fix the read, then requeue.';
+    case 'gateway_port_offline_unresolved':return 'Gateway/port stayed offline across repeated checks — inspect the physical gateway/port, then requeue.';
+    case 'teltik_line_not_seated':         return 'Line is not physically seated in any Teltik gateway port (reset-port cannot fix this) — reseat the SIM via the Teltik dashboard using the Teltik-known MDN.';
+    case 'verify_sms_disabled':            return 'Action likely succeeded but could not be SMS-verified — outbound SMS is globally disabled. Re-run the remediator once SMS sending is re-enabled.';
+    case 'reprocessing_loop':              return 'Report reprocessed repeatedly with no terminal state (possible schema drift on next_review_at) — inspect the attempt history and DB migrations, then requeue.';
     default: return 'Operator review required.';
   }
 }
@@ -740,8 +922,18 @@ function suggestNextAction(failure_type) {
 // Map an exhausted action to a §H.3 failure type normalizeFailureType
 // recognizes. classify_only exhaustion is the "we looked 3 times and cannot
 // reproduce" terminal; vendor actions map to their *_failed buckets.
-function maxAttemptsEscalationReason(action) {
+// R6: PreResolveGate actions whose §C verification requires an outbound SMS.
+// When the global kill switch is on and one of these exhausts its §G budget,
+// the honest cause is "could not verify" — not "the action failed" — so the
+// escalation reason must say so instead of the generic `<action>_failed`.
+const SMS_GATED_ACTIONS = new Set([
+  'resend_online', 'db_sync_upsert', 'atomic_ota', 'atomic_restore',
+  'wing_put_dialable', 'helix_ota', 'helix_unsuspend', 'teltik_reset_network',
+]);
+
+function maxAttemptsEscalationReason(action, env) {
   if (action === 'classify_only') return 'unable_to_reproduce_recommendation';
+  if (SMS_GATED_ACTIONS.has(action) && !smsSendingEnabled(env)) return 'verify_sms_disabled';
   if (action === 'wing_put_dialable') return 'wing_w7_dialable_retry_failed';
   return action + '_failed';
 }
@@ -816,7 +1008,7 @@ async function maybeExecuteAction(env, args) {
         execStatus: 'max_attempts_reached',
         escalationReason: (action === 'classify_only' && readFailed)
           ? 'vendor_read_failed'
-          : maxAttemptsEscalationReason(action),
+          : maxAttemptsEscalationReason(action, env),
       };
     }
     return gateRejection(gate, action, priorActionAttempts);
@@ -1028,12 +1220,19 @@ async function maybeExecuteAction(env, args) {
     // acted_sms_unverified instead of terminal remediated because number.online
     // is a reseller notification, not proof of renter SMS receipt.
     if (action === 'resend_online' && portOnline) {
+      // R6: while the global outbound-SMS kill switch is on, this is not
+      // "acted, verification just pending" (acted_sms_unverified's normal
+      // meaning) — verification is IMPOSSIBLE right now, not merely unproven.
+      // Give it its own outcome so it reads distinctly in the attempts table
+      // and, if it keeps recurring, escalates with an honest reason instead
+      // of the misleading resend_online_failed (see maxAttemptsEscalationReason).
+      const smsOn = smsSendingEnabled(env);
       return {
-        outcome: 'acted_sms_unverified',
+        outcome: smsOn ? 'acted_sms_unverified' : 'verify_sms_disabled',
         evidence: {
           exec_status: res.status,
-          gate_status: smsSendingEnabled(env) ? 'provider_and_teltik_host_healthy' : 'sms_unavailable',
-          gate_reason: smsSendingEnabled(env) ? null : SMS_UNAVAILABLE_MESSAGE,
+          gate_status: smsOn ? 'provider_and_teltik_host_healthy' : 'sms_unavailable',
+          gate_reason: smsOn ? null : SMS_UNAVAILABLE_MESSAGE,
           safe_to_resend_online: true,
           provider_status: 'healthy',
           provider_vendor: evidence.sim.vendor || null,
@@ -1047,7 +1246,8 @@ async function maybeExecuteAction(env, args) {
         },
         errorMessage: null,
         execStatus: res.status,
-        gateStatus: smsSendingEnabled(env) ? 'provider_and_teltik_host_healthy' : 'sms_unavailable',
+        gateStatus: smsOn ? 'provider_and_teltik_host_healthy' : 'sms_unavailable',
+        issueType: smsOn ? null : ISSUE_VERIFY_SMS_DISABLED,
       };
     }
 
@@ -1113,9 +1313,12 @@ async function maybeExecuteAction(env, args) {
   // pre-exec skipped_sms_unavailable (nothing ran; budget-exempt bookkeeping).
   // acted_sms_unverified is NOT budget-exempt: the exempted resend_online must
   // consume its §G attempts or it would re-fire every eligible tick.
+  // R6: sms_unavailable here means preResolveGate's own startVerify call hit
+  // the disabled kill switch after the action ran — verify_sms_disabled, same
+  // distinct outcome as the Teltik-host branch above (see maxAttemptsEscalationReason).
   return {
     outcome: resolveGate.status === 'verify_pending' ? 'verify_pending'
-           : resolveGate.status === 'sms_unavailable' ? 'acted_sms_unverified'
+           : resolveGate.status === 'sms_unavailable' ? 'verify_sms_disabled'
            : (classification.outcome || 'no_change'),
     evidence: {
       exec_status: res.status,
@@ -1126,6 +1329,7 @@ async function maybeExecuteAction(env, args) {
     errorMessage: null,
     execStatus: res.status,
     gateStatus: resolveGate.status,
+    issueType: resolveGate.status === 'sms_unavailable' ? ISSUE_VERIFY_SMS_DISABLED : null,
   };
 }
 
@@ -1214,6 +1418,7 @@ async function classifySharedLadder(env, report, evidence) {
       rental_id: report.rental_id,
       current_sim_id: evidence.rental.sim_id,
       reported_sim_id: report.sim_id,
+      ...reportIdentifiers(report, evidence),
     });
   }
 
@@ -1241,6 +1446,7 @@ async function classifySharedLadder(env, report, evidence) {
   if (!evidence.rental) {
     return terminal('S4', 'close_duplicate', 'duplicate', {
       reason: 'no_rental_row',
+      ...reportIdentifiers(report, evidence),
     });
   }
 
@@ -1252,20 +1458,36 @@ async function classifySharedLadder(env, report, evidence) {
         reason: 'vendor_cancelled_active_rental',
         sim_status: evidence.sim.status || null,
         active_rental_evidence: guard.evidence,
+        ...reportIdentifiers(report, evidence),
       }, 'vendor_cancelled_active_rental');
     }
     return terminal('S1', 'close_duplicate', 'duplicate', {
       reason: 'sim_cancelled_no_active_rental',
       sim_status: evidence.sim.status || null,
+      ...reportIdentifiers(report, evidence),
     });
   }
 
   // S5 — gateway/port offline. Only consider when we have a sim with port info.
   if (evidence.sim && evidence.gatewayOffline) {
+    // R1: mirror A10/W9/H9/T11 — after 2 real classify_only looks with no
+    // progress, escalate with a reason distinct from the generic shared cap
+    // instead of looping classify_only until the 3-attempt/2h cooldown gate
+    // eventually fires a generic unable_to_reproduce_recommendation.
+    const priorClassifyOnly = (evidence.priorActionAttempts && evidence.priorActionAttempts.classify_only) || 0;
+    if (priorClassifyOnly >= 2) {
+      return terminal('S5', 'escalate', 'escalate', {
+        reason: 'gateway_port_offline_unresolved',
+        gateway_id: evidence.sim.gateway_id || null,
+        port: evidence.sim.port || null,
+        prior_classify_only_attempts: priorClassifyOnly,
+      }, 'gateway_port_offline_unresolved', ISSUE_GATEWAY_PORT_OFFLINE_UNRESOLVED);
+    }
     return nonTerminal('S5', 'classify_only', 'no_change', {
       reason: 'gateway_port_offline',
       gateway_id: evidence.sim.gateway_id || null,
       port: evidence.sim.port || null,
+      prior_classify_only_attempts: priorClassifyOnly,
     });
   }
 
@@ -1319,6 +1541,32 @@ async function classifySharedLadder(env, report, evidence) {
     const providerNotActive = String(evidence.sim.vendor || '').toLowerCase() !== 'teltik'
       && !!(vr && vr.ok === true && vr.healthy === false);
     if (statusOk && ps.online === false && !providerNotActive) {
+      // R3: unseated-line detection. Live evidence for Atomic-on-Teltik lines
+      // shows get-info returning gateway_id:0/port:null — the line is not
+      // physically seated in any gateway port, so /v1/reset-port can never
+      // bring it back (it can only re-register a port the line already
+      // occupies). Escalate immediately with a distinct reason instead of
+      // looping teltik_reset_port forever; never call reset on this line.
+      const li = evidence.teltikHostLineInfo;
+      const gid = li && li.ok && !li.not_found ? li.gateway_id : undefined;
+      const gport = li && li.ok && !li.not_found ? li.port : undefined;
+      const unseated = li && li.ok && !li.not_found
+        && (gid === 0 || gid === '0') && (gport === null || gport === undefined || gport === '');
+      if (unseated) {
+        const resetMdnUnseated = (evidence.teltikKnownMdn && evidence.teltikKnownMdn.mdn)
+          || evidence.sim.current_mdn_e164 || '';
+        return terminal('TH5', 'escalate', 'escalate', {
+          reason: 'teltik_line_not_seated',
+          issue_type: ISSUE_TELTIK_LINE_NOT_SEATED,
+          gateway_host: evidence.sim.gateway_host || null,
+          vendor: evidence.sim.vendor || null,
+          gateway_id: gid,
+          port: gport === undefined ? null : gport,
+          port_status: ps.raw || 'offline',
+          mdn10: mdn10(resetMdnUnseated),
+          teltik_known_mdn: evidence.teltikKnownMdn || null,
+        }, 'teltik_line_not_seated', ISSUE_TELTIK_LINE_NOT_SEATED);
+      }
       // Deferred TH5 recheck pass: a prior counted teltik_reset_port attempt
       // on this (same-day) report means the reset already fired and the port
       // is STILL offline after the re-register window — escalate to an
@@ -1396,12 +1644,27 @@ async function classifySharedLadder(env, report, evidence) {
       };
     }
     if (!portReadOk) {
+      // R1: same distinct-exhaustion pattern as S5 above — a report that
+      // can never get a usable Teltik host port read gets its own escalation
+      // reason so the operator knows the port READ is what's broken, instead
+      // of reclassifying TH2 identically forever.
+      const priorClassifyOnly = (evidence.priorActionAttempts && evidence.priorActionAttempts.classify_only) || 0;
+      if (priorClassifyOnly >= 2) {
+        return terminal('TH2', 'escalate', 'escalate', {
+          reason: 'teltik_host_port_read_failed',
+          gateway_host: evidence.sim.gateway_host || null,
+          vendor: evidence.sim.vendor || null,
+          port_read: ps || null,
+          prior_classify_only_attempts: priorClassifyOnly,
+        }, 'teltik_host_port_read_failed', ISSUE_TELTIK_HOST_PORT_READ_FAILED);
+      }
       return nonTerminal('TH2', 'classify_only', 'no_change', {
         reason: 'pending_teltik_host_port_read',
         pending_reason: 'pending_teltik_host_port_read',
         gateway_host: evidence.sim.gateway_host || null,
         vendor: evidence.sim.vendor || null,
         port_read: ps || null,
+        prior_classify_only_attempts: priorClassifyOnly,
       });
     }
   }
@@ -1410,6 +1673,7 @@ async function classifySharedLadder(env, report, evidence) {
   if (!evidence.sim || !evidence.sim.vendor) {
     return terminal('S6', 'escalate', 'escalate', {
       reason: 'insufficient_evidence_no_vendor',
+      ...reportIdentifiers(report, evidence),
     }, 'insufficient_evidence');
   }
   const vendor = String(evidence.sim.vendor || '').toLowerCase();
@@ -1417,6 +1681,7 @@ async function classifySharedLadder(env, report, evidence) {
     return terminal('S6', 'escalate', 'escalate', {
       reason: 'insufficient_evidence_unknown_vendor',
       vendor,
+      ...reportIdentifiers(report, evidence),
     }, 'insufficient_evidence');
   }
 
@@ -1451,6 +1716,7 @@ async function classifySharedLadder(env, report, evidence) {
     return terminal('S6', 'escalate', 'escalate', {
       reason: 'insufficient_evidence_unknown_vendor',
       vendor,
+      ...reportIdentifiers(report, evidence),
     }, 'insufficient_evidence');
   }
   const nra = nextReviewAt({ action: situation.auto_action, now: new Date() });
@@ -1782,6 +2048,21 @@ async function gatherEvidence(env, report) {
     evidence.teltikHostPortMdn = hostReadMdn;
     evidence.teltikHostPortMdnSource = hostReadMdnSource;
     await recordHostPortRead(env, evidence.sim, hostReadMdn, hostReadMdnSource, evidence.teltikHostPortStatus);
+    // R3: port-status alone cannot distinguish "seated but the hardware is
+    // down" (reset-port can fix that) from "not physically seated in any
+    // gateway port at all" (gateway_id:0, port:null — a reset-port call can
+    // never seat it). Only /v1/get-info exposes gateway_id/port, so fetch it
+    // as a single confirmatory read — but only when port-status already read
+    // offline, to keep the healthy path at its usual one Teltik call.
+    const portReadUsable = !!(evidence.teltikHostPortStatus
+      && evidence.teltikHostPortStatus.status >= 200 && evidence.teltikHostPortStatus.status < 300);
+    if (portReadUsable && evidence.teltikHostPortStatus.online === false) {
+      try {
+        evidence.teltikHostLineInfo = await teltikGetInfo(env, { mdn: hostReadMdn });
+      } catch (err) {
+        evidence.teltikHostLineInfo = { ok: false, error: String(err && err.message || err) };
+      }
+    }
   }
   // HE1 usage proof — recent inbound SMS for THIS SIM. DB-only, one indexed
   // query. Matching/window logic lives in healthy-evidence.mjs (pure); this
@@ -1891,6 +2172,19 @@ function terminal(mode, action, outcome, evidenceSummary, escalationReason, issu
 }
 function nonTerminal(mode, action, outcome, evidenceSummary, escalationReason, issueType) {
   return { mode, action, outcome, evidenceSummary, terminal: false, escalationReason: escalationReason || null, issueType: issueType || null };
+}
+
+// R7: standard identifier bundle for the shared terminal closes (S1/S2/S4/S6)
+// whose evidence previously carried whatever ad hoc fields the call site
+// passed — S4 (`no_rental_row`) had none at all. An operator reading only
+// the attempts table had to cross-reference rental_reports.sim_id/e164
+// separately; every S1/S2/S4/S6 evidenceSummary now spreads this in.
+function reportIdentifiers(report, evidence) {
+  return {
+    sim_id: (evidence && evidence.sim && evidence.sim.id) || (report && report.sim_id) || null,
+    iccid: (evidence && evidence.sim && evidence.sim.iccid) || null,
+    mdn: (evidence && evidence.sim && evidence.sim.current_mdn_e164) || (report && report.e164) || null,
+  };
 }
 
 // ---------------------------------------------------------
@@ -2006,7 +2300,10 @@ async function applyClassificationState(env, report, classification, exec) {
   });
   if (!resp.ok && resp.status === 400 && 'next_review_at' in patch) {
     // Migration 20260729 not applied yet — retry without the column rather
-    // than leaving the row stuck in in_progress.
+    // than leaving the row stuck in in_progress. R5: count it — silently
+    // dropping the gating column here is exactly the STUCK-2 class of bug,
+    // so make every occurrence loud instead of invisible.
+    nextReviewAtFallbackCount++;
     const { next_review_at: _nr, ...legacy } = patch;
     resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
       method: 'PATCH',
@@ -2042,6 +2339,41 @@ async function applyClassificationState(env, report, classification, exec) {
       });
     } catch (e) {
       console.log('[Remediator] remediated event log insert failed: ' + e);
+    }
+  }
+  // R4: escalate transitions previously left no rental_report_events row —
+  // only the attempt row + bare state columns. rental_reports.status itself
+  // does not change on escalate (it stays received/in_triage), so — matching
+  // the dashboard's pause/resume-auto convention (handleBadRentalAutoLock) —
+  // to_status carries the unchanged status and the real transition rides in
+  // evidence.auto_remediation_state_from/_to.
+  if (patch.auto_remediation_state === 'escalated') {
+    try {
+      const unchangedStatus = patch.status || report.status || null;
+      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+        method: 'POST',
+        headers: supabaseHeaders(env, false),
+        body: JSON.stringify({
+          report_id: report.id,
+          from_status: report.status || null,
+          to_status: unchangedStatus,
+          actor: 'auto-remediator',
+          note: 'auto-remediator escalated: ' + (patch.escalation_reason || 'operator_review_required'),
+          evidence: {
+            source: 'auto_remediator',
+            mode: classification.mode,
+            action: classification.action,
+            escalation_reason: patch.escalation_reason || null,
+            issue_type: patch.issue_type || null,
+            exec_status: exec && exec.execStatus,
+            gate_status: exec && exec.gateStatus,
+            auto_remediation_state_from: report.auto_remediation_state || null,
+            auto_remediation_state_to: 'escalated',
+          },
+        }),
+      });
+    } catch (e) {
+      console.log('[Remediator] escalated event log insert failed: ' + e);
     }
   }
 }
@@ -2103,7 +2435,33 @@ async function recoverStaleClaims(env, thresholdMs) {
       return 0;
     }
     const rows = await resp.json().catch(() => []);
-    return Array.isArray(rows) ? rows.length : 0;
+    const recovered = Array.isArray(rows) ? rows : [];
+    // R4: claim recovery silently PATCHed in_progress -> queued with no audit
+    // trail. Write one event per recovered row (best-effort, never blocks the
+    // sweep) so an operator can see a report was reclaimed from a crashed/
+    // raced tick, not just infer it from attempt-row gaps.
+    for (const row of recovered) {
+      try {
+        await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+          method: 'POST',
+          headers: supabaseHeaders(env, false),
+          body: JSON.stringify({
+            report_id: row.id,
+            from_status: row.status || null,
+            to_status: row.status || null,
+            actor: 'system',
+            note: 'auto-remediator recovered a stale in_progress claim (crashed/raced tick)',
+            evidence: {
+              source: 'auto_remediator', reason: 'claim_recovered',
+              auto_remediation_state_from: 'in_progress', auto_remediation_state_to: 'queued',
+            },
+          }),
+        });
+      } catch (e) {
+        console.log('[Remediator] claim_recovered event log insert failed for ' + row.id + ': ' + e);
+      }
+    }
+    return recovered.length;
   } catch (err) {
     console.log('[Remediator] recoverStaleClaims error: ' + err);
     return 0;
@@ -2113,7 +2471,7 @@ async function recoverStaleClaims(env, thresholdMs) {
 // INC-25: best-effort reset of a single in_progress row back to queued when
 // processReport throws after claim succeeded. CAS filter avoids stomping a
 // verify_pending / operator_locked / escalated row that some other path set.
-async function releaseClaimedToQueued(env, reportId) {
+async function releaseClaimedToQueued(env, reportId, reportStatus) {
   const filter = '?id=eq.' + encodeURIComponent(reportId)
     + '&auto_remediation_state=eq.in_progress';
   const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
@@ -2123,6 +2481,28 @@ async function releaseClaimedToQueued(env, reportId) {
   });
   if (!resp.ok) {
     console.log('[Remediator] releaseClaimedToQueued failed for ' + reportId + ': ' + resp.status);
+    return;
+  }
+  // R4: same claim_recovered audit trail as recoverStaleClaims, for the
+  // single-row crash-recovery path.
+  try {
+    await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+      method: 'POST',
+      headers: supabaseHeaders(env, false),
+      body: JSON.stringify({
+        report_id: reportId,
+        from_status: reportStatus || null,
+        to_status: reportStatus || null,
+        actor: 'system',
+        note: 'auto-remediator recovered a claim after processReport threw',
+        evidence: {
+          source: 'auto_remediator', reason: 'claim_recovered',
+          auto_remediation_state_from: 'in_progress', auto_remediation_state_to: 'queued',
+        },
+      }),
+    });
+  } catch (e) {
+    console.log('[Remediator] claim_recovered event log insert failed for ' + reportId + ': ' + e);
   }
 }
 
@@ -2174,6 +2554,8 @@ async function fetchOpenReports(env, limit) {
   if (!r.ok && r.status === 400) {
     // Migration 20260729 (next_review_at) not applied yet — fall back to the
     // legacy query instead of going dormant on a column trap (INC-25 class).
+    // R5: count it — see the write-side twin in applyClassificationState.
+    nextReviewAtFallbackCount++;
     console.log('[Remediator] fetchOpenReports 400 (next_review_at missing?); using legacy query.');
     const legacy = 'rental_reports?status=in.(received,in_triage)'
       + '&and=(or(auto_remediation_state.is.null,auto_remediation_state.eq.queued)'

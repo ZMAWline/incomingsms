@@ -197,7 +197,10 @@ test('7182: Atomic active + Teltik host port online → resend_online after both
     const a = h.db.attempts[0];
     assert.equal(a.mode, 'TH2');
     assert.equal(a.action, 'resend_online');
-    assert.equal(a.outcome, 'acted_sms_unverified');
+    // R6: outbound SMS is globally disabled in this harness (no
+    // SMS_SENDING_ENABLED override), so verification is impossible right now
+    // — not merely unproven — and the outcome says so distinctly.
+    assert.equal(a.outcome, 'verify_sms_disabled');
     assert.equal(a.evidence.reason, 'provider_and_host_healthy_resend_online_safe');
     assert.equal(a.evidence.safe_to_resend_online, true);
     assert.equal(a.evidence.provider_vendor, 'atomic');
@@ -222,7 +225,10 @@ test('7182: stale webhook-delivered evidence still uses TH2 safe resend, never A
     const a = h.db.attempts[0];
     assert.equal(a.mode, 'TH2');
     assert.equal(a.action, 'resend_online');
-    assert.equal(a.outcome, 'acted_sms_unverified');
+    // R6: outbound SMS is globally disabled in this harness (no
+    // SMS_SENDING_ENABLED override), so verification is impossible right now
+    // — not merely unproven — and the outcome says so distinctly.
+    assert.equal(a.outcome, 'verify_sms_disabled');
     assert.notEqual(a.mode, 'A1');
     assert.notEqual(a.action, 'atomic_ota');
     assert.equal(a.evidence.webhook_delivered_before_resend, true);
@@ -338,7 +344,10 @@ test('7182: recheck pass online → safe online resend, no false remediated clos
     assert.equal(a.mode, 'TH2');
     assert.equal(a.action, 'resend_online');
     assert.notEqual(a.outcome, 'remediated', 'port-online recheck alone must never close the report');
-    assert.equal(a.outcome, 'acted_sms_unverified');
+    // R6: outbound SMS is globally disabled in this harness (no
+    // SMS_SENDING_ENABLED override), so verification is impossible right now
+    // — not merely unproven — and the outcome says so distinctly.
+    assert.equal(a.outcome, 'verify_sms_disabled');
     assert.equal(a.evidence.safe_to_resend_online, true);
     assert.equal(a.evidence.reason, 'provider_and_host_healthy_resend_online_safe');
 

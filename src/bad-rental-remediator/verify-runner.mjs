@@ -227,6 +227,31 @@ export async function resolvePendingVerify(env, report, opts) {
       verify_pending_nonce: null,
       verify_pending_sent_at: null,
     });
+    // R4: mirror the 'match' branch above — an escalate transition needs a
+    // rental_report_events row too, not just the attempt row + state columns.
+    // rental_reports.status is unchanged by an escalate (stays received/
+    // in_triage), so to_status carries the unchanged status and the real
+    // transition rides in evidence, matching the dashboard's convention.
+    try {
+      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+        method: 'POST',
+        headers: supabaseHeaders(env, false),
+        body: JSON.stringify({
+          report_id: report.id,
+          from_status: report.status || null,
+          to_status: report.status || null,
+          actor: 'auto-remediator',
+          note: 'auto-remediator escalated: verify_receive_timeout',
+          evidence: {
+            source: 'auto_remediator', escalation_reason: 'verify_receive_timeout',
+            nonce: report.verify_pending_nonce, to_number: toNumber, window_ms: RECEIVE_WINDOW_MS,
+            auto_remediation_state_from: 'verify_pending', auto_remediation_state_to: 'escalated',
+          },
+        }),
+      });
+    } catch (e) {
+      console.log('[Verify] escalated event log insert failed report=' + report.id + ': ' + e);
+    }
     return 'timeout';
   }
 

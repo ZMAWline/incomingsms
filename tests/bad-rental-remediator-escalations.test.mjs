@@ -28,7 +28,10 @@ import {
 // ---------------------------------------------------------
 
 test('ESCALATION_FAILURE_TYPES enumerates the bad-rental operator failure types', () => {
-  assert.equal(ESCALATION_FAILURE_TYPES.length, 17);
+  // BRR-FIX-SPEC R1/R3/R5/R6 added 5 distinct reasons: teltik_host_port_read_failed,
+  // gateway_port_offline_unresolved, teltik_line_not_seated, verify_sms_disabled,
+  // reprocessing_loop.
+  assert.equal(ESCALATION_FAILURE_TYPES.length, 22);
   for (const t of [
     'verify_send_failed', 'verify_receive_timeout', 'vendor_active_no_sms',
     'vendor_iccid_not_found', 'imei_wrong_type', 'imei_drift_vendor',
@@ -36,6 +39,8 @@ test('ESCALATION_FAILURE_TYPES enumerates the bad-rental operator failure types'
     'helix_unsuspend_failed', 'atomic_restore_failed', 'teltik_reset_failed',
     'teltik_gateway_port_offline', 'teltik_forward_url_misconfigured', 'unable_to_reproduce_recommendation',
     'vendor_read_failed', 'vendor_mdn_drift',
+    'teltik_host_port_read_failed', 'gateway_port_offline_unresolved',
+    'teltik_line_not_seated', 'verify_sms_disabled', 'reprocessing_loop',
     'generic',
   ]) assert.ok(ESCALATION_FAILURE_TYPES.includes(t), 'missing ' + t);
 });

@@ -45,6 +45,19 @@ export const ESCALATION_FAILURE_TYPES = Object.freeze([
   'unable_to_reproduce_recommendation',
   'vendor_read_failed',
   'vendor_mdn_drift',
+  // R1 — distinct TH2/S5 exhaustion reasons (mirrors the vendor classifier's
+  // A10/W9/H9/T11 unable_to_reproduce pattern, but naming the specific
+  // component that kept failing to read).
+  'teltik_host_port_read_failed',
+  'gateway_port_offline_unresolved',
+  // R3 — unseated Teltik line (gateway_id:0/port:null); reset-port can never
+  // fix this, so it is distinct from teltik_gateway_port_offline.
+  'teltik_line_not_seated',
+  // R6 — a PreResolveGate action succeeded but could not be SMS-verified
+  // because the global outbound-SMS kill switch is on.
+  'verify_sms_disabled',
+  // R5 — reprocessing-loop backstop escalation.
+  'reprocessing_loop',
   'generic',
 ]);
 
