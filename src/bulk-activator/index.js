@@ -229,8 +229,11 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
   const normalizedPortMdn = normalizePhone10(options.portMdn || options.port_mdn || '');
   const portAccountNumber = String(options.portAccountNumber || options.port_account_number || '').trim();
   const portPin = String(options.portPin || options.port_pin || '').trim();
-  if (normalizedPortMdn && (!portAccountNumber || !portPin)) {
-    throw new Error('ATOMIC port-in activation requires port account number and port PIN before carrier submission');
+  if (normalizedPortMdn || portAccountNumber || portPin) {
+    // Atomic Activate docs define only portMdn — no carrier fields for account/PIN.
+    // Refuse rather than silently activate a new number; validation blocks this upstream,
+    // this guard covers messages already queued. Never include the PIN in the error/logs.
+    throw new Error('ATOMIC port-in is not yet available: carrier API field names for port account number/PIN are unconfirmed — refusing to submit');
   }
   const requestBody = buildAtomicActivateRequest({
     session: {
@@ -241,19 +244,8 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
     iccid,
     imei,
     address: addr,
-    portMdn: normalizedPortMdn,
+    portMdn: '',
   });
-  const loggedRequestBody = normalizedPortMdn
-    ? {
-        carrierRequest: requestBody,
-        operatorPortContext: {
-          note: 'Atomic Activate mapping in repo documents only portMdn; account/PIN are validated and preserved here but not sent to carrier until API field names are confirmed.',
-          port_mdn: normalizedPortMdn,
-          port_account_number: portAccountNumber,
-          port_pin: portPin,
-        },
-      }
-    : requestBody;
 
   const res = await relayFetch(env, url, {
     method: 'POST',
@@ -273,7 +265,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
     vendor: 'atomic',
     request_url: url,
     request_method: 'POST',
-    request_body: loggedRequestBody,
+    request_body: requestBody,
     response_status: res.status,
     response_ok: res.ok,
     response_body_text: responseText,

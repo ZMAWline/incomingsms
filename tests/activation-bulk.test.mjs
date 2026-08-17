@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  ATOMIC_PORT_IN_BLOCKED_ERROR,
   buildActivationCsvTemplate,
   buildAtomicActivateRequest,
   parseActivationCsv,
@@ -24,7 +25,7 @@ test('existing non-port ATOMIC activation stays blank portMdn', () => {
   assert.equal(req.wholeSaleApi.wholeSaleRequest.portMdn, '');
 });
 
-test('valid port-in activation normalizes and sets portMdn', () => {
+test('complete port-in row is blocked until carrier field names are confirmed', () => {
   const checked = validateActivationSim({
     iccid: '89014103271467425631',
     imei: '123456789012345',
@@ -35,20 +36,22 @@ test('valid port-in activation normalizes and sets portMdn', () => {
     port_account_number: ' ACCT12345 ',
     port_pin: ' 1234 ',
   });
-  assert.equal(checked.ok, true);
-  assert.equal(checked.sim.port_in, true);
-  assert.equal(checked.sim.port_mdn, '2125550199');
-  assert.equal(checked.sim.port_account_number, 'ACCT12345');
-  assert.equal(checked.sim.port_pin, '1234');
+  assert.equal(checked.ok, false);
+  assert.equal(checked.errors.join('\n'), ATOMIC_PORT_IN_BLOCKED_ERROR);
+});
+
+test('Atomic Activate request never contains customer port account number or PIN', () => {
   const req = buildAtomicActivateRequest({
-    session: { userName: 'u', token: 't', pin: 'p' },
-    iccid: checked.sim.iccid,
-    imei: checked.sim.imei,
+    session: { userName: 'u', token: 't', pin: 'DEALER_PIN' },
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
     address: { streetNumber: '1', streetName: 'Main St', zipCode: '75001' },
-    portMdn: checked.sim.port_mdn,
+    portMdn: '',
     partnerTransactionId: 'tx2',
   });
-  assert.equal(req.wholeSaleApi.wholeSaleRequest.portMdn, '2125550199');
+  const serialized = JSON.stringify(req);
+  assert.equal(req.wholeSaleApi.wholeSaleRequest.portMdn, '');
+  assert.doesNotMatch(serialized, /ACCT12345|port_pin|port_account_number/);
 });
 
 test('missing or invalid portMdn blocks a port-in row', () => {
@@ -105,11 +108,9 @@ test('bulk CSV accepts mixed rows and returns row-level errors', () => {
     '89014103271467425633,123456789012347,1,atomic,true,,ACCT99999,9999',
   ].join('\n');
   const parsed = parseActivationCsv(csv);
-  assert.equal(parsed.valid.length, 2);
-  assert.equal(parsed.invalid.length, 1);
+  assert.equal(parsed.valid.length, 1);
+  assert.equal(parsed.invalid.length, 2);
   assert.equal(parsed.valid[0].sim.port_mdn, '');
-  assert.equal(parsed.valid[1].sim.port_mdn, '2125550199');
-  assert.equal(parsed.valid[1].sim.port_account_number, 'ACCT12345');
-  assert.equal(parsed.valid[1].sim.port_pin, '1234');
-  assert.match(parsed.invalid[0].errors.join('\n'), /port_mdn is required/);
+  assert.match(parsed.invalid[0].errors.join('\n'), /Row 3: ATOMIC port-in is not yet available/);
+  assert.match(parsed.invalid[1].errors.join('\n'), /port_mdn is required/);
 });

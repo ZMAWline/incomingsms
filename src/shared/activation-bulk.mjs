@@ -1,5 +1,8 @@
 export const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin'];
 
+export const ATOMIC_PORT_IN_BLOCKED_ERROR =
+  'ATOMIC port-in is not yet available: the carrier API field names for port account number/PIN are unconfirmed, so port-in submissions are blocked to avoid activating a new number instead. Submit without port_in, or wait until port-in support is enabled.';
+
 const TRUTHY = new Set(['1', 'true', 'yes', 'y', 'port', 'port_in', 'on']);
 const FALSY = new Set(['', '0', 'false', 'no', 'n', 'new', 'new_number', 'off']);
 
@@ -94,6 +97,10 @@ export function validateActivationSim(input, options = {}) {
     } else {
       sim.port_pin = portPin;
     }
+    // The Atomic Activate API (skill docs + EB reference guide) documents only portMdn —
+    // no carrier field names for port account number/PIN exist yet, so a "port-in" would
+    // silently activate as a new number. Block until the carrier mapping is confirmed.
+    errors.push(prefix + ATOMIC_PORT_IN_BLOCKED_ERROR);
   }
 
   return { ok: errors.length === 0, sim, errors };
