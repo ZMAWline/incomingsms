@@ -5,6 +5,7 @@ import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs'
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/teltik-known-mdn.mjs';
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
+import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -151,6 +152,10 @@ export default {
 
     if (url.pathname === '/api/imei-pool/pick' && request.method === 'GET') {
       return handleImeiPoolPick(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/random-address' && request.method === 'GET') {
+      return handleRandomAddress(corsHeaders);
     }
 
     if (url.pathname === '/api/import-gateway-imeis' && request.method === 'POST') {
@@ -3712,6 +3717,27 @@ async function handleImeiPoolPick(env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
+}
+
+// Port-in modal "Use random address" autofill. Draws from the static seed
+// copy of the address pool (civic buildings, no customer/PII data) so the
+// operator never has to hand-type a street address for a test/demo port-in.
+// Read-only — does not touch the DB-backed address_pool_usage table that
+// pickNextPpuAddress()/claim_address_pool_entry() consume for real PPU
+// rotations, so this can't burn a live rotation address.
+function handleRandomAddress(corsHeaders) {
+  const entry = ADDRESS_POOL[Math.floor(Math.random() * ADDRESS_POOL.length)];
+  return new Response(JSON.stringify({
+    ok: true,
+    address: {
+      streetNumber: entry.streetNumber,
+      streetName: entry.streetName,
+      streetDirection: entry.streetDirection || '',
+      city: entry.city,
+      state: entry.state,
+      zipCode: entry.zipCode,
+    },
+  }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
 async function handleImeiPoolPost(request, env, corsHeaders) {
