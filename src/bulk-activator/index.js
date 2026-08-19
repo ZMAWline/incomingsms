@@ -1,5 +1,5 @@
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
-import { buildAtomicActivateRequest, normalizePhone10, parseCsv, validateActivationSim } from '../shared/activation-bulk.mjs';
+import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseCsv, validateActivationSim } from '../shared/activation-bulk.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -47,6 +47,13 @@ export default {
     const iPortMdn = header.indexOf('port_mdn');
     const iPortAccountNumber = header.indexOf('port_account_number');
     const iPortPin = header.indexOf('port_pin');
+    const iPortFirstName = header.indexOf('port_first_name');
+    const iPortLastName = header.indexOf('port_last_name');
+    const iPortStreetNumber = header.indexOf('port_street_number');
+    const iPortStreetName = header.indexOf('port_street_name');
+    const iPortZip = header.indexOf('port_zip');
+    const iPortOldFirstName = header.indexOf('port_old_first_name');
+    const iPortOldLastName = header.indexOf('port_old_last_name');
 
     if ([iIccid, iImei, iReseller, iStatus].some(i => i < 0)) {
       return new Response('CSV missing required headers (iccid, imei, reseller_id, status)', { status: 400 });
@@ -72,6 +79,13 @@ export default {
         port_mdn: iPortMdn >= 0 ? String(r[iPortMdn] || '').trim() : '',
         port_account_number: iPortAccountNumber >= 0 ? String(r[iPortAccountNumber] || '').trim() : '',
         port_pin: iPortPin >= 0 ? String(r[iPortPin] || '').trim() : '',
+        port_first_name: iPortFirstName >= 0 ? String(r[iPortFirstName] || '').trim() : '',
+        port_last_name: iPortLastName >= 0 ? String(r[iPortLastName] || '').trim() : '',
+        port_street_number: iPortStreetNumber >= 0 ? String(r[iPortStreetNumber] || '').trim() : '',
+        port_street_name: iPortStreetName >= 0 ? String(r[iPortStreetName] || '').trim() : '',
+        port_zip: iPortZip >= 0 ? String(r[iPortZip] || '').trim() : '',
+        port_old_first_name: iPortOldFirstName >= 0 ? String(r[iPortOldFirstName] || '').trim() : '',
+        port_old_last_name: iPortOldLastName >= 0 ? String(r[iPortOldLastName] || '').trim() : '',
       }, { defaultVendor: 'atomic' });
       if (!checked.ok) {
         validationErrors++;
@@ -116,6 +130,13 @@ export default {
         port_mdn: portMdn = '',
         port_account_number: portAccountNumber = '',
         port_pin: portPin = '',
+        port_first_name: portFirstName = '',
+        port_last_name: portLastName = '',
+        port_street_number: portStreetNumber = '',
+        port_street_name: portStreetName = '',
+        port_zip: portZip = '',
+        port_old_first_name: portOldFirstName = '',
+        port_old_last_name: portOldLastName = '',
       } = msg.body;
       try {
         // Skip if already activated (check for sub_id or msisdn based on vendor)
@@ -133,7 +154,12 @@ export default {
         let result;
         switch (vendor) {
           case 'atomic':
-            result = await activateViaAtomic(env, iccid, imei, runId, { portMdn, portAccountNumber, portPin });
+            result = await activateViaAtomic(env, iccid, imei, runId, {
+              portMdn, portAccountNumber, portPin,
+              port_first_name: portFirstName, port_last_name: portLastName,
+              port_street_number: portStreetNumber, port_street_name: portStreetName, port_zip: portZip,
+              port_old_first_name: portOldFirstName, port_old_last_name: portOldLastName,
+            });
             break;
           case 'wing_iot':
             result = await activateViaWingIot(env, iccid, runId);
@@ -223,18 +249,23 @@ function relayFetch(env, url, init) {
 /* ── Vendor-specific activation functions ──────────────────────────────────── */
 
 async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
-  // ATOMIC activation - returns MSISDN immediately
-  const addr = await pickNextPpuAddress(env, {});
-  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
   const normalizedPortMdn = normalizePhone10(options.portMdn || options.port_mdn || '');
   const portAccountNumber = String(options.portAccountNumber || options.port_account_number || '').trim();
   const portPin = String(options.portPin || options.port_pin || '').trim();
+
+  // Port-in path: use Atomic Wholesale portinRequest with full carrier field set.
   if (normalizedPortMdn || portAccountNumber || portPin) {
-    // Atomic Activate docs define only portMdn — no carrier fields for account/PIN.
-    // Refuse rather than silently activate a new number; validation blocks this upstream,
-    // this guard covers messages already queued. Never include the PIN in the error/logs.
-    throw new Error('ATOMIC port-in is not yet available: carrier API field names for port account number/PIN are unconfirmed — refusing to submit');
+    return await activateViaAtomicPortIn(env, iccid, imei, runId, {
+      ...options,
+      normalizedPortMdn,
+      portAccountNumber,
+      portPin,
+    });
   }
+
+  // New-number activation path.
+  const addr = await pickNextPpuAddress(env, {});
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
   const requestBody = buildAtomicActivateRequest({
     session: {
       userName: env.ATOMIC_USERNAME,
@@ -293,6 +324,109 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
     ban: result.BAN || '',
     status: 'active', // ATOMIC activations are immediately active
     zipCode: addr.zipCode,
+  };
+}
+
+async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
+  const normalizedPortMdn = options.normalizedPortMdn || normalizePhone10(options.portMdn || options.port_mdn || '');
+  const portAccountNumber = String(options.portAccountNumber || options.port_account_number || '').trim();
+  const portPin = String(options.portPin || options.port_pin || '').trim();
+  const portFields = mapPortFields(options);
+
+  // Belt-and-suspenders: validateActivationSim already blocks incomplete port-in
+  // rows upstream (CSV /run, JSON /activate, dashboard). This guard covers
+  // messages already queued before that validation existed, and refuses rather
+  // than silently falling back to a new-number Activate submission.
+  const missing = [];
+  if (!normalizedPortMdn) missing.push('port_mdn (10 digits)');
+  if (!portAccountNumber) missing.push('port_account_number');
+  if (!portPin) missing.push('port_pin');
+  if (!portFields.firstName) missing.push('port_first_name');
+  if (!portFields.lastName) missing.push('port_last_name');
+  if (!portFields.streetNumber) missing.push('port_street_number');
+  if (!portFields.streetName) missing.push('port_street_name');
+  if (!portFields.zip) missing.push('port_zip');
+  if (!portFields.oldFirstName) missing.push('port_old_first_name');
+  if (!portFields.oldLastName) missing.push('port_old_last_name');
+  if (missing.length) {
+    throw new Error(`ATOMIC port-in refused — missing required field(s): ${missing.join(', ')}`);
+  }
+
+  const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const requestBody = buildAtomicPortInRequest({
+    session: {
+      userName: env.ATOMIC_USERNAME,
+      token: env.ATOMIC_TOKEN,
+      pin: env.ATOMIC_PIN,
+    },
+    iccid,
+    imei,
+    portMdn: normalizedPortMdn,
+    portAccountNumber,
+    portPin,
+    firstName: portFields.firstName,
+    lastName: portFields.lastName,
+    streetNumber: portFields.streetNumber,
+    streetName: portFields.streetName,
+    zip: portFields.zip,
+    oldFirstName: portFields.oldFirstName,
+    oldLastName: portFields.oldLastName,
+  });
+
+  const res = await relayFetch(env, url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  });
+
+  const responseText = await res.text();
+  let responseJson = {};
+  try { responseJson = JSON.parse(responseText); } catch {}
+
+  await logCarrierApiCall(env, {
+    run_id: runId,
+    step: 'portin',
+    iccid,
+    imei,
+    vendor: 'atomic',
+    request_url: url,
+    request_method: 'POST',
+    request_body: requestBody,
+    response_status: res.status,
+    response_ok: res.ok,
+    response_body_text: responseText,
+    response_body_json: responseJson,
+    error: res.ok ? null : `ATOMIC port-in failed: ${res.status}`,
+  });
+
+  if (!res.ok) {
+    throw new Error(`ATOMIC port-in failed ${res.status}: ${responseText.slice(0, 300)}`);
+  }
+
+  // Unlike Activate, a port is accepted asynchronously by the losing carrier —
+  // the carrier's success/response shape for portinRequest is not independently
+  // confirmed (see docs/atomic-port-in-runbook.md), so we don't hard-require an
+  // MSISDN echo here. We already know the target MDN; use it as the identifier
+  // and record the SIM as still provisioning rather than immediately active.
+  const result = responseJson?.wholeSaleApi?.wholeSaleResponse?.Result;
+  return {
+    msisdn: result?.MSISDN || normalizedPortMdn,
+    ban: result?.BAN || '',
+    status: 'provisioning', // sims.status CHECK constraint has no "pending port" value
+    zipCode: portFields.zip,
+  };
+}
+
+function mapPortFields(options) {
+  const get = (k) => String(options?.[k] ?? '').trim();
+  return {
+    firstName: get('port_first_name'),
+    lastName: get('port_last_name'),
+    streetNumber: get('port_street_number'),
+    streetName: get('port_street_name'),
+    zip: get('port_zip'),
+    oldFirstName: get('port_old_first_name'),
+    oldLastName: get('port_old_last_name'),
   };
 }
 
@@ -510,8 +644,11 @@ async function upsertSimWithVendor(env, iccid, result, vendor) {
   if (vendor === 'atomic' || vendor === 'wing_iot') {
     // ATOMIC and Wing IoT use MSISDN, not mobilitySubscriptionId
     payload.msisdn = result.msisdn;
-    // For ATOMIC/Wing, SIM is immediately active with MDN
-    if (result.msisdn) {
+    // New-number Activate is immediately active with MDN. Port-in is accepted
+    // asynchronously by the losing carrier — activateViaAtomicPortIn returns
+    // status: 'provisioning' precisely so this does NOT get forced to 'active'
+    // before the port has actually completed.
+    if (result.msisdn && result.status !== 'provisioning') {
       payload.status = 'active';
     }
     if (result.zipCode) {
