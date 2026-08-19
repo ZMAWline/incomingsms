@@ -6,6 +6,7 @@ import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-i
 import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/teltik-known-mdn.mjs';
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
+import { NAME_POOL } from '../shared/name-pool.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -156,6 +157,10 @@ export default {
 
     if (url.pathname === '/api/random-address' && request.method === 'GET') {
       return handleRandomAddress(corsHeaders);
+    }
+
+    if (url.pathname === '/api/random-identity' && request.method === 'GET') {
+      return handleRandomIdentity(corsHeaders);
     }
 
     if (url.pathname === '/api/import-gateway-imeis' && request.method === 'POST') {
@@ -3730,6 +3735,32 @@ function handleRandomAddress(corsHeaders) {
   return new Response(JSON.stringify({
     ok: true,
     address: {
+      streetNumber: entry.streetNumber,
+      streetName: entry.streetName,
+      streetDirection: entry.streetDirection || '',
+      city: entry.city,
+      state: entry.state,
+      zipCode: entry.zipCode,
+    },
+  }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
+// Port-in modal "Use random subscriber identity" autofill. Draws a name from
+// the static FakeNameGenerator.com seed pool (fake identities, no real
+// customer/PII) and an address from the same ADDRESS_POOL used above, and
+// returns them together so the operator can fill the whole "new subscriber /
+// account holder" block in one click. Never touches account number, PIN, or
+// the losing-carrier (old_service_provider) name fields — those require an
+// explicit, separate operator action because they must match real carrier
+// records for the port to succeed.
+function handleRandomIdentity(corsHeaders) {
+  const name = NAME_POOL[Math.floor(Math.random() * NAME_POOL.length)];
+  const entry = ADDRESS_POOL[Math.floor(Math.random() * ADDRESS_POOL.length)];
+  return new Response(JSON.stringify({
+    ok: true,
+    identity: {
+      firstName: name.firstName,
+      lastName: name.lastName,
       streetNumber: entry.streetNumber,
       streetName: entry.streetName,
       streetDirection: entry.streetDirection || '',
