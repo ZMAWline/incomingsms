@@ -1,4 +1,19 @@
-export const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin'];
+export const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin', 'port_first_name', 'port_last_name', 'port_street_number', 'port_street_name', 'port_zip', 'port_old_first_name', 'port_old_last_name'];
+
+// Required subscriber (new account holder) + old_service_provider (losing-carrier
+// account holder) fields per the Atomic Wholesale API portinRequest reference.
+// old_service_provider has no address block — only billing account + name — so we
+// don't collect an "old" street/zip; collecting fields the carrier never receives
+// would be misleading to operators.
+const REQUIRED_PORT_FIELDS = [
+  'port_first_name',
+  'port_last_name',
+  'port_street_number',
+  'port_street_name',
+  'port_zip',
+  'port_old_first_name',
+  'port_old_last_name',
+];
 
 const TRUTHY = new Set(['1', 'true', 'yes', 'y', 'port', 'port_in', 'on']);
 const FALSY = new Set(['', '0', 'false', 'no', 'n', 'new', 'new_number', 'off']);
@@ -67,6 +82,13 @@ export function validateActivationSim(input, options = {}) {
     port_mdn: '',
     port_account_number: '',
     port_pin: '',
+    port_first_name: '',
+    port_last_name: '',
+    port_street_number: '',
+    port_street_name: '',
+    port_zip: '',
+    port_old_first_name: '',
+    port_old_last_name: '',
   };
   const errors = [];
 
@@ -93,6 +115,19 @@ export function validateActivationSim(input, options = {}) {
       errors.push(prefix + 'port_pin is required for port-in');
     } else {
       sim.port_pin = portPin;
+    }
+    // subscriber.* (new account holder) + old_service_provider.* (losing-carrier
+    // account holder) — required by the carrier's portinRequest; block with a
+    // specific per-field error rather than silently falling back to a new-number
+    // Activate submission.
+    for (const key of REQUIRED_PORT_FIELDS) {
+      const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+      const val = String(input?.[key] ?? input?.[camel] ?? '').trim();
+      if (!val) {
+        errors.push(prefix + key + ' is required for port-in');
+      } else {
+        sim[key] = val;
+      }
     }
   }
 
@@ -123,6 +158,13 @@ export function parseActivationCsv(text, options = {}) {
       port_mdn: valueAt(row, header, 'port_mdn'),
       port_account_number: valueAt(row, header, 'port_account_number'),
       port_pin: valueAt(row, header, 'port_pin'),
+      port_first_name: valueAt(row, header, 'port_first_name'),
+      port_last_name: valueAt(row, header, 'port_last_name'),
+      port_street_number: valueAt(row, header, 'port_street_number'),
+      port_street_name: valueAt(row, header, 'port_street_name'),
+      port_zip: valueAt(row, header, 'port_zip'),
+      port_old_first_name: valueAt(row, header, 'port_old_first_name'),
+      port_old_last_name: valueAt(row, header, 'port_old_last_name'),
     };
     const result = validateActivationSim(candidate, { rowNumber, defaultVendor });
     if (result.ok) valid.push({ row: rowNumber, sim: result.sim });
@@ -140,8 +182,8 @@ export function csvEscape(value) {
 export function buildActivationCsvTemplate() {
   const rows = [
     ACTIVATION_CSV_HEADERS,
-    ['89014103271467425631', '123456789012345', '1', 'atomic', 'false', '', '', ''],
-    ['89014103271467425632', '123456789012346', '1', 'atomic', 'true', '2125550199', 'ACCT12345', '1234'],
+    ['89014103271467425631', '123456789012345', '1', 'atomic', 'false', '', '', '', '', '', '', '', '', '', ''],
+    ['89014103271467425632', '123456789012346', '1', 'atomic', 'true', '2125550199', 'ACCT12345', '1234', 'John', 'Doe', '123', 'Main St', '75001', 'Jane', 'Smith'],
   ];
   return rows.map(row => row.map(csvEscape).join(',')).join('\n') + '\n';
 }
@@ -166,6 +208,62 @@ export function buildAtomicActivateRequest({ session, iccid, imei, address, port
         zip: address.zipCode,
         plan: 'EBNOVOICE',
         portMdn: portMdn || '',
+      },
+    },
+  };
+}
+
+// Atomic Wholesale API `portinRequest` — a SEPARATE operation from `Activate`.
+// Field names/shape per the atomic-wholesale-api skill (subscriber = new account
+// holder taking the line; old_service_provider = losing-carrier account holder —
+// they are independent blocks and are not required to match). `planCode` (not
+// `plan`, which is only the Activate field name) and top-level `BAN` are the
+// carrier's documented required keys; BAN is sent blank on the same precedent as
+// Activate's BAN (assigned by the carrier, not supplied by us) — unconfirmed by
+// the carrier for this specific operation, flagged for live-test review.
+export function buildAtomicPortInRequest({
+  session,
+  iccid,
+  imei,
+  portMdn,
+  portAccountNumber,
+  portPin,
+  firstName,
+  lastName,
+  streetNumber,
+  streetName,
+  zip,
+  oldFirstName,
+  oldLastName,
+  partnerTransactionId,
+}) {
+  return {
+    wholeSaleApi: {
+      session,
+      wholeSaleRequest: {
+        requestType: 'portinRequest',
+        partnerTransactionId: partnerTransactionId || `port_${Date.now()}`,
+        MSISDN: portMdn,
+        sim: iccid,
+        eSim: 'N',
+        BAN: '',
+        imei,
+        planCode: 'EBNOVOICE',
+        subscriber: {
+          firstName,
+          lastName,
+          streetNumber,
+          streetType: '',
+          streetDirection: '',
+          streetName,
+          zipCode: zip,
+        },
+        old_service_provider: {
+          billingAccountNumber: portAccountNumber,
+          billingAccountPassword: portPin,
+          firstName: oldFirstName,
+          lastName: oldLastName,
+        },
       },
     },
   };

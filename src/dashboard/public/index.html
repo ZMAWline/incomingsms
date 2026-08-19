@@ -3838,7 +3838,41 @@ set verify_pending; schedule §C.3 poll
                             <input id="activate-port-pin" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="PIN or passcode">
                         </div>
                     </div>
-                    <p class="text-xs text-gray-500 mt-2">Required for single port-in. MDN is normalized to 10 digits before submitting. Atomic docs available in this repo only expose portMdn on Activate; account/PIN are validated and preserved in queue/log context until exact carrier field names are confirmed.</p>
+                    <h4 class="text-sm text-gray-300 font-medium mt-4 mb-2">New subscriber / account holder</h4>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">First name <span class="text-red-400">*</span></label>
+                            <input id="activate-port-first-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="First name">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Last name <span class="text-red-400">*</span></label>
+                            <input id="activate-port-last-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Last name">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Street number <span class="text-red-400">*</span></label>
+                            <input id="activate-port-street-number" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="123">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Street name <span class="text-red-400">*</span></label>
+                            <input id="activate-port-street-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Main St">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">ZIP <span class="text-red-400">*</span></label>
+                            <input id="activate-port-zip" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="75001">
+                        </div>
+                    </div>
+                    <h4 class="text-sm text-gray-300 font-medium mt-4 mb-2">Losing-carrier account holder (name only — may differ from subscriber above)</h4>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Old first name <span class="text-red-400">*</span></label>
+                            <input id="activate-port-old-first-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Old first name">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-300 mb-1">Old last name <span class="text-red-400">*</span></label>
+                            <input id="activate-port-old-last-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Old last name">
+                        </div>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-2">All fields are required for port-in. Sends the Atomic Wholesale <code class="bg-dark-900 px-1 rounded">portinRequest</code> operation (separate from <code class="bg-dark-900 px-1 rounded">Activate</code>) with the subscriber name/address and the losing-carrier billing account/PIN/name. The losing-carrier account number/PIN/name must match their records exactly or the port will reject. PIN is sent only inside this carrier request — never written to any separate debug field — but the request itself (including PIN) is recorded in carrier_api_logs for troubleshooting, same as every other carrier call.</p>
                 </div>
                 <div class="mb-4 p-3 rounded-lg border border-dark-600 bg-dark-900/40">
                     <div class="flex flex-wrap items-center gap-3">
@@ -3846,7 +3880,7 @@ set verify_pending; schedule §C.3 poll
                         <input id="activate-csv-file" type="file" accept=".csv,text/csv" class="text-sm text-gray-300">
                         <button type="button" onclick="downloadActivationTemplate()" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Download CSV Template</button>
                     </div>
-                    <p class="text-xs text-gray-500 mt-2">CSV headers: iccid, imei, reseller_id, vendor, port_in, port_mdn, port_account_number, port_pin. The review step blocks submission if any row is invalid.</p>
+                    <p class="text-xs text-gray-500 mt-2">CSV headers: iccid, imei, reseller_id, vendor, port_in, port_mdn, port_account_number, port_pin, port_first_name, port_last_name, port_street_number, port_street_name, port_zip, port_old_first_name, port_old_last_name. The review step blocks submission if any row is invalid.</p>
                 </div>
                 <p class="text-sm text-gray-400 mb-3">Paste from spreadsheet or enter one SIM per line:</p>
                 <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631&#9;123456789012345&#9;1
@@ -6274,6 +6308,13 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('activate-port-mdn').value = '';
             document.getElementById('activate-port-account-number').value = '';
             document.getElementById('activate-port-pin').value = '';
+            document.getElementById('activate-port-first-name').value = '';
+            document.getElementById('activate-port-last-name').value = '';
+            document.getElementById('activate-port-street-number').value = '';
+            document.getElementById('activate-port-street-name').value = '';
+            document.getElementById('activate-port-zip').value = '';
+            document.getElementById('activate-port-old-first-name').value = '';
+            document.getElementById('activate-port-old-last-name').value = '';
             document.getElementById('activate-port-in').checked = false;
             document.getElementById('activate-csv-file').value = '';
             const review = document.getElementById('activate-review');
@@ -6281,7 +6322,7 @@ async function sendSimOnline(simId, phoneNumber) {
             updateActivatePortInUi();
         }
 
-        const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin'];
+        const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin', 'port_first_name', 'port_last_name', 'port_street_number', 'port_street_name', 'port_zip', 'port_old_first_name', 'port_old_last_name'];
         function normalizeActivationPhone10(value) {
             const digits = String(value || '').replace(/\D/g, '');
             return digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
@@ -6309,6 +6350,10 @@ async function sendSimOnline(simId, phoneNumber) {
             row.push(cur); rows.push(row);
             return rows.filter(r => r.some(v => String(v).trim() !== ''));
         }
+        const PORT_FIELD_KEYS = [
+            'port_first_name', 'port_last_name', 'port_street_number', 'port_street_name', 'port_zip',
+            'port_old_first_name', 'port_old_last_name'
+        ];
         function validateActivationRow(row, rowNumber, defaultVendor) {
             const sim = {
                 iccid: String(row.iccid || '').trim(),
@@ -6318,7 +6363,14 @@ async function sendSimOnline(simId, phoneNumber) {
                 port_in: activationFlag(row.port_in),
                 port_mdn: '',
                 port_account_number: '',
-                port_pin: ''
+                port_pin: '',
+                port_first_name: '',
+                port_last_name: '',
+                port_street_number: '',
+                port_street_name: '',
+                port_zip: '',
+                port_old_first_name: '',
+                port_old_last_name: ''
             };
             const errors = [];
             const prefix = rowNumber ? 'Row ' + rowNumber + ': ' : '';
@@ -6336,13 +6388,21 @@ async function sendSimOnline(simId, phoneNumber) {
                 const portPin = String(row.port_pin || row.portPin || row.port_passcode || row.portPasscode || '').trim();
                 if (!portPin) errors.push(prefix + 'port_pin is required for port-in');
                 else sim.port_pin = portPin;
+                for (const k of PORT_FIELD_KEYS) {
+                    const v = String(row[k] || '').trim();
+                    if (!v) errors.push(prefix + k + ' is required for port-in');
+                    else sim[k] = v;
+                }
             }
             return { ok: errors.length === 0, sim, errors };
         }
         function buildActivationCsvTemplate() {
-            return ACTIVATION_CSV_HEADERS.join(',') + '\n' +
-                '89014103271467425631,123456789012345,1,atomic,false,,,\n' +
-                '89014103271467425632,123456789012346,1,atomic,true,2125550199,ACCT12345,1234\n';
+            const rows = [
+                ACTIVATION_CSV_HEADERS,
+                ['89014103271467425631', '123456789012345', '1', 'atomic', 'false', '', '', '', '', '', '', '', '', '', ''],
+                ['89014103271467425632', '123456789012346', '1', 'atomic', 'true', '2125550199', 'ACCT12345', '1234', 'John', 'Doe', '123', 'Main St', '75001', 'Jane', 'Smith'],
+            ];
+            return rows.map(r => r.join(',')).join('\n') + '\n';
         }
         function downloadActivationTemplate() {
             const blob = new Blob([buildActivationCsvTemplate()], { type: 'text/csv' });
@@ -6438,7 +6498,14 @@ async function sendSimOnline(simId, phoneNumber) {
                         port_in: manualPortIn ? 'true' : 'false',
                         port_mdn: manualPortIn ? document.getElementById('activate-port-mdn').value : '',
                         port_account_number: manualPortIn ? document.getElementById('activate-port-account-number').value : '',
-                        port_pin: manualPortIn ? document.getElementById('activate-port-pin').value : ''
+                        port_pin: manualPortIn ? document.getElementById('activate-port-pin').value : '',
+                        port_first_name: manualPortIn ? document.getElementById('activate-port-first-name').value : '',
+                        port_last_name: manualPortIn ? document.getElementById('activate-port-last-name').value : '',
+                        port_street_number: manualPortIn ? document.getElementById('activate-port-street-number').value : '',
+                        port_street_name: manualPortIn ? document.getElementById('activate-port-street-name').value : '',
+                        port_zip: manualPortIn ? document.getElementById('activate-port-zip').value : '',
+                        port_old_first_name: manualPortIn ? document.getElementById('activate-port-old-first-name').value : '',
+                        port_old_last_name: manualPortIn ? document.getElementById('activate-port-old-last-name').value : ''
                     }, i + 1, vendor);
                     if (checked.ok) sims.push(checked.sim);
                     else errors.push.apply(errors, checked.errors);
