@@ -6,17 +6,31 @@ workers_dev = true
 
 [vars]
 ASSIGNMENT_TTL_MINUTES = "60"
+LOGIN_SESSION_TTL_MINUTES = "720"
 
 [observability.logs]
 enabled = true
 invocation_logs = true
 
-# Secrets (wrangler secret put): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OTP_PORTAL_TOKEN.
+# Secrets (wrangler secret put): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+# OTP_PORTAL_PASSWORD_HASH, OTP_PORTAL_SESSION_SECRET.
 #
-# OTP_PORTAL_TOKEN is the private path segment that gates the entire app
-# (e.g. generate with `openssl rand -hex 24`). The page lives at
-# https://<worker-host>/<OTP_PORTAL_TOKEN>/ — anyone without the token gets a
-# plain 404, same as any other unknown route. Never commit the value.
+# The page lives at the plain worker root, e.g.
+# https://otp-portal.<subdomain>.workers.dev/ — it shows a login form and
+# only serves a number/SMS once signed in.
+#
+# OTP_PORTAL_PASSWORD_HASH is a PBKDF2 hash of the shared login password in
+# the format produced by src/otp-portal/auth.mjs#hashPassword
+# ("pbkdf2$<iterations>$<salt_b64>$<hash_b64>") — never store the plaintext
+# password itself. To generate one: run `hashPassword('<the password>')`
+# from auth.mjs (e.g. via `node --input-type=module -e "..."`) and
+# `wrangler secret put OTP_PORTAL_PASSWORD_HASH` with the result.
+#
+# OTP_PORTAL_SESSION_SECRET signs the login session cookie
+# (`openssl rand -hex 32`). Rotating it invalidates all existing sessions.
+#
+# A wrong or missing password never reaches Supabase — verification is pure
+# local PBKDF2/HMAC. Never commit any of these secret values.
 
 # ============ TEST ENVIRONMENT ============
 [env.test]
@@ -24,6 +38,7 @@ name = "otp-portal-test"
 
 [env.test.vars]
 ASSIGNMENT_TTL_MINUTES = "60"
+LOGIN_SESSION_TTL_MINUTES = "720"
 
 [env.test.observability.logs]
 enabled = true

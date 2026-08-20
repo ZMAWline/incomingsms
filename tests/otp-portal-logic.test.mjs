@@ -1,26 +1,18 @@
-// otp-portal pure-logic tests — candidate selection, message scoping, and
-// the constant-time token compare. No network, no DB.
+// otp-portal pure-logic tests — candidate selection and message scoping.
+// No network, no DB. Auth-related pure functions (constantTimeEqual,
+// password hashing, session signing) live in auth.mjs and are covered by
+// otp-portal-auth.test.mjs instead.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   normalizeToE164,
   vendorToCarrier,
-  constantTimeEqual,
   computeAvailableCandidates,
   pickRandom,
   filterAssignmentMessages,
   escapeHtml,
   highlightOtpHtml,
 } from '../src/otp-portal/logic.mjs';
-
-test('constantTimeEqual only true for exact matches', () => {
-  assert.equal(constantTimeEqual('abc123', 'abc123'), true);
-  assert.equal(constantTimeEqual('abc123', 'abc124'), false);
-  assert.equal(constantTimeEqual('abc123', 'abc12'), false);
-  assert.equal(constantTimeEqual('', ''), true);
-  assert.equal(constantTimeEqual(null, ''), true);
-  assert.equal(constantTimeEqual(undefined, 'x'), false);
-});
 
 test('vendorToCarrier: teltik is T-Mobile, everything else AT&T', () => {
   assert.equal(vendorToCarrier('teltik'), 'T-Mobile');

@@ -15,17 +15,6 @@ export function vendorToCarrier(vendor) {
   return vendor === 'teltik' ? 'T-Mobile' : 'AT&T';
 }
 
-// Constant-time compare — used for the path-token check so a wrong guess
-// doesn't leak timing information about how many characters matched.
-export function constantTimeEqual(a, b) {
-  const A = String(a == null ? '' : a);
-  const B = String(b == null ? '' : b);
-  if (A.length !== B.length) return false;
-  let diff = 0;
-  for (let i = 0; i < A.length; i++) diff |= A.charCodeAt(i) ^ B.charCodeAt(i);
-  return diff === 0;
-}
-
 // Sims eligible for a fresh OTP-portal assignment: in shop_pool ∩
 // sims.status='active' ∩ has a current e164 ∩ NOT rented by a paying
 // storefront customer ∩ NOT already held by another unexpired otp-portal

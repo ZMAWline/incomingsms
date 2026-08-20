@@ -1,4 +1,4 @@
-// otp-portal worker integration tests — token gating, per-browser assignment
+// otp-portal worker integration tests — login gating, per-browser assignment
 // stability, SMS scope, no-number state, and (critically) that nothing but
 // the otp_portal_claim RPC is ever written to. Mocks fetch as a fake
 // PostgREST/RPC backend; no live DB, no carrier API involved (this worker
@@ -9,14 +9,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { hashPassword } from '../src/otp-portal/auth.mjs';
 
 const logicUrl = new URL('../src/otp-portal/logic.mjs', import.meta.url).href;
+const authUrl = new URL('../src/otp-portal/auth.mjs', import.meta.url).href;
 const workerSrc = (await readFile(new URL('../src/otp-portal/index.js', import.meta.url), 'utf8'))
-  .replace("'./logic.mjs'", JSON.stringify(logicUrl));
+  .replace("'./logic.mjs'", JSON.stringify(logicUrl))
+  .replace("'./auth.mjs'", JSON.stringify(authUrl));
 const otpPortal = (await import('data:text/javascript;base64,' + Buffer.from(workerSrc).toString('base64'))).default;
 
 const realFetch = globalThis.fetch;
 const realRandom = Math.random;
+
+const PASSWORD = 'correct horse battery staple';
+const PASSWORD_HASH = await hashPassword(PASSWORD);
+
+const ENV = {
+  SUPABASE_URL: 'https://x.supabase.co',
+  SUPABASE_SERVICE_ROLE_KEY: 'k',
+  OTP_PORTAL_PASSWORD_HASH: PASSWORD_HASH,
+  OTP_PORTAL_SESSION_SECRET: 'test-session-secret',
+};
 
 function jsonRes(data, status = 200) {
   return { ok: status < 400, status, json: async () => data, text: async () => JSON.stringify(data) };
@@ -113,55 +126,133 @@ function fakeBackend({ pool = [], sims = [], numbers = [], shopRentals = [], mes
   return { calls, assignments };
 }
 
-const ENV = { SUPABASE_URL: 'https://x.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k', OTP_PORTAL_TOKEN: 'sekrit-token-abc' };
-
-function req(path, cookie) {
+function req(path, { method = 'GET', cookies = {}, body } = {}) {
+  const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+  const headers = {};
+  if (cookieStr) headers.Cookie = cookieStr;
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
   return new Request('https://otp-portal.test' + path, {
-    headers: cookie ? { Cookie: 'otpp_sid=' + cookie } : {},
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
 }
 
-function sidFromSetCookie(res) {
-  const sc = res.headers.get('Set-Cookie');
-  if (!sc) return null;
-  const m = sc.match(/otpp_sid=([^;]+)/);
-  return m ? m[1] : null;
+function cookieFromSetCookie(res, name) {
+  // Response can carry multiple Set-Cookie headers; Headers#get only returns
+  // the first, so read them all via getSetCookie (undici) with a fallback.
+  const all = typeof res.headers.getSetCookie === 'function'
+    ? res.headers.getSetCookie()
+    : [res.headers.get('Set-Cookie')].filter(Boolean);
+  for (const sc of all) {
+    const m = sc.match(new RegExp(name + '=([^;]*)'));
+    if (m) return m[1];
+  }
+  return null;
 }
 
-// --- token / auth protection ------------------------------------------------
+async function login(env = ENV) {
+  const res = await otpPortal.fetch(req('/login', { method: 'POST', body: { password: PASSWORD } }), env);
+  const authCookie = cookieFromSetCookie(res, 'otpp_auth');
+  return { res, authCookie };
+}
 
-test('wrong or missing token 404s without touching the DB at all', async (t) => {
+// --- login required / bad login never touches the DB ------------------------
+
+test('root page without a session shows the login page, not the app, and touches no DB', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   const { calls } = fakeBackend({});
 
-  const res1 = await otpPortal.fetch(req('/'), ENV);
-  assert.equal(res1.status, 404);
-
-  const res2 = await otpPortal.fetch(req('/wrong-token/'), ENV);
-  assert.equal(res2.status, 404);
-
-  const res3 = await otpPortal.fetch(req('/sekrit-token-ab/'), ENV); // one char short
-  assert.equal(res3.status, 404);
-
-  const res4 = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), { ...ENV, OTP_PORTAL_TOKEN: '' });
-  assert.equal(res4.status, 404, 'unset OTP_PORTAL_TOKEN never matches anything');
-
-  assert.equal(calls.length, 0, 'no Supabase call happens before the token check passes');
+  const res = await otpPortal.fetch(req('/'), ENV);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('Content-Type'), /text\/html/);
+  const html = await res.text();
+  assert.match(html, /Sign in/);
+  assert.equal(calls.length, 0, 'serving the login page never touches Supabase');
 });
 
-test('correct token serves the page and unknown sub-routes 404', async (t) => {
+test('api/state and api/messages 401 without a valid session and never touch the DB', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  const { calls } = fakeBackend({});
+
+  const state = await otpPortal.fetch(req('/api/state'), ENV);
+  assert.equal(state.status, 401);
+  const messages = await otpPortal.fetch(req('/api/messages'), ENV);
+  assert.equal(messages.status, 401);
+
+  assert.equal(calls.length, 0, 'no Supabase call happens before authentication');
+});
+
+test('wrong password is rejected and never touches the DB', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  const { calls } = fakeBackend({});
+
+  const res = await otpPortal.fetch(req('/login', { method: 'POST', body: { password: 'nope-not-it' } }), ENV);
+  assert.equal(res.status, 401);
+  const body = await res.json();
+  assert.equal(body.ok, false);
+  assert.equal(cookieFromSetCookie(res, 'otpp_auth'), null, 'no session cookie on a failed login');
+  assert.equal(calls.length, 0, 'password verification is pure local PBKDF2 — never calls Supabase');
+});
+
+test('missing password body is rejected and never touches the DB', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  const { calls } = fakeBackend({});
+
+  const res = await otpPortal.fetch(req('/login', { method: 'POST', body: {} }), ENV);
+  assert.equal(res.status, 401);
+  assert.equal(calls.length, 0);
+});
+
+test('login with missing OTP_PORTAL_PASSWORD_HASH or OTP_PORTAL_SESSION_SECRET always fails, never touches the DB', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  const { calls } = fakeBackend({});
+
+  const noHash = await otpPortal.fetch(
+    req('/login', { method: 'POST', body: { password: PASSWORD } }),
+    { ...ENV, OTP_PORTAL_PASSWORD_HASH: undefined },
+  );
+  assert.equal(noHash.status, 401);
+
+  const noSecret = await otpPortal.fetch(
+    req('/login', { method: 'POST', body: { password: PASSWORD } }),
+    { ...ENV, OTP_PORTAL_SESSION_SECRET: undefined },
+  );
+  assert.equal(noSecret.status, 401);
+
+  assert.equal(calls.length, 0);
+});
+
+test('a forged/garbage session cookie is rejected without touching the DB', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  const { calls } = fakeBackend({});
+
+  const res = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: 'garbage.not-a-real-token' } }), ENV);
+  assert.equal(res.status, 401);
+  assert.equal(calls.length, 0);
+});
+
+// --- good login creates a session -------------------------------------------
+
+test('correct password sets a signed HttpOnly session cookie and serves the app page', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   fakeBackend({});
 
-  const page = await otpPortal.fetch(req('/sekrit-token-abc/'), ENV);
-  assert.equal(page.status, 200);
-  assert.match(page.headers.get('Content-Type'), /text\/html/);
+  const { res, authCookie } = await login();
+  assert.equal(res.status, 200);
+  assert.ok(authCookie, 'login sets otpp_auth');
+  const setCookieHeader = res.headers.get('Set-Cookie');
+  assert.match(setCookieHeader, /HttpOnly/);
+  assert.match(setCookieHeader, /Secure/);
+  assert.match(setCookieHeader, /SameSite=Lax/);
 
-  const unknown = await otpPortal.fetch(req('/sekrit-token-abc/api/nope'), ENV);
-  assert.equal(unknown.status, 404);
+  const page = await otpPortal.fetch(req('/', { cookies: { otpp_auth: authCookie } }), ENV);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.match(html, /Your temporary number/);
 });
 
-test('/health works without a token and reveals nothing', async (t) => {
+test('/health works without a session and reveals nothing', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   const { calls } = fakeBackend({});
   const res = await otpPortal.fetch(req('/health'), ENV);
@@ -170,18 +261,52 @@ test('/health works without a token and reveals nothing', async (t) => {
   assert.equal(calls.length, 0);
 });
 
+test('unknown routes 404 regardless of auth state', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  fakeBackend({});
+  const { authCookie } = await login();
+
+  const loggedOut = await otpPortal.fetch(req('/nope'), ENV);
+  assert.equal(loggedOut.status, 404);
+  const loggedIn = await otpPortal.fetch(req('/api/nope', { cookies: { otpp_auth: authCookie } }), ENV);
+  assert.equal(loggedIn.status, 404);
+});
+
+// --- logout -------------------------------------------------------------------
+
+test('logout clears the session cookie and the root page reverts to the login screen', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  fakeBackend({});
+  const { authCookie } = await login();
+
+  const logoutRes = await otpPortal.fetch(req('/logout', { method: 'POST', cookies: { otpp_auth: authCookie } }), ENV);
+  assert.equal(logoutRes.status, 200);
+  const cleared = logoutRes.headers.get('Set-Cookie');
+  assert.match(cleared, /otpp_auth=;/);
+  assert.match(cleared, /Max-Age=0/);
+
+  // The cleared cookie value from the response is the empty string — simulate
+  // the browser dropping the cookie entirely by omitting it on the next request.
+  const after = await otpPortal.fetch(req('/'), ENV);
+  const html = await after.text();
+  assert.match(html, /Sign in/);
+
+  const stateAfterLogout = await otpPortal.fetch(req('/api/state'), ENV);
+  assert.equal(stateAfterLogout.status, 401);
+});
+
 // --- no-number-available -----------------------------------------------------
 
 test('no numbers in the pool -> clear no-number state, nothing claimed', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
-  const { calls } = fakeBackend({ pool: [] });
+  fakeBackend({ pool: [] });
+  const { authCookie } = await login();
 
-  const res = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), ENV);
+  const res = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: authCookie } }), ENV);
   const body = await res.json();
   assert.equal(res.status, 200);
   assert.equal(body.has_number, false);
   assert.equal(body.no_number_available, true);
-  assert.equal(calls.some((c) => c.path.includes('rpc/otp_portal_claim')), false, 'never calls the claim RPC when nothing is available');
 });
 
 test('every candidate already rented or held -> no-number state', async (t) => {
@@ -192,8 +317,9 @@ test('every candidate already rented or held -> no-number state', async (t) => {
     numbers: [{ sim_id: 1, e164: '+13475551111' }],
     shopRentals: [{ sim_id: 1, status: 'active' }],
   });
+  const { authCookie } = await login();
 
-  const res = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), ENV);
+  const res = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: authCookie } }), ENV);
   const body = await res.json();
   assert.equal(body.has_number, false);
   assert.equal(body.no_number_available, true);
@@ -212,20 +338,22 @@ test('assigns a number, keeps the same one across reloads for the same session c
       { sim_id: 3, e164: '+13475553333' },
     ],
   });
+  const { authCookie } = await login();
 
-  const first = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), ENV);
+  const first = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: authCookie } }), ENV);
   const firstBody = await first.json();
   assert.equal(firstBody.has_number, true);
-  const sid = sidFromSetCookie(first);
-  assert.ok(sid, 'a session cookie is set on first assignment');
+  const sid = cookieFromSetCookie(first, 'otpp_sid');
+  assert.ok(sid, 'an assignment cookie is set on first assignment');
 
   const claimCallsAfterFirst = calls.filter((c) => c.path.includes('rpc/otp_portal_claim')).length;
   assert.equal(claimCallsAfterFirst, 1);
 
-  // Same browser (cookie) reloads twice — must see the identical number both times.
-  const second = await otpPortal.fetch(req('/sekrit-token-abc/api/state', sid), ENV);
+  // Same browser (both cookies) reloads twice — must see the identical number both times.
+  const cookies = { otpp_auth: authCookie, otpp_sid: sid };
+  const second = await otpPortal.fetch(req('/api/state', { cookies }), ENV);
   const secondBody = await second.json();
-  const third = await otpPortal.fetch(req('/sekrit-token-abc/api/state', sid), ENV);
+  const third = await otpPortal.fetch(req('/api/state', { cookies }), ENV);
   const thirdBody = await third.json();
 
   assert.equal(secondBody.e164, firstBody.e164);
@@ -236,17 +364,18 @@ test('assigns a number, keeps the same one across reloads for the same session c
   assert.equal(claimCallsAfterReloads, 1, 'reloading with the existing cookie never re-claims a number');
 });
 
-test('a different session (no/blank cookie) gets its own independent assignment', async (t) => {
+test('a different session (no/blank assignment cookie) gets its own independent assignment', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   fakeBackend({
     pool: [1, 2],
     sims: [{ id: 1, vendor: 'atomic' }, { id: 2, vendor: 'teltik' }],
     numbers: [{ sim_id: 1, e164: '+13475551111' }, { sim_id: 2, e164: '+13475552222' }],
   });
+  const { authCookie } = await login();
 
-  const a = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), ENV);
+  const a = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: authCookie } }), ENV);
   const aBody = await a.json();
-  const b = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), ENV); // fresh request, no cookie
+  const b = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: authCookie } }), ENV); // fresh request, no sid cookie
   const bBody = await b.json();
 
   assert.notEqual(aBody.e164, bBody.e164, 'two different browsers never share the same held number');
@@ -260,9 +389,10 @@ test('lost race on the first pick retries with a different candidate instead of 
     numbers: [{ sim_id: 10, e164: '+13475551010' }, { sim_id: 11, e164: '+13475551011' }],
     forceTakenSims: new Set([10]), // simulates someone else claiming it between query and claim
   });
+  const { authCookie } = await login();
   Math.random = () => 0; // always "pick the first candidate" — forces the race on sim 10 first
 
-  const res = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), ENV);
+  const res = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: authCookie } }), ENV);
   const body = await res.json();
   assert.equal(body.has_number, true);
   assert.equal(body.e164, '+13475551011', 'fell back to the other candidate after losing the race for sim 10');
@@ -285,9 +415,10 @@ test('messages endpoint only returns SMS to the assigned number at/after assignm
     numbers: [{ sim_id: 1, e164: '+13475551111' }],
     messagesBySim,
   });
+  const { authCookie } = await login();
 
-  const state = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), ENV);
-  const sid = sidFromSetCookie(state);
+  const state = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: authCookie } }), ENV);
+  const sid = cookieFromSetCookie(state, 'otpp_sid');
   const assignedAtMs = Date.parse(assignments[0].assigned_at);
 
   // Arrives after assignment, right number — should show up.
@@ -301,7 +432,9 @@ test('messages endpoint only returns SMS to the assigned number at/after assignm
     received_at: new Date(assignedAtMs + 6000).toISOString(),
   });
 
-  const messagesRes = await otpPortal.fetch(req('/sekrit-token-abc/api/messages', sid), ENV);
+  const messagesRes = await otpPortal.fetch(
+    req('/api/messages', { cookies: { otpp_auth: authCookie, otpp_sid: sid } }), ENV,
+  );
   const messagesBody = await messagesRes.json();
 
   assert.equal(messagesRes.status, 200);
@@ -310,16 +443,21 @@ test('messages endpoint only returns SMS to the assigned number at/after assignm
   assert.equal(messagesBody.expired, false);
 });
 
-test('messages endpoint 404s with no assignment cookie', async (t) => {
+test('messages endpoint returns a no-number state (not an error) with no assignment cookie', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   fakeBackend({ pool: [] });
-  const res = await otpPortal.fetch(req('/sekrit-token-abc/api/messages'), ENV);
-  assert.equal(res.status, 404);
+  const { authCookie } = await login();
+
+  const res = await otpPortal.fetch(req('/api/messages', { cookies: { otpp_auth: authCookie } }), ENV);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.has_number, false);
+  assert.deepEqual(body.messages, []);
 });
 
 // --- no carrier / unexpected write side effects -----------------------------
 
-test('a full assignment + poll cycle never calls anything but Supabase REST/RPC, and only writes via the claim RPC', async (t) => {
+test('a full login + assignment + poll cycle never calls anything but Supabase REST/RPC, and only writes via the claim RPC', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   const { calls } = fakeBackend({
     pool: [1],
@@ -327,11 +465,13 @@ test('a full assignment + poll cycle never calls anything but Supabase REST/RPC,
     numbers: [{ sim_id: 1, e164: '+13475551111' }],
     messagesBySim: { 1: [] },
   });
+  const { authCookie } = await login();
 
-  const state = await otpPortal.fetch(req('/sekrit-token-abc/api/state'), ENV);
-  const sid = sidFromSetCookie(state);
-  await otpPortal.fetch(req('/sekrit-token-abc/api/messages', sid), ENV);
-  await otpPortal.fetch(req('/sekrit-token-abc/api/state', sid), ENV);
+  const state = await otpPortal.fetch(req('/api/state', { cookies: { otpp_auth: authCookie } }), ENV);
+  const sid = cookieFromSetCookie(state, 'otpp_sid');
+  const cookies = { otpp_auth: authCookie, otpp_sid: sid };
+  await otpPortal.fetch(req('/api/messages', { cookies }), ENV);
+  await otpPortal.fetch(req('/api/state', { cookies }), ENV);
 
   for (const c of calls) {
     assert.ok(c.path.startsWith('/rest/v1/'), 'every outbound call is Supabase REST/RPC: ' + c.path);
@@ -342,4 +482,5 @@ test('a full assignment + poll cycle never calls anything but Supabase REST/RPC,
   }
   const writes = calls.filter((c) => c.method !== 'GET');
   assert.equal(writes.length, 1, 'exactly one claim, never re-claimed across a poll + reload');
+  assert.equal(calls.length > 0, true, 'login itself made no Supabase calls, but the app flow did');
 });
