@@ -3805,11 +3805,11 @@ set verify_pending; schedule §C.3 poll
 
     <!-- Activate Modal -->
     <div id="activate-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl max-h-[90vh] flex flex-col">
             <div class="px-5 py-4 border-b border-dark-600">
                 <h3 class="text-lg font-semibold text-white">Activate SIMs</h3>
             </div>
-            <div class="p-5">
+            <div class="p-5 overflow-y-auto flex-1">
                 <div class="flex items-center gap-3 mb-4">
                     <label class="text-sm text-gray-400">Vendor:</label>
                     <select id="activate-vendor" onchange="updateActivatePortInUi()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
@@ -3838,7 +3838,14 @@ set verify_pending; schedule §C.3 poll
                             <input id="activate-port-pin" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="PIN or passcode">
                         </div>
                     </div>
-                    <h4 class="text-sm text-gray-300 font-medium mt-4 mb-2">New subscriber / account holder</h4>
+                    <div class="flex items-center justify-between mt-4 mb-2">
+                        <h4 class="text-sm text-gray-300 font-medium">New subscriber / account holder</h4>
+                        <div class="flex items-center gap-2">
+                            <button type="button" onclick="fillRandomPortIdentity(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Use random info</button>
+                            <button type="button" onclick="fillRandomPortAddress(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Use random address</button>
+                        </div>
+                    </div>
+                    <p class="text-xs text-gray-500 mb-2">"Use random info" fills subscriber first/last name, street number/name/ZIP, and the losing-carrier (old carrier) first/last name below — all from fake-identity/address pools (no real customer data), using a separate random name for the old carrier by default. "Use random address" fills only street number/name and ZIP. Neither ever touches port account number, PIN, MDN, SIM/IMEI, or plan.</p>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                         <div>
                             <label class="block text-sm text-gray-300 mb-1">First name <span class="text-red-400">*</span></label>
@@ -3861,7 +3868,11 @@ set verify_pending; schedule §C.3 poll
                             <input id="activate-port-zip" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="75001">
                         </div>
                     </div>
-                    <h4 class="text-sm text-gray-300 font-medium mt-4 mb-2">Losing-carrier account holder (name only — may differ from subscriber above)</h4>
+                    <div class="flex items-center justify-between mt-4 mb-2">
+                        <h4 class="text-sm text-gray-300 font-medium">Losing-carrier account holder (name only — may differ from subscriber above)</h4>
+                        <button type="button" onclick="copySubscriberNameToOldCarrier(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Copy subscriber name to old carrier name</button>
+                    </div>
+                    <p class="text-xs text-gray-500 mb-2">"Use random info" above already fills these with a separate random fake name. Only use "Copy subscriber name to old carrier name" if the losing carrier's billing records actually show this name — copying does not guarantee a match, and a mismatch will make the port reject. Leave the fields as separately-entered real values for a live port.</p>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                         <div>
                             <label class="block text-sm text-gray-300 mb-1">Old first name <span class="text-red-400">*</span></label>
@@ -6424,6 +6435,64 @@ async function sendSimOnline(simId, phoneNumber) {
                 document.getElementById('activate-port-in').checked = false;
                 showToast('Port-in is currently supported only for ATOMIC activations', 'error');
             }
+        }
+        async function fillRandomPortAddress(evt) {
+            const btn = evt && evt.target;
+            const prevText = btn ? btn.textContent : null;
+            if (btn) { btn.disabled = true; btn.textContent = '...'; }
+            try {
+                const res = await fetch(API_BASE + '/random-address');
+                const data = await res.json();
+                if (!data.ok) {
+                    showToast(data.error || 'Failed to fetch a random address', 'error');
+                    return;
+                }
+                document.getElementById('activate-port-street-number').value = data.address.streetNumber;
+                document.getElementById('activate-port-street-name').value = data.address.streetName;
+                document.getElementById('activate-port-zip').value = data.address.zipCode;
+                showToast('Filled address: ' + data.address.city + ', ' + data.address.state, 'success');
+            } catch (e) {
+                showToast('Failed to fetch a random address', 'error');
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = prevText; }
+            }
+        }
+
+        async function fillRandomPortIdentity(evt) {
+            const btn = evt && evt.target;
+            const prevText = btn ? btn.textContent : null;
+            if (btn) { btn.disabled = true; btn.textContent = '...'; }
+            try {
+                const res = await fetch(API_BASE + '/random-identity');
+                const data = await res.json();
+                if (!data.ok) {
+                    showToast(data.error || 'Failed to fetch a random identity', 'error');
+                    return;
+                }
+                document.getElementById('activate-port-first-name').value = data.identity.firstName;
+                document.getElementById('activate-port-last-name').value = data.identity.lastName;
+                document.getElementById('activate-port-street-number').value = data.identity.streetNumber;
+                document.getElementById('activate-port-street-name').value = data.identity.streetName;
+                document.getElementById('activate-port-zip').value = data.identity.zipCode;
+                document.getElementById('activate-port-old-first-name').value = data.identity.oldFirstName;
+                document.getElementById('activate-port-old-last-name').value = data.identity.oldLastName;
+                showToast('Filled subscriber ' + data.identity.firstName + ' ' + data.identity.lastName + ' + old carrier ' + data.identity.oldFirstName + ' ' + data.identity.oldLastName, 'success');
+            } catch (e) {
+                showToast('Failed to fetch a random identity', 'error');
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = prevText; }
+            }
+        }
+        function copySubscriberNameToOldCarrier(evt) {
+            const first = document.getElementById('activate-port-first-name').value.trim();
+            const last = document.getElementById('activate-port-last-name').value.trim();
+            if (!first || !last) {
+                showToast('Fill in the subscriber first/last name first', 'error');
+                return;
+            }
+            document.getElementById('activate-port-old-first-name').value = first;
+            document.getElementById('activate-port-old-last-name').value = last;
+            showToast('Copied to old carrier name — verify this matches the losing carrier\'s records', 'info');
         }
         function renderActivationReview(summary) {
             const el = document.getElementById('activate-review');

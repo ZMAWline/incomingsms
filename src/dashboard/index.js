@@ -5,6 +5,8 @@ import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs'
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/teltik-known-mdn.mjs';
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
+import { ADDRESS_POOL } from '../shared/address-pool.mjs';
+import { NAME_POOL } from '../shared/name-pool.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -151,6 +153,14 @@ export default {
 
     if (url.pathname === '/api/imei-pool/pick' && request.method === 'GET') {
       return handleImeiPoolPick(env, corsHeaders);
+    }
+
+    if (url.pathname === '/api/random-address' && request.method === 'GET') {
+      return handleRandomAddress(corsHeaders);
+    }
+
+    if (url.pathname === '/api/random-identity' && request.method === 'GET') {
+      return handleRandomIdentity(corsHeaders);
     }
 
     if (url.pathname === '/api/import-gateway-imeis' && request.method === 'POST') {
@@ -3712,6 +3722,64 @@ async function handleImeiPoolPick(env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   }
+}
+
+// Port-in modal "Use random address" autofill. Draws from the static seed
+// copy of the address pool (civic buildings, no customer/PII data) so the
+// operator never has to hand-type a street address for a test/demo port-in.
+// Read-only — does not touch the DB-backed address_pool_usage table that
+// pickNextPpuAddress()/claim_address_pool_entry() consume for real PPU
+// rotations, so this can't burn a live rotation address.
+function handleRandomAddress(corsHeaders) {
+  const entry = ADDRESS_POOL[Math.floor(Math.random() * ADDRESS_POOL.length)];
+  return new Response(JSON.stringify({
+    ok: true,
+    address: {
+      streetNumber: entry.streetNumber,
+      streetName: entry.streetName,
+      streetDirection: entry.streetDirection || '',
+      city: entry.city,
+      state: entry.state,
+      zipCode: entry.zipCode,
+    },
+  }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
+// Port-in modal "Use random info" autofill. Draws two independent names from
+// the static FakeNameGenerator.com seed pool (fake identities, no real
+// customer/PII) — one for the new subscriber, one for the losing-carrier
+// (old_service_provider) account holder — plus an address from the same
+// ADDRESS_POOL used above, and returns them together so the operator can
+// fill the whole port-in identity block in one click. Per the Atomic
+// Wholesale API, subscriber and old_service_provider names are independent
+// fields that don't need to match, so distinct random names are used by
+// default; the operator can still use the explicit "copy" control to force
+// them to match. Never touches account number, PIN, MDN, or any other
+// carrier credential field.
+function handleRandomIdentity(corsHeaders) {
+  const subIdx = Math.floor(Math.random() * NAME_POOL.length);
+  let oldIdx = Math.floor(Math.random() * NAME_POOL.length);
+  if (NAME_POOL.length > 1 && oldIdx === subIdx) {
+    oldIdx = (oldIdx + 1) % NAME_POOL.length;
+  }
+  const name = NAME_POOL[subIdx];
+  const oldName = NAME_POOL[oldIdx];
+  const entry = ADDRESS_POOL[Math.floor(Math.random() * ADDRESS_POOL.length)];
+  return new Response(JSON.stringify({
+    ok: true,
+    identity: {
+      firstName: name.firstName,
+      lastName: name.lastName,
+      streetNumber: entry.streetNumber,
+      streetName: entry.streetName,
+      streetDirection: entry.streetDirection || '',
+      city: entry.city,
+      state: entry.state,
+      zipCode: entry.zipCode,
+      oldFirstName: oldName.firstName,
+      oldLastName: oldName.lastName,
+    },
+  }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
 async function handleImeiPoolPost(request, env, corsHeaders) {
