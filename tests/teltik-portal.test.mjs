@@ -152,6 +152,12 @@ test('GET /api/lines returns only Teltik-hosted lines, excluding other gateway h
   assert.deepEqual(ids, [1, 2], 'sim 3 (skyline host) excluded');
   assert.equal(data.lines.find((l) => l.sim_id === 1).state, 'online');
   assert.equal(data.lines.find((l) => l.sim_id === 1).online_7d, 26);
+  // Current MDN (from sim_numbers) vs Hosted MDN (Teltik's own resolved MDN,
+  // from get_hosting_port_status_summary.last_mdn) are distinct fields — the
+  // portal surfaces both since they can legitimately differ.
+  const line1 = data.lines.find((l) => l.sim_id === 1);
+  assert.equal(line1.mdn, '+12125551111');
+  assert.equal(line1.hosted_mdn, '2125551111');
 });
 
 test('per-line check/reset on an out-of-scope sim id returns 404, never calls Teltik', async () => {

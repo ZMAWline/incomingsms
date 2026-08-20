@@ -105,7 +105,16 @@ async function fetchHostedLines(env) {
     return {
       sim_id: s.id,
       iccid: s.iccid,
+      // Current MDN: our DB's number for this line (sim_numbers).
       mdn: (s.sim_numbers && s.sim_numbers[0] && s.sim_numbers[0].e164) || null,
+      // Hosted MDN: the number Teltik itself resolved the line by for the
+      // last port-status check (hp.last_mdn) — can legitimately differ from
+      // Current MDN, since Teltik's side doesn't see our MDN rotations (see
+      // src/shared/teltik-known-mdn.mjs). A mismatch is useful signal, not
+      // an error: it explains why a reset/check might target a number that
+      // looks "wrong" at a glance.
+      hosted_mdn: hp ? hp.last_mdn : null,
+      hosted_mdn_source: hp ? hp.last_mdn_source : null,
       gateway_host: s.gateway_host || 'teltik',
       state: hp ? hp.last_state : null,
       checked_at: hp ? hp.last_checked_at : null,
@@ -340,6 +349,11 @@ const PAGE_STYLES = `
   .btn-ghost { background: none; border: 1px solid #232f4a; color: #b7c2de; border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer; }
   .btn-ghost:hover { border-color: #3ddc84; color: #3ddc84; }
 
+  .filter-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .filter-bar input[type="text"] { flex: 1; min-width: 220px; margin-bottom: 0; padding: 8px 12px; font-size: 13px; }
+  .filter-bar select { background: #0e1626; border: 1px solid #202b46; border-radius: 8px; padding: 8px 10px; color: #e6e9f0; font-size: 13px; }
+  .filter-bar select:focus, .filter-bar input:focus { outline: none; border-color: #3ddc84; }
+
   .bulk-bar { display: none; align-items: center; gap: 10px; background: #131c30; border: 1px solid #232f4a; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; color: #b7c2de; }
   .bulk-bar.visible { display: flex; }
   .btn-sm { border-radius: 8px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; }
@@ -347,8 +361,13 @@ const PAGE_STYLES = `
   .btn-reset { background: #6e2734; color: #ffd2d8; }
   .btn-cancel { background: none; border: 1px solid #3a4a6e; color: #8fa0c7; }
 
+  .table-scroll { overflow-x: auto; border-radius: 12px; }
   table { width: 100%; border-collapse: collapse; background: #131c30; border: 1px solid #232f4a; border-radius: 12px; overflow: hidden; font-size: 13.5px; }
-  thead th { text-align: left; padding: 10px 12px; color: #7c8db5; font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid #202b46; }
+  thead th { text-align: left; padding: 10px 12px; color: #7c8db5; font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid #202b46; white-space: nowrap; }
+  thead th.sortable { cursor: pointer; user-select: none; }
+  thead th.sortable:hover { color: #cfd9f0; }
+  .sort-arrow { display: inline-block; width: 10px; font-size: 10px; opacity: .8; }
+  .mdn-flag { color: #ffb84d; margin-left: 5px; cursor: help; font-size: 12px; }
   tbody td { padding: 10px 12px; border-bottom: 1px solid #182238; vertical-align: middle; }
   tbody tr:last-child td { border-bottom: none; }
   tbody tr:hover { background: #16213a; }
@@ -435,9 +454,22 @@ function appHtml() {
       <div class="sub" id="summary-line">Loading…</div>
     </div>
     <div class="topbar-actions">
+      <button class="btn-ghost" id="export-btn" type="button">Export CSV</button>
       <button class="btn-ghost" id="refresh-btn" type="button">Refresh</button>
       <button class="btn-ghost" id="signout-btn" type="button">Sign out</button>
     </div>
+  </div>
+
+  <div class="filter-bar">
+    <input type="text" id="search-input" placeholder="Search ICCID, Current MDN or Hosted MDN…">
+    <select id="status-filter">
+      <option value="">All statuses</option>
+      <option value="online">Online</option>
+      <option value="offline">Offline</option>
+      <option value="unknown">Unknown</option>
+      <option value="error">Error</option>
+    </select>
+    <span class="muted" id="filter-count"></span>
   </div>
 
   <div class="bulk-bar" id="bulk-bar">
@@ -457,6 +489,20 @@ function appHtml() {
   var lines = [];
   var selected = new Set();
   var bulkCancelled = false;
+  var searchText = '';
+  var statusFilter = '';
+  var sortKey = null;
+  var sortDir = 1; // 1 = asc, -1 = desc
+
+  var COLUMNS = [
+    { key: 'mdn', label: 'Current MDN' },
+    { key: 'hosted_mdn', label: 'Hosted MDN' },
+    { key: 'iccid', label: 'ICCID' },
+    { key: 'state', label: 'Status' },
+    { key: 'pct24', label: '24h up' },
+    { key: 'pct7', label: '7d up' },
+    { key: 'checked_at', label: 'Last checked' },
+  ];
 
   function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
@@ -477,6 +523,19 @@ function appHtml() {
     return d.toLocaleString();
   }
 
+  // Same normalization Teltik's own API uses (src/shared/teltik-known-mdn.mjs
+  // toTeltik10Digit) — needed here only to compare Current vs Hosted MDN,
+  // which are stored in different formats (+1E.164 vs bare 10-digit).
+  function toTeltik10(mdn) {
+    var digits = String(mdn || '').replace(/\\D/g, '');
+    return (digits.length === 11 && digits.charAt(0) === '1') ? digits.slice(1) : digits;
+  }
+  function mdnMismatch(l) {
+    if (!l.hosted_mdn || !l.mdn) return false;
+    var cur = toTeltik10(l.mdn), hosted = toTeltik10(l.hosted_mdn);
+    return cur.length === 10 && hosted.length === 10 && cur !== hosted;
+  }
+
   document.getElementById('signout-btn').addEventListener('click', function () {
     fetch('/logout', { method: 'POST', credentials: 'include' }).finally(function () { location.href = '/'; });
   });
@@ -495,14 +554,55 @@ function appHtml() {
     }
   }
 
+  function sortValue(l, key) {
+    if (key === 'pct24') return l.checks_24h > 0 ? l.online_24h / l.checks_24h : -1;
+    if (key === 'pct7') return l.checks_7d > 0 ? l.online_7d / l.checks_7d : -1;
+    if (key === 'checked_at') return l.checked_at ? Date.parse(l.checked_at) : 0;
+    return String(l[key] || '');
+  }
+
+  // Filter (search text over ICCID/Current MDN/Hosted MDN + status dropdown)
+  // then sort — this is exactly what "Export CSV" also reads, so the export
+  // always matches what's currently on screen.
+  function visibleLines() {
+    var q = searchText.trim().toLowerCase();
+    var out = lines.filter(function (l) {
+      if (statusFilter && (l.state || 'unknown') !== statusFilter) return false;
+      if (!q) return true;
+      return [l.iccid, l.mdn, l.hosted_mdn].some(function (v) { return v && String(v).toLowerCase().indexOf(q) !== -1; });
+    });
+    if (sortKey) {
+      out.sort(function (a, b) {
+        var av = sortValue(a, sortKey), bv = sortValue(b, sortKey);
+        if (av < bv) return -1 * sortDir;
+        if (av > bv) return 1 * sortDir;
+        return 0;
+      });
+    }
+    return out;
+  }
+
+  function headerCell(col) {
+    var arrow = sortKey === col.key ? (sortDir === 1 ? '▲' : '▼') : '';
+    return '<th class="sortable" data-key="' + col.key + '">' + esc(col.label)
+      + '<span class="sort-arrow">' + arrow + '</span></th>';
+  }
+
   function render() {
     var wrap = document.getElementById('table-wrap');
+    var visible = visibleLines();
+    document.getElementById('filter-count').textContent = lines.length
+      ? (visible.length === lines.length ? lines.length + ' lines' : visible.length + ' of ' + lines.length + ' lines')
+      : '';
     if (!lines.length) { wrap.innerHTML = '<div class="empty">No Teltik-hosted lines found.</div>'; return; }
-    var rows = lines.map(function (l) {
+    if (!visible.length) { wrap.innerHTML = '<div class="empty">No lines match the current search/filter.</div>'; return; }
+    var rows = visible.map(function (l) {
       var checked = selected.has(l.sim_id) ? ' checked' : '';
+      var flag = mdnMismatch(l) ? '<span class="mdn-flag" title="Differs from Current MDN — Teltik knows this line by a different number">⚠</span>' : '';
       return '<tr data-id="' + l.sim_id + '">'
         + '<td><input type="checkbox" class="row-cb" data-id="' + l.sim_id + '"' + checked + '></td>'
         + '<td class="mono">' + esc(l.mdn || '—') + '</td>'
+        + '<td class="mono">' + esc(l.hosted_mdn || '—') + flag + '</td>'
         + '<td class="mono">' + esc(l.iccid || '—') + '</td>'
         + '<td>' + badge(l.state) + '</td>'
         + '<td>' + pct(l.online_24h, l.checks_24h) + ' <span class="muted">(' + l.checks_24h + ')</span></td>'
@@ -514,15 +614,22 @@ function appHtml() {
         + '</td>'
         + '</tr>';
     }).join('');
-    wrap.innerHTML = '<table>'
-      + '<thead><tr>'
-        + '<th><input type="checkbox" id="select-all"></th>'
-        + '<th>MDN</th><th>ICCID</th><th>Status</th><th>24h up</th><th>7d up</th><th>Last checked</th><th>Actions</th>'
-      + '</tr></thead><tbody>' + rows + '</tbody></table>';
+    var headers = '<th><input type="checkbox" id="select-all"></th>'
+      + headerCell(COLUMNS[0]) + headerCell(COLUMNS[1]) + headerCell(COLUMNS[2]) + headerCell(COLUMNS[3])
+      + headerCell(COLUMNS[4]) + headerCell(COLUMNS[5]) + headerCell(COLUMNS[6]) + '<th>Actions</th>';
+    wrap.innerHTML = '<div class="table-scroll"><table>'
+      + '<thead><tr>' + headers + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
 
     document.getElementById('select-all').addEventListener('change', function (e) {
-      lines.forEach(function (l) { if (e.target.checked) selected.add(l.sim_id); else selected.delete(l.sim_id); });
+      visible.forEach(function (l) { if (e.target.checked) selected.add(l.sim_id); else selected.delete(l.sim_id); });
       render();
+    });
+    wrap.querySelectorAll('th.sortable').forEach(function (th) {
+      th.addEventListener('click', function () {
+        var key = th.getAttribute('data-key');
+        if (sortKey === key) sortDir = -sortDir; else { sortKey = key; sortDir = 1; }
+        render();
+      });
     });
     wrap.querySelectorAll('.row-cb').forEach(function (cb) {
       cb.addEventListener('change', function () {
@@ -544,8 +651,39 @@ function appHtml() {
     var online = lines.filter(function (l) { return l.state === 'online'; }).length;
     var offline = lines.filter(function (l) { return l.state === 'offline'; }).length;
     document.getElementById('summary-line').textContent =
-      lines.length + ' lines · ' + online + ' online · ' + offline + ' offline';
+      lines.length + ' lines · ' + online + ' online · ' + offline + ' offline · as of ' + new Date().toLocaleTimeString();
   }
+
+  function csvField(v) {
+    var s = v == null ? '' : String(v);
+    return /[",\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+
+  // Exports exactly what's currently visible (search/filter/sort applied) —
+  // "what you're looking at" is what gets exported, not the full unfiltered
+  // fleet, so a filtered-to-offline export doesn't quietly include lines
+  // that were never on screen.
+  function exportCsv() {
+    var visible = visibleLines();
+    var header = ['ICCID', 'Current MDN', 'Hosted MDN', 'Status', '24h checks', '24h online', '7d checks', '7d online', 'Last checked'];
+    var rows = visible.map(function (l) {
+      return [l.iccid, l.mdn, l.hosted_mdn, l.state || 'unknown', l.checks_24h, l.online_24h, l.checks_7d, l.online_7d, l.checked_at || ''];
+    });
+    var csv = [header].concat(rows).map(function (r) { return r.map(csvField).join(','); }).join('\\r\\n');
+    var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'teltik-hosted-lines-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  document.getElementById('export-btn').addEventListener('click', exportCsv);
+  document.getElementById('search-input').addEventListener('input', function (e) { searchText = e.target.value; render(); });
+  document.getElementById('status-filter').addEventListener('change', function (e) { statusFilter = e.target.value; render(); });
 
   function loadLines() {
     setStatus('Loading…');
