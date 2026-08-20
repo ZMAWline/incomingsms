@@ -12,7 +12,9 @@
 //
 // Auth is a single shared username + password (OTP_PORTAL_USERNAME /
 // OTP_PORTAL_PASSWORD_HASH) verified locally — a wrong or missing username
-// or password never touches Supabase. A successful login sets an
+// or password never touches Supabase. Username matching is case-insensitive
+// (trimmed + ASCII-folded on both sides); password matching stays exact. A
+// successful login sets an
 // HMAC-signed, HttpOnly session cookie (see auth.mjs). Once logged in, the
 // existing per-browser assignment cookie (otpp_sid) keeps the same number
 // stable across reloads exactly as before the login model was added.
@@ -23,7 +25,7 @@ import {
   pickRandom,
   filterAssignmentMessages,
 } from './logic.mjs';
-import { verifyPassword, signSession, verifySession, randomHex, constantTimeEqual } from './auth.mjs';
+import { verifyPassword, signSession, verifySession, randomHex, constantTimeEqual, foldUsername } from './auth.mjs';
 
 const AUTH_COOKIE_NAME = 'otpp_auth';
 const SID_COOKIE_NAME = 'otpp_sid';
@@ -138,13 +140,13 @@ async function isAuthenticated(request, env) {
 // Login / logout
 // ---------------------------------------------------------------------------
 
-// POST /login — verifies the shared username (exact, constant-time compare)
-// and password (PBKDF2) locally and, on success, sets a signed session
-// cookie. Never calls Supabase: a wrong or missing username or password, or
-// a missing OTP_PORTAL_USERNAME/OTP_PORTAL_PASSWORD_HASH/
-// OTP_PORTAL_SESSION_SECRET secret, always fails before any DB access. Both
-// checks always run (no short-circuit) so a wrong username can't be timed
-// apart from a wrong password.
+// POST /login — verifies the shared username (case-insensitive, ASCII-folded,
+// constant-time compare) and password (PBKDF2, exact) locally and, on
+// success, sets a signed session cookie. Never calls Supabase: a wrong or
+// missing username or password, or a missing OTP_PORTAL_USERNAME/
+// OTP_PORTAL_PASSWORD_HASH/OTP_PORTAL_SESSION_SECRET secret, always fails
+// before any DB access. Both checks always run (no short-circuit) so a wrong
+// username can't be timed apart from a wrong password.
 async function handleLogin(request, env) {
   let body;
   try { body = await request.json(); } catch { body = null; }
@@ -154,7 +156,7 @@ async function handleLogin(request, env) {
   if (!env.OTP_PORTAL_USERNAME || !env.OTP_PORTAL_PASSWORD_HASH || !env.OTP_PORTAL_SESSION_SECRET || !username || !password) {
     return json({ ok: false, error: 'invalid_credentials' }, 401);
   }
-  const usernameOk = constantTimeEqual(username, env.OTP_PORTAL_USERNAME);
+  const usernameOk = constantTimeEqual(foldUsername(username), foldUsername(env.OTP_PORTAL_USERNAME));
   const passwordOk = await verifyPassword(password, env.OTP_PORTAL_PASSWORD_HASH);
   if (!usernameOk || !passwordOk) return json({ ok: false, error: 'invalid_credentials' }, 401);
 

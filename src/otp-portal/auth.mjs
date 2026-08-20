@@ -43,6 +43,16 @@ export async function hashPassword(password) {
   return ['pbkdf2', PBKDF2_ITERATIONS, u8ToB64(salt), u8ToB64(hash)].join('$');
 }
 
+// ASCII-only lowercase fold for username matching — deliberately not
+// String#toLocaleLowerCase (locale-dependent, e.g. Turkish dotless-i) and
+// deliberately not touching non-ASCII bytes, so this can't be tricked into
+// mapping two visually-different usernames onto the same folded value.
+export function foldUsername(s) {
+  return String(s == null ? '' : s)
+    .trim()
+    .replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
 export function constantTimeEqual(a, b) {
   const A = String(a == null ? '' : a);
   const B = String(b == null ? '' : b);

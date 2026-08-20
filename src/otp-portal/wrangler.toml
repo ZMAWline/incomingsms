@@ -19,8 +19,9 @@ invocation_logs = true
 # https://otp-portal.<subdomain>.workers.dev/ — it shows a login form and
 # only serves a number/SMS once signed in.
 #
-# OTP_PORTAL_USERNAME is the exact shared login username (compared
-# constant-time, trimmed input only — no fuzzy matching).
+# OTP_PORTAL_USERNAME is the shared login username, matched case-
+# insensitively (trimmed + ASCII-folded, constant-time compare on both
+# sides).
 #
 # OTP_PORTAL_PASSWORD_HASH is a PBKDF2 hash of the shared login password in
 # the format produced by src/otp-portal/auth.mjs#hashPassword
