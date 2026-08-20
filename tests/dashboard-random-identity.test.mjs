@@ -1,13 +1,17 @@
-// Port-in modal "Use random subscriber identity" autofill.
+// Port-in modal "Use random info" autofill.
 //
 // Extends the random-address autofill added for the port-in modal (see
 // dashboard-random-address.test.mjs) with a fake name pool sourced from a
 // FakeNameGenerator.com bulk export (GivenName,Surname only — no addresses,
-// SSNs, or credit cards were in that export). Combines a name + address into
-// one "identity" the operator can drop into the "new subscriber / account
-// holder" block with a single click, while keeping account number, PIN, and
-// the losing-carrier (old_service_provider) name fields untouched unless the
-// operator explicitly opts in via a separate "copy" control.
+// SSNs, or credit cards were in that export). Combines a subscriber name +
+// address + independent losing-carrier (old_service_provider) name into one
+// "identity" the operator can drop into the port-in identity block with a
+// single click. Per the Atomic Wholesale API, subscriber and
+// old_service_provider names are independent fields that don't need to
+// match, so this draws two distinct random names by default. Still keeps
+// account number, PIN, MDN, and other carrier credential fields untouched;
+// an explicit "copy" control lets the operator force the old-carrier name to
+// match the subscriber name instead.
 //
 // As in dashboard-random-address.test.mjs, we lift the real handler out of
 // the source and run it in a vm since the dashboard worker is ESM inside a
@@ -100,27 +104,28 @@ test('returns a combined name+address identity object', () => {
   assert.equal(resp.status, 200);
 });
 
-test('response shape has exactly the fields the port-in "new subscriber" block needs, nothing else', async () => {
+test('response shape has exactly the fields the port-in identity block needs, nothing else', async () => {
   const sandbox = makeSandbox();
   const resp = sandbox.handleRandomIdentity({});
   const body = await resp.json();
   assert.equal(body.ok, true);
   assert.ok(body.identity, 'identity object missing');
   const keys = Object.keys(body.identity).sort();
-  assert.deepEqual(keys, ['city', 'firstName', 'lastName', 'state', 'streetDirection', 'streetName', 'streetNumber', 'zipCode']);
-  // No PIN, account number, or old-carrier data leaks in.
+  assert.deepEqual(keys, ['city', 'firstName', 'lastName', 'oldFirstName', 'oldLastName', 'state', 'streetDirection', 'streetName', 'streetNumber', 'zipCode']);
+  // No PIN, account number, or MDN leaks in.
   assert.ok(!('pin' in body.identity));
   assert.ok(!('accountNumber' in body.identity));
-  assert.ok(!('oldFirstName' in body.identity));
-  assert.ok(!('oldLastName' in body.identity));
+  assert.ok(!('mdn' in body.identity));
 });
 
-test('the returned name always matches an entry in NAME_POOL and address matches ADDRESS_POOL (no invented data)', async () => {
+test('the returned subscriber name, old-carrier name, and address all match real pool entries (no invented data)', async () => {
   const sandbox = makeSandbox();
   for (let i = 0; i < 20; i++) {
     const body = await sandbox.handleRandomIdentity({}).json();
     const nameMatch = NAME_POOL.find(e => e.firstName === body.identity.firstName && e.lastName === body.identity.lastName);
-    assert.ok(nameMatch, 'returned name must come from the real NAME_POOL');
+    assert.ok(nameMatch, 'returned subscriber name must come from the real NAME_POOL');
+    const oldNameMatch = NAME_POOL.find(e => e.firstName === body.identity.oldFirstName && e.lastName === body.identity.oldLastName);
+    assert.ok(oldNameMatch, 'returned old-carrier name must come from the real NAME_POOL');
     const addrMatch = ADDRESS_POOL.find(e =>
       e.streetNumber === body.identity.streetNumber &&
       e.streetName === body.identity.streetName &&
@@ -131,6 +136,19 @@ test('the returned name always matches an entry in NAME_POOL and address matches
   }
 });
 
+test('the subscriber name and old-carrier name are independently drawn and need not match', async () => {
+  const sandbox = makeSandbox();
+  let sawDifferent = false;
+  for (let i = 0; i < 20; i++) {
+    const body = await sandbox.handleRandomIdentity({}).json();
+    if (body.identity.firstName !== body.identity.oldFirstName || body.identity.lastName !== body.identity.oldLastName) {
+      sawDifferent = true;
+      break;
+    }
+  }
+  assert.ok(sawDifferent, 'expected at least one draw with distinct subscriber/old-carrier names out of 20 tries');
+});
+
 test('CORS headers passed in are echoed back on the response', async () => {
   const sandbox = makeSandbox();
   const resp = sandbox.handleRandomIdentity({ 'Access-Control-Allow-Origin': '*' });
@@ -139,15 +157,15 @@ test('CORS headers passed in are echoed back on the response', async () => {
 });
 
 // ---------------------------------------------------------
-// Frontend: "Use random subscriber identity" control + wiring
+// Frontend: "Use random info" control + wiring
 // ---------------------------------------------------------
 
-test('the port-in modal exposes a "Use random subscriber identity" autofill control', () => {
+test('the port-in modal exposes a "Use random info" autofill control', () => {
   assert.match(HTML, /onclick="fillRandomPortIdentity\(event\)"/);
-  assert.match(HTML, /Use random subscriber identity/);
+  assert.match(HTML, /Use random info/);
 });
 
-test('fillRandomPortIdentity fetches /random-identity and fills name+street/zip fields, never account/PIN/old-carrier', () => {
+test('fillRandomPortIdentity fetches /random-identity and fills subscriber name/street/zip AND old-carrier name fields, never account/PIN', () => {
   assert.match(HTML, /async function fillRandomPortIdentity\(evt\)/);
   assert.match(HTML, /fetch\(API_BASE \+ '\/random-identity'\)/);
   assert.match(HTML, /getElementById\('activate-port-first-name'\)\.value = data\.identity\.firstName/);
@@ -155,15 +173,16 @@ test('fillRandomPortIdentity fetches /random-identity and fills name+street/zip 
   assert.match(HTML, /getElementById\('activate-port-street-number'\)\.value = data\.identity\.streetNumber/);
   assert.match(HTML, /getElementById\('activate-port-street-name'\)\.value = data\.identity\.streetName/);
   assert.match(HTML, /getElementById\('activate-port-zip'\)\.value = data\.identity\.zipCode/);
+  assert.match(HTML, /getElementById\('activate-port-old-first-name'\)\.value = data\.identity\.oldFirstName/);
+  assert.match(HTML, /getElementById\('activate-port-old-last-name'\)\.value = data\.identity\.oldLastName/);
 
   const start = HTML.indexOf('async function fillRandomPortIdentity(evt) {');
   const end = HTML.indexOf('\n        }', start);
   const fnBody = HTML.slice(start, end);
   for (const forbidden of [
-    'activate-port-account-number', 'activate-port-pin',
-    'activate-port-old-first-name', 'activate-port-old-last-name',
+    'activate-port-account-number', 'activate-port-pin', 'activate-port-mdn',
   ]) {
-    assert.ok(!fnBody.includes(forbidden), 'random-identity autofill must never write to ' + forbidden);
+    assert.ok(!fnBody.includes(forbidden), 'random-info autofill must never write to ' + forbidden);
   }
 });
 

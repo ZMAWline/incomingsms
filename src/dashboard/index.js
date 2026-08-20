@@ -3745,16 +3745,25 @@ function handleRandomAddress(corsHeaders) {
   }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
-// Port-in modal "Use random subscriber identity" autofill. Draws a name from
+// Port-in modal "Use random info" autofill. Draws two independent names from
 // the static FakeNameGenerator.com seed pool (fake identities, no real
-// customer/PII) and an address from the same ADDRESS_POOL used above, and
-// returns them together so the operator can fill the whole "new subscriber /
-// account holder" block in one click. Never touches account number, PIN, or
-// the losing-carrier (old_service_provider) name fields — those require an
-// explicit, separate operator action because they must match real carrier
-// records for the port to succeed.
+// customer/PII) — one for the new subscriber, one for the losing-carrier
+// (old_service_provider) account holder — plus an address from the same
+// ADDRESS_POOL used above, and returns them together so the operator can
+// fill the whole port-in identity block in one click. Per the Atomic
+// Wholesale API, subscriber and old_service_provider names are independent
+// fields that don't need to match, so distinct random names are used by
+// default; the operator can still use the explicit "copy" control to force
+// them to match. Never touches account number, PIN, MDN, or any other
+// carrier credential field.
 function handleRandomIdentity(corsHeaders) {
-  const name = NAME_POOL[Math.floor(Math.random() * NAME_POOL.length)];
+  const subIdx = Math.floor(Math.random() * NAME_POOL.length);
+  let oldIdx = Math.floor(Math.random() * NAME_POOL.length);
+  if (NAME_POOL.length > 1 && oldIdx === subIdx) {
+    oldIdx = (oldIdx + 1) % NAME_POOL.length;
+  }
+  const name = NAME_POOL[subIdx];
+  const oldName = NAME_POOL[oldIdx];
   const entry = ADDRESS_POOL[Math.floor(Math.random() * ADDRESS_POOL.length)];
   return new Response(JSON.stringify({
     ok: true,
@@ -3767,6 +3776,8 @@ function handleRandomIdentity(corsHeaders) {
       city: entry.city,
       state: entry.state,
       zipCode: entry.zipCode,
+      oldFirstName: oldName.firstName,
+      oldLastName: oldName.lastName,
     },
   }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
