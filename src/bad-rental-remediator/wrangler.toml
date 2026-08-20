@@ -37,6 +37,14 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 #   TELTIK_API_KEY                                      (T3 / T4 / T5)
 #   RELAY_URL, RELAY_KEY                                (optional egress relay)
 #
+# SLACK_WEBHOOK_URL — Incoming Webhook URL for the #<channel> alert channel.
+# Fires a Slack message from notify.mjs on TH5 offline detection (first
+# detection) and again if the port is still offline after the auto-reset
+# attempt (escalation). Missing/unset → notifyPortOffline no-ops (logs
+# 'no_webhook', never throws). Dedup is internal (REMEDIATOR_KV), so this is
+# safe to set at any time without a code change.
+#   npx wrangler secret put SLACK_WEBHOOK_URL -c src/bad-rental-remediator/wrangler.toml --env ""
+#
 # INC-22 / INC-16f — Paperclip escalation API. When absent, escalation rows
 # are still written to operator_escalations (status='queued', last_error=
 # 'paperclip_credentials_missing') so an out-of-band drainer can post them.

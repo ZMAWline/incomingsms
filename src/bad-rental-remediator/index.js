@@ -22,6 +22,7 @@ import { runVerifyPoll, preResolveGate } from './verify-runner.mjs';
 import { cleanRecheckPredicate } from './verify.mjs';
 import { executeAction } from './actions.mjs';
 import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
+import { notifyPortOffline } from './notify.mjs';
 import { teltikPortStatus, readVendorView, teltikGetInfo } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import {
@@ -704,6 +705,28 @@ async function processReport(env, report) {
 
   const evidence = await gatherEvidence(env, report);
   let classification = await classifyShared(env, report, evidence);
+
+  // TH5 offline alert — Slack notification, independent of and in addition
+  // to the classifier's own action/escalation. Never awaited into failure:
+  // notifyPortOffline swallows its own errors so a Slack outage can't affect
+  // report processing. Deduped internally per ICCID + kind (see notify.mjs).
+  if (classification && classification.mode === 'TH5' && evidence.sim) {
+    const reason = classification.evidenceSummary && classification.evidenceSummary.reason;
+    if (reason === 'teltik_gateway_port_offline') {
+      await notifyPortOffline(env, {
+        kind: 'first_detection',
+        sim: evidence.sim,
+        portStatus: classification.evidenceSummary.port_status,
+      });
+    } else if (reason === 'teltik_gateway_port_offline_after_reset') {
+      await notifyPortOffline(env, {
+        kind: 'still_offline_after_reset',
+        sim: evidence.sim,
+        portStatus: classification.evidenceSummary.port_status,
+        priorResets: classification.evidenceSummary.prior_reset_attempts,
+      });
+    }
+  }
 
   // R5 robust fix: a report that reprocessed this many times without ever
   // reaching a terminal state is stuck for a reason no classifier branch
