@@ -10,12 +10,12 @@
 // worker ever makes (relayFetch is for calls to CF-proxied third-party
 // APIs, per agent/constraints.md #11; this worker makes none).
 //
-// Auth is a single shared password (OTP_PORTAL_PASSWORD_HASH) verified
-// locally with PBKDF2 — a wrong or missing login never touches Supabase.
-// A successful login sets an HMAC-signed, HttpOnly session cookie
-// (see auth.mjs). Once logged in, the existing per-browser assignment
-// cookie (otpp_sid) keeps the same number stable across reloads exactly as
-// before the login model was added.
+// Auth is a single shared username + password (OTP_PORTAL_USERNAME /
+// OTP_PORTAL_PASSWORD_HASH) verified locally — a wrong or missing username
+// or password never touches Supabase. A successful login sets an
+// HMAC-signed, HttpOnly session cookie (see auth.mjs). Once logged in, the
+// existing per-browser assignment cookie (otpp_sid) keeps the same number
+// stable across reloads exactly as before the login model was added.
 
 import {
   vendorToCarrier,
@@ -23,7 +23,7 @@ import {
   pickRandom,
   filterAssignmentMessages,
 } from './logic.mjs';
-import { verifyPassword, signSession, verifySession, randomHex } from './auth.mjs';
+import { verifyPassword, signSession, verifySession, randomHex, constantTimeEqual } from './auth.mjs';
 
 const AUTH_COOKIE_NAME = 'otpp_auth';
 const SID_COOKIE_NAME = 'otpp_sid';
@@ -138,20 +138,25 @@ async function isAuthenticated(request, env) {
 // Login / logout
 // ---------------------------------------------------------------------------
 
-// POST /login — verifies the shared password locally (PBKDF2) and, on
-// success, sets a signed session cookie. Never calls Supabase: a wrong or
-// missing password, or a missing OTP_PORTAL_PASSWORD_HASH/
-// OTP_PORTAL_SESSION_SECRET secret, always fails before any DB access.
+// POST /login — verifies the shared username (exact, constant-time compare)
+// and password (PBKDF2) locally and, on success, sets a signed session
+// cookie. Never calls Supabase: a wrong or missing username or password, or
+// a missing OTP_PORTAL_USERNAME/OTP_PORTAL_PASSWORD_HASH/
+// OTP_PORTAL_SESSION_SECRET secret, always fails before any DB access. Both
+// checks always run (no short-circuit) so a wrong username can't be timed
+// apart from a wrong password.
 async function handleLogin(request, env) {
   let body;
   try { body = await request.json(); } catch { body = null; }
+  const username = (body && typeof body.username === 'string') ? body.username.trim() : '';
   const password = (body && typeof body.password === 'string') ? body.password : '';
 
-  if (!env.OTP_PORTAL_PASSWORD_HASH || !env.OTP_PORTAL_SESSION_SECRET || !password) {
+  if (!env.OTP_PORTAL_USERNAME || !env.OTP_PORTAL_PASSWORD_HASH || !env.OTP_PORTAL_SESSION_SECRET || !username || !password) {
     return json({ ok: false, error: 'invalid_credentials' }, 401);
   }
-  const ok = await verifyPassword(password, env.OTP_PORTAL_PASSWORD_HASH);
-  if (!ok) return json({ ok: false, error: 'invalid_credentials' }, 401);
+  const usernameOk = constantTimeEqual(username, env.OTP_PORTAL_USERNAME);
+  const passwordOk = await verifyPassword(password, env.OTP_PORTAL_PASSWORD_HASH);
+  if (!usernameOk || !passwordOk) return json({ ok: false, error: 'invalid_credentials' }, 401);
 
   const minutes = loginTtlMinutes(env);
   const token = await signSession(env.OTP_PORTAL_SESSION_SECRET, minutes * 60000);
@@ -344,6 +349,7 @@ function loginHtml() {
   <div class="card">
     <h1>Sign in</h1>
     <form id="login-form">
+      <input id="username" name="username" type="text" autocomplete="username" placeholder="Username" required>
       <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Password" required>
       <div id="login-err" class="error" style="display:none;padding:0 0 14px"></div>
       <button id="login-btn" type="submit">Sign in</button>
@@ -363,12 +369,15 @@ function loginHtml() {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: document.getElementById('password').value }),
+      body: JSON.stringify({
+        username: document.getElementById('username').value,
+        password: document.getElementById('password').value,
+      }),
     })
       .then(function (r) { return r.json().then(function (data) { if (!r.ok) throw new Error(data.error || 'sign_in_failed'); }); })
       .then(function () { location.href = '/'; })
       .catch(function () {
-        err.textContent = 'Incorrect password.';
+        err.textContent = 'Incorrect username or password.';
         err.style.display = 'block';
         btn.disabled = false;
         btn.textContent = 'Sign in';

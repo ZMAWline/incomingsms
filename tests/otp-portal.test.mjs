@@ -21,12 +21,14 @@ const otpPortal = (await import('data:text/javascript;base64,' + Buffer.from(wor
 const realFetch = globalThis.fetch;
 const realRandom = Math.random;
 
+const USERNAME = 'test-user';
 const PASSWORD = 'correct horse battery staple';
 const PASSWORD_HASH = await hashPassword(PASSWORD);
 
 const ENV = {
   SUPABASE_URL: 'https://x.supabase.co',
   SUPABASE_SERVICE_ROLE_KEY: 'k',
+  OTP_PORTAL_USERNAME: USERNAME,
   OTP_PORTAL_PASSWORD_HASH: PASSWORD_HASH,
   OTP_PORTAL_SESSION_SECRET: 'test-session-secret',
 };
@@ -152,7 +154,10 @@ function cookieFromSetCookie(res, name) {
 }
 
 async function login(env = ENV) {
-  const res = await otpPortal.fetch(req('/login', { method: 'POST', body: { password: PASSWORD } }), env);
+  const res = await otpPortal.fetch(
+    req('/login', { method: 'POST', body: { username: USERNAME, password: PASSWORD } }),
+    env,
+  );
   const authCookie = cookieFromSetCookie(res, 'otpp_auth');
   return { res, authCookie };
 }
@@ -183,11 +188,29 @@ test('api/state and api/messages 401 without a valid session and never touch the
   assert.equal(calls.length, 0, 'no Supabase call happens before authentication');
 });
 
+test('wrong username is rejected and never touches the DB', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  const { calls } = fakeBackend({});
+
+  const res = await otpPortal.fetch(
+    req('/login', { method: 'POST', body: { username: 'not-yossi', password: PASSWORD } }),
+    ENV,
+  );
+  assert.equal(res.status, 401);
+  const body = await res.json();
+  assert.equal(body.ok, false);
+  assert.equal(cookieFromSetCookie(res, 'otpp_auth'), null, 'no session cookie on a failed login');
+  assert.equal(calls.length, 0, 'username verification is pure local compare — never calls Supabase');
+});
+
 test('wrong password is rejected and never touches the DB', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   const { calls } = fakeBackend({});
 
-  const res = await otpPortal.fetch(req('/login', { method: 'POST', body: { password: 'nope-not-it' } }), ENV);
+  const res = await otpPortal.fetch(
+    req('/login', { method: 'POST', body: { username: USERNAME, password: 'nope-not-it' } }),
+    ENV,
+  );
   assert.equal(res.status, 401);
   const body = await res.json();
   assert.equal(body.ok, false);
@@ -195,27 +218,45 @@ test('wrong password is rejected and never touches the DB', async (t) => {
   assert.equal(calls.length, 0, 'password verification is pure local PBKDF2 — never calls Supabase');
 });
 
-test('missing password body is rejected and never touches the DB', async (t) => {
+test('missing username is rejected and never touches the DB', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   const { calls } = fakeBackend({});
 
-  const res = await otpPortal.fetch(req('/login', { method: 'POST', body: {} }), ENV);
+  const res = await otpPortal.fetch(
+    req('/login', { method: 'POST', body: { password: PASSWORD } }),
+    ENV,
+  );
   assert.equal(res.status, 401);
   assert.equal(calls.length, 0);
 });
 
-test('login with missing OTP_PORTAL_PASSWORD_HASH or OTP_PORTAL_SESSION_SECRET always fails, never touches the DB', async (t) => {
+test('missing password body is rejected and never touches the DB', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   const { calls } = fakeBackend({});
 
+  const res = await otpPortal.fetch(req('/login', { method: 'POST', body: { username: USERNAME } }), ENV);
+  assert.equal(res.status, 401);
+  assert.equal(calls.length, 0);
+});
+
+test('login with missing OTP_PORTAL_USERNAME, OTP_PORTAL_PASSWORD_HASH, or OTP_PORTAL_SESSION_SECRET always fails, never touches the DB', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  const { calls } = fakeBackend({});
+
+  const noUsername = await otpPortal.fetch(
+    req('/login', { method: 'POST', body: { username: USERNAME, password: PASSWORD } }),
+    { ...ENV, OTP_PORTAL_USERNAME: undefined },
+  );
+  assert.equal(noUsername.status, 401);
+
   const noHash = await otpPortal.fetch(
-    req('/login', { method: 'POST', body: { password: PASSWORD } }),
+    req('/login', { method: 'POST', body: { username: USERNAME, password: PASSWORD } }),
     { ...ENV, OTP_PORTAL_PASSWORD_HASH: undefined },
   );
   assert.equal(noHash.status, 401);
 
   const noSecret = await otpPortal.fetch(
-    req('/login', { method: 'POST', body: { password: PASSWORD } }),
+    req('/login', { method: 'POST', body: { username: USERNAME, password: PASSWORD } }),
     { ...ENV, OTP_PORTAL_SESSION_SECRET: undefined },
   );
   assert.equal(noSecret.status, 401);
@@ -234,7 +275,7 @@ test('a forged/garbage session cookie is rejected without touching the DB', asyn
 
 // --- good login creates a session -------------------------------------------
 
-test('correct password sets a signed HttpOnly session cookie and serves the app page', async (t) => {
+test('correct username and password sets a signed HttpOnly session cookie and serves the app page', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   fakeBackend({});
 
