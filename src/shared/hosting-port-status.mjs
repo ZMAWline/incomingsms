@@ -29,7 +29,7 @@ import {
   retryMdnSource,
 } from './teltik-known-mdn.mjs';
 
-export const CHECK_SOURCES = ['cron', 'manual_bulk', 'manual_sweep', 'single_query', 'bad_rental_remediator'];
+export const CHECK_SOURCES = ['cron', 'manual_bulk', 'manual_sweep', 'single_query', 'bad_rental_remediator', 'teltik_portal'];
 
 // --- pure helpers ---------------------------------------------------------
 
