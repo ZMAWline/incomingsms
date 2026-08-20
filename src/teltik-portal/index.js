@@ -29,7 +29,17 @@ import { verifyPassword, signSession, verifySession, constantTimeEqual, foldUser
 const AUTH_COOKIE_NAME = 'tprt_auth';
 const DEFAULT_LOGIN_TTL_MINUTES = 720; // 12h
 const RESET_TIMEOUT_MS = 15000;
-const LINES_LIMIT = 2000;
+// PostgREST caps a single response at its configured db-max-rows regardless
+// of a larger `limit=` in the query string (silently — no error, no
+// Content-Range warning), so a single big-limit request under-reports once
+// the fleet crosses that cap. Page at a size safely under any reasonable
+// max-rows setting and keep fetching until a short page proves there's no
+// more, rather than trusting one request's row count.
+const SIMS_PAGE_SIZE = 1000;
+// Backstop only — real Teltik fleets are nowhere near this. Existing only so
+// a runaway pagination loop can't fetch forever; surfaced as `truncated` in
+// the API response rather than silently dropped if ever actually hit.
+const LINES_HARD_CAP = 20000;
 
 // ---------------------------------------------------------------------------
 // Supabase (PostgREST) helpers
@@ -85,13 +95,31 @@ async function fetchScopedSim(env, simId) {
   };
 }
 
+// Walks the full scoped result set page by page (see SIMS_PAGE_SIZE) instead
+// of issuing one request with a large `limit=` — PostgREST silently caps a
+// single response at its own db-max-rows setting, which can be well under
+// what we ask for.
+async function fetchAllHostedSims(env) {
+  const all = [];
+  let offset = 0;
+  let truncated = false;
+  while (true) {
+    const page = await sbSelect(env,
+      'sims?select=id,iccid,vendor,gateway_host,status,sim_numbers(e164)'
+      + '&sim_numbers.valid_to=is.null'
+      + '&status=eq.active'
+      + '&' + TELTIK_SCOPE
+      + '&order=id.asc&offset=' + offset + '&limit=' + SIMS_PAGE_SIZE);
+    all.push(...page);
+    if (page.length < SIMS_PAGE_SIZE) break; // short page = no more rows
+    offset += SIMS_PAGE_SIZE;
+    if (all.length >= LINES_HARD_CAP) { truncated = true; break; }
+  }
+  return { sims: all, truncated };
+}
+
 async function fetchHostedLines(env) {
-  const sims = await sbSelect(env,
-    'sims?select=id,iccid,vendor,gateway_host,status,sim_numbers(e164)'
-    + '&sim_numbers.valid_to=is.null'
-    + '&status=eq.active'
-    + '&' + TELTIK_SCOPE
-    + '&order=id.asc&limit=' + LINES_LIMIT);
+  const { sims, truncated } = await fetchAllHostedSims(env);
 
   const ids = sims.map((s) => s.id);
   const summaryBySimId = {};
@@ -100,7 +128,7 @@ async function fetchHostedLines(env) {
     if (Array.isArray(rows)) for (const row of rows) summaryBySimId[row.sim_id] = row;
   }
 
-  return sims.map((s) => {
+  const lines = sims.map((s) => {
     const hp = summaryBySimId[s.id] || null;
     return {
       sim_id: s.id,
@@ -124,6 +152,7 @@ async function fetchHostedLines(env) {
       online_7d: hp ? hp.online_7d : 0,
     };
   });
+  return { lines, truncated };
 }
 
 // Mirrors the reset-port call into carrier_api_logs (same table the
@@ -279,8 +308,8 @@ function handleLogout() {
 async function handleLinesList(request, env) {
   if (!(await isAuthenticated(request, env))) return json({ ok: false, error: 'unauthorized' }, 401);
   try {
-    const lines = await fetchHostedLines(env);
-    return json({ ok: true, lines });
+    const { lines, truncated } = await fetchHostedLines(env);
+    return json({ ok: true, lines, truncated });
   } catch (e) {
     return json({ ok: false, error: String(e && e.message || e) }, 502);
   }
@@ -487,6 +516,7 @@ function appHtml() {
 <script>
 (function () {
   var lines = [];
+  var linesTruncated = false;
   var selected = new Set();
   var bulkCancelled = false;
   var searchText = '';
@@ -650,8 +680,9 @@ function appHtml() {
   function updateSummary() {
     var online = lines.filter(function (l) { return l.state === 'online'; }).length;
     var offline = lines.filter(function (l) { return l.state === 'offline'; }).length;
-    document.getElementById('summary-line').textContent =
-      lines.length + ' lines · ' + online + ' online · ' + offline + ' offline · as of ' + new Date().toLocaleTimeString();
+    var text = lines.length + ' lines · ' + online + ' online · ' + offline + ' offline · as of ' + new Date().toLocaleTimeString();
+    if (linesTruncated) text += ' · ⚠ list truncated, not all lines shown';
+    document.getElementById('summary-line').textContent = text;
   }
 
   function csvField(v) {
@@ -696,6 +727,7 @@ function appHtml() {
         if (!data) return;
         if (!data.ok) throw new Error(data.error || 'load_failed');
         lines = data.lines || [];
+        linesTruncated = !!data.truncated;
         render();
         updateSummary();
         setStatus('');
