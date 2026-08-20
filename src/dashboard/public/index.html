@@ -6426,6 +6426,17 @@ async function sendSimOnline(simId, phoneNumber) {
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
         }
+        // A non-2xx from /activate (auth failure, Cloudflare edge error, worker
+        // exception) can return a plain-text or HTML body instead of JSON.
+        // response.json() would throw a raw "Unexpected token" SyntaxError with
+        // no useful message, so callers parse text() through this first.
+        function parseApiResponseText(text) {
+            try {
+                return { ok: true, data: JSON.parse(text) };
+            } catch {
+                return { ok: false, data: null };
+            }
+        }
         function updateActivatePortInUi() {
             const vendor = document.getElementById('activate-vendor')?.value || 'atomic';
             const checked = !!document.getElementById('activate-port-in')?.checked;
@@ -6609,7 +6620,14 @@ async function sendSimOnline(simId, phoneNumber) {
                     body: JSON.stringify({ sims, vendor })
                 });
 
-                const result = await response.json();
+                const responseText = await response.text();
+                const parsed = parseApiResponseText(responseText);
+                if (!parsed.ok) {
+                    showToast(`Error activating SIMs: server returned a non-JSON response (${response.status}). Try refreshing the page and logging in again.`, 'error');
+                    console.error('Non-JSON /activate response:', response.status, responseText.slice(0, 300));
+                    return;
+                }
+                const result = parsed.data;
 
                 if (response.ok) {
                     showToast('Queued ' + (result.queued || 0) + ' SIM(s) for activation' + (result.validation_errors > 0 ? ', ' + result.validation_errors + ' validation error(s)' : ''),

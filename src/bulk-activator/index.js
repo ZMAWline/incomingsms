@@ -199,7 +199,7 @@ async function handleActivateJson(request, env) {
   const url = new URL(request.url);
   const secret = url.searchParams.get('secret') || '';
   if (!env.BULK_RUN_SECRET || secret !== env.BULK_RUN_SECRET) {
-    return new Response('Unauthorized', { status: 401 });
+    return json({ ok: false, error: 'Unauthorized' }, 401);
   }
   if (request.method !== 'POST') return json({ ok: false, error: 'Method must be POST' });
 
@@ -777,6 +777,6 @@ function normalizeRow(row, len) {
   return r;
 }
 
-function json(obj) {
-  return new Response(JSON.stringify(obj, null, 2), { headers: { 'Content-Type': 'application/json' } });
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), { status, headers: { 'Content-Type': 'application/json' } });
 }
