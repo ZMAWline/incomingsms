@@ -203,6 +203,33 @@ test('wrong username is rejected and never touches the DB', async (t) => {
   assert.equal(calls.length, 0, 'username verification is pure local compare — never calls Supabase');
 });
 
+test('username matching is case-insensitive: lowercase, uppercase, and mixed-case all accepted with the correct password', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+
+  for (const candidate of [USERNAME.toLowerCase(), USERNAME.toUpperCase(), '  ' + USERNAME.toUpperCase() + '  ']) {
+    fakeBackend({});
+    const res = await otpPortal.fetch(
+      req('/login', { method: 'POST', body: { username: candidate, password: PASSWORD } }),
+      ENV,
+    );
+    assert.equal(res.status, 200, `expected ${JSON.stringify(candidate)} to be accepted`);
+    assert.ok(cookieFromSetCookie(res, 'otpp_auth'), 'sets a session cookie on success');
+  }
+});
+
+test('a username that only differs by more than case is still rejected, and never touches the DB', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch; });
+  const { calls } = fakeBackend({});
+
+  const res = await otpPortal.fetch(
+    req('/login', { method: 'POST', body: { username: USERNAME.toUpperCase() + 'x', password: PASSWORD } }),
+    ENV,
+  );
+  assert.equal(res.status, 401);
+  assert.equal(cookieFromSetCookie(res, 'otpp_auth'), null);
+  assert.equal(calls.length, 0, 'username verification is pure local compare — never calls Supabase');
+});
+
 test('wrong password is rejected and never touches the DB', async (t) => {
   t.after(() => { globalThis.fetch = realFetch; });
   const { calls } = fakeBackend({});

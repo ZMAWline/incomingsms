@@ -7,6 +7,7 @@ import {
   hashPassword,
   verifyPassword,
   constantTimeEqual,
+  foldUsername,
   randomHex,
   signSession,
   verifySession,
@@ -62,10 +63,22 @@ test('constantTimeEqual compares correctly', () => {
   assert.equal(constantTimeEqual(undefined, 'x'), false);
 });
 
-test('constantTimeEqual is case-sensitive (username matching must not fuzzy-match case)', () => {
+test('constantTimeEqual itself is case-sensitive — the primitive does no folding; login-route username case-insensitivity comes from foldUsername (see below), not from this function', () => {
   assert.equal(constantTimeEqual('Yossi', 'Yossi'), true);
   assert.equal(constantTimeEqual('Yossi', 'yossi'), false);
   assert.equal(constantTimeEqual('YOSSI', 'yossi'), false);
+});
+
+test('foldUsername trims and lowercases ASCII only, for case-insensitive username matching', () => {
+  assert.equal(foldUsername('Yossi'), 'yossi');
+  assert.equal(foldUsername('YOSSI'), 'yossi');
+  assert.equal(foldUsername('  Yossi  '), 'yossi');
+  assert.equal(foldUsername(''), '');
+  assert.equal(foldUsername(null), '');
+  assert.equal(foldUsername(undefined), '');
+  // Non-ASCII characters are left untouched (no locale-dependent folding,
+  // e.g. no Turkish dotted/dotless-I surprises).
+  assert.equal(foldUsername('İstanbul'), 'İstanbul');
 });
 
 test('randomHex returns hex of the requested byte length', () => {
