@@ -62,6 +62,12 @@ test('constantTimeEqual compares correctly', () => {
   assert.equal(constantTimeEqual(undefined, 'x'), false);
 });
 
+test('constantTimeEqual is case-sensitive (username matching must not fuzzy-match case)', () => {
+  assert.equal(constantTimeEqual('Yossi', 'Yossi'), true);
+  assert.equal(constantTimeEqual('Yossi', 'yossi'), false);
+  assert.equal(constantTimeEqual('YOSSI', 'yossi'), false);
+});
+
 test('randomHex returns hex of the requested byte length', () => {
   const t = randomHex(32);
   assert.match(t, /^[0-9a-f]{64}$/);
