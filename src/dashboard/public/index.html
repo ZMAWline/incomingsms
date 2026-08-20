@@ -3828,6 +3828,11 @@ set verify_pending; schedule §C.3 poll
                 <div id="activate-port-fields" class="hidden mb-4 p-3 rounded-lg border border-dark-600 bg-dark-900/60">
                     <label class="block text-sm text-gray-300 mb-1">Port MDN <span class="text-red-400">*</span></label>
                     <input id="activate-port-mdn" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="2125550199">
+                    <div class="mt-3">
+                        <label class="block text-sm text-gray-300 mb-1">Reseller ID <span class="text-red-400">*</span></label>
+                        <input id="activate-port-reseller-id" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="1" inputmode="numeric">
+                        <p class="text-xs text-gray-500 mt-1">Only used when pasting the 5-column ICCID/IMEI/MDN/account/PIN row above (it has no reseller column). Pasting the older 3-column ICCID/IMEI/reseller_id row fills reseller_id from that row instead and ignores this box.</p>
+                    </div>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
                         <div>
                             <label class="block text-sm text-gray-300 mb-1">Port account number <span class="text-red-400">*</span></label>
@@ -3896,7 +3901,7 @@ set verify_pending; schedule §C.3 poll
                 <p class="text-sm text-gray-400 mb-3">Paste from spreadsheet or enter one SIM per line:</p>
                 <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631&#9;123456789012345&#9;1
 89014103271467425632&#9;123456789012346&#9;1"></textarea>
-                <p class="text-xs text-gray-500 mt-2">Manual paste columns: ICCID (20 digits), IMEI (15 digits or blank for Wing IoT), Reseller ID — tab or comma separated. Use the switch above for one ATOMIC port-in row.</p>
+                <p class="text-xs text-gray-500 mt-2">Manual paste columns: ICCID (20 digits), IMEI (15 digits or blank for Wing IoT), Reseller ID — tab or comma separated. Use the switch above for one ATOMIC port-in row. With port-in on, you can instead paste a 5-column Google Sheets row — ICCID, IMEI, MDN, account number, PIN — separated by spaces, commas, tabs, or a mix; it fills Port MDN/account number/PIN above (enter Reseller ID in the box above the port fields since that row has no reseller column).</p>
                 <div id="activate-review" class="hidden mt-4 p-3 rounded-lg border border-dark-600 bg-dark-900/70 text-xs text-gray-300 max-h-48 overflow-auto"></div>
             </div>
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
@@ -6317,6 +6322,7 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('activate-modal').classList.add('hidden');
             document.getElementById('activate-input').value = '';
             document.getElementById('activate-port-mdn').value = '';
+            document.getElementById('activate-port-reseller-id').value = '';
             document.getElementById('activate-port-account-number').value = '';
             document.getElementById('activate-port-pin').value = '';
             document.getElementById('activate-port-first-name').value = '';
@@ -6360,6 +6366,26 @@ async function sendSimOnline(simId, phoneNumber) {
             }
             row.push(cur); rows.push(row);
             return rows.filter(r => r.some(v => String(v).trim() !== ''));
+        }
+        // Manual port-in paste row: splits on any run of comma/whitespace (space, tab,
+        // or a spreadsheet's mixed comma+space) so a Google Sheets row pastes cleanly
+        // regardless of how the browser represents the copied cell boundaries.
+        function splitPasteFields(line) {
+            return String(line || '').split(/[\s,]+/).filter(p => p.length > 0);
+        }
+        // Manual port-in textarea accepts either the pre-existing 3-column row
+        // (ICCID, IMEI, reseller_id) or a 5-column Google Sheets row carrying the
+        // port-in details directly (ICCID, IMEI, MDN, account number, PIN). Returns
+        // null for any other column count so the caller can report a clear error.
+        function parseManualPortInRow(line) {
+            const fields = splitPasteFields(line);
+            if (fields.length === 3) {
+                return { iccid: fields[0], imei: fields[1], reseller_id: fields[2], port_mdn: '', port_account_number: '', port_pin: '' };
+            }
+            if (fields.length === 5) {
+                return { iccid: fields[0], imei: fields[1], reseller_id: '', port_mdn: fields[2], port_account_number: fields[3], port_pin: fields[4] };
+            }
+            return null;
         }
         const PORT_FIELD_KEYS = [
             'port_first_name', 'port_last_name', 'port_street_number', 'port_street_name', 'port_zip',
@@ -6555,7 +6581,11 @@ async function sendSimOnline(simId, phoneNumber) {
                     }
                 }
             } else {
-                // Parse pasted data (tab-separated from spreadsheet, or comma-separated)
+                // Parse pasted data. Non-port-in rows keep the original tab-or-comma,
+                // exactly-3-column behavior unchanged. Port-in rows also accept a
+                // 5-column Google Sheets row (ICCID, IMEI, MDN, account number, PIN)
+                // separated by spaces, commas, tabs, or a spreadsheet's mixed
+                // whitespace/comma paste — see parseManualPortInRow.
                 const lines = input.split('\n').map(line => line.trim()).filter(line => line.length > 0);
                 const manualPortIn = !!document.getElementById('activate-port-in').checked;
                 if (manualPortIn && lines.length !== 1) {
@@ -6563,22 +6593,34 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
 
                 for (let i = 0; i < lines.length; i++) {
-                    const delimiter = lines[i].includes('\t') ? '\t' : ',';
-                    const parts = lines[i].split(delimiter).map(p => p.trim());
-                    if (parts.length !== 3) {
-                        errors.push(`Line ${i + 1}: Invalid format (expected 3 columns)`);
-                        continue;
+                    let iccid, imei, resellerId, pastedPortMdn = '', pastedPortAccountNumber = '', pastedPortPin = '';
+                    if (manualPortIn) {
+                        const parsed = parseManualPortInRow(lines[i]);
+                        if (!parsed) {
+                            errors.push(`Line ${i + 1}: Invalid format (expected ICCID/IMEI/reseller_id, or ICCID/IMEI/MDN/account/PIN for port-in)`);
+                            continue;
+                        }
+                        iccid = parsed.iccid; imei = parsed.imei;
+                        resellerId = parsed.reseller_id || document.getElementById('activate-port-reseller-id').value;
+                        pastedPortMdn = parsed.port_mdn; pastedPortAccountNumber = parsed.port_account_number; pastedPortPin = parsed.port_pin;
+                    } else {
+                        const delimiter = lines[i].includes('\t') ? '\t' : ',';
+                        const parts = lines[i].split(delimiter).map(p => p.trim());
+                        if (parts.length !== 3) {
+                            errors.push(`Line ${i + 1}: Invalid format (expected 3 columns)`);
+                            continue;
+                        }
+                        [iccid, imei, resellerId] = parts;
                     }
-                    const [iccid, imei, resellerId] = parts;
                     const checked = validateActivationRow({
                         iccid,
                         imei,
                         reseller_id: resellerId,
                         vendor,
                         port_in: manualPortIn ? 'true' : 'false',
-                        port_mdn: manualPortIn ? document.getElementById('activate-port-mdn').value : '',
-                        port_account_number: manualPortIn ? document.getElementById('activate-port-account-number').value : '',
-                        port_pin: manualPortIn ? document.getElementById('activate-port-pin').value : '',
+                        port_mdn: manualPortIn ? (pastedPortMdn || document.getElementById('activate-port-mdn').value) : '',
+                        port_account_number: manualPortIn ? (pastedPortAccountNumber || document.getElementById('activate-port-account-number').value) : '',
+                        port_pin: manualPortIn ? (pastedPortPin || document.getElementById('activate-port-pin').value) : '',
                         port_first_name: manualPortIn ? document.getElementById('activate-port-first-name').value : '',
                         port_last_name: manualPortIn ? document.getElementById('activate-port-last-name').value : '',
                         port_street_number: manualPortIn ? document.getElementById('activate-port-street-number').value : '',
