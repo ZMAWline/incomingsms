@@ -72,7 +72,9 @@ function fakeBackend({ posted = [], apiLogs = [], resetSuccess = true } = {}) {
         const id = Number(idParam.slice(3));
         rows = rows.filter((s) => s.id === id);
       }
-      return jsonRes(rows);
+      const offset = Number(u.searchParams.get('offset') || 0);
+      const limit = u.searchParams.has('limit') ? Number(u.searchParams.get('limit')) : rows.length;
+      return jsonRes(rows.slice(offset, offset + limit));
     }
     if (u.pathname === '/rest/v1/rpc/get_hosting_port_status_summary') {
       const body = JSON.parse(init.body);
@@ -152,6 +154,12 @@ test('GET /api/lines returns only Teltik-hosted lines, excluding other gateway h
   assert.deepEqual(ids, [1, 2], 'sim 3 (skyline host) excluded');
   assert.equal(data.lines.find((l) => l.sim_id === 1).state, 'online');
   assert.equal(data.lines.find((l) => l.sim_id === 1).online_7d, 26);
+  // Current MDN (from sim_numbers) vs Hosted MDN (Teltik's own resolved MDN,
+  // from get_hosting_port_status_summary.last_mdn) are distinct fields — the
+  // portal surfaces both since they can legitimately differ.
+  const line1 = data.lines.find((l) => l.sim_id === 1);
+  assert.equal(line1.mdn, '+12125551111');
+  assert.equal(line1.hosted_mdn, '2125551111');
 });
 
 test('per-line check/reset on an out-of-scope sim id returns 404, never calls Teltik', async () => {
@@ -166,6 +174,42 @@ test('per-line check/reset on an out-of-scope sim id returns 404, never calls Te
   const resetRes = await teltikPortal.fetch(authedRequest('https://x/api/lines/3/reset', { method: 'POST' }, cookie), ENV);
   assert.equal(resetRes.status, 404);
   assert.equal(apiLogs.length, 0);
+});
+
+// --- pagination --------------------------------------------------------
+
+// Regression: PostgREST silently caps a single response at its own
+// db-max-rows setting regardless of a larger `limit=` in the request — a
+// one-shot fetch under-reports once the fleet crosses that cap, with no
+// error to notice. fetchAllHostedSims must page past it.
+test('GET /api/lines pages past a PostgREST-style single-response cap to return the full fleet', async () => {
+  const bigFleet = [];
+  for (let i = 1; i <= 1500; i++) {
+    bigFleet.push({ id: i, iccid: 'ICC' + i, vendor: 'teltik', gateway_host: null, status: 'active', sim_numbers: [{ e164: '+1212555' + String(i).padStart(4, '0') }] });
+  }
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    if (u.pathname === '/rest/v1/sims') {
+      const offset = Number(u.searchParams.get('offset') || 0);
+      const limit = u.searchParams.has('limit') ? Number(u.searchParams.get('limit')) : bigFleet.length;
+      return jsonRes(bigFleet.slice(offset, offset + limit));
+    }
+    if (u.pathname === '/rest/v1/rpc/get_hosting_port_status_summary') {
+      const body = JSON.parse(init.body);
+      return jsonRes(body.sim_ids.map((id) => ({
+        sim_id: id, last_state: 'online', last_checked_at: null, last_source: 'cron',
+        last_mdn: null, last_mdn_source: null, last_http_status: 200, last_error: null,
+        checks_24h: 0, online_24h: 0, checks_7d: 0, online_7d: 0,
+      })));
+    }
+    throw new Error('unexpected fetch ' + u.pathname);
+  };
+  const cookie = await loginCookie();
+  const res = await teltikPortal.fetch(authedRequest('https://x/api/lines', {}, cookie), ENV);
+  const data = await res.json();
+  assert.equal(data.ok, true);
+  assert.equal(data.lines.length, 1500, 'all 1500 lines returned, not capped at one page');
+  assert.equal(data.truncated, false);
 });
 
 // --- per-line actions ------------------------------------------------------
