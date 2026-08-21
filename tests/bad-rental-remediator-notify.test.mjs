@@ -3,7 +3,7 @@
 // dedup via the fake KV, and that a Slack failure/exception never throws.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { notifyPortOffline } from '../src/bad-rental-remediator/notify.mjs';
+import { notifyPortOffline, notifyOfflineFleetSummary } from '../src/bad-rental-remediator/notify.mjs';
 
 const realFetch = globalThis.fetch;
 
@@ -108,4 +108,83 @@ test('missing REMEDIATOR_KV fails open — still posts (no dedup available)', as
   await notifyPortOffline(env, { kind: 'first_detection', sim: SIM });
   await notifyPortOffline(env, { kind: 'first_detection', sim: SIM });
   assert.equal(postCount, 2);
+});
+
+// --- notifyOfflineFleetSummary ------------------------------------------
+// Fleet-wide digest, independent of report processing: covers every
+// currently-offline Teltik line, not just ones with an open bad-rental
+// report attached.
+
+function fakeOfflineRpc(rows, { rpcOk = true } = {}) {
+  return async (url, init = {}) => {
+    const u = new URL(String(url));
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') {
+      if (!rpcOk) return { ok: false, status: 500, text: async () => 'boom' };
+      return { ok: true, status: 200, json: async () => rows };
+    }
+    throw new Error('unexpected fetch ' + u.pathname);
+  };
+}
+
+test('notifyOfflineFleetSummary: no webhook configured is a no-op', async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: true, status: 200 }; };
+  const res = await notifyOfflineFleetSummary({ REMEDIATOR_KV: fakeKv() });
+  assert.equal(res.ok, false);
+  assert.equal(res.skipped, 'no_webhook');
+  assert.equal(called, false);
+});
+
+test('notifyOfflineFleetSummary: nothing offline posts nothing and does not consume the dedup window', async () => {
+  const kv = fakeKv();
+  globalThis.fetch = fakeOfflineRpc([]);
+  const env = { SLACK_WEBHOOK_URL: 'https://hooks.slack.test/x', SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'k', REMEDIATOR_KV: kv };
+  const res = await notifyOfflineFleetSummary(env);
+  assert.equal(res.ok, true);
+  assert.equal(res.skipped, 'none_offline');
+  assert.equal(kv.store.size, 0, 'an empty check must not burn the digest dedup window');
+});
+
+test('notifyOfflineFleetSummary: posts one batch message listing offline lines, capped with a "+N more"', async () => {
+  const rows = Array.from({ length: 20 }, (_, i) => ({ sim_id: i + 1, iccid: 'ICC' + i, mdn: '212555' + String(i).padStart(4, '0') }));
+  let posted = null;
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, json: async () => rows };
+    posted = JSON.parse(init.body);
+    return { ok: true, status: 200 };
+  };
+  const env = { SLACK_WEBHOOK_URL: 'https://hooks.slack.test/x', SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'k', REMEDIATOR_KV: fakeKv() };
+  const res = await notifyOfflineFleetSummary(env);
+  assert.equal(res.ok, true);
+  assert.equal(res.offline_count, 20);
+  const text = JSON.stringify(posted);
+  assert.ok(text.includes('20 Teltik line'));
+  assert.ok(text.includes('ICC0'), 'first line listed');
+  assert.ok(text.includes('...and 5 more'), 'list capped at 15 with a remainder note');
+});
+
+test('notifyOfflineFleetSummary: a second call within the digest window is deduped, no second post', async () => {
+  const rows = [{ sim_id: 1, iccid: 'ICC1', mdn: '2125551111' }];
+  let postCount = 0;
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, json: async () => rows };
+    postCount++;
+    return { ok: true, status: 200 };
+  };
+  const env = { SLACK_WEBHOOK_URL: 'https://hooks.slack.test/x', SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'k', REMEDIATOR_KV: fakeKv() };
+  const first = await notifyOfflineFleetSummary(env);
+  const second = await notifyOfflineFleetSummary(env);
+  assert.equal(first.ok, true);
+  assert.equal(second.skipped, 'deduped');
+  assert.equal(second.offline_count, 1);
+  assert.equal(postCount, 1);
+});
+
+test('notifyOfflineFleetSummary: an RPC failure resolves ok:false instead of throwing', async () => {
+  globalThis.fetch = fakeOfflineRpc([], { rpcOk: false });
+  const env = { SLACK_WEBHOOK_URL: 'https://hooks.slack.test/x', SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'k', REMEDIATOR_KV: fakeKv() };
+  const res = await notifyOfflineFleetSummary(env);
+  assert.equal(res.ok, false);
 });
