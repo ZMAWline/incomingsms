@@ -347,68 +347,178 @@ async function handleLinesCheckBulk(request, env) {
 // Pages
 // ---------------------------------------------------------------------------
 const PAGE_STYLES = `
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --bg: #0b1220; --card-bg: #131c30; --border: #232f4a; --row-border: #182238; --row-hover: #16213a;
+    --text: #e6e9f0; --text-muted: #7c8db5; --text-dim: #5c6b8f;
+    --accent: #3ddc84; --accent-fg: #06210f;
+    --input-bg: #0e1626; --input-border: #202b46;
+    --error: #ff8686;
+    --badge-online-bg: rgba(61,220,132,.18); --badge-online-fg: #3ddc84;
+    --badge-offline-bg: rgba(255,90,90,.18); --badge-offline-fg: #ff8686;
+    --badge-neutral-bg: rgba(180,180,180,.15); --badge-neutral-fg: #aab4cc;
+    --btn-check-bg: #274a6e; --btn-check-fg: #cfe4ff;
+    --btn-reset-bg: #6e2734; --btn-reset-fg: #ffd2d8;
+    --flag: #ffb84d;
+    --overlay: rgba(4,8,18,.6);
+    --spinner-track: rgba(255,255,255,.25);
+  }
+  :root.light {
+    color-scheme: light;
+    --bg: #f4f6fb; --card-bg: #ffffff; --border: #dfe4f0; --row-border: #eef1f7; --row-hover: #f2f5fb;
+    --text: #182238; --text-muted: #5b6b8c; --text-dim: #8593ad;
+    --accent: #158a52; --accent-fg: #ffffff;
+    --input-bg: #ffffff; --input-border: #d7deec;
+    --error: #c0342c;
+    --badge-online-bg: #e3f9ee; --badge-online-fg: #14804f;
+    --badge-offline-bg: #fdeaea; --badge-offline-fg: #c0342c;
+    --badge-neutral-bg: #eef1f7; --badge-neutral-fg: #5b6472;
+    --btn-check-bg: #dbe9fb; --btn-check-fg: #1c4f86;
+    --btn-reset-bg: #fbdfe3; --btn-reset-fg: #8a1f2c;
+    --flag: #a05a05;
+    --overlay: rgba(30,38,58,.4);
+    --spinner-track: rgba(0,0,0,.15);
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; min-height: 100vh;
-    background: #0b1220; color: #e6e9f0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   }
-  .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
-  .card { width: 100%; max-width: 440px; background: #131c30; border: 1px solid #232f4a; border-radius: 16px; padding: 28px 24px; }
-  h1 { font-size: 15px; text-transform: uppercase; letter-spacing: .08em; color: #7c8db5; margin: 0 0 14px; font-weight: 600; }
+  .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; position: relative; }
+  .card { width: 100%; max-width: 440px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 28px 24px; }
+  h1 { font-size: 15px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-muted); margin: 0 0 14px; font-weight: 600; }
   input {
-    width: 100%; background: #0e1626; border: 1px solid #202b46; border-radius: 10px; padding: 12px 14px;
-    color: #e6e9f0; font-size: 15px; margin-bottom: 14px;
+    width: 100%; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 10px; padding: 12px 14px;
+    color: var(--text); font-size: 15px; margin-bottom: 14px;
   }
-  input:focus { outline: none; border-color: #3ddc84; }
+  input:focus { outline: none; border-color: var(--accent); }
   button { font: inherit; }
   button[type="submit"], .btn-primary {
-    background: #3ddc84; color: #06210f; border: none; border-radius: 10px;
+    background: var(--accent); color: var(--accent-fg); border: none; border-radius: 10px;
     padding: 10px 16px; font-size: 14px; font-weight: 700; cursor: pointer;
   }
   button[type="submit"] { width: 100%; padding: 12px 14px; }
   button:disabled { opacity: .5; cursor: default; }
-  .error { color: #ff8686; font-size: 14px; text-align: center; padding: 0 0 14px; }
+  .error { color: var(--error); font-size: 14px; text-align: center; padding: 0 0 14px; }
+
+  .theme-toggle {
+    background: none; border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px;
+    padding: 8px 10px; font-size: 14px; cursor: pointer; line-height: 1;
+  }
+  .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+  .login-wrap .theme-toggle { position: absolute; top: 20px; right: 20px; }
 
   .app-wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 60px; }
   .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; flex-wrap: wrap; gap: 10px; }
-  .topbar h1 { margin: 0; font-size: 18px; text-transform: none; letter-spacing: 0; color: #e6e9f0; }
-  .topbar .sub { color: #7c8db5; font-size: 13px; margin-top: 2px; }
+  .topbar h1 { margin: 0; font-size: 18px; text-transform: none; letter-spacing: 0; color: var(--text); }
+  .topbar .sub { color: var(--text-muted); font-size: 13px; margin-top: 2px; }
   .topbar-actions { display: flex; gap: 8px; align-items: center; }
-  .btn-ghost { background: none; border: 1px solid #232f4a; color: #b7c2de; border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer; }
-  .btn-ghost:hover { border-color: #3ddc84; color: #3ddc84; }
+  .btn-ghost { background: none; border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer; }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
 
   .filter-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
   .filter-bar input[type="text"] { flex: 1; min-width: 220px; margin-bottom: 0; padding: 8px 12px; font-size: 13px; }
-  .filter-bar select { background: #0e1626; border: 1px solid #202b46; border-radius: 8px; padding: 8px 10px; color: #e6e9f0; font-size: 13px; }
-  .filter-bar select:focus, .filter-bar input:focus { outline: none; border-color: #3ddc84; }
+  .filter-bar select { background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 8px; padding: 8px 10px; color: var(--text); font-size: 13px; }
+  .filter-bar select:focus, .filter-bar input:focus { outline: none; border-color: var(--accent); }
 
-  .bulk-bar { display: none; align-items: center; gap: 10px; background: #131c30; border: 1px solid #232f4a; border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; color: #b7c2de; }
+  .bulk-bar { display: none; align-items: center; gap: 10px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; color: var(--text-muted); }
   .bulk-bar.visible { display: flex; }
-  .btn-sm { border-radius: 8px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; }
-  .btn-check { background: #274a6e; color: #cfe4ff; }
-  .btn-reset { background: #6e2734; color: #ffd2d8; }
-  .btn-cancel { background: none; border: 1px solid #3a4a6e; color: #8fa0c7; }
+  .btn-sm { border-radius: 8px; padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; position: relative; }
+  .btn-check { background: var(--btn-check-bg); color: var(--btn-check-fg); }
+  .btn-reset { background: var(--btn-reset-bg); color: var(--btn-reset-fg); }
+  .btn-cancel { background: none; border: 1px solid var(--input-border); color: var(--text-muted); }
+  .btn-sm.is-loading { color: transparent !important; pointer-events: none; }
+  .btn-sm .spinner { display: none; }
+  .btn-sm.is-loading .spinner {
+    display: block; position: absolute; top: 50%; left: 50%; width: 14px; height: 14px;
+    margin: -7px 0 0 -7px; border-radius: 50%; border: 2px solid var(--spinner-track);
+    border-top-color: currentColor; color: inherit; animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   .table-scroll { overflow-x: auto; border-radius: 12px; }
-  table { width: 100%; border-collapse: collapse; background: #131c30; border: 1px solid #232f4a; border-radius: 12px; overflow: hidden; font-size: 13.5px; }
-  thead th { text-align: left; padding: 10px 12px; color: #7c8db5; font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid #202b46; white-space: nowrap; }
+  table { width: 100%; border-collapse: collapse; background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; font-size: 13.5px; }
+  thead th { text-align: left; padding: 10px 12px; color: var(--text-muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--input-border); white-space: nowrap; }
   thead th.sortable { cursor: pointer; user-select: none; }
-  thead th.sortable:hover { color: #cfd9f0; }
+  thead th.sortable:hover { color: var(--text); }
   .sort-arrow { display: inline-block; width: 10px; font-size: 10px; opacity: .8; }
-  .mdn-flag { color: #ffb84d; margin-left: 5px; cursor: help; font-size: 12px; }
-  tbody td { padding: 10px 12px; border-bottom: 1px solid #182238; vertical-align: middle; }
+  .mdn-flag { color: var(--flag); margin-left: 5px; cursor: help; font-size: 12px; }
+  tbody td { padding: 10px 12px; border-bottom: 1px solid var(--row-border); vertical-align: middle; }
   tbody tr:last-child td { border-bottom: none; }
-  tbody tr:hover { background: #16213a; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: #cfd9f0; }
-  .muted { color: #5c6b8f; }
+  tbody tr:hover { background: var(--row-hover); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: var(--text); opacity: .9; }
+  .muted { color: var(--text-dim); }
   .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
-  .badge-online { background: rgba(61,220,132,.18); color: #3ddc84; }
-  .badge-offline { background: rgba(255,90,90,.18); color: #ff8686; }
-  .badge-unknown, .badge-error { background: rgba(180,180,180,.15); color: #aab4cc; }
+  .badge-online { background: var(--badge-online-bg); color: var(--badge-online-fg); }
+  .badge-offline { background: var(--badge-offline-bg); color: var(--badge-offline-fg); }
+  .badge-unknown, .badge-error { background: var(--badge-neutral-bg); color: var(--badge-neutral-fg); }
   .row-actions button { margin-right: 6px; }
-  .empty, .loading { text-align: center; color: #7c8db5; padding: 40px 0; }
-  .status-line { font-size: 12px; color: #7c8db5; margin-top: 10px; min-height: 16px; }
+  .empty, .loading { text-align: center; color: var(--text-muted); padding: 40px 0; }
+  .status-line { font-size: 12px; color: var(--text-muted); margin-top: 10px; min-height: 16px; }
+
+  .toast-stack { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 300; max-width: 340px; }
+  .toast {
+    background: var(--card-bg); border: 1px solid var(--border); border-left: 3px solid var(--text-dim);
+    border-radius: 10px; padding: 10px 14px; font-size: 13px; color: var(--text); box-shadow: 0 6px 20px rgba(0,0,0,.25);
+    animation: toast-in .18s ease-out;
+  }
+  .toast.ok { border-left-color: var(--accent); }
+  .toast.bad { border-left-color: var(--error); }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+  .modal-backdrop {
+    display: none; position: fixed; inset: 0; background: var(--overlay); z-index: 200;
+    align-items: center; justify-content: center; padding: 20px;
+  }
+  .modal-backdrop.visible { display: flex; }
+  .modal-panel { width: 100%; max-width: 520px; max-height: 80vh; background: var(--card-bg); border: 1px solid var(--border); border-radius: 14px; display: flex; flex-direction: column; overflow: hidden; }
+  .modal-head { padding: 16px 20px; border-bottom: 1px solid var(--row-border); display: flex; align-items: center; justify-content: space-between; }
+  .modal-head h2 { margin: 0; font-size: 15px; font-weight: 700; }
+  .modal-body { padding: 8px 0; overflow-y: auto; }
+  .modal-row { display: flex; align-items: center; gap: 10px; padding: 8px 20px; font-size: 13px; }
+  .modal-row .mrow-id { flex: 1; min-width: 0; }
+  .modal-row .mrow-mdn { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .modal-row .mrow-iccid { color: var(--text-dim); font-size: 11.5px; }
+  .modal-row .mrow-state { font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .modal-row .mrow-state.pending { color: var(--text-dim); }
+  .modal-row .mrow-state.running { color: var(--text-muted); }
+  .modal-row .mrow-state.ok { color: var(--badge-online-fg); }
+  .modal-row .mrow-state.bad { color: var(--badge-offline-fg); }
+  .mrow-spinner {
+    width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--spinner-track);
+    border-top-color: var(--text-muted); display: inline-block; animation: spin .7s linear infinite; margin-right: 4px;
+  }
+  .modal-foot { padding: 12px 20px; border-top: 1px solid var(--row-border); display: flex; align-items: center; justify-content: space-between; font-size: 13px; color: var(--text-muted); }
+  .modal-foot .modal-actions { display: flex; gap: 8px; }
+`;
+
+// Runs before body paint so the saved/preferred theme applies with no flash
+// of the wrong theme. No user identity involved — just a class on <html>.
+const THEME_INIT_SCRIPT = `
+(function () {
+  try {
+    var saved = localStorage.getItem('teltik_portal_theme');
+    var light = saved ? saved === 'light' : matchMedia('(prefers-color-scheme: light)').matches;
+    if (light) document.documentElement.classList.add('light');
+  } catch (e) {}
+})();
+`;
+
+// Wires up a #theme-toggle-btn present on the page; shared by both the
+// login and app pages so the toggle behaves identically everywhere.
+const THEME_TOGGLE_SCRIPT = `
+  (function () {
+    var btn = document.getElementById('theme-toggle-btn');
+    if (!btn) return;
+    function sync() { btn.textContent = document.documentElement.classList.contains('light') ? '🌙' : '☀️'; }
+    sync();
+    btn.addEventListener('click', function () {
+      var light = !document.documentElement.classList.contains('light');
+      document.documentElement.classList.toggle('light', light);
+      try { localStorage.setItem('teltik_portal_theme', light ? 'light' : 'dark'); } catch (e) {}
+      sync();
+    });
+  })();
 `;
 
 function loginHtml() {
@@ -419,9 +529,11 @@ function loginHtml() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Teltik line status — sign in</title>
 <style>${PAGE_STYLES}</style>
+<script>${THEME_INIT_SCRIPT}</script>
 </head>
 <body>
 <div class="login-wrap">
+  <button class="theme-toggle" id="theme-toggle-btn" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme">🌙</button>
   <div class="card">
     <h1>Sign in</h1>
     <form id="login-form">
@@ -432,6 +544,7 @@ function loginHtml() {
     </form>
   </div>
 </div>
+<script>${THEME_TOGGLE_SCRIPT}</script>
 <script>
 (function () {
   var form = document.getElementById('login-form');
@@ -474,6 +587,7 @@ function appHtml() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Teltik hosted lines</title>
 <style>${PAGE_STYLES}</style>
+<script>${THEME_INIT_SCRIPT}</script>
 </head>
 <body>
 <div class="app-wrap">
@@ -483,6 +597,7 @@ function appHtml() {
       <div class="sub" id="summary-line">Loading…</div>
     </div>
     <div class="topbar-actions">
+      <button class="theme-toggle" id="theme-toggle-btn" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme">🌙</button>
       <button class="btn-ghost" id="export-btn" type="button">Export CSV</button>
       <button class="btn-ghost" id="refresh-btn" type="button">Refresh</button>
       <button class="btn-ghost" id="signout-btn" type="button">Sign out</button>
@@ -505,7 +620,6 @@ function appHtml() {
     <span id="bulk-count">0 selected</span>
     <button class="btn-sm btn-check" id="bulk-check-btn" type="button">Check selected</button>
     <button class="btn-sm btn-reset" id="bulk-reset-btn" type="button">Reset selected</button>
-    <button class="btn-cancel" id="bulk-cancel-btn" type="button" style="display:none">Cancel</button>
   </div>
 
   <div id="table-wrap">
@@ -513,6 +627,26 @@ function appHtml() {
   </div>
   <div class="status-line" id="status-line"></div>
 </div>
+
+<div class="toast-stack" id="toast-stack"></div>
+
+<div class="modal-backdrop" id="bulk-modal">
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h2 id="bulk-modal-title">Working…</h2>
+    </div>
+    <div class="modal-body" id="bulk-modal-body"></div>
+    <div class="modal-foot">
+      <span id="bulk-modal-summary"></span>
+      <div class="modal-actions">
+        <button class="btn-cancel" id="bulk-modal-cancel-btn" type="button" style="display:none">Cancel</button>
+        <button class="btn-primary" id="bulk-modal-close-btn" type="button" style="display:none">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>${THEME_TOGGLE_SCRIPT}</script>
 <script>
 (function () {
   var lines = [];
@@ -669,10 +803,10 @@ function appHtml() {
       });
     });
     wrap.querySelectorAll('[data-action="check"]').forEach(function (b) {
-      b.addEventListener('click', function () { checkOne(Number(b.getAttribute('data-id'))); });
+      b.addEventListener('click', function () { checkOne(Number(b.getAttribute('data-id')), b); });
     });
     wrap.querySelectorAll('[data-action="reset"]').forEach(function (b) {
-      b.addEventListener('click', function () { resetOne(Number(b.getAttribute('data-id'))); });
+      b.addEventListener('click', function () { resetOne(Number(b.getAttribute('data-id')), b); });
     });
     updateBulkBar();
   }
@@ -716,91 +850,224 @@ function appHtml() {
   document.getElementById('search-input').addEventListener('input', function (e) { searchText = e.target.value; render(); });
   document.getElementById('status-filter').addEventListener('change', function (e) { statusFilter = e.target.value; render(); });
 
+  // ------------------------------------------------------------------
+  // Toasts — result feedback that doesn't depend on noticing a table
+  // re-render or a small status-line change.
+  // ------------------------------------------------------------------
+  function showToast(kind, msg) {
+    var stack = document.getElementById('toast-stack');
+    var el = document.createElement('div');
+    el.className = 'toast ' + kind;
+    el.textContent = msg;
+    stack.appendChild(el);
+    setTimeout(function () {
+      el.style.transition = 'opacity .25s ease';
+      el.style.opacity = '0';
+      setTimeout(function () { el.remove(); }, 260);
+    }, 4200);
+  }
+
+  function setButtonLoading(btn, loading) {
+    if (!btn) return;
+    btn.disabled = loading;
+    btn.classList.toggle('is-loading', loading);
+    if (loading && !btn.querySelector('.spinner')) {
+      var sp = document.createElement('span');
+      sp.className = 'spinner';
+      btn.appendChild(sp);
+    }
+  }
+
+  function fetchLinesOnce() {
+    return fetch('/api/lines', { credentials: 'include' }).then(function (r) {
+      if (r.status === 401) { location.href = '/'; return null; }
+      return r.json();
+    });
+  }
+
+  function applyLinesData(data) {
+    if (!data) return;
+    if (!data.ok) throw new Error(data.error || 'load_failed');
+    lines = data.lines || [];
+    linesTruncated = !!data.truncated;
+    render();
+    updateSummary();
+  }
+
+  // Initial/manual load — shows "Loading…" and surfaces errors in the
+  // status line, since there's nothing on screen yet to fall back to.
   function loadLines() {
     setStatus('Loading…');
-    fetch('/api/lines', { credentials: 'include' })
-      .then(function (r) {
-        if (r.status === 401) { location.href = '/'; return null; }
-        return r.json();
-      })
-      .then(function (data) {
-        if (!data) return;
-        if (!data.ok) throw new Error(data.error || 'load_failed');
-        lines = data.lines || [];
-        linesTruncated = !!data.truncated;
-        render();
-        updateSummary();
-        setStatus('');
-      })
+    fetchLinesOnce()
+      .then(function (data) { applyLinesData(data); setStatus(''); })
       .catch(function (e) { setStatus('Failed to load: ' + e.message); });
   }
 
-  function checkOne(id) {
-    setStatus('Checking line ' + id + '…');
-    fetch('/api/lines/' + id + '/check', { method: 'POST', credentials: 'include' })
-      .then(function (r) { return r.json(); })
-      .then(function () { setStatus('Check complete.'); loadLines(); })
-      .catch(function (e) { setStatus('Check failed: ' + e.message); });
+  // Post-action refresh — the table already has data on screen, so this
+  // updates it in place (new status/uptime numbers) without a "Loading…"
+  // flash, and restores scroll position since re-rendering the table
+  // rebuilds its DOM.
+  function refreshLinesQuietly() {
+    var scrollY = window.scrollY;
+    return fetchLinesOnce()
+      .then(function (data) { applyLinesData(data); window.scrollTo(0, scrollY); })
+      .catch(function () { /* keep showing the last good data over a transient refresh error */ });
   }
 
-  function resetOne(id) {
-    setStatus('Resetting line ' + id + '…');
+  function checkOne(id, btn) {
+    setButtonLoading(btn, true);
+    fetch('/api/lines/' + id + '/check', { method: 'POST', credentials: 'include' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.ok) throw new Error(data.error || 'check_failed');
+        var state = data.result && data.result.state;
+        showToast(state === 'online' ? 'ok' : 'bad', 'Line ' + id + ' checked: ' + (state || 'unknown') + '.');
+        return refreshLinesQuietly();
+      })
+      .catch(function (e) { showToast('bad', 'Check failed: ' + e.message); })
+      .then(function () { setButtonLoading(btn, false); });
+  }
+
+  function resetOne(id, btn) {
+    setButtonLoading(btn, true);
     fetch('/api/lines/' + id + '/reset', { method: 'POST', credentials: 'include' })
       .then(function (r) { return r.json(); })
       .then(function (data) {
-        setStatus(data.ok ? 'Reset triggered.' : 'Reset failed: ' + (data.result && data.result.error || data.error || 'unknown'));
-        loadLines();
+        if (!data.ok) throw new Error((data.result && data.result.error) || data.error || 'reset_failed');
+        showToast('ok', 'Reset triggered for line ' + id + '.');
+        return refreshLinesQuietly();
       })
-      .catch(function (e) { setStatus('Reset failed: ' + e.message); });
+      .catch(function (e) { showToast('bad', 'Reset failed: ' + e.message); })
+      .then(function () { setButtonLoading(btn, false); });
   }
 
   function delay(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
 
+  // ------------------------------------------------------------------
+  // Bulk action modal — replaces the old status-line-only feedback with a
+  // dedicated window listing every selected line and its outcome, since a
+  // bulk run against dozens/hundreds of lines has no other way to show
+  // per-line results.
+  // ------------------------------------------------------------------
+  function openBulkModal(title, items) {
+    var backdrop = document.getElementById('bulk-modal');
+    var body = document.getElementById('bulk-modal-body');
+    var summary = document.getElementById('bulk-modal-summary');
+    var cancelBtn = document.getElementById('bulk-modal-cancel-btn');
+    var closeBtn = document.getElementById('bulk-modal-close-btn');
+
+    document.getElementById('bulk-modal-title').textContent = title;
+    summary.textContent = '';
+    cancelBtn.style.display = 'none';
+    cancelBtn.onclick = null;
+    closeBtn.style.display = 'none';
+    closeBtn.onclick = function () { backdrop.classList.remove('visible'); };
+
+    body.innerHTML = items.map(function (it) {
+      return '<div class="modal-row" data-row-id="' + it.sim_id + '">'
+        + '<div class="mrow-id"><div class="mrow-mdn">' + (it.mdn || it.iccid || ('#' + it.sim_id)) + '</div>'
+        + '<div class="mrow-iccid">' + (it.iccid || '') + '</div></div>'
+        + '<div class="mrow-state pending" data-row-state>Pending…</div>'
+        + '</div>';
+    }).join('');
+
+    backdrop.classList.add('visible');
+
+    function setRow(simId, state, label) {
+      var row = body.querySelector('[data-row-id="' + simId + '"] [data-row-state]');
+      if (!row) return;
+      row.className = 'mrow-state ' + state;
+      row.innerHTML = (state === 'running' ? '<span class="mrow-spinner"></span>' : '') + label;
+    }
+
+    return {
+      setRow: setRow,
+      finish: function (summaryText) {
+        summary.textContent = summaryText;
+        cancelBtn.style.display = 'none';
+        closeBtn.style.display = 'inline-block';
+      },
+      showCancel: function (onCancel) {
+        cancelBtn.style.display = 'inline-block';
+        cancelBtn.onclick = onCancel;
+      },
+      hideCancel: function () { cancelBtn.style.display = 'none'; },
+    };
+  }
+
+  function selectedItems() {
+    return lines.filter(function (l) { return selected.has(l.sim_id); })
+      .map(function (l) { return { sim_id: l.sim_id, mdn: l.mdn, iccid: l.iccid }; });
+  }
+
   document.getElementById('bulk-check-btn').addEventListener('click', function () {
-    var ids = Array.from(selected);
-    if (!ids.length) return;
-    setStatus('Checking ' + ids.length + ' line(s)…');
+    var items = selectedItems();
+    if (!items.length) return;
+    var modal = openBulkModal('Checking ' + items.length + ' line(s)…', items);
+    items.forEach(function (it) { modal.setRow(it.sim_id, 'running', 'Checking…'); });
+
     fetch('/api/lines/check-bulk', {
       method: 'POST', credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sim_ids: ids }),
+      body: JSON.stringify({ sim_ids: items.map(function (it) { return it.sim_id; }) }),
     })
       .then(function (r) { return r.json(); })
       .then(function (data) {
-        setStatus('Checked ' + (data.total || ids.length) + ' line(s): '
+        var results = (data && data.results) || [];
+        var byId = {};
+        results.forEach(function (r) { byId[r.sim_id] = r; });
+        items.forEach(function (it) {
+          var r = byId[it.sim_id];
+          if (!r) { modal.setRow(it.sim_id, 'bad', 'No result'); return; }
+          modal.setRow(it.sim_id, r.state === 'online' ? 'ok' : 'bad', r.state || 'unknown');
+        });
+        modal.finish('Checked ' + (data.total || items.length) + ' line(s): '
           + (data.online || 0) + ' online, ' + (data.offline || 0) + ' offline.');
-        loadLines();
+        showToast(data.ok === false ? 'bad' : 'ok', 'Bulk check complete: ' + (data.online || 0) + ' online, ' + (data.offline || 0) + ' offline.');
+        return refreshLinesQuietly();
       })
-      .catch(function (e) { setStatus('Bulk check failed: ' + e.message); });
+      .catch(function (e) {
+        items.forEach(function (it) { modal.setRow(it.sim_id, 'bad', 'Error'); });
+        modal.finish('Bulk check failed: ' + e.message);
+        showToast('bad', 'Bulk check failed: ' + e.message);
+      });
   });
 
   // Bulk reset is a paced sequential loop against the single-line endpoint —
   // Teltik's reset-port API is one-line-at-a-time with no bulk variant, and
   // this loop is externally triggerable (Teltik's own login), so it paces
-  // itself rather than firing every request at once.
+  // itself rather than firing every request at once. The modal shows true
+  // live per-line progress here since each request completes before the
+  // next one starts.
   document.getElementById('bulk-reset-btn').addEventListener('click', function () {
-    var ids = Array.from(selected);
-    if (!ids.length) return;
+    var items = selectedItems();
+    if (!items.length) return;
     bulkCancelled = false;
-    var cancelBtn = document.getElementById('bulk-cancel-btn');
-    cancelBtn.style.display = 'inline-block';
-    cancelBtn.onclick = function () { bulkCancelled = true; };
+    var modal = openBulkModal('Resetting ' + items.length + ' line(s)…', items);
+    modal.showCancel(function () { bulkCancelled = true; });
 
     (async function () {
-      var ok = 0, failed = 0;
-      for (var i = 0; i < ids.length; i++) {
-        if (bulkCancelled) { setStatus('Cancelled after ' + i + ' of ' + ids.length + '.'); break; }
-        setStatus('Resetting ' + (i + 1) + ' of ' + ids.length + '…');
+      var ok = 0, failed = 0, cancelledAt = -1;
+      for (var i = 0; i < items.length; i++) {
+        if (bulkCancelled) { cancelledAt = i; break; }
+        modal.setRow(items[i].sim_id, 'running', 'Resetting…');
         try {
-          var r = await fetch('/api/lines/' + ids[i] + '/reset', { method: 'POST', credentials: 'include' });
+          var r = await fetch('/api/lines/' + items[i].sim_id + '/reset', { method: 'POST', credentials: 'include' });
           var data = await r.json();
-          if (data.ok) ok++; else failed++;
-        } catch (e) { failed++; }
-        if (i < ids.length - 1) await delay(600);
+          if (data.ok) { ok++; modal.setRow(items[i].sim_id, 'ok', 'Reset triggered'); }
+          else { failed++; modal.setRow(items[i].sim_id, 'bad', (data.result && data.result.error) || 'Failed'); }
+        } catch (e) { failed++; modal.setRow(items[i].sim_id, 'bad', 'Error'); }
+        if (i < items.length - 1) await delay(600);
       }
-      cancelBtn.style.display = 'none';
-      setStatus('Bulk reset done: ' + ok + ' ok, ' + failed + ' failed.');
-      loadLines();
+      if (cancelledAt >= 0) {
+        for (var j = cancelledAt; j < items.length; j++) modal.setRow(items[j].sim_id, 'bad', 'Cancelled');
+      }
+      var summaryText = cancelledAt >= 0
+        ? 'Cancelled after ' + cancelledAt + ' of ' + items.length + ' — ' + ok + ' ok, ' + failed + ' failed.'
+        : 'Done: ' + ok + ' ok, ' + failed + ' failed.';
+      modal.finish(summaryText);
+      showToast(failed > 0 ? 'bad' : 'ok', 'Bulk reset — ' + summaryText);
+      await refreshLinesQuietly();
     })();
   });
 
