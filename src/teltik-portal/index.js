@@ -455,6 +455,8 @@ const PAGE_STYLES = `
   .row-actions button { margin-right: 6px; }
   .empty, .loading { text-align: center; color: var(--text-muted); padding: 40px 0; }
   .status-line { font-size: 12px; color: var(--text-muted); margin-top: 10px; min-height: 16px; }
+  .pager { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 14px 0 4px; font-size: 13px; }
+  .pager button:disabled { opacity: .35; cursor: default; }
 
   .toast-stack { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 300; max-width: 340px; }
   .toast {
@@ -657,6 +659,13 @@ function appHtml() {
   var statusFilter = '';
   var sortKey = null;
   var sortDir = 1; // 1 = asc, -1 = desc
+  // Real fleets run into the thousands of lines — rendering them all as DOM
+  // rows at once makes the page enormous (a 4000-row unpaginated table is a
+  // ~200,000px-tall document) and every post-action re-render rebuilds all
+  // of it. Paginate the rendered rows; filtering/sorting still runs over the
+  // full set (visibleLines()), only the DOM slice is capped.
+  var PAGE_SIZE = 100;
+  var currentPage = 0;
 
   var COLUMNS = [
     { key: 'mdn', label: 'Current MDN' },
@@ -752,6 +761,17 @@ function appHtml() {
       + '<span class="sort-arrow">' + arrow + '</span></th>';
   }
 
+  function pagerHtml(totalPages, totalCount, pageStart, pageCount) {
+    if (totalPages <= 1) return '';
+    var from = pageCount ? pageStart + 1 : 0;
+    var to = pageStart + pageCount;
+    return '<div class="pager">'
+      + '<button class="btn-ghost" id="page-prev-btn" type="button"' + (currentPage === 0 ? ' disabled' : '') + '>Prev</button>'
+      + '<span class="muted">' + from + '–' + to + ' of ' + totalCount + ' · page ' + (currentPage + 1) + ' of ' + totalPages + '</span>'
+      + '<button class="btn-ghost" id="page-next-btn" type="button"' + (currentPage >= totalPages - 1 ? ' disabled' : '') + '>Next</button>'
+      + '</div>';
+  }
+
   function render() {
     var wrap = document.getElementById('table-wrap');
     var visible = visibleLines();
@@ -760,7 +780,14 @@ function appHtml() {
       : '';
     if (!lines.length) { wrap.innerHTML = '<div class="empty">No Teltik-hosted lines found.</div>'; return; }
     if (!visible.length) { wrap.innerHTML = '<div class="empty">No lines match the current search/filter.</div>'; return; }
-    var rows = visible.map(function (l) {
+
+    var totalPages = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+    if (currentPage >= totalPages) currentPage = totalPages - 1;
+    if (currentPage < 0) currentPage = 0;
+    var pageStart = currentPage * PAGE_SIZE;
+    var pageLines = visible.slice(pageStart, pageStart + PAGE_SIZE);
+
+    var rows = pageLines.map(function (l) {
       var checked = selected.has(l.sim_id) ? ' checked' : '';
       var flag = mdnMismatch(l) ? '<span class="mdn-flag" title="Differs from Current MDN — Teltik knows this line by a different number">⚠</span>' : '';
       return '<tr data-id="' + l.sim_id + '">'
@@ -778,23 +805,32 @@ function appHtml() {
         + '</td>'
         + '</tr>';
     }).join('');
-    var headers = '<th><input type="checkbox" id="select-all"></th>'
+    var headers = '<th><input type="checkbox" id="select-all" title="Select all on this page"></th>'
       + headerCell(COLUMNS[0]) + headerCell(COLUMNS[1]) + headerCell(COLUMNS[2]) + headerCell(COLUMNS[3])
       + headerCell(COLUMNS[4]) + headerCell(COLUMNS[5]) + headerCell(COLUMNS[6]) + '<th>Actions</th>';
     wrap.innerHTML = '<div class="table-scroll"><table>'
-      + '<thead><tr>' + headers + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+      + '<thead><tr>' + headers + '</tr></thead><tbody>' + rows + '</tbody></table></div>'
+      + pagerHtml(totalPages, visible.length, pageStart, pageLines.length);
 
+    // Selects/deselects only the rows on THIS page — bulk-selecting the
+    // full filtered set (which can be thousands of lines) is one filter +
+    // page-by-page selection away, not a single accidental click.
     document.getElementById('select-all').addEventListener('change', function (e) {
-      visible.forEach(function (l) { if (e.target.checked) selected.add(l.sim_id); else selected.delete(l.sim_id); });
+      pageLines.forEach(function (l) { if (e.target.checked) selected.add(l.sim_id); else selected.delete(l.sim_id); });
       render();
     });
     wrap.querySelectorAll('th.sortable').forEach(function (th) {
       th.addEventListener('click', function () {
         var key = th.getAttribute('data-key');
         if (sortKey === key) sortDir = -sortDir; else { sortKey = key; sortDir = 1; }
+        currentPage = 0;
         render();
       });
     });
+    var prevBtn = document.getElementById('page-prev-btn');
+    var nextBtn = document.getElementById('page-next-btn');
+    if (prevBtn) prevBtn.addEventListener('click', function () { currentPage--; render(); window.scrollTo(0, 0); });
+    if (nextBtn) nextBtn.addEventListener('click', function () { currentPage++; render(); window.scrollTo(0, 0); });
     wrap.querySelectorAll('.row-cb').forEach(function (cb) {
       cb.addEventListener('change', function () {
         var id = Number(cb.getAttribute('data-id'));
@@ -824,10 +860,10 @@ function appHtml() {
     return /[",\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   }
 
-  // Exports exactly what's currently visible (search/filter/sort applied) —
-  // "what you're looking at" is what gets exported, not the full unfiltered
-  // fleet, so a filtered-to-offline export doesn't quietly include lines
-  // that were never on screen.
+  // Exports everything matching the current search/filter/sort — the same
+  // set the on-screen table paginates through, not just the current page,
+  // so a filtered-to-offline export gets every matching line in one file
+  // without having to page through and export piecemeal.
   function exportCsv() {
     var visible = visibleLines();
     var header = ['ICCID', 'Current MDN', 'Hosted MDN', 'Status', '24h checks', '24h online', '7d checks', '7d online', 'Last checked'];
@@ -847,8 +883,8 @@ function appHtml() {
   }
 
   document.getElementById('export-btn').addEventListener('click', exportCsv);
-  document.getElementById('search-input').addEventListener('input', function (e) { searchText = e.target.value; render(); });
-  document.getElementById('status-filter').addEventListener('change', function (e) { statusFilter = e.target.value; render(); });
+  document.getElementById('search-input').addEventListener('input', function (e) { searchText = e.target.value; currentPage = 0; render(); });
+  document.getElementById('status-filter').addEventListener('change', function (e) { statusFilter = e.target.value; currentPage = 0; render(); });
 
   // ------------------------------------------------------------------
   // Toasts — result feedback that doesn't depend on noticing a table
