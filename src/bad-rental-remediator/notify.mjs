@@ -207,10 +207,15 @@ async function fetchCurrentlyOfflineLines(env) {
   }
 }
 
-function buildFleetOfflineMessage(offline) {
+// Overridable via TELTIK_PORTAL_URL so the link can follow a future custom
+// domain without a code change; falls back to the current production URL.
+const TELTIK_PORTAL_URL_DEFAULT = 'https://teltik-portal.zalmen-531.workers.dev';
+
+function buildFleetOfflineMessage(env, offline) {
   const shown = offline.slice(0, FLEET_OFFLINE_LIST_CAP);
   const lines = shown.map((l) => '• `' + (l.iccid || 'unknown') + '`' + (l.mdn ? ' — ' + l.mdn : ''));
   if (offline.length > shown.length) lines.push('_...and ' + (offline.length - shown.length) + ' more_');
+  const portalUrl = (env && env.TELTIK_PORTAL_URL) || TELTIK_PORTAL_URL_DEFAULT;
   return {
     blocks: [
       {
@@ -220,7 +225,10 @@ function buildFleetOfflineMessage(offline) {
       { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
       {
         type: 'context',
-        elements: [{ type: 'mrkdwn', text: 'Full list: teltik-portal.zalmen-531.workers.dev (filter: offline) — generated ' + new Date().toISOString() }],
+        elements: [{
+          type: 'mrkdwn',
+          text: '<' + portalUrl + '/offline|View all offline lines> — generated ' + new Date().toISOString(),
+        }],
       },
     ],
   };
@@ -246,7 +254,7 @@ export async function notifyOfflineFleetSummary(env, { now } = {}) {
     const allowed = await dedupOnce(env, dedupKey, DIGEST_DEDUP_TTL_S);
     if (!allowed) return { ok: true, skipped: 'deduped', offline_count: offline.length };
 
-    const payload = buildFleetOfflineMessage(offline);
+    const payload = buildFleetOfflineMessage(env, offline);
     const result = await postToSlack(env, env.SLACK_WEBHOOK_URL, payload);
     return { ...result, offline_count: offline.length };
   } catch (err) {
