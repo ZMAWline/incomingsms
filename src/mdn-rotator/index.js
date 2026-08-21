@@ -3,6 +3,7 @@ import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { gatewaySupports } from '../shared/gateway-host.mjs';
 import { buildAtomicPortInStatusRequest } from '../shared/activation-bulk.mjs';
+import { resolveMsisdn, resolveZip, buildSwapImeiRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -445,7 +446,7 @@ export default {
         // Load SIM from DB
         const sims = await supabaseSelect(
           env,
-          `sims?select=id,iccid,msisdn,mobility_subscription_id,vendor,gateway_host,gateway_id,port,status,imei,activated_at,att_ban,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
+          `sims?select=id,iccid,msisdn,mobility_subscription_id,vendor,gateway_host,gateway_id,port,status,imei,activated_at,att_ban,activation_zip,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
         );
         if (!Array.isArray(sims) || sims.length === 0) {
           return new Response(JSON.stringify({ ok: false, error: `SIM not found: ${sim_id}` }), {
@@ -552,14 +553,6 @@ export default {
 
         // For change_imei — full IMEI swap flow
         if (action === "change_imei") {
-          // Teltik-hosted SIMs cannot take an IMEI write (no Skyline gateway/port).
-          if (!gatewaySupports(sim, 'setImei')) {
-            return new Response(JSON.stringify({
-              ok: false,
-              error: `SIM ${sim.iccid} is Teltik-hosted: IMEI writes are not supported (no Skyline gateway).`,
-              gateway_host: 'teltik',
-            }), { status: 409, headers: { "Content-Type": "application/json" } });
-          }
           const autoImei = body.auto_imei === true;
           const newImeiRaw = body.new_imei ? String(body.new_imei).trim() : null;
 
@@ -567,6 +560,13 @@ export default {
             return new Response(JSON.stringify({ ok: false, error: "new_imei must be 15 digits, or set auto_imei: true" }), {
               status: 400, headers: { "Content-Type": "application/json" }
             });
+          }
+
+          // Teltik-hosted SIMs have no Skyline gateway/port to write the modem IMEI
+          // to. Skip that hardware step and go straight to the carrier-side IMEI
+          // update instead of blocking the operator.
+          if (!gatewaySupports(sim, 'setImei')) {
+            return changeImeiTeltikHosted(env, sim, sim_id, iccid, autoImei, newImeiRaw);
           }
           if (!sim.gateway_id || !sim.port) {
             return new Response(JSON.stringify({ ok: false, error: "SIM must have gateway_id and port to change IMEI" }), {
@@ -3571,6 +3571,71 @@ async function retireImeiPoolEntry(env, poolEntryId, simId) {
       updated_at: new Date().toISOString(),
     }
   );
+}
+
+// ===========================
+// Change IMEI for a Teltik-hosted SIM: no Skyline gateway/port exists to write
+// the modem IMEI to, so this skips that step entirely and performs the
+// carrier-side IMEI update instead. Only ATOMIC (AT&T) exposes a carrier-side
+// IMEI update (swapImei); other vendors are not yet wired up here.
+// ===========================
+async function changeImeiTeltikHosted(env, sim, sim_id, iccid, autoImei, newImeiRaw) {
+  const fail = (error, status) => new Response(JSON.stringify({
+    ok: false, error, gateway_host: 'teltik', gateway_skipped: true,
+  }), { status, headers: { "Content-Type": "application/json" } });
+
+  if (autoImei) {
+    return fail(`SIM ${iccid} is Teltik-hosted: auto IMEI allocation draws from the Skyline pool, which does not apply here. Provide new_imei explicitly.`, 400);
+  }
+  if (sim.vendor !== 'atomic') {
+    return fail(`SIM ${iccid} is Teltik-hosted and vendor '${sim.vendor}' has no carrier-side IMEI update wired up; only ATOMIC (AT&T) swapImei is supported.`, 400);
+  }
+  if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+    return fail("ATOMIC credentials not configured", 500);
+  }
+
+  const msisdn = resolveMsisdn(sim);
+  if (!msisdn) return fail(`No MSISDN on file for SIM ${iccid}`, 400);
+  const zipCode = resolveZip(null, sim);
+  if (!zipCode) return fail(`No PPU zip on file for SIM ${iccid}; required for ATOMIC swapImei`, 400);
+
+  const runId = `change_imei_teltik_${iccid}_${Date.now()}`;
+  const atomicUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+  const requestBody = buildSwapImeiRequest({
+    session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+    msisdn, zipCode, imei: newImeiRaw,
+  });
+
+  const res = await relayFetch(env, atomicUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  const success = res.ok && isSwapSuccess(data);
+  const errMsg = success ? null : swapErrorMessage(data, res.status);
+
+  await logCarrierApiCall(env, {
+    run_id: runId, step: 'change_imei_teltik_hosted', iccid, imei: newImeiRaw, vendor: 'atomic',
+    request_url: atomicUrl, request_method: 'POST', request_body: requestBody,
+    response_status: res.status, response_ok: res.ok,
+    response_body_text: text, response_body_json: data, error: errMsg,
+  });
+
+  if (!success) {
+    return fail(`Skyline hardware update skipped (SIM ${iccid} is Teltik-hosted). ATOMIC carrier-side IMEI update failed: ${errMsg}`, res.status >= 400 ? res.status : 502);
+  }
+
+  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { imei: newImeiRaw });
+
+  return new Response(JSON.stringify({
+    ok: true, action: 'change_imei', sim_id, iccid, imei: newImeiRaw,
+    gateway_host: 'teltik', gateway_skipped: true,
+    message: `Skyline hardware update skipped (SIM ${iccid} is Teltik-hosted). ATOMIC carrier-side IMEI update to ${newImeiRaw} succeeded.`,
+    detail: data,
+  }, null, 2), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
 // ===========================
