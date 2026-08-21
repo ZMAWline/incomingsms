@@ -651,7 +651,7 @@ function loginHtml() {
       }),
     })
       .then(function (r) { return r.json().then(function (data) { if (!r.ok) throw new Error(data.error || 'sign_in_failed'); }); })
-      .then(function () { location.href = '/'; })
+      .then(function () { location.href = location.pathname; }) // preserves a deep link like /offline
       .catch(function () {
         err.textContent = 'Incorrect username or password.';
         err.style.display = 'block';
@@ -1391,6 +1391,14 @@ function appHtml() {
     if (lastDailyData.length) renderChart(lastDailyData);
   });
 
+  // '/offline' is a deep link (used by the fleet-offline Slack digest) —
+  // pre-apply the status filter and reflect it in the dropdown before the
+  // first render, rather than requiring a manual filter click after load.
+  if (location.pathname === '/offline') {
+    statusFilter = 'offline';
+    document.getElementById('status-filter').value = 'offline';
+  }
+
   loadLines();
 })();
 </script>
@@ -1404,11 +1412,28 @@ function appHtml() {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    // The login cookie is set with the Secure attribute (required, since it's
+    // the only auth token this worker has) — browsers silently discard a
+    // Secure cookie received over plain HTTP, so a session that logs in over
+    // http:// looks successful (200 from /login) but never actually
+    // authenticates. workers.dev is HSTS-preloaded in browsers so this never
+    // came up there; a fresh custom domain isn't preloaded and this worker
+    // sent no Strict-Transport-Security header and no http->https redirect,
+    // so a request that reaches this worker over http (mistyped scheme, old
+    // link, etc.) fell through to the app instead of being upgraded first.
+    if (url.protocol === 'http:') {
+      url.protocol = 'https:';
+      return Response.redirect(url.toString(), 301);
+    }
     const method = request.method;
     const parts = url.pathname.split('/').filter(Boolean);
 
     try {
-      if (parts.length === 0 && method === 'GET') {
+      // '/offline' is a deep link, not a distinct page — same app shell as
+      // '/', but appHtml()'s own script checks the path and pre-applies the
+      // offline status filter. Used by the fleet-offline Slack digest so the
+      // link opens straight to the filtered view instead of the full list.
+      if (parts.length === 0 && method === 'GET' || (parts.length === 1 && parts[0] === 'offline' && method === 'GET')) {
         const authed = await isAuthenticated(request, env);
         return new Response(authed ? appHtml() : loginHtml(), {
           status: 200,

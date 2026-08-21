@@ -112,6 +112,17 @@ test.afterEach(() => { globalThis.fetch = realFetch; });
 
 // --- auth gating -------------------------------------------------------
 
+// The login cookie is Secure-only; a plain-http request that reached the
+// worker (no HSTS preload on a fresh custom domain, unlike workers.dev)
+// would get a 200 with a Secure Set-Cookie the browser silently drops. Every
+// http:// request must be upgraded before it can reach any route.
+test('http:// requests are redirected to https:// before routing', async () => {
+  fakeBackend();
+  const res = await teltikPortal.fetch(new Request('http://x/api/lines'), ENV);
+  assert.equal(res.status, 301);
+  assert.equal(res.headers.get('Location'), 'https://x/api/lines');
+});
+
 test('API routes 401 without a session cookie', async () => {
   fakeBackend();
   const res = await teltikPortal.fetch(new Request('https://x/api/lines'), ENV);
@@ -128,6 +139,18 @@ test('GET / shows the login page when unauthenticated, the app page when authent
   const authed = await teltikPortal.fetch(authedRequest('https://x/', {}, cookie), ENV);
   const authedHtml = await authed.text();
   assert.ok(authedHtml.includes('Teltik hosted lines'));
+});
+
+test('GET /offline serves the same app shell as /, and pre-applies the offline filter client-side', async () => {
+  fakeBackend();
+  const anon = await teltikPortal.fetch(new Request('https://x/offline'), ENV);
+  assert.ok((await anon.text()).includes('Sign in'), 'unauthenticated /offline still gates behind login');
+
+  const cookie = await loginCookie();
+  const authed = await teltikPortal.fetch(authedRequest('https://x/offline', {}, cookie), ENV);
+  const html = await authed.text();
+  assert.ok(html.includes('Teltik hosted lines'));
+  assert.match(html, /location\.pathname === '\/offline'/, 'client script checks the path to pre-apply the offline filter');
 });
 
 test('wrong password never reaches Supabase and fails login', async () => {

@@ -181,6 +181,24 @@ test('notifyOfflineFleetSummary: posts one batch message listing offline lines, 
   assert.ok(text.includes('20 Teltik line'));
   assert.ok(text.includes('ICC0'), 'first line listed');
   assert.ok(text.includes('...and 5 more'), 'list capped at 15 with a remainder note');
+  assert.ok(text.includes('<https://teltik-portal.zalmen-531.workers.dev/offline|View all offline lines>'), 'links straight to the pre-filtered offline view');
+});
+
+test('notifyOfflineFleetSummary: TELTIK_PORTAL_URL overrides the default link target', async () => {
+  const rows = [{ sim_id: 1, iccid: 'ICC1', mdn: '2125551111' }];
+  let posted = null;
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, json: async () => rows };
+    posted = JSON.parse(init.body);
+    return { ok: true, status: 200 };
+  };
+  const env = {
+    SLACK_WEBHOOK_URL: 'https://hooks.slack.test/x', SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'k',
+    REMEDIATOR_KV: fakeKv(), TELTIK_PORTAL_URL: 'https://status.example.com',
+  };
+  await notifyOfflineFleetSummary(env, { now: MORNING_WINDOW });
+  assert.ok(JSON.stringify(posted).includes('<https://status.example.com/offline|View all offline lines>'));
 });
 
 test('notifyOfflineFleetSummary: a second call in the same window is deduped, no second post', async () => {
