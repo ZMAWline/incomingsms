@@ -11250,7 +11250,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 let manualImei = null;
                 if (!isAuto) {
                     manualImei = imeiInput.value.trim();
-                    if (!/^d{15}$/.test(manualImei)) { showToast('Enter a valid 15-digit IMEI', 'error'); return; }
+                    if (!/^\d{15}$/.test(manualImei)) { showToast('Enter a valid 15-digit IMEI', 'error'); return; }
                 }
                 if (!(await showConfirm('Change IMEI', (isAuto ? 'Auto-assign new IMEI from pool' : 'Change IMEI to ' + manualImei) + ' for ' + simIds.length + ' SIM(s)?'))) return;
                 modal.remove();
@@ -11828,7 +11828,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
         async function checkManualImeiEligibility() {
             const imei = document.getElementById('change-imei-input').value.trim();
-            if (!/^d{15}$/.test(imei)) {
+            if (!/^\d{15}$/.test(imei)) {
                 document.getElementById('change-imei-eligibility-result').innerHTML = '<span class="text-yellow-400">Enter a valid 15-digit IMEI first</span>';
                 return;
             }
@@ -11852,7 +11852,7 @@ async function sendSimOnline(simId, phoneNumber) {
             let newImei = null;
             if (!autoImei) {
                 newImei = document.getElementById('change-imei-input').value.trim();
-                if (!/^d{15}$/.test(newImei)) { showToast('Enter a valid 15-digit IMEI or use Auto', 'error'); return; }
+                if (!/^\d{15}$/.test(newImei)) { showToast('Enter a valid 15-digit IMEI or use Auto', 'error'); return; }
                 if (!(await showConfirm('Change IMEI', 'Change IMEI for SIM ' + ctx.simId + ' to ' + newImei + '?'))) return;
             } else {
                 if (!(await showConfirm('Change IMEI', 'Auto-pick an available IMEI from pool and apply to SIM ' + ctx.simId + '?'))) return;
