@@ -505,7 +505,10 @@ test('scheduled handler awaits the drain and sweep — no ctx.waitUntil fire-and
   const scheduled = DASHBOARD_SRC.slice(start, DASHBOARD_SRC.indexOf('\n  },', start));
   assert.ok(!scheduled.includes('waitUntil'), 'no ctx.waitUntil in scheduled handler');
   assert.match(scheduled, /await processHostingPortJobs\(env, \{ maxJobs: 1 \}\)/);
-  assert.match(scheduled, /await runHostingPortSweep\(env, \{ source: 'cron' \}\)/);
+  // Rotating wrapper, not runHostingPortSweep directly — see
+  // src/shared/hosting-port-status.mjs#runRotatingCronSweep and its
+  // regression tests in tests/hosting-port-status.test.mjs.
+  assert.match(scheduled, /await runRotatingCronSweep\(env, \{ source: 'cron' \}\)/);
 });
 
 test('Workers page polls job status but the job itself runs server-side', () => {

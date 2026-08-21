@@ -69,6 +69,20 @@ async function sbRpc(env, fn, args) {
   return res.json().catch(() => null);
 }
 
+// Count-only query (Prefer: count=exact, limit=1 so no rows are actually
+// transferred) — same Content-Range-parsing pattern runHostingPortSweep
+// already uses for total_available (src/shared/hosting-port-status.mjs).
+async function sbCount(env, path) {
+  const sep = path.includes('?') ? '&' : '?';
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}${sep}select=id&limit=1`, {
+    headers: sbHeaders(env, { Prefer: 'count=exact' }),
+  });
+  if (!res.ok) return null;
+  const range = res.headers.get('content-range');
+  const m = range && range.match(/\/(\d+)\s*$/);
+  return m ? Number(m[1]) : null;
+}
+
 function chunk(arr, n) {
   const out = [];
   for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
@@ -343,6 +357,54 @@ async function handleLinesCheckBulk(request, env) {
   return json(summary, summary.ok === false ? 502 : 200);
 }
 
+const ANALYTICS_DAYS_BACK = 30;
+const ANALYTICS_RESET_WINDOW_DAYS = 30;
+// Bookkeeping-only outcomes (the cooldown gate rejected before any vendor
+// call happened) — not real reset attempts. Mirrors BOOKKEEPING_OUTCOMES in
+// src/bad-rental-remediator/cooldown.mjs; duplicated here (not imported)
+// since that module isn't part of this worker's dependency graph and this
+// is a fixed, rarely-changing list.
+const RESET_BOOKKEEPING_OUTCOMES = ['skipped_cooldown', 'skipped_sms_unavailable'];
+
+// Reset attempts (auto via bad-rental-remediator + manual via the portal's
+// own reset button, whichever a given rental_report row happened to be
+// resolved through) over the trailing window. Deliberately a single count,
+// not a success/fail split: rental_report_remediation_attempts' outcome
+// vocabulary (classify_only / no_change / failed / ...) isn't clean enough
+// to safely derive "success rate" without deeper study of the remediator's
+// executor, and publishing a wrong number to a client is worse than not
+// having one. carrier_api_logs was considered and rejected as the source —
+// it only ever gets a manual reset's own direct Teltik call logged (6 rows
+// total, ever); the vast majority of resets are automatic and never touch
+// that table.
+async function fetchResetAttempts30d(env) {
+  const since = new Date(Date.now() - ANALYTICS_RESET_WINDOW_DAYS * 86400000).toISOString();
+  const outcomeExclusion = RESET_BOOKKEEPING_OUTCOMES.map((o) => '"' + o + '"').join(',');
+  const path = 'rental_report_remediation_attempts'
+    + '?action=in.(teltik_reset_port,teltik_reset_network)'
+    + '&outcome=not.in.(' + outcomeExclusion + ')'
+    + '&attempted_at=gte.' + encodeURIComponent(since);
+  const count = await sbCount(env, path);
+  return count == null ? null : count;
+}
+
+async function handleAnalytics(request, env) {
+  if (!(await isAuthenticated(request, env))) return json({ ok: false, error: 'unauthorized' }, 401);
+  try {
+    const [daily, resetAttempts] = await Promise.all([
+      sbRpc(env, 'get_teltik_daily_uptime', { days_back: ANALYTICS_DAYS_BACK }),
+      fetchResetAttempts30d(env),
+    ]);
+    return json({
+      ok: true,
+      daily: Array.isArray(daily) ? daily : [],
+      reset_attempts_30d: resetAttempts,
+    });
+  } catch (e) {
+    return json({ ok: false, error: String(e && e.message || e) }, 502);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Pages
 // ---------------------------------------------------------------------------
@@ -415,6 +477,25 @@ const PAGE_STYLES = `
   .topbar-actions { display: flex; gap: 8px; align-items: center; }
   .btn-ghost { background: none; border: 1px solid var(--border); color: var(--text-muted); border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer; }
   .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+  .tab-bar { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
+  .tab-btn { background: none; border: none; border-bottom: 2px solid transparent; color: var(--text-muted); padding: 8px 4px; margin-right: 18px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .kpi-tile { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .kpi-tile .kpi-label { font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin-bottom: 6px; }
+  .kpi-tile .kpi-value { font-size: 24px; font-weight: 700; color: var(--text); }
+  .kpi-tile .kpi-trend { font-size: 12.5px; margin-top: 4px; }
+  .kpi-trend.up { color: var(--badge-online-fg); }
+  .kpi-trend.down { color: var(--badge-offline-fg); }
+  .kpi-trend.flat { color: var(--text-dim); }
+
+  .chart-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; margin-bottom: 20px; }
+  .chart-card-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 6px; }
+  .chart-card-head h2 { margin: 0; font-size: 14px; font-weight: 700; color: var(--text); }
+  .chart-summary { font-size: 12.5px; color: var(--text-muted); margin-top: 10px; }
 
   .filter-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
   .filter-bar input[type="text"] { flex: 1; min-width: 220px; margin-bottom: 0; padding: 8px 12px; font-size: 13px; }
@@ -590,6 +671,7 @@ function appHtml() {
 <title>Teltik hosted lines</title>
 <style>${PAGE_STYLES}</style>
 <script>${THEME_INIT_SCRIPT}</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js" defer></script>
 </head>
 <body>
 <div class="app-wrap">
@@ -606,28 +688,51 @@ function appHtml() {
     </div>
   </div>
 
-  <div class="filter-bar">
-    <input type="text" id="search-input" placeholder="Search ICCID, Current MDN or Hosted MDN…">
-    <select id="status-filter">
-      <option value="">All statuses</option>
-      <option value="online">Online</option>
-      <option value="offline">Offline</option>
-      <option value="unknown">Unknown</option>
-      <option value="error">Error</option>
-    </select>
-    <span class="muted" id="filter-count"></span>
+  <div class="tab-bar">
+    <button class="tab-btn active" id="tab-btn-lines" type="button">Lines</button>
+    <button class="tab-btn" id="tab-btn-analytics" type="button">Analytics</button>
   </div>
 
-  <div class="bulk-bar" id="bulk-bar">
-    <span id="bulk-count">0 selected</span>
-    <button class="btn-sm btn-check" id="bulk-check-btn" type="button">Check selected</button>
-    <button class="btn-sm btn-reset" id="bulk-reset-btn" type="button">Reset selected</button>
+  <div id="tab-lines">
+    <div class="filter-bar">
+      <input type="text" id="search-input" placeholder="Search ICCID, Current MDN or Hosted MDN…">
+      <select id="status-filter">
+        <option value="">All statuses</option>
+        <option value="online">Online</option>
+        <option value="offline">Offline</option>
+        <option value="unknown">Unknown</option>
+        <option value="error">Error</option>
+      </select>
+      <span class="muted" id="filter-count"></span>
+    </div>
+
+    <div class="bulk-bar" id="bulk-bar">
+      <span id="bulk-count">0 selected</span>
+      <button class="btn-sm btn-check" id="bulk-check-btn" type="button">Check selected</button>
+      <button class="btn-sm btn-reset" id="bulk-reset-btn" type="button">Reset selected</button>
+    </div>
+
+    <div id="table-wrap">
+      <div class="loading">Loading lines…</div>
+    </div>
+    <div class="status-line" id="status-line"></div>
   </div>
 
-  <div id="table-wrap">
-    <div class="loading">Loading lines…</div>
+  <div id="tab-analytics" style="display:none">
+    <div class="kpi-row" id="kpi-row"><div class="loading">Loading analytics…</div></div>
+    <div class="chart-card">
+      <div class="chart-card-head">
+        <h2>Daily uptime — last 30 days</h2>
+        <span class="muted" id="chart-asof"></span>
+      </div>
+      <canvas id="uptime-chart" height="90"></canvas>
+      <div class="chart-summary" id="chart-summary"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-card-head"><h2>Worst-performing lines (7d)</h2></div>
+      <div id="worst-table-wrap"></div>
+    </div>
   </div>
-  <div class="status-line" id="status-line"></div>
 </div>
 
 <div class="toast-stack" id="toast-stack"></div>
@@ -712,7 +817,30 @@ function appHtml() {
   document.getElementById('signout-btn').addEventListener('click', function () {
     fetch('/logout', { method: 'POST', credentials: 'include' }).finally(function () { location.href = '/'; });
   });
-  document.getElementById('refresh-btn').addEventListener('click', function () { loadLines(); });
+
+  // ------------------------------------------------------------------
+  // Tabs — Analytics data is fetched lazily on first open, not on initial
+  // page load, so signing in stays fast regardless of how expensive the
+  // analytics queries get later.
+  // ------------------------------------------------------------------
+  var activeTab = 'lines';
+  var analyticsLoaded = false;
+
+  document.getElementById('tab-btn-lines').addEventListener('click', function () { switchTab('lines'); });
+  document.getElementById('tab-btn-analytics').addEventListener('click', function () { switchTab('analytics'); });
+
+  function switchTab(tab) {
+    activeTab = tab;
+    document.getElementById('tab-lines').style.display = tab === 'lines' ? '' : 'none';
+    document.getElementById('tab-analytics').style.display = tab === 'analytics' ? '' : 'none';
+    document.getElementById('tab-btn-lines').classList.toggle('active', tab === 'lines');
+    document.getElementById('tab-btn-analytics').classList.toggle('active', tab === 'analytics');
+    if (tab === 'analytics' && !analyticsLoaded) loadAnalytics();
+  }
+
+  document.getElementById('refresh-btn').addEventListener('click', function () {
+    if (activeTab === 'analytics') loadAnalytics(); else loadLines();
+  });
 
   function setStatus(msg) { document.getElementById('status-line').textContent = msg || ''; }
 
@@ -1107,6 +1235,160 @@ function appHtml() {
     })();
   });
 
+  // ------------------------------------------------------------------
+  // Analytics tab
+  // ------------------------------------------------------------------
+  var uptimeChart = null;
+  var lastDailyData = [];
+
+  function themeColor(varName) {
+    return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  }
+
+  function kpiTile(label, value, trend) {
+    return '<div class="kpi-tile"><div class="kpi-label">' + esc(label) + '</div>'
+      + '<div class="kpi-value">' + value + '</div>'
+      + (trend ? '<div class="kpi-trend ' + trend.cls + '">' + trend.text + '</div>' : '')
+      + '</div>';
+  }
+
+  function trendInfo(curPct, prevPct) {
+    if (prevPct == null || curPct == null) return null;
+    var delta = curPct - prevPct;
+    if (Math.abs(delta) < 0.5) return { cls: 'flat', text: '≈ flat vs prior 7d' };
+    var rounded = Math.round(Math.abs(delta) * 10) / 10;
+    return { cls: delta > 0 ? 'up' : 'down', text: (delta > 0 ? '▲ ' : '▼ ') + rounded + 'pt vs prior 7d' };
+  }
+
+  function sumWindow(daily, startIdx, len) {
+    var checks = 0, online = 0;
+    for (var i = Math.max(startIdx, 0); i < startIdx + len && i < daily.length; i++) {
+      checks += daily[i].checks || 0;
+      online += daily[i].online_checks || 0;
+    }
+    return { checks: checks, online: online };
+  }
+
+  function renderKpis(daily, resetAttempts) {
+    var n = daily.length;
+    var last7 = sumWindow(daily, n - 7, 7);
+    var prev7 = sumWindow(daily, n - 14, 7);
+    var curPct = last7.checks > 0 ? 100 * last7.online / last7.checks : null;
+    var prevPct = prev7.checks > 0 ? 100 * prev7.online / prev7.checks : null;
+    var offlineCount = lines.filter(function (l) { return l.state === 'offline'; }).length;
+    var mismatchCount = lines.filter(mdnMismatch).length;
+
+    var html = '';
+    html += kpiTile('Checks online (7d)', curPct == null ? '—' : (Math.round(curPct * 10) / 10) + '%', trendInfo(curPct, prevPct));
+    html += kpiTile('Currently offline', String(offlineCount));
+    html += kpiTile('MDN mismatches', String(mismatchCount));
+    html += kpiTile('Reset attempts (30d)', resetAttempts == null ? '—' : String(resetAttempts));
+    document.getElementById('kpi-row').innerHTML = html;
+  }
+
+  // "% of checks online" is not the same as "% of the fleet online" — not
+  // every line is checked every day (coverage varies), so this is a trend
+  // indicator over whatever got checked, not a literal fleet-uptime number.
+  // Said explicitly in the caption rather than left implicit, since this is
+  // a client-facing page.
+  function renderChart(daily) {
+    lastDailyData = daily;
+    var canvas = document.getElementById('uptime-chart');
+    if (typeof Chart === 'undefined' || !canvas) return;
+    var labels = daily.map(function (d) { return d.day.slice(5); });
+    var pcts = daily.map(function (d) { return d.checks > 0 ? Math.round(1000 * d.online_checks / d.checks) / 10 : null; });
+    var gridColor = themeColor('--row-border');
+    var textColor = themeColor('--text-muted');
+    var accent = themeColor('--accent');
+
+    if (uptimeChart) uptimeChart.destroy();
+    uptimeChart = new Chart(canvas.getContext('2d'), {
+      type: 'line',
+      data: { labels: labels, datasets: [{
+        label: '% checks online', data: pcts, borderColor: accent, backgroundColor: accent,
+        spanGaps: true, tension: 0.25, pointRadius: 2,
+      }] },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { min: 0, max: 100, ticks: { color: textColor, callback: function (v) { return v + '%'; } }, grid: { color: gridColor } },
+          x: { ticks: { color: textColor }, grid: { color: gridColor } },
+        },
+      },
+    });
+
+    var last = daily[daily.length - 1];
+    var lastPct = last && last.checks > 0 ? Math.round(1000 * last.online_checks / last.checks) / 10 : null;
+    document.getElementById('chart-summary').textContent = lastPct == null
+      ? 'No checks recorded for the most recent day yet.'
+      : ('Most recent day (' + last.day + '): ' + lastPct + '% of ' + last.checks + ' checks were online. '
+        + 'Tracks the share of port-status checks that came back online each day — coverage varies day to day '
+        + '(not every line is checked every day), so read this as a trend alongside the live table, not literal fleet-wide uptime.');
+    document.getElementById('chart-asof').textContent = 'as of ' + new Date().toLocaleString();
+  }
+
+  function renderWorstPerformers() {
+    var candidates = lines.filter(function (l) { return l.checks_7d >= 3; })
+      .map(function (l) { return { l: l, frac: l.online_7d / l.checks_7d }; })
+      .sort(function (a, b) { return a.frac - b.frac; })
+      .slice(0, 10);
+    var wrap = document.getElementById('worst-table-wrap');
+    if (!candidates.length) { wrap.innerHTML = '<div class="empty">Not enough check history yet.</div>'; return; }
+    var rows = candidates.map(function (c) {
+      var l = c.l;
+      return '<tr>'
+        + '<td class="mono">' + esc(l.mdn || l.iccid || '—') + '</td>'
+        + '<td class="mono">' + esc(l.iccid || '—') + '</td>'
+        + '<td>' + badge(l.state) + '</td>'
+        + '<td>' + pct(l.online_7d, l.checks_7d) + ' <span class="muted">(' + l.checks_7d + ')</span></td>'
+        + '<td class="row-actions">'
+          + '<button class="btn-sm btn-check" data-action="check" data-id="' + l.sim_id + '">Check</button>'
+          + '<button class="btn-sm btn-reset" data-action="reset" data-id="' + l.sim_id + '">Reset</button>'
+        + '</td>'
+        + '</tr>';
+    }).join('');
+    wrap.innerHTML = '<div class="table-scroll"><table><thead><tr>'
+      + '<th>Current MDN</th><th>ICCID</th><th>Status</th><th>7d up</th><th>Actions</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+    wrap.querySelectorAll('[data-action="check"]').forEach(function (b) {
+      b.addEventListener('click', function () { checkOne(Number(b.getAttribute('data-id')), b); });
+    });
+    wrap.querySelectorAll('[data-action="reset"]').forEach(function (b) {
+      b.addEventListener('click', function () { resetOne(Number(b.getAttribute('data-id')), b); });
+    });
+  }
+
+  function loadAnalytics() {
+    document.getElementById('kpi-row').innerHTML = '<div class="loading">Loading analytics…</div>';
+    fetch('/api/analytics', { credentials: 'include' })
+      .then(function (r) {
+        if (r.status === 401) { location.href = '/'; return null; }
+        return r.json();
+      })
+      .then(function (data) {
+        if (!data) return;
+        if (!data.ok) throw new Error(data.error || 'analytics_load_failed');
+        analyticsLoaded = true;
+        var daily = data.daily || [];
+        renderKpis(daily, data.reset_attempts_30d);
+        if (daily.length) renderChart(daily);
+        else document.getElementById('chart-summary').textContent = 'No check history yet.';
+        renderWorstPerformers();
+      })
+      .catch(function (e) {
+        document.getElementById('kpi-row').innerHTML = '<div class="empty">Failed to load analytics: ' + esc(e.message) + '</div>';
+      });
+  }
+
+  // Chart colors are baked in at render time from CSS variables, so a theme
+  // flip needs an explicit re-render — this listener runs after
+  // THEME_TOGGLE_SCRIPT's own (registered first, earlier in the page), so
+  // the .light class is already updated by the time this fires.
+  document.getElementById('theme-toggle-btn').addEventListener('click', function () {
+    if (lastDailyData.length) renderChart(lastDailyData);
+  });
+
   loadLines();
 })();
 </script>
@@ -1139,6 +1421,7 @@ export default {
 
       if (parts.length === 2 && parts[0] === 'api' && parts[1] === 'lines' && method === 'GET') return handleLinesList(request, env);
       if (parts.length === 3 && parts[0] === 'api' && parts[1] === 'lines' && parts[2] === 'check-bulk' && method === 'POST') return handleLinesCheckBulk(request, env);
+      if (parts.length === 2 && parts[0] === 'api' && parts[1] === 'analytics' && method === 'GET') return handleAnalytics(request, env);
       if (parts.length === 4 && parts[0] === 'api' && parts[1] === 'lines' && parts[3] === 'check' && method === 'POST') return handleLineCheck(request, env, parts[2]);
       if (parts.length === 4 && parts[0] === 'api' && parts[1] === 'lines' && parts[3] === 'reset' && method === 'POST') return handleLineReset(request, env, parts[2]);
 
