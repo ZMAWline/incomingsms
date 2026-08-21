@@ -139,14 +139,21 @@ export default {
         port_old_last_name: portOldLastName = '',
       } = msg.body;
       try {
-        // Skip if already activated (check for sub_id or msisdn based on vendor)
+        // Skip if already activated (check for sub_id or msisdn based on vendor).
+        // Gated on status too — sim-canceller sets status='canceled' without
+        // clearing msisdn/mobility_subscription_id, so a canceled (or errored)
+        // SIM being re-activated/re-ported still carries its old identifiers and
+        // must NOT be mistaken for "already activated" here.
         const existing = await supabaseSelect(
           env,
-          `sims?select=id,mobility_subscription_id,msisdn,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
+          `sims?select=id,mobility_subscription_id,msisdn,vendor,status&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
         );
         const existingSim = existing?.[0];
-        if (existingSim?.mobility_subscription_id || existingSim?.msisdn || existingSim?.status === 'provisioning') {
-          console.log(`[Activator] ${iccid}: already activated — skipping`);
+        const alreadyActivated = existingSim
+          && (existingSim.status === 'active' || existingSim.status === 'provisioning')
+          && (existingSim.mobility_subscription_id || existingSim.msisdn);
+        if (alreadyActivated) {
+          console.log(`[Activator] ${iccid}: already activated (status=${existingSim.status}) — skipping`);
           msg.ack();
           continue;
         }
