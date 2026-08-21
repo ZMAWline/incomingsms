@@ -282,7 +282,7 @@ test('POST /api/lines/check-bulk with no sim_ids is a 400, not a full-fleet swee
 
 // --- analytics ---------------------------------------------------------
 
-function analyticsBackend({ dailyRows = [{ day: '2026-08-20', checks: 10, online_checks: 8 }], resetCount = 5, capturedUrls = [] } = {}) {
+function analyticsBackend({ dailyRows = [{ day: '2026-08-20', lines_checked: 10, online_lines: 8 }], resetCount = 5, capturedUrls = [] } = {}) {
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url));
     capturedUrls.push(u.pathname + u.search);
@@ -310,8 +310,8 @@ test('GET /api/analytics requires a session', async () => {
 
 test('GET /api/analytics returns the daily uptime series and a reset-attempts count', async () => {
   const dailyRows = [
-    { day: '2026-08-19', checks: 300, online_checks: 120 },
-    { day: '2026-08-20', checks: 320, online_checks: 140 },
+    { day: '2026-08-19', lines_checked: 300, online_lines: 120 },
+    { day: '2026-08-20', lines_checked: 320, online_lines: 140 },
   ];
   analyticsBackend({ dailyRows, resetCount: 143 });
   const cookie = await loginCookie();
