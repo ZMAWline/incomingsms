@@ -74,12 +74,15 @@ async function sbRpc(env, fn, args) {
 // already uses for total_available (src/shared/hosting-port-status.mjs).
 async function sbCount(env, path) {
   const sep = path.includes('?') ? '&' : '?';
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}${sep}select=id&limit=1`, {
-    headers: sbHeaders(env, { Prefer: 'count=exact' }),
-  });
-  if (!res.ok) return null;
+  const url = `${env.SUPABASE_URL}/rest/v1/${path}${sep}select=id&limit=1`;
+  const res = await fetch(url, { headers: sbHeaders(env, { Prefer: 'count=exact' }) });
+  if (!res.ok) {
+    console.log('[TeltikPortal] sbCount HTTP ' + res.status + ' for ' + url + ': ' + (await res.text().catch(() => '')).slice(0, 300));
+    return null;
+  }
   const range = res.headers.get('content-range');
   const m = range && range.match(/\/(\d+)\s*$/);
+  if (!m) console.log('[TeltikPortal] sbCount: no parseable Content-Range (' + range + ') for ' + url);
   return m ? Number(m[1]) : null;
 }
 
@@ -1261,42 +1264,42 @@ function appHtml() {
   }
 
   function sumWindow(daily, startIdx, len) {
-    var checks = 0, online = 0;
+    var checked = 0, online = 0;
     for (var i = Math.max(startIdx, 0); i < startIdx + len && i < daily.length; i++) {
-      checks += daily[i].checks || 0;
-      online += daily[i].online_checks || 0;
+      checked += daily[i].lines_checked || 0;
+      online += daily[i].online_lines || 0;
     }
-    return { checks: checks, online: online };
+    return { checked: checked, online: online };
   }
 
   function renderKpis(daily, resetAttempts) {
     var n = daily.length;
     var last7 = sumWindow(daily, n - 7, 7);
     var prev7 = sumWindow(daily, n - 14, 7);
-    var curPct = last7.checks > 0 ? 100 * last7.online / last7.checks : null;
-    var prevPct = prev7.checks > 0 ? 100 * prev7.online / prev7.checks : null;
+    var curPct = last7.checked > 0 ? 100 * last7.online / last7.checked : null;
+    var prevPct = prev7.checked > 0 ? 100 * prev7.online / prev7.checked : null;
     var offlineCount = lines.filter(function (l) { return l.state === 'offline'; }).length;
     var mismatchCount = lines.filter(mdnMismatch).length;
 
     var html = '';
-    html += kpiTile('Checks online (7d)', curPct == null ? '—' : (Math.round(curPct * 10) / 10) + '%', trendInfo(curPct, prevPct));
+    html += kpiTile('Lines online (7d)', curPct == null ? '—' : (Math.round(curPct * 10) / 10) + '%', trendInfo(curPct, prevPct));
     html += kpiTile('Currently offline', String(offlineCount));
     html += kpiTile('MDN mismatches', String(mismatchCount));
     html += kpiTile('Reset attempts (30d)', resetAttempts == null ? '—' : String(resetAttempts));
     document.getElementById('kpi-row').innerHTML = html;
   }
 
-  // "% of checks online" is not the same as "% of the fleet online" — not
-  // every line is checked every day (coverage varies), so this is a trend
-  // indicator over whatever got checked, not a literal fleet-uptime number.
-  // Said explicitly in the caption rather than left implicit, since this is
-  // a client-facing page.
+  // "% of lines checked that were online" is not the same as "% of the
+  // fleet online" — not every line is checked every day (coverage varies),
+  // so this is a trend indicator over whatever got checked that day, not a
+  // literal fleet-uptime number. Said explicitly in the caption rather than
+  // left implicit, since this is a client-facing page.
   function renderChart(daily) {
     lastDailyData = daily;
     var canvas = document.getElementById('uptime-chart');
     if (typeof Chart === 'undefined' || !canvas) return;
     var labels = daily.map(function (d) { return d.day.slice(5); });
-    var pcts = daily.map(function (d) { return d.checks > 0 ? Math.round(1000 * d.online_checks / d.checks) / 10 : null; });
+    var pcts = daily.map(function (d) { return d.lines_checked > 0 ? Math.round(1000 * d.online_lines / d.lines_checked) / 10 : null; });
     var gridColor = themeColor('--row-border');
     var textColor = themeColor('--text-muted');
     var accent = themeColor('--accent');
@@ -1305,7 +1308,7 @@ function appHtml() {
     uptimeChart = new Chart(canvas.getContext('2d'), {
       type: 'line',
       data: { labels: labels, datasets: [{
-        label: '% checks online', data: pcts, borderColor: accent, backgroundColor: accent,
+        label: '% lines online', data: pcts, borderColor: accent, backgroundColor: accent,
         spanGaps: true, tension: 0.25, pointRadius: 2,
       }] },
       options: {
@@ -1319,12 +1322,11 @@ function appHtml() {
     });
 
     var last = daily[daily.length - 1];
-    var lastPct = last && last.checks > 0 ? Math.round(1000 * last.online_checks / last.checks) / 10 : null;
+    var lastPct = last && last.lines_checked > 0 ? Math.round(1000 * last.online_lines / last.lines_checked) / 10 : null;
     document.getElementById('chart-summary').textContent = lastPct == null
-      ? 'No checks recorded for the most recent day yet.'
-      : ('Most recent day (' + last.day + '): ' + lastPct + '% of ' + last.checks + ' checks were online. '
-        + 'Tracks the share of port-status checks that came back online each day — coverage varies day to day '
-        + '(not every line is checked every day), so read this as a trend alongside the live table, not literal fleet-wide uptime.');
+      ? 'No lines were checked on the most recent day yet.'
+      : ('Most recent day (' + last.day + '): ' + lastPct + '% of the ' + last.lines_checked + ' lines checked that day were online. '
+        + 'Coverage varies day to day (not every line is checked every day), so read this as a trend alongside the live table, not literal fleet-wide uptime.');
     document.getElementById('chart-asof').textContent = 'as of ' + new Date().toLocaleString();
   }
 
