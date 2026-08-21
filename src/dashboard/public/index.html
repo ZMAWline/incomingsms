@@ -13195,7 +13195,7 @@ async function sendSimOnline(simId, phoneNumber) {
             var canOta = sim.status === 'active' && ['teltik','wing_iot'].indexOf(sim.vendor) === -1 && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
             var canRetry = sim.status === 'error' && sim.vendor !== 'teltik' && !(sim.vendor === 'helix' && !window.HELIX_ENABLED);
             var canSwap = sim.vendor === 'atomic' && sim.status === 'active';
-            var canPortinStatus = sim.vendor === 'atomic' && !!sim.port_in_pending;
+            var canPortinStatus = sim.vendor === 'atomic' && !!sim.msisdn;
             var gatewayPort = (sim.gateway_name || sim.gateway_code || (sim.gateway_id ? 'GW#' + sim.gateway_id : '')) + (sim.port ? ' / ' + normalizePortDisplay(sim.port) : '');
             var errHtml = (sim.status === 'error' && sim.last_activation_error)
                 ? '<div class="mt-3 p-2 bg-red-900/20 border border-red-800/40 rounded text-xs text-red-400 font-mono break-all">' + sim.last_activation_error.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>'
@@ -13224,7 +13224,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 _sdField('Activated', sim.activated_at ? new Date(sim.activated_at).toLocaleString() : '') +
                 _sdField('Last Notified', sim.last_notified_at ? new Date(sim.last_notified_at).toLocaleString() : '') +
                 _sdField('Last SMS', sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '') +
-                (sim.port_in_pending ? _sdField('Port-In Status', (sim.atomic_portin_description || sim.atomic_portin_status_code || 'Not yet checked') +
+                ((sim.port_in_pending || sim.atomic_portin_checked_at) ? _sdField('Port-In Status', (sim.atomic_portin_description || sim.atomic_portin_status_code || 'Not yet checked') +
                     (sim.atomic_portin_checked_at ? ' <span class="text-gray-500">(checked ' + new Date(sim.atomic_portin_checked_at).toLocaleString() + ')</span>' : '')) : '') +
                 '</div>' +
                 errHtml + actions;

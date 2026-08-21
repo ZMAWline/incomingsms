@@ -161,10 +161,37 @@ test('dashboard /api/sims query selects msisdn and the atomic_portin_* fields', 
   assert.match(DASHBOARD_SRC, /select=[^`]*\batomic_portin_checked_at\b/);
 });
 
-test('dashboard SIM detail modal shows a "Check Port-In Status" button gated to ATOMIC SIMs with a pending port', () => {
-  assert.match(DASHBOARD_HTML, /var canPortinStatus = sim\.vendor === 'atomic' && !!sim\.port_in_pending;/);
+test('dashboard /api/sims response actually forwards msisdn and the atomic_portin_* fields to the browser (not just selected from Supabase)', () => {
+  // handleSims selects these columns from Supabase but was dropping them
+  // before building the `formatted` response object, so sim.port_in_pending
+  // and sim.msisdn were always undefined in the browser and the button never
+  // rendered for anyone, regardless of vendor or pending state.
+  const start = DASHBOARD_SRC.indexOf('async function handleSims');
+  assert.ok(start > 0, 'handleSims defined');
+  const end = DASHBOARD_SRC.indexOf('\nasync function handleMessages', start);
+  assert.ok(end > start, 'function body bounded');
+  const fn = DASHBOARD_SRC.slice(start, end);
+
+  const mapStart = fn.indexOf('const formatted = filteredSims.map(sim => {');
+  assert.ok(mapStart > 0, 'formatted map found');
+  const objBody = fn.slice(mapStart, fn.indexOf('return new Response', mapStart));
+
+  assert.match(objBody, /msisdn:\s*sim\.msisdn \|\| null/);
+  assert.match(objBody, /port_in_pending:\s*sim\.port_in_pending \|\| false/);
+  assert.match(objBody, /atomic_portin_status_code:\s*sim\.atomic_portin_status_code \|\| null/);
+  assert.match(objBody, /atomic_portin_description:\s*sim\.atomic_portin_description \|\| null/);
+  assert.match(objBody, /atomic_portin_checked_at:\s*sim\.atomic_portin_checked_at \|\| null/);
+});
+
+test('dashboard SIM detail modal shows a "Check Port-In Status" button for ATOMIC SIMs with an MSISDN, not gated on port_in_pending', () => {
+  assert.match(DASHBOARD_HTML, /var canPortinStatus = sim\.vendor === 'atomic' && !!sim\.msisdn;/);
+  assert.doesNotMatch(DASHBOARD_HTML, /var canPortinStatus = sim\.vendor === 'atomic' && !!sim\.port_in_pending;/);
   assert.match(DASHBOARD_HTML, /canPortinStatus \? '<button onclick="_sdPortinStatus\(\)"/);
   assert.match(DASHBOARD_HTML, /function _sdPortinStatus\(\) \{ if \(_sdCurrentSim\) simAction\(_sdCurrentSim\.id, 'portin_status'\); \}/);
+});
+
+test('dashboard SIM detail modal shows Port-In Status once checked, even after port_in_pending clears', () => {
+  assert.match(DASHBOARD_HTML, /\(\(sim\.port_in_pending \|\| sim\.atomic_portin_checked_at\) \? _sdField\('Port-In Status'/);
 });
 
 test('dashboard action dispatch (simAction) is generic and reaches POST /sim-action for any action, including portin_status', () => {
