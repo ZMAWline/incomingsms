@@ -279,3 +279,73 @@ test('POST /api/lines/check-bulk with no sim_ids is a 400, not a full-fleet swee
   }, cookie), ENV);
   assert.equal(res.status, 400);
 });
+
+// --- analytics ---------------------------------------------------------
+
+function analyticsBackend({ dailyRows = [{ day: '2026-08-20', checks: 10, online_checks: 8 }], resetCount = 5, capturedUrls = [] } = {}) {
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    capturedUrls.push(u.pathname + u.search);
+    if (u.pathname === '/rest/v1/rpc/get_teltik_daily_uptime') {
+      const body = JSON.parse(init.body);
+      assert.equal(body.days_back, 30);
+      return jsonRes(dailyRows);
+    }
+    if (u.pathname === '/rest/v1/rental_report_remediation_attempts') {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'Content-Range': '0-0/' + resetCount },
+      });
+    }
+    throw new Error('unexpected fetch ' + u.pathname);
+  };
+  return capturedUrls;
+}
+
+test('GET /api/analytics requires a session', async () => {
+  analyticsBackend();
+  const res = await teltikPortal.fetch(new Request('https://x/api/analytics'), ENV);
+  assert.equal(res.status, 401);
+});
+
+test('GET /api/analytics returns the daily uptime series and a reset-attempts count', async () => {
+  const dailyRows = [
+    { day: '2026-08-19', checks: 300, online_checks: 120 },
+    { day: '2026-08-20', checks: 320, online_checks: 140 },
+  ];
+  analyticsBackend({ dailyRows, resetCount: 143 });
+  const cookie = await loginCookie();
+  const res = await teltikPortal.fetch(authedRequest('https://x/api/analytics', {}, cookie), ENV);
+  const data = await res.json();
+  assert.equal(data.ok, true);
+  assert.deepEqual(data.daily, dailyRows);
+  assert.equal(data.reset_attempts_30d, 143);
+});
+
+test('GET /api/analytics excludes bookkeeping outcomes and scopes to teltik reset actions over 30 days', async () => {
+  const urls = [];
+  analyticsBackend({ capturedUrls: urls });
+  const cookie = await loginCookie();
+  await teltikPortal.fetch(authedRequest('https://x/api/analytics', {}, cookie), ENV);
+  const attemptsUrl = urls.find((u) => u.startsWith('/rental_report_remediation_attempts') || u.includes('rental_report_remediation_attempts'));
+  assert.ok(attemptsUrl, 'reset-attempts query was made');
+  assert.match(attemptsUrl, /action=in\.\(teltik_reset_port,teltik_reset_network\)/);
+  assert.match(attemptsUrl, /outcome=not\.in\.\(%22skipped_cooldown%22,%22skipped_sms_unavailable%22\)/);
+  assert.match(attemptsUrl, /attempted_at=gte\./);
+});
+
+test('GET /api/analytics degrades to an empty series when the RPC returns nothing usable', async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    if (u.pathname === '/rest/v1/rpc/get_teltik_daily_uptime') return new Response(null, { status: 500 });
+    if (u.pathname === '/rest/v1/rental_report_remediation_attempts') {
+      return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json', 'Content-Range': '0-0/0' } });
+    }
+    throw new Error('unexpected fetch ' + u.pathname);
+  };
+  const cookie = await loginCookie();
+  const res = await teltikPortal.fetch(authedRequest('https://x/api/analytics', {}, cookie), ENV);
+  const data = await res.json();
+  assert.equal(data.ok, true);
+  assert.deepEqual(data.daily, []);
+});

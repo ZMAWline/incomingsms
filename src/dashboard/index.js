@@ -4,7 +4,7 @@ import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateCh
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/teltik-known-mdn.mjs';
-import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
+import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, runRotatingCronSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
 
@@ -599,10 +599,14 @@ export default {
   // event alive until the batch commits.
   async scheduled(event, env, ctx) {
     if (event.cron === '0 */12 * * *') {
-      await runHostingPortSweep(env, { source: 'cron' })
+      // Rotates through the whole fleet across runs (persisted offset in
+      // hosting_port_cron_state) instead of re-checking the same ~200
+      // lowest-id lines every 12h forever — see runRotatingCronSweep.
+      await runRotatingCronSweep(env, { source: 'cron' })
         .then(s => console.log('[HostPort] cron sweep done: ' + JSON.stringify({
           total: s.total, online: s.online, offline: s.offline,
           unknown: s.unknown, error: s.error, truncated: s.truncated,
+          offset: s.offset, next_offset: s.next_offset, has_more: s.has_more,
         })))
         .catch(e => console.log('[HostPort] cron sweep failed: ' + (e && e.message || e)));
     }

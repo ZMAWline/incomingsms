@@ -16,6 +16,7 @@ import {
   checkAndRecordTeltikHostPort,
   readTeltikPortStatus,
   runHostingPortSweep,
+  runRotatingCronSweep,
   CHECK_SOURCES,
   fetchWithTimeout,
 } from '../src/shared/hosting-port-status.mjs';
@@ -302,6 +303,88 @@ test('full sweep pages by stable id order: offset batches never repeat and repor
   } finally { globalThis.fetch = orig; }
 });
 
+// Regression: the 12h cron used to call runHostingPortSweep directly with no
+// offset, so every invocation defaulted to offset=0 and re-checked the same
+// ~200 lowest-id lines forever. runRotatingCronSweep persists the offset in
+// a singleton hosting_port_cron_state row so repeated calls actually walk
+// the whole fleet, wrapping back to 0 once a pass completes.
+function rotatingCronMock(fleet, { cronStateFailsWrite = false } = {}) {
+  let cronOffset = 0;
+  const checkedIds = [];
+  const fetchImpl = async (url, opts = {}) => {
+    url = String(url);
+    if (url.includes('/rest/v1/hosting_port_cron_state')) {
+      if ((opts.method || 'GET') === 'PATCH') {
+        if (cronStateFailsWrite) return new Response(null, { status: 500 });
+        cronOffset = JSON.parse(opts.body).next_offset;
+        return new Response(null, { status: 204 });
+      }
+      return jsonResp([{ next_offset: cronOffset }]);
+    }
+    if (url.includes('/rest/v1/hosting_port_status_checks')) {
+      const row = JSON.parse(opts.body);
+      checkedIds.push(row.sim_id);
+      return new Response(null, { status: 201 });
+    }
+    if (url.includes('/rest/v1/carrier_api_logs')) return new Response(null, { status: 201 });
+    if (url.includes('/rest/v1/sims')) {
+      const params = new URL(url).searchParams;
+      const off = Number(params.get('offset'));
+      const lim = Number(params.get('limit'));
+      const page = fleet.slice(off, off + lim);
+      return new Response(JSON.stringify(page), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'Content-Range': off + '-' + (off + page.length - 1) + '/' + fleet.length },
+      });
+    }
+    if (url.includes('/v1/port-status')) return jsonResp({ port_status: 'online' });
+    throw new Error('unexpected fetch ' + url);
+  };
+  return { fetchImpl, checkedIds, getCronOffset: () => cronOffset };
+}
+
+test('runRotatingCronSweep advances the persisted offset across calls instead of re-checking the same slice', async () => {
+  const fleet = [1, 2, 3, 4, 5].map(id => ({ id, iccid: 'ICC' + id, vendor: 'teltik', gateway_host: null, sim_numbers: [] }));
+  const mock = rotatingCronMock(fleet);
+  const orig = globalThis.fetch;
+  globalThis.fetch = mock.fetchImpl;
+  try {
+    const first = await runRotatingCronSweep(ENV, { maxSims: 2 });
+    assert.equal(first.offset, 0);
+    assert.deepEqual(first.results.map(r => r.sim_id), [1, 2]);
+    assert.equal(mock.getCronOffset(), 2, 'offset persisted after first call');
+
+    const second = await runRotatingCronSweep(ENV, { maxSims: 2 });
+    assert.equal(second.offset, 2, 'second call resumed from the persisted offset, not 0');
+    assert.deepEqual(second.results.map(r => r.sim_id), [3, 4]);
+    assert.equal(mock.getCronOffset(), 4);
+
+    const third = await runRotatingCronSweep(ENV, { maxSims: 2 });
+    assert.deepEqual(third.results.map(r => r.sim_id), [5]);
+    assert.equal(third.has_more, false, 'reached the end of the fleet');
+    assert.equal(mock.getCronOffset(), 0, 'offset wraps back to 0 once a full pass completes');
+
+    assert.deepEqual(mock.checkedIds, [1, 2, 3, 4, 5], 'every sim checked exactly once across the three calls');
+  } finally { globalThis.fetch = orig; }
+});
+
+test('runRotatingCronSweep leaves the offset untouched when the sweep query itself fails', async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    url = String(url);
+    if (url.includes('/rest/v1/hosting_port_cron_state')) {
+      if ((opts.method || 'GET') === 'PATCH') { assert.fail('offset must not be written after a failed sweep'); }
+      return jsonResp([{ next_offset: 6 }]);
+    }
+    if (url.includes('/rest/v1/sims')) throw new Error('network down');
+    throw new Error('unexpected fetch ' + url);
+  };
+  try {
+    const summary = await runRotatingCronSweep(ENV, { maxSims: 2 });
+    assert.equal(summary.ok, false);
+  } finally { globalThis.fetch = orig; }
+});
+
 // --- migration schema ------------------------------------------------------
 
 test('migration creates the canonical table, indexes and summary RPC idempotently', () => {
@@ -342,7 +425,7 @@ test('all Teltik port-status call sites route through the shared recorder', () =
   // Dashboard: teltik-query + teltik-host-check + sweep all record.
   const dashboardImport = DASHBOARD_SRC.match(/import \{([^}]+)\} from '\.\.\/shared\/hosting-port-status\.mjs'/);
   assert.ok(dashboardImport, 'dashboard imports the shared recorder module');
-  for (const name of ['recordHostingPortCheck', 'buildHostingPortCheckRow', 'normalizeHostPortState', 'runHostingPortSweep', 'enqueueHostingPortJob', 'getHostingPortJob', 'processHostingPortJobs']) {
+  for (const name of ['recordHostingPortCheck', 'buildHostingPortCheckRow', 'normalizeHostPortState', 'runHostingPortSweep', 'runRotatingCronSweep', 'enqueueHostingPortJob', 'getHostingPortJob', 'processHostingPortJobs']) {
     assert.ok(dashboardImport[1].includes(name), 'dashboard imports ' + name + ' from shared recorder');
   }
   const dashboardRecordCalls = (DASHBOARD_SRC.match(/recordHostingPortCheck\(env,/g) || []).length;
@@ -359,7 +442,11 @@ test('12h cron + manual run endpoint exist and share the sweep implementation', 
   assert.match(DASHBOARD_SRC, /async scheduled\(event, env, ctx\)/);
   // Full automatic sweep stays bounded to the 12h schedule — never every minute.
   assert.match(DASHBOARD_SRC, /if \(event\.cron === '0 \*\/12 \* \* \*'\) \{/);
-  assert.match(DASHBOARD_SRC, /runHostingPortSweep\(env, \{ source: 'cron' \}\)/);
+  // The cron uses the rotating wrapper (persists offset across runs) rather
+  // than calling runHostingPortSweep directly, which would default to
+  // offset=0 on every single invocation and never advance past the same
+  // ~200 lowest-id lines. See runRotatingCronSweep.
+  assert.match(DASHBOARD_SRC, /runRotatingCronSweep\(env, \{ source: 'cron' \}\)/);
   assert.match(DASHBOARD_SRC, /\/api\/hosting-port-status\/run/);
   assert.match(DASHBOARD_SRC, /handleHostingPortStatusRun/);
   assert.match(SHARED_SRC, /concurrency = 5/);
