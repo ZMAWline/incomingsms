@@ -421,6 +421,7 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
     ban: result?.BAN || '',
     status: 'provisioning', // sims.status CHECK constraint has no "pending port" value
     zipCode: portFields.zip,
+    portInPending: true, // marks this SIM for details-finalizer's portinStatus poll
   };
 }
 
@@ -660,6 +661,13 @@ async function upsertSimWithVendor(env, iccid, result, vendor) {
     }
     if (result.zipCode) {
       payload.activation_zip = result.zipCode;
+    }
+    // Explicit true/false (not just "set when true"): an ICCID being
+    // reactivated via plain Activate after a prior port-in attempt must not
+    // keep a stale port_in_pending=true, which would leave it stuck in
+    // details-finalizer's portinStatus poll forever.
+    if (vendor === 'atomic') {
+      payload.port_in_pending = !!result.portInPending;
     }
   } else if (vendor === 'helix') {
     payload.mobility_subscription_id = result.mobilitySubscriptionId;

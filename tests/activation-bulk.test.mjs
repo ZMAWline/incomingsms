@@ -4,6 +4,7 @@ import {
   buildActivationCsvTemplate,
   buildAtomicActivateRequest,
   buildAtomicPortInRequest,
+  buildAtomicPortInStatusRequest,
   parseActivationCsv,
   validateActivationSim,
 } from '../src/shared/activation-bulk.mjs';
@@ -281,4 +282,51 @@ test('buildAtomicPortInRequest uses a different requestType than Activate and ne
     oldLastName: 'Smith',
   });
   assert.equal(portin.wholeSaleApi.wholeSaleRequest.requestType, 'portinRequest');
+});
+
+test('buildAtomicPortInStatusRequest sends only requestType and MSISDN — no activation/port-in fields', () => {
+  const req = buildAtomicPortInStatusRequest({
+    session: { userName: 'u', token: 't', pin: 'p' },
+    msisdn: '2125550199',
+  });
+  const wr = req.wholeSaleApi.wholeSaleRequest;
+  assert.equal(wr.requestType, 'portinStatus');
+  assert.equal(wr.MSISDN, '2125550199');
+  assert.deepEqual(Object.keys(wr).sort(), ['MSISDN', 'requestType']);
+  // Never carries sim/imei/subscriber/old_service_provider/planCode/BAN/eSim —
+  // those belong only to portinRequest/portinUpdate and would risk mutating
+  // the port instead of just reading its status.
+  for (const key of ['sim', 'imei', 'subscriber', 'old_service_provider', 'planCode', 'BAN', 'eSim', 'partnerTransactionId']) {
+    assert.ok(!(key in wr), `portinStatus request must not contain "${key}"`);
+  }
+  assert.deepEqual(req.wholeSaleApi.session, { userName: 'u', token: 't', pin: 'p' });
+});
+
+test('buildAtomicPortInStatusRequest uses a distinct requestType from portinRequest/Activate', () => {
+  const status = buildAtomicPortInStatusRequest({ session: { userName: 'u', token: 't', pin: 'p' }, msisdn: '2125550199' });
+  const portin = buildAtomicPortInRequest({
+    session: { userName: 'u', token: 't', pin: 'p' },
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
+    portMdn: '2125550199',
+    portAccountNumber: 'ACCT12345',
+    portPin: '1234',
+    firstName: 'John', lastName: 'Doe',
+    streetNumber: '123', streetName: 'Main St', zip: '75001',
+    oldFirstName: 'Jane', oldLastName: 'Smith',
+  });
+  const activate = buildAtomicActivateRequest({
+    session: { userName: 'u', token: 't', pin: 'p' },
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
+    address: { streetNumber: '1', streetName: 'Main St', zipCode: '75001' },
+    portMdn: '',
+    partnerTransactionId: 'tx4',
+  });
+  const types = new Set([
+    status.wholeSaleApi.wholeSaleRequest.requestType,
+    portin.wholeSaleApi.wholeSaleRequest.requestType,
+    activate.wholeSaleApi.wholeSaleRequest.requestType,
+  ]);
+  assert.equal(types.size, 3, 'portinStatus, portinRequest, and Activate must be three distinct requestTypes');
 });

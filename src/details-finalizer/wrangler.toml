@@ -27,7 +27,8 @@ binding = "SKYLINE_GATEWAY"
 service = "skyline-gateway"
 
 # mdn-rotator holds ATOMIC credentials; details-finalizer reaches it via this binding
-# for subsriberInquiry reconciliation of ATOMIC SIMs stuck in provisioning.
+# for subsriberInquiry reconciliation of ATOMIC SIMs stuck in provisioning, and for
+# read-only portinStatus polling of SIMs awaiting port-in completion.
 [[services]]
 binding = "MDN_ROTATOR"
 service = "mdn-rotator"

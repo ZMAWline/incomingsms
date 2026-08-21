@@ -268,3 +268,20 @@ export function buildAtomicPortInRequest({
     },
   };
 }
+
+// Atomic Wholesale API `portinStatus` — read-only status lookup for a port-in
+// already submitted via portinRequest. Per the atomic-wholesale-api skill,
+// MSISDN is the ONLY required (and only supported) field for this
+// requestType; it must never carry port account number/PIN or subscriber
+// fields, which belong only to portinRequest/portinUpdate.
+export function buildAtomicPortInStatusRequest({ session, msisdn }) {
+  return {
+    wholeSaleApi: {
+      session,
+      wholeSaleRequest: {
+        requestType: 'portinStatus',
+        MSISDN: msisdn,
+      },
+    },
+  };
+}
