@@ -1,5 +1,15 @@
 // =========================================================
-// Slack notifications for Teltik gateway-port offline events (TH5).
+// Slack notifications for Teltik gateway-port offline events.
+//
+// Two independent paths:
+//   notifyPortOffline        — report-driven (TH5 classification), one
+//                               message per line, only fires when a
+//                               bad-rental report already exists for it.
+//   notifyOfflineFleetSummary — fleet-driven, one batch digest per run,
+//                               covers every currently-offline Teltik line
+//                               regardless of whether any report exists.
+// See notifyOfflineFleetSummary's own doc comment below for why the first
+// one alone isn't enough.
 //
 // Fire-and-forget from the caller's perspective in effect, but implemented
 // as an awaited call that swallows its own errors — a Slack outage or a
@@ -115,6 +125,92 @@ export async function notifyPortOffline(env, { kind, sim, portStatus, priorReset
     return await postToSlack(env, env.SLACK_WEBHOOK_URL, payload);
   } catch (err) {
     console.log('[Remediator] notifyPortOffline error: ' + (err && err.message || err));
+    return { ok: false, error: String(err && err.message || err) };
+  }
+}
+
+// =========================================================
+// Fleet-wide offline digest — independent of bad-rental report processing.
+//
+// notifyPortOffline (above) only ever fires for a line that already has an
+// open bad-rental report attached to it (a reseller/customer complaint).
+// That misses the common case: a line goes offline with no report ever
+// filed on it, which is most of the fleet once coverage improved (rotating
+// cron + the teltik-portal). This queries the ACTUAL current status of
+// every Teltik-hosted line (get_teltik_currently_offline — latest recorded
+// check per line, filtered to state='offline') and sends a single batch
+// summary, not one message per line, so a mass-outage or a cold start
+// against an already-large offline count can't spam the channel.
+// =========================================================
+
+const FLEET_OFFLINE_SUMMARY_TTL_S = 60 * 60; // 1h — digest cadence, not per-line dedup
+const FLEET_OFFLINE_LIST_CAP = 15;
+const SB_FETCH_TIMEOUT_MS = 15000;
+
+function sbHeaders(env) {
+  return {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+    'Content-Type': 'application/json',
+  };
+}
+
+async function fetchCurrentlyOfflineLines(env) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error('fetch timeout after ' + SB_FETCH_TIMEOUT_MS + 'ms')), SB_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/get_teltik_currently_offline', {
+      method: 'POST',
+      headers: sbHeaders(env),
+      body: JSON.stringify({}),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error('get_teltik_currently_offline HTTP ' + res.status);
+    const rows = await res.json();
+    return Array.isArray(rows) ? rows : [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildFleetOfflineMessage(offline) {
+  const shown = offline.slice(0, FLEET_OFFLINE_LIST_CAP);
+  const lines = shown.map((l) => '• `' + (l.iccid || 'unknown') + '`' + (l.mdn ? ' — ' + l.mdn : ''));
+  if (offline.length > shown.length) lines.push('_...and ' + (offline.length - shown.length) + ' more_');
+  return {
+    blocks: [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: ':rotating_light: ' + offline.length + ' Teltik line(s) currently offline', emoji: true },
+      },
+      { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: 'Full list: teltik-portal.zalmen-531.workers.dev (filter: offline) — generated ' + new Date().toISOString() }],
+      },
+    ],
+  };
+}
+
+// Runs on bad-rental-remediator's existing 15-min cron (see index.js
+// scheduled()), independent of report processing. Dedup only activates
+// once a real alert has been sent — an empty-offline-list run never burns
+// the digest window, so a line going offline 5 minutes after an "all
+// clear" tick isn't silently suppressed for the rest of the hour.
+export async function notifyOfflineFleetSummary(env) {
+  try {
+    if (!env.SLACK_WEBHOOK_URL) return { ok: false, skipped: 'no_webhook' };
+    const offline = await fetchCurrentlyOfflineLines(env);
+    if (!offline.length) return { ok: true, skipped: 'none_offline' };
+
+    const allowed = await dedupOnce(env, 'bad_rental_remediator_notify_fleet_offline_summary', FLEET_OFFLINE_SUMMARY_TTL_S);
+    if (!allowed) return { ok: true, skipped: 'deduped', offline_count: offline.length };
+
+    const payload = buildFleetOfflineMessage(offline);
+    const result = await postToSlack(env, env.SLACK_WEBHOOK_URL, payload);
+    return { ...result, offline_count: offline.length };
+  } catch (err) {
+    console.log('[Remediator] notifyOfflineFleetSummary error: ' + (err && err.message || err));
     return { ok: false, error: String(err && err.message || err) };
   }
 }

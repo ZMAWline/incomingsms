@@ -22,7 +22,7 @@ import { runVerifyPoll, preResolveGate } from './verify-runner.mjs';
 import { cleanRecheckPredicate } from './verify.mjs';
 import { executeAction } from './actions.mjs';
 import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
-import { notifyPortOffline } from './notify.mjs';
+import { notifyPortOffline, notifyOfflineFleetSummary } from './notify.mjs';
 import { teltikPortStatus, readVendorView, teltikGetInfo } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import {
@@ -238,6 +238,14 @@ export default {
     }
     ctx.waitUntil(runTick(env).catch(err => {
       console.log('[Remediator] scheduled error: ' + err);
+    }));
+    // Independent of report processing above — covers every currently-
+    // offline Teltik line, not just ones with an open bad-rental report.
+    // See notifyOfflineFleetSummary's doc comment in notify.mjs.
+    ctx.waitUntil(notifyOfflineFleetSummary(env).then(r => {
+      if (!r.skipped) console.log('[Remediator] fleet-offline digest: ' + JSON.stringify(r));
+    }).catch(err => {
+      console.log('[Remediator] fleet-offline digest error: ' + err);
     }));
   },
 };
