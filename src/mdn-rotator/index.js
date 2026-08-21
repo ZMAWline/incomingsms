@@ -2,6 +2,7 @@ import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { gatewaySupports } from '../shared/gateway-host.mjs';
+import { buildAtomicPortInStatusRequest } from '../shared/activation-bulk.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -198,6 +199,36 @@ export default {
           status: 500, headers: { "Content-Type": "application/json" }
         });
       }
+    }
+
+    // Invoked by details-finalizer via service binding (5-min cron poll of
+    // SIMs with sims.port_in_pending=true) and by the dashboard's manual
+    // "Check Port Status" button. Read-only ATOMIC portinStatus lookup — per
+    // the atomic-wholesale-api skill, MSISDN is the only field this
+    // requestType accepts; never sends port account/PIN or subscriber data,
+    // and never submits/cancels/updates a port. Does not interpret the
+    // carrier's statusCode/description — callers record it as-is.
+    if (url.pathname === "/atomic-portin-status" && request.method === "GET") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const msisdn = (url.searchParams.get("msisdn") || "").replace(/\D/g, '');
+      const iccid = url.searchParams.get("iccid") || "";
+      if (!/^\d{10}$/.test(msisdn)) {
+        return new Response(JSON.stringify({ error: "msisdn must normalize to 10 digits" }), {
+          status: 400, headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+        return new Response(JSON.stringify({ error: "ATOMIC credentials not configured" }), {
+          status: 500, headers: { "Content-Type": "application/json" }
+        });
+      }
+      const result = await lookupAtomicPortinStatus(env, { msisdn, iccid });
+      return new Response(JSON.stringify(result, null, 2), {
+        status: result.http_status === 0 ? 500 : 200, headers: { "Content-Type": "application/json" }
+      });
     }
 
     if (url.pathname === "/remediate-stuck-wing" && request.method === "POST") {
@@ -403,7 +434,7 @@ export default {
           });
         }
 
-        const validActions = ["ota_refresh", "cancel", "resume", "rotate", "fix", "retry_activation", "change_imei"];
+        const validActions = ["ota_refresh", "cancel", "resume", "rotate", "fix", "retry_activation", "change_imei", "portin_status"];
         if (!validActions.includes(action)) {
           return new Response(JSON.stringify({ error: `Invalid action: ${action}. Valid: ${validActions.join(", ")}` }), {
             status: 400,
@@ -425,6 +456,41 @@ export default {
         const sim = sims[0];
         const iccid = sim.iccid;
         const subId = sim.mobility_subscription_id;
+
+        // Manual, read-only ATOMIC portinStatus check — dashboard's "Check
+        // Port-In Status" button. Same lookup the finalizer's periodic poll
+        // uses; also records the result on the SIM row so a manual check
+        // updates what the dashboard displays, not just carrier_api_logs.
+        if (action === "portin_status") {
+          if (sim.vendor !== "atomic") {
+            return new Response(JSON.stringify({ ok: false, error: `portin_status is only supported for ATOMIC SIMs (this SIM is ${sim.vendor})` }), {
+              status: 400, headers: { "Content-Type": "application/json" }
+            });
+          }
+          const msisdn = String(sim.msisdn || '').replace(/\D/g, '');
+          if (!/^\d{10}$/.test(msisdn)) {
+            return new Response(JSON.stringify({ ok: false, error: "SIM has no valid 10-digit MSISDN on file to check" }), {
+              status: 400, headers: { "Content-Type": "application/json" }
+            });
+          }
+          if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
+            return new Response(JSON.stringify({ ok: false, error: "ATOMIC credentials not configured" }), {
+              status: 500, headers: { "Content-Type": "application/json" }
+            });
+          }
+          const lookup = await lookupAtomicPortinStatus(env, { msisdn, iccid });
+          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, {
+            atomic_portin_status_code: lookup.statusCode ?? null,
+            atomic_portin_description: lookup.description ?? null,
+            atomic_portin_checked_at: new Date().toISOString(),
+          });
+          return new Response(JSON.stringify({
+            ok: lookup.ok, action, sim_id, iccid, status_updated: true, detail: lookup,
+          }, null, 2), {
+            status: lookup.http_status && lookup.http_status !== 0 ? 200 : 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
 
         // For rotate, delegate directly. `force: true` bypasses the daily dedup guard.
         if (action === "rotate") {
@@ -3914,6 +3980,73 @@ async function retryActivateViaWingIot(env, iccid, runId) {
   });
 
   return { msisdn: verifyJson.mdn || verifyJson.msisdn || '', status: 'active' };
+}
+
+// Read-only ATOMIC portinStatus lookup — shared by the /atomic-portin-status
+// route (called by details-finalizer's poll and the dashboard's manual
+// action) and by /sim-action's "portin_status" branch, so both entry points
+// log to carrier_api_logs and redact the session the same way. Per the
+// atomic-wholesale-api skill, MSISDN is the only field this requestType
+// accepts; never sends port account/PIN or subscriber data, and never
+// submits/cancels/updates a port. Does not interpret the carrier's
+// statusCode/description — callers record it as-is.
+async function lookupAtomicPortinStatus(env, { msisdn, iccid }) {
+  try {
+    const atomicUrl = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+    const requestBody = buildAtomicPortInStatusRequest({
+      session: {
+        userName: env.ATOMIC_USERNAME,
+        token: env.ATOMIC_TOKEN,
+        pin: env.ATOMIC_PIN,
+      },
+      msisdn,
+    });
+    const runId = `portin_status_${iccid || msisdn}_${Date.now()}`;
+    const res = await relayFetch(env, atomicUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+    const text = await res.text();
+    let data = {};
+    try { data = JSON.parse(text); } catch {}
+    const wr = data?.wholeSaleApi?.wholeSaleResponse;
+    await logCarrierApiCall(env, {
+      run_id: runId, step: 'portin_status', iccid: iccid || null, imei: null, vendor: 'atomic',
+      request_url: atomicUrl, request_method: 'POST', request_body: redactAtomicSession(requestBody),
+      response_status: res.status, response_ok: res.ok,
+      response_body_text: text, response_body_json: data,
+      error: (res.ok && wr?.statusCode === '00') ? null :
+        `ATOMIC portinStatus failed: ${wr?.description || res.status}`,
+    });
+    return {
+      ok: res.ok,
+      http_status: res.status,
+      statusCode: wr?.statusCode ?? null,
+      description: wr?.description ?? null,
+      result: wr?.Result ?? null,
+    };
+  } catch (err) {
+    return { ok: false, http_status: 0, statusCode: null, description: null, result: null, error: String(err) };
+  }
+}
+
+// Blanks the ATOMIC session credentials (userName/token/pin) before a request
+// body is written to carrier_api_logs. Same field set as the dashboard API
+// Tester's REDACTED_BODY_FIELDS allow-list.
+function redactAtomicSession(body) {
+  try {
+    const clone = JSON.parse(JSON.stringify(body));
+    const session = clone?.wholeSaleApi?.session;
+    if (session) {
+      if ('userName' in session) session.userName = '[REDACTED]';
+      if ('token' in session) session.token = '[REDACTED]';
+      if ('pin' in session) session.pin = '[REDACTED]';
+    }
+    return clone;
+  } catch {
+    return body;
+  }
 }
 
 async function logCarrierApiCall(env, logData) {

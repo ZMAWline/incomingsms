@@ -1,12 +1,16 @@
 // =========================================================
 // DETAILS FINALIZER WORKER
 // Cron: every 5 minutes.
-// Runs four finalizers per tick:
+// Runs five finalizers per tick:
 //   1) Helix finalizer — for provisioning Helix SIMs (gated on HELIX_ENABLED)
 //   2) Wing IoT finalizer — for provisioning Wing IoT SIMs (activation + post-rotation)
 //   3) Teltik finalizer — for provisioning Teltik SIMs (post-rotation MDN sync)
 //   4) ATOMIC finalizer — for ATOMIC SIMs stuck after 5xx/network error during swapMSISDN
 //      (calls mdn-rotator's /atomic-inquiry via service binding since it holds ATOMIC creds)
+//   5) ATOMIC port-in status finalizer — read-only portinStatus poll for SIMs
+//      awaiting a port-in submitted via portinRequest (sims.port_in_pending=true),
+//      via mdn-rotator's /atomic-portin-status. Records the carrier's raw
+//      status/description only; never auto-completes the SIM.
 // =========================================================
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
@@ -131,7 +135,8 @@ export default {
     const wing = await runWingIotFinalizer(env, limit);
     const teltik = await runTeltikFinalizer(env, limit);
     const atomic = await runAtomicFinalizer(env, limit);
-    return json({ ok: true, helix, wing, teltik, atomic });
+    const atomicPortinStatus = await runAtomicPortinStatusFinalizer(env, limit);
+    return json({ ok: true, helix, wing, teltik, atomic, atomic_portin_status: atomicPortinStatus });
   },
 
   async scheduled(event, env, ctx) {
@@ -165,6 +170,7 @@ export default {
     ctx.waitUntil(runWingIotFinalizer(env, 50));
     ctx.waitUntil(runTeltikFinalizer(env, 50));
     ctx.waitUntil(runAtomicFinalizer(env, 50));
+    ctx.waitUntil(runAtomicPortinStatusFinalizer(env, 50));
   },
 };
 
@@ -1172,6 +1178,73 @@ async function runAtomicFinalizer(env, limit) {
   }
 
   return { ok: true, processed, synced, escalated, errors, failed, results };
+}
+
+/* ── ATOMIC port-in status finalizer ──────────────────────────────────────── */
+// Read-only poll of ATOMIC's portinStatus for SIMs awaiting port-in
+// completion (sims.port_in_pending = true, set by bulk-activator when a
+// portinRequest is submitted — a distinct signal from rotation_status=
+// 'mdn_pending', which runAtomicFinalizer's bucket already owns for stuck
+// swapMSISDN recovery). Talks to ATOMIC only via mdn-rotator's
+// /atomic-portin-status route (mdn-rotator holds the ATOMIC credentials, same
+// as the /atomic-inquiry call above). Records the carrier's raw statusCode/
+// description on the sims row every tick — it does NOT interpret the enum or
+// auto-transition sims.status/port_in_pending, since the carrier's full
+// status vocabulary and completion signal are not independently confirmed
+// (see the atomic-wholesale-api skill's "Unknowns" list). Ops reviews
+// atomic_portin_description (surfaced in the dashboard) and finalizes
+// manually once the port is confirmed complete.
+async function runAtomicPortinStatusFinalizer(env, limit) {
+  if (!env.MDN_ROTATOR) {
+    return { processed: 0, checked: 0, message: 'mdn_rotator_binding_missing' };
+  }
+  if (!env.ADMIN_RUN_SECRET) {
+    return { processed: 0, checked: 0, message: 'admin_run_secret_missing' };
+  }
+
+  const sims = (await supabaseSelect(
+    env,
+    `sims?select=id,iccid,msisdn&vendor=eq.atomic&status=eq.provisioning&port_in_pending=eq.true&limit=${limit}`
+  )) || [];
+  if (sims.length === 0) return { ok: true, processed: 0, checked: 0 };
+
+  let processed = 0;
+  let checked = 0;
+  let errors = 0;
+  const results = [];
+
+  for (const sim of sims) {
+    processed++;
+    const msisdn = String(sim.msisdn || '').replace(/\D/g, '');
+    if (!/^\d{10}$/.test(msisdn)) {
+      errors++;
+      results.push({ iccid: sim.iccid, ok: false, error: 'no valid 10-digit MSISDN on file' });
+      continue;
+    }
+    try {
+      const url = `https://mdn-rotator/atomic-portin-status?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&msisdn=${encodeURIComponent(msisdn)}&iccid=${encodeURIComponent(sim.iccid)}`;
+      const res = await env.MDN_ROTATOR.fetch(url, { method: 'GET' });
+      if (!res.ok) {
+        errors++;
+        results.push({ iccid: sim.iccid, ok: false, error: `portin-status ${res.status}` });
+        continue;
+      }
+      const data = await res.json().catch(() => ({}));
+      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        atomic_portin_status_code: data.statusCode ?? null,
+        atomic_portin_description: data.description ?? null,
+        atomic_portin_checked_at: new Date().toISOString(),
+      });
+      checked++;
+      results.push({ iccid: sim.iccid, ok: true, statusCode: data.statusCode ?? null, description: data.description ?? null });
+    } catch (e) {
+      errors++;
+      results.push({ iccid: sim.iccid, ok: false, error: String(e) });
+      console.error(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: ${e}`);
+    }
+  }
+
+  return { ok: true, processed, checked, errors, results };
 }
 
 /* ── Rotation Review (daily 12:30 UTC) ────────────────────────────────────── */
