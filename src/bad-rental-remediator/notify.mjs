@@ -141,11 +141,45 @@ export async function notifyPortOffline(env, { kind, sim, portStatus, priorReset
 // check per line, filtered to state='offline') and sends a single batch
 // summary, not one message per line, so a mass-outage or a cold start
 // against an already-large offline count can't spam the channel.
+//
+// Sends twice a day — 8:00 AM and 4:00 PM America/New_York — instead of on
+// every 15-minute cron tick. The worker's own cron trigger stays at */15
+// (no new Cloudflare cron needed); this function just no-ops outside those
+// two windows. Time is computed via Intl (DST-aware), the same pattern
+// src/teltik-worker/index.js#getNYHour already uses, rather than a fixed
+// UTC cron that would silently drift an hour off after a DST change.
 // =========================================================
 
-const FLEET_OFFLINE_SUMMARY_TTL_S = 60 * 60; // 1h — digest cadence, not per-line dedup
+const DIGEST_WINDOWS = [
+  { key: 'morning', hour: 8 },
+  { key: 'afternoon', hour: 16 },
+];
+const DIGEST_WINDOW_MINUTES = 15; // matches the */15 cron tick spacing
+const DIGEST_DEDUP_TTL_S = 18 * 60 * 60; // clears well before the same window recurs next day
 const FLEET_OFFLINE_LIST_CAP = 15;
 const SB_FETCH_TIMEOUT_MS = 15000;
+
+// Hour/minute/date in America/New_York, DST-aware via Intl. hour12:false can
+// report midnight as "24" in some ICU builds, so normalize with %24 the same
+// way getNYHour() in teltik-worker/index.js does.
+function nyNow(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour: 'numeric', minute: 'numeric', hour12: false,
+  }).formatToParts(now);
+  const get = (type) => Number(parts.find((p) => p.type === type).value);
+  const hour = ((get('hour') % 24) + 24) % 24;
+  const minute = get('minute');
+  const date = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now); // YYYY-MM-DD
+  return { hour, minute, date };
+}
+
+// Returns { key, date } when `now` falls inside the first DIGEST_WINDOW_MINUTES
+// of a configured hour, else null. `now` is injectable for tests.
+function currentDigestWindow(now = new Date()) {
+  const { hour, minute, date } = nyNow(now);
+  const win = DIGEST_WINDOWS.find((w) => w.hour === hour && minute < DIGEST_WINDOW_MINUTES);
+  return win ? { key: win.key, date } : null;
+}
 
 function sbHeaders(env) {
   return {
@@ -193,17 +227,23 @@ function buildFleetOfflineMessage(offline) {
 }
 
 // Runs on bad-rental-remediator's existing 15-min cron (see index.js
-// scheduled()), independent of report processing. Dedup only activates
-// once a real alert has been sent — an empty-offline-list run never burns
-// the digest window, so a line going offline 5 minutes after an "all
-// clear" tick isn't silently suppressed for the rest of the hour.
-export async function notifyOfflineFleetSummary(env) {
+// scheduled()), independent of report processing. Most ticks exit
+// immediately on the window check below, before any Supabase call. Dedup
+// is keyed per calendar day + window, so it sends once at 8 AM and once at
+// 4 PM, not on every tick that happens to land inside those 15-minute
+// bracket — and an empty-offline-list run never consumes the dedup slot,
+// so a line going offline later in the same window still gets reported.
+export async function notifyOfflineFleetSummary(env, { now } = {}) {
   try {
     if (!env.SLACK_WEBHOOK_URL) return { ok: false, skipped: 'no_webhook' };
+    const window = currentDigestWindow(now);
+    if (!window) return { ok: true, skipped: 'outside_digest_window' };
+
     const offline = await fetchCurrentlyOfflineLines(env);
     if (!offline.length) return { ok: true, skipped: 'none_offline' };
 
-    const allowed = await dedupOnce(env, 'bad_rental_remediator_notify_fleet_offline_summary', FLEET_OFFLINE_SUMMARY_TTL_S);
+    const dedupKey = 'bad_rental_remediator_notify_fleet_offline_summary:' + window.date + ':' + window.key;
+    const allowed = await dedupOnce(env, dedupKey, DIGEST_DEDUP_TTL_S);
     if (!allowed) return { ok: true, skipped: 'deduped', offline_count: offline.length };
 
     const payload = buildFleetOfflineMessage(offline);
