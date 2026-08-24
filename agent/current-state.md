@@ -1,7 +1,27 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-07-06 (Teltik 7am rotations: night-guard made permanent, window 3-8, batch 150, 15-min ticks, inline re-anchor for morning recoveries; ⚠️ ATOMIC carry-over below still open — 14 lines DEACTIVATED)
+> Last updated: 2026-08-24 (Activation Runs full-error UI + b11b2839 root-cause fix — see session below)
+
+---
+
+## Session 2026-08-24 — Activation Runs full-error UI + `address_pool_usage` test-parity fix (branch `feat/bulk-activator-job-tracking`, PR #69)
+
+**User report:** Activation Runs truncated errors so badly an operator couldn't troubleshoot, plus run `b11b2839-69aa-4b94-8d81-07c1b99fb113` was failing.
+
+**Root cause of b11b2839 (and every ATOMIC/Helix activation run in TEST):** the `claim_address_pool_entry(p_exclude_state, p_exclude_zip)` RPC and its backing `address_pool_usage` table exist on **PROD** (`lzjqegxazqlktttyybth`) — applied there via ad-hoc Supabase MCP migrations (`claim_address_pool_entry_returns_row`, `address_pool_usage_add_address_fields`, see decision-log 2026-05-20 area) that were **never captured as a migration file** and **never applied to TEST** (`lwapudjjlwkskijefxdz`, "incomingsms-test"). Every PPU address pick in test threw `PGRST202: Could not find the function public.claim_address_pool_entry(...)`, caught in `pickNextPpuAddress` (`src/shared/address-picker.mjs`) and written verbatim to `activation_job_items.error_message` — exactly what b11b2839's single item shows.
+
+**Fixed (test project only, no prod change, no carrier call):**
+- New migration file `supabase/migrations/20260824_address_pool_test_parity.sql` — documents the schema as it already exists on PROD (table + indexes + `claim_address_pool_entry` function) and is now also applied to TEST via the Supabase Management API (`SUPABASE_ACCESS_TOKEN` from `.dev.vars`, same fallback pattern as the 2026-05-27/06-01 sessions — Supabase MCP tool access wasn't available in this runtime either).
+- One-off data backfill (not committed as a migration, per the constraints.md exception for one-off backfills): copied all 1,533 `address_pool_usage` rows from PROD into TEST (public civic-building addresses sourced from OpenStreetMap via `scripts/build-address-pool.mjs` — not customer PII), resetting `use_count`/`last_used_at` to fresh defaults. Verified post-seed: `select claim_address_pool_entry(NULL, NULL)` on TEST now returns a real address instead of erroring.
+- Did **not** retry item `bea426e6-93a9-473b-ba50-119d6f98bc74` (the b11b2839 SIM) — retrying would send it through `ACTIVATION_QUEUE` to the real ATOMIC carrier API even in the test dashboard (carrier calls are never mocked), which is out of scope for an unattended fix. Hermes can safely click Retry on it now that the address pool exists in test.
+- The other two runs Hermes saw (`406036eb…`, `a48b19eb…`) are unrelated **validation-error** runs (`total_items:0`, all rows rejected before any DB write) — no code/data bug, just previously-invisible `run.error` text (see UI fix below).
+
+**UI fix (`src/dashboard/public/index.html`):** the per-item error cell was CSS-truncated (`max-w-[200px] truncate`) with only a hover `title` for the full text, and the run-level `activation_runs.error` column (set when 100% of a submission fails validation) was **never rendered anywhere** in the detail view — a validation-error run showed 0 items and no reason why. Added: a red run-level error banner (`#ar-detail-error-banner`) that always renders the full `run.error` text plus a Copy button; a click-to-expand `#error-detail-modal` (full untruncated `item.error_message`, monospace, scrollable, Copy button) wired to the item table's error cell. No server-side change needed — `handleActivationRunDetail`/`handleActivationRunsList` already returned the full text.
+
+**Tests:** new `tests/dashboard-activation-runs-error-detail.test.mjs` (4 tests, real inline `<script>` executed in a `node:vm` sandbox) — run-level banner shows/hides correctly with the full text, modal renders full text, and a structural guard that neither path ever calls `.slice(`/`.substring(` on the error text. Full suite: 678/678 passing (previous 674 + 4 new).
+
+**Deploy:** not yet redeployed to `dashboard-test` as of this note — deploy after this commit lands (`cd src/dashboard && npx wrangler deploy --env test`). Ask Hermes to verify visually on dashboard-test after deploy: open the b11b2839 run → banner should stay hidden (run.error is null) but the item error cell should open the full RPC-not-found text in a modal; open 406036eb or a48b19eb → the red run-level banner should now show the validation error text.
 
 ---
 
