@@ -3720,8 +3720,7 @@ set verify_pending; schedule §C.3 poll
                             <select id="ar-filter-source" onchange="loadActivationRuns()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                 <option value="">All Sources</option>
                                 <option value="csv">CSV Import</option>
-                                <option value="json">JSON API</option>
-                                <option value="dashboard">Dashboard</option>
+                                <option value="json">Dashboard / JSON API</option>
                             </select>
                         </div>
                     </div>
@@ -4524,6 +4523,7 @@ set verify_pending; schedule §C.3 poll
             'sms-usage': '/sms-usage',
             'guide': '/guide',
             'api-tester': '/api-tester',
+            'activation-runs': '/activation-runs',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
         ROUTE_TO_TAB['/gateway'] = 'gateways'; // legacy alias for old bookmarks
@@ -6830,6 +6830,13 @@ async function sendSimOnline(simId, phoneNumber) {
                     showToast('Queued ' + (result.queued || 0) + ' SIM(s) for activation' + (result.validation_errors > 0 ? ', ' + result.validation_errors + ' validation error(s)' : ''),
                         (result.validation_errors || 0) > 0 ? 'error' : 'success');
                     loadData();
+                    // job_run_id is the activation_runs.id primary key; run_id is
+                    // just a queue-message correlation string and doesn't match
+                    // any row, so the detail view must be opened with job_run_id.
+                    if (result.job_run_id) {
+                        switchTab('activation-runs');
+                        showActivationRunDetail(result.job_run_id);
+                    }
                 } else {
                     showToast(`Error activating SIMs: ${result.error}`, 'error');
                 }
