@@ -1,7 +1,30 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-08-24 (live single-row ATOMIC port-in test run `b6fdced3` — carrier REJECTED the port, PIN wrong at T-Mobile — see session below)
+> Last updated: 2026-08-24 (dashboard: port-in default random subscriber info + custom-info toggle, bulk port-in paste, reseller dropdown applied per-row — see session below)
+
+---
+
+## Session 2026-08-24 (cont'd 3) — port-in UI/flow overhaul: default random subscriber info, bulk port-in paste, reseller dropdown
+
+Zalmen's next ask after the ownership-workflow work: port-in shouldn't require manually clicking "random info" or typing name/address by default (single or bulk), bulk port-in shouldn't be CSV-only, and reseller selection should be a dropdown instead of embedded in pasted rows/CSV columns.
+
+**Shared validator (`src/shared/activation-bulk.mjs`):** new `pickRandomPortIdentity()` draws a random subscriber name (from `NAME_POOL`) + address (from `ADDRESS_POOL`) + a *separate* random old-carrier name — same pools `handleRandomIdentity` already used for the manual "Use random info" button. `validateActivationSim` now calls it automatically whenever a port-in row's 7 subscriber/old-carrier fields are **all** blank (the new default); if **any** one is provided, it falls back to the old strict per-field-required behavior (custom-info mode). Also added `options.resellerId` — a batch-wide reseller that, when present, overrides every row's own `reseller_id` (falls back to row-level when absent, so old CSV/API callers keep working). `parseActivationCsv` no longer requires a `reseller_id` CSV header (still reads it if present).
+
+**bulk-activator (`handleActivateJson`) + dashboard (`handleActivateSims`):** both now accept/forward a top-level `reseller_id` on the `/activate` JSON body, threaded into `validateActivationSim`'s new `resellerId` option — same override semantics as above, applied per-row before `activation_job_items`/queue messages are built. No schema changes; `activation_job_items` still doesn't persist port name/address columns (only the queue message does, as before) — random-filled identity is verified via the queue message body in tests, not the job-item DB row.
+
+**Dashboard UI (`src/dashboard/public/index.html`):** note — the actual frontend lives here as a plain static asset (extracted from `index.js`'s old `getHTML()` back on 2026-06-12, per commit history), *not* inside `index.js` — the `patch-dashboard` skill's CRLF/backtick-escaping workflow is now stale for this file (verified: no CRLF, no `getHTML()` template literal remain in `index.js`); used normal Edit tool + `node --check` on the extracted inline `<script>` blocks instead.
+- Added an "Activate to reseller" `<select>` to the Activate modal (reuses the existing `loadResellers()`/cache pattern), populated on `showActivateModal()`. Removed the old standalone "Reseller ID" text box next to the port fields.
+- Added a "Use custom subscriber info" checkbox, off by default, wrapping the "New subscriber"/"Losing-carrier" manual fields in a `hidden`-by-default `<div>`. Off = fields stay hidden and blank client-side; the server auto-fills random info per row. On = fields show and their values are sent (applied to every row in the pasted/CSV batch, since the modal only has one set of fields).
+- Removed the old "manual port-in accepts exactly one SIM row" cap — `parseManualPortInRow`'s existing 5-column (ICCID/IMEI/MDN/account/PIN) parser is now looped over every pasted line when port-in is checked, so bulk port-in works via paste, not just CSV upload.
+- Regular (non-port-in) paste now uses the same tolerant `splitPasteFields` splitter as port-in rows (tab/space/comma/mixed), accepting 2 columns (ICCID/IMEI, reseller from the dropdown) or the older 3-column (ICCID/IMEI/reseller_id) for backward compatibility — previously it only accepted an exact tab-or-comma 3-column paste.
+- CSV bulk upload: `reseller_id` header is no longer required (dropdown can supply it instead); still read if present.
+
+**Tests:** 693 → 713 (`npm test`, all passing). New/updated: `activation-bulk.test.mjs` (pickRandomPortIdentity, auto-random-when-blank, resellerId override, CSV mixed-rows row now valid), `dashboard-activation-paste-parse.test.mjs` (2-column paste, resellerIdOverride, blank-port-fields-ok), `bulk-activator-job-tracking.test.mjs` (top-level reseller_id applied per row overriding row-level, bulk port-in gets distinct random identity per row via queue message), new `tests/dashboard-activate-reseller-forward.test.mjs` (dashboard proxy forwards reseller_id), new `tests/dashboard-portin-random-info-reseller-dropdown.test.mjs` (markup defaults + a full vm-sandboxed boot simulation of `activateSims()` proving the dropdown value and multi-row port-in paste actually reach the `/activate` fetch body — same boot-harness pattern as `dashboard-activation-runs-boot-render.test.mjs`).
+
+**Pushed to PR #69** (commit `a473fdf`, on top of `43b0a27`). All PR checks passed, including "Deploy shared dashboard preview" — preview at `dashboard-test.zalmen-531.workers.dev` (env.test bindings, no production deploy). No live carrier activation was run this session — validation/unit/boot-simulation only, per this task's constraints.
+
+**Hermes: what to verify live in dashboard-test** — open the Activate SIMs modal: (1) reseller dropdown populated and required when no row supplies its own reseller_id; (2) check "Port in existing number", confirm the subscriber/old-carrier fields stay hidden until "Use custom subscriber info" is checked; (3) paste 2+ port-in rows (ICCID/IMEI/MDN/account/PIN per line) with the custom-info toggle off and submit — should queue all rows without any client-side "name is required" error (server fills random info per row — verify via the run's job items once carrier-callable, or via Activation Runs item detail once processed); (4) paste plain ICCID/IMEI rows (no reseller column) with a reseller selected in the dropdown — should validate and submit; (5) confirm Activation Runs still shows one parent run with the correct per-row item count for a bulk submission.
 
 ---
 
