@@ -108,6 +108,20 @@ export default {
       return handleActivateSims(request, env, corsHeaders);
     }
 
+    // Activation Runs / Jobs tracking
+    if (url.pathname === '/api/activation-runs' && request.method === 'GET') {
+      return handleActivationRunsList(env, corsHeaders, url);
+    }
+
+    if (url.pathname === '/api/activation-runs' && request.method === 'POST') {
+      return handleActivationRunRetry(request, env, corsHeaders);
+    }
+
+    if (url.pathname.startsWith('/api/activation-runs/') && request.method === 'GET') {
+      const runId = url.pathname.slice('/api/activation-runs/'.length);
+      return handleActivationRunDetail(env, corsHeaders, runId, url);
+    }
+
     if (url.pathname === '/api/sim-online') {
       return handleSimOnline(request, env, corsHeaders);
     }
@@ -3210,6 +3224,50 @@ async function supabaseGet(env, path) {
       Accept: 'application/json',
     },
   });
+}
+
+async function supabasePatch(env, path, body) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Supabase PATCH ${res.status}: ${await res.text().catch(() => '')}`);
+}
+
+// Re-derives an activation run's per-status counts and overall status from
+// its child job items — mirrors the queue consumer's recompute in
+// src/bulk-activator/index.js so counts stay consistent after a dashboard retry.
+async function recomputeActivationRunCounts(env, runId) {
+  const itemsResp = await supabaseGet(env, `activation_job_items?select=status&run_id=eq.${encodeURIComponent(runId)}`);
+  const items = itemsResp.ok ? await itemsResp.json() : [];
+  const counts = { queued: 0, processing: 0, done: 0, failed: 0, retry_needed: 0, skipped: 0 };
+  for (const item of items) {
+    if (Object.prototype.hasOwnProperty.call(counts, item.status)) counts[item.status]++;
+  }
+  const total = items.length;
+  const terminal = counts.done + counts.failed + counts.retry_needed + counts.skipped;
+  const patch = {
+    queued_items: counts.queued,
+    processing_items: counts.processing,
+    done_items: counts.done,
+    failed_items: counts.failed,
+    retry_needed_items: counts.retry_needed,
+    skipped_items: counts.skipped,
+    updated_at: new Date().toISOString(),
+  };
+  if (total > 0 && terminal === total) {
+    patch.status = (counts.failed > 0 || counts.retry_needed > 0) ? 'failed' : 'done';
+    patch.finished_at = new Date().toISOString();
+  } else {
+    patch.status = 'processing';
+  }
+  await supabasePatch(env, `activation_runs?id=eq.${runId}`, patch);
 }
 
 async function supabaseGetAllArray(env, pathWithoutLimit) {
@@ -9378,6 +9436,184 @@ async function handleGatewayStatus(request, env) {
     return jsonRes({ ok: true, count: results.length, results });
   } catch (e) {
     return jsonRes({ error: String(e && e.message ? e.message : e) }, 500);
+  }
+}
+
+/* ── Activation Runs / Jobs API ───────────────────────────────────────────── */
+
+async function handleActivationRunsList(env, corsHeaders, url) {
+  try {
+    const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50', 10), 1), 200);
+    const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10), 0);
+    const status = url.searchParams.get('status');
+    const source = url.searchParams.get('source');
+
+    let query = 'activation_runs?select=*&order=created_at.desc&limit=' + limit + '&offset=' + offset;
+    const filters = [];
+    if (status) filters.push('status=eq.' + status);
+    if (source) filters.push('source=eq.' + source);
+    if (filters.length) query += '&' + filters.join('&');
+
+    const resp = await supabaseGet(env, query);
+    const runs = resp.ok ? await resp.json() : [];
+
+    // Also get total count
+    let countQuery = 'activation_runs?select=id';
+    if (filters.length) countQuery += '&' + filters.join('&');
+    const countResp = await supabaseGet(env, countQuery + '&count=exact');
+    const totalCount = countResp.headers?.get?.('content-range')?.split('/').pop() || runs.length;
+
+    return new Response(JSON.stringify({ runs, total: parseInt(totalCount, 10), limit, offset }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleActivationRunDetail(env, corsHeaders, runId, url) {
+  try {
+    // Get the run
+    const runResp = await supabaseGet(env, 'activation_runs?select=*&id=eq.' + encodeURIComponent(runId) + '&limit=1');
+    const runs = runResp.ok ? await runResp.json() : [];
+    if (!runs[0]) {
+      return new Response(JSON.stringify({ error: 'Run not found' }), {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const run = runs[0];
+
+    // Get job items for this run
+    const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '200', 10), 1), 1000);
+    const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10), 0);
+    const status = url.searchParams.get('status');
+
+    let itemsQuery = 'activation_job_items?select=*&run_id=eq.' + encodeURIComponent(runId) + '&order=created_at.asc&limit=' + limit + '&offset=' + offset;
+    if (status) itemsQuery += '&status=eq.' + status;
+
+    const itemsResp = await supabaseGet(env, itemsQuery);
+    const items = itemsResp.ok ? await itemsResp.json() : [];
+
+    // Get total count for this run
+    let countQuery = 'activation_job_items?select=id&run_id=eq.' + encodeURIComponent(runId);
+    if (status) countQuery += '&status=eq.' + status;
+    const countResp = await supabaseGet(env, countQuery + '&count=exact');
+    const totalItems = countResp.headers?.get?.('content-range')?.split('/').pop() || items.length;
+
+    // Also get carrier_api_logs for these items
+    const iccids = [...new Set(items.map(i => i.iccid))];
+    let carrierLogs = [];
+    if (iccids.length > 0) {
+      const inList = iccids.map(c => encodeURIComponent(c)).join(',');
+      const logsResp = await supabaseGet(env, 'carrier_api_logs?select=*&iccid=in.(' + inList + ')&order=created_at.desc&limit=200');
+      carrierLogs = logsResp.ok ? await logsResp.json() : [];
+    }
+
+    return new Response(JSON.stringify({ run, items, total_items: parseInt(totalItems, 10), carrier_logs: carrierLogs, limit, offset }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+async function handleActivationRunRetry(request, env, corsHeaders) {
+  try {
+    const body = await request.json();
+    const { run_id, item_ids, retry_all_failed } = body;
+
+    if (!run_id) {
+      return new Response(JSON.stringify({ error: 'run_id required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Get the run
+    const runResp = await supabaseGet(env, 'activation_runs?select=*&id=eq.' + encodeURIComponent(run_id) + '&limit=1');
+    const runs = runResp.ok ? await runResp.json() : [];
+    if (!runs[0]) {
+      return new Response(JSON.stringify({ error: 'Run not found' }), {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const run = runs[0];
+
+    let itemsToRetry = [];
+
+    if (retry_all_failed) {
+      // Retry all failed and retry_needed items
+      const itemsResp = await supabaseGet(env, 'activation_job_items?select=*&run_id=eq.' + encodeURIComponent(run_id) + '&status=in.(failed,retry_needed)');
+      itemsToRetry = itemsResp.ok ? await itemsResp.json() : [];
+    } else if (item_ids && Array.isArray(item_ids) && item_ids.length > 0) {
+      // Retry specific items
+      const inList = item_ids.map(id => encodeURIComponent(id)).join(',');
+      const itemsResp = await supabaseGet(env, 'activation_job_items?select=*&id=in.(' + inList + ')&run_id=eq.' + encodeURIComponent(run_id));
+      itemsToRetry = itemsResp.ok ? await itemsResp.json() : [];
+      // Filter to only retry failed/retry_needed
+      itemsToRetry = itemsToRetry.filter(i => ['failed', 'retry_needed'].includes(i.status));
+    } else {
+      return new Response(JSON.stringify({ error: 'item_ids array or retry_all_failed=true required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (itemsToRetry.length === 0) {
+      return new Response(JSON.stringify({ ok: true, retried: 0, message: 'No eligible items to retry' }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    // For each item, reset status to queued and re-queue to ACTIVATION_QUEUE
+    let retried = 0;
+    const runIdForQueue = `retry_${Date.now()}`;
+
+    for (const item of itemsToRetry) {
+      // Reset job item status to queued, increment attempt
+      const newAttempt = (item.attempt || 0) + 1;
+      await supabasePatch(env, `activation_job_items?id=eq.${item.id}`, {
+        status: 'queued',
+        attempt: newAttempt,
+        error_message: null,
+        started_at: null,
+        finished_at: null,
+        updated_at: new Date().toISOString(),
+      });
+
+      // Re-queue to activation queue
+      await env.ACTIVATION_QUEUE.send({
+        iccid: item.iccid,
+        imei: item.imei,
+        reseller_id: item.reseller_id,
+        vendor: item.vendor,
+        run_id: runIdForQueue,
+        job_run_id: run_id,
+      });
+      retried++;
+    }
+
+    // Retried items are back to 'queued', so the run's stale done/failed/
+    // retry_needed counts (and status) need to be refreshed from the items
+    // table rather than just flipped back to 'processing'.
+    await recomputeActivationRunCounts(env, run_id);
+
+    return new Response(JSON.stringify({ ok: true, retried, run_id }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
   }
 }
 
