@@ -3216,12 +3216,13 @@ async function handleSkylineProxy(request, env, url, corsHeaders) {
   }
 }
 
-async function supabaseGet(env, path) {
+async function supabaseGet(env, path, extraHeaders) {
   return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       Accept: 'application/json',
+      ...extraHeaders,
     },
   });
 }
@@ -9454,14 +9455,11 @@ async function handleActivationRunsList(env, corsHeaders, url) {
     if (source) filters.push('source=eq.' + source);
     if (filters.length) query += '&' + filters.join('&');
 
-    const resp = await supabaseGet(env, query);
+    // Prefer: count=exact returns the full filtered row count on the same
+    // response (via Content-Range) instead of a second round-trip query.
+    const resp = await supabaseGet(env, query, { Prefer: 'count=exact' });
     const runs = resp.ok ? await resp.json() : [];
-
-    // Also get total count
-    let countQuery = 'activation_runs?select=id';
-    if (filters.length) countQuery += '&' + filters.join('&');
-    const countResp = await supabaseGet(env, countQuery + '&count=exact');
-    const totalCount = countResp.headers?.get?.('content-range')?.split('/').pop() || runs.length;
+    const totalCount = resp.headers?.get?.('content-range')?.split('/').pop() || runs.length;
 
     return new Response(JSON.stringify({ runs, total: parseInt(totalCount, 10), limit, offset }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -9495,14 +9493,11 @@ async function handleActivationRunDetail(env, corsHeaders, runId, url) {
     let itemsQuery = 'activation_job_items?select=*&run_id=eq.' + encodeURIComponent(runId) + '&order=created_at.asc&limit=' + limit + '&offset=' + offset;
     if (status) itemsQuery += '&status=eq.' + status;
 
-    const itemsResp = await supabaseGet(env, itemsQuery);
+    // Prefer: count=exact returns the filtered item count on the same
+    // response (via Content-Range) instead of a second round-trip query.
+    const itemsResp = await supabaseGet(env, itemsQuery, { Prefer: 'count=exact' });
     const items = itemsResp.ok ? await itemsResp.json() : [];
-
-    // Get total count for this run
-    let countQuery = 'activation_job_items?select=id&run_id=eq.' + encodeURIComponent(runId);
-    if (status) countQuery += '&status=eq.' + status;
-    const countResp = await supabaseGet(env, countQuery + '&count=exact');
-    const totalItems = countResp.headers?.get?.('content-range')?.split('/').pop() || items.length;
+    const totalItems = itemsResp.headers?.get?.('content-range')?.split('/').pop() || items.length;
 
     // Also get carrier_api_logs for these items
     const iccids = [...new Set(items.map(i => i.iccid))];

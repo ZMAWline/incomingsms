@@ -70,7 +70,7 @@ function makeSandbox(routes) {
     extractConst('HEALTHY_EVIDENCE_ACTION'),
     extractConst('MAX_REPORT_ID_FILTER'),
     extractFn('function chunkIds(ids, size = MAX_REPORT_ID_FILTER) {'),
-    extractFn('async function supabaseGet(env, path) {'),
+    extractFn('async function supabaseGet(env, path, extraHeaders) {'),
     extractFn('async function fetchAutoResolvedReportIds(env, outcome) {'),
     extractFn('async function handleHealthyEvidenceSummary(env, corsHeaders, url) {'),
   ].join('\n\n');

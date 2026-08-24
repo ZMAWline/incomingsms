@@ -65,17 +65,10 @@ export default {
 
     if (toProcess.length === 0) return json({ ok: true, queued: 0, note: 'No pending rows' });
 
-    // Create parent activation run
-    const runId = `csv_${Date.now()}`;
-    const runUuid = await createActivationRun(env, {
-      source: 'csv',
-      totalItems: toProcess.length,
-      createdBy: 'csv_run',
-    });
-
-    let queued = 0;
+    // Validate all rows first before any DB operations
     let validationErrors = 0;
     const rowErrors = [];
+    const validatedSims = [];
 
     for (const r of toProcess) {
       const checked = validateActivationSim({
@@ -100,22 +93,45 @@ export default {
         rowErrors.push(...checked.errors);
         continue;
       }
-      // Create child job item for this SIM
-      await createActivationJobItem(env, {
-        run_id: runUuid,
-        iccid: checked.sim.iccid,
-        imei: checked.sim.imei,
-        reseller_id: checked.sim.reseller_id,
-        vendor: checked.sim.vendor,
-        status: 'queued',
-      });
-      // Queue with run_id and job_item_id
-      await env.ACTIVATION_QUEUE.send({ ...checked.sim, run_id: runId, job_run_id: runUuid });
-      queued++;
+      validatedSims.push(checked.sim);
     }
 
-    // Update run counts
-    await updateActivationRunCounts(env, runUuid, { queuedItems: queued, validationErrors, rowErrors });
+    // Create parent activation run
+    const runId = `csv_${Date.now()}`;
+    let runUuid;
+    try {
+      runUuid = await createActivationRun(env, {
+        source: 'csv',
+        totalItems: validatedSims.length,
+        createdBy: 'csv_run',
+      });
+    } catch (e) {
+      return new Response(`Failed to create activation run: ${e}`, { status: 502 });
+    }
+
+    let queued = 0;
+    try {
+      if (validatedSims.length > 0) {
+        // One INSERT and one batch of queue sends instead of two round-trips
+        // per SIM — the prior per-row loop was the dominant cost of a CSV run.
+        await createActivationJobItems(env, runUuid, validatedSims);
+        await sendQueueBatch(env.ACTIVATION_QUEUE, validatedSims.map(sim => ({
+          body: { ...sim, run_id: runId, job_run_id: runUuid },
+        })));
+        queued = validatedSims.length;
+      }
+      await updateActivationRunCounts(env, runUuid, { queuedItems: queued, validationErrors, rowErrors });
+    } catch (e) {
+      return json({
+        ok: false,
+        error: `Activation run ${runUuid} created but queuing failed: ${e}`,
+        queued,
+        validation_errors: validationErrors,
+        row_errors: rowErrors,
+        run_id: runId,
+        job_run_id: runUuid,
+      }, 502);
+    }
 
     return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, run_id: runId, job_run_id: runUuid });
   },
@@ -296,30 +312,43 @@ async function handleActivateJson(request, env) {
 
   // Create parent activation run
   const runId = `json_${Date.now()}`;
-  const runUuid = await createActivationRun(env, {
-    source: 'json',
-    totalItems: validatedSims.length,
-    createdBy: 'dashboard',
-  });
-
-  let queued = 0;
-
-  for (const sim of validatedSims) {
-    // Create child job item for this SIM
-    await createActivationJobItem(env, {
-      run_id: runUuid,
-      iccid: sim.iccid,
-      imei: sim.imei,
-      reseller_id: sim.reseller_id,
-      vendor: sim.vendor,
-      status: 'queued',
+  let runUuid;
+  try {
+    runUuid = await createActivationRun(env, {
+      source: 'json',
+      totalItems: validatedSims.length,
+      createdBy: 'dashboard',
     });
-    await env.ACTIVATION_QUEUE.send({ ...sim, run_id: runId, job_run_id: runUuid });
-    queued++;
+  } catch (e) {
+    // Nothing was persisted — safe to report as a plain failure.
+    return json({ ok: false, error: `Failed to create activation run: ${e}`, run_id: null, job_run_id: null }, 502);
   }
 
-  // Update run counts
-  await updateActivationRunCounts(env, runUuid, { queuedItems: queued, validationErrors, rowErrors });
+  let queued = 0;
+  try {
+    if (validatedSims.length > 0) {
+      await createActivationJobItems(env, runUuid, validatedSims);
+      await sendQueueBatch(env.ACTIVATION_QUEUE, validatedSims.map(sim => ({
+        body: { ...sim, run_id: runId, job_run_id: runUuid },
+      })));
+      queued = validatedSims.length;
+    }
+    await updateActivationRunCounts(env, runUuid, { queuedItems: queued, validationErrors, rowErrors });
+  } catch (e) {
+    // The activation_runs row already exists at this point — always return its
+    // job_run_id even on failure so the dashboard can open it and show whatever
+    // partially succeeded, instead of surfacing a bare error and orphaning it.
+    return json({
+      ok: false,
+      error: `Activation run ${runUuid} created but queuing failed: ${e}`,
+      queued,
+      validation_errors: validationErrors,
+      row_errors: rowErrors,
+      attempted: sims.length,
+      run_id: runId,
+      job_run_id: runUuid,
+    }, 502);
+  }
 
   return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, attempted: sims.length, run_id: runId, job_run_id: runUuid });
 }
@@ -359,20 +388,30 @@ async function createActivationRun(env, { source, totalItems, createdBy }) {
   return rows[0].id;
 }
 
-async function createActivationJobItem(env, { run_id, iccid, imei, reseller_id, vendor, status }) {
-  const rows = await supabaseInsert(env, 'activation_job_items', [{
-    run_id,
-    iccid,
-    imei,
-    reseller_id,
-    vendor,
-    status,
+// One INSERT for the whole batch instead of one round-trip per SIM — the
+// per-item loop this replaced was the dominant cost of a bulk /activate call.
+async function createActivationJobItems(env, runId, sims) {
+  const queuedAt = new Date().toISOString();
+  const rows = await supabaseInsert(env, 'activation_job_items', sims.map(sim => ({
+    run_id: runId,
+    iccid: sim.iccid,
+    imei: sim.imei,
+    reseller_id: sim.reseller_id,
+    vendor: sim.vendor,
+    status: 'queued',
     attempt: 0,
     max_attempts: 3,
-    queued_at: new Date().toISOString(),
-  }]);
-  if (!rows?.[0]?.id) throw new Error('Failed to create activation job item');
-  return rows[0].id;
+    queued_at: queuedAt,
+  })));
+  if (rows.length !== sims.length) throw new Error(`Expected ${sims.length} activation job items, got ${rows.length}`);
+  return rows;
+}
+
+// Cloudflare Queues caps sendBatch() at 100 messages per call.
+async function sendQueueBatch(queue, messages) {
+  for (let i = 0; i < messages.length; i += 100) {
+    await queue.sendBatch(messages.slice(i, i + 100));
+  }
 }
 
 async function updateActivationRunCounts(env, runId, { queuedItems = 0, validationErrors = 0, rowErrors = [] }) {

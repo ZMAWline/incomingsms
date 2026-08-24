@@ -12,6 +12,16 @@
 //    `job_run_id` (the actual activation_runs.id) — only job_run_id can be
 //    used to open the run detail view.
 //
+// Section 4 below covers a follow-up round: handleActivationRunsList and
+// handleActivationRunDetail each issued a redundant second Supabase query
+// just to get a row count, doubling the latency of every list/detail load
+// (part of the "portal is super slow" report); they now use the
+// `Prefer: count=exact` header to get the count from the same request's
+// Content-Range response header. See also tests/bulk-activator-job-tracking.test.mjs
+// for the matching bulk-activator fix (batched job-item inserts and queue
+// sends instead of a serial per-SIM loop, which was the dominant cost of
+// submitting a bulk activation).
+//
 // The dashboard frontend is a single static HTML file with inline <script>,
 // not a bundled module, so these lift the exact source text out of
 // index.html/index.js and evaluate it, mirroring the pattern used by
@@ -123,9 +133,9 @@ function makeSandbox(routes) {
   const calls = [];
   const sandbox = {
     console, Response, URL, URLSearchParams,
-    async fetch(url) {
+    async fetch(url, init) {
       const u = String(url);
-      calls.push(u);
+      calls.push({ url: u, headers: (init && init.headers) || {} });
       for (const [pattern, handler] of routes) {
         if (u.includes(pattern)) return handler(u);
       }
@@ -134,7 +144,7 @@ function makeSandbox(routes) {
   };
   vm.createContext(sandbox);
   const code = [
-    extractFn(SRC, 'async function supabaseGet(env, path) {'),
+    extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
     extractFn(SRC, 'async function handleActivationRunsList(env, corsHeaders, url) {'),
   ].join('\n\n');
   vm.runInContext(code, sandbox);
@@ -146,12 +156,10 @@ const ENV = { SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'srv' 
 test('activation-runs list applies no status/source filter when none is requested', async () => {
   const freshRun = { id: 'new-run-uuid', source: 'json', status: 'queued', created_at: '2026-08-24T12:00:00Z' };
   const { sandbox, calls } = makeSandbox([
-    ['/activation_runs', (u) => {
-      if (u.includes('count=exact')) {
-        return new Response('[]', { status: 200, headers: { 'content-range': '0-0/1' } });
-      }
-      return new Response(JSON.stringify([freshRun]), { status: 200 });
-    }],
+    ['/activation_runs', () => new Response(JSON.stringify([freshRun]), {
+      status: 200,
+      headers: { 'content-range': '0-0/1' },
+    })],
   ]);
 
   const url = new sandbox.URL('https://dashboard.test/api/activation-runs');
@@ -159,19 +167,82 @@ test('activation-runs list applies no status/source filter when none is requeste
   const body = await res.json();
 
   assert.deepEqual(body.runs, [freshRun], 'a run with no explicit filter selection is returned');
-  assert.ok(calls.some(c => c.includes('/activation_runs?select=*')), 'base query issued');
-  assert.ok(!calls.some(c => c.includes('status=eq.')), 'no status filter applied when status is unset');
-  assert.ok(!calls.some(c => c.includes('source=eq.')), 'no source filter applied when source is unset');
+  assert.equal(body.total, 1, 'total count is read from the single request\'s Content-Range header');
+  assert.equal(calls.length, 1, 'the list and its count come from one round-trip, not two');
+  assert.ok(calls[0].url.includes('/activation_runs?select=*'), 'base query issued');
+  assert.equal(calls[0].headers.Prefer, 'count=exact', 'count is requested via the Prefer header, not a second query');
+  assert.ok(!calls[0].url.includes('status=eq.'), 'no status filter applied when status is unset');
+  assert.ok(!calls[0].url.includes('source=eq.'), 'no source filter applied when source is unset');
 });
 
 test('activation-runs list orders newest-first so a just-submitted run is on page one', async () => {
   const { sandbox, calls } = makeSandbox([
-    ['/activation_runs', (u) => {
-      if (u.includes('count=exact')) return new Response('[]', { status: 200, headers: { 'content-range': '0-0/0' } });
-      return new Response('[]', { status: 200 });
-    }],
+    ['/activation_runs', () => new Response('[]', { status: 200, headers: { 'content-range': '0-0/0' } })],
   ]);
   const url = new sandbox.URL('https://dashboard.test/api/activation-runs');
   await sandbox.handleActivationRunsList(ENV, {}, url);
-  assert.ok(calls.some(c => c.includes('order=created_at.desc')), 'newest runs sort first');
+  assert.ok(calls.some(c => c.url.includes('order=created_at.desc')), 'newest runs sort first');
+});
+
+// ---------------------------------------------------------------------
+// 4. Run detail can be opened by id right after submit (the other half of
+//    the "invisible new run" bug — activateSims() navigates straight to
+//    /api/activation-runs/<job_run_id>, so this endpoint must find it) and
+//    does so without a redundant items-count round-trip.
+// ---------------------------------------------------------------------
+
+function makeDetailSandbox(routes) {
+  const calls = [];
+  const sandbox = {
+    console, Response, URL, URLSearchParams,
+    async fetch(url, init) {
+      const u = String(url);
+      calls.push({ url: u, headers: (init && init.headers) || {} });
+      for (const [pattern, handler] of routes) {
+        if (u.includes(pattern)) return handler(u);
+      }
+      return new Response('[]', { status: 200 });
+    },
+  };
+  vm.createContext(sandbox);
+  const code = [
+    extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
+    extractFn(SRC, 'async function handleActivationRunDetail(env, corsHeaders, runId, url) {'),
+  ].join('\n\n');
+  vm.runInContext(code, sandbox);
+  return { sandbox, calls };
+}
+
+test('a just-created run is found by id, with item count from one round-trip', async () => {
+  const run = { id: 'run-1', source: 'json', status: 'processing', total_items: 1, created_at: '2026-08-24T12:00:00Z' };
+  const item = { id: 'item-1', run_id: 'run-1', iccid: '89014103271467425631', status: 'queued' };
+  const { sandbox, calls } = makeDetailSandbox([
+    ['/activation_runs?select=*&id=eq.run-1', () => new Response(JSON.stringify([run]), { status: 200 })],
+    ['/activation_job_items', (u) => u.includes('run_id=eq.run-1')
+      ? new Response(JSON.stringify([item]), { status: 200, headers: { 'content-range': '0-0/1' } })
+      : new Response('[]', { status: 200 })],
+    ['/carrier_api_logs', () => new Response('[]', { status: 200 })],
+  ]);
+
+  const url = new sandbox.URL('https://dashboard.test/api/activation-runs/run-1');
+  const res = await sandbox.handleActivationRunDetail(ENV, {}, 'run-1', url);
+  const body = await res.json();
+
+  assert.equal(res.status, 200, 'the just-submitted run is found, not a 404');
+  assert.deepEqual(body.run, run);
+  assert.deepEqual(body.items, [item]);
+  assert.equal(body.total_items, 1, 'item count is read from Content-Range, not a second query');
+
+  const itemCalls = calls.filter(c => c.url.includes('/activation_job_items'));
+  assert.equal(itemCalls.length, 1, 'items and their count come from one round-trip');
+  assert.equal(itemCalls[0].headers.Prefer, 'count=exact', 'count requested via the Prefer header');
+});
+
+test('an unknown run id returns 404 instead of a silent empty page', async () => {
+  const { sandbox } = makeDetailSandbox([
+    ['/activation_runs?select=*&id=eq.missing', () => new Response('[]', { status: 200 })],
+  ]);
+  const url = new sandbox.URL('https://dashboard.test/api/activation-runs/missing');
+  const res = await sandbox.handleActivationRunDetail(ENV, {}, 'missing', url);
+  assert.equal(res.status, 404);
 });

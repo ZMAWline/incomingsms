@@ -4528,7 +4528,7 @@ set verify_pending; schedule §C.3 poll
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
         ROUTE_TO_TAB['/gateway'] = 'gateways'; // legacy alias for old bookmarks
 
-        function switchTab(tabName, push = true) {
+        function switchTab(tabName, push = true, autoLoad = true) {
             toggleSidebar(false);
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
             document.querySelectorAll('.sidebar-btn').forEach(el => {
@@ -4576,17 +4576,19 @@ set verify_pending; schedule §C.3 poll
                 if (_st) _st.textContent = _hdr[2];
             }
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
-            if (tabName === 'imei-pool') loadImeiPool();
-            if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
-            if (tabName === 'errors') loadErrors();
-            if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); }
-            if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
-            if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
-            if (tabName === 'sms-usage') loadSmsUsage();
-            if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} }
-            if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); }
-            if (tabName === 'workers') loadHostingPortJobs();
-            if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); }
+            if (autoLoad) {
+                if (tabName === 'imei-pool') loadImeiPool();
+                if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
+                if (tabName === 'errors') loadErrors();
+                if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); }
+                if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
+                if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
+                if (tabName === 'sms-usage') loadSmsUsage();
+                if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} }
+                if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); }
+                if (tabName === 'workers') loadHostingPortJobs();
+                if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); }
+            }
         }
 
         // Handle browser back/forward
@@ -6833,8 +6835,10 @@ async function sendSimOnline(simId, phoneNumber) {
                     // job_run_id is the activation_runs.id primary key; run_id is
                     // just a queue-message correlation string and doesn't match
                     // any row, so the detail view must be opened with job_run_id.
+                    // autoLoad=false skips the tab's default list fetch since
+                    // showActivationRunDetail immediately replaces it anyway.
                     if (result.job_run_id) {
-                        switchTab('activation-runs');
+                        switchTab('activation-runs', true, false);
                         showActivationRunDetail(result.job_run_id);
                     }
                 } else {
@@ -14363,6 +14367,10 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('activation-run-detail').classList.add('hidden');
             document.getElementById('activation-runs-list').classList.remove('hidden');
             currentRunId = null;
+            // Refresh rather than rely on stale data — a direct-open (e.g. right
+            // after submitting) may never have loaded the list in the background.
+            activationRunsPage = 0;
+            loadActivationRuns();
         }
 
         async function loadActivationRunItems() {
@@ -14433,7 +14441,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         <td class="px-4 py-3 text-center">${item.attempt || 0} / ${item.max_attempts || 3}</td>
                         <td class="px-4 py-3 text-xs text-red-400 max-w-[200px] truncate" title="${escapeHtml(item.error_message || '')}">${escapeHtml(item.error_message || '—')}</td>
                         <td class="px-4 py-3 text-center">${item.sim_id || '—'}</td>
-                        <td class="px-4 py-3 text-center">${logs.length > 0 ? `<button onclick="showCarrierLogsModal('${escapeHtml(item.iccid)}', ${JSON.stringify(logs).replace(/"/g, '"')})" class="px-2 py-1 text-xs bg-cyan-600 hover:bg-cyan-700 text-white rounded transition">${logs.length} logs</button>` : '—'}</td>
+                        <td class="px-4 py-3 text-center">${logs.length > 0 ? `<button onclick="showCarrierLogsModal('${escapeHtml(item.iccid)}', ${escapeHtml(JSON.stringify(logs))})" class="px-2 py-1 text-xs bg-cyan-600 hover:bg-cyan-700 text-white rounded transition">${logs.length} logs</button>` : '—'}</td>
                         <td class="px-4 py-3 text-xs">${escapeHtml(item.queued_at ? fmt(item.queued_at) : '—')}</td>
                         <td class="px-4 py-3 text-xs">${escapeHtml(item.started_at ? fmt(item.started_at) : '—')}</td>
                         <td class="px-4 py-3 text-xs">${escapeHtml(item.finished_at ? fmt(item.finished_at) : '—')}</td>
