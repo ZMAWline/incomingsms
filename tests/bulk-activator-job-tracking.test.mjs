@@ -238,3 +238,113 @@ test('a queueing failure after the run is created still returns JSON with job_ru
     restore();
   }
 });
+
+// ---------------------------------------------------------------------
+// Batch-wide reseller dropdown + default random port-in subscriber info:
+// a top-level body.reseller_id applies to every row (overriding any
+// per-row reseller_id), and port-in rows with no name/address fields get
+// a distinct random identity per row instead of failing validation — both
+// must survive all the way through to the queued job items/messages, and
+// the parent activation_runs row + activation_job_items rows must still
+// be created correctly.
+// ---------------------------------------------------------------------
+
+test('a top-level reseller_id is applied to every row, overriding any per-row reseller_id', async () => {
+  const { requests, restore } = makeSupabaseMock();
+  try {
+    const sentBatches = [];
+    const env = {
+      BULK_RUN_SECRET: 'test-secret',
+      SUPABASE_URL: 'https://sb.test',
+      SUPABASE_SERVICE_ROLE_KEY: 'srv',
+      ACTIVATION_QUEUE: { sendBatch: async (msgs) => { sentBatches.push(msgs); } },
+    };
+    const req = new Request('https://bulk-activator/activate?secret=test-secret', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        reseller_id: 7,
+        sims: [
+          { iccid: '89014103271467425631', imei: '123456789012345', vendor: 'atomic' }, // no reseller_id at all
+          { iccid: '89014103271467425632', imei: '123456789012346', reseller_id: '1', vendor: 'atomic' }, // has one — dropdown still wins
+        ],
+      }),
+    });
+
+    const res = await worker.fetch(req, env);
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.queued, 2);
+
+    const jobItemInsert = requests.find(r => r.url.includes('/activation_job_items') && r.method === 'POST');
+    assert.ok(jobItemInsert, 'job items were inserted');
+    for (const row of jobItemInsert.body) assert.equal(row.reseller_id, 7);
+
+    assert.equal(sentBatches.length, 1);
+    for (const msg of sentBatches[0]) assert.equal(msg.body.reseller_id, 7);
+  } finally {
+    restore();
+  }
+});
+
+test('bulk port-in submission with no name/address fields gets a distinct random identity per row, other fields untouched', async () => {
+  const { requests, restore } = makeSupabaseMock();
+  try {
+    const sentBatches = [];
+    const env = {
+      BULK_RUN_SECRET: 'test-secret',
+      SUPABASE_URL: 'https://sb.test',
+      SUPABASE_SERVICE_ROLE_KEY: 'srv',
+      ACTIVATION_QUEUE: { sendBatch: async (msgs) => { sentBatches.push(msgs); } },
+    };
+    const sims = [
+      { iccid: '89014103271467425631', imei: '123456789012345', vendor: 'atomic', port_in: 'true', port_mdn: '2125550101', port_account_number: 'ACCT1', port_pin: '1111' },
+      { iccid: '89014103271467425632', imei: '123456789012346', vendor: 'atomic', port_in: 'true', port_mdn: '2125550102', port_account_number: 'ACCT2', port_pin: '2222' },
+    ];
+    const req = new Request('https://bulk-activator/activate?secret=test-secret', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reseller_id: 4, sims }),
+    });
+
+    const res = await worker.fetch(req, env);
+    const body = await res.json();
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.queued, 2);
+
+    const jobItemInsert = requests.find(r => r.url.includes('/activation_job_items') && r.method === 'POST');
+    assert.equal(jobItemInsert.body.length, 2, 'one job item per SIM — Activation Runs still tracks per-row items');
+    assert.equal(jobItemInsert.body[0].iccid, '89014103271467425631');
+    assert.equal(jobItemInsert.body[1].iccid, '89014103271467425632');
+    assert.equal(jobItemInsert.body[0].reseller_id, 4);
+    assert.equal(jobItemInsert.body[1].reseller_id, 4);
+
+    // activation_job_items doesn't persist port name/address columns — the
+    // auto-filled random identity travels to the carrier call only via the
+    // queue message, so assert it there.
+    assert.equal(sentBatches.length, 1);
+    assert.equal(sentBatches[0].length, 2);
+    const [msg1, msg2] = sentBatches[0].map(m => m.body);
+    for (const row of [msg1, msg2]) {
+      assert.ok(row.port_first_name, 'random first name filled');
+      assert.ok(row.port_last_name, 'random last name filled');
+      assert.ok(row.port_street_number, 'random street number filled');
+      assert.ok(row.port_old_first_name, 'random old-carrier first name filled');
+    }
+    // Random info is per-row, not one identity reused for the whole batch.
+    assert.notEqual(msg1.port_first_name + msg1.port_last_name, msg2.port_first_name + msg2.port_last_name,
+      'each port-in row in the batch gets its own distinct random identity');
+
+    // Random info must never touch ICCID/IMEI/MDN/account/PIN/reseller.
+    assert.equal(msg1.iccid, '89014103271467425631');
+    assert.equal(msg2.iccid, '89014103271467425632');
+    assert.equal(msg1.port_mdn, '2125550101');
+    assert.equal(msg2.port_mdn, '2125550102');
+    assert.equal(msg1.port_account_number, 'ACCT1');
+    assert.equal(msg2.port_account_number, 'ACCT2');
+    assert.equal(msg1.reseller_id, 4);
+    assert.equal(msg2.reseller_id, 4);
+  } finally {
+    restore();
+  }
+});

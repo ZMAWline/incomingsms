@@ -6,6 +6,7 @@ import {
   buildAtomicPortInRequest,
   buildAtomicPortInStatusRequest,
   parseActivationCsv,
+  pickRandomPortIdentity,
   validateActivationSim,
 } from '../src/shared/activation-bulk.mjs';
 
@@ -205,14 +206,18 @@ test('bulk CSV accepts mixed rows and returns row-level errors', () => {
   const parsed = parseActivationCsv(csv);
   // Row 1: valid new-number activation. Row 2: valid, COMPLETE port-in (this is
   // the case the old blanket block used to reject outright — it must now pass).
-  assert.equal(parsed.valid.length, 2);
-  assert.equal(parsed.invalid.length, 2);
+  // Row 4: port-in with ALL name/address fields blank — no longer an error;
+  // defaults to an auto-generated random subscriber identity per row.
+  assert.equal(parsed.valid.length, 3);
+  assert.equal(parsed.invalid.length, 1);
   assert.equal(parsed.valid[0].sim.port_mdn, '');
   assert.equal(parsed.valid[1].sim.port_mdn, '2125550199');
   assert.equal(parsed.valid[1].sim.port_old_last_name, 'Smith');
-  // Row 3: missing port_mdn. Row 4: missing subscriber/old_service_provider fields.
+  assert.equal(parsed.valid[2].sim.port_mdn, '2125550299');
+  assert.ok(parsed.valid[2].sim.port_first_name, 'row 4 gets an auto-filled random first name');
+  assert.ok(parsed.valid[2].sim.port_old_last_name, 'row 4 gets an auto-filled random old-carrier last name');
+  // Row 3: missing port_mdn — still a hard error regardless of random-fill.
   assert.match(parsed.invalid[0].errors.join('\n'), /port_mdn is required/);
-  assert.match(parsed.invalid[1].errors.join('\n'), /port_first_name is required/);
 });
 
 // Regression: the outgoing ATOMIC payload must actually carry every field the
@@ -329,4 +334,112 @@ test('buildAtomicPortInStatusRequest uses a distinct requestType from portinRequ
     activate.wholeSaleApi.wholeSaleRequest.requestType,
   ]);
   assert.equal(types.size, 3, 'portinStatus, portinRequest, and Activate must be three distinct requestTypes');
+});
+
+// ── Default random subscriber info (no manual click/fields required) ──────
+
+test('pickRandomPortIdentity returns only name/address fields, subscriber and old-carrier names differ', () => {
+  const identity = pickRandomPortIdentity();
+  assert.deepEqual(Object.keys(identity).sort(), [
+    'port_first_name', 'port_last_name', 'port_old_first_name', 'port_old_last_name',
+    'port_street_name', 'port_street_number', 'port_zip',
+  ].sort());
+  for (const v of Object.values(identity)) assert.ok(String(v).length > 0);
+});
+
+test('port-in row with no name/address fields auto-fills a random identity instead of erroring', () => {
+  const checked = validateActivationSim({
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
+    reseller_id: '1',
+    vendor: 'atomic',
+    port_in: 'true',
+    port_mdn: '2125550199',
+    port_account_number: 'ACCT12345',
+    port_pin: '1234',
+    // no port_first_name / port_last_name / street / zip / old_* — this is
+    // exactly the shape of a 5-column ICCID/IMEI/MDN/account/PIN paste row.
+  });
+  assert.equal(checked.ok, true);
+  assert.ok(checked.sim.port_first_name);
+  assert.ok(checked.sim.port_last_name);
+  assert.ok(checked.sim.port_street_number);
+  assert.ok(checked.sim.port_street_name);
+  assert.ok(checked.sim.port_zip);
+  assert.ok(checked.sim.port_old_first_name);
+  assert.ok(checked.sim.port_old_last_name);
+  // Random info must never touch these fields.
+  assert.equal(checked.sim.iccid, '89014103271467425631');
+  assert.equal(checked.sim.imei, '123456789012345');
+  assert.equal(checked.sim.port_mdn, '2125550199');
+  assert.equal(checked.sim.port_account_number, 'ACCT12345');
+  assert.equal(checked.sim.port_pin, '1234');
+  assert.equal(checked.sim.reseller_id, 1);
+});
+
+test('two random-fill port-in rows in the same batch get distinct identities', () => {
+  const base = {
+    iccid: '89014103271467425631', imei: '123456789012345', reseller_id: '1', vendor: 'atomic',
+    port_in: 'true', port_mdn: '2125550199', port_account_number: 'ACCT12345', port_pin: '1234',
+  };
+  // Run several times — random pools are large, but guard against flakiness
+  // from an astronomically unlucky identical draw by trying a few times.
+  let sawDifferent = false;
+  for (let i = 0; i < 5 && !sawDifferent; i++) {
+    const a = validateActivationSim(base).sim;
+    const b = validateActivationSim(base).sim;
+    if (a.port_first_name !== b.port_first_name || a.port_last_name !== b.port_last_name) sawDifferent = true;
+  }
+  assert.ok(sawDifferent, 'expected at least one pair of distinct random identities across 5 draws');
+});
+
+test('any single port name/address field provided switches to strict custom-info validation', () => {
+  const checked = validateActivationSim({
+    iccid: '89014103271467425631', imei: '123456789012345', reseller_id: '1', vendor: 'atomic',
+    port_in: 'true', port_mdn: '2125550199', port_account_number: 'ACCT12345', port_pin: '1234',
+    port_first_name: 'John', // only one custom field set — the rest are missing
+  });
+  assert.equal(checked.ok, false);
+  assert.match(checked.errors.join('\n'), /port_last_name is required/);
+});
+
+// ── Batch-wide reseller dropdown overrides per-row reseller_id ─────────────
+
+test('options.resellerId overrides a row-level reseller_id', () => {
+  const checked = validateActivationSim(
+    { iccid: '89014103271467425631', imei: '123456789012345', reseller_id: '1', vendor: 'atomic' },
+    { resellerId: 7 }
+  );
+  assert.equal(checked.ok, true);
+  assert.equal(checked.sim.reseller_id, 7);
+});
+
+test('row-level reseller_id is used when no batch-wide resellerId option is given', () => {
+  const checked = validateActivationSim(
+    { iccid: '89014103271467425631', imei: '123456789012345', reseller_id: '3', vendor: 'atomic' },
+    {}
+  );
+  assert.equal(checked.ok, true);
+  assert.equal(checked.sim.reseller_id, 3);
+});
+
+test('a row missing reseller_id is valid once a batch-wide resellerId is supplied', () => {
+  const checked = validateActivationSim(
+    { iccid: '89014103271467425631', imei: '123456789012345', vendor: 'atomic' },
+    { resellerId: '9' }
+  );
+  assert.equal(checked.ok, true);
+  assert.equal(checked.sim.reseller_id, 9);
+});
+
+test('parseActivationCsv no longer requires a reseller_id header, applies options.resellerId to every row', () => {
+  const csv = [
+    'iccid,imei',
+    '89014103271467425631,123456789012345',
+    '89014103271467425632,123456789012346',
+  ].join('\n');
+  const parsed = parseActivationCsv(csv, { resellerId: 5 });
+  assert.equal(parsed.valid.length, 2);
+  assert.equal(parsed.valid[0].sim.reseller_id, 5);
+  assert.equal(parsed.valid[1].sim.reseller_id, 5);
 });

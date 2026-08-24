@@ -286,12 +286,15 @@ async function handleActivateJson(request, env) {
 
   // Validate all SIMs first before any DB operations
   const defaultVendor = body.vendor || 'atomic';
+  // Batch-wide reseller (dashboard's "activate to reseller" dropdown) — applied
+  // to every row by validateActivationSim, overriding any per-row reseller_id.
+  const resellerId = body.reseller_id;
   const validatedSims = [];
   let validationErrors = 0;
   const rowErrors = [];
 
   for (let i = 0; i < sims.length; i++) {
-    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor });
+    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor, resellerId });
     if (!checked.ok) {
       validationErrors++;
       rowErrors.push(...checked.errors);

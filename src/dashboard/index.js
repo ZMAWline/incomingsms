@@ -1544,6 +1544,9 @@ async function handleActivateSims(request, env, corsHeaders) {
     const body = await request.json();
     const sims = body.sims || [];
     const vendor = body.vendor || 'atomic';
+    // Batch-wide reseller (dashboard's "activate to reseller" dropdown) —
+    // forwarded as-is; bulk-activator applies it to every row.
+    const resellerId = body.reseller_id;
 
     if (!Array.isArray(sims) || sims.length === 0) {
       return new Response(JSON.stringify({ error: 'sims array is required' }), {
@@ -1565,7 +1568,7 @@ async function handleActivateSims(request, env, corsHeaders) {
     const activateResponse = await env.BULK_ACTIVATOR.fetch(activateUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sims, vendor })
+      body: JSON.stringify({ sims, vendor, reseller_id: resellerId })
     });
 
     // Handle non-JSON responses (e.g., Cloudflare errors)

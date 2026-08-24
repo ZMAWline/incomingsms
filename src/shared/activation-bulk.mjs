@@ -1,3 +1,6 @@
+import { NAME_POOL } from './name-pool.mjs';
+import { ADDRESS_POOL } from './address-pool.mjs';
+
 export const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin', 'port_first_name', 'port_last_name', 'port_street_number', 'port_street_name', 'port_zip', 'port_old_first_name', 'port_old_last_name'];
 
 // Required subscriber (new account holder) + old_service_provider (losing-carrier
@@ -17,6 +20,34 @@ const REQUIRED_PORT_FIELDS = [
 
 const TRUTHY = new Set(['1', 'true', 'yes', 'y', 'port', 'port_in', 'on']);
 const FALSY = new Set(['', '0', 'false', 'no', 'n', 'new', 'new_number', 'off']);
+
+// Default port-in behavior: an operator should never have to hand-type a
+// subscriber name/address just to submit a port-in. When a row's port
+// subscriber/old-carrier fields are left entirely blank, validateActivationSim
+// fills them from these fake-identity/address pools automatically (called once
+// PER ROW so a bulk port-in batch gets a distinct random identity per line —
+// never the same name repeated across a batch). Only name/address fields are
+// touched; port_mdn/port_account_number/port_pin/iccid/imei/reseller_id are
+// never generated here.
+export function pickRandomPortIdentity() {
+  const subIdx = Math.floor(Math.random() * NAME_POOL.length);
+  let oldIdx = Math.floor(Math.random() * NAME_POOL.length);
+  if (NAME_POOL.length > 1 && oldIdx === subIdx) {
+    oldIdx = (oldIdx + 1) % NAME_POOL.length;
+  }
+  const name = NAME_POOL[subIdx];
+  const oldName = NAME_POOL[oldIdx];
+  const address = ADDRESS_POOL[Math.floor(Math.random() * ADDRESS_POOL.length)];
+  return {
+    port_first_name: name.firstName,
+    port_last_name: name.lastName,
+    port_street_number: address.streetNumber,
+    port_street_name: address.streetName,
+    port_zip: address.zipCode,
+    port_old_first_name: oldName.firstName,
+    port_old_last_name: oldName.lastName,
+  };
+}
 
 export function parseCsv(text) {
   const rows = [];
@@ -73,10 +104,18 @@ export function validateActivationSim(input, options = {}) {
   const rowNumber = options.rowNumber || null;
   const prefix = rowNumber ? `Row ${rowNumber}: ` : '';
   const defaultVendor = options.defaultVendor || 'atomic';
+  // A batch-wide reseller_id (from the dashboard's "activate to reseller"
+  // dropdown) always wins over any per-row value — the dropdown applies to
+  // every row in the submitted batch. When absent, fall back to the row's
+  // own reseller_id for backward compatibility with older CSV/paste formats
+  // and direct API callers that still send it per row.
+  const resellerIdSource = (options.resellerId !== undefined && options.resellerId !== null && String(options.resellerId).trim() !== '')
+    ? options.resellerId
+    : (input?.reseller_id ?? input?.resellerId ?? '');
   const sim = {
     iccid: String(input?.iccid || '').trim(),
     imei: String(input?.imei || '').trim(),
-    reseller_id: Number.parseInt(String(input?.reseller_id ?? input?.resellerId ?? '').trim(), 10),
+    reseller_id: Number.parseInt(String(resellerIdSource).trim(), 10),
     vendor: String(input?.vendor || defaultVendor || 'atomic').trim() || 'atomic',
     port_in: parseBooleanFlag(input?.port_in ?? input?.portIn),
     port_mdn: '',
@@ -117,16 +156,29 @@ export function validateActivationSim(input, options = {}) {
       sim.port_pin = portPin;
     }
     // subscriber.* (new account holder) + old_service_provider.* (losing-carrier
-    // account holder) — required by the carrier's portinRequest; block with a
+    // account holder) — required by the carrier's portinRequest. Default
+    // behavior: when the caller supplies none of these fields (the dashboard's
+    // "use custom subscriber info" toggle is off, or a bulk paste/CSV row simply
+    // has no name/address columns), auto-fill a random identity per row instead
+    // of erroring — see pickRandomPortIdentity. If ANY field is supplied, treat
+    // it as an explicit custom-info submission and require every field, with a
     // specific per-field error rather than silently falling back to a new-number
     // Activate submission.
-    for (const key of REQUIRED_PORT_FIELDS) {
+    const anyPortFieldProvided = REQUIRED_PORT_FIELDS.some(key => {
       const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-      const val = String(input?.[key] ?? input?.[camel] ?? '').trim();
-      if (!val) {
-        errors.push(prefix + key + ' is required for port-in');
-      } else {
-        sim[key] = val;
+      return String(input?.[key] ?? input?.[camel] ?? '').trim() !== '';
+    });
+    if (!anyPortFieldProvided) {
+      Object.assign(sim, pickRandomPortIdentity());
+    } else {
+      for (const key of REQUIRED_PORT_FIELDS) {
+        const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+        const val = String(input?.[key] ?? input?.[camel] ?? '').trim();
+        if (!val) {
+          errors.push(prefix + key + ' is required for port-in');
+        } else {
+          sim[key] = val;
+        }
       }
     }
   }
@@ -139,7 +191,11 @@ export function parseActivationCsv(text, options = {}) {
   if (rows.length === 0) return { rows: [], valid: [], invalid: [{ row: 1, errors: ['CSV is empty'] }], errors: ['CSV is empty'] };
   const header = rows[0].map(normalizeHeader);
   const headerErrors = [];
-  for (const name of ['iccid', 'imei', 'reseller_id']) requireHeader(header, name, headerErrors);
+  // reseller_id is no longer a required CSV column — a batch-wide reseller can
+  // be supplied via options.resellerId (the dashboard's reseller dropdown) and
+  // applied to every row. The column is still read/parsed when present, for
+  // backward compatibility with older sheets/API callers.
+  for (const name of ['iccid', 'imei']) requireHeader(header, name, headerErrors);
   if (headerErrors.length) return { rows: [], valid: [], invalid: [{ row: 1, errors: headerErrors }], errors: headerErrors };
 
   const valid = [];
@@ -166,7 +222,7 @@ export function parseActivationCsv(text, options = {}) {
       port_old_first_name: valueAt(row, header, 'port_old_first_name'),
       port_old_last_name: valueAt(row, header, 'port_old_last_name'),
     };
-    const result = validateActivationSim(candidate, { rowNumber, defaultVendor });
+    const result = validateActivationSim(candidate, { rowNumber, defaultVendor, resellerId: options.resellerId });
     if (result.ok) valid.push({ row: rowNumber, sim: result.sim });
     else invalid.push({ row: rowNumber, errors: result.errors, raw: candidate });
   });
