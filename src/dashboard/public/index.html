@@ -4528,6 +4528,19 @@ set verify_pending; schedule §C.3 poll
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
         ROUTE_TO_TAB['/gateway'] = 'gateways'; // legacy alias for old bookmarks
 
+        // Activation Runs tab state — must be initialized before switchTab can run,
+        // because a deep-link/direct page load resolves straight into
+        // switchTab('activation-runs') via initTabFromUrl() before the rest of the
+        // script has executed. Declaring these later (as `let`) left them in the
+        // temporal dead zone at that call site, throwing a ReferenceError that
+        // aborted the whole boot script before loadActivationRuns() ever ran —
+        // the tab rendered its static empty table with zero rows.
+        let activationRunsPage = 0;
+        let activationItemsPage = 0;
+        const ACTIVATION_RUNS_PAGE_SIZE = 50;
+        const ACTIVATION_ITEMS_PAGE_SIZE = 200;
+        let currentRunId = null;
+
         function switchTab(tabName, push = true, autoLoad = true) {
             toggleSidebar(false);
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
@@ -4577,17 +4590,22 @@ set verify_pending; schedule §C.3 poll
             }
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
             if (autoLoad) {
-                if (tabName === 'imei-pool') loadImeiPool();
-                if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
-                if (tabName === 'errors') loadErrors();
-                if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); }
-                if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
-                if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
-                if (tabName === 'sms-usage') loadSmsUsage();
-                if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} }
-                if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); }
-                if (tabName === 'workers') loadHostingPortJobs();
-                if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); }
+                // Each branch is isolated in its own try/catch: a thrown error dispatching
+                // one tab's loader must not prevent the others from running, and — since
+                // this can run synchronously during page boot via initTabFromUrl() before
+                // the rest of the script has executed — must not abort the remaining
+                // top-level script (see the activation-runs state comment above).
+                try { if (tabName === 'imei-pool') loadImeiPool(); } catch(e) { console.error('switchTab autoLoad failed for imei-pool', e); }
+                try { if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); } } catch(e) { console.error('switchTab autoLoad failed for gateways', e); }
+                try { if (tabName === 'errors') loadErrors(); } catch(e) { console.error('switchTab autoLoad failed for errors', e); }
+                try { if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); } } catch(e) { console.error('switchTab autoLoad failed for bad-rentals', e); }
+                try { if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); } } catch(e) { console.error('switchTab autoLoad failed for invoicing', e); }
+                try { if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); } } catch(e) { console.error('switchTab autoLoad failed for billing', e); }
+                try { if (tabName === 'sms-usage') loadSmsUsage(); } catch(e) { console.error('switchTab autoLoad failed for sms-usage', e); }
+                try { if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} } } catch(e) { console.error('switchTab autoLoad failed for sims', e); }
+                try { if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); } } catch(e) { console.error('switchTab autoLoad failed for rotation-reviews', e); }
+                try { if (tabName === 'workers') loadHostingPortJobs(); } catch(e) { console.error('switchTab autoLoad failed for workers', e); }
+                try { if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); } } catch(e) { console.error('switchTab autoLoad failed for activation-runs', e); }
             }
         }
 
@@ -13271,7 +13289,9 @@ async function sendSimOnline(simId, phoneNumber) {
 
                 loadData();
         setInterval(loadData, 3600000);
-        initTabFromUrl();
+        // A thrown error here would otherwise abort every remaining top-level
+        // statement in this script block (the rest of dashboard boot wiring).
+        try { initTabFromUrl(); } catch (e) { console.error('initTabFromUrl failed', e); }
 
         // Helix UI quarantine — hide/disable Helix-specific controls when HELIX_ENABLED=false
         if (!window.HELIX_ENABLED) {
@@ -14219,12 +14239,6 @@ async function sendSimOnline(simId, phoneNumber) {
 
 
         // ===== Activation Runs Tab =====
-        let activationRunsPage = 0;
-        let activationItemsPage = 0;
-        const ACTIVATION_RUNS_PAGE_SIZE = 50;
-        const ACTIVATION_ITEMS_PAGE_SIZE = 200;
-        let currentRunId = null;
-
         async function loadActivationRuns() {
             const tbody = document.getElementById('activation-runs-tbody');
             const countEl = document.getElementById('activation-runs-count');
@@ -14296,9 +14310,9 @@ async function sendSimOnline(simId, phoneNumber) {
                         <td class="px-4 py-3 text-right text-red-400">${r.failed_items || 0}</td>
                         <td class="px-4 py-3 text-right text-amber-400">${r.retry_needed_items || 0}</td>
                         <td class="px-4 py-3 text-right">${r.skipped_items || 0}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(r.created_at ? fmt(r.created_at) : '—')}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(r.started_at ? fmt(r.started_at) : '—')}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(r.finished_at ? fmt(r.finished_at) : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(r.created_at ? new Date(r.created_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(r.started_at ? new Date(r.started_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(r.finished_at ? new Date(r.finished_at).toLocaleString() : '—')}</td>
                         <td class="px-4 py-3">
                             <button onclick="event.stopPropagation(); showActivationRunDetail('${r.id}')" class="px-2 py-1 text-xs bg-accent hover:bg-green-600 text-white rounded transition">View</button>
                         </td>
@@ -14467,9 +14481,9 @@ async function sendSimOnline(simId, phoneNumber) {
                         <td class="px-4 py-3 text-xs text-red-400 max-w-[200px] truncate" title="${escapeHtml(item.error_message || '')}">${escapeHtml(item.error_message || '—')}</td>
                         <td class="px-4 py-3 text-center">${item.sim_id || '—'}</td>
                         <td class="px-4 py-3 text-center">${logs.length > 0 ? `<button onclick="showCarrierLogsModal('${escapeHtml(item.iccid)}', ${escapeHtml(JSON.stringify(logs))})" class="px-2 py-1 text-xs bg-cyan-600 hover:bg-cyan-700 text-white rounded transition">${logs.length} logs</button>` : '—'}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(item.queued_at ? fmt(item.queued_at) : '—')}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(item.started_at ? fmt(item.started_at) : '—')}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(item.finished_at ? fmt(item.finished_at) : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(item.queued_at ? new Date(item.queued_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(item.started_at ? new Date(item.started_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(item.finished_at ? new Date(item.finished_at).toLocaleString() : '—')}</td>
                         <td class="px-4 py-3">
                             ${canRetry ? `<button onclick="retryActivationItem('${item.id}')" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Retry</button>` : '<span class="text-xs text-gray-500">—</span>'}
                         </td>
