@@ -14250,6 +14250,15 @@ async function sendSimOnline(simId, phoneNumber) {
             try {
                 const resp = await fetch(`${API_BASE}/activation-runs?${params.toString()}`);
                 const data = await resp.json();
+
+                if (!resp.ok || data.error) {
+                    tbody.innerHTML = `<tr><td colspan="14" class="px-4 py-8 text-center text-red-400">Error loading activation runs: ${escapeHtml(data.error || resp.statusText || String(resp.status))}</td></tr>`;
+                    countEl.textContent = '';
+                    prevBtn.disabled = true;
+                    nextBtn.disabled = true;
+                    return;
+                }
+
                 const runs = data.runs || [];
                 const total = data.total || 0;
 
@@ -14326,6 +14335,13 @@ async function sendSimOnline(simId, phoneNumber) {
             try {
                 const resp = await fetch(`${API_BASE}/activation-runs/${encodeURIComponent(runId)}`);
                 const data = await resp.json();
+
+                if (!resp.ok || data.error) {
+                    console.error('Failed to load run detail:', data.error || resp.statusText);
+                    document.getElementById('ar-detail-run-id').textContent = 'Error: ' + (data.error || resp.statusText || String(resp.status));
+                    return;
+                }
+
                 const run = data.run;
 
                 document.getElementById('ar-detail-run-id').textContent = run.id;
@@ -14400,6 +14416,15 @@ async function sendSimOnline(simId, phoneNumber) {
             try {
                 const resp = await fetch(`${API_BASE}/activation-runs/${encodeURIComponent(currentRunId)}?${params.toString()}`);
                 const data = await resp.json();
+
+                if (!resp.ok || data.error) {
+                    tbody.innerHTML = `<tr><td colspan="12" class="px-4 py-8 text-center text-red-400">Error loading items: ${escapeHtml(data.error || resp.statusText || String(resp.status))}</td></tr>`;
+                    countEl.textContent = '';
+                    prevBtn.disabled = true;
+                    nextBtn.disabled = true;
+                    return;
+                }
+
                 const items = data.items || [];
                 const totalItems = data.total_items || 0;
                 const carrierLogs = data.carrier_logs || [];

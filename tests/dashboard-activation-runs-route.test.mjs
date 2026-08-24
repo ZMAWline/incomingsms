@@ -246,3 +246,92 @@ test('an unknown run id returns 404 instead of a silent empty page', async () =>
   const res = await sandbox.handleActivationRunDetail(ENV, {}, 'missing', url);
   assert.equal(res.status, 404);
 });
+
+// ---------------------------------------------------------------------
+// 5. A failed Supabase/PostgREST request surfaces as a visible error, not
+//    a silent "no runs found" empty state — this was the actual bug
+//    reported after the latest preview deploy: a run existed in Supabase
+//    (visible in the table editor, which bypasses PostgREST) but the
+//    dashboard's REST-backed list/detail endpoints swallowed a non-2xx
+//    response (`resp.ok ? await resp.json() : []`) and rendered as if
+//    there were zero runs, with no indication anything had gone wrong.
+// ---------------------------------------------------------------------
+
+test('activation-runs list returns a visible error, not an empty runs array, when Supabase query fails', async () => {
+  const { sandbox, calls } = makeSandbox([
+    ['/activation_runs', () => new Response('{"message":"relation \\"public.activation_runs\\" does not exist"}', { status: 404 })],
+  ]);
+  const url = new sandbox.URL('https://dashboard.test/api/activation-runs');
+  const res = await sandbox.handleActivationRunsList(ENV, {}, url);
+  const body = await res.json();
+
+  assert.equal(res.status, 502, 'a failed upstream query is reported as an error, not 200 with an empty list');
+  assert.ok(body.error, 'error field is present so the frontend can distinguish this from a genuine empty result');
+  assert.equal(body.runs, undefined, 'no runs array is fabricated on failure');
+  assert.equal(calls.length, 1);
+});
+
+test('activation-run detail returns a visible error when the run query fails', async () => {
+  const { sandbox } = makeDetailSandbox([
+    ['/activation_runs?select=*&id=eq.run-1', () => new Response('{"message":"upstream error"}', { status: 500 })],
+  ]);
+  const url = new sandbox.URL('https://dashboard.test/api/activation-runs/run-1');
+  const res = await sandbox.handleActivationRunDetail(ENV, {}, 'run-1', url);
+  const body = await res.json();
+
+  assert.equal(res.status, 502);
+  assert.ok(body.error);
+  assert.equal(body.run, undefined);
+});
+
+test('activation-run detail returns a visible error when the items query fails', async () => {
+  const run = { id: 'run-1', source: 'json', status: 'processing', created_at: '2026-08-24T12:00:00Z' };
+  const { sandbox } = makeDetailSandbox([
+    ['/activation_runs?select=*&id=eq.run-1', () => new Response(JSON.stringify([run]), { status: 200 })],
+    ['/activation_job_items', () => new Response('{"message":"upstream error"}', { status: 500 })],
+  ]);
+  const url = new sandbox.URL('https://dashboard.test/api/activation-runs/run-1');
+  const res = await sandbox.handleActivationRunDetail(ENV, {}, 'run-1', url);
+  const body = await res.json();
+
+  assert.equal(res.status, 502);
+  assert.ok(body.error);
+  assert.equal(body.items, undefined);
+});
+
+// ---------------------------------------------------------------------
+// 6. Frontend renders the error banner (not "No activation runs found")
+//    when the API reports a failure.
+// ---------------------------------------------------------------------
+
+test('loadActivationRuns shows a visible error banner, not the empty-state message, on API failure', async () => {
+  const elements = new Map();
+  function makeEl(id) {
+    const el = { id, innerHTML: '', textContent: '', value: '', disabled: false, classList: { add() {}, remove() {}, contains: () => false } };
+    elements.set(id, el);
+    return el;
+  }
+  ['activation-runs-tbody', 'activation-runs-count', 'ar-prev-btn', 'ar-next-btn', 'ar-filter-status', 'ar-filter-source']
+    .forEach(makeEl);
+
+  const sandbox = {
+    console,
+    document: { getElementById: (id) => elements.get(id) || null },
+    fetch: async () => new Response(JSON.stringify({ error: 'Supabase query failed (404)' }), { status: 502 }),
+    Response, URL, URLSearchParams,
+    API_BASE: '/api',
+    activationRunsPage: 0,
+    ACTIVATION_RUNS_PAGE_SIZE: 50,
+    escapeHtml: (s) => String(s == null ? '' : s),
+    fmt: (s) => s,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext('async ' + grabHtmlFn('loadActivationRuns'), sandbox);
+
+  await sandbox.loadActivationRuns();
+
+  const tbody = elements.get('activation-runs-tbody');
+  assert.ok(/Error loading activation runs/.test(tbody.innerHTML), 'a failed request renders a visible error, not silence');
+  assert.ok(!/No activation runs found/.test(tbody.innerHTML), 'an API error must not be presented as an empty result');
+  assert.ok(tbody.innerHTML.includes('Supabase query failed'), 'the actual upstream error is shown, not a generic message');
+});

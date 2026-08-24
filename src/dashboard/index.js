@@ -9458,7 +9458,15 @@ async function handleActivationRunsList(env, corsHeaders, url) {
     // Prefer: count=exact returns the full filtered row count on the same
     // response (via Content-Range) instead of a second round-trip query.
     const resp = await supabaseGet(env, query, { Prefer: 'count=exact' });
-    const runs = resp.ok ? await resp.json() : [];
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      console.error('activation-runs list: Supabase query failed', resp.status, body);
+      return new Response(JSON.stringify({ error: `Supabase query failed (${resp.status})`, detail: body }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const runs = await resp.json();
     const totalCount = resp.headers?.get?.('content-range')?.split('/').pop() || runs.length;
 
     return new Response(JSON.stringify({ runs, total: parseInt(totalCount, 10), limit, offset }), {
@@ -9476,7 +9484,15 @@ async function handleActivationRunDetail(env, corsHeaders, runId, url) {
   try {
     // Get the run
     const runResp = await supabaseGet(env, 'activation_runs?select=*&id=eq.' + encodeURIComponent(runId) + '&limit=1');
-    const runs = runResp.ok ? await runResp.json() : [];
+    if (!runResp.ok) {
+      const body = await runResp.text().catch(() => '');
+      console.error('activation-run detail: Supabase run query failed', runResp.status, body);
+      return new Response(JSON.stringify({ error: `Supabase query failed (${runResp.status})`, detail: body }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const runs = await runResp.json();
     if (!runs[0]) {
       return new Response(JSON.stringify({ error: 'Run not found' }), {
         status: 404,
@@ -9496,7 +9512,15 @@ async function handleActivationRunDetail(env, corsHeaders, runId, url) {
     // Prefer: count=exact returns the filtered item count on the same
     // response (via Content-Range) instead of a second round-trip query.
     const itemsResp = await supabaseGet(env, itemsQuery, { Prefer: 'count=exact' });
-    const items = itemsResp.ok ? await itemsResp.json() : [];
+    if (!itemsResp.ok) {
+      const body = await itemsResp.text().catch(() => '');
+      console.error('activation-run detail: Supabase items query failed', itemsResp.status, body);
+      return new Response(JSON.stringify({ error: `Supabase query failed (${itemsResp.status})`, detail: body }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+    const items = await itemsResp.json();
     const totalItems = itemsResp.headers?.get?.('content-range')?.split('/').pop() || items.length;
 
     // Also get carrier_api_logs for these items
