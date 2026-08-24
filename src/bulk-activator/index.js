@@ -17,6 +17,10 @@ export default {
       return handleActivateJson(request, env);
     }
 
+    if (url.pathname === '/retry') {
+      return handleRetryJson(request, env);
+    }
+
     if (url.pathname !== '/run') {
       return new Response('sim-activator ok. Use /run?secret=... or POST /activate?secret=...', { status: 200 });
     }
@@ -351,6 +355,60 @@ async function handleActivateJson(request, env) {
   }
 
   return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, attempted: sims.length, run_id: runId, job_run_id: runUuid });
+}
+
+// Retries existing job items in place: resets each item to 'queued' and
+// re-sends it to ACTIVATION_QUEUE. This owns the queue producer binding that
+// the dashboard worker doesn't have — the dashboard's /api/activation-runs
+// retry route forwards here over the BULK_ACTIVATOR service binding rather
+// than touching the queue directly (see handleActivateSims for the same
+// service-binding pattern on the initial-submit path).
+async function handleRetryJson(request, env) {
+  const url = new URL(request.url);
+  const secret = url.searchParams.get('secret') || '';
+  if (!env.BULK_RUN_SECRET || secret !== env.BULK_RUN_SECRET) {
+    return json({ ok: false, error: 'Unauthorized' }, 401);
+  }
+  if (request.method !== 'POST') return json({ ok: false, error: 'Method must be POST' });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }); }
+
+  const { run_id: runId, items } = body;
+  if (!runId) return json({ ok: false, error: 'run_id required' });
+  if (!Array.isArray(items) || items.length === 0) return json({ ok: false, error: 'items array required' });
+
+  const runIdForQueue = `retry_${Date.now()}`;
+  let retried = 0;
+  try {
+    for (const item of items) {
+      const newAttempt = (item.attempt || 0) + 1;
+      await supabasePatch(env, `activation_job_items?id=eq.${item.id}`, {
+        status: 'queued',
+        attempt: newAttempt,
+        error_message: null,
+        started_at: null,
+        finished_at: null,
+        updated_at: new Date().toISOString(),
+      });
+    }
+    await sendQueueBatch(env.ACTIVATION_QUEUE, items.map(item => ({
+      body: {
+        iccid: item.iccid,
+        imei: item.imei,
+        reseller_id: item.reseller_id,
+        vendor: item.vendor,
+        run_id: runIdForQueue,
+        job_run_id: runId,
+      },
+    })));
+    retried = items.length;
+    await recomputeActivationRunCounts(env, runId);
+  } catch (e) {
+    return json({ ok: false, error: `Retry failed: ${e}`, retried, run_id: runId }, 502);
+  }
+
+  return json({ ok: true, retried, run_id: runId });
 }
 
 /* ── Relay fetch helper (routes through VPS to avoid CF-to-CF blocking) ─────── */

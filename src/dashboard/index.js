@@ -9592,40 +9592,43 @@ async function handleActivationRunRetry(request, env, corsHeaders) {
       });
     }
 
-    // For each item, reset status to queued and re-queue to ACTIVATION_QUEUE
-    let retried = 0;
-    const runIdForQueue = `retry_${Date.now()}`;
-
-    for (const item of itemsToRetry) {
-      // Reset job item status to queued, increment attempt
-      const newAttempt = (item.attempt || 0) + 1;
-      await supabasePatch(env, `activation_job_items?id=eq.${item.id}`, {
-        status: 'queued',
-        attempt: newAttempt,
-        error_message: null,
-        started_at: null,
-        finished_at: null,
-        updated_at: new Date().toISOString(),
+    // Actual queuing is delegated to bulk-activator, which owns the
+    // ACTIVATION_QUEUE producer binding — this dashboard worker does not
+    // (see handleActivateSims above for the same service-binding pattern on
+    // the initial-submit path). Calling env.ACTIVATION_QUEUE.send directly
+    // here threw on every retry (no such binding on dashboard/dashboard-test),
+    // leaving items patched to 'queued' in the DB but never actually delivered
+    // to the queue. bulk-activator's /retry route resets each item, re-sends
+    // it to the queue, and recomputes the run's counts.
+    if (!env.BULK_RUN_SECRET) {
+      return new Response(JSON.stringify({ error: 'BULK_RUN_SECRET not configured' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
-
-      // Re-queue to activation queue
-      await env.ACTIVATION_QUEUE.send({
-        iccid: item.iccid,
-        imei: item.imei,
-        reseller_id: item.reseller_id,
-        vendor: item.vendor,
-        run_id: runIdForQueue,
-        job_run_id: run_id,
-      });
-      retried++;
     }
 
-    // Retried items are back to 'queued', so the run's stale done/failed/
-    // retry_needed counts (and status) need to be refreshed from the items
-    // table rather than just flipped back to 'processing'.
-    await recomputeActivationRunCounts(env, run_id);
+    const retryUrl = `https://bulk-activator/retry?secret=${encodeURIComponent(env.BULK_RUN_SECRET)}`;
+    const retryResponse = await env.BULK_ACTIVATOR.fetch(retryUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id, items: itemsToRetry }),
+    });
 
-    return new Response(JSON.stringify({ ok: true, retried, run_id }), {
+    const retryText = await retryResponse.text();
+    let retryResult;
+    try {
+      retryResult = JSON.parse(retryText);
+    } catch {
+      return new Response(JSON.stringify({
+        error: `Worker returned non-JSON response (${retryResponse.status}): ${retryText.slice(0, 200)}`
+      }), {
+        status: 502,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
+    return new Response(JSON.stringify(retryResult), {
+      status: retryResponse.status,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
