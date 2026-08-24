@@ -5,6 +5,7 @@ on:
     types: [opened, synchronize, reopened, closed]
     paths:
       - 'src/dashboard/**'
+      - 'src/bulk-activator/**'
       - 'src/shared/**'
       - 'tests/**'
       - 'package.json'
@@ -22,6 +23,7 @@ concurrency:
 
 env:
   PREVIEW_URL: https://dashboard-test.zalmen-531.workers.dev
+  BULK_ACTIVATOR_TEST_URL: https://bulk-activator-test.zalmen-531.workers.dev
 
 jobs:
   deploy-preview:
@@ -65,6 +67,25 @@ jobs:
           test "$code" = "401"
           grep -qi 'WWW-Authenticate' <(curl -sS -I --max-time 30 "$PREVIEW_URL/")
 
+      # dashboard-test proxies SIM activation to bulk-activator-test over a service
+      # binding, so a stale bulk-activator-test makes the shared preview lie about
+      # what the PR under review actually does. Keep it deployed alongside dashboard-test.
+      - name: Dry-run bulk-activator test deploy
+        run: npx wrangler deploy --config src/bulk-activator/wrangler.toml --env test --dry-run
+
+      - name: Deploy bulk-activator test preview
+        run: npx wrangler deploy --config src/bulk-activator/wrangler.toml --env test
+
+      - name: Smoke-test bulk-activator preview returns JSON on auth failure
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /tmp/bulk-activator-preview-body.txt -w '%{http_code}' --max-time 30 \
+            -X POST "$BULK_ACTIVATOR_TEST_URL/activate?secret=preview-smoke-test-invalid" \
+            -H 'Content-Type: application/json' -d '{"sims":[]}')
+          test "$code" = "401"
+          python3 -c "import json; d=json.load(open('/tmp/bulk-activator-preview-body.txt')); assert d.get('ok') is False, d"
+
       - name: Comment preview URL on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
@@ -83,7 +104,7 @@ jobs:
               '- Exercise the changed dashboard flow.',
               '- Confirm API calls use dashboard test service bindings, not production.',
               '',
-              'Safety: this shared preview deploys with `src/dashboard/wrangler.toml` `[env.test]`, preserving the existing Cloudflare Worker secrets already attached to `dashboard-test` and binding service calls to `*-test` workers.',
+              'Safety: this shared preview deploys with `src/dashboard/wrangler.toml` `[env.test]` and `src/bulk-activator/wrangler.toml` `[env.test]`, preserving existing Cloudflare Worker secrets already attached to `dashboard-test` / `bulk-activator-test` and binding service calls to `*-test` workers.',
             ].join('\n');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
