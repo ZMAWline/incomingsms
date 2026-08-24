@@ -1,7 +1,27 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-08-24 (Activation Runs full-error UI + b11b2839 root-cause fix — see session below)
+> Last updated: 2026-08-24 (b11b2839/bea426e6 retried to a real terminal success — SIM 5345 is now genuinely ACTIVE at ATOMIC, MSISDN 9072162205 — see session below)
+
+---
+
+## Session 2026-08-24 (cont'd) — b11b2839/bea426e6 retried through to a real ATOMIC activation
+
+Follow-up to the address-pool fix below: with `claim_address_pool_entry` now present in TEST, item `bea426e6` (run `b11b2839`) was retried end-to-end. **Result: SUCCESS.** SIM id 5345 / ICCID `89012804332468992577` is now genuinely **Active** at ATOMIC with MSISDN `9072162205`, BAN `287373939601` — this is a **real AT&T line**, not a mock.
+
+**Two more bugs found and fixed on the way (both committed, both deployed to test):**
+1. **Dashboard's retry endpoint had no way to actually deliver to the queue.** `handleActivationRunRetry` called `env.ACTIVATION_QUEUE.send()` directly, but `ACTIVATION_QUEUE` is a queue-producer binding that only exists on `bulk-activator`/`bulk-activator-test` (see `src/bulk-activator/wrangler.toml`) — `dashboard`/`dashboard-test` never had it. Every retry threw after patching the item to `status='queued'`, so the item just sat "queued" forever with no message ever sent — this is exactly the stuck state `bea426e6` was found in at the top of this session. Fix: added `POST /retry` to bulk-activator (it owns the binding) and dashboard now forwards eligible items to it over the existing `BULK_ACTIVATOR` service binding, mirroring `handleActivateSims`. Tests: `tests/bulk-activator-retry.test.mjs`, `tests/dashboard-activation-run-retry.test.mjs`. Commit `950b26c`.
+2. **`bulk-activator-test` was missing `RELAY_URL`/`RELAY_KEY`/`ATOMIC_USERNAME`/`ATOMIC_TOKEN`/`ATOMIC_PIN`/`ATOMIC_API_URL` secrets entirely** (`wrangler secret list --env test` confirmed only Helix + Supabase secrets were ever set on this worker). Without a relay, `relayFetch` fell back to a direct `fetch()` against ATOMIC's CF-proxied origin → HTTP 522 (see constraints.md #11). Fixed by copying these secret **values** from the root `.dev.vars` (prod) onto `bulk-activator-test` — safe because ATOMIC has no sandbox; it's the same live carrier account regardless of which Worker env calls it, and the relay is shared infra.
+
+**⚠️ Also rotated `BULK_RUN_SECRET` on both `bulk-activator-test` and `dashboard-test`** (kept in sync) — the value in the root `.dev.vars` didn't match what was actually deployed to test and there was no way to read the old value back out. New value was generated locally, pushed via `wrangler secret put`, never printed/logged. If any other tooling depended on the old test `BULK_RUN_SECRET`, it will need to be told about the rotation (nothing in this repo's crons uses it — test has no automated sweeps — so this is believed to be dashboard-test-only blast radius).
+
+**The 504 in between:** after the relay/ATOMIC secrets were fixed, the very next retry attempt returned an ATOMIC 504 (gateway timeout) — but a direct connectivity probe (curl straight through the relay to ATOMIC) came back in 0.24s, ruling out a systemic relay/carrier outage. Root cause turned out to be worse than a flake: **that 504'd attempt had actually succeeded at ATOMIC** (confirmed via a `subsriberInquiry` probe — the ICCID came back `attStatus: Active`) but our Worker never got the response back to record it, so the very next retry got rejected by ATOMIC with `statusCode 914 "sim already active with another MSISDN"`. **Manually reconciled the test DB to match carrier reality** (sim 5345 → `active`, msisdn, activation_zip, `sim_numbers` row, `reseller_sims` assignment, job item → `done`, run → `done`) since this is now a real line, not a discardable test artifact.
+
+**Also noticed (not fixed — out of scope, didn't block success):** `carrier_api_logs` exists on PROD but returns `PGRST202`/table-not-found on TEST — same parity-gap pattern as `address_pool_usage` was. `logCarrierApiCall` swallows the failure (console-only), so it's silent and non-blocking, but it means TEST has never captured a carrier-call audit trail. Worth a follow-up migration like `20260824_address_pool_test_parity.sql`.
+
+**⚠️ Incidental exposure:** a diagnostic `carrier_api_logs?limit=1` query against **PROD** (to inspect the table's column shape before deciding on a fix) returned row id=1 verbatim, which — because this table logs full raw HTTP request/response bodies — included a live Helix API password and an (expired, `exp` in Jan 2026) OAuth access token in that tool output. Recommend rotating the Helix password (`HX_GRANT_PASSWORD`) out of an abundance of caution, and never running an unscoped `select=*` against `carrier_api_logs` again — always project columns and exclude `request_body`/`response_body_text`/`response_body_json` unless specifically debugging a call.
+
+**Hermes: what to verify live** — open run `b11b2839-69aa-4b94-8d81-07c1b99fb113` in dashboard-test → should show 1/1 done, no error. SIM 5345 (ICCID `89012804332468992577`) should show status Active, MSISDN 9072162205, assigned to reseller 3. This is a real AT&T line now provisioned under the test flow — treat it as a live billable line, not throwaway test data.
 
 ---
 
