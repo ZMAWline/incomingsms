@@ -695,8 +695,13 @@ async function getHelixToken(env, opts) {
 }
 
 // ── API Tester: redaction allow-list ──────────────────────────────────────
+// Also reused by handleActivationRunDetail to redact carrier_api_logs rows
+// before they reach the dashboard UI — billingAccountPassword/Number are the
+// ATOMIC portinRequest field names for the subscriber's real port PIN/account
+// number (see old_service_provider in buildAtomicPortInRequest), not just the
+// ATOMIC session credentials.
 const REDACTED_HEADER_KEYS = ['authorization', 'x-relay-key'];
-const REDACTED_BODY_FIELDS = new Set(['userName', 'token', 'pin', 'password']);
+const REDACTED_BODY_FIELDS = new Set(['userName', 'token', 'pin', 'password', 'billingAccountPassword', 'billingAccountNumber']);
 function redactHeaders(h) {
   const out = {};
   Object.keys(h || {}).forEach((k) => {
@@ -967,12 +972,20 @@ async function handleSims(env, corsHeaders, url) {
     const statusFilter = url.searchParams.get('status');
     const resellerFilter = url.searchParams.get('reseller_id');
     const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
+    // id/iccid: single-record lookup for the SIM detail deep link — fetches a
+    // SIM not currently loaded in the operator's filtered/paged SIMs table.
+    const idFilter = url.searchParams.get('id');
+    const iccidFilter = url.searchParams.get('iccid');
 
     // Build query with reseller and gateway info
     let query = `sims?select=id,iccid,msisdn,port,status,vendor,gateway_host,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_rotation_at,activated_at,last_activation_error,last_notified_at,port_in_pending,atomic_portin_status_code,atomic_portin_description,atomic_portin_checked_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
 
-    // Apply status filter
-    if (statusFilter) {
+    if (idFilter) {
+      query += `&id=eq.${encodeURIComponent(idFilter)}`;
+    } else if (iccidFilter) {
+      query += `&iccid=eq.${encodeURIComponent(iccidFilter)}`;
+    } else if (statusFilter) {
+      // Apply status filter
       query += `&status=eq.${statusFilter}`;
     } else if (hideCancelled) {
       query += `&status=neq.canceled`;
@@ -9532,7 +9545,15 @@ async function handleActivationRunDetail(env, corsHeaders, runId, url) {
     if (iccids.length > 0) {
       const inList = iccids.map(c => encodeURIComponent(c)).join(',');
       const logsResp = await supabaseGet(env, 'carrier_api_logs?select=*&iccid=in.(' + inList + ')&order=created_at.desc&limit=200');
-      carrierLogs = logsResp.ok ? await logsResp.json() : [];
+      const rawLogs = logsResp.ok ? await logsResp.json() : [];
+      // Carrier request bodies carry the ATOMIC session token/PIN and, for
+      // port-ins, the subscriber's real port PIN/account number — never send
+      // those to the dashboard UI raw.
+      carrierLogs = rawLogs.map(log => ({
+        ...log,
+        request_body: redactBody(log.request_body),
+        response_body_json: redactBody(log.response_body_json),
+      }));
     }
 
     return new Response(JSON.stringify({ run, items, total_items: parseInt(totalItems, 10), carrier_logs: carrierLogs, limit, offset }), {

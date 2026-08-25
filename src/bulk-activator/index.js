@@ -244,7 +244,11 @@ export default {
 
         // Update job item to done
         if (jobRunId) {
-          await updateJobItemStatus(env, jobRunId, iccid, 'done', { finished_at: new Date().toISOString(), sim_id: simId });
+          await updateJobItemStatus(env, jobRunId, iccid, 'done', {
+            finished_at: new Date().toISOString(),
+            sim_id: simId,
+            carrier_log_id: result?.carrierLogId || null,
+          });
         }
 
         msg.ack();
@@ -259,6 +263,7 @@ export default {
             finished_at: new Date().toISOString(),
             error_message: errorMsg,
             attempt_increment: true,
+            carrier_log_id: e?.carrierLogId || null,
           });
         }
 
@@ -486,7 +491,7 @@ async function updateActivationRunCounts(env, runId, { queuedItems = 0, validati
   });
 }
 
-async function updateJobItemStatus(env, runId, iccid, status, { started_at = null, finished_at = null, sim_id = null, error_message = null, attempt_increment = false } = {}) {
+async function updateJobItemStatus(env, runId, iccid, status, { started_at = null, finished_at = null, sim_id = null, error_message = null, attempt_increment = false, carrier_log_id = null } = {}) {
   const patch = {
     status,
     updated_at: new Date().toISOString(),
@@ -495,6 +500,7 @@ async function updateJobItemStatus(env, runId, iccid, status, { started_at = nul
   if (finished_at) patch.finished_at = finished_at;
   if (sim_id) patch.sim_id = sim_id;
   if (error_message) patch.error_message = error_message;
+  if (carrier_log_id) patch.carrier_log_id = carrier_log_id;
   if (attempt_increment) {
     // We need to read current attempt first, then increment
     const existing = await supabaseSelect(env, `activation_job_items?select=attempt&run_id=eq.${runId}&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
@@ -582,7 +588,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
   let responseJson = {};
   try { responseJson = JSON.parse(responseText); } catch {}
 
-  await logCarrierApiCall(env, {
+  const carrierLogId = await logCarrierApiCall(env, {
     run_id: runId,
     step: 'activation',
     iccid,
@@ -599,7 +605,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
   });
 
   if (!res.ok) {
-    throw new Error(`ATOMIC activation failed ${res.status}: ${responseText.slice(0, 300)}`);
+    throw new CarrierActivationError(`ATOMIC activation failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
   // Quarantine the picked address if AT&T rejected it (won't be re-picked for 90d).
@@ -610,7 +616,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
 
   const result = responseJson?.wholeSaleApi?.wholeSaleResponse?.Result;
   if (!result?.MSISDN) {
-    throw new Error(`ATOMIC activation returned no MSISDN: ${responseText.slice(0, 300)}`);
+    throw new CarrierActivationError(`ATOMIC activation returned no MSISDN: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
   return {
@@ -618,6 +624,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
     ban: result.BAN || '',
     status: 'active', // ATOMIC activations are immediately active
     zipCode: addr.zipCode,
+    carrierLogId,
   };
 }
 
@@ -677,7 +684,7 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   let responseJson = {};
   try { responseJson = JSON.parse(responseText); } catch {}
 
-  await logCarrierApiCall(env, {
+  const carrierLogId = await logCarrierApiCall(env, {
     run_id: runId,
     step: 'portin',
     iccid,
@@ -694,7 +701,7 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   });
 
   if (!res.ok) {
-    throw new Error(`ATOMIC port-in failed ${res.status}: ${responseText.slice(0, 300)}`);
+    throw new CarrierActivationError(`ATOMIC port-in failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
   // Unlike Activate, a port is accepted asynchronously by the losing carrier —
@@ -709,6 +716,7 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
     status: 'provisioning', // sims.status CHECK constraint has no "pending port" value
     zipCode: portFields.zip,
     portInPending: true, // marks this SIM for details-finalizer's portinStatus poll
+    carrierLogId,
   };
 }
 
@@ -750,7 +758,7 @@ async function activateViaWingIot(env, iccid, runId) {
   let responseJson = {};
   try { responseJson = JSON.parse(responseText); } catch {}
 
-  await logCarrierApiCall(env, {
+  const carrierLogId = await logCarrierApiCall(env, {
     run_id: runId,
     step: 'activation',
     iccid,
@@ -767,11 +775,11 @@ async function activateViaWingIot(env, iccid, runId) {
   });
 
   if (!res.ok) {
-    throw new Error(`Wing IoT activation failed ${res.status}: ${responseText.slice(0, 300)}`);
+    throw new CarrierActivationError(`Wing IoT activation failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
   // MDN takes ~1-4 min to propagate — mdn-rotator's syncWingIotPendingMdns cron fills it in
-  return { msisdn: '', status: 'provisioning' };
+  return { msisdn: '', status: 'provisioning', carrierLogId };
 }
 
 async function activateViaHelix(env, token, iccid, imei, runId) {
@@ -1035,8 +1043,10 @@ async function assignSimToReseller(env, resellerId, simId) {
 
 /* ── Carrier API logging ───────────────────────────────────────────────────── */
 
+// Returns the inserted row's id (for linking back via
+// activation_job_items.carrier_log_id) or null if logging was skipped/failed.
 async function logCarrierApiCall(env, logData) {
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return null;
   const vendor = logData.vendor || 'helix';
   const payload = {
     run_id: logData.run_id,
@@ -1061,11 +1071,28 @@ async function logCarrierApiCall(env, logData) {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
+      Prefer: 'return=representation',
     },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) console.error(`[Carrier Log] Supabase failed: ${res.status}`);
+  if (!res.ok) { console.error(`[Carrier Log] Supabase failed: ${res.status}`); return null; }
+  try {
+    const rows = await res.json();
+    return rows?.[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Thrown by the activateVia* functions so the queue consumer can link the
+// carrier log for a call that failed (e.g. a port-in the carrier rejected on
+// PIN) — logCarrierApiCall() already wrote the row before the throw, but a
+// plain Error would drop that id on the floor.
+class CarrierActivationError extends Error {
+  constructor(message, carrierLogId) {
+    super(message);
+    this.carrierLogId = carrierLogId ?? null;
+  }
 }
 
 // Backward compatibility alias
