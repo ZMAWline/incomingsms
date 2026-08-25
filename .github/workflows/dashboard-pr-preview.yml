@@ -57,6 +57,8 @@ jobs:
         run: npx wrangler deploy --config src/dashboard/wrangler.toml --env test --dry-run
 
       - name: Deploy dashboard test preview
+        env:
+          DASHBOARD_AUTH: ${{ secrets.DASHBOARD_AUTH }}
         run: npx wrangler deploy --config src/dashboard/wrangler.toml --env test
 
       - name: Smoke-test preview auth challenge
