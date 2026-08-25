@@ -10072,7 +10072,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         <span class="px-2 py-0.5 text-xs font-medium rounded bg-dark-600 text-gray-300">${err.source || '-'}</span>
                         ${err.action ? `<span class="text-xs text-gray-500 ml-1">${err.action}</span>` : ''}
                     </td>
-                    <td class="px-4 py-3 font-mono text-xs text-gray-400">${err.sim_id || err.iccid ? `<a href="javascript:void(0)" onclick="navigateToSimDetail(${err.sim_id || 'null'}, ${escapeHtml(JSON.stringify(err.iccid || null))}, 'details')" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${simLabel}</a>` : simLabel}</td>
+                    <td class="px-4 py-3 font-mono text-xs text-gray-400">${err.sim_id || err.iccid ? `<a href="javascript:void(0)" onclick="openSimDetailModal(${err.sim_id || 'null'}, ${escapeHtml(JSON.stringify(err.iccid || null))}, 'details')" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${simLabel}</a>` : simLabel}</td>
                     <td class="px-4 py-3 text-gray-300 text-xs max-w-xs truncate" title="${(err.error_message || '').replace(/"/g, '&quot;')}">${errorPreview}</td>
                     <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full ${sevClass}">${err.severity || '-'}</span></td>
                     <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${err.status || '-'}</span></td>
@@ -13429,14 +13429,16 @@ async function sendSimOnline(simId, phoneNumber) {
             if (tab === 'logs') loadSimDetailLogs(sim.id, sim.iccid);
         }
 
-        // Deep-link entry point for click targets outside the SIMs table (e.g.
-        // an Activation Run item's ICCID/SIM cell) — pushes a /sims/:id URL so
-        // the SIM detail view is bookmarkable/shareable, then opens it.
-        function navigateToSimDetail(simId, iccid, tab) {
+        // Entry point for click targets outside the SIMs table (e.g. an
+        // Activation Run item's ICCID/SIM cell, or the Errors table) — opens
+        // the SIM detail modal as an overlay on top of the operator's current
+        // page. Deliberately does NOT switch tabs or touch the URL: the
+        // operator stays on the Activation Run (or Errors) view underneath,
+        // and closing the modal returns them to exactly where they were.
+        // openSimDetail() has its own fetch-by-id/iccid fallback, so this
+        // works even when the SIM isn't loaded into tableState.sims.data.
+        function openSimDetailModal(simId, iccid, tab) {
             if (!simId && !iccid) { showToast('No SIM linked to this item', 'error'); return; }
-            const path = simId ? ('/sims/' + encodeURIComponent(simId)) : '/sims';
-            if (location.pathname !== path) history.pushState({ tab: 'sims', simId: simId }, '', path);
-            switchTab('sims', false, false);
             openSimDetail(simId, tab, iccid);
         }
 
@@ -14601,13 +14603,13 @@ async function sendSimOnline(simId, phoneNumber) {
                     const simNavArgs = `${item.sim_id || 'null'}, ${escapeHtml(JSON.stringify(item.iccid))}, 'details'`;
 
                     return `<tr class="border-b border-dark-700 hover:bg-dark-700/50">
-                        <td class="px-4 py-3 font-mono text-xs"><a href="javascript:void(0)" onclick="navigateToSimDetail(${simNavArgs})" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${escapeHtml(item.iccid)}</a></td>
+                        <td class="px-4 py-3 font-mono text-xs"><a href="javascript:void(0)" onclick="openSimDetailModal(${simNavArgs})" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${escapeHtml(item.iccid)}</a></td>
                         <td class="px-4 py-3 font-mono text-xs">${escapeHtml(item.imei || '—')}</td>
                         <td class="px-4 py-3">${escapeHtml(item.vendor || '—')}</td>
                         <td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ${statusCls}">${escapeHtml(item.status)}</span></td>
                         <td class="px-4 py-3 text-center">${item.attempt || 0} / ${item.max_attempts || 3}</td>
                         <td class="px-4 py-3 text-xs text-red-400 max-w-[200px] truncate ${item.error_message ? 'cursor-pointer hover:text-red-300 hover:underline' : ''}" title="${item.error_message ? 'Click to view full error' : ''}" ${item.error_message ? `onclick="showErrorDetailModal(${escapeHtml(JSON.stringify(item.error_message))})"` : ''}>${escapeHtml(item.error_message || '—')}</td>
-                        <td class="px-4 py-3 text-center">${item.sim_id ? `<a href="javascript:void(0)" onclick="navigateToSimDetail(${simNavArgs})" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${item.sim_id}</a>` : '—'}</td>
+                        <td class="px-4 py-3 text-center">${item.sim_id ? `<a href="javascript:void(0)" onclick="openSimDetailModal(${simNavArgs})" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${item.sim_id}</a>` : '—'}</td>
                         <td class="px-4 py-3 text-center">${logs.length > 0 ? `<button onclick="showCarrierLogsModal('${escapeHtml(item.iccid)}', ${escapeHtml(JSON.stringify(logs))})" class="px-2 py-1 text-xs bg-cyan-600 hover:bg-cyan-700 text-white rounded transition">${logs.length} logs</button>` : '—'}</td>
                         <td class="px-4 py-3 text-xs">${escapeHtml(item.queued_at ? new Date(item.queued_at).toLocaleString() : '—')}</td>
                         <td class="px-4 py-3 text-xs">${escapeHtml(item.started_at ? new Date(item.started_at).toLocaleString() : '—')}</td>
