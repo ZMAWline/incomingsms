@@ -1257,6 +1257,7 @@
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','gateway_code')">Gateway <span class="sort-arrow" data-table="sims" data-col="gateway_code"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','iccid')">ICCID <span class="sort-arrow" data-table="sims" data-col="iccid"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','phone_number')">Phone <span class="sort-arrow" data-table="sims" data-col="phone_number"></span></th>
+                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','blimei')">BLIMEI <span class="sort-arrow" data-table="sims" data-col="blimei"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','status')">Status <span class="sort-arrow" data-table="sims" data-col="status"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','vendor')">Vendor <span class="sort-arrow" data-table="sims" data-col="vendor"></span></th>
                                     <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','hosting_port_state')" title="Latest persisted Teltik hosting port status (any source: cron, bulk, query, remediator)">Host Port <span class="sort-arrow" data-table="sims" data-col="hosting_port_state"></span></th>
@@ -1270,7 +1271,7 @@
                                 </tr>
                             </thead>
                             <tbody id="sims-table" class="text-sm">
-                                <tr><td colspan="15" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="16" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     <div id="sims-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
@@ -5153,6 +5154,7 @@ set verify_pending; schedule §C.3 poll
             const COLUMN_LABELS = {
                 gateway_code: 'Gateway',
                 iccid: 'ICCID',
+                blimei: 'BLIMEI',
                 vendor: 'Vendor',
                 hosting_port_state: 'Host Port',
                 reseller_name: 'Reseller',
@@ -6141,9 +6143,9 @@ function renderSims() {
                     || fs.vendors.length || fs.gateways.length || fs.resellerIds.length
                     || fs.presets.size > 0 || fs.activatedFrom || fs.activatedTo || fs.search;
                 if (hasFilters) {
-                    tbody.innerHTML = '<tr><td colspan="15" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="16" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';
                 } else {
-                    tbody.innerHTML = '<tr><td colspan="15" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="16" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
                 }
                 applySimsColumnVisibility();
                 return;
@@ -6168,6 +6170,7 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-400" title="${sim.gateway_name || ''}">${gatewayDisplay}</td>
                     <td class="px-4 py-3 text-gray-400 font-mono text-xs">${sim.iccid}</td>
                     <td class="px-4 py-3 text-gray-200">${sim.phone_number || '-'}${verifiedBadge}</td>
+                    <td class="px-4 py-3 text-gray-400 font-mono text-xs">${sim.blimei || '-'}</td>
                     <td class="px-4 py-3">
                         <span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${sim.status}</span>
                     </td>
@@ -6209,7 +6212,7 @@ function renderSims() {
                 const s = String(v);
                 return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
             };
-            const header = ['ID','Gateway','Port','ICCID','Phone','Verification','Status','Vendor','Host Port','Host Port Checked','Reseller','SMS','Last SMS','Last Rotated','Activated','Last Notified'];
+            const header = ['ID','Gateway','Port','ICCID','Phone','BLIMEI','Verification','Status','Vendor','Host Port','Host Port Checked','Reseller','SMS','Last SMS','Last Rotated','Activated','Last Notified'];
             const lines = [header.join(',')];
             for (const s of rows) {
                 lines.push([
@@ -6218,6 +6221,7 @@ function renderSims() {
                     esc(normalizePortDisplay(s.port) || ''),
                     esc(s.iccid || ''),
                     esc(s.phone_number || ''),
+                    esc(s.blimei || ''),
                     esc(s.verification_status || ''),
                     esc(s.status || ''),
                     esc(s.vendor || ''),
@@ -13518,6 +13522,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 '<div class="grid grid-cols-2 gap-x-6 gap-y-3 mb-4">' +
                 _sdField('ICCID', '<span class="font-mono">' + (sim.iccid || '-') + '</span>') +
                 _sdField('Phone Number', sim.phone_number || '') +
+                _sdField('BLIMEI', '<span class="font-mono text-xs">' + (sim.blimei || '') + '</span>') +
                 _sdField('Status', statusBadge) +
                 _sdField('Vendor', vendorBadge) +
                 _sdField('Carrier', sim.carrier || '') +
@@ -13564,6 +13569,7 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('sdtab-imei').innerHTML =
                 '<div class="grid grid-cols-2 gap-4 mb-5">' +
                 _sdField('ICCID', '<span class="font-mono text-xs">' + (sim.iccid || '-') + '</span>') +
+                _sdField('BLIMEI', '<span class="font-mono text-xs">' + (sim.blimei || '-') + '</span>') +
                 _sdField('Gateway / Port', '<span class="font-mono">' + ((sim.gateway_name || (sim.gateway_id ? 'GW#' + sim.gateway_id : '')) + (sim.port ? ' / ' + normalizePortDisplay(sim.port) : '') || '-') + '</span>') +
                 _sdField('Subscription ID', '<span class="font-mono text-xs">' + (sim.mobility_subscription_id || '-') + '</span>') +
                 '</div>' +
