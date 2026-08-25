@@ -6,6 +6,7 @@ import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10,
 // Queues individual SIM activations — one SIM at a time.
 // Supports multiple vendors: helix, atomic, wing_iot
 // Queue consumer routes to appropriate carrier API per SIM.
+// Now with per-SIM job tracking via activation_runs / activation_job_items.
 // =========================================================
 
 export default {
@@ -14,6 +15,10 @@ export default {
 
     if (url.pathname === '/activate') {
       return handleActivateJson(request, env);
+    }
+
+    if (url.pathname === '/retry') {
+      return handleRetryJson(request, env);
     }
 
     if (url.pathname !== '/run') {
@@ -64,10 +69,10 @@ export default {
 
     if (toProcess.length === 0) return json({ ok: true, queued: 0, note: 'No pending rows' });
 
-    const runId = `csv_${Date.now()}`;
-    let queued = 0;
+    // Validate all rows first before any DB operations
     let validationErrors = 0;
     const rowErrors = [];
+    const validatedSims = [];
 
     for (const r of toProcess) {
       const checked = validateActivationSim({
@@ -92,11 +97,47 @@ export default {
         rowErrors.push(...checked.errors);
         continue;
       }
-      await env.ACTIVATION_QUEUE.send({ ...checked.sim, run_id: runId });
-      queued++;
+      validatedSims.push(checked.sim);
     }
 
-    return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, run_id: runId });
+    // Create parent activation run
+    const runId = `csv_${Date.now()}`;
+    let runUuid;
+    try {
+      runUuid = await createActivationRun(env, {
+        source: 'csv',
+        totalItems: validatedSims.length,
+        createdBy: 'csv_run',
+      });
+    } catch (e) {
+      return new Response(`Failed to create activation run: ${e}`, { status: 502 });
+    }
+
+    let queued = 0;
+    try {
+      if (validatedSims.length > 0) {
+        // One INSERT and one batch of queue sends instead of two round-trips
+        // per SIM — the prior per-row loop was the dominant cost of a CSV run.
+        await createActivationJobItems(env, runUuid, validatedSims);
+        await sendQueueBatch(env.ACTIVATION_QUEUE, validatedSims.map(sim => ({
+          body: { ...sim, run_id: runId, job_run_id: runUuid },
+        })));
+        queued = validatedSims.length;
+      }
+      await updateActivationRunCounts(env, runUuid, { queuedItems: queued, validationErrors, rowErrors });
+    } catch (e) {
+      return json({
+        ok: false,
+        error: `Activation run ${runUuid} created but queuing failed: ${e}`,
+        queued,
+        validation_errors: validationErrors,
+        row_errors: rowErrors,
+        run_id: runId,
+        job_run_id: runUuid,
+      }, 502);
+    }
+
+    return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, run_id: runId, job_run_id: runUuid });
   },
 
   // ── Queue consumer — one SIM at a time, routes by vendor ─────────────────
@@ -126,6 +167,7 @@ export default {
         imei,
         reseller_id: resellerId,
         run_id: runId,
+        job_run_id: jobRunId,
         vendor = 'atomic',
         port_mdn: portMdn = '',
         port_account_number: portAccountNumber = '',
@@ -138,6 +180,12 @@ export default {
         port_old_first_name: portOldFirstName = '',
         port_old_last_name: portOldLastName = '',
       } = msg.body;
+
+      // Update job item to processing
+      if (jobRunId) {
+        await updateJobItemStatus(env, jobRunId, iccid, 'processing', { started_at: new Date().toISOString() });
+      }
+
       try {
         // Skip if already activated (check for sub_id or msisdn based on vendor).
         // Gated on status too — sim-canceller sets status='canceled' without
@@ -154,6 +202,9 @@ export default {
           && (existingSim.mobility_subscription_id || existingSim.msisdn);
         if (alreadyActivated) {
           console.log(`[Activator] ${iccid}: already activated (status=${existingSim.status}) — skipping`);
+          if (jobRunId) {
+            await updateJobItemStatus(env, jobRunId, iccid, 'skipped', { finished_at: new Date().toISOString(), error_message: 'Already activated' });
+          }
           msg.ack();
           continue;
         }
@@ -190,10 +241,32 @@ export default {
         if (resellerId) await assignSimToReseller(env, resellerId, simId);
 
         console.log(`[Activator] ${iccid}: activated via ${vendor}, simId=${simId}`);
+
+        // Update job item to done
+        if (jobRunId) {
+          await updateJobItemStatus(env, jobRunId, iccid, 'done', {
+            finished_at: new Date().toISOString(),
+            sim_id: simId,
+            carrier_log_id: result?.carrierLogId || null,
+          });
+        }
+
         msg.ack();
       } catch (e) {
-        console.error(`[Activator] ${iccid}: failed: ${e}`);
-        try { await upsertSimError(env, iccid, String(e), vendor); } catch {}
+        const errorMsg = String(e);
+        console.error(`[Activator] ${iccid}: failed: ${errorMsg}`);
+        try { await upsertSimError(env, iccid, errorMsg, vendor); } catch {}
+
+        // Update job item to failed with error
+        if (jobRunId) {
+          await updateJobItemStatus(env, jobRunId, iccid, 'failed', {
+            finished_at: new Date().toISOString(),
+            error_message: errorMsg,
+            attempt_increment: true,
+            carrier_log_id: e?.carrierLogId || null,
+          });
+        }
+
         msg.ack(); // ACK to prevent infinite retry — error recorded in DB
       }
     }
@@ -216,26 +289,134 @@ async function handleActivateJson(request, env) {
   const sims = body.sims || [];
   if (!Array.isArray(sims) || sims.length === 0) return json({ ok: false, error: 'sims array required' });
 
-  const runId = `json_${Date.now()}`;
-  let queued = 0;
+  // Validate all SIMs first before any DB operations
+  const defaultVendor = body.vendor || 'atomic';
+  // Batch-wide reseller (dashboard's "activate to reseller" dropdown) — applied
+  // to every row by validateActivationSim, overriding any per-row reseller_id.
+  const resellerId = body.reseller_id;
+  const validatedSims = [];
   let validationErrors = 0;
   const rowErrors = [];
 
-  // Default vendor from request body, or 'atomic' for AT&T
-  const defaultVendor = body.vendor || 'atomic';
-
   for (let i = 0; i < sims.length; i++) {
-    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor });
+    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor, resellerId });
     if (!checked.ok) {
       validationErrors++;
       rowErrors.push(...checked.errors);
       continue;
     }
-    await env.ACTIVATION_QUEUE.send({ ...checked.sim, run_id: runId });
-    queued++;
+    validatedSims.push(checked.sim);
   }
 
-  return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, attempted: sims.length, run_id: runId });
+  // If Supabase is not configured, return validation results without creating DB records
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({
+      ok: validationErrors === 0,
+      queued: 0,
+      validation_errors: validationErrors,
+      row_errors: rowErrors,
+      attempted: sims.length,
+      run_id: null,
+      job_run_id: null,
+      note: 'Supabase not configured — validation only',
+    });
+  }
+
+  // Create parent activation run
+  const runId = `json_${Date.now()}`;
+  let runUuid;
+  try {
+    runUuid = await createActivationRun(env, {
+      source: 'json',
+      totalItems: validatedSims.length,
+      createdBy: 'dashboard',
+    });
+  } catch (e) {
+    // Nothing was persisted — safe to report as a plain failure.
+    return json({ ok: false, error: `Failed to create activation run: ${e}`, run_id: null, job_run_id: null }, 502);
+  }
+
+  let queued = 0;
+  try {
+    if (validatedSims.length > 0) {
+      await createActivationJobItems(env, runUuid, validatedSims);
+      await sendQueueBatch(env.ACTIVATION_QUEUE, validatedSims.map(sim => ({
+        body: { ...sim, run_id: runId, job_run_id: runUuid },
+      })));
+      queued = validatedSims.length;
+    }
+    await updateActivationRunCounts(env, runUuid, { queuedItems: queued, validationErrors, rowErrors });
+  } catch (e) {
+    // The activation_runs row already exists at this point — always return its
+    // job_run_id even on failure so the dashboard can open it and show whatever
+    // partially succeeded, instead of surfacing a bare error and orphaning it.
+    return json({
+      ok: false,
+      error: `Activation run ${runUuid} created but queuing failed: ${e}`,
+      queued,
+      validation_errors: validationErrors,
+      row_errors: rowErrors,
+      attempted: sims.length,
+      run_id: runId,
+      job_run_id: runUuid,
+    }, 502);
+  }
+
+  return json({ ok: validationErrors === 0, queued, validation_errors: validationErrors, row_errors: rowErrors, attempted: sims.length, run_id: runId, job_run_id: runUuid });
+}
+
+// Retries existing job items in place: resets each item to 'queued' and
+// re-sends it to ACTIVATION_QUEUE. This owns the queue producer binding that
+// the dashboard worker doesn't have — the dashboard's /api/activation-runs
+// retry route forwards here over the BULK_ACTIVATOR service binding rather
+// than touching the queue directly (see handleActivateSims for the same
+// service-binding pattern on the initial-submit path).
+async function handleRetryJson(request, env) {
+  const url = new URL(request.url);
+  const secret = url.searchParams.get('secret') || '';
+  if (!env.BULK_RUN_SECRET || secret !== env.BULK_RUN_SECRET) {
+    return json({ ok: false, error: 'Unauthorized' }, 401);
+  }
+  if (request.method !== 'POST') return json({ ok: false, error: 'Method must be POST' });
+
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }); }
+
+  const { run_id: runId, items } = body;
+  if (!runId) return json({ ok: false, error: 'run_id required' });
+  if (!Array.isArray(items) || items.length === 0) return json({ ok: false, error: 'items array required' });
+
+  const runIdForQueue = `retry_${Date.now()}`;
+  let retried = 0;
+  try {
+    for (const item of items) {
+      const newAttempt = (item.attempt || 0) + 1;
+      await supabasePatch(env, `activation_job_items?id=eq.${item.id}`, {
+        status: 'queued',
+        attempt: newAttempt,
+        error_message: null,
+        started_at: null,
+        finished_at: null,
+        updated_at: new Date().toISOString(),
+      });
+    }
+    await sendQueueBatch(env.ACTIVATION_QUEUE, items.map(item => ({
+      body: {
+        iccid: item.iccid,
+        imei: item.imei,
+        reseller_id: item.reseller_id,
+        vendor: item.vendor,
+        run_id: runIdForQueue,
+        job_run_id: runId,
+      },
+    })));
+    retried = items.length;
+    await recomputeActivationRunCounts(env, runId);
+  } catch (e) {
+    return json({ ok: false, error: `Retry failed: ${e}`, retried, run_id: runId }, 502);
+  }
+
+  return json({ ok: true, retried, run_id: runId });
 }
 
 /* ── Relay fetch helper (routes through VPS to avoid CF-to-CF blocking) ─────── */
@@ -251,6 +432,118 @@ function relayFetch(env, url, init) {
     });
   }
   return fetch(url, init);
+}
+
+/* ── Activation Run / Job Item DB helpers ─────────────────────────────────── */
+
+async function createActivationRun(env, { source, totalItems, createdBy }) {
+  const rows = await supabaseInsert(env, 'activation_runs', [{
+    source,
+    status: 'queued',
+    total_items: totalItems,
+    queued_items: 0,
+    processing_items: 0,
+    done_items: 0,
+    failed_items: 0,
+    retry_needed_items: 0,
+    skipped_items: 0,
+    created_by: createdBy,
+    started_at: new Date().toISOString(),
+  }]);
+  if (!rows?.[0]?.id) throw new Error('Failed to create activation run');
+  return rows[0].id;
+}
+
+// One INSERT for the whole batch instead of one round-trip per SIM — the
+// per-item loop this replaced was the dominant cost of a bulk /activate call.
+async function createActivationJobItems(env, runId, sims) {
+  const queuedAt = new Date().toISOString();
+  const rows = await supabaseInsert(env, 'activation_job_items', sims.map(sim => ({
+    run_id: runId,
+    iccid: sim.iccid,
+    imei: sim.imei,
+    reseller_id: sim.reseller_id,
+    vendor: sim.vendor,
+    status: 'queued',
+    attempt: 0,
+    max_attempts: 3,
+    queued_at: queuedAt,
+  })));
+  if (rows.length !== sims.length) throw new Error(`Expected ${sims.length} activation job items, got ${rows.length}`);
+  return rows;
+}
+
+// Cloudflare Queues caps sendBatch() at 100 messages per call.
+async function sendQueueBatch(queue, messages) {
+  for (let i = 0; i < messages.length; i += 100) {
+    await queue.sendBatch(messages.slice(i, i + 100));
+  }
+}
+
+async function updateActivationRunCounts(env, runId, { queuedItems = 0, validationErrors = 0, rowErrors = [] }) {
+  const status = validationErrors > 0 ? 'failed' : 'processing';
+  await supabasePatch(env, `activation_runs?id=eq.${runId}`, {
+    status,
+    queued_items: queuedItems,
+    processing_items: status === 'processing' ? queuedItems : 0,
+    error: validationErrors > 0 ? `Validation errors: ${rowErrors.join('; ')}` : null,
+    updated_at: new Date().toISOString(),
+  });
+}
+
+async function updateJobItemStatus(env, runId, iccid, status, { started_at = null, finished_at = null, sim_id = null, error_message = null, attempt_increment = false, carrier_log_id = null } = {}) {
+  const patch = {
+    status,
+    updated_at: new Date().toISOString(),
+  };
+  if (started_at) patch.started_at = started_at;
+  if (finished_at) patch.finished_at = finished_at;
+  if (sim_id) patch.sim_id = sim_id;
+  if (error_message) patch.error_message = error_message;
+  if (carrier_log_id) patch.carrier_log_id = carrier_log_id;
+  if (attempt_increment) {
+    // We need to read current attempt first, then increment
+    const existing = await supabaseSelect(env, `activation_job_items?select=attempt&run_id=eq.${runId}&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+    if (existing?.[0]) {
+      patch.attempt = (existing[0].attempt || 0) + 1;
+      // If attempts >= max_attempts, mark as retry_needed
+      if (patch.attempt >= (existing[0].max_attempts || 3)) {
+        patch.status = 'retry_needed';
+      }
+    }
+  }
+  await supabasePatch(env, `activation_job_items?run_id=eq.${runId}&iccid=eq.${encodeURIComponent(iccid)}`, patch);
+  await recomputeActivationRunCounts(env, runId);
+}
+
+// Re-derives the parent run's per-status counts and overall status from its
+// child job items. Recompute-from-source-of-truth rather than incrementing a
+// counter, since Cloudflare Queue consumers can process a run's items across
+// concurrent invocations and a read-then-increment would race.
+async function recomputeActivationRunCounts(env, runId) {
+  const items = await supabaseSelect(env, `activation_job_items?select=status&run_id=eq.${runId}`);
+  const counts = { queued: 0, processing: 0, done: 0, failed: 0, retry_needed: 0, skipped: 0 };
+  for (const item of items) {
+    if (Object.prototype.hasOwnProperty.call(counts, item.status)) counts[item.status]++;
+  }
+  const total = items.length;
+  const terminal = counts.done + counts.failed + counts.retry_needed + counts.skipped;
+  const patch = {
+    queued_items: counts.queued,
+    processing_items: counts.processing,
+    done_items: counts.done,
+    failed_items: counts.failed,
+    retry_needed_items: counts.retry_needed,
+    skipped_items: counts.skipped,
+    updated_at: new Date().toISOString(),
+  };
+  if (total > 0 && terminal === total) {
+    patch.status = (counts.failed > 0 || counts.retry_needed > 0) ? 'failed' : 'done';
+    patch.finished_at = new Date().toISOString();
+  } else {
+    patch.status = 'processing';
+  }
+  await supabasePatch(env, `activation_runs?id=eq.${runId}`, patch);
 }
 
 /* ── Vendor-specific activation functions ──────────────────────────────────── */
@@ -295,7 +588,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
   let responseJson = {};
   try { responseJson = JSON.parse(responseText); } catch {}
 
-  await logCarrierApiCall(env, {
+  const carrierLogId = await logCarrierApiCall(env, {
     run_id: runId,
     step: 'activation',
     iccid,
@@ -312,7 +605,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
   });
 
   if (!res.ok) {
-    throw new Error(`ATOMIC activation failed ${res.status}: ${responseText.slice(0, 300)}`);
+    throw new CarrierActivationError(`ATOMIC activation failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
   // Quarantine the picked address if AT&T rejected it (won't be re-picked for 90d).
@@ -323,7 +616,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
 
   const result = responseJson?.wholeSaleApi?.wholeSaleResponse?.Result;
   if (!result?.MSISDN) {
-    throw new Error(`ATOMIC activation returned no MSISDN: ${responseText.slice(0, 300)}`);
+    throw new CarrierActivationError(`ATOMIC activation returned no MSISDN: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
   return {
@@ -331,6 +624,7 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
     ban: result.BAN || '',
     status: 'active', // ATOMIC activations are immediately active
     zipCode: addr.zipCode,
+    carrierLogId,
   };
 }
 
@@ -390,7 +684,7 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   let responseJson = {};
   try { responseJson = JSON.parse(responseText); } catch {}
 
-  await logCarrierApiCall(env, {
+  const carrierLogId = await logCarrierApiCall(env, {
     run_id: runId,
     step: 'portin',
     iccid,
@@ -407,7 +701,7 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   });
 
   if (!res.ok) {
-    throw new Error(`ATOMIC port-in failed ${res.status}: ${responseText.slice(0, 300)}`);
+    throw new CarrierActivationError(`ATOMIC port-in failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
   // Unlike Activate, a port is accepted asynchronously by the losing carrier —
@@ -422,6 +716,7 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
     status: 'provisioning', // sims.status CHECK constraint has no "pending port" value
     zipCode: portFields.zip,
     portInPending: true, // marks this SIM for details-finalizer's portinStatus poll
+    carrierLogId,
   };
 }
 
@@ -463,7 +758,7 @@ async function activateViaWingIot(env, iccid, runId) {
   let responseJson = {};
   try { responseJson = JSON.parse(responseText); } catch {}
 
-  await logCarrierApiCall(env, {
+  const carrierLogId = await logCarrierApiCall(env, {
     run_id: runId,
     step: 'activation',
     iccid,
@@ -480,11 +775,11 @@ async function activateViaWingIot(env, iccid, runId) {
   });
 
   if (!res.ok) {
-    throw new Error(`Wing IoT activation failed ${res.status}: ${responseText.slice(0, 300)}`);
+    throw new CarrierActivationError(`Wing IoT activation failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
   // MDN takes ~1-4 min to propagate — mdn-rotator's syncWingIotPendingMdns cron fills it in
-  return { msisdn: '', status: 'provisioning' };
+  return { msisdn: '', status: 'provisioning', carrierLogId };
 }
 
 async function activateViaHelix(env, token, iccid, imei, runId) {
@@ -748,8 +1043,10 @@ async function assignSimToReseller(env, resellerId, simId) {
 
 /* ── Carrier API logging ───────────────────────────────────────────────────── */
 
+// Returns the inserted row's id (for linking back via
+// activation_job_items.carrier_log_id) or null if logging was skipped/failed.
 async function logCarrierApiCall(env, logData) {
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return;
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return null;
   const vendor = logData.vendor || 'helix';
   const payload = {
     run_id: logData.run_id,
@@ -774,11 +1071,28 @@ async function logCarrierApiCall(env, logData) {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
       'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
+      Prefer: 'return=representation',
     },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) console.error(`[Carrier Log] Supabase failed: ${res.status}`);
+  if (!res.ok) { console.error(`[Carrier Log] Supabase failed: ${res.status}`); return null; }
+  try {
+    const rows = await res.json();
+    return rows?.[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Thrown by the activateVia* functions so the queue consumer can link the
+// carrier log for a call that failed (e.g. a port-in the carrier rejected on
+// PIN) — logCarrierApiCall() already wrote the row before the throw, but a
+// plain Error would drop that id on the floor.
+class CarrierActivationError extends Error {
+  constructor(message, carrierLogId) {
+    super(message);
+    this.carrierLogId = carrierLogId ?? null;
+  }
 }
 
 // Backward compatibility alias

@@ -165,3 +165,90 @@ test('validateActivationRow: port-in disabled does not require or fill MDN/accou
   assert.equal(sim.port_account_number, '', 'port_account_number must stay empty when port-in is disabled');
   assert.equal(sim.port_pin, '', 'port_pin must stay empty when port-in is disabled');
 });
+
+// ── Default random subscriber info (client-side: just don't error on blank) ─
+
+test('validateActivationRow: port-in with no name/address fields is valid (server fills random info)', () => {
+  const { ok, sim, errors } = validateActivationRow({
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
+    reseller_id: '1',
+    vendor: 'atomic',
+    port_in: 'true',
+    port_mdn: '2125550199',
+    port_account_number: 'ACCT12345',
+    port_pin: '1234',
+    // no port_first_name/last_name/street/zip/old_* — this is exactly what a
+    // 5-column paste (or the modal with the custom-info toggle off) sends.
+  }, 1, 'atomic');
+  assert.equal(errors.length, 0);
+  assert.equal(ok, true);
+  assert.equal(sim.port_first_name, '', 'client leaves name fields blank — server auto-fills them');
+  assert.equal(sim.port_mdn, '2125550199');
+});
+
+test('validateActivationRow: providing one custom-info field requires all of them', () => {
+  const { ok, errors } = validateActivationRow({
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
+    reseller_id: '1',
+    vendor: 'atomic',
+    port_in: 'true',
+    port_mdn: '2125550199',
+    port_account_number: 'ACCT12345',
+    port_pin: '1234',
+    port_first_name: 'John',
+  }, 1, 'atomic');
+  assert.equal(ok, false);
+  assert.match(errors.join('\n'), /port_last_name is required/);
+});
+
+// ── Reseller dropdown override ─────────────────────────────────────────────
+
+test('validateActivationRow: resellerIdOverride applies to a row with no reseller_id', () => {
+  const { ok, sim } = validateActivationRow({
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
+    vendor: 'atomic',
+    port_in: 'false',
+  }, 1, 'atomic', '5');
+  assert.equal(ok, true);
+  assert.equal(sim.reseller_id, 5);
+});
+
+test('validateActivationRow: resellerIdOverride wins over a row-level reseller_id', () => {
+  const { sim } = validateActivationRow({
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
+    reseller_id: '1',
+    vendor: 'atomic',
+    port_in: 'false',
+  }, 1, 'atomic', '9');
+  assert.equal(sim.reseller_id, 9);
+});
+
+test('validateActivationRow: row-level reseller_id used when no override supplied', () => {
+  const { sim } = validateActivationRow({
+    iccid: '89014103271467425631',
+    imei: '123456789012345',
+    reseller_id: '2',
+    vendor: 'atomic',
+    port_in: 'false',
+  }, 1, 'atomic');
+  assert.equal(sim.reseller_id, 2);
+});
+
+// ── 2-column regular activation paste (reseller from dropdown, not a column) ─
+
+test('splitPasteFields: 2-column ICCID/IMEI paste (no reseller column)', () => {
+  assert.deepEqual(Array.from(splitPasteFields('89014103271467425631 123456789012345')), ['89014103271467425631', '123456789012345']);
+  assert.deepEqual(Array.from(splitPasteFields('89014103271467425631,123456789012345')), ['89014103271467425631', '123456789012345']);
+  assert.deepEqual(Array.from(splitPasteFields('89014103271467425631\t123456789012345')), ['89014103271467425631', '123456789012345']);
+});
+
+// ── Bulk multi-row port-in paste is no longer capped at one row ────────────
+
+test('the old "manual port-in accepts exactly one row" restriction is removed from the source', () => {
+  const html = readFileSync(new URL('../src/dashboard/public/index.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(html, /Manual port-in accepts exactly one SIM row/);
+});

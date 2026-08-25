@@ -930,6 +930,10 @@
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
                     <span class="text-sm">SIMs</span>
                 </a>
+                <a href="/activation-runs" onclick="event.preventDefault();switchTab('activation-runs')" data-tab="activation-runs" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Activation Runs">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                    <span class="text-sm">Activation Runs</span>
+                </a>
                 <a href="/bad-rentals" onclick="event.preventDefault();switchTab('bad-rentals')" data-tab="bad-rentals" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Bad Rentals">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
                     <span class="text-sm">Bad Rentals</span>
@@ -3693,6 +3697,162 @@ set verify_pending; schedule §C.3 poll
                 </div>
             </div>
 
+            <!-- Activation Runs Tab -->
+            <div id="tab-activation-runs" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-6">
+                    <h2 class="text-xl font-bold text-white">Activation Runs</h2>
+                    <span class="text-sm text-gray-500">Track bulk activation jobs — per-SIM status, errors, and retry controls</span>
+                </div>
+
+                <!-- Runs List View -->
+                <div id="activation-runs-list" class="bg-dark-800 rounded-xl border border-dark-600 p-5">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="text-lg font-semibold text-white">Recent Activation Runs</h3>
+                        <div class="flex items-center gap-2">
+                            <select id="ar-filter-status" onchange="loadActivationRuns()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                <option value="">All Statuses</option>
+                                <option value="queued">Queued</option>
+                                <option value="processing">Processing</option>
+                                <option value="done">Done</option>
+                                <option value="failed">Failed</option>
+                                <option value="cancelled">Cancelled</option>
+                            </select>
+                            <select id="ar-filter-source" onchange="loadActivationRuns()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                <option value="">All Sources</option>
+                                <option value="csv">CSV Import</option>
+                                <option value="json">Dashboard / JSON API</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm" id="activation-runs-table">
+                            <thead>
+                                <tr class="border-b border-dark-600 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                                    <th class="pb-3 px-4">Run ID</th>
+                                    <th class="pb-3 px-4">Source</th>
+                                    <th class="pb-3 px-4">Status</th>
+                                    <th class="pb-3 px-4">Total</th>
+                                    <th class="pb-3 px-4">Queued</th>
+                                    <th class="pb-3 px-4">Processing</th>
+                                    <th class="pb-3 px-4">Done</th>
+                                    <th class="pb-3 px-4">Failed</th>
+                                    <th class="pb-3 px-4">Retry Needed</th>
+                                    <th class="pb-3 px-4">Skipped</th>
+                                    <th class="pb-3 px-4">Created</th>
+                                    <th class="pb-3 px-4">Started</th>
+                                    <th class="pb-3 px-4">Finished</th>
+                                    <th class="pb-3 px-4">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="activation-runs-tbody"></tbody>
+                        </table>
+                    </div>
+
+                    <div id="activation-runs-pagination" class="flex items-center justify-between mt-4 pt-4 border-t border-dark-600">
+                        <p id="activation-runs-count" class="text-sm text-gray-500"></p>
+                        <div class="flex items-center gap-2">
+                            <button onclick="activationRunsPrevPage()" disabled class="px-3 py-1.5 text-sm bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-400 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed" id="ar-prev-btn">&larr; Prev</button>
+                            <button onclick="activationRunsNextPage()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition" id="ar-next-btn">Next &rarr;</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Run Detail View -->
+                <div id="activation-run-detail" class="hidden bg-dark-800 rounded-xl border border-dark-600 p-5">
+                    <div class="flex items-center justify-between mb-4">
+                        <div>
+                            <button onclick="showActivationRunsList()" class="text-sm text-gray-400 hover:text-white transition mr-4">&larr; Back to Runs</button>
+                            <h3 class="text-lg font-semibold text-white" id="ar-detail-run-id"></h3>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <span id="ar-detail-status-badge" class="px-2 py-1 text-xs rounded-full"></span>
+                            <span id="ar-detail-source-badge" class="px-2 py-1 text-xs bg-dark-700 text-gray-300 rounded-full"></span>
+                        </div>
+                    </div>
+
+                    <!-- Run-level error (e.g. validation failures that never queued any item) -->
+                    <div id="ar-detail-error-banner" class="hidden mb-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+                        <div class="flex items-start justify-between gap-3">
+                            <p class="text-sm text-red-300 whitespace-pre-wrap break-words font-mono" id="ar-detail-error-text"></p>
+                            <button onclick="copyToClipboard(document.getElementById('ar-detail-error-text').textContent)" class="shrink-0 px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded transition">Copy</button>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                        <div class="bg-dark-700 rounded-lg p-4">
+                            <p class="text-xs text-gray-400">Total Items</p>
+                            <p class="text-2xl font-bold text-white" id="ar-detail-total">0</p>
+                        </div>
+                        <div class="bg-dark-700 rounded-lg p-4">
+                            <p class="text-xs text-gray-400">Done</p>
+                            <p class="text-2xl font-bold text-emerald-400" id="ar-detail-done">0</p>
+                        </div>
+                        <div class="bg-dark-700 rounded-lg p-4">
+                            <p class="text-xs text-gray-400">Failed</p>
+                            <p class="text-2xl font-bold text-red-400" id="ar-detail-failed">0</p>
+                        </div>
+                        <div class="bg-dark-700 rounded-lg p-4">
+                            <p class="text-xs text-gray-400">Retry Needed</p>
+                            <p class="text-2xl font-bold text-amber-400" id="ar-detail-retry">0</p>
+                        </div>
+                    </div>
+
+                    <!-- Bulk Retry Controls -->
+                    <div id="ar-bulk-retry-bar" class="mb-4 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg hidden">
+                        <div class="flex items-center justify-between">
+                            <span class="text-sm text-amber-300" id="ar-retry-count-text">0 failed/retry-needed items</span>
+                            <button onclick="retryAllFailedInRun()" class="px-4 py-2 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg transition">Retry All Failed</button>
+                        </div>
+                    </div>
+
+                    <!-- Filter bar for items -->
+                    <div class="flex items-center gap-4 mb-4 flex-wrap">
+                        <select id="ar-items-filter-status" onchange="loadActivationRunItems()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                            <option value="">All Statuses</option>
+                            <option value="pending">Pending</option>
+                            <option value="queued">Queued</option>
+                            <option value="processing">Processing</option>
+                            <option value="done">Done</option>
+                            <option value="failed">Failed</option>
+                            <option value="retry_needed">Retry Needed</option>
+                            <option value="skipped">Skipped</option>
+                        </select>
+                        <input type="text" id="ar-items-search" placeholder="Search ICCID..." oninput="loadActivationRunItems()" class="flex-1 min-w-[200px] text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent" />
+                    </div>
+
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm" id="activation-items-table">
+                            <thead>
+                                <tr class="border-b border-dark-600 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                                    <th class="pb-3 px-4">ICCID</th>
+                                    <th class="pb-3 px-4">IMEI</th>
+                                    <th class="pb-3 px-4">Vendor</th>
+                                    <th class="pb-3 px-4">Status</th>
+                                    <th class="pb-3 px-4">Attempt</th>
+                                    <th class="pb-3 px-4">Error</th>
+                                    <th class="pb-3 px-4">SIM ID</th>
+                                    <th class="pb-3 px-4">Carrier Logs</th>
+                                    <th class="pb-3 px-4">Queued At</th>
+                                    <th class="pb-3 px-4">Started At</th>
+                                    <th class="pb-3 px-4">Finished At</th>
+                                    <th class="pb-3 px-4">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="activation-items-tbody"></tbody>
+                        </table>
+                    </div>
+
+                    <div id="activation-items-pagination" class="flex items-center justify-between mt-4 pt-4 border-t border-dark-600">
+                        <p id="activation-items-count" class="text-sm text-gray-500"></p>
+                        <div class="flex items-center gap-2">
+                            <button onclick="activationItemsPrevPage()" disabled class="px-3 py-1.5 text-sm bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-400 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed" id="ai-prev-btn">&larr; Prev</button>
+                            <button onclick="activationItemsNextPage()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition" id="ai-next-btn">Next &rarr;</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             </div>
         </main>
     </div>
@@ -3818,21 +3978,24 @@ set verify_pending; schedule §C.3 poll
                         <option value="helix">Helix (legacy AT&T)</option>
                     </select>
                 </div>
+                <div class="flex items-center gap-3 mb-4">
+                    <label class="text-sm text-gray-400" for="activate-reseller-select">Activate to reseller:</label>
+                    <select id="activate-reseller-select" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent flex-1">
+                        <option value="">-- Select reseller --</option>
+                    </select>
+                </div>
+                <p class="text-xs text-gray-500 -mt-3 mb-4">Applied to every row in this batch (paste or CSV). Older pasted/CSV rows that still carry their own reseller_id column keep working if no reseller is selected here.</p>
                 <label class="flex items-center justify-between gap-3 p-3 mb-3 rounded-lg border border-orange-500/30 bg-orange-500/10">
                     <span>
                         <span class="block text-sm font-semibold text-orange-300">Port in existing number</span>
-                        <span class="block text-xs text-orange-200/80">ATOMIC only. This sends live carrier port details; CSV bulk rows can mix new-number and port-in activations.</span>
+                        <span class="block text-xs text-orange-200/80">ATOMIC only. This sends live carrier port details; CSV and paste can both submit multiple port-in rows at once.</span>
                     </span>
                     <input id="activate-port-in" type="checkbox" onchange="updateActivatePortInUi()" class="h-5 w-5 accent-orange-500">
                 </label>
                 <div id="activate-port-fields" class="hidden mb-4 p-3 rounded-lg border border-dark-600 bg-dark-900/60">
                     <label class="block text-sm text-gray-300 mb-1">Port MDN <span class="text-red-400">*</span></label>
                     <input id="activate-port-mdn" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="2125550199">
-                    <div class="mt-3">
-                        <label class="block text-sm text-gray-300 mb-1">Reseller ID <span class="text-red-400">*</span></label>
-                        <input id="activate-port-reseller-id" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="1" inputmode="numeric">
-                        <p class="text-xs text-gray-500 mt-1">Only used when pasting the 5-column ICCID/IMEI/MDN/account/PIN row above (it has no reseller column). Pasting the older 3-column ICCID/IMEI/reseller_id row fills reseller_id from that row instead and ignores this box.</p>
-                    </div>
+                    <p class="text-xs text-gray-500 mt-1">Only used for a single pasted port-in row. Each row in a multi-row port-in paste/CSV carries its own MDN/account/PIN and overrides this box.</p>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
                         <div>
                             <label class="block text-sm text-gray-300 mb-1">Port account number <span class="text-red-400">*</span></label>
@@ -3843,52 +4006,59 @@ set verify_pending; schedule §C.3 poll
                             <input id="activate-port-pin" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="PIN or passcode">
                         </div>
                     </div>
-                    <div class="flex items-center justify-between mt-4 mb-2">
-                        <h4 class="text-sm text-gray-300 font-medium">New subscriber / account holder</h4>
-                        <div class="flex items-center gap-2">
-                            <button type="button" onclick="fillRandomPortIdentity(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Use random info</button>
-                            <button type="button" onclick="fillRandomPortAddress(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Use random address</button>
+                    <label class="flex items-center gap-2 mt-4">
+                        <input id="activate-port-custom-info" type="checkbox" onchange="updateActivatePortCustomInfoUi()" class="h-4 w-4 accent-orange-500">
+                        <span class="text-sm text-gray-300">Use custom subscriber info (name/address)</span>
+                    </label>
+                    <p class="text-xs text-gray-500 mt-1 mb-2">By default (unchecked), every port-in line gets an automatically generated random subscriber name and address — no manual entry or button click needed, and each line in a bulk batch gets its own distinct random identity. Check this box to type specific name/address values instead; they're applied to every row in this batch. Neither random nor custom info ever touches ICCID, IMEI, MDN, port account number, PIN, or reseller.</p>
+                    <div id="activate-port-custom-fields" class="hidden">
+                        <div class="flex items-center justify-between mt-2 mb-2">
+                            <h4 class="text-sm text-gray-300 font-medium">New subscriber / account holder</h4>
+                            <div class="flex items-center gap-2">
+                                <button type="button" onclick="fillRandomPortIdentity(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Use random info</button>
+                                <button type="button" onclick="fillRandomPortAddress(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Use random address</button>
+                            </div>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-2">"Use random info" fills subscriber first/last name, street number/name/ZIP, and the losing-carrier (old carrier) first/last name below — all from fake-identity/address pools (no real customer data), using a separate random name for the old carrier by default. "Use random address" fills only street number/name and ZIP. Neither ever touches port account number, PIN, MDN, SIM/IMEI, or plan.</p>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-sm text-gray-300 mb-1">First name <span class="text-red-400">*</span></label>
+                                <input id="activate-port-first-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="First name">
+                            </div>
+                            <div>
+                                <label class="block text-sm text-gray-300 mb-1">Last name <span class="text-red-400">*</span></label>
+                                <input id="activate-port-last-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Last name">
+                            </div>
+                            <div>
+                                <label class="block text-sm text-gray-300 mb-1">Street number <span class="text-red-400">*</span></label>
+                                <input id="activate-port-street-number" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="123">
+                            </div>
+                            <div>
+                                <label class="block text-sm text-gray-300 mb-1">Street name <span class="text-red-400">*</span></label>
+                                <input id="activate-port-street-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Main St">
+                            </div>
+                            <div>
+                                <label class="block text-sm text-gray-300 mb-1">ZIP <span class="text-red-400">*</span></label>
+                                <input id="activate-port-zip" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="75001">
+                            </div>
+                        </div>
+                        <div class="flex items-center justify-between mt-4 mb-2">
+                            <h4 class="text-sm text-gray-300 font-medium">Losing-carrier account holder (name only — may differ from subscriber above)</h4>
+                            <button type="button" onclick="copySubscriberNameToOldCarrier(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Copy subscriber name to old carrier name</button>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-2">"Use random info" above already fills these with a separate random fake name. Only use "Copy subscriber name to old carrier name" if the losing carrier's billing records actually show this name — copying does not guarantee a match, and a mismatch will make the port reject. Leave the fields as separately-entered real values for a live port.</p>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-sm text-gray-300 mb-1">Old first name <span class="text-red-400">*</span></label>
+                                <input id="activate-port-old-first-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Old first name">
+                            </div>
+                            <div>
+                                <label class="block text-sm text-gray-300 mb-1">Old last name <span class="text-red-400">*</span></label>
+                                <input id="activate-port-old-last-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Old last name">
+                            </div>
                         </div>
                     </div>
-                    <p class="text-xs text-gray-500 mb-2">"Use random info" fills subscriber first/last name, street number/name/ZIP, and the losing-carrier (old carrier) first/last name below — all from fake-identity/address pools (no real customer data), using a separate random name for the old carrier by default. "Use random address" fills only street number/name and ZIP. Neither ever touches port account number, PIN, MDN, SIM/IMEI, or plan.</p>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        <div>
-                            <label class="block text-sm text-gray-300 mb-1">First name <span class="text-red-400">*</span></label>
-                            <input id="activate-port-first-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="First name">
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-300 mb-1">Last name <span class="text-red-400">*</span></label>
-                            <input id="activate-port-last-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Last name">
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-300 mb-1">Street number <span class="text-red-400">*</span></label>
-                            <input id="activate-port-street-number" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="123">
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-300 mb-1">Street name <span class="text-red-400">*</span></label>
-                            <input id="activate-port-street-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Main St">
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-300 mb-1">ZIP <span class="text-red-400">*</span></label>
-                            <input id="activate-port-zip" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="75001">
-                        </div>
-                    </div>
-                    <div class="flex items-center justify-between mt-4 mb-2">
-                        <h4 class="text-sm text-gray-300 font-medium">Losing-carrier account holder (name only — may differ from subscriber above)</h4>
-                        <button type="button" onclick="copySubscriberNameToOldCarrier(event)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Copy subscriber name to old carrier name</button>
-                    </div>
-                    <p class="text-xs text-gray-500 mb-2">"Use random info" above already fills these with a separate random fake name. Only use "Copy subscriber name to old carrier name" if the losing carrier's billing records actually show this name — copying does not guarantee a match, and a mismatch will make the port reject. Leave the fields as separately-entered real values for a live port.</p>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        <div>
-                            <label class="block text-sm text-gray-300 mb-1">Old first name <span class="text-red-400">*</span></label>
-                            <input id="activate-port-old-first-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Old first name">
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-300 mb-1">Old last name <span class="text-red-400">*</span></label>
-                            <input id="activate-port-old-last-name" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent" placeholder="Old last name">
-                        </div>
-                    </div>
-                    <p class="text-xs text-gray-500 mt-2">All fields are required for port-in. Sends the Atomic Wholesale <code class="bg-dark-900 px-1 rounded">portinRequest</code> operation (separate from <code class="bg-dark-900 px-1 rounded">Activate</code>) with the subscriber name/address and the losing-carrier billing account/PIN/name. The losing-carrier account number/PIN/name must match their records exactly or the port will reject. PIN is sent only inside this carrier request — never written to any separate debug field — but the request itself (including PIN) is recorded in carrier_api_logs for troubleshooting, same as every other carrier call.</p>
+                    <p class="text-xs text-gray-500 mt-2">Sends the Atomic Wholesale <code class="bg-dark-900 px-1 rounded">portinRequest</code> operation (separate from <code class="bg-dark-900 px-1 rounded">Activate</code>) with the subscriber name/address and the losing-carrier billing account/PIN/name. The losing-carrier account number/PIN/name must match their records exactly or the port will reject. PIN is sent only inside this carrier request — never written to any separate debug field — but the request itself (including PIN) is recorded in carrier_api_logs for troubleshooting, same as every other carrier call.</p>
                 </div>
                 <div class="mb-4 p-3 rounded-lg border border-dark-600 bg-dark-900/40">
                     <div class="flex flex-wrap items-center gap-3">
@@ -3896,12 +4066,12 @@ set verify_pending; schedule §C.3 poll
                         <input id="activate-csv-file" type="file" accept=".csv,text/csv" class="text-sm text-gray-300">
                         <button type="button" onclick="downloadActivationTemplate()" class="px-3 py-1.5 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Download CSV Template</button>
                     </div>
-                    <p class="text-xs text-gray-500 mt-2">CSV headers: iccid, imei, reseller_id, vendor, port_in, port_mdn, port_account_number, port_pin, port_first_name, port_last_name, port_street_number, port_street_name, port_zip, port_old_first_name, port_old_last_name. The review step blocks submission if any row is invalid.</p>
+                    <p class="text-xs text-gray-500 mt-2">CSV headers: iccid, imei, reseller_id, vendor, port_in, port_mdn, port_account_number, port_pin, port_first_name, port_last_name, port_street_number, port_street_name, port_zip, port_old_first_name, port_old_last_name. reseller_id and the port_first_name/last_name/street/zip/old_* columns are optional — leave them blank to use the reseller dropdown above and automatic random subscriber info. The review step blocks submission if any row is invalid.</p>
                 </div>
                 <p class="text-sm text-gray-400 mb-3">Paste from spreadsheet or enter one SIM per line:</p>
-                <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631&#9;123456789012345&#9;1
-89014103271467425632&#9;123456789012346&#9;1"></textarea>
-                <p class="text-xs text-gray-500 mt-2">Manual paste columns: ICCID (20 digits), IMEI (15 digits or blank for Wing IoT), Reseller ID — tab or comma separated. Use the switch above for one ATOMIC port-in row. With port-in on, you can instead paste a 5-column Google Sheets row — ICCID, IMEI, MDN, account number, PIN — separated by spaces, commas, tabs, or a mix; it fills Port MDN/account number/PIN above (enter Reseller ID in the box above the port fields since that row has no reseller column).</p>
+                <textarea id="activate-input" rows="10" class="w-full px-3 py-2 bg-dark-700 border border-dark-500 rounded-lg text-gray-200 text-sm focus:outline-none focus:border-accent font-mono" placeholder="89014103271467425631&#9;123456789012345
+89014103271467425632&#9;123456789012346"></textarea>
+                <p class="text-xs text-gray-500 mt-2">Manual paste columns: ICCID (20 digits), IMEI (15 digits or blank for Wing IoT) — tab, space, or comma separated, mixed separators OK. Select a reseller above instead of adding a reseller_id column (an older 3-column ICCID/IMEI/reseller_id row still works if you leave the dropdown unselected). With port-in on, paste one row per line as a 5-column Google Sheets row — ICCID, IMEI, MDN, account number, PIN — separated by spaces, commas, tabs, or a mix; every line becomes its own port-in activation.</p>
                 <div id="activate-review" class="hidden mt-4 p-3 rounded-lg border border-dark-600 bg-dark-900/70 text-xs text-gray-300 max-h-48 overflow-auto"></div>
             </div>
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-3">
@@ -4371,11 +4541,25 @@ set verify_pending; schedule §C.3 poll
             'sms-usage': '/sms-usage',
             'guide': '/guide',
             'api-tester': '/api-tester',
+            'activation-runs': '/activation-runs',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
         ROUTE_TO_TAB['/gateway'] = 'gateways'; // legacy alias for old bookmarks
 
-        function switchTab(tabName, push = true) {
+        // Activation Runs tab state — must be initialized before switchTab can run,
+        // because a deep-link/direct page load resolves straight into
+        // switchTab('activation-runs') via initTabFromUrl() before the rest of the
+        // script has executed. Declaring these later (as `let`) left them in the
+        // temporal dead zone at that call site, throwing a ReferenceError that
+        // aborted the whole boot script before loadActivationRuns() ever ran —
+        // the tab rendered its static empty table with zero rows.
+        let activationRunsPage = 0;
+        let activationItemsPage = 0;
+        const ACTIVATION_RUNS_PAGE_SIZE = 50;
+        const ACTIVATION_ITEMS_PAGE_SIZE = 200;
+        let currentRunId = null;
+
+        function switchTab(tabName, push = true, autoLoad = true) {
             toggleSidebar(false);
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
             document.querySelectorAll('.sidebar-btn').forEach(el => {
@@ -4395,7 +4579,7 @@ set verify_pending; schedule §C.3 poll
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'bad-rentals': 'Bad Rentals', 'rotation-reviews': 'Rotation Health', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'bad-rentals': 'Bad Rentals', 'rotation-reviews': 'Rotation Health', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester', 'activation-runs': 'Activation Runs' };
             const PAGE_HEADERS = {
                 dashboard:   ['Overview',       'Dashboard',          'Monitor SIMs, messages, and system status.'],
                 sims:        ['Inventory',      'SIMs',               'Browse, filter, and manage every SIM card in the fleet.'],
@@ -4410,7 +4594,8 @@ set verify_pending; schedule §C.3 poll
                 billing:     ['Billing',        'Reseller Billing',   'Charging audit, billing ledger, and plan rates.'],
                 'sms-usage': ['Analytics',      'SMS Usage',          'Inbound SMS volume per SIM over time.'],
                 guide:       ['Reference',      'Operations Guide',   'Cheat sheet for everyday dashboard operations.'],
-                'api-tester':['Tools',          'API Tester',         'Make raw requests against internal APIs for debugging.']
+                'api-tester':['Tools',          'API Tester',         'Make raw requests against internal APIs for debugging.'],
+                'activation-runs': ['Operations',  'Activation Runs',    'Track bulk activation jobs — per-SIM status, errors, and retry controls.']
             };
             const _hdr = PAGE_HEADERS[tabName];
             const _eb = document.getElementById('page-eyebrow');
@@ -4422,27 +4607,46 @@ set verify_pending; schedule §C.3 poll
                 if (_st) _st.textContent = _hdr[2];
             }
             document.title = (PAGE_TITLES[tabName] || tabName) + ' — SMS Gateway';
-            if (tabName === 'imei-pool') loadImeiPool();
-            if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); }
-            if (tabName === 'errors') loadErrors();
-            if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); }
-            if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); }
-            if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); }
-            if (tabName === 'sms-usage') loadSmsUsage();
-            if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} }
-            if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); }
-            if (tabName === 'workers') loadHostingPortJobs();
+            if (autoLoad) {
+                // Each branch is isolated in its own try/catch: a thrown error dispatching
+                // one tab's loader must not prevent the others from running, and — since
+                // this can run synchronously during page boot via initTabFromUrl() before
+                // the rest of the script has executed — must not abort the remaining
+                // top-level script (see the activation-runs state comment above).
+                try { if (tabName === 'imei-pool') loadImeiPool(); } catch(e) { console.error('switchTab autoLoad failed for imei-pool', e); }
+                try { if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); } } catch(e) { console.error('switchTab autoLoad failed for gateways', e); }
+                try { if (tabName === 'errors') loadErrors(); } catch(e) { console.error('switchTab autoLoad failed for errors', e); }
+                try { if (tabName === 'bad-rentals') { loadBadRentals(); loadRemediatorStatus(); } } catch(e) { console.error('switchTab autoLoad failed for bad-rentals', e); }
+                try { if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); } } catch(e) { console.error('switchTab autoLoad failed for invoicing', e); }
+                try { if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); } } catch(e) { console.error('switchTab autoLoad failed for billing', e); }
+                try { if (tabName === 'sms-usage') loadSmsUsage(); } catch(e) { console.error('switchTab autoLoad failed for sms-usage', e); }
+                try { if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} } } catch(e) { console.error('switchTab autoLoad failed for sims', e); }
+                try { if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); } } catch(e) { console.error('switchTab autoLoad failed for rotation-reviews', e); }
+                try { if (tabName === 'workers') loadHostingPortJobs(); } catch(e) { console.error('switchTab autoLoad failed for workers', e); }
+                try { if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); } } catch(e) { console.error('switchTab autoLoad failed for activation-runs', e); }
+            }
+        }
+
+        // /sims/:id — SIM detail deep link (e.g. clicked from an Activation
+        // Run item's ICCID). Not in TAB_ROUTES/ROUTE_TO_TAB since it's a
+        // per-record path, not a fixed tab route.
+        function matchSimDetailRoute() {
+            const m = location.pathname.match(/^\/sims\/([^/]+)$/);
+            return m ? m[1] : null;
         }
 
         // Handle browser back/forward
         window.addEventListener('popstate', (e) => {
-            const tab = e.state?.tab || ROUTE_TO_TAB[location.pathname] || 'dashboard';
+            const simDetailId = matchSimDetailRoute();
+            const tab = e.state?.tab || ROUTE_TO_TAB[simDetailId ? '/sims' : location.pathname] || 'dashboard';
             switchTab(tab, false);
             if (tab === 'sims') {
                 try {
                     const had = hydrateSimsFromUrl();
                     if (had) loadSims(true);
                 } catch(e){ console.error('popstate hydrate failed', e); }
+                if (simDetailId) openSimDetail(simDetailId, 'details');
+                else closeSimDetail();
             }
         });
 
@@ -5092,8 +5296,13 @@ set verify_pending; schedule §C.3 poll
 
 
         function initTabFromUrl() {
-            const tab = ROUTE_TO_TAB[location.pathname] || 'dashboard';
+            const simDetailId = matchSimDetailRoute();
+            const tab = simDetailId ? 'sims' : (ROUTE_TO_TAB[location.pathname] || 'dashboard');
             switchTab(tab, false);
+            // openSimDetail() has its own fetch-by-id fallback, so this works
+            // even before loadData()'s background loadSims(true) populates
+            // tableState.sims.data.
+            if (simDetailId) openSimDetail(simDetailId, 'details');
         }
 
 
@@ -6145,6 +6354,16 @@ async function sendSimOnline(simId, phoneNumber) {
         function hideMsgBodyModal() {
             document.getElementById('msg-body-modal').classList.add('hidden');
         }
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text || '').then(() => showToast('Copied to clipboard', 'success'));
+        }
+        function showErrorDetailModal(text) {
+            document.getElementById('error-detail-modal-text').textContent = text || 'No error text';
+            document.getElementById('error-detail-modal').classList.remove('hidden');
+        }
+        function hideErrorDetailModal() {
+            document.getElementById('error-detail-modal').classList.add('hidden');
+        }
         function renderMessages() {
             const state = tableState.messages;
             const search = (document.getElementById('messages-search')?.value || '').trim();
@@ -6314,15 +6533,29 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('iccids-input').value = '';
         }
 
+        function populateActivateResellerSelect() {
+            const sel = document.getElementById('activate-reseller-select');
+            if (!sel) return;
+            const prev = sel.value;
+            const cache = window._simsResellersCache || [];
+            sel.innerHTML = '<option value="">-- Select reseller --</option>' +
+                cache.map(function(r){ return '<option value="' + r.id + '">' + (r.name || '#' + r.id) + '</option>'; }).join('');
+            if (prev && cache.some(function(r){ return String(r.id) === prev; })) sel.value = prev;
+        }
+
         function showActivateModal() {
             document.getElementById('activate-modal').classList.remove('hidden');
+            if (window._simsResellersCache && window._simsResellersCache.length) {
+                populateActivateResellerSelect();
+            } else {
+                loadResellers().then(populateActivateResellerSelect);
+            }
         }
 
         function hideActivateModal() {
             document.getElementById('activate-modal').classList.add('hidden');
             document.getElementById('activate-input').value = '';
             document.getElementById('activate-port-mdn').value = '';
-            document.getElementById('activate-port-reseller-id').value = '';
             document.getElementById('activate-port-account-number').value = '';
             document.getElementById('activate-port-pin').value = '';
             document.getElementById('activate-port-first-name').value = '';
@@ -6333,10 +6566,13 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('activate-port-old-first-name').value = '';
             document.getElementById('activate-port-old-last-name').value = '';
             document.getElementById('activate-port-in').checked = false;
+            document.getElementById('activate-port-custom-info').checked = false;
+            document.getElementById('activate-reseller-select').value = '';
             document.getElementById('activate-csv-file').value = '';
             const review = document.getElementById('activate-review');
             if (review) { review.classList.add('hidden'); review.textContent = ''; }
             updateActivatePortInUi();
+            updateActivatePortCustomInfoUi();
         }
 
         const ACTIVATION_CSV_HEADERS = ['iccid', 'imei', 'reseller_id', 'vendor', 'port_in', 'port_mdn', 'port_account_number', 'port_pin', 'port_first_name', 'port_last_name', 'port_street_number', 'port_street_name', 'port_zip', 'port_old_first_name', 'port_old_last_name'];
@@ -6391,11 +6627,18 @@ async function sendSimOnline(simId, phoneNumber) {
             'port_first_name', 'port_last_name', 'port_street_number', 'port_street_name', 'port_zip',
             'port_old_first_name', 'port_old_last_name'
         ];
-        function validateActivationRow(row, rowNumber, defaultVendor) {
+        // resellerIdOverride is the dashboard's "activate to reseller" dropdown
+        // value — when set, it's applied to every row and wins over any
+        // per-row reseller_id (kept for backward compatibility with older
+        // 3-column pastes / CSV rows that still carry their own column).
+        function validateActivationRow(row, rowNumber, defaultVendor, resellerIdOverride) {
+            const resellerIdSource = (resellerIdOverride !== undefined && resellerIdOverride !== null && String(resellerIdOverride).trim() !== '')
+                ? resellerIdOverride
+                : (row.reseller_id || '');
             const sim = {
                 iccid: String(row.iccid || '').trim(),
                 imei: String(row.imei || '').trim(),
-                reseller_id: parseInt(String(row.reseller_id || '').trim(), 10),
+                reseller_id: parseInt(String(resellerIdSource).trim(), 10),
                 vendor: String(row.vendor || defaultVendor || 'atomic').trim() || 'atomic',
                 port_in: activationFlag(row.port_in),
                 port_mdn: '',
@@ -6413,7 +6656,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const prefix = rowNumber ? 'Row ' + rowNumber + ': ' : '';
             if (!/^\d{19,20}$/.test(sim.iccid)) errors.push(prefix + 'Invalid ICCID (expected 19-20 digits)');
             if (sim.vendor !== 'wing_iot' && !/^\d{15}$/.test(sim.imei)) errors.push(prefix + 'Invalid IMEI (expected 15 digits)');
-            if (!Number.isFinite(sim.reseller_id)) errors.push(prefix + 'Invalid reseller_id (must be a number)');
+            if (!Number.isFinite(sim.reseller_id)) errors.push(prefix + 'Invalid reseller_id (must be a number) — select a reseller above or include a reseller_id column');
             if (sim.port_in) {
                 if (sim.vendor !== 'atomic') errors.push(prefix + 'Port-in is currently supported only for ATOMIC activations');
                 const mdn = normalizeActivationPhone10(row.port_mdn || row.portMdn || '');
@@ -6425,10 +6668,18 @@ async function sendSimOnline(simId, phoneNumber) {
                 const portPin = String(row.port_pin || row.portPin || row.port_passcode || row.portPasscode || '').trim();
                 if (!portPin) errors.push(prefix + 'port_pin is required for port-in');
                 else sim.port_pin = portPin;
-                for (const k of PORT_FIELD_KEYS) {
-                    const v = String(row[k] || '').trim();
-                    if (!v) errors.push(prefix + k + ' is required for port-in');
-                    else sim[k] = v;
+                // Default: no name/address fields provided → leave them blank
+                // and let the server auto-fill a random subscriber identity
+                // per row (see pickRandomPortIdentity in activation-bulk.mjs).
+                // Only enforce the per-field requirement when the operator
+                // explicitly supplied at least one (custom-info mode).
+                const anyPortFieldProvided = PORT_FIELD_KEYS.some(k => String(row[k] || '').trim() !== '');
+                if (anyPortFieldProvided) {
+                    for (const k of PORT_FIELD_KEYS) {
+                        const v = String(row[k] || '').trim();
+                        if (!v) errors.push(prefix + k + ' is required for port-in');
+                        else sim[k] = v;
+                    }
                 }
             }
             return { ok: errors.length === 0, sim, errors };
@@ -6472,6 +6723,16 @@ async function sendSimOnline(simId, phoneNumber) {
                 document.getElementById('activate-port-in').checked = false;
                 showToast('Port-in is currently supported only for ATOMIC activations', 'error');
             }
+        }
+        // Default port-in behavior needs no manual name/address entry — every
+        // line gets an automatically generated random subscriber identity
+        // (server-side, one per row). This toggle only reveals the manual
+        // fields when the operator explicitly wants a specific name/address
+        // instead of a random one.
+        function updateActivatePortCustomInfoUi() {
+            const checked = !!document.getElementById('activate-port-custom-info')?.checked;
+            const fields = document.getElementById('activate-port-custom-fields');
+            if (fields) fields.classList.toggle('hidden', !checked);
         }
         async function fillRandomPortAddress(evt) {
             const btn = evt && evt.target;
@@ -6559,6 +6820,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const sims = [];
             const errors = [];
             let sourceLabel = 'manual row(s)';
+            const dropdownResellerId = document.getElementById('activate-reseller-select')?.value || '';
 
             if (csvText) {
                 sourceLabel = 'CSV row(s)';
@@ -6567,50 +6829,50 @@ async function sendSimOnline(simId, phoneNumber) {
                     errors.push('CSV is empty or missing a header row');
                 } else {
                     const header = rows[0].map(h => String(h || '').trim().toLowerCase().replace(/[\s-]+/g, '_'));
-                    for (const required of ['iccid', 'imei', 'reseller_id']) {
+                    // reseller_id is optional in the CSV header — a batch-wide
+                    // reseller can come from the dropdown above instead.
+                    for (const required of ['iccid', 'imei']) {
                         if (!header.includes(required)) errors.push('CSV missing required header: ' + required);
                     }
                     if (errors.length === 0) {
                         rows.slice(1).forEach(function(raw, idx) {
                             const row = {};
                             header.forEach(function(h, j) { row[h] = String(raw[j] || '').trim(); });
-                            const checked = validateActivationRow(row, idx + 2, vendor);
+                            const checked = validateActivationRow(row, idx + 2, vendor, dropdownResellerId);
                             if (checked.ok) sims.push(checked.sim);
                             else errors.push.apply(errors, checked.errors);
                         });
                     }
                 }
             } else {
-                // Parse pasted data. Non-port-in rows keep the original tab-or-comma,
-                // exactly-3-column behavior unchanged. Port-in rows also accept a
-                // 5-column Google Sheets row (ICCID, IMEI, MDN, account number, PIN)
-                // separated by spaces, commas, tabs, or a spreadsheet's mixed
-                // whitespace/comma paste — see parseManualPortInRow.
+                // Parse pasted data. Non-port-in rows accept ICCID+IMEI (2
+                // columns, reseller from the dropdown above) or the older
+                // ICCID/IMEI/reseller_id (3 columns), tab/space/comma/mixed
+                // separated — same tolerant splitter as the port-in row
+                // parser. Port-in rows accept one row per line as a
+                // 5-column Google Sheets row (ICCID, IMEI, MDN, account
+                // number, PIN) — see parseManualPortInRow.
                 const lines = input.split('\n').map(line => line.trim()).filter(line => line.length > 0);
                 const manualPortIn = !!document.getElementById('activate-port-in').checked;
-                if (manualPortIn && lines.length !== 1) {
-                    errors.push('Manual port-in accepts exactly one SIM row. Use CSV for mixed/bulk port-in activations.');
-                }
+                const useCustomInfo = manualPortIn && !!document.getElementById('activate-port-custom-info')?.checked;
 
                 for (let i = 0; i < lines.length; i++) {
-                    let iccid, imei, resellerId, pastedPortMdn = '', pastedPortAccountNumber = '', pastedPortPin = '';
+                    let iccid, imei, resellerId = '', pastedPortMdn = '', pastedPortAccountNumber = '', pastedPortPin = '';
                     if (manualPortIn) {
                         const parsed = parseManualPortInRow(lines[i]);
                         if (!parsed) {
                             errors.push(`Line ${i + 1}: Invalid format (expected ICCID/IMEI/reseller_id, or ICCID/IMEI/MDN/account/PIN for port-in)`);
                             continue;
                         }
-                        iccid = parsed.iccid; imei = parsed.imei;
-                        resellerId = parsed.reseller_id || document.getElementById('activate-port-reseller-id').value;
+                        iccid = parsed.iccid; imei = parsed.imei; resellerId = parsed.reseller_id || '';
                         pastedPortMdn = parsed.port_mdn; pastedPortAccountNumber = parsed.port_account_number; pastedPortPin = parsed.port_pin;
                     } else {
-                        const delimiter = lines[i].includes('\t') ? '\t' : ',';
-                        const parts = lines[i].split(delimiter).map(p => p.trim());
-                        if (parts.length !== 3) {
-                            errors.push(`Line ${i + 1}: Invalid format (expected 3 columns)`);
+                        const parts = splitPasteFields(lines[i]);
+                        if (parts.length !== 2 && parts.length !== 3) {
+                            errors.push(`Line ${i + 1}: Invalid format (expected ICCID/IMEI, or ICCID/IMEI/reseller_id)`);
                             continue;
                         }
-                        [iccid, imei, resellerId] = parts;
+                        iccid = parts[0]; imei = parts[1]; resellerId = parts[2] || '';
                     }
                     const checked = validateActivationRow({
                         iccid,
@@ -6618,17 +6880,23 @@ async function sendSimOnline(simId, phoneNumber) {
                         reseller_id: resellerId,
                         vendor,
                         port_in: manualPortIn ? 'true' : 'false',
+                        // Single-row manual port-in (no MDN/account/PIN parsed from
+                        // the pasted line) falls back to the modal's MDN/account/PIN
+                        // boxes; a 5-column paste always uses its own per-row values.
                         port_mdn: manualPortIn ? (pastedPortMdn || document.getElementById('activate-port-mdn').value) : '',
                         port_account_number: manualPortIn ? (pastedPortAccountNumber || document.getElementById('activate-port-account-number').value) : '',
                         port_pin: manualPortIn ? (pastedPortPin || document.getElementById('activate-port-pin').value) : '',
-                        port_first_name: manualPortIn ? document.getElementById('activate-port-first-name').value : '',
-                        port_last_name: manualPortIn ? document.getElementById('activate-port-last-name').value : '',
-                        port_street_number: manualPortIn ? document.getElementById('activate-port-street-number').value : '',
-                        port_street_name: manualPortIn ? document.getElementById('activate-port-street-name').value : '',
-                        port_zip: manualPortIn ? document.getElementById('activate-port-zip').value : '',
-                        port_old_first_name: manualPortIn ? document.getElementById('activate-port-old-first-name').value : '',
-                        port_old_last_name: manualPortIn ? document.getElementById('activate-port-old-last-name').value : ''
-                    }, i + 1, vendor);
+                        // Custom-info fields apply to every row in this batch when the
+                        // toggle is on; left blank otherwise so the server auto-fills
+                        // a distinct random subscriber identity per line.
+                        port_first_name: useCustomInfo ? document.getElementById('activate-port-first-name').value : '',
+                        port_last_name: useCustomInfo ? document.getElementById('activate-port-last-name').value : '',
+                        port_street_number: useCustomInfo ? document.getElementById('activate-port-street-number').value : '',
+                        port_street_name: useCustomInfo ? document.getElementById('activate-port-street-name').value : '',
+                        port_zip: useCustomInfo ? document.getElementById('activate-port-zip').value : '',
+                        port_old_first_name: useCustomInfo ? document.getElementById('activate-port-old-first-name').value : '',
+                        port_old_last_name: useCustomInfo ? document.getElementById('activate-port-old-last-name').value : ''
+                    }, i + 1, vendor, dropdownResellerId);
                     if (checked.ok) sims.push(checked.sim);
                     else errors.push.apply(errors, checked.errors);
                 }
@@ -6659,7 +6927,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const response = await fetch(`${API_BASE}/activate`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sims, vendor })
+                    body: JSON.stringify({ sims, vendor, reseller_id: dropdownResellerId || undefined })
                 });
 
                 const responseText = await response.text();
@@ -6675,6 +6943,15 @@ async function sendSimOnline(simId, phoneNumber) {
                     showToast('Queued ' + (result.queued || 0) + ' SIM(s) for activation' + (result.validation_errors > 0 ? ', ' + result.validation_errors + ' validation error(s)' : ''),
                         (result.validation_errors || 0) > 0 ? 'error' : 'success');
                     loadData();
+                    // job_run_id is the activation_runs.id primary key; run_id is
+                    // just a queue-message correlation string and doesn't match
+                    // any row, so the detail view must be opened with job_run_id.
+                    // autoLoad=false skips the tab's default list fetch since
+                    // showActivationRunDetail immediately replaces it anyway.
+                    if (result.job_run_id) {
+                        switchTab('activation-runs', true, false);
+                        showActivationRunDetail(result.job_run_id);
+                    }
                 } else {
                     showToast(`Error activating SIMs: ${result.error}`, 'error');
                 }
@@ -9795,7 +10072,7 @@ async function sendSimOnline(simId, phoneNumber) {
                         <span class="px-2 py-0.5 text-xs font-medium rounded bg-dark-600 text-gray-300">${err.source || '-'}</span>
                         ${err.action ? `<span class="text-xs text-gray-500 ml-1">${err.action}</span>` : ''}
                     </td>
-                    <td class="px-4 py-3 font-mono text-xs text-gray-400">${simLabel}</td>
+                    <td class="px-4 py-3 font-mono text-xs text-gray-400">${err.sim_id || err.iccid ? `<a href="javascript:void(0)" onclick="openSimDetailModal(${err.sim_id || 'null'}, ${escapeHtml(JSON.stringify(err.iccid || null))}, 'details')" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${simLabel}</a>` : simLabel}</td>
                     <td class="px-4 py-3 text-gray-300 text-xs max-w-xs truncate" title="${(err.error_message || '').replace(/"/g, '&quot;')}">${errorPreview}</td>
                     <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full ${sevClass}">${err.severity || '-'}</span></td>
                     <td class="px-4 py-3"><span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${err.status || '-'}</span></td>
@@ -13105,7 +13382,9 @@ async function sendSimOnline(simId, phoneNumber) {
 
                 loadData();
         setInterval(loadData, 3600000);
-        initTabFromUrl();
+        // A thrown error here would otherwise abort every remaining top-level
+        // statement in this script block (the rest of dashboard boot wiring).
+        try { initTabFromUrl(); } catch (e) { console.error('initTabFromUrl failed', e); }
 
         // Helix UI quarantine — hide/disable Helix-specific controls when HELIX_ENABLED=false
         if (!window.HELIX_ENABLED) {
@@ -13123,10 +13402,21 @@ async function sendSimOnline(simId, phoneNumber) {
         // ── D3: Per-SIM Unified Detail Modal ──────────────────────────────────
         let _sdCurrentSim = null;
 
-        function openSimDetail(simId, tab) {
+        // simId/iccid: deep links (e.g. from an Activation Run item's ICCID)
+        // may open a SIM that isn't in the currently loaded/filtered SIMs
+        // table — fall back to a direct single-record fetch by id or iccid.
+        async function openSimDetail(simId, tab, iccid) {
             tab = tab || 'details';
-            const sim = tableState.sims && tableState.sims.data && tableState.sims.data.find(function(s) { return String(s.id) === String(simId); });
-            if (!sim) { showToast('SIM #' + simId + ' not in current view — refresh the SIMs list first', 'error'); return; }
+            let sim = tableState.sims && tableState.sims.data && tableState.sims.data.find(function(s) { return String(s.id) === String(simId); });
+            if (!sim && (simId || iccid)) {
+                try {
+                    const params = simId ? ('id=' + encodeURIComponent(simId)) : ('iccid=' + encodeURIComponent(iccid));
+                    const resp = await fetch(API_BASE + '/sims?' + params);
+                    const list = await resp.json();
+                    if (resp.ok && Array.isArray(list)) sim = list[0];
+                } catch (e) { console.error('openSimDetail fetch fallback failed', e); }
+            }
+            if (!sim) { showToast('SIM ' + (simId ? '#' + simId : iccid) + ' not found', 'error'); return; }
             _sdCurrentSim = sim;
             document.getElementById('sd-title').textContent = 'SIM #' + sim.id;
             document.getElementById('sd-subtitle').textContent = sim.iccid || '';
@@ -13139,9 +13429,25 @@ async function sendSimOnline(simId, phoneNumber) {
             if (tab === 'logs') loadSimDetailLogs(sim.id, sim.iccid);
         }
 
+        // Entry point for click targets outside the SIMs table (e.g. an
+        // Activation Run item's ICCID/SIM cell, or the Errors table) — opens
+        // the SIM detail modal as an overlay on top of the operator's current
+        // page. Deliberately does NOT switch tabs or touch the URL: the
+        // operator stays on the Activation Run (or Errors) view underneath,
+        // and closing the modal returns them to exactly where they were.
+        // openSimDetail() has its own fetch-by-id/iccid fallback, so this
+        // works even when the SIM isn't loaded into tableState.sims.data.
+        function openSimDetailModal(simId, iccid, tab) {
+            if (!simId && !iccid) { showToast('No SIM linked to this item', 'error'); return; }
+            openSimDetail(simId, tab, iccid);
+        }
+
         function closeSimDetail() {
             document.getElementById('sim-detail-modal').classList.add('hidden');
             _sdCurrentSim = null;
+            if (/^\/sims\/[^/]+$/.test(location.pathname)) {
+                history.pushState({ tab: 'sims' }, '', '/sims');
+            }
         }
 
         function switchSimDetailTab(tab) {
@@ -14052,6 +14358,385 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
 
+        // ===== Activation Runs Tab =====
+        async function loadActivationRuns() {
+            const tbody = document.getElementById('activation-runs-tbody');
+            const countEl = document.getElementById('activation-runs-count');
+            const prevBtn = document.getElementById('ar-prev-btn');
+            const nextBtn = document.getElementById('ar-next-btn');
+            const statusFilter = document.getElementById('ar-filter-status');
+            const sourceFilter = document.getElementById('ar-filter-source');
+
+            if (!tbody) return;
+
+            const status = statusFilter ? statusFilter.value : '';
+            const source = sourceFilter ? sourceFilter.value : '';
+
+            const params = new URLSearchParams({
+                limit: ACTIVATION_RUNS_PAGE_SIZE,
+                offset: activationRunsPage * ACTIVATION_RUNS_PAGE_SIZE,
+            });
+            if (status) params.append('status', status);
+            if (source) params.append('source', source);
+
+            tbody.innerHTML = '<tr><td colspan="14" class="px-4 py-8 text-center text-dark-400">Loading…</td></tr>';
+
+            try {
+                const resp = await fetch(`${API_BASE}/activation-runs?${params.toString()}`);
+                const data = await resp.json();
+
+                if (!resp.ok || data.error) {
+                    tbody.innerHTML = `<tr><td colspan="14" class="px-4 py-8 text-center text-red-400">Error loading activation runs: ${escapeHtml(data.error || resp.statusText || String(resp.status))}</td></tr>`;
+                    countEl.textContent = '';
+                    prevBtn.disabled = true;
+                    nextBtn.disabled = true;
+                    return;
+                }
+
+                const runs = data.runs || [];
+                const total = data.total || 0;
+
+                if (runs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="14" class="px-4 py-8 text-center text-dark-400">No activation runs found</td></tr>';
+                    countEl.textContent = `Total: 0`;
+                    prevBtn.disabled = true;
+                    nextBtn.disabled = true;
+                    return;
+                }
+
+                tbody.innerHTML = runs.map(r => {
+                    const statusCls = {
+                        queued: 'bg-blue-500/20 text-blue-300',
+                        processing: 'bg-yellow-500/20 text-yellow-300',
+                        done: 'bg-emerald-500/20 text-emerald-300',
+                        failed: 'bg-red-500/20 text-red-300',
+                        cancelled: 'bg-gray-500/20 text-gray-300',
+                    }[r.status] || 'bg-dark-600 text-gray-300';
+
+                    const sourceCls = {
+                        csv: 'bg-purple-500/20 text-purple-300',
+                        json: 'bg-cyan-500/20 text-cyan-300',
+                        dashboard: 'bg-accent/20 text-accent',
+                    }[r.source] || 'bg-dark-600 text-gray-300';
+
+                    return `<tr class="border-b border-dark-700 hover:bg-dark-700/50 cursor-pointer" onclick="showActivationRunDetail('${r.id}')">
+                        <td class="px-4 py-3 font-mono text-xs">${escapeHtml(r.id)}</td>
+                        <td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ${sourceCls}">${escapeHtml(r.source)}</span></td>
+                        <td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ${statusCls}">${escapeHtml(r.status)}</span></td>
+                        <td class="px-4 py-3 text-right">${r.total_items || 0}</td>
+                        <td class="px-4 py-3 text-right">${r.queued_items || 0}</td>
+                        <td class="px-4 py-3 text-right">${r.processing_items || 0}</td>
+                        <td class="px-4 py-3 text-right">${r.done_items || 0}</td>
+                        <td class="px-4 py-3 text-right text-red-400">${r.failed_items || 0}</td>
+                        <td class="px-4 py-3 text-right text-amber-400">${r.retry_needed_items || 0}</td>
+                        <td class="px-4 py-3 text-right">${r.skipped_items || 0}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(r.created_at ? new Date(r.created_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(r.started_at ? new Date(r.started_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(r.finished_at ? new Date(r.finished_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3">
+                            <button onclick="event.stopPropagation(); showActivationRunDetail('${r.id}')" class="px-2 py-1 text-xs bg-accent hover:bg-green-600 text-white rounded transition">View</button>
+                        </td>
+                    </tr>`;
+                }).join('');
+
+                countEl.textContent = `Showing ${runs.length} of ${total} (page ${activationRunsPage + 1})`;
+                prevBtn.disabled = activationRunsPage === 0;
+                nextBtn.disabled = (activationRunsPage + 1) * ACTIVATION_RUNS_PAGE_SIZE >= total;
+            } catch (e) {
+                tbody.innerHTML = `<tr><td colspan="14" class="px-4 py-8 text-center text-red-400">Error: ${escapeHtml(String(e))}</td></tr>`;
+                countEl.textContent = '';
+            }
+        }
+
+        function activationRunsPrevPage() {
+            if (activationRunsPage > 0) {
+                activationRunsPage--;
+                loadActivationRuns();
+            }
+        }
+
+        function activationRunsNextPage() {
+            activationRunsPage++;
+            loadActivationRuns();
+        }
+
+        async function showActivationRunDetail(runId) {
+            currentRunId = runId;
+            document.getElementById('activation-runs-list').classList.add('hidden');
+            document.getElementById('activation-run-detail').classList.remove('hidden');
+
+            // Load run details
+            try {
+                const resp = await fetch(`${API_BASE}/activation-runs/${encodeURIComponent(runId)}`);
+                const data = await resp.json();
+
+                if (!resp.ok || data.error) {
+                    console.error('Failed to load run detail:', data.error || resp.statusText);
+                    document.getElementById('ar-detail-run-id').textContent = 'Error: ' + (data.error || resp.statusText || String(resp.status));
+                    return;
+                }
+
+                const run = data.run;
+
+                document.getElementById('ar-detail-run-id').textContent = run.id;
+                document.getElementById('ar-detail-status-badge').textContent = run.status;
+                document.getElementById('ar-detail-status-badge').className = 'px-2 py-1 text-xs rounded-full ' + ({
+                    queued: 'bg-blue-500/20 text-blue-300',
+                    processing: 'bg-yellow-500/20 text-yellow-300',
+                    done: 'bg-emerald-500/20 text-emerald-300',
+                    failed: 'bg-red-500/20 text-red-300',
+                    cancelled: 'bg-gray-500/20 text-gray-300',
+                }[run.status] || 'bg-dark-600 text-gray-300');
+                document.getElementById('ar-detail-source-badge').textContent = run.source;
+
+                const errorBanner = document.getElementById('ar-detail-error-banner');
+                if (run.error) {
+                    document.getElementById('ar-detail-error-text').textContent = run.error;
+                    errorBanner.classList.remove('hidden');
+                } else {
+                    errorBanner.classList.add('hidden');
+                }
+
+                document.getElementById('ar-detail-total').textContent = run.total_items || 0;
+                document.getElementById('ar-detail-done').textContent = run.done_items || 0;
+                document.getElementById('ar-detail-failed').textContent = run.failed_items || 0;
+                document.getElementById('ar-detail-retry').textContent = run.retry_needed_items || 0;
+
+                // Show bulk retry bar if there are failed items
+                const retryCount = (run.failed_items || 0) + (run.retry_needed_items || 0);
+                const retryBar = document.getElementById('ar-bulk-retry-bar');
+                const retryText = document.getElementById('ar-retry-count-text');
+                if (retryCount > 0) {
+                    retryBar.classList.remove('hidden');
+                    retryText.textContent = `${retryCount} failed/retry-needed items`;
+                } else {
+                    retryBar.classList.add('hidden');
+                }
+            } catch (e) {
+                console.error('Failed to load run detail:', e);
+            }
+
+            // Load items
+            activationItemsPage = 0;
+            await loadActivationRunItems();
+        }
+
+        function showActivationRunsList() {
+            document.getElementById('activation-run-detail').classList.add('hidden');
+            document.getElementById('activation-runs-list').classList.remove('hidden');
+            currentRunId = null;
+            // Refresh rather than rely on stale data — a direct-open (e.g. right
+            // after submitting) may never have loaded the list in the background.
+            activationRunsPage = 0;
+            loadActivationRuns();
+        }
+
+        async function loadActivationRunItems() {
+            if (!currentRunId) return;
+
+            const tbody = document.getElementById('activation-items-tbody');
+            const countEl = document.getElementById('activation-items-count');
+            const prevBtn = document.getElementById('ai-prev-btn');
+            const nextBtn = document.getElementById('ai-next-btn');
+            const statusFilter = document.getElementById('ar-items-filter-status');
+            const searchInput = document.getElementById('ar-items-search');
+
+            if (!tbody) return;
+
+            const status = statusFilter ? statusFilter.value : '';
+            const search = searchInput ? searchInput.value : '';
+
+            const params = new URLSearchParams({
+                limit: ACTIVATION_ITEMS_PAGE_SIZE,
+                offset: activationItemsPage * ACTIVATION_ITEMS_PAGE_SIZE,
+            });
+            if (status) params.append('status', status);
+            if (search) params.append('search', search);
+
+            tbody.innerHTML = '<tr><td colspan="12" class="px-4 py-8 text-center text-dark-400">Loading…</td></tr>';
+
+            try {
+                const resp = await fetch(`${API_BASE}/activation-runs/${encodeURIComponent(currentRunId)}?${params.toString()}`);
+                const data = await resp.json();
+
+                if (!resp.ok || data.error) {
+                    tbody.innerHTML = `<tr><td colspan="12" class="px-4 py-8 text-center text-red-400">Error loading items: ${escapeHtml(data.error || resp.statusText || String(resp.status))}</td></tr>`;
+                    countEl.textContent = '';
+                    prevBtn.disabled = true;
+                    nextBtn.disabled = true;
+                    return;
+                }
+
+                const items = data.items || [];
+                const totalItems = data.total_items || 0;
+                const carrierLogs = data.carrier_logs || [];
+
+                // Build carrier logs map by ICCID
+                const logsByIccid = {};
+                for (const log of carrierLogs) {
+                    if (!logsByIccid[log.iccid]) logsByIccid[log.iccid] = [];
+                    logsByIccid[log.iccid].push(log);
+                }
+
+                if (items.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="12" class="px-4 py-8 text-center text-dark-400">No items found</td></tr>';
+                    countEl.textContent = `Total: 0`;
+                    prevBtn.disabled = true;
+                    nextBtn.disabled = true;
+                    return;
+                }
+
+                tbody.innerHTML = items.map(item => {
+                    const statusCls = {
+                        pending: 'bg-gray-500/20 text-gray-300',
+                        queued: 'bg-blue-500/20 text-blue-300',
+                        processing: 'bg-yellow-500/20 text-yellow-300',
+                        done: 'bg-emerald-500/20 text-emerald-300',
+                        failed: 'bg-red-500/20 text-red-300',
+                        retry_needed: 'bg-amber-500/20 text-amber-300',
+                        skipped: 'bg-gray-500/20 text-gray-400',
+                    }[item.status] || 'bg-dark-600 text-gray-300';
+
+                    const canRetry = ['failed', 'retry_needed'].includes(item.status);
+                    const logs = logsByIccid[item.iccid] || [];
+
+                    const simNavArgs = `${item.sim_id || 'null'}, ${escapeHtml(JSON.stringify(item.iccid))}, 'details'`;
+
+                    return `<tr class="border-b border-dark-700 hover:bg-dark-700/50">
+                        <td class="px-4 py-3 font-mono text-xs"><a href="javascript:void(0)" onclick="openSimDetailModal(${simNavArgs})" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${escapeHtml(item.iccid)}</a></td>
+                        <td class="px-4 py-3 font-mono text-xs">${escapeHtml(item.imei || '—')}</td>
+                        <td class="px-4 py-3">${escapeHtml(item.vendor || '—')}</td>
+                        <td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ${statusCls}">${escapeHtml(item.status)}</span></td>
+                        <td class="px-4 py-3 text-center">${item.attempt || 0} / ${item.max_attempts || 3}</td>
+                        <td class="px-4 py-3 text-xs text-red-400 max-w-[200px] truncate ${item.error_message ? 'cursor-pointer hover:text-red-300 hover:underline' : ''}" title="${item.error_message ? 'Click to view full error' : ''}" ${item.error_message ? `onclick="showErrorDetailModal(${escapeHtml(JSON.stringify(item.error_message))})"` : ''}>${escapeHtml(item.error_message || '—')}</td>
+                        <td class="px-4 py-3 text-center">${item.sim_id ? `<a href="javascript:void(0)" onclick="openSimDetailModal(${simNavArgs})" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">${item.sim_id}</a>` : '—'}</td>
+                        <td class="px-4 py-3 text-center">${logs.length > 0 ? `<button onclick="showCarrierLogsModal('${escapeHtml(item.iccid)}', ${escapeHtml(JSON.stringify(logs))})" class="px-2 py-1 text-xs bg-cyan-600 hover:bg-cyan-700 text-white rounded transition">${logs.length} logs</button>` : '—'}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(item.queued_at ? new Date(item.queued_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(item.started_at ? new Date(item.started_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3 text-xs">${escapeHtml(item.finished_at ? new Date(item.finished_at).toLocaleString() : '—')}</td>
+                        <td class="px-4 py-3">
+                            ${canRetry ? `<button onclick="retryActivationItem('${item.id}')" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded transition">Retry</button>` : '<span class="text-xs text-gray-500">—</span>'}
+                        </td>
+                    </tr>`;
+                }).join('');
+
+                countEl.textContent = `Showing ${items.length} of ${totalItems} (page ${activationItemsPage + 1})`;
+                prevBtn.disabled = activationItemsPage === 0;
+                nextBtn.disabled = (activationItemsPage + 1) * ACTIVATION_ITEMS_PAGE_SIZE >= totalItems;
+            } catch (e) {
+                tbody.innerHTML = `<tr><td colspan="12" class="px-4 py-8 text-center text-red-400">Error: ${escapeHtml(String(e))}</td></tr>`;
+                countEl.textContent = '';
+            }
+        }
+
+        function activationItemsPrevPage() {
+            if (activationItemsPage > 0) {
+                activationItemsPage--;
+                loadActivationRunItems();
+            }
+        }
+
+        function activationItemsNextPage() {
+            activationItemsPage++;
+            loadActivationRunItems();
+        }
+
+        async function retryActivationItem(itemId) {
+            if (!confirm('Retry this activation item?')) return;
+
+            try {
+                const resp = await fetch(`${API_BASE}/activation-runs`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ run_id: currentRunId, item_ids: [itemId] }),
+                });
+                const data = await resp.json();
+                if (data.ok) {
+                    showToast(`Retried 1 item`, 'success');
+                    loadActivationRunItems();
+                    // Also refresh the run list to update counts
+                    loadActivationRuns();
+                } else {
+                    showToast('Retry failed: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                showToast('Retry failed: ' + e, 'error');
+            }
+        }
+
+        async function retryAllFailedInRun() {
+            const retryCount = (parseInt(document.getElementById('ar-detail-failed').textContent) || 0) +
+                               (parseInt(document.getElementById('ar-detail-retry').textContent) || 0);
+            if (retryCount === 0) return;
+            if (!confirm(`Retry all ${retryCount} failed/retry-needed items in this run?`)) return;
+
+            try {
+                const resp = await fetch(`${API_BASE}/activation-runs`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ run_id: currentRunId, retry_all_failed: true }),
+                });
+                const data = await resp.json();
+                if (data.ok) {
+                    showToast(`Retried ${data.retried} items`, 'success');
+                    loadActivationRunItems();
+                    loadActivationRuns();
+                } else {
+                    showToast('Bulk retry failed: ' + (data.error || 'Unknown error'), 'error');
+                }
+            } catch (e) {
+                showToast('Bulk retry failed: ' + e, 'error');
+            }
+        }
+
+        function showCarrierLogsModal(iccid, logs) {
+            // Reuse the API tester response area or create a simple modal
+            const modalHtml = `
+                <div id="carrier-logs-modal" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+                    <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-3xl max-h-[80vh] flex flex-col">
+                        <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                            <h3 class="text-lg font-semibold text-white">Carrier API Logs for ${iccid}</h3>
+                            <button onclick="hideCarrierLogsModal()" class="text-gray-400 hover:text-white text-xl">&times;</button>
+                        </div>
+                        <div class="p-5 overflow-y-auto flex-1">
+                            <div class="space-y-4 max-h-[60vh] overflow-y-auto">
+                                ${logs.map(log => `
+                                    <div class="bg-dark-700 border border-dark-600 rounded-lg p-4">
+                                        <div class="flex items-center justify-between mb-2">
+                                            <span class="text-xs font-medium text-gray-400">${log.vendor || 'helix'}</span>
+                                            <span class="text-xs text-gray-500">${fmt(log.created_at)}</span>
+                                        </div>
+                                        <div class="grid grid-cols-2 gap-2 text-xs mb-2">
+                                            <div><span class="text-gray-400">Step:</span> <span class="text-gray-200">${log.step || '—'}</span></div>
+                                            <div><span class="text-gray-400">Method:</span> <span class="text-gray-200">${log.request_method || '—'}</span></div>
+                                            <div><span class="text-gray-400">Status:</span> <span class="${log.response_ok ? 'text-emerald-400' : 'text-red-400'}">${log.response_status || '—'}</span></div>
+                                            <div><span class="text-gray-400">URL:</span> <span class="text-gray-300 truncate">${log.request_url || '—'}</span></div>
+                                        </div>
+                                        ${log.error ? `<div class="text-xs text-red-400 mb-2">Error: ${escapeHtml(log.error)}</div>` : ''}
+                                        <details class="group">
+                                            <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">Request Body</summary>
+                                            <pre class="text-[10px] text-gray-300 font-mono bg-dark-900 rounded p-2 mt-1 overflow-x-auto border border-dark-600">${escapeHtml(JSON.stringify(log.request_body, null, 2))}</pre>
+                                        </details>
+                                        <details class="group mt-2">
+                                            <summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-300">Response Body</summary>
+                                            <pre class="text-[10px] text-gray-300 font-mono bg-dark-900 rounded p-2 mt-1 overflow-x-auto border border-dark-600">${escapeHtml(JSON.stringify(log.response_body_json, null, 2))}</pre>
+                                        </details>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+        }
+
+        function hideCarrierLogsModal() {
+            const modal = document.getElementById('carrier-logs-modal');
+            if (modal) modal.remove();
+        }
+
+
     </script>
         <!-- Add Mapping Modal -->
         <div id="add-mapping-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -14088,6 +14773,21 @@ async function sendSimOnline(simId, phoneNumber) {
             </div>
             <div class="p-5">
                 <p id="msg-body-text" class="text-sm text-gray-200 whitespace-pre-wrap break-words"></p>
+            </div>
+        </div>
+    </div>
+
+    <div id="error-detail-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onclick="hideErrorDetailModal()">
+        <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl" onclick="event.stopPropagation()">
+            <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+                <h3 class="text-base font-semibold text-white">Full Error</h3>
+                <div class="flex items-center gap-2">
+                    <button onclick="copyToClipboard(document.getElementById('error-detail-modal-text').textContent)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded transition">Copy</button>
+                    <button onclick="hideErrorDetailModal()" class="text-gray-500 hover:text-white text-xl leading-none">&times;</button>
+                </div>
+            </div>
+            <div class="p-5">
+                <pre id="error-detail-modal-text" class="text-xs text-red-300 font-mono whitespace-pre-wrap break-words max-h-[60vh] overflow-y-auto"></pre>
             </div>
         </div>
     </div>

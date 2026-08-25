@@ -67,7 +67,7 @@ function makeSandbox(routes) {
   };
   vm.createContext(sandbox);
   const code = [
-    extractFn('async function supabaseGet(env, path) {'),
+    extractFn('async function supabaseGet(env, path, extraHeaders) {'),
     extractFn('function csvEscape(value) {'),
     extractFn('async function handleTeltikPortOfflineExport(env, corsHeaders, url) {'),
     extractFn('async function handlePublicBadRentalEscalationToday(env) {'),
