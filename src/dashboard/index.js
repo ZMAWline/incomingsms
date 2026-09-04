@@ -4,7 +4,7 @@ import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateCh
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
 import { isTeltikInvalidIccidResponse, iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/teltik-known-mdn.mjs';
-import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, runRotatingCronSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
+import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
 
@@ -603,26 +603,24 @@ export default {
     return serveApp(env);
   },
 
-  // Two schedules (wrangler.toml [triggers]): the 12h cron runs the capped
-  // automatic sweep; the 1-minute tick drains queued Workers-page Hosting
-  // Port Check jobs one bounded batch per tick, so a manual full sweep
-  // continues even after the operator's browser closes. Both record through
-  // the same canonical recorder, so cron + manual runs feed one history.
-  // Awaited (not ctx.waitUntil): fire-and-forget drains were observed to be
-  // dropped before persisting progress/logs; awaiting keeps the scheduled
-  // event alive until the batch commits.
+  // Two schedules (wrangler.toml [triggers]): the 12h cron enqueues one
+  // durable full-fleet hosting_port_status_jobs row; the 1-minute tick drains
+  // the oldest queued/running job (that enqueue, or a Workers-page manual
+  // sweep) one bounded batch per tick, so the sweep continues even after the
+  // operator's browser closes and covers every eligible SIM, not a
+  // fixed-size slice. Both record through the same canonical recorder, so
+  // cron + manual runs feed one history. Awaited (not ctx.waitUntil):
+  // fire-and-forget drains were observed to be dropped before persisting
+  // progress/logs; awaiting keeps the scheduled event alive until the batch
+  // commits.
   async scheduled(event, env, ctx) {
     if (event.cron === '0 */12 * * *') {
-      // Rotates through the whole fleet across runs (persisted offset in
-      // hosting_port_cron_state) instead of re-checking the same ~200
-      // lowest-id lines every 12h forever — see runRotatingCronSweep.
-      await runRotatingCronSweep(env, { source: 'cron' })
-        .then(s => console.log('[HostPort] cron sweep done: ' + JSON.stringify({
-          total: s.total, online: s.online, offline: s.offline,
-          unknown: s.unknown, error: s.error, truncated: s.truncated,
-          offset: s.offset, next_offset: s.next_offset, has_more: s.has_more,
-        })))
-        .catch(e => console.log('[HostPort] cron sweep failed: ' + (e && e.message || e)));
+      // enqueueHostingPortJob dedupes against an already queued/running job,
+      // so this is a no-op (not a stacked duplicate) when the previous
+      // cycle's sweep hasn't finished draining yet.
+      await enqueueHostingPortJob(env, { source: 'cron' })
+        .then(r => console.log('[HostPort] cron enqueue: ' + JSON.stringify(r)))
+        .catch(e => console.log('[HostPort] cron enqueue failed: ' + (e && e.message || e)));
     }
     await processHostingPortJobs(env, { maxJobs: 1 })
       .then(r => { if (r.claimed) console.log('[HostPort] job drain: ' + JSON.stringify(r)); })
