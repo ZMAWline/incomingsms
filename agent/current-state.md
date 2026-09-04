@@ -1,7 +1,80 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-08-24 (dashboard: port-in default random subscriber info + custom-info toggle, bulk port-in paste, reseller dropdown applied per-row — see session below)
+> Last updated: 2026-09-04 (infrastructure correction: all SIMs Teltik-hosted, all Wing IoT SIMs cancelled)
+
+---
+
+## 2026-09-04 — Infrastructure correction from Zalmen: SkyLine is legacy, Wing IoT is dead
+
+Two standing facts that the repo docs (and `agent/project-map.md` in particular) still described as
+current. Both are now corrected in the project map; recording them here as the authoritative note.
+
+1. **All SIMs are hosted by Teltik.** The SkyLine gateway hardware — gateways `64-1` and `512-1`, the
+   Supabase Edge Function bridge to `54.254.97.139:63826`, the `goip_send_at.html` AT-command
+   transport, KASA outlet power-cycling — is the **old setup** and no longer hosts production lines.
+   Carrier vendor remains a real distinction (an `atomic`/AT&T SIM sits in a Teltik gateway), so
+   carrier-level ops still route on `vendor`; it is only the *physical host* axis that has collapsed
+   to Teltik.
+2. **All `wing_iot` SIMs are cancelled.** `src/shared/wing-iot.ts` and every `vendor === 'wing_iot'`
+   branch across the workers are dead paths in production, not merely quiet.
+
+### Root cause found and fixed: `sims.gateway_host` defaulted to `'skyline'` at the DB level
+
+The initial suspicion (null `gateway_host` falling through `gatewayHostOf`) was **wrong** — the column
+is `NOT NULL` and had zero nulls on PROD. The actual defect was a **write-path default**:
+
+```
+sims.gateway_host  ->  NOT NULL DEFAULT 'skyline'::text
+```
+
+No activation insert path sets `gateway_host` explicitly, so **every newly activated SIM silently
+landed as `skyline`** — including the entire 2026-08-24 → 09-04 Teltik port-in cohort. Those rows are
+identifiable because they carry `gateway_id IS NULL` and `port IS NULL`: they were seated in no
+SkyLine gateway at all. (Genuine legacy SkyLine rows, e.g. the 14 deactivated ids 2610–2631, do carry
+a real `gateway_id` and port.) Two ICCIDs sampled from `teltik-port-in-deploy-report-170.csv` were
+confirmed inside the mislabeled active set.
+
+Why it mattered: `shared/gateway-host.mjs` keys the capability matrix on `gateway_host`. A row wrongly
+marked `skyline` reports `setImei: true` / `portReset: false` — the inverse of what a Teltik-hosted
+line supports. Silent wrong branch, not an exception. The codebase was also holding **two
+contradictory defaults**: ~10 read sites already coalesced to `sim.gateway_host || 'teltik'`, while
+`gatewayHostOf()` derived `SKYLINE`.
+
+**Applied (three layers, so the fix does not regress):**
+1. **DB default flipped** `'skyline'` → `'teltik'` on **PROD** (`lzjqegxazqlktttyybth`) and **TEST**
+   (`lwapudjjlwkskijefxdz`), migration `sims_gateway_host_default_teltik`; file committed at
+   `migrations/20260904_sims_gateway_host_default_teltik.sql`. Both verified reading
+   `'teltik'::text`. Stops new rows being mislabeled.
+2. **One-off PROD backfill** (per constraints.md #6 exception, recorded here): **186 rows** updated —
+   113 `active` + 73 `error` — scoped to
+   `gateway_host='skyline' AND gateway_id IS NULL AND port IS NULL AND status <> 'canceled'`.
+   Canceled legacy rows were deliberately **left as `skyline`**: they really were SkyLine-seated and
+   rewriting them would destroy accurate history.
+3. **`gatewayHostOf()` fallback flipped** to `TELTIK` (was `vendor === 'teltik' ? TELTIK : SKYLINE`),
+   so the module, the DB default, and the scattered `|| 'teltik'` coalesces finally agree. Explicit
+   `'skyline'` still wins, so legacy rows are unaffected.
+
+**Test suite: 749/749 passing.** `tests/gateway-host.test.mjs` rewritten for the new default plus a
+regression guard that explicit `skyline` still wins. One pre-existing test broke and was corrected
+rather than worked around: `bad-rental-remediator-real-run-limit.test.mjs`'s `sim-6817` fixture left
+`gateway_host: null` and relied on the old vendor-derived default to get a Skyline-hosted SIM for its
+A6 SMS-kill-switch assertion; under the new default it routes to TH2 and defers on
+`pending_teltik_host_port_read`, never reaching the SMS gate. Fixture now says `gateway_host:
+'skyline'` explicitly, which is what a real legacy row looks like.
+
+**PROD state after:** every non-canceled SIM is `teltik` except **one** — sim id **770** (`active`,
+`vendor=atomic`, `gateway_host='skyline'`, `gateway_id=3`, real port). Left untouched on purpose: it
+has an actual SkyLine gateway seat recorded, so unlike the 186 it is genuinely ambiguous.
+**Needs Zalmen's call:** is 770 a stale record, or a real line still in the 512-port gateway?
+
+Still open, not started:
+- Decide whether the dead SkyLine/Wing code paths get deleted or left in place. The
+  `sim-capability-map` skill's inventory of SIM-action sites is the right starting point. Note the
+  SkyLine path is **not** fully dead — legacy `skyline` rows still exist and still route through it.
+- No worker was redeployed for the `gatewayHostOf` change; the shared module ships with whichever
+  worker deploys next. Workers importing it: mdn-rotator, bad-rental-remediator, dashboard,
+  teltik-portal (and shared/hosting-port-status).
 
 ---
 
