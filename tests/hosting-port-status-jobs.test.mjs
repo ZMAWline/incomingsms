@@ -435,6 +435,79 @@ test('listHostingPortJobs returns recent jobs newest first', async () => {
   } finally { globalThis.fetch = orig; }
 });
 
+// --- 12h cron: full-fleet coverage, not a 200-SIM slice ---------------------
+// The 12h cron used to call runRotatingCronSweep with maxSims=200, so a fleet
+// over 200 active Teltik SIMs only ever got its first slice checked per cycle
+// (or, before that, a rotating slice that took multiple 12h cycles to cover
+// the whole fleet). The cron now enqueues one durable full-sweep job (source
+// 'cron') and leans on the same 1-minute drain as the manual sweep, which
+// pages the ENTIRE active fleet via has_more/next_offset regardless of size —
+// these tests pin that a fleet well over 200 SIMs is fully covered by
+// draining a single enqueued job to completion.
+
+test('a single 12h cron enqueue drains to cover a fleet of 235 SIMs, not capped to 200', async () => {
+  const FLEET_SIZE = 235;
+  const state = { jobs: [], posted: [], fleet: makeFleet(FLEET_SIZE) };
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    // Mirrors the scheduled() handler's 12h branch.
+    const enq = await enqueueHostingPortJob(ENV, { source: 'cron' });
+    assert.equal(enq.ok, true);
+    assert.equal(enq.already_pending, false);
+
+    let ticks = 0;
+    let job = state.jobs[0];
+    while (job.status !== 'done') {
+      const out = await processHostingPortJobs(ENV, { maxJobs: 1 });
+      assert.equal(out.failed, 0, 'no batch failures while draining');
+      ticks++;
+      job = state.jobs[0];
+      assert.ok(ticks <= Math.ceil(FLEET_SIZE / ASYNC_JOB_MAX_SIMS) + 1, 'drain must terminate within the expected batch count');
+    }
+
+    assert.equal(ticks, Math.ceil(FLEET_SIZE / ASYNC_JOB_MAX_SIMS), 'every batch bounded to ASYNC_JOB_MAX_SIMS');
+    assert.equal(job.totals.checked, FLEET_SIZE, 'every eligible SIM scheduled/attempted, not capped to 200');
+    assert.equal(state.posted.length, FLEET_SIZE);
+    const checkedIds = state.posted.map(p => p.sim_id).sort((a, b) => a - b);
+    assert.deepEqual(checkedIds, Array.from({ length: FLEET_SIZE }, (_, i) => i + 1), 'every SIM checked exactly once, none skipped or repeated');
+    assert.ok(state.posted.every(p => p.source === 'cron'), 'batches recorded under the cron source');
+  } finally { globalThis.fetch = orig; }
+});
+
+test('a second 12h cron firing while the previous sweep is still draining does not stack a duplicate job', async () => {
+  const state = { jobs: [], posted: [], fleet: makeFleet(30) };
+  const orig = globalThis.fetch;
+  globalThis.fetch = jobsMock(state);
+  try {
+    const first = await enqueueHostingPortJob(ENV, { source: 'cron' });
+    assert.equal(first.already_pending, false);
+
+    // Drain one batch so the job is genuinely mid-sweep (still queued, not done).
+    await processHostingPortJobs(ENV, { maxJobs: 1 });
+    assert.equal(state.jobs[0].status, 'queued');
+    assert.ok(state.jobs[0].next_offset > 0 && state.jobs[0].next_offset < 30, 'sweep is partway through the fleet');
+
+    // Next 12h tick fires while the fleet-wide sweep is still in progress.
+    const second = await enqueueHostingPortJob(ENV, { source: 'cron' });
+    assert.equal(second.ok, true);
+    assert.equal(second.already_pending, true, 'no duplicate job stacked');
+    assert.equal(second.job_id, first.job_id);
+    assert.equal(state.jobs.length, 1, 'still exactly one job row');
+
+    // Drain it to completion, then a subsequent 12h firing starts a fresh job.
+    while (state.jobs[0].status !== 'done') {
+      await processHostingPortJobs(ENV, { maxJobs: 1 });
+    }
+    assert.equal(state.posted.length, 30, 'the one job still covered the whole fleet');
+
+    const third = await enqueueHostingPortJob(ENV, { source: 'cron' });
+    assert.equal(third.already_pending, false, 'a new cycle starts once the previous job is done');
+    assert.notEqual(third.job_id, first.job_id);
+    assert.equal(state.jobs.length, 2);
+  } finally { globalThis.fetch = orig; }
+});
+
 // --- migration --------------------------------------------------------------
 
 test('jobs migration is idempotent and matches what the code reads/writes', () => {
@@ -505,10 +578,9 @@ test('scheduled handler awaits the drain and sweep — no ctx.waitUntil fire-and
   const scheduled = DASHBOARD_SRC.slice(start, DASHBOARD_SRC.indexOf('\n  },', start));
   assert.ok(!scheduled.includes('waitUntil'), 'no ctx.waitUntil in scheduled handler');
   assert.match(scheduled, /await processHostingPortJobs\(env, \{ maxJobs: 1 \}\)/);
-  // Rotating wrapper, not runHostingPortSweep directly — see
-  // src/shared/hosting-port-status.mjs#runRotatingCronSweep and its
-  // regression tests in tests/hosting-port-status.test.mjs.
-  assert.match(scheduled, /await runRotatingCronSweep\(env, \{ source: 'cron' \}\)/);
+  // Enqueue, not a direct runHostingPortSweep/runRotatingCronSweep slice —
+  // the durable job + 1-minute drain above is what actually walks the fleet.
+  assert.match(scheduled, /await enqueueHostingPortJob\(env, \{ source: 'cron' \}\)/);
 });
 
 test('Workers page polls job status but the job itself runs server-side', () => {

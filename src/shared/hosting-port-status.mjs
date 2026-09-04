@@ -247,12 +247,11 @@ export async function checkAndRecordTeltikHostPort(env, sim, { source } = {}) {
 }
 
 // Sweep all (or the given) Teltik-hosted SIMs with bounded concurrency.
-// Used by the dashboard 12h cron, the operator manual run and the Sims bulk
-// action — all three record through the same recorder above.
+// Used by the durable job batches (12h cron + Workers-page manual run) and the
+// Sims bulk action — all three record through the same recorder above.
 // Full sweeps page by { offset, maxSims } over a stable id ordering so callers
-// (Workers-page manual run) can walk the whole fleet in bounded batches;
-// summary reports { offset, next_offset, has_more, total_available } for that.
-// ponytail: hard cap MAX_SIMS per run; cron stays a single capped slice.
+// can walk the whole fleet in bounded batches; summary reports { offset,
+// next_offset, has_more, total_available } for that.
 export async function runHostingPortSweep(env, { simIds = null, source = 'manual_sweep', concurrency = 5, maxSims = 200, offset = 0 } = {}) {
   if (!Number.isInteger(offset) || offset < 0) offset = 0;
   if (!Number.isInteger(maxSims) || maxSims < 1) maxSims = 200;
@@ -312,66 +311,18 @@ export async function runHostingPortSweep(env, { simIds = null, source = 'manual
   return summary;
 }
 
-// --- Rotating cron sweep ----------------------------------------------------
-// The dashboard's 12h cron used to call runHostingPortSweep(env,
-// {source:'cron'}) with no offset, so `offset` defaulted to 0 on every
-// single invocation forever — the same ~200 lowest-id active Teltik sims got
-// re-checked every run and the cron never advanced to the rest of the
-// fleet. runRotatingCronSweep persists a next-offset in a singleton
-// Postgres row (hosting_port_cron_state) so repeated calls actually walk
-// the whole fleet, wrapping back to 0 once a full pass completes — the same
-// offset/has_more contract runHostingPortSweep already returns for the
-// (separately persisted) async job queue below, just a lighter-weight
-// single-row state instead of a job lifecycle, since this path has no
-// queued/running/done states of its own to track.
-const CRON_STATE_ROW_ID = 1;
-
-async function getCronSweepOffset(env) {
-  try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_cron_state?id=eq.'
-      + CRON_STATE_ROW_ID + '&select=next_offset&limit=1', { headers: sbHeaders(env) });
-    const rows = resp.ok ? await resp.json() : null;
-    return (Array.isArray(rows) && rows[0] && Number.isInteger(rows[0].next_offset)) ? rows[0].next_offset : 0;
-  } catch (e) {
-    console.log('[HostPort] getCronSweepOffset error: ' + (e && e.message || e));
-    return 0;
-  }
-}
-
-async function saveCronSweepOffset(env, offset) {
-  try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_cron_state?id=eq.' + CRON_STATE_ROW_ID, {
-      method: 'PATCH',
-      headers: { ...sbHeaders(env), Prefer: 'return=minimal' },
-      body: JSON.stringify({ next_offset: offset, updated_at: new Date().toISOString() }),
-    });
-    if (!resp.ok) console.log('[HostPort] saveCronSweepOffset failed HTTP ' + resp.status);
-  } catch (e) {
-    console.log('[HostPort] saveCronSweepOffset error: ' + (e && e.message || e));
-  }
-}
-
-// Runs one bounded slice of the full fleet starting from the persisted
-// offset, then advances (or wraps) that offset for next time. A sweep-query
-// failure (summary.ok === false) leaves the offset untouched so the next
-// run retries the same slice rather than skipping it.
-export async function runRotatingCronSweep(env, { source = 'cron', maxSims = 200, concurrency = 5 } = {}) {
-  const offset = await getCronSweepOffset(env);
-  const summary = await runHostingPortSweep(env, { source, offset, maxSims, concurrency });
-  if (summary.ok !== false) {
-    await saveCronSweepOffset(env, summary.has_more ? summary.next_offset : 0);
-  }
-  return summary;
-}
-
 // --- Durable full-sweep jobs ----------------------------------------------
-// The Workers-page "Hosting Port Check" enqueues one hosting_port_status_jobs
-// row and returns immediately; the dashboard's 1-minute scheduled tick drains
-// the oldest pending job one bounded batch per tick via
-// processHostingPortJobs(). Offsets/totals persist after every batch, so the
-// sweep never depends on a browser staying open and a crashed batch resumes
-// where it stopped. Lifecycle: queued (ready for next batch) -> running
-// (batch in flight) -> queued -> ... -> done | failed | cancelled.
+// Both the Workers-page "Hosting Port Check" button and the 12h scheduled
+// cron enqueue one hosting_port_status_jobs row and return immediately; the
+// dashboard's 1-minute scheduled tick drains the oldest pending job one
+// bounded batch per tick via processHostingPortJobs(). Offsets/totals persist
+// after every batch, so the sweep never depends on a browser staying open,
+// covers every eligible SIM (not just a fixed-size slice), and a crashed
+// batch resumes where it stopped. Lifecycle: queued (ready for next batch) ->
+// running (batch in flight) -> queued -> ... -> done | failed | cancelled.
+// enqueueHostingPortJob dedupes against an already queued/running job, so a
+// 12h cron firing while the previous cycle's sweep is still draining is a
+// no-op instead of stacking a duplicate full sweep.
 // ponytail: optimistic-PATCH claim + updated_at lease, no queue infra; move
 // to Cloudflare Queues if batch cadence ever needs to beat one per minute.
 
