@@ -68,6 +68,45 @@ A6 SMS-kill-switch assertion; under the new default it routes to TH2 and defers 
 has an actual SkyLine gateway seat recorded, so unlike the 186 it is genuinely ambiguous.
 **Needs Zalmen's call:** is 770 a stale record, or a real line still in the 512-port gateway?
 
+### Follow-on: re-ran the host-port check on the cohort — the "107 offline" lines are NOT offline
+
+Sim **770** was reassigned to `gateway_host='teltik'` per Zalmen (it had `gateway_id=3`, port `14B`,
+but is Teltik-hosted like everything else). PROD now has **zero** non-canceled `skyline` rows.
+
+Then re-ran the Teltik hosting port-status check over the full cohort — the 113 backfilled active
+rows plus 770 = **114 SIMs** — via new script `scripts/recheck-portin-cohort-host-ports.mjs`
+(read-only: `GET /v1/port-status` through the relay, writes only `hosting_port_status_checks` +
+`carrier_api_logs`; the same call the 12h cron makes, no reset/rotation/carrier mutation).
+
+**First, why this had never run:** `runHostingPortSweep` selects on
+`or=(gateway_host.eq.teltik,and(gateway_host.is.null,vendor.eq.teltik))`. While these rows were
+mislabeled `skyline` with `vendor='atomic'` they matched **neither arm**, so the 12h cron skipped
+them entirely. They had never been host-checked once. That is the operational cost of the default bug,
+separate from the capability-matrix inversion.
+
+**Result — 114 checked: 7 online, 0 offline, 107 error.** The 107 is exactly the number
+`PROJECT.md` carried as "still offline at the Teltik host/port layer — likely needs a Teltik port
+reset". That hypothesis is **wrong**, and the evidence is unambiguous:
+
+- All 107 returned **HTTP 404** with body `{"message": "Incorrect Phone Number !"}`.
+- All 107 have `mdn_source = db_current_mdn_unconfirmed` — the Teltik inventory lookup did not
+  contain the number, so the resolver fell back to our DB's MDN, which Teltik then rejected.
+- All 7 that came back online resolved via `teltik_all_lines_inventory` (or inbound-SMS payload).
+
+So **Teltik has no port for these 107 lines** — they are absent from Teltik's hosted-line inventory,
+not sitting on a down port. A port reset is meaningless against a line the host doesn't know; there is
+nothing to reset. Note `normalizeHostPortState`'s rule is doing its job here: a 404 is `error`, never
+`offline`, precisely so a read failure can't masquerade as a down line.
+
+Two candidate explanations, not yet distinguished:
+1. Teltik never provisioned these ported-in lines onto hosting ports (work incomplete on Shlomo's side).
+2. They are on Teltik ports under a different MDN that our resolver can't link to the ported number.
+
+**Next action is with Teltik, not in this repo.** List written to
+`teltik-missing-from-inventory-107.csv` (untracked, repo root; sim_id, iccid, db_current_mdn,
+result) — hand to Shlomo and ask why these ICCIDs are not in Teltik inventory. Until that is answered,
+do not queue port resets for this cohort.
+
 Still open, not started:
 - Decide whether the dead SkyLine/Wing code paths get deleted or left in place. The
   `sim-capability-map` skill's inventory of SIM-action sites is the right starting point. Note the
