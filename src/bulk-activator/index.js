@@ -201,8 +201,16 @@ export default {
           `sims?select=id,mobility_subscription_id,msisdn,vendor,status&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
         );
         const existingSim = existing?.[0];
+        // A provisioning port-in SIM carries the customer's target MDN in
+        // `msisdn` — the number we are trying to port, not one we were assigned
+        // — so this heuristic reads it as "already activated" and silently
+        // no-ops the retry. /retry-portin has already proven with the carrier
+        // that no port request exists, so let it through. `active` is never
+        // relaxed: that is the case this guard actually exists for.
+        const isPortInRetry = msg.body.portin_retry === true;
         const alreadyActivated = existingSim
-          && (existingSim.status === 'active' || existingSim.status === 'provisioning')
+          && (existingSim.status === 'active'
+              || (existingSim.status === 'provisioning' && !isPortInRetry))
           && (existingSim.mobility_subscription_id || existingSim.msisdn);
         if (alreadyActivated) {
           console.log(`[Activator] ${iccid}: already activated (status=${existingSim.status}) — skipping`);
@@ -539,6 +547,10 @@ async function handleRetryPortInJson(request, env) {
       imei: original.imei || sim.imei || '',
       reseller_id: sim.reseller_sims?.[0]?.reseller_id ?? null,
       vendor: sim.vendor || 'atomic',
+      // Tells the consumer this SIM's `provisioning` status is a pending port,
+      // not a live activation, so its already-activated guard does not no-op
+      // the retry. Only set here, never on a first-time submission.
+      portin_retry: true,
       ...fields,
     });
     results.push({ iccid, requeued: true, reason: 'resubmitting the original portinRequest' });
