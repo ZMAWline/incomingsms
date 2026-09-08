@@ -1,7 +1,35 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-08-24 (dashboard: port-in default random subscriber info + custom-info toggle, bulk port-in paste, reseller dropdown applied per-row — see session below)
+> Last updated: 2026-09-08 (ATOMIC port-in auto-finalizer shipped — completed ports now transition to active automatically; see session below)
+
+---
+
+## Session 2026-09-08 — ATOMIC port-in auto-finalizer shipped (PR #72), 42-SIM backlog drained
+
+`fix/atomic-portin-finalizer-record` had been sitting unpushed on a worktree since 2026-08-25 — code complete, tests green, never merged or deployed. Meanwhile the read-only `portinStatus` poll it was meant to replace had accumulated a backlog: **42 SIMs with `port_in_pending=true`, generating 11,232 `portinStatus` calls to the carrier in 24 hours.** The oldest completed ports had been sitting in `provisioning` for 14 days.
+
+**PROD state before deploy:** 27 SIMs at `statusCode=00` (ports actually completed), 12 at `948`, 1 at `951`, 2 never polled.
+
+**Status codes confirmed from live `carrier_api_logs`** — the `atomic-wholesale-api` skill lists this enum under "Unknowns", and the pre-existing code comment declined to interpret it for that reason. Real responses:
+
+- Completed: `statusCode="00"`, `description="Success"`, `Result={"MSISDN":"…","reasonCode":"CO","reasonDescription":"Completed"}`. **`Result.reasonCode="CO"` is the completion signal.**
+- `948`: `description="Error!!Port Request Does Not Exist"`, no `Result`. All 12 carried this description verbatim. Note `948` is overloaded across ATOMIC operations (see `decision-log.md` — it also means "Subscriber Must Be Active" on `swapMSISDN` and a plan/equipment mismatch on `reconnectSubscriber`), so matching on the bare code is a latent risk; matching on description would be safer.
+- `951`: `Result.reasonCode="CT"`, real reason embedded in the description as `statusReasonCode - <XX> ~ statusReasonDescription - <text>` (seen `8A` account number incorrect, `6B` T-Mobile transfer PIN incorrect).
+
+**What shipped:** `runAtomicPortinStatusFinalizer` now ends the poll three ways — `948`/`910` terminal (clears `port_in_pending`, leaves `status` alone); `00`+`CO` runs `subsriberInquiry` by ICCID through the `MDN_ROTATOR` binding and finalizes to `status='active'`, `rotation_status='success'`, MDN/BAN/IMEI/activation date/zip, cleared errors, plus a `sim_numbers` roll if the MDN moved; anything else keeps polling. `port_in_pending` clears only after finalization succeeds, so a transient inquiry failure retries next tick. `mdn-rotator`'s `/atomic-inquiry` was widened to return `ban`/`imei`/`activationDate`/`zipCode`/raw `result` (same carrier call, wider projection).
+
+**Deployed:** mdn-rotator `f227a41c-4f40-4670-b659-a44f0fae2967`, details-finalizer `356028b0-02c9-41c9-aa1a-47d5f16cac91`. **Cloudflare Workers Builds only runs as a PR check — it does NOT auto-deploy on merge to main.** Both workers still showed their 2026-09-04 deployments after the merge; `wrangler deploy` was required. Deploy `mdn-rotator` first, since `details-finalizer` depends on its wider inquiry response.
+
+**Observed behavior:** the tick works the backlog serially at ~6s/SIM (`limit=50` on the 5-min cron). First tick finalized 19 SIMs to `active` and marked 8 terminal on `948`; every `finalize_inquiry` log row returned `statusCode=00`, `attStatus=Active`, zero errors.
+
+**Known gaps, not fixed:**
+- **`951` is not terminal.** SIM 36217 (`msisdn=2089578967`, "Account number required or incorrect") will poll forever. `TERMINAL_CODES` holds only `948`/`910`. Cheapest follow-up here.
+- `910` has no live example; that branch ships unexercised.
+- Tests assert against source text, not a stubbed carrier response — they prove the branches exist, not that they behave.
+- Two SIMs (36054, 36073) sit at `port_in_pending=true` with `atomic_portin_status_code=null` and `status=active` — they have never polled successfully and predate this work. Unrelated to the finalizer; worth a look.
+
+**Separate breakage found:** the `Deploy shared dashboard preview` GitHub Actions workflow fails with `Invalid access token [code: 9109]` when setting `DASHBOARD_AUTH` on `dashboard-test-test`. It last passed 2026-09-04, so the Cloudflare API token in Actions secrets broke sometime after that. Unrelated to PR #72 (no dashboard or workflow files touched); merged past it. **Needs a token rotation from Zalmen** — it will fail every dashboard PR until then.
 
 ---
 
