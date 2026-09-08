@@ -141,18 +141,47 @@ test('runAtomicPortinStatusFinalizer polls only vendor=atomic, status=provisioni
   assert.match(fn, /atomic_portin_checked_at: new Date\(\)\.toISOString\(\)/);
 });
 
-test('details-finalizer handles 948 "Port Request Does Not Exist" as terminal', () => {
-  assert.match(FINALIZER, /TERMINAL_CODES = new Set\(\['948', '910'\]\)/);
-  assert.match(FINALIZER, /statusCode === '948'/);
+// Reads the codes out of the TERMINAL_REASONS map rather than matching the
+// source text, so the assertion is about which codes actually stop the poll.
+function terminalReasons(src) {
+  const start = src.indexOf('const TERMINAL_REASONS = {');
+  const block = src.slice(start, src.indexOf('};', start));
+  return Object.fromEntries([...block.matchAll(/'(\d{3})':\s*'([^']*)'/g)].map(m => [m[1], m[2]]));
+}
+
+test('details-finalizer treats exactly 948/910/951 as terminal, each with a reason', () => {
+  const reasons = terminalReasons(FINALIZER);
+  assert.deepEqual(Object.keys(reasons).sort(), ['910', '948', '951']);
+  for (const [code, text] of Object.entries(reasons)) {
+    assert.ok(text.length > 20, `${code} needs an operator-facing reason`);
+  }
+  assert.match(FINALIZER, /TERMINAL_CODES = new Set\(Object\.keys\(TERMINAL_REASONS\)\)/);
   assert.match(FINALIZER, /port_in_pending: false/);
-  assert.match(FINALIZER, /Port Request Does Not Exist/);
 });
 
-test('details-finalizer handles 910 "sim does not belong to this MVNO" as terminal', () => {
-  assert.match(FINALIZER, /TERMINAL_CODES = new Set\(\['948', '910'\]\)/);
-  assert.match(FINALIZER, /Atomic portinStatus returned 910/);
-  assert.match(FINALIZER, /sim does not belong to this MVNO/);
-  assert.match(FINALIZER, /terminal.*true/);
+test('details-finalizer 948 reason says the port never existed', () => {
+  assert.match(terminalReasons(FINALIZER)['948'], /never created|cancelled/i);
+  assert.match(FINALIZER, /Port Request Does Not Exist/, 'header comment documents the carrier text');
+});
+
+test('details-finalizer 910 reason says the SIM is not on our ATOMIC account', () => {
+  assert.match(terminalReasons(FINALIZER)['910'], /not under our ATOMIC account/i);
+  assert.match(FINALIZER, /sim does not belong to this MVNO/, 'header comment documents the carrier text');
+});
+
+// 951 carries Result.reasonCode="CT" and embeds the real cause in the
+// description ("statusReasonCode - 8A ~ statusReasonDescription - Account
+// number required or incorrect"). A rejection cannot clear itself by polling,
+// so it must stop rather than poll forever.
+test('details-finalizer 951 reason says the port was rejected and needs resubmission', () => {
+  const reason = terminalReasons(FINALIZER)['951'];
+  assert.match(reason, /rejected/i);
+  assert.match(reason, /resubmit/i);
+  assert.match(FINALIZER, /statusReasonDescription/, 'header comment documents the embedded-reason format');
+});
+
+test('details-finalizer terminal log line carries the carrier description', () => {
+  assert.match(FINALIZER, /TERMINAL - \$\{reason\} \(carrier said: \$\{description\}\)/);
 });
 
 test('details-finalizer auto-finalizes statusCode 00 + reasonCode CO by subscriber inquiry', () => {

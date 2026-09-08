@@ -1194,6 +1194,12 @@ async function runAtomicFinalizer(env, limit) {
 //   cancelled on the carrier side. No point continuing to poll.
 // - 910 "sim does not belong to this MVNO" — the SIM/ICCID is not under our
 //   ATOMIC account. This is a configuration error, not a transient state.
+// - 951 "Portin status fail.Conflict" (Result.reasonCode=CT) — the losing
+//   carrier rejected the port. The real reason is embedded in the description
+//   as "statusReasonCode - <XX> ~ statusReasonDescription - <text>" (seen: 8A
+//   account number incorrect, 6B T-Mobile transfer PIN incorrect). Polling
+//   cannot clear a rejection — the details must be corrected and the port
+//   resubmitted — so stop and leave it for an operator.
 // - 00 with Result.reasonCode=CO (Completed) — port completed successfully.
 //   Immediately run regular ATOMIC subsriberInquiry by ICCID and auto-finalize
 //   the SIM from that response. Only clear port_in_pending after that
@@ -1303,7 +1309,14 @@ async function runAtomicPortinStatusFinalizer(env, limit) {
   let terminal = 0;
   const results = [];
 
-  const TERMINAL_CODES = new Set(['948', '910']);
+  // Carrier statusCode -> what it means for us. The carrier's own text is kept
+  // verbatim in atomic_portin_description; these say why we stop polling.
+  const TERMINAL_REASONS = {
+    '948': 'port was never created or was cancelled on carrier side',
+    '910': 'SIM/ICCID not under our ATOMIC account',
+    '951': 'port rejected by the losing carrier — correct the details and resubmit; polling cannot clear a rejection',
+  };
+  const TERMINAL_CODES = new Set(Object.keys(TERMINAL_REASONS));
   const COMPLETED_REASON_CODES = new Set(['CO']);
 
   for (const sim of sims) {
@@ -1342,11 +1355,9 @@ async function runAtomicPortinStatusFinalizer(env, limit) {
           port_in_pending: false,
         });
         terminal++;
-        const reason = statusCode === '948'
-          ? 'Atomic portinStatus returned 948 "Port Request Does Not Exist" — port was never created or was cancelled on carrier side'
-          : 'Atomic portinStatus returned 910 "sim does not belong to this MVNO" — SIM/ICCID not under our ATOMIC account';
+        const reason = `Atomic portinStatus returned ${statusCode} — ${TERMINAL_REASONS[String(statusCode)]}`;
         results.push({ iccid: sim.iccid, ok: true, statusCode, description, reasonCode, terminal: true, reason });
-        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: TERMINAL - ${reason}`);
+        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: TERMINAL - ${reason} (carrier said: ${description})`);
       } else if (isCompleted) {
         const finalized = await finalizeCompletedAtomicPortin(env, sim);
         terminal++;
