@@ -11,6 +11,9 @@ node_modules/
 .env
 .env.local
 
+# Generated export outputs
+artifacts/
+
 # Logs
 *.log
 npm-debug.log*
