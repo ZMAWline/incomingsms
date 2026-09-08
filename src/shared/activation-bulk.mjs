@@ -325,6 +325,39 @@ export function buildAtomicPortInRequest({
   };
 }
 
+// Inverse of buildAtomicPortInRequest: recovers the original inputs from a
+// logged portinRequest body. Used by bulk-activator's /retry-portin to replay
+// a failed port-in, because the losing-carrier account number and PIN are
+// never stored on `sims` — the request body in carrier_api_logs is the only
+// record of them.
+//
+// Keep this next to the builder. If the builder's payload shape changes, this
+// must change with it, and the round-trip test in
+// tests/activation-bulk.test.mjs is what catches the drift.
+//
+// partnerTransactionId is intentionally not returned: it identifies a single
+// attempt, and the builder mints a fresh one per call.
+export function parseAtomicPortInRequest(requestBody) {
+  const wsr = requestBody?.wholeSaleApi?.wholeSaleRequest;
+  if (!wsr || wsr.requestType !== 'portinRequest') return null;
+  const subscriber = wsr.subscriber || {};
+  const oldProvider = wsr.old_service_provider || {};
+  return {
+    iccid: wsr.sim || '',
+    imei: wsr.imei || '',
+    portMdn: wsr.MSISDN || '',
+    portAccountNumber: oldProvider.billingAccountNumber || '',
+    portPin: oldProvider.billingAccountPassword || '',
+    firstName: subscriber.firstName || '',
+    lastName: subscriber.lastName || '',
+    streetNumber: subscriber.streetNumber || '',
+    streetName: subscriber.streetName || '',
+    zip: subscriber.zipCode || '',
+    oldFirstName: oldProvider.firstName || '',
+    oldLastName: oldProvider.lastName || '',
+  };
+}
+
 // Atomic Wholesale API `portinStatus` — read-only status lookup for a port-in
 // already submitted via portinRequest. Per the atomic-wholesale-api skill,
 // MSISDN is the ONLY required (and only supported) field for this
