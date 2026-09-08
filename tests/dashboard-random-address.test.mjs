@@ -51,7 +51,7 @@ test('random-address route is registered as a GET endpoint', () => {
 
 test('the route is registered after the operator Basic-auth gate (requires operator auth)', () => {
   const routeIdx = SRC.indexOf("url.pathname === '/api/random-address'");
-  const authGateIdx = SRC.indexOf('// Basic auth check');
+  const authGateIdx = SRC.indexOf('// --- Authentication ---');
   assert.notEqual(routeIdx, -1, 'route not registered');
   assert.notEqual(authGateIdx, -1, 'auth gate marker not found');
   assert.ok(routeIdx > authGateIdx, 'random-address route must require operator auth, unlike the public export routes');
