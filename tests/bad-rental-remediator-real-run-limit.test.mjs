@@ -269,8 +269,16 @@ test('same-day A6 report records skipped_sms_unavailable instead of classify_onl
   const { env, db, restore } = makeHarness({
     reports,
     sims: {
+      // gateway_host must be EXPLICIT 'skyline': this test exercises the A6
+      // (Skyline-hosted) SMS kill-switch gate. It used to leave the field null
+      // and lean on gatewayHostOf()'s old vendor-derived default, which mapped
+      // an atomic-vendor SIM to Skyline. That default is now TELTIK (all live
+      // SIMs are Teltik-hosted; see shared/gateway-host.mjs), under which this
+      // fixture routes to TH2 and defers on pending_teltik_host_port_read
+      // instead of ever reaching the SMS gate. Legacy Skyline rows carry an
+      // explicit 'skyline' in the DB, so spelling it out here matches reality.
       'sim-6817': {
-        id: 'sim-6817', iccid: '8901410327000006817', vendor: 'atomic', gateway_host: null,
+        id: 'sim-6817', iccid: '8901410327000006817', vendor: 'atomic', gateway_host: 'skyline',
         status: 'active', msisdn: '5550006817', gateway_id: null, port: null,
       },
     },
