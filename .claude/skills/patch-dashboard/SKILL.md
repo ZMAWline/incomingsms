@@ -1,22 +1,42 @@
 ---
 name: patch-dashboard
-description: Safe dashboard patching workflow for src/dashboard/index.js. Use for ANY change to the dashboard — new columns, buttons, API routes, UI features, bug fixes. Enforces CRLF/escaping rules automatically. Triggers on: "add X to dashboard", "update dashboard to show Y", "fix dashboard Z", "add a column/button/tab/route to dashboard".
+description: Safe dashboard patching workflow for src/dashboard/index.js and src/dashboard/public/index.html. Use for ANY change to the dashboard — new columns, buttons, API routes, UI features, bug fixes. Enforces verify-before-replace and the two-environment deploy rule. Triggers on: "add X to dashboard", "update dashboard to show Y", "fix dashboard Z", "add a column/button/tab/route to dashboard".
 ---
 
 # Dashboard Patch Skill
 
-The dashboard file (`src/dashboard/index.js`) uses **CRLF line endings** and embeds ALL frontend JS inside a single `getHTML()` template literal. Standard editing tools corrupt it. This skill enforces the only safe approach.
+> **Layout changed — read this first (updated 2026-09-08).**
+> `src/dashboard/index.js` is now **pure LF** (0 CRLF lines) and no longer contains
+> `getHTML()`. The frontend was extracted to `src/dashboard/public/index.html` by
+> `scripts/extract_dashboard_frontend.mjs`. Earlier versions of this skill told you
+> to normalize CRLF→LF and convert back to CRLF on write; doing that today rewrites
+> **all 9,664 lines** and produces an unreviewable diff. Do not convert line endings.
+> Verify before trusting any claim here: `git show main:src/dashboard/index.js | file -`.
+
+`src/dashboard/index.js` is the Worker backend: routes, API handlers, cron. The
+browser code lives in `src/dashboard/public/index.html`. They are separate files and
+neither needs template-literal escaping any more.
 
 ## Critical Rules (enforce without exception)
 
-1. **Never use the Edit tool** on `src/dashboard/index.js`. Always use a Node.js patch script.
-2. **Never pass patch scripts via bash heredoc** — bash strips `\` before backticks, silently corrupting the script. Use the `Write` tool to create `.js` files.
-3. **Patch scripts must use `require()`, not ESM `import`** (they run as CommonJS with `node _fix.js`).
-4. **Inner template literals inside `getHTML()`** must use `\`` and `\${...}`. Never unescaped `` ` `` or `${`.
-5. **Build replacement strings with concatenation (`+`)** when they contain backticks or `${`. Do not use template literals to build those strings.
-6. **CRITICAL escaping rule for backtick/`${` in replacement strings:** In your patch script, to write `\`` (escaped backtick for inside getHTML template) into the file, use `'\\' + '`'` — NOT `'\`'`. The expression `'\`'` is just a plain backtick in JS. Always test: `console.log('\\' + '\`')` should show `\``.
-7. **Always syntax-check after patching — TWO checks required:** (a) outer Worker JS; (b) frontend JS. See Step 4.
-8. **Dynamic row buttons** must be wrapped in `\${...}`. A bare `` \`...\` `` not inside `\${...}` closes the outer template.
+1. **Never convert line endings.** Read, replace, write. No `replace(/\r\n/g, '\n')`
+   and no `replace(/\n/g, '\r\n')`. If your diff touches more than the lines you
+   meant to change, you did this — revert with `git checkout -- <file>` and retry.
+2. **Verify the old string exists, and exactly once, before replacing.** Count
+   matches and bail on 0 or 2+. A silent no-op or a wrong-site replace is the main
+   failure mode now that escaping is no longer a concern.
+3. **Confirm the diff is the size you expect** — `git diff --stat` before committing.
+4. **Syntax-check after patching:** `node --input-type=module --check < src/dashboard/index.js`.
+5. **Never pass patch scripts via bash heredoc** — bash strips `\` before backticks,
+   silently corrupting the script. Use the `Write` tool to create `.js` files.
+6. **Patch scripts must use `require()`, not ESM `import`** (they run as CommonJS).
+7. **Delete `_fix_*.js` helper scripts before committing.** Stray root-level
+   `_fix_*.js` files have leaked into PRs before (see the closed #17).
+
+**Editing with a script vs. the Edit tool:** a script is still preferred for
+multi-site or generated changes because it verifies match counts and is re-runnable.
+For a one- or two-line change with a unique anchor, the Edit tool is now safe — the
+CRLF and template-literal hazards that originally banned it are gone.
 
 ## Your Workflow (follow every step)
 
@@ -35,21 +55,21 @@ const path = require('path');
 const filePath = path.join(__dirname, 'src/dashboard/index.js');
 let content = fs.readFileSync(filePath, 'utf8');
 
-// Normalize to LF for reliable search/replace
-content = content.replace(/\r\n/g, '\n');
+// NO line-ending conversion. The file is pure LF; round-tripping through CRLF
+// rewrites every line.
 
-// Verify old string exists before replacing
-const OLD = `exact string from file`;  // use string concat if it contains backticks
-const NEW = `replacement string`;       // use string concat if it contains backticks
+const OLD = `exact string from file`;
+const NEW = `replacement string`;
 
-if (!content.includes(OLD)) {
-  console.error('PATCH FAILED: old string not found. File may have changed.');
+// Require exactly one match: 0 means the file moved on, 2+ means you'd hit the
+// wrong site too.
+const hits = content.split(OLD).length - 1;
+if (hits !== 1) {
+  console.error('PATCH FAILED: expected 1 match, found ' + hits + '. File may have changed.');
   process.exit(1);
 }
 content = content.replace(OLD, NEW);
 
-// Convert back to CRLF
-content = content.replace(/\n/g, '\r\n');
 fs.writeFileSync(filePath, content, 'utf8');
 console.log('Patch applied successfully.');
 ```
@@ -62,76 +82,37 @@ if (start === -1 || end === -1) { console.error('markers not found'); process.ex
 content = content.slice(0, start) + newFunctionCode + content.slice(end);
 ```
 
-**Escaping reminder for row HTML in the patch script:**
-- Unconditional button: `\${\`<button ...>\`}`
-- Conditional button: `\${condition ? \`<button ...>\` : ''}`
-- Any JS expression: `\${expr}`
-- String variable reference: `\${varName}`
-
-**Correct way to build escaped backtick/`${` in a patch script replacement string:**
-```js
-// To produce \` in the file (escaped backtick for inside getHTML template):
-const BT = '\\' + '`';    // '\\' = one backslash, '`' = backtick → \`
-// To produce \${ in the file (escaped template expression):
-const DS = '\\' + '${';   // \${
-// Then use:
-'fetch(' + BT + DS + 'API_BASE}/endpoint' + BT + ', {'
-// Writes:  fetch(\`\${API_BASE}/endpoint\`, {   ← correct in file
-```
-**WRONG:** `const Q = '\`'` — `'\`'` is just a plain backtick `` ` `` in JavaScript, NOT `\``. This was the root cause of the recurring data-not-loading bug.
-
 ### Step 3 — Run the patch
 ```bash
 node _fix_<feature>.js
 ```
 
-### Step 4 — Syntax check (TWO checks — both required)
+### Step 4 — Verify
 
-**Check 1: outer Worker module syntax**
+**Check 1: the diff is the size you intended.**
+```bash
+git diff --stat src/dashboard/index.js
+git diff src/dashboard/index.js
+```
+If this reports thousands of changed lines for a small edit, your script converted
+line endings. Revert (`git checkout -- src/dashboard/index.js`) and remove the
+conversion.
+
+**Check 2: Worker module syntax.**
 ```bash
 node --input-type=module --check < src/dashboard/index.js
 ```
 
-**Check 2: frontend JS inside `<script>` tags**
+**Check 3: tests.**
 ```bash
-node _check_frontend_js.js
-```
-(`_check_frontend_js.js` lives at the repo root. If it's missing, create it — see template below.)
-
-**Why two checks?** Check 1 only validates the outer Worker module. Escaping bugs in the frontend JS (e.g. an unescaped `${` or a missing `\`` on a `fetch()` URL) appear as a *string* to Node — the outer module passes but the browser gets broken JS, and `loadData()` never runs. This is the root cause of the recurring "data not loading" bug.
-
-**`_check_frontend_js.js` template (create if missing):**
-
-**IMPORTANT:** Do NOT use simple regex replacement (`replace(/\\`/g, '\`')`) to simulate the template literal — it misses `\n` → newline and other escape evaluations, causing false "OK" results. Use Node `vm` to actually execute `getHTML()`:
-
-```js
-const fs = require('fs'), cp = require('child_process'), vm = require('vm');
-const src = fs.readFileSync('src/dashboard/index.js', 'utf8');
-const start = src.indexOf('function getHTML() {');
-if (start === -1) { console.error('getHTML not found'); process.exit(1); }
-// Find the end of getHTML by brace counting
-let depth = 0, i = start, bodyStarted = false;
-while (i < src.length) {
-  const c = src[i];
-  if (c === '{') { depth++; bodyStarted = true; }
-  if (c === '}') { if (--depth === 0 && bodyStarted) break; }
-  i++;
-}
-const fn = vm.runInContext('(' + src.slice(start, i+1) + ')', vm.createContext({}));
-const html = fn();
-const scriptStart = html.lastIndexOf('<script>');
-const scriptEnd = html.lastIndexOf('</script>');
-if (scriptStart === -1) { console.error('script tag not found'); process.exit(1); }
-const browserJs = html.slice(scriptStart + 8, scriptEnd);
-fs.writeFileSync('_frontend_check_tmp.js', browserJs, 'utf8');
-try {
-  cp.execSync('node --check < _frontend_check_tmp.js', { stdio: ['inherit','inherit','inherit'], shell: true });
-  console.log('Frontend JS syntax OK');
-} catch(e) { console.error('Frontend JS has syntax errors!'); process.exit(1); }
-finally { try { fs.unlinkSync('_frontend_check_tmp.js'); } catch(e) {} }
+npm test
 ```
 
-If either check fails, the patch broke something. Read the error line number, fix the script, and re-run from Step 2.
+> **Removed:** older versions of this skill required a second `_check_frontend_js.js`
+> pass that executed `getHTML()` via `vm` to validate the embedded browser JS. There is
+> no `getHTML()` any more — the frontend lives in `src/dashboard/public/index.html`, a
+> plain HTML file you can edit directly. That checker now fails with "getHTML not found"
+> and should not be recreated.
 
 ### Step 5 — Deploy
 
