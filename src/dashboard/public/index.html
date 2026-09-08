@@ -1230,6 +1230,7 @@
                                     <button data-preset="auto_paused"        onclick="toggleSimsPreset('auto_paused')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Auto-rotate paused</button>
                                     <button data-preset="stuck_provisioning" onclick="toggleSimsPreset('stuck_provisioning')" class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Stuck provisioning &gt;1h</button>
                                     <button data-preset="not_notified"       onclick="toggleSimsPreset('not_notified')"       class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="AT&T not notified today, T-Mobile not notified today or yesterday">Not Notified</button>
+                                    <button data-preset="portin_failed"      onclick="toggleSimsPreset('portin_failed')"      class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="Carrier returned a non-Success status for the port-in (948 port request does not exist, 910 SIM not on our ATOMIC account, 951 losing carrier rejected). These sit at status=provisioning and are otherwise invisible.">Port-in failed</button>
                                 </div>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <button id="sims-fb-status"   onclick="openSimsFilterMenu('status', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Status<span id="sims-fb-status-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
@@ -4706,8 +4707,18 @@ set verify_pending; schedule §C.3 poll
             if (!ref) return false;
             return (Date.now() - new Date(ref).getTime()) > 3600000;
         }
+        // A port-in failed if the carrier returned any status other than "00"
+        // (Success). Known failures: 948 port request does not exist, 910 SIM
+        // not on our ATOMIC account, 951 losing carrier rejected the port.
+        // Deliberately "not 00" rather than a fixed list — a code we have not
+        // seen yet should surface here rather than stay invisible.
+        function simPortInFailed(s) {
+            const code = s.atomic_portin_status_code;
+            return !!code && String(code) !== '00';
+        }
         const SIM_PRESETS = {
             not_rotated_today:  { label: 'Not rotated today',     test: simNotRotatedToday },
+            portin_failed:      { label: 'Port-in failed',        test: simPortInFailed },
             no_sms_12h:         { label: 'No SMS in 12h',         test: simNoSms12h },
             no_reseller:        { label: 'No reseller',           test: function(s){ return !s.reseller_id; } },
             auto_paused:        { label: 'Auto-rotate paused',    test: function(s){ return s.rotation_eligible === false; } },
@@ -6162,6 +6173,12 @@ function renderSims() {
                     'canceled': 'bg-red-500/20 text-red-400',
                     'error': 'bg-red-500/20 text-red-400',
                 }[sim.status] || 'bg-gray-500/20 text-gray-400';
+                // A failed port-in leaves the SIM at status=provisioning with no
+                // error field set, so without this badge it is indistinguishable
+                // from a SIM that is healthily mid-provisioning.
+                const portInBadge = simPortInFailed(sim)
+                    ? `<span class="ml-1 px-2 py-1 text-xs font-medium rounded-full bg-red-500/20 text-red-400 cursor-help" title="Port-in failed — ${escapeHtml(sim.atomic_portin_description || 'no detail recorded')}${sim.atomic_portin_checked_at ? ' (checked ' + escapeHtml(new Date(sim.atomic_portin_checked_at).toLocaleString()) + ')' : ''}">port-in ${escapeHtml(sim.atomic_portin_status_code)}</span>`
+                    : '';
                 const vendorBadge = { teltik: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>', atomic: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-blue-500/20 text-blue-300">ATOMIC</span>', wing_iot: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-green-500/20 text-green-300">Wing IoT</span>', helix: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>' }[sim.vendor] || '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">-</span>';
                 return `
                 <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
@@ -6172,7 +6189,7 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-200">${sim.phone_number || '-'}${verifiedBadge}</td>
                     <td class="px-4 py-3 text-gray-400 font-mono text-xs">${sim.blimei || '-'}</td>
                     <td class="px-4 py-3">
-                        <span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${sim.status}</span>
+                        <span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${sim.status}</span>${portInBadge}
                     </td>
                     <td class="px-4 py-3">${vendorBadge}</td>
                     <td class="px-4 py-3">${hostPortCell(sim)}</td>
