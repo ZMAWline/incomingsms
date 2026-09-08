@@ -39,6 +39,17 @@ const COLUMNS = [
     constraint: 'check_rotation_source',
     allowed: new Set(['auto', 'manual']),
   },
+  {
+    // Added 2026-09-08: bulk-activator's /retry-portin shipped writing
+    // source='portin_retry', which the CHECK rejected at runtime with a 23514.
+    // The endpoint failed cleanly, but only because the INSERT happens before
+    // anything is queued — the same mistake one step later would have been a
+    // half-submitted carrier batch. `source` is a common property name, so this
+    // only fires inside a createActivationRun() call (see below).
+    column: 'source',
+    constraint: 'activation_runs_source_check',
+    allowed: new Set(['csv', 'json', 'dashboard']),
+  },
 ];
 
 function makeRx(column) {
@@ -63,6 +74,18 @@ function isSimsStatusContext(src, matchIndex) {
   // SQL context: UPDATE sims ... SET ... status = 'x'
   if (/UPDATE\s+(public\.)?sims[\s\S]{0,300}$/i.test(before)) return true;
   // Otherwise: ignore
+  return false;
+}
+
+// `source:` is a common property name across this codebase (rental reports,
+// hosting-port jobs, MDN provenance...). Only activation_runs.source carries a
+// CHECK constraint, and every write to it goes through createActivationRun,
+// so gate on that call rather than on a table name — the literal sits at the
+// call site, while the table name lives inside the helper.
+function isActivationRunSourceContext(src, matchIndex) {
+  const before = src.slice(Math.max(0, matchIndex - 400), matchIndex);
+  if (/createActivationRun\s*\([^)]{0,300}$/.test(before)) return true;
+  if (/(supabasePatch|supabaseInsert|sbPost)\s*\([^)]{0,200}['"`]activation_runs[?']/.test(before)) return true;
   return false;
 }
 
@@ -91,6 +114,8 @@ for (const { column, constraint, allowed } of COLUMNS) {
       if (allowed.has(value)) continue;
       // Generic-`status` literal only matters when writing to the sims table.
       if (column === 'status' && !isSimsStatusContext(src, m.index)) continue;
+      // Likewise `source` — only activation_runs writes are constrained.
+      if (column === 'source' && !isActivationRunSourceContext(src, m.index)) continue;
       const before = src.slice(0, m.index);
       const line = before.split('\n').length;
       violations.push({
