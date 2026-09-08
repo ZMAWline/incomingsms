@@ -183,8 +183,16 @@ export default {
         });
         // subsriberInquiry returns the MDN at Result.msisdn (lowercase), not MSISDN.
         // swapMSISDN's response uses Result.newMSISDN — different shape, same API.
-        const msisdn = inqR?.Result?.msisdn || inqR?.Result?.MSISDN || null;
-        const attStatus = inqR?.Result?.attStatus || null;
+        // Preserve the full Result object because details-finalizer needs BAN,
+        // BLIMEI/IMEI, activation date, and status fields to auto-finalize a
+        // completed port-in from the carrier's source-of-truth response.
+        const result = inqR?.Result || {};
+        const msisdn = result.msisdn || result.MSISDN || null;
+        const attStatus = result.attStatus || result.status || null;
+        const ban = result.BAN || result.ban || result.attBan || result.billingAccountNumber || null;
+        const imei = result.BLIMEI || result.blimei || result.billingImei || result.imei || result.IMEI || null;
+        const activationDate = result.activationDate || result.activatedAt || result.activation_date || null;
+        const zipCode = (result.address && (result.address.zipCode || result.address.zip)) || result.zipCode || result.zip || null;
         return new Response(JSON.stringify({
           ok: inqRes.ok && inqR?.statusCode === '00',
           http_status: inqRes.status,
@@ -192,6 +200,11 @@ export default {
           description: inqR?.description || null,
           msisdn,
           attStatus,
+          ban,
+          imei,
+          activationDate,
+          zipCode,
+          result,
         }, null, 2), {
           status: 200, headers: { "Content-Type": "application/json" }
         });

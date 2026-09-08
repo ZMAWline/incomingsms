@@ -74,6 +74,16 @@ test('redactAtomicSession blanks userName/token/pin before logging', () => {
   }
 });
 
+test('mdn-rotator /atomic-inquiry returns full subscriber fields for auto-finalization', () => {
+  assert.match(MDN_ROTATOR, /requestType: 'subsriberInquiry'/);
+  assert.match(MDN_ROTATOR, /const result = inqR\?\.Result \|\| \{\}/);
+  assert.match(MDN_ROTATOR, /BLIMEI/);
+  assert.match(MDN_ROTATOR, /billingImei/);
+  assert.match(MDN_ROTATOR, /activationDate/);
+  assert.match(MDN_ROTATOR, /ban/);
+  assert.match(MDN_ROTATOR, /result,/);
+});
+
 /* ── mdn-rotator: POST /sim-action action=portin_status ──────────────────── */
 
 test('/sim-action accepts a "portin_status" action, ATOMIC-only, MSISDN-validated', () => {
@@ -126,17 +136,83 @@ test('runAtomicPortinStatusFinalizer polls only vendor=atomic, status=provisioni
   assert.match(fn, /vendor=eq\.atomic&status=eq\.provisioning&port_in_pending=eq\.true/);
   assert.match(fn, /env\.MDN_ROTATOR\.fetch\(url/, 'reaches ATOMIC only via the mdn-rotator service binding');
   assert.match(fn, /\/atomic-portin-status\?secret=/, 'calls the read-only status route, not a mutating one');
-  assert.match(fn, /atomic_portin_status_code: data\.statusCode/);
-  assert.match(fn, /atomic_portin_description: data\.description/);
+  assert.match(fn, /atomic_portin_status_code: statusCode/);
+  assert.match(fn, /atomic_portin_description: description/);
   assert.match(fn, /atomic_portin_checked_at: new Date\(\)\.toISOString\(\)/);
+});
 
-  // Records the carrier's raw status only — does not interpret it into an
-  // auto-transition of sims.status or clear port_in_pending itself.
-  assert.ok(!fn.includes('status: '), 'finalizer must not set sims.status (no auto-completion)');
-  assert.ok(!fn.includes('port_in_pending:'), 'finalizer must not clear port_in_pending itself');
-  for (const forbidden of ['portinRequest', 'portinCancel', 'portinUpdate', 'swapMSISDN']) {
-    assert.ok(!fn.includes(forbidden), `finalizer must not reference "${forbidden}"`);
-  }
+test('details-finalizer handles 948 "Port Request Does Not Exist" as terminal', () => {
+  assert.match(FINALIZER, /TERMINAL_CODES = new Set\(\['948', '910'\]\)/);
+  assert.match(FINALIZER, /statusCode === '948'/);
+  assert.match(FINALIZER, /port_in_pending: false/);
+  assert.match(FINALIZER, /Port Request Does Not Exist/);
+});
+
+test('details-finalizer handles 910 "sim does not belong to this MVNO" as terminal', () => {
+  assert.match(FINALIZER, /TERMINAL_CODES = new Set\(\['948', '910'\]\)/);
+  assert.match(FINALIZER, /Atomic portinStatus returned 910/);
+  assert.match(FINALIZER, /sim does not belong to this MVNO/);
+  assert.match(FINALIZER, /terminal.*true/);
+});
+
+test('details-finalizer auto-finalizes statusCode 00 + reasonCode CO by subscriber inquiry', () => {
+  const fnBody = FINALIZER.slice(
+    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer'),
+    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer') + 7000
+  );
+  assert.match(FINALIZER, /async function finalizeCompletedAtomicPortin/);
+  assert.match(FINALIZER, /\/atomic-inquiry\?secret=.*iccid=/);
+  assert.match(fnBody, /finalizeCompletedAtomicPortin\(env, sim\)/);
+  assert.match(fnBody, /Auto-finalized from ATOMIC subsriberInquiry/);
+});
+
+test('details-finalizer completed port-in finalization writes active SIM fields and stops polling', () => {
+  const helperBody = FINALIZER.slice(
+    FINALIZER.indexOf('async function finalizeCompletedAtomicPortin'),
+    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer')
+  );
+  assert.match(helperBody, /status: 'active'/);
+  assert.match(helperBody, /port_in_pending: false/);
+  assert.match(helperBody, /last_activation_error: null/);
+  assert.match(helperBody, /last_rotation_error: null/);
+  assert.match(helperBody, /patch\.att_ban/);
+  assert.match(helperBody, /patch\.imei/);
+  assert.match(helperBody, /patch\.activated_at/);
+  assert.match(helperBody, /closeCurrentNumber/);
+  assert.match(helperBody, /insertNewNumber/);
+});
+
+test('details-finalizer does not clear port_in_pending before completed inquiry finalization succeeds', () => {
+  const completedBranch = FINALIZER.slice(
+    FINALIZER.indexOf('} else if (isCompleted) {'),
+    FINALIZER.indexOf('} else {', FINALIZER.indexOf('} else if (isCompleted) {'))
+  );
+  assert.match(completedBranch, /const finalized = await finalizeCompletedAtomicPortin\(env, sim\)/);
+  assert.doesNotMatch(completedBranch, /supabasePatch\([^\n]*port_in_pending: false/);
+});
+
+test('details-finalizer logs operator-facing reason for terminal cases', () => {
+  assert.match(FINALIZER, /TERMINAL/);
+  assert.match(FINALIZER, /COMPLETED/);
+  assert.match(FINALIZER, /auto-finalized from subscriber inquiry/i);
+});
+
+test('details-finalizer auto-transitions completed ports to active/success', () => {
+  const helperBody = FINALIZER.slice(
+    FINALIZER.indexOf('async function finalizeCompletedAtomicPortin'),
+    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer')
+  );
+  assert.match(helperBody, /status: 'active'/);
+  assert.match(helperBody, /rotation_status: 'success'/);
+});
+
+test('details-finalizer continues polling for non-terminal codes', () => {
+  const fnBody = FINALIZER.slice(
+    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer'),
+    FINALIZER.indexOf('/* ── Rotation Review')
+  );
+  assert.match(fnBody, /terminal: false/);
+  assert.match(fnBody, /continuing poll/);
 });
 
 test('details-finalizer wrangler.toml documents the MDN_ROTATOR binding covers portinStatus polling', () => {

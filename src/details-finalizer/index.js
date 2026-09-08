@@ -9,8 +9,8 @@
 //      (calls mdn-rotator's /atomic-inquiry via service binding since it holds ATOMIC creds)
 //   5) ATOMIC port-in status finalizer — read-only portinStatus poll for SIMs
 //      awaiting a port-in submitted via portinRequest (sims.port_in_pending=true),
-//      via mdn-rotator's /atomic-portin-status. Records the carrier's raw
-//      status/description only; never auto-completes the SIM.
+//      via mdn-rotator's /atomic-portin-status. Terminal carrier responses stop
+//      polling; completed ports auto-finalize from ATOMIC subscriber inquiry.
 // =========================================================
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
@@ -1187,13 +1187,102 @@ async function runAtomicFinalizer(env, limit) {
 // 'mdn_pending', which runAtomicFinalizer's bucket already owns for stuck
 // swapMSISDN recovery). Talks to ATOMIC only via mdn-rotator's
 // /atomic-portin-status route (mdn-rotator holds the ATOMIC credentials, same
-// as the /atomic-inquiry call above). Records the carrier's raw statusCode/
-// description on the sims row every tick — it does NOT interpret the enum or
-// auto-transition sims.status/port_in_pending, since the carrier's full
-// status vocabulary and completion signal are not independently confirmed
-// (see the atomic-wholesale-api skill's "Unknowns" list). Ops reviews
-// atomic_portin_description (surfaced in the dashboard) and finalizes
-// manually once the port is confirmed complete.
+// as the /atomic-inquiry call above).
+//
+// Terminal status codes that stop polling:
+// - 948 "Port Request Does Not Exist" — the port was never created or was
+//   cancelled on the carrier side. No point continuing to poll.
+// - 910 "sim does not belong to this MVNO" — the SIM/ICCID is not under our
+//   ATOMIC account. This is a configuration error, not a transient state.
+// - 00 with Result.reasonCode=CO (Completed) — port completed successfully.
+//   Immediately run regular ATOMIC subsriberInquiry by ICCID and auto-finalize
+//   the SIM from that response. Only clear port_in_pending after that
+//   finalization succeeds, so transient inquiry failures keep the 5-minute poll
+//   alive for retry.
+//
+// For non-terminal codes (e.g., 01 Pending, 02 In Progress, etc.), we record
+// the carrier's raw statusCode/description on the sims row every tick and
+// continue polling. The dashboard's manual Check Port-In Status button remains
+// read-only and available for operator review.
+function pickAtomicInquiryField(data, keys) {
+  const result = data?.result || {};
+  for (const key of keys) {
+    if (data && data[key] !== undefined && data[key] !== null && data[key] !== '') return data[key];
+    if (result && result[key] !== undefined && result[key] !== null && result[key] !== '') return result[key];
+  }
+  return null;
+}
+
+function normalizeAtomicMdn(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (digits.length === 10) return digits;
+  if (digits.length === 11 && digits.startsWith('1')) return digits.slice(1);
+  return null;
+}
+
+async function finalizeCompletedAtomicPortin(env, sim) {
+  const inqUrl = `https://mdn-rotator/atomic-inquiry?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&iccid=${encodeURIComponent(sim.iccid)}`;
+  const inqRes = await env.MDN_ROTATOR.fetch(inqUrl, { method: 'GET' });
+  if (!inqRes.ok) {
+    throw new Error(`subscriber inquiry ${inqRes.status}`);
+  }
+  const data = await inqRes.json().catch(() => ({}));
+  if (!data.ok || data.statusCode !== '00') {
+    throw new Error(`subscriber inquiry failed: ${data.description || data.statusCode || 'unknown'}`);
+  }
+
+  const attStatus = String(pickAtomicInquiryField(data, ['attStatus', 'status']) || '').trim();
+  if (attStatus && attStatus.toLowerCase() !== 'active') {
+    throw new Error(`subscriber inquiry not Active (got ${attStatus})`);
+  }
+
+  const msisdn = normalizeAtomicMdn(pickAtomicInquiryField(data, ['msisdn', 'MSISDN']));
+  const e164 = msisdn ? `+1${msisdn}` : null;
+  const patch = {
+    status: 'active',
+    status_reason: null,
+    port_in_pending: false,
+    rotation_status: 'success',
+    rotation_fail_count: 0,
+    rotation_eligible: true,
+    last_activation_error: null,
+    last_rotation_error: null,
+  };
+
+  if (msisdn) patch.msisdn = msisdn;
+  const ban = pickAtomicInquiryField(data, ['ban', 'BAN', 'attBan', 'billingAccountNumber']);
+  if (ban) patch.att_ban = String(ban);
+  const imei = pickAtomicInquiryField(data, ['imei', 'IMEI', 'BLIMEI', 'blimei', 'billingImei']);
+  if (imei) patch.imei = String(imei);
+  const activationDate = pickAtomicInquiryField(data, ['activationDate', 'activatedAt', 'activation_date']);
+  if (activationDate) {
+    const parsed = new Date(activationDate);
+    if (!isNaN(parsed.getTime())) patch.activated_at = parsed.toISOString();
+  }
+  const zipCode = pickAtomicInquiryField(data, ['zipCode', 'zip']);
+  if (zipCode) patch.activation_zip = String(zipCode);
+
+  if (e164) {
+    const openRows = await supabaseSelect(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&limit=1`);
+    const openE164 = Array.isArray(openRows) && openRows[0] ? openRows[0].e164 : null;
+    if (openE164 !== e164) {
+      await closeCurrentNumber(env, sim.id);
+      await insertNewNumber(env, sim.id, e164);
+    }
+  }
+
+  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+  return {
+    ok: true,
+    msisdn,
+    e164,
+    attStatus,
+    ban: ban || null,
+    imei: imei || null,
+    activated_at: patch.activated_at || null,
+  };
+}
+
 async function runAtomicPortinStatusFinalizer(env, limit) {
   if (!env.MDN_ROTATOR) {
     return { processed: 0, checked: 0, message: 'mdn_rotator_binding_missing' };
@@ -1204,14 +1293,18 @@ async function runAtomicPortinStatusFinalizer(env, limit) {
 
   const sims = (await supabaseSelect(
     env,
-    `sims?select=id,iccid,msisdn&vendor=eq.atomic&status=eq.provisioning&port_in_pending=eq.true&limit=${limit}`
+    `sims?select=id,iccid,msisdn,atomic_portin_status_code,atomic_portin_checked_at&vendor=eq.atomic&status=eq.provisioning&port_in_pending=eq.true&limit=${limit}`
   )) || [];
   if (sims.length === 0) return { ok: true, processed: 0, checked: 0 };
 
   let processed = 0;
   let checked = 0;
   let errors = 0;
+  let terminal = 0;
   const results = [];
+
+  const TERMINAL_CODES = new Set(['948', '910']);
+  const COMPLETED_REASON_CODES = new Set(['CO']);
 
   for (const sim of sims) {
     processed++;
@@ -1230,13 +1323,49 @@ async function runAtomicPortinStatusFinalizer(env, limit) {
         continue;
       }
       const data = await res.json().catch(() => ({}));
+      const statusCode = data.statusCode ?? null;
+      const description = data.description ?? null;
+      const result = data.result ?? null;
+      const reasonCode = result?.reasonCode ?? null;
+      const isTerminalCode = statusCode && TERMINAL_CODES.has(String(statusCode));
+      const isCompleted = statusCode === '00' && reasonCode && COMPLETED_REASON_CODES.has(reasonCode);
+
       await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-        atomic_portin_status_code: data.statusCode ?? null,
-        atomic_portin_description: data.description ?? null,
+        atomic_portin_status_code: statusCode,
+        atomic_portin_description: description,
         atomic_portin_checked_at: new Date().toISOString(),
       });
       checked++;
-      results.push({ iccid: sim.iccid, ok: true, statusCode: data.statusCode ?? null, description: data.description ?? null });
+
+      if (isTerminalCode) {
+        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          port_in_pending: false,
+        });
+        terminal++;
+        const reason = statusCode === '948'
+          ? 'Atomic portinStatus returned 948 "Port Request Does Not Exist" — port was never created or was cancelled on carrier side'
+          : 'Atomic portinStatus returned 910 "sim does not belong to this MVNO" — SIM/ICCID not under our ATOMIC account';
+        results.push({ iccid: sim.iccid, ok: true, statusCode, description, reasonCode, terminal: true, reason });
+        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: TERMINAL - ${reason}`);
+      } else if (isCompleted) {
+        const finalized = await finalizeCompletedAtomicPortin(env, sim);
+        terminal++;
+        results.push({
+          iccid: sim.iccid,
+          ok: true,
+          statusCode,
+          description,
+          reasonCode,
+          terminal: true,
+          finalized: true,
+          ...finalized,
+          reason: 'Port completed (reasonCode=CO). Auto-finalized from ATOMIC subsriberInquiry.',
+        });
+        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: COMPLETED - auto-finalized from subscriber inquiry`);
+      } else {
+        results.push({ iccid: sim.iccid, ok: true, statusCode, description, reasonCode, terminal: false });
+        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: statusCode=${statusCode} reasonCode=${reasonCode} — continuing poll`);
+      }
     } catch (e) {
       errors++;
       results.push({ iccid: sim.iccid, ok: false, error: String(e) });
@@ -1244,7 +1373,7 @@ async function runAtomicPortinStatusFinalizer(env, limit) {
     }
   }
 
-  return { ok: true, processed, checked, errors, results };
+  return { ok: true, processed, checked, errors, terminal, results };
 }
 
 /* ── Rotation Review (daily 12:30 UTC) ────────────────────────────────────── */
