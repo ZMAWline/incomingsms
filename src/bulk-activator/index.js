@@ -1,5 +1,5 @@
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
-import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseCsv, validateActivationSim } from '../shared/activation-bulk.mjs';
+import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseAtomicPortInRequest, parseCsv, validateActivationSim } from '../shared/activation-bulk.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -19,6 +19,10 @@ export default {
 
     if (url.pathname === '/retry') {
       return handleRetryJson(request, env);
+    }
+
+    if (url.pathname === '/retry-portin') {
+      return handleRetryPortInJson(request, env);
     }
 
     if (url.pathname !== '/run') {
@@ -417,6 +421,155 @@ async function handleRetryJson(request, env) {
   }
 
   return json({ ok: true, retried, run_id: runId });
+}
+
+// Re-submits the ORIGINAL portinRequest for SIMs whose port-in never created a
+// port at the carrier. POST /retry-portin?secret=X with {"iccids":[...]}.
+//
+// Why this exists instead of reusing /retry: activation_job_items has no
+// port-in columns, so /retry rebuilds a queue message with empty
+// port_mdn/port_account_number/port_pin. activateViaAtomic branches on exactly
+// those three fields, so an empty set falls through to the plain Activate path
+// and assigns the SIM a BRAND-NEW MDN instead of porting the customer's number
+// — silently, and reported as success. Never point /retry at a port-in SIM.
+//
+// The losing-carrier account number and PIN are deliberately not stored on
+// `sims` (see docs/atomic-port-in-runbook.md); the only record is the original
+// request body in carrier_api_logs. They are read here, inside the Worker, fed
+// straight back to ATOMIC, and never included in the response.
+//
+// partnerTransactionId is deliberately NOT reused. buildAtomicPortInRequest
+// mints a fresh one per call, and the skill's Unknowns list does not confirm
+// whether replaying an id is idempotent or rejected. A fresh id is what the
+// successful 2026-09-04 resubmissions used.
+async function handleRetryPortInJson(request, env) {
+  const url = new URL(request.url);
+  const secret = url.searchParams.get('secret') || '';
+  if (!env.BULK_RUN_SECRET || secret !== env.BULK_RUN_SECRET) {
+    return json({ ok: false, error: 'Unauthorized' }, 401);
+  }
+  if (request.method !== 'POST') return json({ ok: false, error: 'Method must be POST' });
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return json({ ok: false, error: 'Supabase not configured' }, 500);
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }); }
+  const iccids = Array.isArray(body?.iccids) ? body.iccids.map(String) : [];
+  if (iccids.length === 0) return json({ ok: false, error: 'iccids array required' });
+  if (iccids.length > 50) return json({ ok: false, error: 'max 50 iccids per call' });
+
+  const results = [];
+  const toQueue = [];
+
+  for (const iccid of iccids) {
+    const skip = (reason) => results.push({ iccid, requeued: false, reason });
+
+    // Newest portinRequest we ever sent for this SIM — the call being retried.
+    const reqLogs = await supabaseSelect(
+      env,
+      `carrier_api_logs?select=request_body,response_body_json,created_at&iccid=eq.${encodeURIComponent(iccid)}&step=eq.portin&order=created_at.desc&limit=1`
+    );
+    const reqLog = reqLogs?.[0];
+    if (!reqLog) {
+      skip('no portinRequest was ever logged for this SIM — the port account number and PIN are unrecoverable and must be re-supplied');
+      continue;
+    }
+
+    // Guard 1: the last attempt already succeeded, so a port exists. Sending
+    // another portinRequest would duplicate it against a live port.
+    const lastReqStatus = reqLog.response_body_json?.wholeSaleApi?.wholeSaleResponse?.statusCode;
+    if (lastReqStatus === '00') {
+      skip('last portinRequest succeeded — a port already exists at the carrier; resubmitting would duplicate it');
+      continue;
+    }
+
+    // Guard 2: independently confirm with the carrier's own view. Anything
+    // other than "no such port request" means something is live over there.
+    const statusLogs = await supabaseSelect(
+      env,
+      `carrier_api_logs?select=response_body_json&iccid=eq.${encodeURIComponent(iccid)}&step=eq.portin_status&order=created_at.desc&limit=1`
+    );
+    const lastStatus = statusLogs?.[0]?.response_body_json?.wholeSaleApi?.wholeSaleResponse;
+    if (lastStatus && lastStatus.statusCode !== '948') {
+      skip(`carrier's latest portinStatus is ${lastStatus.statusCode} (${lastStatus.description || 'no description'}) — not resubmitting over an existing port request`);
+      continue;
+    }
+
+    // Recover the exact original inputs via the builder's inverse.
+    const original = parseAtomicPortInRequest(reqLog.request_body);
+    if (!original) {
+      skip('logged request body is not a portinRequest — cannot rebuild the call');
+      continue;
+    }
+    const fields = {
+      port_mdn: original.portMdn,
+      port_account_number: original.portAccountNumber,
+      port_pin: original.portPin,
+      port_first_name: original.firstName,
+      port_last_name: original.lastName,
+      port_street_number: original.streetNumber,
+      port_street_name: original.streetName,
+      port_zip: original.zip,
+      port_old_first_name: original.oldFirstName,
+      port_old_last_name: original.oldLastName,
+    };
+    const missing = Object.entries(fields).filter(([, v]) => !v).map(([k]) => k);
+    if (missing.length) {
+      skip(`original request body is missing ${missing.join(', ')} — cannot rebuild the call`);
+      continue;
+    }
+
+    const simRows = await supabaseSelect(
+      env,
+      `sims?select=id,imei,vendor,reseller_sims(reseller_id)&iccid=eq.${encodeURIComponent(iccid)}&reseller_sims.active=eq.true&limit=1`
+    );
+    const sim = simRows?.[0];
+    if (!sim) { skip('no sims row for this ICCID'); continue; }
+
+    toQueue.push({
+      iccid,
+      imei: original.imei || sim.imei || '',
+      reseller_id: sim.reseller_sims?.[0]?.reseller_id ?? null,
+      vendor: sim.vendor || 'atomic',
+      ...fields,
+    });
+    results.push({ iccid, requeued: true, reason: 'resubmitting the original portinRequest' });
+  }
+
+  if (toQueue.length === 0) {
+    return json({ ok: true, queued: 0, attempted: iccids.length, results, run_id: null, job_run_id: null });
+  }
+
+  const runId = `portin_retry_${Date.now()}`;
+  let runUuid;
+  try {
+    runUuid = await createActivationRun(env, {
+      source: 'portin_retry',
+      totalItems: toQueue.length,
+      createdBy: 'retry-portin',
+    });
+  } catch (e) {
+    return json({ ok: false, error: `Failed to create activation run: ${e}`, results }, 502);
+  }
+
+  try {
+    await createActivationJobItems(env, runUuid, toQueue);
+    await sendQueueBatch(env.ACTIVATION_QUEUE, toQueue.map(sim => ({
+      body: { ...sim, run_id: runId, job_run_id: runUuid },
+    })));
+    await updateActivationRunCounts(env, runUuid, { queuedItems: toQueue.length, validationErrors: 0, rowErrors: [] });
+  } catch (e) {
+    return json({
+      ok: false,
+      error: `Activation run ${runUuid} created but queuing failed: ${e}`,
+      results,
+      run_id: runId,
+      job_run_id: runUuid,
+    }, 502);
+  }
+
+  return json({ ok: true, queued: toQueue.length, attempted: iccids.length, results, run_id: runId, job_run_id: runUuid });
 }
 
 /* ── Relay fetch helper (routes through VPS to avoid CF-to-CF blocking) ─────── */
