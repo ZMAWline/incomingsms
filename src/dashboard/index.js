@@ -7,6 +7,7 @@ import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
+import { splitSearchTerms } from '../shared/search-terms.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -1134,10 +1135,10 @@ async function handleMessages(env, corsHeaders, url) {
     if (!search) {
       queryPath = `inbound_sms?${baseSelect}&order=received_at.desc&limit=500`;
     } else {
-      const terms = search.split(/[,;\r\n]+/)
-        .map(t => t.replace(/[^a-zA-Z0-9\s+\-]/g, '').trim())
-        .filter(Boolean)
-        .slice(0, 10);
+      // Also splits on spaces when every token looks like an identifier, so a
+      // typed or mobile-pasted number list is several terms rather than one
+      // long non-matching string. Free text with spaces stays one substring.
+      const terms = splitSearchTerms(search, 10);
       if (!terms.length) {
         return new Response(JSON.stringify([]), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' }
