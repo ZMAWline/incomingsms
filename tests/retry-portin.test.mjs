@@ -128,6 +128,30 @@ test('/retry-portin sends the full port field set to the queue', () => {
   }
 });
 
+test('a port-in retry is not no-opped by the already-activated guard', () => {
+  // A provisioning port-in SIM holds the customer's TARGET mdn in `msisdn`, so
+  // the guard read it as "already activated" and skipped all 12 SIMs of the
+  // first real batch without making a single carrier call.
+  assert.match(ACTIVATOR, /portin_retry: true/, '/retry-portin must flag its queue messages');
+  assert.match(ACTIVATOR, /const isPortInRetry = msg\.body\.portin_retry === true/);
+  assert.match(
+    ACTIVATOR,
+    /existingSim\.status === 'provisioning' && !isPortInRetry/,
+    'only provisioning is relaxed'
+  );
+});
+
+test('an active SIM is still protected from re-activation', () => {
+  // The relaxation must never extend to `active` — that is the case the guard
+  // exists for, and re-running a live SIM through activation is destructive.
+  const guard = ACTIVATOR.slice(
+    ACTIVATOR.indexOf('const alreadyActivated = existingSim'),
+    ACTIVATOR.indexOf('if (alreadyActivated)')
+  );
+  assert.match(guard, /existingSim\.status === 'active'\s*$/m, "'active' must be unconditional");
+  assert.ok(!/active'\s*&&\s*!isPortInRetry/.test(guard), "'active' must not be gated on the retry flag");
+});
+
 test('the plain /retry path is documented as unsafe for port-ins', () => {
   // activation_job_items has no port-in columns, so /retry rebuilds a message
   // without them. Keep the warning attached to the code that has the trap.
