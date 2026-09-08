@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-09-08 — ATOMIC portinStatus enum is now confirmed; the finalizer may interpret it. Workers Builds does not deploy on merge.
+
+**Decision:** (1) `runAtomicPortinStatusFinalizer` now interprets the carrier's `portinStatus` response instead of only recording it — `948`/`910` end the poll, `statusCode="00"` + `Result.reasonCode="CO"` auto-finalizes the SIM to `active` from a `subsriberInquiry`. This reverses the deliberate 2026-08 choice to stay read-only. (2) `port_in_pending` is cleared **only after** finalization succeeds, never alongside the status write. (3) Deploys of these two workers are manual `wrangler deploy`, `mdn-rotator` first.
+
+**Why:** (1) The `atomic-wholesale-api` skill lists the status enum under "Unknowns", and the original code comment cited exactly that in declining to interpret it. That caution was correct at the time but had a standing cost: nothing ever cleared `port_in_pending`, so by 2026-09-08 there were 42 stuck SIMs generating **11,232 carrier calls in 24 hours** and completed ports sat in `provisioning` for up to 14 days. Live `carrier_api_logs` rows settled the enum — completed ports return `Result={"MSISDN":"…","reasonCode":"CO","reasonDescription":"Completed"}`, and all 12 `948`s carried `"Error!!Port Request Does Not Exist"` verbatim. The unknown was resolvable by reading production, not by asking the carrier. (2) The inquiry is a live carrier call and can fail transiently; clearing the flag first would strand the SIM in `provisioning` with nothing left to retry it. Leaving the flag set costs one extra poll and is self-healing. (3) Cloudflare Workers Builds runs on this repo as a **PR check only** — after PR #72 merged, both workers still showed their 2026-09-04 deployments.
+
+**Consequence:** Do NOT revert `runAtomicPortinStatusFinalizer` to read-only on the grounds that the skill lists the enum as unknown — it is confirmed from production for `00`/`CO`, `948`, and `951`/`CT`; `910` remains unverified. Do NOT match ATOMIC `948` on the bare code anywhere else: it is overloaded across operations (see the 2026-07-02 entry — "Subscriber Must Be Active" on `swapMSISDN`, plan/equipment mismatch on `reconnectSubscriber`). The port-in path gets away with it only because every observed `948` there carries the same description; match on description if this is extended. Do NOT reorder the deploy — `details-finalizer` reads `ban`/`imei`/`activationDate`/`zipCode` from `mdn-rotator`'s widened `/atomic-inquiry`, so shipping it first yields SIMs finalized with missing fields. Do NOT assume a merge deploys anything.
+
+---
+
 ## 2026-07-06 — Teltik night-guard is permanent; anchors drift ~15 min/day and must be continuously re-anchored
 
 **Decision:** The Teltik night-migration (`teltik_hold_morning_batch` + 22:00-NY cron) is now a PERMANENT night-guard, not a finite migration: window widened NY 6–8 → 3–8 (migration `teltik_hold_widen_3_8`, applied to prod 2026-07-06), batch 100 → 150/night. Rotation cron cadence tightened from every 30 min to every 15 min (`5,20,35,50 4-14 UTC`). New inline re-anchor in `rotateOneTeltikSim`: a **retried or forced** rotation that succeeds at NY hour ≥ 5 (tunable `TELTIK_REANCHOR_FROM_HOUR`) gets a next-midnight `rotation_hold_until` instead of null.
