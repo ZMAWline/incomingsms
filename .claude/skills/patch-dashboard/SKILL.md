@@ -1,30 +1,37 @@
 ---
 name: patch-dashboard
-description: Safe dashboard patching workflow for src/dashboard/index.js. Use for ANY change to the dashboard — new columns, buttons, API routes, UI features, bug fixes. Enforces CRLF/escaping rules automatically. Triggers on: "add X to dashboard", "update dashboard to show Y", "fix dashboard Z", "add a column/button/tab/route to dashboard".
+description: Safe dashboard change workflow. Use for ANY change to the dashboard — new columns, buttons, API routes, UI features, bug fixes. Routes you to the right file (frontend vs Worker) and enforces the syntax checks and deploy-environment rules. Triggers on: "add X to dashboard", "update dashboard to show Y", "fix dashboard Z", "add a column/button/tab/route to dashboard".
 ---
 
 # Dashboard Patch Skill
 
-The dashboard file (`src/dashboard/index.js`) uses **CRLF line endings** and embeds ALL frontend JS inside a single `getHTML()` template literal. Standard editing tools corrupt it. This skill enforces the only safe approach.
+## Which file (read this first)
 
-## Critical Rules (enforce without exception)
+The dashboard is **two** files. Pick by what you are changing:
 
-1. **Never use the Edit tool** on `src/dashboard/index.js`. Always use a Node.js patch script.
-2. **Never pass patch scripts via bash heredoc** — bash strips `\` before backticks, silently corrupting the script. Use the `Write` tool to create `.js` files.
-3. **Patch scripts must use `require()`, not ESM `import`** (they run as CommonJS with `node _fix.js`).
-4. **Inner template literals inside `getHTML()`** must use `\`` and `\${...}`. Never unescaped `` ` `` or `${`.
-5. **Build replacement strings with concatenation (`+`)** when they contain backticks or `${`. Do not use template literals to build those strings.
-6. **CRITICAL escaping rule for backtick/`${` in replacement strings:** In your patch script, to write `\`` (escaped backtick for inside getHTML template) into the file, use `'\\' + '`'` — NOT `'\`'`. The expression `'\`'` is just a plain backtick in JS. Always test: `console.log('\\' + '\`')` should show `\``.
-7. **Always syntax-check after patching — TWO checks required:** (a) outer Worker JS; (b) frontend JS. See Step 4.
-8. **Dynamic row buttons** must be wrapped in `\${...}`. A bare `` \`...\` `` not inside `\${...}` closes the outer template.
+| Change | File | How to edit |
+|---|---|---|
+| UI — markup, frontend JS, tables, filters, modals | `src/dashboard/public/index.html` | **Edit tool, normally.** Plain LF file, no nested template literal. No escaping ceremony. |
+| Server — API routes, Supabase queries, auth, the `select=` column lists that feed the UI | `src/dashboard/index.js` | Edit tool is fine. LF file, ~9.6k lines. |
+
+Adding a UI feature that shows a new DB column usually touches **both**: add the column to the `sims?select=` list and its passthrough mapping in `index.js`, then render it in `public/index.html`.
+
+> **History — do not re-apply the old rules.** Until 2026-06-12 the entire SPA lived inside a `getHTML()` template literal in `index.js`, which forced Node patch scripts and `\`` / `\${` escaping. `scripts/extract_dashboard_frontend.mjs` moved it to `public/index.html`, served as a Workers static asset (`serveApp` in `index.js`). `getHTML()` no longer exists and **neither file is CRLF**. Writing `\`` into `public/index.html` today inserts a literal backslash. If you find this skill still describing the old world below, fix the skill.
+
+## Critical Rules
+
+1. **Verify before you edit.** `grep -c "function getHTML" src/dashboard/index.js` should be `0` and `file src/dashboard/public/index.html` should not say CRLF. If either surprises you, stop and re-read the file before trusting this skill.
+2. **Always syntax-check after editing — TWO checks required:** (a) outer Worker JS; (b) frontend JS. See Step 4.
+3. **Never deploy without an explicit `--env`.** See Step 5 — this is the rule most likely to cause real damage.
+4. If you do need a scripted edit (large mechanical change across many call sites), use the `Write` tool to create `_fix_<feature>.js` at the repo root and `require()` in it — never a bash heredoc, which strips `\` before backticks.
 
 ## Your Workflow (follow every step)
 
 ### Step 1 — Understand the change
-Read the relevant section of `src/dashboard/index.js` to find exact strings to replace. Never guess.
+Read the relevant section of the file you identified above to find the exact strings to change. Never guess.
 
-### Step 2 — Write the patch script
-Use the `Write` tool to create `_fix_<feature>.js` at the repo root.
+### Step 2 — Make the edit
+Use the Edit tool. Only fall back to a `_fix_<feature>.js` patch script for large mechanical edits.
 
 **Patch script template:**
 ```js
@@ -35,12 +42,9 @@ const path = require('path');
 const filePath = path.join(__dirname, 'src/dashboard/index.js');
 let content = fs.readFileSync(filePath, 'utf8');
 
-// Normalize to LF for reliable search/replace
-content = content.replace(/\r\n/g, '\n');
-
 // Verify old string exists before replacing
-const OLD = `exact string from file`;  // use string concat if it contains backticks
-const NEW = `replacement string`;       // use string concat if it contains backticks
+const OLD = `exact string from file`;
+const NEW = `replacement string`;
 
 if (!content.includes(OLD)) {
   console.error('PATCH FAILED: old string not found. File may have changed.');
@@ -48,11 +52,11 @@ if (!content.includes(OLD)) {
 }
 content = content.replace(OLD, NEW);
 
-// Convert back to CRLF
-content = content.replace(/\n/g, '\r\n');
 fs.writeFileSync(filePath, content, 'utf8');
 console.log('Patch applied successfully.');
 ```
+
+Point `filePath` at `src/dashboard/public/index.html` for UI changes. Both files are LF — do not add CRLF conversion, and do not escape backticks or `${`. Write the code exactly as it should appear in the file.
 
 **For whole-function replacement**, use positional patching instead of string replace:
 ```js
@@ -61,24 +65,6 @@ const end = content.indexOf('\nasync function ', start + 1);
 if (start === -1 || end === -1) { console.error('markers not found'); process.exit(1); }
 content = content.slice(0, start) + newFunctionCode + content.slice(end);
 ```
-
-**Escaping reminder for row HTML in the patch script:**
-- Unconditional button: `\${\`<button ...>\`}`
-- Conditional button: `\${condition ? \`<button ...>\` : ''}`
-- Any JS expression: `\${expr}`
-- String variable reference: `\${varName}`
-
-**Correct way to build escaped backtick/`${` in a patch script replacement string:**
-```js
-// To produce \` in the file (escaped backtick for inside getHTML template):
-const BT = '\\' + '`';    // '\\' = one backslash, '`' = backtick → \`
-// To produce \${ in the file (escaped template expression):
-const DS = '\\' + '${';   // \${
-// Then use:
-'fetch(' + BT + DS + 'API_BASE}/endpoint' + BT + ', {'
-// Writes:  fetch(\`\${API_BASE}/endpoint\`, {   ← correct in file
-```
-**WRONG:** `const Q = '\`'` — `'\`'` is just a plain backtick `` ` `` in JavaScript, NOT `\``. This was the root cause of the recurring data-not-loading bug.
 
 ### Step 3 — Run the patch
 ```bash
@@ -96,42 +82,11 @@ node --input-type=module --check < src/dashboard/index.js
 ```bash
 node _check_frontend_js.js
 ```
-(`_check_frontend_js.js` lives at the repo root. If it's missing, create it — see template below.)
+`_check_frontend_js.js` is committed at the repo root. It pulls every inline `<script>` block out of `public/index.html` and runs `node --check` over each one.
 
-**Why two checks?** Check 1 only validates the outer Worker module. Escaping bugs in the frontend JS (e.g. an unescaped `${` or a missing `\`` on a `fetch()` URL) appear as a *string* to Node — the outer module passes but the browser gets broken JS, and `loadData()` never runs. This is the root cause of the recurring "data not loading" bug.
+**Why two checks?** Check 1 only validates the Worker module, which no longer contains any frontend code. A syntax error in `public/index.html` is invisible to it — the Worker deploys fine and the browser gets broken JS, so `loadData()` never runs and the page renders empty. That is the recurring "data not loading" bug.
 
-**`_check_frontend_js.js` template (create if missing):**
-
-**IMPORTANT:** Do NOT use simple regex replacement (`replace(/\\`/g, '\`')`) to simulate the template literal — it misses `\n` → newline and other escape evaluations, causing false "OK" results. Use Node `vm` to actually execute `getHTML()`:
-
-```js
-const fs = require('fs'), cp = require('child_process'), vm = require('vm');
-const src = fs.readFileSync('src/dashboard/index.js', 'utf8');
-const start = src.indexOf('function getHTML() {');
-if (start === -1) { console.error('getHTML not found'); process.exit(1); }
-// Find the end of getHTML by brace counting
-let depth = 0, i = start, bodyStarted = false;
-while (i < src.length) {
-  const c = src[i];
-  if (c === '{') { depth++; bodyStarted = true; }
-  if (c === '}') { if (--depth === 0 && bodyStarted) break; }
-  i++;
-}
-const fn = vm.runInContext('(' + src.slice(start, i+1) + ')', vm.createContext({}));
-const html = fn();
-const scriptStart = html.lastIndexOf('<script>');
-const scriptEnd = html.lastIndexOf('</script>');
-if (scriptStart === -1) { console.error('script tag not found'); process.exit(1); }
-const browserJs = html.slice(scriptStart + 8, scriptEnd);
-fs.writeFileSync('_frontend_check_tmp.js', browserJs, 'utf8');
-try {
-  cp.execSync('node --check < _frontend_check_tmp.js', { stdio: ['inherit','inherit','inherit'], shell: true });
-  console.log('Frontend JS syntax OK');
-} catch(e) { console.error('Frontend JS has syntax errors!'); process.exit(1); }
-finally { try { fs.unlinkSync('_frontend_check_tmp.js'); } catch(e) {} }
-```
-
-If either check fails, the patch broke something. Read the error line number, fix the script, and re-run from Step 2.
+If either check fails, read the error line number, fix it, and re-check.
 
 ### Step 5 — Deploy
 
