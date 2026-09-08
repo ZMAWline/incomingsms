@@ -77,12 +77,22 @@ test('/retry-portin is routed and secret-gated', () => {
 
 test('/retry-portin refuses to resubmit when a port already exists', () => {
   const fn = retryPortInFn();
-  // Guard 1 — our own record of the last attempt succeeding.
-  assert.match(fn, /lastReqStatus === '00'/);
-  assert.match(fn, /would duplicate it/);
-  // Guard 2 — the carrier's own view, independent of what we recorded.
+  // Guard 1 — the carrier's own view, independent of what we recorded.
   assert.match(fn, /lastStatus\.statusCode !== '948'/);
   assert.match(fn, /not resubmitting over an existing port request/);
+  // Guard 2 — our own record of the last attempt succeeding.
+  assert.match(fn, /lastReqStatus === '00'/);
+  assert.match(fn, /would duplicate it/);
+});
+
+test('/retry-portin lets a newer 948 status check override our own recorded success', () => {
+  // Ports can open and then vanish: on 2026-09-04, 15 SIMs got Success with
+  // reasonCode=OP and every later portinStatus returned 948. A guard keyed only
+  // on "our last request succeeded" would permanently block exactly those.
+  const fn = retryPortInFn();
+  assert.match(fn, /statusIsNewer/, 'guard must compare recency, not just outcome');
+  assert.match(fn, /statusLog\.created_at > reqLog\.created_at/);
+  assert.match(fn, /!\(lastStatus\?\.statusCode === '948' && statusIsNewer\)/);
 });
 
 test('/retry-portin skips SIMs whose credentials are unrecoverable', () => {

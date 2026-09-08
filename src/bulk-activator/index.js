@@ -476,23 +476,30 @@ async function handleRetryPortInJson(request, env) {
       continue;
     }
 
-    // Guard 1: the last attempt already succeeded, so a port exists. Sending
-    // another portinRequest would duplicate it against a live port.
-    const lastReqStatus = reqLog.response_body_json?.wholeSaleApi?.wholeSaleResponse?.statusCode;
-    if (lastReqStatus === '00') {
-      skip('last portinRequest succeeded — a port already exists at the carrier; resubmitting would duplicate it');
+    const statusLogs = await supabaseSelect(
+      env,
+      `carrier_api_logs?select=response_body_json,created_at&iccid=eq.${encodeURIComponent(iccid)}&step=eq.portin_status&order=created_at.desc&limit=1`
+    );
+    const statusLog = statusLogs?.[0];
+    const lastStatus = statusLog?.response_body_json?.wholeSaleApi?.wholeSaleResponse;
+
+    // Guard 1: the carrier's own view is authoritative. Anything other than
+    // 948 "Port Request Does Not Exist" means something is live over there.
+    if (lastStatus && lastStatus.statusCode !== '948') {
+      skip(`carrier's latest portinStatus is ${lastStatus.statusCode} (${lastStatus.description || 'no description'}) — not resubmitting over an existing port request`);
       continue;
     }
 
-    // Guard 2: independently confirm with the carrier's own view. Anything
-    // other than "no such port request" means something is live over there.
-    const statusLogs = await supabaseSelect(
-      env,
-      `carrier_api_logs?select=response_body_json&iccid=eq.${encodeURIComponent(iccid)}&step=eq.portin_status&order=created_at.desc&limit=1`
-    );
-    const lastStatus = statusLogs?.[0]?.response_body_json?.wholeSaleApi?.wholeSaleResponse;
-    if (lastStatus && lastStatus.statusCode !== '948') {
-      skip(`carrier's latest portinStatus is ${lastStatus.statusCode} (${lastStatus.description || 'no description'}) — not resubmitting over an existing port request`);
+    // Guard 2: our own last attempt succeeded, so we believe a port exists.
+    // Overridden only by a MORE RECENT status check saying the port is gone —
+    // ports do open and then disappear (2026-09-04: 15 SIMs got a Success with
+    // reasonCode=OP, and every later status check returned 948). Without the
+    // recency comparison this guard would permanently block exactly the SIMs
+    // that most need resubmitting.
+    const lastReqStatus = reqLog.response_body_json?.wholeSaleApi?.wholeSaleResponse?.statusCode;
+    const statusIsNewer = statusLog && reqLog.created_at && statusLog.created_at > reqLog.created_at;
+    if (lastReqStatus === '00' && !(lastStatus?.statusCode === '948' && statusIsNewer)) {
+      skip('last portinRequest succeeded and no newer status check contradicts it — a port already exists; resubmitting would duplicate it');
       continue;
     }
 
@@ -541,11 +548,15 @@ async function handleRetryPortInJson(request, env) {
     return json({ ok: true, queued: 0, attempted: iccids.length, results, run_id: null, job_run_id: null });
   }
 
+  // activation_runs.source is CHECK-constrained to csv/json/dashboard, so the
+  // retry provenance rides on run_id and created_by rather than a new source
+  // value — adding one would need a migration applied to both PROD and TEST,
+  // and this repo has repeatedly been bitten by that pair drifting apart.
   const runId = `portin_retry_${Date.now()}`;
   let runUuid;
   try {
     runUuid = await createActivationRun(env, {
-      source: 'portin_retry',
+      source: 'json',
       totalItems: toQueue.length,
       createdBy: 'retry-portin',
     });
