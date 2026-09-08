@@ -4716,6 +4716,24 @@ set verify_pending; schedule §C.3 poll
             const code = s.atomic_portin_status_code;
             return !!code && String(code) !== '00';
         }
+        // Turns the carrier's response into a label an operator can act on.
+        // The actionable detail for a 951 is not the code — it is the
+        // statusReasonCode buried in the description
+        // ("...~ statusReasonCode - 8A ~ statusReasonDescription - ..."), so
+        // that is read first and the top-level code is only a fallback.
+        // Observed in PROD 2026-09-08: 948 "Error!!Port Request Does Not Exist"
+        // and "portRequestInfo Does Not Exist", 951/8A, 951/6B.
+        const PORTIN_REASON_LABELS = { '8A': 'Wrong Account', '6B': 'Wrong PIN' };
+        const PORTIN_CODE_LABELS = { '948': 'No Request', '910': 'Not Our SIM', '951': 'Rejected' };
+        function portInFailureLabel(s) {
+            const descr = String(s.atomic_portin_description || '');
+            const m = descr.match(/statusReasonCode\s*-\s*([A-Z0-9]+)/i);
+            if (m && PORTIN_REASON_LABELS[m[1].toUpperCase()]) return PORTIN_REASON_LABELS[m[1].toUpperCase()];
+            const code = String(s.atomic_portin_status_code || '');
+            if (PORTIN_CODE_LABELS[code]) return PORTIN_CODE_LABELS[code];
+            // Unknown shape — show the raw code rather than invent a label.
+            return 'Port-in ' + (code || '?');
+        }
         const SIM_PRESETS = {
             not_rotated_today:  { label: 'Not rotated today',     test: simNotRotatedToday },
             portin_failed:      { label: 'Port-in failed',        test: simPortInFailed },
@@ -6177,7 +6195,7 @@ function renderSims() {
                 // error field set, so without this badge it is indistinguishable
                 // from a SIM that is healthily mid-provisioning.
                 const portInBadge = simPortInFailed(sim)
-                    ? `<span class="ml-1 px-2 py-1 text-xs font-medium rounded-full bg-red-500/20 text-red-400 cursor-help" title="Port-in failed — ${escapeHtml(sim.atomic_portin_description || 'no detail recorded')}${sim.atomic_portin_checked_at ? ' (checked ' + escapeHtml(new Date(sim.atomic_portin_checked_at).toLocaleString()) + ')' : ''}">port-in ${escapeHtml(sim.atomic_portin_status_code)}</span>`
+                    ? `<span class="ml-1 px-2 py-1 text-xs font-medium rounded-full bg-red-500/20 text-red-400 cursor-help whitespace-nowrap" title="Port-in failed (${escapeHtml(sim.atomic_portin_status_code)}) — ${escapeHtml(sim.atomic_portin_description || 'no detail recorded')}${sim.atomic_portin_checked_at ? ' (checked ' + escapeHtml(new Date(sim.atomic_portin_checked_at).toLocaleString()) + ')' : ''}">${escapeHtml(portInFailureLabel(sim))}</span>`
                     : '';
                 const vendorBadge = { teltik: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>', atomic: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-blue-500/20 text-blue-300">ATOMIC</span>', wing_iot: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-green-500/20 text-green-300">Wing IoT</span>', helix: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>' }[sim.vendor] || '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">-</span>';
                 return `
