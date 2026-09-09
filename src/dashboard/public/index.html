@@ -5033,6 +5033,18 @@ set verify_pending; schedule §C.3 poll
             activatedTo: '',
             search: '',
         };
+        // Fleet-wide { status: count }, from /api/sims/status-counts. Null until
+        // it loads, or if it fails — callers fall back to counting loaded rows.
+        let SIMS_STATUS_COUNTS = null;
+        async function loadSimsStatusCounts() {
+            try {
+                const res = await fetch(API_BASE + '/sims/status-counts');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data && data.ok && data.counts) SIMS_STATUS_COUNTS = data.counts;
+            } catch (e) { /* menu falls back to loaded-row counts */ }
+        }
+
         function simNotRotatedToday(s) {
             const todayUTC = new Date().toISOString().slice(0, 10);
             return !s.last_mdn_rotated_at || s.last_mdn_rotated_at.slice(0, 10) < todayUTC;
@@ -5718,9 +5730,26 @@ set verify_pending; schedule §C.3 poll
                 { value: 'data_mismatch', label: 'Data Mismatch' },
                 { value: '__all__', label: 'Include cancelled (server flag)' },
             ];
-                const counts = {};
-                data.forEach(function(s){ counts[s.status] = (counts[s.status]||0) + 1; });
+                // Prefer fleet-wide counts. Counting the loaded rows cannot work
+                // for status: the server filters on it, so any status excluded by
+                // the current query always tallied 0 — "Cancelled (0)" while
+                // hundreds existed. Falls back to loaded rows if the fetch failed.
+                const loaded = {};
+                data.forEach(function(s){ loaded[s.status] = (loaded[s.status]||0) + 1; });
+                const counts = SIMS_STATUS_COUNTS || loaded;
                 opts = STATUS_OPTS.map(function(o){ return { value: o.value, label: o.label, count: o.value === '__all__' ? 0 : (counts[o.value] || 0) }; });
+                // A status nobody thought to hardcode (rotation_failed, say) is
+                // otherwise unfilterable and invisible. Surface whatever the
+                // fleet actually contains.
+                const known = new Set(STATUS_OPTS.map(function(o){ return o.value; }));
+                Object.keys(counts).sort().forEach(function(st){
+                    if (known.has(st) || !counts[st]) return;
+                    opts.splice(opts.length - 1, 0, {
+                        value: st,
+                        label: st.replace(/_/g, ' ').replace(/\b\w/g, function(c){ return c.toUpperCase(); }),
+                        count: counts[st],
+                    });
+                });
             } else if (kind === 'vendor') {
             const VENDOR_OPTS = [
                 { value: 'helix', label: 'Helix (legacy)' },
@@ -6866,7 +6895,9 @@ set verify_pending; schedule §C.3 poll
                 if (force) params.set('force', 'true');
 
                 const url = API_BASE + '/sims?' + params.toString();
-                const response = await fetch(url);
+                // Fleet-wide status counts are independent of this query, so they
+                // ride along rather than adding a stage to the load.
+                const [response] = await Promise.all([fetch(url), loadSimsStatusCounts()]);
                 const sims = await response.json();
                 tableState.sims.data = sims;
                 lastSimsFetchedAt = Date.now();

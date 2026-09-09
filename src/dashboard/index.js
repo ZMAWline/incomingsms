@@ -106,6 +106,10 @@ export default {
       return handleSims(env, corsHeaders, url);
     }
 
+    if (url.pathname === '/api/sims/status-counts') {
+      return handleSimsStatusCounts(env, corsHeaders);
+    }
+
     if (url.pathname === '/api/messages') {
       return handleMessages(env, corsHeaders, url);
     }
@@ -995,6 +999,38 @@ async function handleSmsUsage(env, corsHeaders, url) {
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+// Fleet-wide tally of SIMs per status.
+//
+// The SIMs filter menu used to count whatever rows happened to be loaded, but
+// status is filtered server-side: the default query appends status=neq.canceled,
+// so no cancelled row is ever present and "Cancelled (0)" was structurally
+// guaranteed regardless of how many exist. Same for any status the current
+// query excludes. This counts the table itself, so the menu can show what is
+// really there rather than what is on screen.
+//
+// Only the status column is selected, so this stays a small payload even at
+// full fleet size, and needs no new DB function.
+async function handleSimsStatusCounts(env, corsHeaders) {
+  try {
+    const rows = await supabaseGetAllArray(env, 'sims?select=status');
+    const counts = {};
+    for (const row of rows) {
+      const key = row && row.status ? row.status : 'unknown';
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return new Response(JSON.stringify({ ok: true, counts, total: rows.length }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    // The menu falls back to counting loaded rows if this fails, so a failure
+    // here degrades the counts rather than breaking the filter.
+    return new Response(JSON.stringify({ ok: false, error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
 }
