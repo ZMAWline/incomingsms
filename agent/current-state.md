@@ -63,10 +63,44 @@ a separate change touching the frontend's call sites, and is worth doing.
   stray worker deleted. The Cloudflare API token in GitHub secrets was *also* independently
   expired and was refreshed. Both faults were real — see the correction note below.
 
+**Method guards — DONE later the same day (PR #97, prod `6fc1282a`).** All nine routes now
+require POST. A subagent audited every caller first: the SPA builds paths as
+`API_BASE + '/cancel'`, so a literal grep finds nothing — the suffix form and both dynamic
+dispatchers (`bulkStatusChange`, `_epFor`) were checked separately. **Every caller already
+sent POST, so zero caller changes were needed.** No worker service-binds to the dashboard;
+`/api/debug-cancel` has no caller at all. Same-named routes in `mdn-rotator`, `sim-canceller`,
+`bulk-activator`, `sim-status-changer`, `teltik-worker` are those workers' OWN routes,
+downstream — not callers.
+
+Verified on dashboard-test (authenticated, so routing is reached): GET on the nine returns
+the SPA shell and does not act; POST still reaches the handler and returns JSON. Note a
+guarded GET falls through to `serveApp()` and returns 200 + HTML rather than 405, matching
+every other guarded route — so curling `GET /api/cancel` to debug returns HTML, which is not
+a fault.
+
+The path-first role model in `shared/portal-auth.mjs` was deliberately KEPT as defence in
+depth, and the new test asserts all nine stay in `ALWAYS_MUTATING`, so the two layers pin
+each other. See decision-log 2026-09-09.
+
+**`agent/constraints.md` corrected (PR #99).** §1 described the pre-2026-06-12 world (CRLF
+`index.js`, `getHTML()` template literal, mandatory patch scripts) — all false since the
+frontend moved to `public/index.html`; verified 0 CR bytes and 0 `getHTML` in both files.
+Two further unrunnable instructions fixed in the same pass: §11 pointed at a
+`_check_relay.js` that does not exist, and §6 named only one of the two live migration
+directories (`supabase/migrations/` 24 files vs top-level `migrations/` 22 — both written to
+this week, including by this session; documented, not reorganised).
+
+**Stale PRs closed:** #85 (superseded by #99; was 3294 deletions behind and would have
+removed `tests/portal-auth.test.mjs` and three other recent test files) and #87 (superseded
+by #93; its diff only looked new because its merge base predates #93).
+
 **Pending / next:**
-- Missing method guards on the mutating routes above (permission layer compensates today).
-- `main` is current with both merges; nothing uncommitted.
-- Operational CSVs in the repo root remain untracked by convention.
+- Two migration directories still coexist — needs a deliberate consolidation decision.
+- `teltik-not-in-inventory-6.csv` — 6 ICCIDs to ask Shlomo about. **Not 107.**
+- `teltik-offline-needs-port-reset-10.csv` — 10 genuine port-reset candidates.
+- `main` clean; tests 815/815; prod dashboard `6fc1282a` verified healthy.
+- Operational CSVs/XLSX in the repo root remain untracked by convention (PR #82 from another
+  session proposes gitignoring them).
 
 ---
 

@@ -1246,3 +1246,23 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 **Why:** The dashboard is the control surface for ~4,000 live billable lines. A bug in a brand-new login path with no fallback means nobody can reach production operations until a fix is written and deployed. Break-glass also solves bootstrapping: the first admin has to be created by someone, and no user exists yet.
 
 **Consequence:** Break-glass is now `off` in production and `dashboard123` is dead (verified 401). It remains available on `dashboard-test`. If a future auth change risks lockout, re-enable by deleting the `DASHBOARD_BREAK_GLASS` secret — `DASHBOARD_AUTH` is still set. Break-glass has no `dashboard_users` row, so it cannot use the Profile tab; `/auth/me` reports `has_profile: false`.
+
+---
+
+## 2026-09-09 — Nine mutating dashboard routes guarded; path-first role model kept anyway
+
+**Decision:** `/api/activate`, `/api/cancel`, `/api/suspend`, `/api/restore`, `/api/rotate-sim`, `/api/fix-sim`, `/api/send-test-sms`, `/api/sim-online` and `/api/debug-cancel` now require `request.method === 'POST'`. The path-first permission model in `src/shared/portal-auth.mjs` was NOT simplified to a method check afterwards — it still treats all nine as `ALWAYS_MUTATING` regardless of verb.
+
+**Why:** Each of those routes previously answered a bare GET, so `GET /api/cancel?sim_id=123` cancelled a real billable line — and a URL travels in links, bookmarks and crawlers. Every caller in the repo already sent POST (the SPA builds paths as `API_BASE + '/cancel'`, which is why a literal grep finds nothing; the two dynamic dispatchers `bulkStatusChange` and `_epFor` were audited separately), so the guards changed no behaviour for legitimate traffic. The role model was kept path-first because defence in depth is cheap here and the two layers now pin each other: a regression test asserts each route keeps its method guard, and another asserts each stays in `ALWAYS_MUTATING`.
+
+**Consequence:** Do not "simplify" `requiredRole()` to a method check on the grounds that the routes are guarded now — that removes the second layer and re-creates the original exposure if a guard is ever dropped. Also note a guarded GET falls through to `serveApp()` and returns 200 + SPA HTML, not 405, consistent with every other guarded route; anyone debugging with `curl GET /api/cancel` gets HTML back and should not read that as breakage.
+
+---
+
+## 2026-09-09 — A carrier error code is not a diagnosis: the "107 offline SIMs" retraction
+
+**Decision:** The long-standing finding that 107 port-in lines were offline and needed a Teltik port reset is retracted. Real numbers, re-measured: 165 checked, 149 online, 10 offline, 6 absent from Teltik's inventory. Only the 10 are reset candidates.
+
+**Why:** The check queried Teltik `/v1/port-status` using the MDN from our own database. For a Teltik-hosted line that number is never right — Teltik keeps the FIRST MDN it ever saw and our rotations do not sync back, a rule already documented at the top of `src/shared/teltik-known-mdn.mjs`. Teltik answered `404 Incorrect Phone Number`, which is a wrong-key error, and it was read as a dead line. Proof on sim 36066 (`89012804332469395747`): port-status via our MDN `3855869698` returns 404; via Teltik's MDN `9297213581` it returns `{"success":true,"status":"online"}`. 101 of the original 107 are in `/v1/all-lines` with an MDN and a port.
+
+**Consequence:** For any Teltik host-level call, resolve the MDN through `resolveTeltikKnownMdn()` and treat `db_current_mdn_unconfirmed` as "this reading is not trustworthy" rather than as data. Endpoint facts worth not re-deriving: `/v1/get-phone-number?iccid=` returns `404 Invalid ICCID` for AT&T ICCIDs because it only covers Teltik's own T-Mobile SIMs; `/v1/all-lines` is the ICCID -> MDN source; `/v1/get-info` takes `mdn` only and rejects `iccid`. More generally: a 4xx from a carrier describes the request, not the line — confirm which before acting on it.
