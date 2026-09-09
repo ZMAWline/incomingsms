@@ -2754,6 +2754,20 @@ async function handleHostingPortStatusJobGet(jobId, env, corsHeaders) {
   }
 }
 
+// Cancel-side cleanup shared by every path that lands a SIM in 'canceled':
+// expire its active MDN and end the reseller assignment. Idempotent — the
+// filters mean no rows are touched when these are already in the desired
+// state, so it is safe to call repeatedly.
+//
+// Any new code that sets sims.status='canceled' MUST call this. Skipping it
+// leaves reseller_sims.active=true on a dead line, which keeps the SIM in the
+// billable set that computeBillingBreakdown counts (src/shared/billing.js:145).
+async function deactivateSimAssignments(env, simId) {
+  const nowIso = new Date().toISOString();
+  await sbPatch(env, 'sim_numbers?sim_id=eq.' + encodeURIComponent(String(simId)) + '&valid_to=is.null', { valid_to: nowIso });
+  await sbPatch(env, 'reseller_sims?sim_id=eq.' + encodeURIComponent(String(simId)) + '&active=eq.true', { active: false });
+}
+
 async function syncCancelledSim(env, subId, helixData) {
   try {
     const sims = await sbGet(env, 'sims?mobility_subscription_id=eq.' + encodeURIComponent(subId) + '&select=id,iccid,status&limit=1');
@@ -2770,11 +2784,7 @@ async function syncCancelledSim(env, subId, helixData) {
       result.status_already_canceled = true;
     }
 
-    // Idempotent cancel-side cleanup: expire active sim_numbers and remove from reseller_sims.active.
-    // Filters ensure no work happens if these are already in the desired state — safe to call repeatedly.
-    const nowIsoCancel = new Date().toISOString();
-    await sbPatch(env, 'sim_numbers?sim_id=eq.' + sim.id + '&valid_to=is.null', { valid_to: nowIsoCancel });
-    await sbPatch(env, 'reseller_sims?sim_id=eq.' + sim.id + '&active=eq.true', { active: false });
+    await deactivateSimAssignments(env, sim.id);
 
     const hist = await sbGet(env, 'sim_status_history?sim_id=eq.' + sim.id + '&new_status=eq.canceled&limit=1');
     if (!Array.isArray(hist) || hist.length === 0) {
@@ -6553,6 +6563,10 @@ async function handleSetSimStatus(request, env, corsHeaders) {
     const text = await res.text();
     return new Response(JSON.stringify({ error: 'DB error: ' + text }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
+  // Setting a SIM canceled by hand must release it the same way the carrier
+  // sync does. Only 'canceled' — the other statuses here (including 'error')
+  // are retryable, and dropping the reseller assignment would lose it.
+  if (status === 'canceled') await deactivateSimAssignments(env, sim_id);
   return new Response(JSON.stringify({ ok: true, sim_id, status }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
@@ -9310,6 +9324,10 @@ async function handleAtomicSubAction(request, env, corsHeaders) {
     }
 
     await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(sim.id)), { status: spec.status });
+    // 'deactivate' is terminal at the carrier — release the MDN and end the
+    // reseller assignment so the line drops out of the billable set.
+    // suspend/restore/reconnect are reversible and keep their assignment.
+    if (spec.status === 'canceled') await deactivateSimAssignments(env, sim.id);
     return json({ ok: true, sim_id: sim.id, iccid: sim.iccid, msisdn, op, requestType: spec.requestType, new_status: spec.status, response: data });
   } catch (error) {
     return json({ ok: false, error: String(error) }, 500);
