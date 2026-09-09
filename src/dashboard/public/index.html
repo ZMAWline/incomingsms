@@ -982,6 +982,19 @@
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
                     <span class="text-sm">Guide</span>
                 </a>
+                <a href="/profile" onclick="event.preventDefault();switchTab('profile')" data-tab="profile" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Profile">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                    <span class="text-sm">Profile</span>
+                </a>
+                <!-- Admin-only. Unhidden by applyRoleToUi() when /auth/me says admin. -->
+                <!-- `flex` and `hidden` together is intentional and matches the other
+                     nav items: Tailwind emits .hidden after .flex, so display:none wins
+                     while hidden is applied and the row layout returns when it is removed.
+                     Dropping `flex` to avoid the clash instead stacks the icon and label. -->
+                <a id="nav-users" href="/users" onclick="event.preventDefault();switchTab('users')" data-tab="users" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200 hidden" title="Users">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                    <span class="text-sm">Users</span>
+                </a>
             </nav>
             <div class="mt-auto px-6 pb-4">
                 <button onclick="loadData()" class="w-full inline-flex items-center justify-center gap-2 transition" title="Refresh" style="padding:8px 24px;border-radius:999px;background:var(--mc-paper);border:1.5px solid var(--mc-ink);color:var(--mc-ink);font-size:14px;font-weight:500;">
@@ -1177,6 +1190,129 @@
             </div>
 
             <!-- SIMs Tab -->
+            <!-- Profile: available to every signed-in user, whatever their role.
+                 The self-service endpoints are routed ahead of the role gate so a
+                 viewer can still manage their own credentials. -->
+            <div id="tab-profile" class="tab-content hidden">
+                <div class="mb-6">
+                    <h2 class="text-xl font-semibold">Your profile</h2>
+                    <p class="text-sm text-dark-400">Signed in as <span id="profile-username" class="font-medium">—</span> · <span id="profile-role">—</span></p>
+                </div>
+
+                <div id="profile-breakglass" class="mb-6 p-4 rounded-lg hidden" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                    <p class="text-sm">You are signed in with the shared break-glass password, which has no profile of its own. Sign in with a user account to change a username or password.</p>
+                </div>
+
+                <div id="profile-forms">
+                    <div class="mb-6 p-4 rounded-lg" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                        <h3 class="font-medium mb-3">Change username</h3>
+                        <div class="flex flex-wrap items-end gap-3">
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-username">New username</label>
+                                <input id="pf-username" autocomplete="username" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-username-pw">Current password</label>
+                                <input id="pf-username-pw" type="password" autocomplete="current-password" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <button onclick="changeUsername()" class="px-4 py-2 rounded text-sm font-medium" style="background:var(--mc-ink);color:var(--mc-paper);">Update username</button>
+                        </div>
+                        <div id="pf-username-msg" class="mt-3 text-sm"></div>
+                    </div>
+
+                    <div class="mb-6 p-4 rounded-lg" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                        <h3 class="font-medium mb-3">Change password</h3>
+                        <p class="text-xs text-dark-400 mb-3">Changing your password signs you out of every other browser. Minimum 12 characters.</p>
+                        <div class="flex flex-wrap items-end gap-3">
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-cur-pw">Current password</label>
+                                <input id="pf-cur-pw" type="password" autocomplete="current-password" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-new-pw">New password</label>
+                                <input id="pf-new-pw" type="password" autocomplete="new-password" minlength="12" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-new-pw2">Confirm new password</label>
+                                <input id="pf-new-pw2" type="password" autocomplete="new-password" minlength="12" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <button onclick="changePassword()" class="px-4 py-2 rounded text-sm font-medium" style="background:var(--mc-ink);color:var(--mc-paper);">Update password</button>
+                        </div>
+                        <div id="pf-password-msg" class="mt-3 text-sm"></div>
+                    </div>
+                </div>
+
+                <div class="p-4 rounded-lg" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                    <h3 class="font-medium mb-3">Session</h3>
+                    <button onclick="logout()" class="px-4 py-2 rounded text-sm border" style="border-color:var(--mc-line);">Sign out</button>
+                </div>
+            </div>
+
+            <!-- Users: admin-only. The server enforces this (403 on /api/users for
+                 anyone below admin); hiding the tab is only cosmetic. -->
+            <div id="tab-users" class="tab-content hidden">
+                <div class="mb-6">
+                    <h2 class="text-xl font-semibold">Users</h2>
+                    <p class="text-sm text-dark-400">Invite people, set what they can do, and revoke access.</p>
+                </div>
+
+                <div class="mb-6 p-4 rounded-lg" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                    <h3 class="font-medium mb-3">Invite someone</h3>
+                    <div class="flex flex-wrap items-end gap-3">
+                        <div>
+                            <label class="block text-xs mb-1" for="invite-username">Username (optional)</label>
+                            <input id="invite-username" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);" placeholder="they can choose their own">
+                        </div>
+                        <div>
+                            <label class="block text-xs mb-1" for="invite-role">Role</label>
+                            <select id="invite-role" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                                <option value="viewer">Viewer — read only</option>
+                                <option value="operator">Operator — SIM actions, no billing or users</option>
+                                <option value="admin">Admin — everything</option>
+                            </select>
+                        </div>
+                        <button onclick="createInvite()" class="px-4 py-2 rounded text-sm font-medium" style="background:var(--mc-ink);color:var(--mc-paper);">Create invite link</button>
+                    </div>
+                    <div id="invite-result" class="mt-3 text-sm hidden">
+                        <p class="mb-1">Send this link. It works once and expires in 7 days.</p>
+                        <div class="flex gap-2">
+                            <input id="invite-link" readonly class="flex-1 px-3 py-2 rounded border text-xs font-mono" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            <button onclick="copyInviteLink()" class="px-3 py-2 rounded text-sm border" style="border-color:var(--mc-line);">Copy</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto rounded-lg" style="border:1px solid var(--mc-line);">
+                    <table class="w-full text-sm">
+                        <thead style="background:var(--mc-paper);">
+                            <tr class="text-left">
+                                <th class="px-4 py-2 font-medium">User</th>
+                                <th class="px-4 py-2 font-medium">Role</th>
+                                <th class="px-4 py-2 font-medium">Status</th>
+                                <th class="px-4 py-2 font-medium">Last login</th>
+                                <th class="px-4 py-2 font-medium">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-tbody"></tbody>
+                    </table>
+                </div>
+
+                <h3 class="font-medium mt-6 mb-2">Pending invites</h3>
+                <div class="overflow-x-auto rounded-lg" style="border:1px solid var(--mc-line);">
+                    <table class="w-full text-sm">
+                        <thead style="background:var(--mc-paper);">
+                            <tr class="text-left">
+                                <th class="px-4 py-2 font-medium">For</th>
+                                <th class="px-4 py-2 font-medium">Role</th>
+                                <th class="px-4 py-2 font-medium">Created</th>
+                                <th class="px-4 py-2 font-medium">Expires</th>
+                            </tr>
+                        </thead>
+                        <tbody id="invites-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
             <div id="tab-sims" class="tab-content hidden">
                 <div id="sim-action-bar" class="quiet-actions hidden mb-4 p-3 bg-dark-800 rounded-lg border border-dark-600 flex items-center gap-3">
                     <span id="sim-selected-count" class="text-sm text-gray-300">0 selected</span>
@@ -1230,6 +1366,7 @@
                                     <button data-preset="auto_paused"        onclick="toggleSimsPreset('auto_paused')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Auto-rotate paused</button>
                                     <button data-preset="stuck_provisioning" onclick="toggleSimsPreset('stuck_provisioning')" class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Stuck provisioning &gt;1h</button>
                                     <button data-preset="not_notified"       onclick="toggleSimsPreset('not_notified')"       class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="AT&T not notified today, T-Mobile not notified today or yesterday">Not Notified</button>
+                                    <button data-preset="portin_failed"      onclick="toggleSimsPreset('portin_failed')"      class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="Carrier returned a non-Success status for the port-in (948 port request does not exist, 910 SIM not on our ATOMIC account, 951 losing carrier rejected). These sit at status=provisioning and are otherwise invisible.">Port-in failed</button>
                                 </div>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <button id="sims-fb-status"   onclick="openSimsFilterMenu('status', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Status<span id="sims-fb-status-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
@@ -4543,6 +4680,8 @@ set verify_pending; schedule §C.3 poll
             'guide': '/guide',
             'api-tester': '/api-tester',
             'activation-runs': '/activation-runs',
+            'users': '/users',
+            'profile': '/profile',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
         ROUTE_TO_TAB['/gateway'] = 'gateways'; // legacy alias for old bookmarks
@@ -4625,7 +4764,212 @@ set verify_pending; schedule §C.3 poll
                 try { if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); } } catch(e) { console.error('switchTab autoLoad failed for rotation-reviews', e); }
                 try { if (tabName === 'workers') loadHostingPortJobs(); } catch(e) { console.error('switchTab autoLoad failed for workers', e); }
                 try { if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); } } catch(e) { console.error('switchTab autoLoad failed for activation-runs', e); }
+                try { if (tabName === 'users') loadUsers(); } catch(e) { console.error('switchTab autoLoad failed for users', e); }
+                try { if (tabName === 'profile') loadProfile(); } catch(e) { console.error('switchTab autoLoad failed for profile', e); }
             }
+        }
+
+        // --- Users / roles -------------------------------------------------
+        // The server is the enforcement point: /api/users is 403 for anyone
+        // below admin and every write route is role-checked centrally. What
+        // happens here is presentation only — showing a viewer buttons that
+        // would just 403 is a worse experience, not a security boundary.
+        let CURRENT_USER = null;
+
+        async function loadCurrentUser() {
+            try {
+                const res = await fetch('/auth/me');
+                if (!res.ok) return null;
+                const data = await res.json();
+                CURRENT_USER = data && data.ok
+                    ? { username: data.username, role: data.role, hasProfile: data.has_profile !== false }
+                    : null;
+            } catch (e) { CURRENT_USER = null; }
+            applyRoleToUi();
+            return CURRENT_USER;
+        }
+
+        function applyRoleToUi() {
+            const role = CURRENT_USER && CURRENT_USER.role;
+            const navUsers = document.getElementById('nav-users');
+            if (navUsers) navUsers.classList.toggle('hidden', role !== 'admin');
+            // Viewers get a read-only surface: anything explicitly marked as a
+            // write control is hidden rather than left to fail server-side.
+            document.querySelectorAll('[data-requires-write]').forEach(function (el) {
+                el.classList.toggle('hidden', role === 'viewer');
+            });
+            const badge = document.getElementById('current-user-badge');
+            if (badge && CURRENT_USER) badge.textContent = CURRENT_USER.username + ' · ' + role;
+        }
+
+        function esc(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+
+        function fmtWhen(v) {
+            if (!v) return '—';
+            try { return new Date(v).toLocaleString(); } catch (e) { return String(v); }
+        }
+
+        async function loadUsers() {
+            const tbody = document.getElementById('users-tbody');
+            const itbody = document.getElementById('invites-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-3 text-dark-400">Loading...</td></tr>';
+            try {
+                const res = await fetch('/api/users');
+                if (res.status === 403) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-3 text-dark-400">Admins only.</td></tr>';
+                    return;
+                }
+                const data = await res.json();
+                const users = (data && data.users) || [];
+                tbody.innerHTML = users.length ? users.map(function (u) {
+                    const locked = u.locked_until && new Date(u.locked_until) > new Date();
+                    const disabled = u.status !== 'active';
+                    return '<tr style="border-top:1px solid var(--mc-line);">'
+                        + '<td class="px-4 py-2">' + esc(u.username) + '</td>'
+                        + '<td class="px-4 py-2">'
+                        + '<select onchange="updateUser(\'' + esc(u.id) + '\', { role: this.value })" class="px-2 py-1 rounded border text-xs" style="background:var(--mc-bg);border-color:var(--mc-line);">'
+                        + ['viewer', 'operator', 'admin'].map(function (r) {
+                            return '<option value="' + r + '"' + (u.role === r ? ' selected' : '') + '>' + r + '</option>';
+                        }).join('')
+                        + '</select></td>'
+                        + '<td class="px-4 py-2">' + (disabled ? 'disabled' : 'active')
+                        + (locked ? ' <span title="too many failed logins">(locked)</span>' : '') + '</td>'
+                        + '<td class="px-4 py-2">' + esc(fmtWhen(u.last_login_at)) + '</td>'
+                        + '<td class="px-4 py-2">'
+                        + '<button onclick="updateUser(\'' + esc(u.id) + '\', { status: \'' + (disabled ? 'active' : 'disabled') + '\' })" class="px-3 py-1 rounded text-xs border" style="border-color:var(--mc-line);">'
+                        + (disabled ? 'Re-enable' : 'Disable') + '</button>'
+                        + '</td></tr>';
+                }).join('') : '<tr><td colspan="5" class="px-4 py-3 text-dark-400">No users yet — create an invite below.</td></tr>';
+
+                const invites = (data && data.pending_invites) || [];
+                if (itbody) {
+                    itbody.innerHTML = invites.length ? invites.map(function (i) {
+                        return '<tr style="border-top:1px solid var(--mc-line);">'
+                            + '<td class="px-4 py-2">' + esc(i.username || 'anyone with the link') + '</td>'
+                            + '<td class="px-4 py-2">' + esc(i.role) + '</td>'
+                            + '<td class="px-4 py-2">' + esc(fmtWhen(i.created_at)) + '</td>'
+                            + '<td class="px-4 py-2">' + esc(fmtWhen(i.expires_at)) + '</td>'
+                            + '</tr>';
+                    }).join('') : '<tr><td colspan="4" class="px-4 py-3 text-dark-400">None outstanding.</td></tr>';
+                }
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-3">Could not load users: ' + esc(e.message) + '</td></tr>';
+            }
+        }
+
+        async function updateUser(id, patch) {
+            try {
+                const res = await fetch('/api/users/' + encodeURIComponent(id), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(patch)
+                });
+                const data = await res.json().catch(function () { return {}; });
+                // The server refuses to strand the last admin; surface that reason.
+                if (!res.ok || !data.ok) alert(data.error || 'Update failed');
+            } catch (e) { alert('Update failed: ' + e.message); }
+            loadUsers();
+        }
+
+        async function createInvite() {
+            const role = document.getElementById('invite-role').value;
+            const username = document.getElementById('invite-username').value.trim();
+            try {
+                const res = await fetch('/api/invites', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ role: role, username: username || null })
+                });
+                const data = await res.json().catch(function () { return {}; });
+                if (!res.ok || !data.ok) { alert(data.error || 'Could not create invite'); return; }
+                document.getElementById('invite-link').value = window.location.origin + data.accept_path;
+                document.getElementById('invite-result').classList.remove('hidden');
+                loadUsers();
+            } catch (e) { alert('Could not create invite: ' + e.message); }
+        }
+
+        function copyInviteLink() {
+            const el = document.getElementById('invite-link');
+            el.select();
+            try { document.execCommand('copy'); } catch (e) { /* clipboard blocked */ }
+        }
+
+        async function logout() {
+            try { await fetch('/auth/logout', { method: 'POST' }); } catch (e) { /* fall through */ }
+            window.location.replace('/');
+        }
+
+        // --- Profile (self-service) ----------------------------------------
+
+        function setMsg(id, text, ok) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = text || '';
+            el.style.color = text ? (ok ? '#166534' : '#991b1b') : '';
+        }
+
+        async function loadProfile() {
+            await loadCurrentUser();
+            const u = CURRENT_USER;
+            const nameEl = document.getElementById('profile-username');
+            const roleEl = document.getElementById('profile-role');
+            if (nameEl) nameEl.textContent = u ? u.username : '—';
+            if (roleEl) roleEl.textContent = u ? u.role : '—';
+            // Break-glass authenticates against a secret, not a row, so there is
+            // nothing for it to edit.
+            const isBreakGlass = !!u && u.hasProfile === false;
+            const forms = document.getElementById('profile-forms');
+            const notice = document.getElementById('profile-breakglass');
+            if (forms) forms.classList.toggle('hidden', isBreakGlass);
+            if (notice) notice.classList.toggle('hidden', !isBreakGlass);
+            const pf = document.getElementById('pf-username');
+            if (pf && u && !isBreakGlass && !pf.value) pf.value = u.username;
+        }
+
+        async function changeUsername() {
+            const username = document.getElementById('pf-username').value.trim();
+            const current_password = document.getElementById('pf-username-pw').value;
+            setMsg('pf-username-msg', '');
+            if (!username) { setMsg('pf-username-msg', 'Enter a username.', false); return; }
+            try {
+                const res = await fetch('/auth/change-username', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: username, current_password: current_password })
+                });
+                const data = await res.json().catch(function () { return {}; });
+                if (!res.ok || !data.ok) { setMsg('pf-username-msg', data.error || 'Could not update username.', false); return; }
+                document.getElementById('pf-username-pw').value = '';
+                setMsg('pf-username-msg', 'Username updated.', true);
+                loadProfile();
+            } catch (e) { setMsg('pf-username-msg', 'Network error. Try again.', false); }
+        }
+
+        async function changePassword() {
+            const current_password = document.getElementById('pf-cur-pw').value;
+            const pw = document.getElementById('pf-new-pw').value;
+            const pw2 = document.getElementById('pf-new-pw2').value;
+            setMsg('pf-password-msg', '');
+            if (pw !== pw2) { setMsg('pf-password-msg', 'The two new passwords do not match.', false); return; }
+            if (pw.length < 12) { setMsg('pf-password-msg', 'New password must be at least 12 characters.', false); return; }
+            try {
+                const res = await fetch('/auth/change-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ current_password: current_password, new_password: pw })
+                });
+                const data = await res.json().catch(function () { return {}; });
+                if (!res.ok || !data.ok) { setMsg('pf-password-msg', data.error || 'Could not update password.', false); return; }
+                document.getElementById('pf-cur-pw').value = '';
+                document.getElementById('pf-new-pw').value = '';
+                document.getElementById('pf-new-pw2').value = '';
+                setMsg('pf-password-msg', 'Password updated. Other browsers have been signed out.', true);
+            } catch (e) { setMsg('pf-password-msg', 'Network error. Try again.', false); }
         }
 
         // /sims/:id — SIM detail deep link (e.g. clicked from an Activation
@@ -4706,8 +5050,36 @@ set verify_pending; schedule §C.3 poll
             if (!ref) return false;
             return (Date.now() - new Date(ref).getTime()) > 3600000;
         }
+        // A port-in failed if the carrier returned any status other than "00"
+        // (Success). Known failures: 948 port request does not exist, 910 SIM
+        // not on our ATOMIC account, 951 losing carrier rejected the port.
+        // Deliberately "not 00" rather than a fixed list — a code we have not
+        // seen yet should surface here rather than stay invisible.
+        function simPortInFailed(s) {
+            const code = s.atomic_portin_status_code;
+            return !!code && String(code) !== '00';
+        }
+        // Turns the carrier's response into a label an operator can act on.
+        // The actionable detail for a 951 is not the code — it is the
+        // statusReasonCode buried in the description
+        // ("...~ statusReasonCode - 8A ~ statusReasonDescription - ..."), so
+        // that is read first and the top-level code is only a fallback.
+        // Observed in PROD 2026-09-08: 948 "Error!!Port Request Does Not Exist"
+        // and "portRequestInfo Does Not Exist", 951/8A, 951/6B.
+        const PORTIN_REASON_LABELS = { '8A': 'Wrong Account', '6B': 'Wrong PIN' };
+        const PORTIN_CODE_LABELS = { '948': 'No Request', '910': 'Not Our SIM', '951': 'Rejected' };
+        function portInFailureLabel(s) {
+            const descr = String(s.atomic_portin_description || '');
+            const m = descr.match(/statusReasonCode\s*-\s*([A-Z0-9]+)/i);
+            if (m && PORTIN_REASON_LABELS[m[1].toUpperCase()]) return PORTIN_REASON_LABELS[m[1].toUpperCase()];
+            const code = String(s.atomic_portin_status_code || '');
+            if (PORTIN_CODE_LABELS[code]) return PORTIN_CODE_LABELS[code];
+            // Unknown shape — show the raw code rather than invent a label.
+            return 'Port-in ' + (code || '?');
+        }
         const SIM_PRESETS = {
             not_rotated_today:  { label: 'Not rotated today',     test: simNotRotatedToday },
+            portin_failed:      { label: 'Port-in failed',        test: simPortInFailed },
             no_sms_12h:         { label: 'No SMS in 12h',         test: simNoSms12h },
             no_reseller:        { label: 'No reseller',           test: function(s){ return !s.reseller_id; } },
             auto_paused:        { label: 'Auto-rotate paused',    test: function(s){ return s.rotation_eligible === false; } },
@@ -6162,6 +6534,12 @@ function renderSims() {
                     'canceled': 'bg-red-500/20 text-red-400',
                     'error': 'bg-red-500/20 text-red-400',
                 }[sim.status] || 'bg-gray-500/20 text-gray-400';
+                // A failed port-in leaves the SIM at status=provisioning with no
+                // error field set, so without this badge it is indistinguishable
+                // from a SIM that is healthily mid-provisioning.
+                const portInBadge = simPortInFailed(sim)
+                    ? `<span class="ml-1 px-2 py-1 text-xs font-medium rounded-full bg-red-500/20 text-red-400 cursor-help whitespace-nowrap" title="Port-in failed (${escapeHtml(sim.atomic_portin_status_code)}) — ${escapeHtml(sim.atomic_portin_description || 'no detail recorded')}${sim.atomic_portin_checked_at ? ' (checked ' + escapeHtml(new Date(sim.atomic_portin_checked_at).toLocaleString()) + ')' : ''}">${escapeHtml(portInFailureLabel(sim))}</span>`
+                    : '';
                 const vendorBadge = { teltik: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>', atomic: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-blue-500/20 text-blue-300">ATOMIC</span>', wing_iot: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-green-500/20 text-green-300">Wing IoT</span>', helix: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>' }[sim.vendor] || '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">-</span>';
                 return `
                 <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
@@ -6172,7 +6550,7 @@ function renderSims() {
                     <td class="px-4 py-3 text-gray-200">${sim.phone_number || '-'}${verifiedBadge}</td>
                     <td class="px-4 py-3 text-gray-400 font-mono text-xs">${sim.blimei || '-'}</td>
                     <td class="px-4 py-3">
-                        <span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${sim.status}</span>
+                        <span class="px-2 py-1 text-xs font-medium rounded-full ${statusClass}">${sim.status}</span>${portInBadge}
                     </td>
                     <td class="px-4 py-3">${vendorBadge}</td>
                     <td class="px-4 py-3">${hostPortCell(sim)}</td>
@@ -14742,6 +15120,11 @@ async function sendSimOnline(simId, phoneNumber) {
             if (modal) modal.remove();
         }
 
+        // Resolve who is logged in as soon as the shell boots, so the Users tab
+        // and any write-only controls settle before the first interaction.
+        // Reaching this file at all means the session was already accepted by
+        // the Worker, so a failure here is cosmetic, never a security gap.
+        loadCurrentUser();
 
     </script>
         <!-- Add Mapping Modal -->

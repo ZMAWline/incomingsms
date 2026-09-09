@@ -61,7 +61,14 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DASHBOARD_AUTH: ${{ secrets.DASHBOARD_AUTH }}
-        run: echo "$DASHBOARD_AUTH" | npx wrangler secret put DASHBOARD_AUTH --env test --name dashboard-test
+        # Resolve the target worker from the config's [env.test] name, like every
+        # other step here. `--env test --name dashboard-test` made wrangler append
+        # the env suffix to the explicit name and write to `dashboard-test-test`,
+        # a phantom worker it created on 2026-08-25 — so DASHBOARD_AUTH never
+        # reached the real dashboard-test.
+        # printf, never echo: echo appends a newline and corrupts the secret
+        # (constraints.md #4).
+        run: printf '%s' "$DASHBOARD_AUTH" | npx wrangler secret put DASHBOARD_AUTH --config src/dashboard/wrangler.toml --env test
 
       - name: Deploy dashboard test preview
         env:

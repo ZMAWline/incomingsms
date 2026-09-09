@@ -7,6 +7,9 @@ import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
+import { canAccess } from '../shared/portal-auth.mjs';
+import { resolveUser, breakGlassUser, handleAuthRoutes } from './auth-routes.mjs';
+import { renderLoginPage, renderAcceptInvitePage } from './auth-pages.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -34,13 +37,49 @@ export default {
       return handlePublicBadRentalEscalationToday(env);
     }
 
-    // Basic auth check
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !checkAuth(authHeader, env)) {
-      return new Response('Unauthorized', {
-        status: 401,
-        headers: { 'WWW-Authenticate': 'Basic realm="Dashboard"' }
+    // --- Authentication ---------------------------------------------------
+    // Named users with revocable sessions. The legacy shared Basic password
+    // still works as break-glass while DASHBOARD_BREAK_GLASS !== 'off', and
+    // counts as admin — that is also how the first admin bootstraps before any
+    // account exists.
+    const user = (await resolveUser(env, request)) || breakGlassUser(env, request);
+    const isApiPath = url.pathname.startsWith('/api/');
+
+    if (!user) {
+      if ((url.pathname === '/auth/login' || url.pathname === '/auth/accept-invite')
+          && request.method === 'POST') {
+        return handleAuthRoutes(request, env, url, null);
+      }
+      if (url.pathname === '/accept-invite') {
+        return new Response(renderAcceptInvitePage(), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
+      if (isApiPath || url.pathname.startsWith('/auth/')) {
+        return new Response(JSON.stringify({ ok: false, error: 'Not authenticated' }), {
+          status: 401, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      // A standalone login page, not the app shell: the SPA stays private, so
+      // an unauthenticated visitor learns nothing about the tool's internals.
+      return new Response(renderLoginPage(), {
+        status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
+    }
+
+    // Auth and user-administration routes.
+    const authResponse = await handleAuthRoutes(request, env, url, user);
+    if (authResponse) return authResponse;
+
+    // Central role enforcement, applied once for every /api route. Deliberately
+    // path-based rather than method-based: several action routes below have no
+    // method guard, so a bare GET /api/cancel really cancels a line. See the
+    // ALWAYS_MUTATING list in shared/portal-auth.mjs.
+    if (isApiPath && !canAccess(user.role, request.method, url.pathname)) {
+      return new Response(JSON.stringify({
+        ok: false,
+        error: 'Your role (' + user.role + ') is not permitted to perform this action',
+      }), { status: 403, headers: { 'Content-Type': 'application/json' } });
     }
 
     // CORS headers for API requests
@@ -628,15 +667,11 @@ export default {
   },
 };
 
-function checkAuth(authHeader, env) {
-  if (!env.DASHBOARD_AUTH) return true; // No auth configured
-
-  const [scheme, credentials] = authHeader.split(' ');
-  if (scheme !== 'Basic') return false;
-
-  const decoded = atob(credentials);
-  return decoded === env.DASHBOARD_AUTH; // Format: "username:password"
-}
+// checkAuth() lived here. Replaced by named-user sessions; the equivalent
+// shared-password check now survives only as breakGlassUser() in
+// auth-routes.mjs, which additionally honours DASHBOARD_BREAK_GLASS=off.
+// Note the old version returned TRUE when DASHBOARD_AUTH was unset — an unset
+// secret meant no authentication at all. The replacement fails closed.
 
 // Normalize an MDN to the exact format Teltik expects for /v1/reset-port and
 // /v1/get-info: 10 digit US, no country code, no '+'. Anything else (E.164,
