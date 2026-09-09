@@ -974,12 +974,34 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
     throw new CarrierActivationError(`ATOMIC port-in failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);
   }
 
-  // Unlike Activate, a port is accepted asynchronously by the losing carrier —
-  // the carrier's success/response shape for portinRequest is not independently
-  // confirmed (see docs/atomic-port-in-runbook.md), so we don't hard-require an
-  // MSISDN echo here. We already know the target MDN; use it as the identifier
-  // and record the SIM as still provisioning rather than immediately active.
-  const result = responseJson?.wholeSaleApi?.wholeSaleResponse?.Result;
+  // ATOMIC answers a REJECTED port with HTTP 200 and the real verdict in the
+  // body. Without this check every rejection was recorded as a successful
+  // submission: the SIM went to `provisioning` with port_in_pending=true, the
+  // job item said `done`, and the only trace was a carrier_api_logs row nobody
+  // was reading. That is how 53 SIMs accumulated looking healthy while no port
+  // existed — including `Error!!Port Request Does Not Exist` (948),
+  // `Error!!streetName Is Invalid` (948) and `Invalid Zipcode.` (510), all
+  // HTTP 200.
+  //
+  // Confirmed from PROD: an accepted port returns statusCode "00" with
+  // Result.reasonCode "OP" (Open) and a portRequestNumber. Anything else is a
+  // rejection and must fail loudly so it lands in the Activation Runs error
+  // detail with the carrier's own words.
+  const wholeSaleResponse = responseJson?.wholeSaleApi?.wholeSaleResponse;
+  const carrierStatusCode = wholeSaleResponse?.statusCode ?? null;
+  if (carrierStatusCode !== null && carrierStatusCode !== '00') {
+    throw new CarrierActivationError(
+      `ATOMIC port-in rejected (statusCode ${carrierStatusCode}): ${wholeSaleResponse?.description || responseText.slice(0, 300)}`,
+      carrierLogId
+    );
+  }
+
+  // The success shape itself is still not hard-required. A port is accepted
+  // asynchronously by the losing carrier, so we don't insist on an MSISDN echo
+  // the way the new-number path does — we already know the target MDN. The SIM
+  // is recorded as provisioning rather than active until the portinStatus poll
+  // sees it complete.
+  const result = wholeSaleResponse?.Result;
   return {
     msisdn: result?.MSISDN || normalizedPortMdn,
     ban: result?.BAN || '',
