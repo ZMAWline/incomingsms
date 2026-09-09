@@ -1,3 +1,4 @@
+import { isAddressRejection } from './activation-bulk.mjs';
 // The address pool is DB-driven (table: address_pool_usage). The static
 // src/shared/address-pool.mjs file is kept only as the original seed source —
 // runtime never imports it. New entries (e.g., refill-cron replacements for
@@ -44,6 +45,17 @@ export async function pickNextPpuAddress(env, opts = {}) {
 // rotation error, and missing one quarantine row is not worth failing on.
 export async function markAddressVerifyFailure(env, addressId, errorMessage) {
   if (!addressId) return;
+  // Only blame the address when the carrier actually complained about the
+  // address. This guard is retrofitted: without it, every UpdateSubscriberInfo
+  // failure quarantined the address it happened to be using — 500s, 504s,
+  // Invalid MSISDN, even a literal "200". By 2026-09-09 that had taken out
+  // 1070 of 1521 addresses, 391 of them on one day during a carrier outage,
+  // when only 13 were genuinely bad. A transient fault must not cost an
+  // address.
+  if (!isAddressRejection(errorMessage)) {
+    console.log(`markAddressVerifyFailure(${addressId}) skipped — not an address rejection: ${String(errorMessage || '').slice(0, 120)}`);
+    return;
+  }
   const url = `${env.SUPABASE_URL}/rest/v1/address_pool_usage?address_id=eq.${encodeURIComponent(addressId)}`;
   try {
     const res = await fetch(url, {
