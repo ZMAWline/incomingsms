@@ -29,7 +29,19 @@ const FALSY = new Set(['', '0', 'false', 'no', 'n', 'new', 'new_number', 'off'])
 // never the same name repeated across a batch). Only name/address fields are
 // touched; port_mdn/port_account_number/port_pin/iccid/imei/reseller_id are
 // never generated here.
-export function pickRandomPortIdentity() {
+// `excludeAddressIds` is the set of addresses ATOMIC has already rejected,
+// read from address_pool_usage.verify_failed_at by the caller (which has the
+// Supabase credentials; this module stays pure).
+//
+// Why it matters: on 2026-09-08, eight port-ins failed with "streetName Is
+// Invalid" / "streetNumber Is Invalid" / "Invalid Zipcode" — and every one of
+// those addresses was ALREADY quarantined in the DB, flagged earlier by the
+// Apex PPU path. Port-ins kept drawing them because this function only ever
+// read the in-code array. Passing the set closes that gap.
+//
+// The returned port_address_id lets the caller quarantine the address if the
+// carrier rejects it, so port-in failures feed the same table.
+export function pickRandomPortIdentity(excludeAddressIds) {
   const subIdx = Math.floor(Math.random() * NAME_POOL.length);
   let oldIdx = Math.floor(Math.random() * NAME_POOL.length);
   if (NAME_POOL.length > 1 && oldIdx === subIdx) {
@@ -37,7 +49,15 @@ export function pickRandomPortIdentity() {
   }
   const name = NAME_POOL[subIdx];
   const oldName = NAME_POOL[oldIdx];
-  const address = ADDRESS_POOL[Math.floor(Math.random() * ADDRESS_POOL.length)];
+
+  const excluded = excludeAddressIds instanceof Set ? excludeAddressIds : new Set(excludeAddressIds || []);
+  // Fall back to the full pool rather than throwing if exclusions would empty
+  // it — a port submitted with a questionable address beats no port at all,
+  // and the carrier is the final arbiter either way.
+  const usable = excluded.size ? ADDRESS_POOL.filter(a => !excluded.has(a.id)) : ADDRESS_POOL;
+  const pool = usable.length > 0 ? usable : ADDRESS_POOL;
+  const address = pool[Math.floor(Math.random() * pool.length)];
+
   return {
     port_first_name: name.firstName,
     port_last_name: name.lastName,
@@ -46,7 +66,22 @@ export function pickRandomPortIdentity() {
     port_zip: address.zipCode,
     port_old_first_name: oldName.firstName,
     port_old_last_name: oldName.lastName,
+    port_address_id: address.id,
   };
+}
+
+// Carrier rejections that mean "this address is bad", as opposed to a transient
+// fault or a problem with the losing-carrier account details. Matched against
+// the portinRequest description so the caller can quarantine the address and
+// redraw instead of failing the port.
+//
+// Observed verbatim in PROD carrier_api_logs 2026-09-08:
+//   Error!!streetName Is Invalid / Error!!streetNumber Is Invalid /
+//   Invalid Zipcode. / ...UpdateSubscriberInfo failed: City is blank.
+const ADDRESS_REJECTION_RX = /street\s*Name\s*Is\s*Invalid|street\s*Number\s*Is\s*Invalid|Invalid\s*Zipcode|City is blank/i;
+
+export function isAddressRejection(description) {
+  return ADDRESS_REJECTION_RX.test(String(description || ''));
 }
 
 export function parseCsv(text) {
@@ -169,7 +204,7 @@ export function validateActivationSim(input, options = {}) {
       return String(input?.[key] ?? input?.[camel] ?? '').trim() !== '';
     });
     if (!anyPortFieldProvided) {
-      Object.assign(sim, pickRandomPortIdentity());
+      Object.assign(sim, pickRandomPortIdentity(options?.excludeAddressIds));
     } else {
       for (const key of REQUIRED_PORT_FIELDS) {
         const camel = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
