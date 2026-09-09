@@ -314,10 +314,10 @@ async function handleActivateJson(request, env) {
   // Loaded once per batch so every auto-filled row skips addresses ATOMIC has
   // already rejected, instead of each row rediscovering them one carrier call
   // at a time.
-  const excludeAddressIds = await loadQuarantinedAddressIds(env);
+  const addresses = await loadAddressPool(env);
 
   for (let i = 0; i < sims.length; i++) {
-    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor, resellerId, excludeAddressIds });
+    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor, resellerId, addresses });
     if (!checked.ok) {
       validationErrors++;
       rowErrors.push(...checked.errors);
@@ -471,7 +471,7 @@ async function handleRetryPortInJson(request, env) {
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }); }
   const iccids = Array.isArray(body?.iccids) ? body.iccids.map(String) : [];
   const newIdentity = body?.new_identity === true;
-  let quarantinedIds = null;
+  let poolAddresses = null;
   if (iccids.length === 0) return json({ ok: false, error: 'iccids array required' });
   if (iccids.length > 50) return json({ ok: false, error: 'max 50 iccids per call' });
 
@@ -532,8 +532,8 @@ async function handleRetryPortInJson(request, env) {
     // Use this when the carrier rejected the address itself (streetNumber Is
     // Invalid / streetName Is Invalid / Invalid Zipcode); replaying those
     // unchanged just reproduces the rejection.
-    if (newIdentity && !quarantinedIds) quarantinedIds = await loadQuarantinedAddressIds(env);
-    const fresh = newIdentity ? pickRandomPortIdentity(quarantinedIds) : null;
+    if (newIdentity && !poolAddresses) poolAddresses = await loadAddressPool(env);
+    const fresh = newIdentity ? pickRandomPortIdentity(poolAddresses) : null;
     const fields = {
       port_mdn: original.portMdn,
       port_account_number: original.portAccountNumber,
@@ -613,29 +613,49 @@ async function handleRetryPortInJson(request, env) {
   return json({ ok: true, queued: toQueue.length, attempted: iccids.length, results, run_id: runId, job_run_id: runUuid });
 }
 
-// Addresses ATOMIC has already rejected, so a port-in never draws one again.
+// The live address pool. address_pool membership is the source of truth: a
+// deleted row is gone from rotation permanently, everywhere.
 //
-// The quarantine table has existed since the Apex PPU work in May, but only
-// that path read it. On 2026-09-08 eight port-ins failed on invalid addresses
-// and every single one was already flagged here — we had the answer and were
-// not looking at it.
-//
-// Mirrors claim_address_pool_entry's 90-day auto-retest: an address quarantined
-// longer ago than that comes back into rotation, since carrier-side validation
-// data does change.
-async function loadQuarantinedAddressIds(env) {
-  const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+// Falls back to the in-code ADDRESS_POOL (via pickRandomPortIdentity's own
+// default) when the table is empty or unreadable, so TEST and any un-seeded
+// environment keep working rather than failing activations.
+async function loadAddressPool(env) {
   try {
     const rows = await supabaseSelect(
       env,
-      `address_pool_usage?select=address_id&verify_failed_at=gte.${encodeURIComponent(cutoff)}&limit=5000`
+      'address_pool?select=address_id,street_number,street_name,street_direction,city,state,zip_code&limit=5000'
     );
-    return new Set((rows || []).map(r => r.address_id).filter(Boolean));
+    return (rows || []).map(r => ({
+      id: r.address_id,
+      streetNumber: r.street_number,
+      streetName: r.street_name,
+      streetDirection: r.street_direction || '',
+      city: r.city,
+      state: r.state,
+      zipCode: r.zip_code,
+    }));
   } catch (e) {
-    // Never block an activation on this — an unfiltered pool is the old
-    // behaviour, not a new failure mode.
-    console.warn(`[Activator] could not load address quarantine: ${e}`);
-    return new Set();
+    console.warn(`[Activator] could not load address_pool, falling back to the code pool: ${e}`);
+    return [];
+  }
+}
+
+// Removes an address permanently and records why. The audit row is what makes
+// a permanent delete safe to operate: without it there is no way to answer
+// "why is this address gone" or to notice a rule deleting too much — which is
+// exactly how the previous quarantine went wrong unnoticed for four months.
+async function deletePoolAddress(env, addressId, reason, carrierStep) {
+  if (!addressId) return;
+  try {
+    await supabaseInsert(env, 'address_pool_deletions', [{
+      address_id: addressId,
+      reason: String(reason || '').slice(0, 500),
+      carrier_step: carrierStep || null,
+    }]);
+    await supabaseDelete(env, `address_pool?address_id=eq.${encodeURIComponent(addressId)}`);
+    console.log(`[Activator] deleted address ${addressId} from the pool: ${reason}`);
+  } catch (e) {
+    console.warn(`[Activator] could not delete address ${addressId}: ${e}`);
   }
 }
 
@@ -854,7 +874,7 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   const portPin = String(options.portPin || options.port_pin || '').trim();
   let portFields = mapPortFields(options);
   let addressId = options.port_address_id || options.portAddressId || null;
-  let quarantined = null;
+  let poolAddresses = null;
 
   // Belt-and-suspenders: validateActivationSim already blocks incomplete port-in
   // rows upstream (CSV /run, JSON /activate, dashboard). This guard covers
@@ -936,12 +956,11 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
     const description = responseJson?.wholeSaleApi?.wholeSaleResponse?.description;
     if (!res.ok || attempt >= MAX_ADDRESS_ATTEMPTS || !isAddressRejection(description)) break;
 
-    console.log(`[Activator] ${iccid}: address rejected (${description}) — quarantining ${addressId || 'unknown'} and redrawing (attempt ${attempt}/${MAX_ADDRESS_ATTEMPTS})`);
-    if (addressId) await markAddressVerifyFailure(env, addressId, `portinRequest: ${description}`);
-    if (!quarantined) quarantined = await loadQuarantinedAddressIds(env);
-    if (addressId) quarantined.add(addressId);
+    console.log(`[Activator] ${iccid}: address rejected (${description}) — deleting ${addressId || 'unknown'} and redrawing (attempt ${attempt}/${MAX_ADDRESS_ATTEMPTS})`);
+    await deletePoolAddress(env, addressId, `portinRequest: ${description}`, 'portinRequest');
+    poolAddresses = await loadAddressPool(env);
 
-    const fresh = pickRandomPortIdentity(quarantined);
+    const fresh = pickRandomPortIdentity(poolAddresses);
     portFields = {
       ...portFields,
       streetNumber: fresh.port_street_number,
@@ -1150,6 +1169,17 @@ async function supabasePatch(env, path, body) {
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`Supabase PATCH ${res.status}: ${await res.text().catch(() => '')}`);
+}
+
+async function supabaseDelete(env, path) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+    method: 'DELETE',
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+  if (!res.ok) throw new Error(`Supabase DELETE ${res.status}: ${await res.text().catch(() => '')}`);
 }
 
 async function supabaseInsert(env, table, rows) {

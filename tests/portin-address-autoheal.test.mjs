@@ -17,41 +17,40 @@ const ACTIVATOR = readFileSync('src/bulk-activator/index.js', 'utf8');
 
 /* ── picking ─────────────────────────────────────────────────────────────── */
 
-test('pickRandomPortIdentity never draws an excluded address', () => {
-  // Exclude all but one, then confirm every draw is that one.
-  const keep = ADDRESS_POOL[42];
-  const exclude = new Set(ADDRESS_POOL.filter(a => a.id !== keep.id).map(a => a.id));
+const DB_POOL = [
+  { id: 'zz-00001-1-alpha-street', streetNumber: '1', streetName: 'Alpha Street', zipCode: '00001' },
+  { id: 'zz-00002-2-beta-road', streetNumber: '2', streetName: 'Beta Road', zipCode: '00002' },
+];
+
+test('pickRandomPortIdentity draws from the live pool when one is supplied', () => {
+  const ids = new Set();
+  for (let i = 0; i < 200; i++) ids.add(pickRandomPortIdentity(DB_POOL).port_address_id);
+  assert.deepEqual([...ids].sort(), DB_POOL.map(a => a.id).sort());
+});
+
+test('a deleted address simply is not in the pool, so it can never be drawn', () => {
+  // Membership IS the filter now — there is no flag to consult and no 90-day
+  // window for a deleted address to come back through.
+  const afterDelete = DB_POOL.slice(0, 1);
   for (let i = 0; i < 100; i++) {
-    const id = pickRandomPortIdentity(exclude);
-    assert.equal(id.port_street_name, keep.streetName);
-    assert.equal(id.port_address_id, keep.id);
+    assert.equal(pickRandomPortIdentity(afterDelete).port_address_id, 'zz-00001-1-alpha-street');
   }
 });
 
-test('pickRandomPortIdentity returns the address id so a rejection can quarantine it', () => {
+test('falls back to the code pool when the DB pool is empty or missing', () => {
+  // Keeps TEST and any un-seeded environment working instead of failing every
+  // activation.
+  for (const arg of [undefined, null, []]) {
+    const id = pickRandomPortIdentity(arg);
+    assert.ok(id.port_street_name);
+    assert.ok(ADDRESS_POOL.some(a => a.id === id.port_address_id));
+  }
+});
+
+test('pickRandomPortIdentity returns the address id so a rejection can delete it', () => {
   const id = pickRandomPortIdentity();
-  assert.ok(id.port_address_id, 'port_address_id must be present');
+  assert.ok(id.port_address_id);
   assert.ok(ADDRESS_POOL.some(a => a.id === id.port_address_id));
-});
-
-test('excluding the whole pool falls back rather than throwing', () => {
-  // A port submitted with a questionable address beats no port at all, and the
-  // carrier is the final arbiter either way.
-  const all = new Set(ADDRESS_POOL.map(a => a.id));
-  const id = pickRandomPortIdentity(all);
-  assert.ok(id.port_street_name, 'must still return an address');
-});
-
-test('accepts a plain array as well as a Set', () => {
-  const keep = ADDRESS_POOL[7];
-  const exclude = ADDRESS_POOL.filter(a => a.id !== keep.id).map(a => a.id);
-  assert.equal(pickRandomPortIdentity(exclude).port_address_id, keep.id);
-});
-
-test('no exclusions behaves exactly as before', () => {
-  for (const arg of [undefined, null, new Set(), []]) {
-    assert.ok(pickRandomPortIdentity(arg).port_street_name);
-  }
 });
 
 /* ── rejection detection ─────────────────────────────────────────────────── */
@@ -83,12 +82,30 @@ function portInFn() {
   return ACTIVATOR.slice(start, ACTIVATOR.indexOf('\nfunction mapPortFields', start));
 }
 
-test('a rejected address is quarantined, redrawn, and resubmitted', () => {
+test('a rejected address is deleted, redrawn, and resubmitted', () => {
   const fn = portInFn();
   assert.match(fn, /MAX_ADDRESS_ATTEMPTS = 3/);
-  assert.match(fn, /markAddressVerifyFailure\(env, addressId, `portinRequest: \$\{description\}`\)/);
-  assert.match(fn, /pickRandomPortIdentity\(quarantined\)/);
+  assert.match(fn, /deletePoolAddress\(env, addressId/);
+  assert.match(fn, /pickRandomPortIdentity\(poolAddresses\)/);
   assert.match(fn, /isAddressRejection\(description\)/);
+});
+
+test('a deletion always writes an audit row before removing the address', () => {
+  const fn = ACTIVATOR.slice(
+    ACTIVATOR.indexOf('async function deletePoolAddress'),
+    ACTIVATOR.indexOf('/* ── Relay fetch helper')
+  );
+  assert.ok(
+    fn.indexOf("address_pool_deletions") < fn.indexOf('supabaseDelete'),
+    'audit row must be written before the delete, or a failed delete loses the reason'
+  );
+});
+
+test('markAddressVerifyFailure only fires on a real address rejection', () => {
+  // The guard that stops a carrier outage from costing 391 addresses in a day.
+  const picker = readFileSync('src/shared/address-picker.mjs', 'utf8');
+  assert.match(picker, /if \(!isAddressRejection\(errorMessage\)\)/);
+  assert.match(picker, /return;/);
 });
 
 test('the retry loop only swaps street and zip', () => {
@@ -105,29 +122,24 @@ test('the retry loop only swaps street and zip', () => {
   }
 });
 
-test('the quarantine list is loaded once per batch, not per row', () => {
-  assert.match(ACTIVATOR, /const excludeAddressIds = await loadQuarantinedAddressIds\(env\)/);
+test('the pool is loaded once per batch, not per row', () => {
+  assert.match(ACTIVATOR, /const addresses = await loadAddressPool\(env\)/);
   const loop = ACTIVATOR.slice(
     ACTIVATOR.indexOf('for (let i = 0; i < sims.length; i++)'),
     ACTIVATOR.indexOf('validatedSims.push(checked.sim)')
   );
-  assert.ok(!loop.includes('loadQuarantinedAddressIds'), 'must not reload inside the per-row loop');
+  assert.ok(!loop.includes('loadAddressPool'), 'must not reload inside the per-row loop');
 });
 
-test('quarantine respects the 90-day auto-retest used by the Apex PPU picker', () => {
-  const loader = ACTIVATOR.slice(
-    ACTIVATOR.indexOf('async function loadQuarantinedAddressIds'),
-    ACTIVATOR.indexOf('/* ── Relay fetch helper')
-  );
-  assert.match(loader, /90 \* 24 \* 60 \* 60 \* 1000/);
-  assert.match(loader, /verify_failed_at=gte\./);
-});
 
-test('a quarantine lookup failure never blocks an activation', () => {
+
+
+
+test('a pool load failure falls back rather than blocking activations', () => {
   const loader = ACTIVATOR.slice(
-    ACTIVATOR.indexOf('async function loadQuarantinedAddressIds'),
-    ACTIVATOR.indexOf('/* ── Relay fetch helper')
+    ACTIVATOR.indexOf('async function loadAddressPool'),
+    ACTIVATOR.indexOf('async function deletePoolAddress')
   );
   assert.match(loader, /catch/);
-  assert.match(loader, /return new Set\(\)/);
+  assert.match(loader, /return \[\]/);
 });
