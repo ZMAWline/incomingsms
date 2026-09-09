@@ -4,42 +4,32 @@ These are non-negotiable. Violating them causes silent bugs, broken deploys, or 
 
 ---
 
-## 1. Dashboard File — ALL Edits Go Through the `patch-dashboard` Skill
+## 1. Dashboard — Two Files, Normal Edits, Two Mandatory Syntax Checks
 
-**ABSOLUTE RULE: every edit to `src/dashboard/index.js` — without exception — must be performed via the `patch-dashboard` skill.** Invoke it at the start of any dashboard task using the `Skill` tool (`skill: "patch-dashboard"`). This applies to:
-- New features, buttons, tabs, columns, API routes
-- Bug fixes of any size, including one-character typos
-- Renames, label changes, style tweaks
-- Reverts and rollbacks
+The dashboard is **two** files. Pick by what you are changing:
 
-**You may NOT:**
-- Use the Edit tool on `src/dashboard/index.js`.
-- Write a patch script freehand without reading the skill's SKILL.md first.
-- Skip either of the two required syntax checks (outer Worker + frontend JS).
-- Deploy with bare `npx wrangler deploy` — always `--env=""` (prod) or `--env test`.
+| Change | File |
+|---|---|
+| UI — markup, frontend JS, tables, filters, modals | `src/dashboard/public/index.html` |
+| Server — API routes, Supabase queries, auth, the `select=` column lists feeding the UI | `src/dashboard/index.js` |
 
-`src/dashboard/index.js` is a **CRLF file** containing a single giant `getHTML()` function whose return value is a template literal. All HTML and frontend JavaScript live inside this one template literal.
+**Both are plain LF files. Edit them with the normal Edit tool.** No patch scripts, no CRLF conversion, no backtick or `${` escaping.
 
-**Consequences:**
-- The Edit tool fails silently or corrupts the file because it expects LF.
-- You cannot write inline template literals in the frontend JS — they must use `\`` and `\${...}`.
-- Any unescaped `` ` `` or `${` inside `getHTML()` closes or breaks the outer template literal.
-- `\n`, `\r`, `\t` inside the source get evaluated by the template literal at runtime — to produce those characters as escape sequences in the browser JS (e.g. inside a regex character class), the source must contain `\\n`, `\\r`, `\\t`. Skipping the frontend JS check hides this class of bug (incident: 2026-04-15 gateway-export regex broke prod because only the outer Worker check was run).
+Adding a UI feature that surfaces a new DB column usually touches both: add the column to the `?select=` list and its passthrough in `index.js`, then render it in `public/index.html`.
 
-**Workflow (enforced by the skill, summarized here):**
-- Read the relevant section of `src/dashboard/index.js` first. Never guess.
-- Use the `Write` tool to create `_fix_<feature>.js` at the repo root. Never pass patch scripts via bash heredoc — bash strips `\` before `` ` ``.
-- Patch scripts use `require()`, not ESM import. Pattern: read file → normalize to LF → find/replace → CRLF → write.
-- Use string concatenation (`+`) when building replacement strings containing backticks or `${`.
-- For whole-function rewrites: use `indexOf(startMarker)` + `indexOf(endMarker)` + slice/concat.
-- Dynamic buttons in row HTML must be wrapped in `\${...}`. A bare `` \`...\` `` not inside `\${...}` closes the outer template.
-- After every patch, run BOTH syntax checks:
+**Still non-negotiable:**
+- Run BOTH syntax checks after any dashboard edit:
   ```bash
-  node --input-type=module --check < src/dashboard/index.js   # outer Worker module
-  node _check_frontend_js.js                                    # frontend JS (executes getHTML via vm)
+  node --input-type=module --check < src/dashboard/index.js   # Worker module
+  node _check_frontend_js.js                                   # inline <script> blocks in public/index.html
   ```
-  Both must pass before deploy. Check 1 alone is insufficient — it treats the frontend JS as a string and misses escaping bugs.
-- Deploy with explicit env: `cd src/dashboard && npx wrangler deploy --env=""` (prod) or `--env test`.
+  Check 1 alone is insufficient. It validates only the Worker; a syntax error in `public/index.html` is invisible to it, so the Worker deploys fine and the browser gets broken JS — `loadData()` never runs and the page renders empty. That is the recurring "data not loading" bug.
+- Deploy with an explicit env: `cd src/dashboard && npx wrangler deploy --env=""` (prod) or `--env test`. Never bare `npx wrangler deploy`.
+- Read the section you are changing before editing it. Never guess.
+
+**Invoke the `patch-dashboard` skill** at the start of a dashboard task — it routes you to the right file and restates these checks. Its SKILL.md is current; this section is the summary.
+
+> **History — do NOT re-apply the old rules.** Until 2026-06-12 the whole SPA lived inside a `getHTML()` template literal in a CRLF `index.js`, which forced Node patch scripts and `\``/`\${` escaping. `scripts/extract_dashboard_frontend.mjs` moved it to `public/index.html`, served as a Workers static asset via `serveApp()`. **`getHTML()` no longer exists and neither file has a single CR byte** (verified 2026-09-09: `grep -c 'function getHTML'` = 0, `tr -cd '\r' | wc -c` = 0 for both). Writing `\`` into `public/index.html` today inserts a literal backslash and breaks the page. This section described the pre-06-12 world until 2026-09-09 and cost real time; if you find it stale again, fix it here rather than working around it.
 
 ---
 
@@ -100,6 +90,15 @@ Process:
 3. The migration is recorded and reproducible
 
 **Exception:** One-off data backfills can be run via `mcp__supabase__execute_sql` without a migration file, but note it in `agent/current-state.md`.
+
+> **Two migration directories exist and both are in active use** (observed 2026-09-09):
+> `supabase/migrations/` (24 files, the one named above) and a top-level `migrations/`
+> (22 files). Recent sessions have written to both — e.g. `20260909_address_pool_db_source_of_truth.sql`
+> landed in the former while `20260908_dashboard_users_auth.sql` and
+> `20260904_sims_gateway_host_default_teltik.sql` landed in the latter. **Prefer
+> `supabase/migrations/`** per the process above. Nothing has been moved, because it is not
+> established whether the split is meaningful (CLI-managed vs ad-hoc/MCP-applied) and other
+> sessions reference both paths. Worth a deliberate decision and a consolidation.
 
 ---
 
@@ -185,11 +184,13 @@ function relayFetch(env: Env, url: string, init?: RequestInit): Promise<Response
 }
 ```
 
-**Before adding a new external API call, run the relay lint check:**
+**Before adding a new external API call, check it by hand:**
 ```bash
-node _check_relay.js
+grep -rn "await fetch(" src/<worker>/ | grep -v "SUPABASE_URL" | grep -v relayFetch
 ```
-This script flags any `await fetch(` calls to non-Supabase URLs that don't go through `relayFetch`.
+Anything that survives that filter is a direct call to a third party and must go through `relayFetch`.
+
+> `_check_relay.js` used to be referenced here as a lint script. **It does not exist in the repo** (verified 2026-09-09) — the instruction was unrunnable. Use the grep above, or write the script and restore the reference.
 
 ---
 
