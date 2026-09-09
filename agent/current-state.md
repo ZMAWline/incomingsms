@@ -31,6 +31,136 @@
 
 **Separate breakage found:** the `Deploy shared dashboard preview` workflow failed on PR #72 with `Invalid access token [code: 9109]` while setting `DASHBOARD_AUTH`. Unrelated to #72 (no dashboard or workflow files touched); merged past it. **This session read that error as an expired Cloudflare API token and said it needed a rotation from Zalmen — that was wrong.** PR #73 found the real cause: `wrangler secret put --env test --name dashboard-test` appends the env suffix to an explicit `--name`, so the write targeted a phantom `dashboard-test-test` worker, and Cloudflare reports a missing script as an auth error. Fixed by resolving the target from `[env.test]` in the config instead. Workflow green again as of 18:43 UTC.
 
+**Correction to the note above (added 2026-09-09, with evidence).** The Cloudflare API
+token *was* independently expired — that part was not wrong. Both faults were real and
+stacked, and fixing only one would not have made the workflow green:
+
+- `npx wrangler whoami` on this box reported "You are not authenticated" before a new
+  token was issued, and the repo secret was still the one set 2026-08-03.
+- The CI log shows two distinct failures: `/accounts/***/workers/scripts/dashboard-test-test/secrets`
+  -> `Authentication error [code: 10000]`, and then a plain `/accounts` -> `Invalid access
+  token [code: 9109]`. The second call lists the account and touches no script, so it
+  cannot be explained by a missing worker.
+- The run only went green after BOTH the GitHub secret was refreshed AND the `--name`
+  bug was fixed (PR #73).
+
+The phantom-worker diagnosis was the more interesting find and had been masked by the
+dead token. The stray `dashboard-test-test` worker has since been deleted.
+
+> Last updated: 2026-09-04 (infrastructure correction: all SIMs Teltik-hosted, all Wing IoT SIMs cancelled)
+
+---
+
+## 2026-09-04 — Infrastructure correction from Zalmen: SkyLine is legacy, Wing IoT is dead
+
+Two standing facts that the repo docs (and `agent/project-map.md` in particular) still described as
+current. Both are now corrected in the project map; recording them here as the authoritative note.
+
+1. **All SIMs are hosted by Teltik.** The SkyLine gateway hardware — gateways `64-1` and `512-1`, the
+   Supabase Edge Function bridge to `54.254.97.139:63826`, the `goip_send_at.html` AT-command
+   transport, KASA outlet power-cycling — is the **old setup** and no longer hosts production lines.
+   Carrier vendor remains a real distinction (an `atomic`/AT&T SIM sits in a Teltik gateway), so
+   carrier-level ops still route on `vendor`; it is only the *physical host* axis that has collapsed
+   to Teltik.
+2. **All `wing_iot` SIMs are cancelled.** `src/shared/wing-iot.ts` and every `vendor === 'wing_iot'`
+   branch across the workers are dead paths in production, not merely quiet.
+
+### Root cause found and fixed: `sims.gateway_host` defaulted to `'skyline'` at the DB level
+
+The initial suspicion (null `gateway_host` falling through `gatewayHostOf`) was **wrong** — the column
+is `NOT NULL` and had zero nulls on PROD. The actual defect was a **write-path default**:
+
+```
+sims.gateway_host  ->  NOT NULL DEFAULT 'skyline'::text
+```
+
+No activation insert path sets `gateway_host` explicitly, so **every newly activated SIM silently
+landed as `skyline`** — including the entire 2026-08-24 → 09-04 Teltik port-in cohort. Those rows are
+identifiable because they carry `gateway_id IS NULL` and `port IS NULL`: they were seated in no
+SkyLine gateway at all. (Genuine legacy SkyLine rows, e.g. the 14 deactivated ids 2610–2631, do carry
+a real `gateway_id` and port.) Two ICCIDs sampled from `teltik-port-in-deploy-report-170.csv` were
+confirmed inside the mislabeled active set.
+
+Why it mattered: `shared/gateway-host.mjs` keys the capability matrix on `gateway_host`. A row wrongly
+marked `skyline` reports `setImei: true` / `portReset: false` — the inverse of what a Teltik-hosted
+line supports. Silent wrong branch, not an exception. The codebase was also holding **two
+contradictory defaults**: ~10 read sites already coalesced to `sim.gateway_host || 'teltik'`, while
+`gatewayHostOf()` derived `SKYLINE`.
+
+**Applied (three layers, so the fix does not regress):**
+1. **DB default flipped** `'skyline'` → `'teltik'` on **PROD** (`lzjqegxazqlktttyybth`) and **TEST**
+   (`lwapudjjlwkskijefxdz`), migration `sims_gateway_host_default_teltik`; file committed at
+   `migrations/20260904_sims_gateway_host_default_teltik.sql`. Both verified reading
+   `'teltik'::text`. Stops new rows being mislabeled.
+2. **One-off PROD backfill** (per constraints.md #6 exception, recorded here): **186 rows** updated —
+   113 `active` + 73 `error` — scoped to
+   `gateway_host='skyline' AND gateway_id IS NULL AND port IS NULL AND status <> 'canceled'`.
+   Canceled legacy rows were deliberately **left as `skyline`**: they really were SkyLine-seated and
+   rewriting them would destroy accurate history.
+3. **`gatewayHostOf()` fallback flipped** to `TELTIK` (was `vendor === 'teltik' ? TELTIK : SKYLINE`),
+   so the module, the DB default, and the scattered `|| 'teltik'` coalesces finally agree. Explicit
+   `'skyline'` still wins, so legacy rows are unaffected.
+
+**Test suite: 749/749 passing.** `tests/gateway-host.test.mjs` rewritten for the new default plus a
+regression guard that explicit `skyline` still wins. One pre-existing test broke and was corrected
+rather than worked around: `bad-rental-remediator-real-run-limit.test.mjs`'s `sim-6817` fixture left
+`gateway_host: null` and relied on the old vendor-derived default to get a Skyline-hosted SIM for its
+A6 SMS-kill-switch assertion; under the new default it routes to TH2 and defers on
+`pending_teltik_host_port_read`, never reaching the SMS gate. Fixture now says `gateway_host:
+'skyline'` explicitly, which is what a real legacy row looks like.
+
+**PROD state after:** every non-canceled SIM is `teltik` except **one** — sim id **770** (`active`,
+`vendor=atomic`, `gateway_host='skyline'`, `gateway_id=3`, real port). Left untouched on purpose: it
+has an actual SkyLine gateway seat recorded, so unlike the 186 it is genuinely ambiguous.
+**Needs Zalmen's call:** is 770 a stale record, or a real line still in the 512-port gateway?
+
+### Follow-on: re-ran the host-port check on the cohort — the "107 offline" lines are NOT offline
+
+Sim **770** was reassigned to `gateway_host='teltik'` per Zalmen (it had `gateway_id=3`, port `14B`,
+but is Teltik-hosted like everything else). PROD now has **zero** non-canceled `skyline` rows.
+
+Then re-ran the Teltik hosting port-status check over the full cohort — the 113 backfilled active
+rows plus 770 = **114 SIMs** — via new script `scripts/recheck-portin-cohort-host-ports.mjs`
+(read-only: `GET /v1/port-status` through the relay, writes only `hosting_port_status_checks` +
+`carrier_api_logs`; the same call the 12h cron makes, no reset/rotation/carrier mutation).
+
+**First, why this had never run:** `runHostingPortSweep` selects on
+`or=(gateway_host.eq.teltik,and(gateway_host.is.null,vendor.eq.teltik))`. While these rows were
+mislabeled `skyline` with `vendor='atomic'` they matched **neither arm**, so the 12h cron skipped
+them entirely. They had never been host-checked once. That is the operational cost of the default bug,
+separate from the capability-matrix inversion.
+
+**Result — 114 checked: 7 online, 0 offline, 107 error.** The 107 is exactly the number
+`PROJECT.md` carried as "still offline at the Teltik host/port layer — likely needs a Teltik port
+reset". That hypothesis is **wrong**, and the evidence is unambiguous:
+
+- All 107 returned **HTTP 404** with body `{"message": "Incorrect Phone Number !"}`.
+- All 107 have `mdn_source = db_current_mdn_unconfirmed` — the Teltik inventory lookup did not
+  contain the number, so the resolver fell back to our DB's MDN, which Teltik then rejected.
+- All 7 that came back online resolved via `teltik_all_lines_inventory` (or inbound-SMS payload).
+
+So **Teltik has no port for these 107 lines** — they are absent from Teltik's hosted-line inventory,
+not sitting on a down port. A port reset is meaningless against a line the host doesn't know; there is
+nothing to reset. Note `normalizeHostPortState`'s rule is doing its job here: a 404 is `error`, never
+`offline`, precisely so a read failure can't masquerade as a down line.
+
+Two candidate explanations, not yet distinguished:
+1. Teltik never provisioned these ported-in lines onto hosting ports (work incomplete on Shlomo's side).
+2. They are on Teltik ports under a different MDN that our resolver can't link to the ported number.
+
+**Next action is with Teltik, not in this repo.** List written to
+`teltik-missing-from-inventory-107.csv` (untracked, repo root; sim_id, iccid, db_current_mdn,
+result) — hand to Shlomo and ask why these ICCIDs are not in Teltik inventory. Until that is answered,
+do not queue port resets for this cohort.
+
+Still open, not started:
+- Decide whether the dead SkyLine/Wing code paths get deleted or left in place. The
+  `sim-capability-map` skill's inventory of SIM-action sites is the right starting point. Note the
+  SkyLine path is **not** fully dead — legacy `skyline` rows still exist and still route through it.
+- No worker was redeployed for the `gatewayHostOf` change; the shared module ships with whichever
+  worker deploys next. Workers importing it: mdn-rotator, bad-rental-remediator, dashboard,
+  teltik-portal (and shared/hosting-port-status).
+
 ---
 
 ## Session 2026-08-24 (cont'd 3) — port-in UI/flow overhaul: default random subscriber info, bulk port-in paste, reseller dropdown

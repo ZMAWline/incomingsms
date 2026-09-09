@@ -1,5 +1,17 @@
 # Project Map
 
+> **Current as of 2026-09-04 — read this before trusting anything below about gateways or Wing.**
+>
+> - **All SIMs are hosted by Teltik.** The SkyLine gateway hardware (gateways `64-1` / `512-1`, the
+>   Supabase Edge Function bridge, the AT-command transport) is the **old setup** and no longer hosts
+>   production lines. Carrier vendor is still a live distinction — an `atomic`-vendor (AT&T) SIM can
+>   and does sit in a Teltik gateway — but `gateway_host` is now effectively `teltik` everywhere.
+> - **All `wing_iot` SIMs are cancelled.** The Wing IoT code paths (`src/shared/wing-iot.ts` and the
+>   `vendor === 'wing_iot'` branches across the workers) are dead in production, not just idle.
+>
+> The SkyLine and Wing sections below are retained as history for the code that still references them.
+> See `agent/current-state.md` (2026-09-04) for the follow-ups this implies.
+
 ## Worker Registry
 
 | Worker | Purpose | Trigger | Key Bindings |
@@ -59,7 +71,7 @@ TELTIK_WORKER      → teltik-worker
 | QuickBooks Online | Invoice generation | OAuth 2.0, tokens in QBO_TOKENS KV |
 | Reseller webhooks | `number.online` event delivery | URL in `resellers.webhook_url` |
 
-## SkyLine Gateway Bridge Architecture
+## SkyLine Gateway Bridge Architecture (LEGACY — no longer hosts production SIMs)
 
 ```
 Worker → SKYLINE_GATEWAY service binding
@@ -71,7 +83,7 @@ Worker → SKYLINE_GATEWAY service binding
 
 **Why the bridge exists:** Cloudflare Workers cannot reach Cloudflare-proxied IPs (error 1003/521 — internal routing loop). The Supabase Edge Function runs on Deno Deploy which has no such restriction.
 
-## Gateways in DB
+## Gateways in DB (LEGACY — SkyLine hardware, no longer hosting production SIMs)
 
 | id | code | ports | host | notes |
 |----|------|-------|------|-------|
