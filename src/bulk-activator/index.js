@@ -1,5 +1,5 @@
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
-import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseAtomicPortInRequest, parseCsv, pickRandomPortIdentity, validateActivationSim } from '../shared/activation-bulk.mjs';
+import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseAtomicPortInRequest, parseCsv, pickRandomPortIdentity, isAddressRejection, validateActivationSim } from '../shared/activation-bulk.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -229,6 +229,7 @@ export default {
               port_first_name: portFirstName, port_last_name: portLastName,
               port_street_number: portStreetNumber, port_street_name: portStreetName, port_zip: portZip,
               port_old_first_name: portOldFirstName, port_old_last_name: portOldLastName,
+              port_address_id: msg.body.port_address_id || null,
             });
             break;
           case 'wing_iot':
@@ -310,8 +311,13 @@ async function handleActivateJson(request, env) {
   let validationErrors = 0;
   const rowErrors = [];
 
+  // Loaded once per batch so every auto-filled row skips addresses ATOMIC has
+  // already rejected, instead of each row rediscovering them one carrier call
+  // at a time.
+  const excludeAddressIds = await loadQuarantinedAddressIds(env);
+
   for (let i = 0; i < sims.length; i++) {
-    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor, resellerId });
+    const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor, resellerId, excludeAddressIds });
     if (!checked.ok) {
       validationErrors++;
       rowErrors.push(...checked.errors);
@@ -465,6 +471,7 @@ async function handleRetryPortInJson(request, env) {
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }); }
   const iccids = Array.isArray(body?.iccids) ? body.iccids.map(String) : [];
   const newIdentity = body?.new_identity === true;
+  let quarantinedIds = null;
   if (iccids.length === 0) return json({ ok: false, error: 'iccids array required' });
   if (iccids.length > 50) return json({ ok: false, error: 'max 50 iccids per call' });
 
@@ -525,7 +532,8 @@ async function handleRetryPortInJson(request, env) {
     // Use this when the carrier rejected the address itself (streetNumber Is
     // Invalid / streetName Is Invalid / Invalid Zipcode); replaying those
     // unchanged just reproduces the rejection.
-    const fresh = newIdentity ? pickRandomPortIdentity() : null;
+    if (newIdentity && !quarantinedIds) quarantinedIds = await loadQuarantinedAddressIds(env);
+    const fresh = newIdentity ? pickRandomPortIdentity(quarantinedIds) : null;
     const fields = {
       port_mdn: original.portMdn,
       port_account_number: original.portAccountNumber,
@@ -560,6 +568,7 @@ async function handleRetryPortInJson(request, env) {
       // not a live activation, so its already-activated guard does not no-op
       // the retry. Only set here, never on a first-time submission.
       portin_retry: true,
+      port_address_id: fresh ? fresh.port_address_id : null,
       ...fields,
     });
     results.push({ iccid, requeued: true, reason: 'resubmitting the original portinRequest' });
@@ -602,6 +611,32 @@ async function handleRetryPortInJson(request, env) {
   }
 
   return json({ ok: true, queued: toQueue.length, attempted: iccids.length, results, run_id: runId, job_run_id: runUuid });
+}
+
+// Addresses ATOMIC has already rejected, so a port-in never draws one again.
+//
+// The quarantine table has existed since the Apex PPU work in May, but only
+// that path read it. On 2026-09-08 eight port-ins failed on invalid addresses
+// and every single one was already flagged here — we had the answer and were
+// not looking at it.
+//
+// Mirrors claim_address_pool_entry's 90-day auto-retest: an address quarantined
+// longer ago than that comes back into rotation, since carrier-side validation
+// data does change.
+async function loadQuarantinedAddressIds(env) {
+  const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+  try {
+    const rows = await supabaseSelect(
+      env,
+      `address_pool_usage?select=address_id&verify_failed_at=gte.${encodeURIComponent(cutoff)}&limit=5000`
+    );
+    return new Set((rows || []).map(r => r.address_id).filter(Boolean));
+  } catch (e) {
+    // Never block an activation on this — an unfiltered pool is the old
+    // behaviour, not a new failure mode.
+    console.warn(`[Activator] could not load address quarantine: ${e}`);
+    return new Set();
+  }
 }
 
 /* ── Relay fetch helper (routes through VPS to avoid CF-to-CF blocking) ─────── */
@@ -817,7 +852,9 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   const normalizedPortMdn = options.normalizedPortMdn || normalizePhone10(options.portMdn || options.port_mdn || '');
   const portAccountNumber = String(options.portAccountNumber || options.port_account_number || '').trim();
   const portPin = String(options.portPin || options.port_pin || '').trim();
-  const portFields = mapPortFields(options);
+  let portFields = mapPortFields(options);
+  let addressId = options.port_address_id || options.portAddressId || null;
+  let quarantined = null;
 
   // Belt-and-suspenders: validateActivationSim already blocks incomplete port-in
   // rows upstream (CSV /run, JSON /activate, dashboard). This guard covers
@@ -839,51 +876,80 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   }
 
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
-  const requestBody = buildAtomicPortInRequest({
-    session: {
-      userName: env.ATOMIC_USERNAME,
-      token: env.ATOMIC_TOKEN,
-      pin: env.ATOMIC_PIN,
-    },
-    iccid,
-    imei,
-    portMdn: normalizedPortMdn,
-    portAccountNumber,
-    portPin,
-    firstName: portFields.firstName,
-    lastName: portFields.lastName,
-    streetNumber: portFields.streetNumber,
-    streetName: portFields.streetName,
-    zip: portFields.zip,
-    oldFirstName: portFields.oldFirstName,
-    oldLastName: portFields.oldLastName,
-  });
 
-  const res = await relayFetch(env, url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(requestBody),
-  });
+  // ATOMIC rejects some pool addresses outright ("streetName Is Invalid",
+  // "streetNumber Is Invalid", "Invalid Zipcode"). Those are permanent for that
+  // address, so quarantine it, draw a replacement, and resubmit in the same
+  // invocation rather than leaving the port to be retried by hand days later.
+  // Only the street/zip change -- the subscriber name is already arbitrary, and
+  // old_service_provider must keep matching the losing carrier's records.
+  const MAX_ADDRESS_ATTEMPTS = 3;
+  let res, responseText, responseJson, requestBody, carrierLogId;
 
-  const responseText = await res.text();
-  let responseJson = {};
-  try { responseJson = JSON.parse(responseText); } catch {}
+  for (let attempt = 1; ; attempt++) {
+    requestBody = buildAtomicPortInRequest({
+      session: {
+        userName: env.ATOMIC_USERNAME,
+        token: env.ATOMIC_TOKEN,
+        pin: env.ATOMIC_PIN,
+      },
+      iccid,
+      imei,
+      portMdn: normalizedPortMdn,
+      portAccountNumber,
+      portPin,
+      firstName: portFields.firstName,
+      lastName: portFields.lastName,
+      streetNumber: portFields.streetNumber,
+      streetName: portFields.streetName,
+      zip: portFields.zip,
+      oldFirstName: portFields.oldFirstName,
+      oldLastName: portFields.oldLastName,
+    });
 
-  const carrierLogId = await logCarrierApiCall(env, {
-    run_id: runId,
-    step: 'portin',
-    iccid,
-    imei,
-    vendor: 'atomic',
-    request_url: url,
-    request_method: 'POST',
-    request_body: requestBody,
-    response_status: res.status,
-    response_ok: res.ok,
-    response_body_text: responseText,
-    response_body_json: responseJson,
-    error: res.ok ? null : `ATOMIC port-in failed: ${res.status}`,
-  });
+    res = await relayFetch(env, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+
+    responseText = await res.text();
+    responseJson = {};
+    try { responseJson = JSON.parse(responseText); } catch {}
+
+    carrierLogId = await logCarrierApiCall(env, {
+      run_id: runId,
+      step: 'portin',
+      iccid,
+      imei,
+      vendor: 'atomic',
+      request_url: url,
+      request_method: 'POST',
+      request_body: requestBody,
+      response_status: res.status,
+      response_ok: res.ok,
+      response_body_text: responseText,
+      response_body_json: responseJson,
+      error: res.ok ? null : `ATOMIC port-in failed: ${res.status}`,
+    });
+
+    const description = responseJson?.wholeSaleApi?.wholeSaleResponse?.description;
+    if (!res.ok || attempt >= MAX_ADDRESS_ATTEMPTS || !isAddressRejection(description)) break;
+
+    console.log(`[Activator] ${iccid}: address rejected (${description}) — quarantining ${addressId || 'unknown'} and redrawing (attempt ${attempt}/${MAX_ADDRESS_ATTEMPTS})`);
+    if (addressId) await markAddressVerifyFailure(env, addressId, `portinRequest: ${description}`);
+    if (!quarantined) quarantined = await loadQuarantinedAddressIds(env);
+    if (addressId) quarantined.add(addressId);
+
+    const fresh = pickRandomPortIdentity(quarantined);
+    portFields = {
+      ...portFields,
+      streetNumber: fresh.port_street_number,
+      streetName: fresh.port_street_name,
+      zip: fresh.port_zip,
+    };
+    addressId = fresh.port_address_id;
+  }
 
   if (!res.ok) {
     throw new CarrierActivationError(`ATOMIC port-in failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);

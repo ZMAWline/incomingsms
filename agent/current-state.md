@@ -30,12 +30,34 @@ a separate change touching the frontend's call sites, and is worth doing.
 - `sims.gateway_host` was `NOT NULL DEFAULT 'skyline'` with no insert path setting it, so
   every new SIM was mislabeled. Fixed in three layers (DB default, 186-row PROD backfill,
   code fallback). PR #93.
-- Re-ran the host-port check over that cohort: 7 online, 0 offline, **107 error** — all
-  HTTP 404 `Incorrect Phone Number` with `mdn_source db_current_mdn_unconfirmed`. Teltik's
-  inventory does not contain those numbers, so the long-standing "107 offline, needs a port
-  reset" theory is wrong: there is no port to reset. List in
-  `teltik-missing-from-inventory-107.csv` (untracked, repo root) — **this is a question for
-  Shlomo/Teltik, not a repo fix.**
+- **Host-port check on that cohort — CORRECTED 2026-09-09.** An earlier run in this session
+  reported 7 online / 0 offline / 107 error and concluded Teltik had no ports for those
+  lines. **That conclusion was wrong and is retracted.** Re-running against current `main`
+  gives **165 checked: 149 online, 10 offline, 6 error.**
+
+  What happened: the 09-04 run resolved the host MDN as `db_current_mdn_unconfirmed` and
+  queried Teltik with our own DB MDN. That number is never right for a Teltik-hosted line —
+  Teltik keeps the FIRST MDN it saw and our rotations do not sync back, a rule already
+  documented at the top of `src/shared/teltik-known-mdn.mjs`. Teltik's
+  `404 Incorrect Phone Number` is a wrong-key error, not a dead line.
+
+  Verified directly: for sim 36066 (`89012804332469395747`) port-status via our DB MDN
+  `3855869698` returns 404, while via Teltik's MDN `9297213581` it returns
+  `{"success":true,"status":"online"}`. **101 of the original 107 are present in
+  `/v1/all-lines` with an MDN and a port.** `teltikInventoryLookup()` resolves that ICCID
+  correctly today, so the resolver is not broken now — the 09-04 result predates
+  intervening changes to this path.
+
+  Endpoint notes worth keeping: `/v1/get-phone-number?iccid=` returns `404 Invalid ICCID`
+  for these because it only covers Teltik's own T-Mobile SIMs, and these are AT&T ICCIDs in
+  Teltik hardware. `/v1/all-lines` is the ICCID -> MDN source. `/v1/get-info` takes `mdn`
+  only and rejects `iccid`.
+
+  Real remaining work, both untracked CSVs in the repo root:
+  - `teltik-offline-needs-port-reset-10.csv` — 10 lines in Teltik inventory reporting
+    offline. The genuine port-reset candidates.
+  - `teltik-not-in-inventory-6.csv` — 6 lines absent from `/v1/all-lines`. This small set,
+    not 107, is the question for Shlomo.
 - CI: the preview workflow wrote `DASHBOARD_AUTH` to a phantom `dashboard-test-test` worker
   (`--env test --name dashboard-test` makes wrangler append the env suffix). Fixed in PR #73;
   stray worker deleted. The Cloudflare API token in GitHub secrets was *also* independently
