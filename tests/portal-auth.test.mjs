@@ -102,10 +102,12 @@ test('viewer can read the safe list', () => {
   }
 });
 
-// THE case that must never regress: these routes have no method guard in
-// src/dashboard/index.js, so a bare GET performs a real carrier action. A
-// method-based permission model would hand them to viewers.
-test('viewer cannot reach method-guardless action routes via GET', () => {
+// THE case that must never regress. These routes now carry a
+// `request.method === 'POST'` guard in src/dashboard/index.js (see
+// tests/dashboard-method-guards.test.mjs), but the role gate must NOT start
+// trusting the method to decide reads from writes: a route that later loses
+// its guard, or a new one added without it, would then be handed to viewers.
+test('viewer cannot reach action routes via GET', () => {
   for (const p of ['/api/activate', '/api/cancel', '/api/suspend', '/api/restore',
     '/api/rotate-sim', '/api/fix-sim', '/api/send-test-sms', '/api/sim-online',
     '/api/debug-cancel', '/api/delete-sim']) {

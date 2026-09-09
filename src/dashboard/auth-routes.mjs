@@ -4,13 +4,13 @@
 // Kept out of index.js (9.6k lines) so the change to the request gate there
 // stays a few lines. Crypto and the role matrix live in shared/portal-auth.mjs.
 //
-// Cookie is SameSite=Strict, not Lax, deliberately. Many dashboard action
-// routes have no method guard (GET /api/cancel really cancels — see the
-// ALWAYS_MUTATING list in portal-auth.mjs), and Lax still sends cookies on
-// cross-site top-level GET navigations. Under Lax, a link someone is tricked
-// into clicking would carry their session and perform the action. Strict costs
-// nothing here: nobody deep-links into an internal operator tool from
-// elsewhere.
+// Cookie is SameSite=Strict, not Lax, deliberately. Lax still sends cookies on
+// cross-site top-level GET navigations, so under Lax a link someone is tricked
+// into clicking would carry their session. The dashboard action routes now
+// require POST and the role gate in portal-auth.mjs is path-first
+// (ALWAYS_MUTATING), so this is the third layer rather than the only one —
+// keep it, it costs nothing: nobody deep-links into an internal operator tool
+// from elsewhere.
 // =========================================================
 
 import {
