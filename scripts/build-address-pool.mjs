@@ -16,6 +16,7 @@
 
 import { writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { DENIED_ADDRESS_IDS } from '../src/shared/address-deny-list.mjs';
 
 const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
 const TARGET_PER_STATE = 30;          // pool target; verifier requires ≥20
@@ -110,6 +111,8 @@ function slug(s) {
 // Split a street like "632 W 6th Ave" into number + name. The number is
 // always the leading numeric token. Everything after is the name.
 // OSM gives us housenumber separately, so we just trim the name.
+let deniedCount = 0;
+
 function buildEntry(tags, stateAbbrev) {
   const housenumber = norm(tags['addr:housenumber']);
   const street      = norm(tags['addr:street']);
@@ -121,8 +124,17 @@ function buildEntry(tags, stateAbbrev) {
   // PO Box postcodes — common across all states; AT&T would reject them anyway.
   // USPS reserves specific ZIPs for PO Box use only; skip obvious markers in the street.
   if (/^p\.?o\.?\s*box\b/i.test(street)) return null;
+  // OSM has no idea which of its addresses ATOMIC's validator rejects, so a
+  // rebuild would happily reintroduce every address we have ever deleted and
+  // the same ports would fail again. src/shared/address-deny-list.mjs is the
+  // build-time mirror of the address_pool deletions.
+  const id = `${stateAbbrev.toLowerCase()}-${zip}-${slug(housenumber + ' ' + street)}`;
+  if (DENIED_ADDRESS_IDS.has(id)) {
+    deniedCount++;
+    return null;
+  }
   return {
-    id:              `${stateAbbrev.toLowerCase()}-${zip}-${slug(housenumber + ' ' + street)}`,
+    id,
     streetNumber:    housenumber,
     streetName:      street,
     streetDirection: '',
@@ -219,6 +231,7 @@ function formatPool(entries) {
 
 writeFileSync(OUT_PATH, fileBody);
 process.stderr.write(`\nWrote ${allEntries.length} entries (${stateStats.filter(s => s.picked >= 20).length}/${STATES.length} states ≥20) to ${OUT_PATH}\n`);
+process.stderr.write(`Skipped ${deniedCount} candidate(s) on the carrier deny list (src/shared/address-deny-list.mjs)\n`);
 const short = stateStats.filter(s => s.picked < 20);
 if (short.length > 0) {
   process.stderr.write(`\nStates with <20 picked entries (verifier will FAIL):\n`);
