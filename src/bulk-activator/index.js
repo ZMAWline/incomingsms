@@ -580,7 +580,16 @@ async function handleRetryPortInJson(request, env) {
       port_address_id: fresh ? fresh.port_address_id : null,
       ...fields,
     });
-    results.push({ iccid, requeued: true, reason: 'resubmitting the original portinRequest' });
+    results.push({
+      iccid,
+      requeued: true,
+      // Say which one actually went out. A retry that silently swapped the
+      // address while reporting "original" would send an operator hunting the
+      // wrong variable when it fails again.
+      reason: newIdentity
+        ? 'resubmitting with a freshly drawn subscriber name and address; losing-carrier account details replayed unchanged'
+        : 'resubmitting the original portinRequest unchanged',
+    });
   }
 
   if (toQueue.length === 0) {

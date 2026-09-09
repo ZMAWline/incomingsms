@@ -206,3 +206,12 @@ test('the inquiry never carries port credentials', () => {
     assert.ok(!fn.includes(leak), `inquiry must not include ${leak}`);
   }
 });
+
+test('the response says whether the identity was redrawn or replayed', () => {
+  // new_identity swaps the address but the reason text said "original" — an
+  // operator debugging a repeat failure would chase the wrong variable.
+  const fn = retryPortInFn();
+  assert.match(fn, /reason: newIdentity/);
+  assert.match(fn, /freshly drawn subscriber name and address/);
+  assert.match(fn, /original portinRequest unchanged/);
+});
