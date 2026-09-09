@@ -1216,3 +1216,33 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 **Why:** Dashboard showed "Queued 1 SIM(s) for activation" for a port-in of a canceled SIM (sim_id 770, ICCID 89014104334606221029), but no new `carrier_api_logs` entry appeared and `sims.status` never changed from `canceled`. Traced to `src/sim-canceller/index.js:112-118` setting `status='canceled'` without clearing `msisdn` — so the SIM still had its old MDN (3022376083) in the `msisdn` column. The queue consumer's idempotency guard saw that non-empty `msisdn` and silently skipped the whole activation, one hop past where the "Queued" count was already reported accurate. `status` wasn't even in the original SELECT, so the guard's own `existingSim?.status === 'provisioning'` clause was dead code.
 
 **Consequence:** Re-activating/re-porting a previously-canceled or errored SIM now actually reaches `activateViaAtomic`/`activateViaAtomicPortIn` instead of being swallowed. Genuinely active/provisioning SIMs are still skipped (idempotency for queue retries preserved). Regression test: `tests/bulk-activator-canceled-sim-reactivation.test.mjs`. PR #59. No `msisdn`-clearing was added to sim-canceller itself — the guard fix is the minimal, correct-layer change (the column legitimately preserves the SIM's last-known number for history/support purposes; the bug was trusting it as a liveness signal).
+
+---
+
+## 2026-09-09 — Dashboard permission model is path-based, not HTTP-method-based
+
+**Decision:** `requiredRole(method, pathname)` in `src/shared/portal-auth.mjs` classifies routes by PATH first and treats a fixed `ALWAYS_MUTATING` list as writes regardless of verb. Viewers get only an explicit `READ_ROUTES` allowlist; anything unclassified requires operator. The obvious "GET = read, POST = write" model was rejected.
+
+**Why:** An audit of the dispatcher's 108 routes found many action routes have **no method guard at all**, so a bare GET performs the action: `/api/activate`, `/api/cancel`, `/api/suspend`, `/api/restore`, `/api/rotate-sim`, `/api/fix-sim`, `/api/send-test-sms`, `/api/sim-online`, `/api/debug-cancel`. A method-based model would have granted every one of those to read-only users — activating and cancelling real billable lines. Verified live: a viewer gets 403 on `GET /api/cancel`.
+
+**Consequence:** Adding a new dashboard route defaults it to operator-level. If it is a safe read, it must be added to `READ_ROUTES` deliberately — that friction is the point. Do not "simplify" this to a method check. `tests/portal-auth.test.mjs` asserts the guardless-GET routes stay closed to viewers. The underlying missing method guards were NOT fixed in that change (separate, larger, and touches the frontend's call sites); the permission layer compensates for them.
+
+---
+
+## 2026-09-09 — Dashboard session cookie is SameSite=Strict, and sessions are DB-backed
+
+**Decision:** The `dsh_auth` cookie uses `SameSite=Strict` rather than the usual `Lax`, and session state lives in a `dashboard_sessions` row rather than purely in the signed token. The token is `dsh_<sessionId>.<HMAC>`; the HMAC is checked locally before any DB read.
+
+**Why:** Two reasons, both consequences of moving from Basic auth to cookies. (1) `Lax` still sends cookies on cross-site top-level GET navigation, which combined with the method-guardless action routes above turns a tricked link into a working CSRF — an exposure Basic auth did not have. Strict costs nothing for an internal operator tool nobody deep-links into. (2) The pre-existing `signSession` helper is stateless and cannot be revoked before expiry, so "remove this person's access" would not take effect for up to 12 hours, which defeats managed accounts. The local HMAC check preserves the otp-portal property that forged cookies never reach Supabase.
+
+**Consequence:** Disabling or changing a user's role revokes live sessions immediately. Changing a password revokes all other sessions but keeps the current one. Do not switch the cookie to `Lax` to "fix" a cross-site flow without first adding method guards to the mutating routes.
+
+---
+
+## 2026-09-09 — Auth cutover used a break-glass flag rather than a hard switch
+
+**Decision:** The shared `DASHBOARD_AUTH` Basic password kept working alongside the new session login, gated by `DASHBOARD_BREAK_GLASS`, and counted as admin. Production deployed with it ON, and it was only set to `off` after a real admin account was confirmed working.
+
+**Why:** The dashboard is the control surface for ~4,000 live billable lines. A bug in a brand-new login path with no fallback means nobody can reach production operations until a fix is written and deployed. Break-glass also solves bootstrapping: the first admin has to be created by someone, and no user exists yet.
+
+**Consequence:** Break-glass is now `off` in production and `dashboard123` is dead (verified 401). It remains available on `dashboard-test`. If a future auth change risks lockout, re-enable by deleting the `DASHBOARD_BREAK_GLASS` secret — `DASHBOARD_AUTH` is still set. Break-glass has no `dashboard_users` row, so it cannot use the Profile tab; `/auth/me` reports `has_profile: false`.

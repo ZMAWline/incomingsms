@@ -1,7 +1,50 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-08 (ATOMIC port-in auto-finalizer shipped — completed ports now transition to active automatically; see session below)
+> Last updated: 2026-09-09 (dashboard shared password replaced with named users, invites and roles — LIVE IN PROD, break-glass off)
+
+---
+
+## Session 2026-09-09 — Dashboard multi-user auth shipped to production (PR #94)
+
+The operator dashboard authenticated everyone with one shared HTTP Basic password
+(`admin`/`dashboard123`). That is gone. Production now runs named accounts with
+admin/operator/viewer roles, invite-based onboarding, revocable sessions, and a Profile
+tab. Deployed as dashboard version `d0d68a5f`; `DASHBOARD_BREAK_GLASS=off` since
+2026-09-09, verified `401` for the old shared password.
+
+**Current prod auth state:** one admin account (`Zalmen`, active, has logged in). The
+shared password no longer works. `DASHBOARD_SESSION_SECRET` is set on both `dashboard`
+and `dashboard-test`; values are in the repo `.dev.vars` as `DASHBOARD_SESSION_SECRET_PROD`
+/ `_TEST`. `DASHBOARD_AUTH` is still set on prod but inert while break-glass is off — that
+is the re-entry path if auth ever breaks (delete the `DASHBOARD_BREAK_GLASS` secret).
+
+**The finding that shaped the design:** many dashboard action routes have no HTTP method
+guard, so a bare GET performs the action (`/api/activate`, `/api/cancel`, `/api/suspend`,
+`/api/restore`, `/api/rotate-sim`, `/api/fix-sim`, `/api/send-test-sms`, `/api/sim-online`,
+`/api/debug-cancel`). The permission model is therefore path-based and fails safe. See
+decision-log 2026-09-09. **The missing method guards themselves were not fixed** — that is
+a separate change touching the frontend's call sites, and is worth doing.
+
+**Also this session:**
+- `sims.gateway_host` was `NOT NULL DEFAULT 'skyline'` with no insert path setting it, so
+  every new SIM was mislabeled. Fixed in three layers (DB default, 186-row PROD backfill,
+  code fallback). PR #93.
+- Re-ran the host-port check over that cohort: 7 online, 0 offline, **107 error** — all
+  HTTP 404 `Incorrect Phone Number` with `mdn_source db_current_mdn_unconfirmed`. Teltik's
+  inventory does not contain those numbers, so the long-standing "107 offline, needs a port
+  reset" theory is wrong: there is no port to reset. List in
+  `teltik-missing-from-inventory-107.csv` (untracked, repo root) — **this is a question for
+  Shlomo/Teltik, not a repo fix.**
+- CI: the preview workflow wrote `DASHBOARD_AUTH` to a phantom `dashboard-test-test` worker
+  (`--env test --name dashboard-test` makes wrangler append the env suffix). Fixed in PR #73;
+  stray worker deleted. The Cloudflare API token in GitHub secrets was *also* independently
+  expired and was refreshed. Both faults were real — see the correction note below.
+
+**Pending / next:**
+- Missing method guards on the mutating routes above (permission layer compensates today).
+- `main` is current with both merges; nothing uncommitted.
+- Operational CSVs in the repo root remain untracked by convention.
 
 ---
 
