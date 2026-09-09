@@ -17,6 +17,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+// The dispatcher now imports its auth from modules rather than defining
+// checkAuth() inline, so the sandbox is given the real implementations instead
+// of a lifted copy. Requests here carry Basic admin:test-pass, which
+// breakGlassUser accepts as admin (DASHBOARD_BREAK_GLASS is unset in env).
+import { canAccess } from '../src/shared/portal-auth.mjs';
+import { resolveUser, breakGlassUser, handleAuthRoutes } from '../src/dashboard/auth-routes.mjs';
+import { renderLoginPage, renderAcceptInvitePage } from '../src/dashboard/auth-pages.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -38,6 +45,8 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
   const assetCalls = [];
   const sandbox = {
     console, Response, URL, URLSearchParams, Request, atob,
+    canAccess, resolveUser, breakGlassUser, handleAuthRoutes,
+    renderLoginPage, renderAcceptInvitePage,
     async fetch(url, init) {
       const u = String(url);
       supabaseCalls.push({ url: u, headers: (init && init.headers) || {} });
@@ -68,7 +77,6 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
   vm.createContext(sandbox);
 
   const code = [
-    extractFn(SRC, 'function checkAuth(authHeader, env) {'),
     extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
     extractFn(SRC, 'async function handleActivationRunsList(env, corsHeaders, url) {'),
     extractFn(SRC, 'async function handleActivationRunDetail(env, corsHeaders, runId, url) {'),

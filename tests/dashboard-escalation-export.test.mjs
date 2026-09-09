@@ -588,7 +588,7 @@ test('the old teltik-port-offline export still works and now carries a date rang
 
 test('the public escalation CSV route is registered before the operator auth gate and needs no Authorization header', () => {
   const routeIdx = SRC.indexOf("url.pathname === '/public/bad-rental-escalations-today.csv'");
-  const authGateIdx = SRC.indexOf('// Basic auth check');
+  const authGateIdx = SRC.indexOf('// --- Authentication ---');
   assert.notEqual(routeIdx, -1, 'public route not registered');
   assert.notEqual(authGateIdx, -1, 'auth gate marker not found');
   assert.ok(routeIdx < authGateIdx, 'public route must be checked before the Basic-auth gate');
