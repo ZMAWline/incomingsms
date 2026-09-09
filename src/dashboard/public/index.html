@@ -982,8 +982,16 @@
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path></svg>
                     <span class="text-sm">Guide</span>
                 </a>
+                <a href="/profile" onclick="event.preventDefault();switchTab('profile')" data-tab="profile" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Profile">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                    <span class="text-sm">Profile</span>
+                </a>
                 <!-- Admin-only. Unhidden by applyRoleToUi() when /auth/me says admin. -->
-                <a id="nav-users" href="/users" onclick="event.preventDefault();switchTab('users')" data-tab="users" class="sidebar-btn w-full items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200 hidden" title="Users">
+                <!-- `flex` and `hidden` together is intentional and matches the other
+                     nav items: Tailwind emits .hidden after .flex, so display:none wins
+                     while hidden is applied and the row layout returns when it is removed.
+                     Dropping `flex` to avoid the clash instead stacks the icon and label. -->
+                <a id="nav-users" href="/users" onclick="event.preventDefault();switchTab('users')" data-tab="users" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200 hidden" title="Users">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
                     <span class="text-sm">Users</span>
                 </a>
@@ -1182,6 +1190,64 @@
             </div>
 
             <!-- SIMs Tab -->
+            <!-- Profile: available to every signed-in user, whatever their role.
+                 The self-service endpoints are routed ahead of the role gate so a
+                 viewer can still manage their own credentials. -->
+            <div id="tab-profile" class="tab-content hidden">
+                <div class="mb-6">
+                    <h2 class="text-xl font-semibold">Your profile</h2>
+                    <p class="text-sm text-dark-400">Signed in as <span id="profile-username" class="font-medium">—</span> · <span id="profile-role">—</span></p>
+                </div>
+
+                <div id="profile-breakglass" class="mb-6 p-4 rounded-lg hidden" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                    <p class="text-sm">You are signed in with the shared break-glass password, which has no profile of its own. Sign in with a user account to change a username or password.</p>
+                </div>
+
+                <div id="profile-forms">
+                    <div class="mb-6 p-4 rounded-lg" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                        <h3 class="font-medium mb-3">Change username</h3>
+                        <div class="flex flex-wrap items-end gap-3">
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-username">New username</label>
+                                <input id="pf-username" autocomplete="username" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-username-pw">Current password</label>
+                                <input id="pf-username-pw" type="password" autocomplete="current-password" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <button onclick="changeUsername()" class="px-4 py-2 rounded text-sm font-medium" style="background:var(--mc-ink);color:var(--mc-paper);">Update username</button>
+                        </div>
+                        <div id="pf-username-msg" class="mt-3 text-sm"></div>
+                    </div>
+
+                    <div class="mb-6 p-4 rounded-lg" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                        <h3 class="font-medium mb-3">Change password</h3>
+                        <p class="text-xs text-dark-400 mb-3">Changing your password signs you out of every other browser. Minimum 12 characters.</p>
+                        <div class="flex flex-wrap items-end gap-3">
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-cur-pw">Current password</label>
+                                <input id="pf-cur-pw" type="password" autocomplete="current-password" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-new-pw">New password</label>
+                                <input id="pf-new-pw" type="password" autocomplete="new-password" minlength="12" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <div>
+                                <label class="block text-xs mb-1" for="pf-new-pw2">Confirm new password</label>
+                                <input id="pf-new-pw2" type="password" autocomplete="new-password" minlength="12" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            </div>
+                            <button onclick="changePassword()" class="px-4 py-2 rounded text-sm font-medium" style="background:var(--mc-ink);color:var(--mc-paper);">Update password</button>
+                        </div>
+                        <div id="pf-password-msg" class="mt-3 text-sm"></div>
+                    </div>
+                </div>
+
+                <div class="p-4 rounded-lg" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                    <h3 class="font-medium mb-3">Session</h3>
+                    <button onclick="logout()" class="px-4 py-2 rounded text-sm border" style="border-color:var(--mc-line);">Sign out</button>
+                </div>
+            </div>
+
             <!-- Users: admin-only. The server enforces this (403 on /api/users for
                  anyone below admin); hiding the tab is only cosmetic. -->
             <div id="tab-users" class="tab-content hidden">
@@ -4615,6 +4681,7 @@ set verify_pending; schedule §C.3 poll
             'api-tester': '/api-tester',
             'activation-runs': '/activation-runs',
             'users': '/users',
+            'profile': '/profile',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
         ROUTE_TO_TAB['/gateway'] = 'gateways'; // legacy alias for old bookmarks
@@ -4698,6 +4765,7 @@ set verify_pending; schedule §C.3 poll
                 try { if (tabName === 'workers') loadHostingPortJobs(); } catch(e) { console.error('switchTab autoLoad failed for workers', e); }
                 try { if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); } } catch(e) { console.error('switchTab autoLoad failed for activation-runs', e); }
                 try { if (tabName === 'users') loadUsers(); } catch(e) { console.error('switchTab autoLoad failed for users', e); }
+                try { if (tabName === 'profile') loadProfile(); } catch(e) { console.error('switchTab autoLoad failed for profile', e); }
             }
         }
 
@@ -4713,7 +4781,9 @@ set verify_pending; schedule §C.3 poll
                 const res = await fetch('/auth/me');
                 if (!res.ok) return null;
                 const data = await res.json();
-                CURRENT_USER = data && data.ok ? { username: data.username, role: data.role } : null;
+                CURRENT_USER = data && data.ok
+                    ? { username: data.username, role: data.role, hasProfile: data.has_profile !== false }
+                    : null;
             } catch (e) { CURRENT_USER = null; }
             applyRoleToUi();
             return CURRENT_USER;
@@ -4832,6 +4902,74 @@ set verify_pending; schedule §C.3 poll
         async function logout() {
             try { await fetch('/auth/logout', { method: 'POST' }); } catch (e) { /* fall through */ }
             window.location.replace('/');
+        }
+
+        // --- Profile (self-service) ----------------------------------------
+
+        function setMsg(id, text, ok) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = text || '';
+            el.style.color = text ? (ok ? '#166534' : '#991b1b') : '';
+        }
+
+        async function loadProfile() {
+            await loadCurrentUser();
+            const u = CURRENT_USER;
+            const nameEl = document.getElementById('profile-username');
+            const roleEl = document.getElementById('profile-role');
+            if (nameEl) nameEl.textContent = u ? u.username : '—';
+            if (roleEl) roleEl.textContent = u ? u.role : '—';
+            // Break-glass authenticates against a secret, not a row, so there is
+            // nothing for it to edit.
+            const isBreakGlass = !!u && u.hasProfile === false;
+            const forms = document.getElementById('profile-forms');
+            const notice = document.getElementById('profile-breakglass');
+            if (forms) forms.classList.toggle('hidden', isBreakGlass);
+            if (notice) notice.classList.toggle('hidden', !isBreakGlass);
+            const pf = document.getElementById('pf-username');
+            if (pf && u && !isBreakGlass && !pf.value) pf.value = u.username;
+        }
+
+        async function changeUsername() {
+            const username = document.getElementById('pf-username').value.trim();
+            const current_password = document.getElementById('pf-username-pw').value;
+            setMsg('pf-username-msg', '');
+            if (!username) { setMsg('pf-username-msg', 'Enter a username.', false); return; }
+            try {
+                const res = await fetch('/auth/change-username', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username: username, current_password: current_password })
+                });
+                const data = await res.json().catch(function () { return {}; });
+                if (!res.ok || !data.ok) { setMsg('pf-username-msg', data.error || 'Could not update username.', false); return; }
+                document.getElementById('pf-username-pw').value = '';
+                setMsg('pf-username-msg', 'Username updated.', true);
+                loadProfile();
+            } catch (e) { setMsg('pf-username-msg', 'Network error. Try again.', false); }
+        }
+
+        async function changePassword() {
+            const current_password = document.getElementById('pf-cur-pw').value;
+            const pw = document.getElementById('pf-new-pw').value;
+            const pw2 = document.getElementById('pf-new-pw2').value;
+            setMsg('pf-password-msg', '');
+            if (pw !== pw2) { setMsg('pf-password-msg', 'The two new passwords do not match.', false); return; }
+            if (pw.length < 12) { setMsg('pf-password-msg', 'New password must be at least 12 characters.', false); return; }
+            try {
+                const res = await fetch('/auth/change-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ current_password: current_password, new_password: pw })
+                });
+                const data = await res.json().catch(function () { return {}; });
+                if (!res.ok || !data.ok) { setMsg('pf-password-msg', data.error || 'Could not update password.', false); return; }
+                document.getElementById('pf-cur-pw').value = '';
+                document.getElementById('pf-new-pw').value = '';
+                document.getElementById('pf-new-pw2').value = '';
+                setMsg('pf-password-msg', 'Password updated. Other browsers have been signed out.', true);
+            } catch (e) { setMsg('pf-password-msg', 'Network error. Try again.', false); }
         }
 
         // /sims/:id — SIM detail deep link (e.g. clicked from an Activation

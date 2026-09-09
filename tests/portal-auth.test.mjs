@@ -162,3 +162,14 @@ test('prefix matching does not leak across similarly-named routes', () => {
   assert.equal(requiredRole('GET', '/api/sims/123'), ROLES.VIEWER);
   assert.equal(requiredRole('GET', '/api/simsomething'), ROLES.OPERATOR);
 });
+
+// --- self-service route placement -----------------------------------------
+// These act on the caller's own account and must not be role-gated. If they
+// were ever moved after the canAccess() check in handleAuthRoutes, a viewer
+// would be unable to change their own password — requiredRole() would classify
+// a POST to /auth/change-password as operator-level.
+test('self-service auth paths would be operator-level if role-gated', () => {
+  assert.equal(requiredRole('POST', '/auth/change-password'), ROLES.OPERATOR);
+  assert.equal(requiredRole('POST', '/auth/change-username'), ROLES.OPERATOR);
+  assert.equal(canAccess(ROLES.VIEWER, 'POST', '/auth/change-password'), false);
+});
