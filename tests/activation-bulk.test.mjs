@@ -343,6 +343,10 @@ test('pickRandomPortIdentity returns only name/address fields, subscriber and ol
   assert.deepEqual(Object.keys(identity).sort(), [
     'port_first_name', 'port_last_name', 'port_old_first_name', 'port_old_last_name',
     'port_street_name', 'port_street_number', 'port_zip',
+    // Identifies the drawn address so a carrier rejection can quarantine it in
+    // address_pool_usage. Never sent to the carrier — buildAtomicPortInRequest
+    // takes explicit params and has no field for it.
+    'port_address_id',
   ].sort());
   for (const v of Object.values(identity)) assert.ok(String(v).length > 0);
 });
