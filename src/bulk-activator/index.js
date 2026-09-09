@@ -552,6 +552,15 @@ async function handleRetryPortInJson(request, env) {
       continue;
     }
 
+    // Guard 3: the carrier's live view of the SIM. portinStatus cannot tell
+    // "no port was ever created" from "the port completed and its request
+    // record aged out" — both answer 948. This is what distinguishes them.
+    const subscriberState = await atomicSubscriberState(env, iccid);
+    if (subscriberState === 'active') {
+      skip('SIM already has active service at ATOMIC — the number is already ours; a port-in would be refused as "not eligible"');
+      continue;
+    }
+
     const simRows = await supabaseSelect(
       env,
       `sims?select=id,imei,vendor,reseller_sims(reseller_id)&iccid=eq.${encodeURIComponent(iccid)}&reseller_sims.active=eq.true&limit=1`
@@ -637,6 +646,46 @@ async function loadAddressPool(env) {
   } catch (e) {
     console.warn(`[Activator] could not load address_pool, falling back to the code pool: ${e}`);
     return [];
+  }
+}
+
+// Asks ATOMIC whether this SIM already has live service, so /retry-portin does
+// not submit a port for a number that is already ours.
+//
+// Guards 1 and 2 both read portinStatus, and portinStatus answers 948 "Port
+// Request Does Not Exist" for two different situations: no port was ever
+// created, and a port that completed long enough ago that the request record is
+// gone. They are indistinguishable from that endpoint alone. On 2026-09-08 that
+// ambiguity cost 12 pointless carrier calls, every one answered "This MSIDN is
+// not eligible for the Portin. Number already assigned to NBI".
+//
+// Returns 'active' | 'inactive' | 'unknown'. Callers treat 'unknown' as
+// permission to proceed: a rejected duplicate port is harmless (the carrier
+// refuses it, nothing changes), so an ATOMIC outage must not block retries.
+async function atomicSubscriberState(env, iccid) {
+  if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) return 'unknown';
+  try {
+    const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
+    const res = await relayFetch(env, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wholeSaleApi: {
+          session: { userName: env.ATOMIC_USERNAME, token: env.ATOMIC_TOKEN, pin: env.ATOMIC_PIN },
+          wholeSaleRequest: { requestType: 'subsriberInquiry', MSISDN: '', sim: iccid },
+        },
+      }),
+    });
+    if (!res.ok) return 'unknown';
+    const body = await res.json().catch(() => ({}));
+    const wsr = body?.wholeSaleApi?.wholeSaleResponse;
+    if (wsr?.statusCode !== '00') return 'inactive';
+    // Result.attStatus is lowercase-keyed msisdn/attStatus on this requestType.
+    const attStatus = String(wsr?.Result?.attStatus || wsr?.Result?.status || '').trim();
+    return attStatus.toLowerCase() === 'active' ? 'active' : 'inactive';
+  } catch (e) {
+    console.warn(`[Activator] subscriber inquiry for ${iccid} failed, proceeding: ${e}`);
+    return 'unknown';
   }
 }
 
