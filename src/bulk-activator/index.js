@@ -1,5 +1,5 @@
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
-import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseAtomicPortInRequest, parseCsv, validateActivationSim } from '../shared/activation-bulk.mjs';
+import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseAtomicPortInRequest, parseCsv, pickRandomPortIdentity, validateActivationSim } from '../shared/activation-bulk.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -464,6 +464,7 @@ async function handleRetryPortInJson(request, env) {
   let body;
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }); }
   const iccids = Array.isArray(body?.iccids) ? body.iccids.map(String) : [];
+  const newIdentity = body?.new_identity === true;
   if (iccids.length === 0) return json({ ok: false, error: 'iccids array required' });
   if (iccids.length > 50) return json({ ok: false, error: 'max 50 iccids per call' });
 
@@ -517,15 +518,23 @@ async function handleRetryPortInJson(request, env) {
       skip('logged request body is not a portinRequest — cannot rebuild the call');
       continue;
     }
+    // With new_identity, only the SUBSCRIBER block is redrawn. The
+    // old_service_provider fields — account number, PIN, and the losing
+    // carrier's account-holder name — must still match that carrier's records
+    // exactly or the port rejects, so they are always replayed verbatim.
+    // Use this when the carrier rejected the address itself (streetNumber Is
+    // Invalid / streetName Is Invalid / Invalid Zipcode); replaying those
+    // unchanged just reproduces the rejection.
+    const fresh = newIdentity ? pickRandomPortIdentity() : null;
     const fields = {
       port_mdn: original.portMdn,
       port_account_number: original.portAccountNumber,
       port_pin: original.portPin,
-      port_first_name: original.firstName,
-      port_last_name: original.lastName,
-      port_street_number: original.streetNumber,
-      port_street_name: original.streetName,
-      port_zip: original.zip,
+      port_first_name: fresh ? fresh.port_first_name : original.firstName,
+      port_last_name: fresh ? fresh.port_last_name : original.lastName,
+      port_street_number: fresh ? fresh.port_street_number : original.streetNumber,
+      port_street_name: fresh ? fresh.port_street_name : original.streetName,
+      port_zip: fresh ? fresh.port_zip : original.zip,
       port_old_first_name: original.oldFirstName,
       port_old_last_name: original.oldLastName,
     };

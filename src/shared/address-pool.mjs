@@ -7,8 +7,26 @@
 // Regenerate: node scripts/build-address-pool.mjs
 // Verifier:   node scripts/verify-address-pool.mjs
 //
-// Bad addresses are self-quarantined at runtime — see
+// Bad addresses are self-quarantined at runtime ONLY on the Apex PPU path,
+// which claims entries through address_pool_usage — see
 // markAddressVerifyFailure in address-picker.mjs.
+//
+// Port-in identities do NOT get that protection: pickRandomPortIdentity in
+// activation-bulk.mjs indexes this array directly, with no DB round-trip and
+// no quarantine check. An address ATOMIC rejects here stays in rotation until
+// it is deleted from this file by hand.
+//
+// Removed 2026-09-08 after ATOMIC rejected them on portinRequest (pool went
+// 1529 -> 1521). A regeneration from OSM will reintroduce them; re-delete, or
+// teach scripts/build-address-pool.mjs a denylist:
+//   5106 Little Caillou Road 70344   streetName Is Invalid
+//   2939 Route 100 05342             streetName Is Invalid
+//   6700 Juniper Bay Road 29544      streetName Is Invalid
+//   3120 East Azure Avenue 89081     streetNumber Is Invalid
+//   5616 Ox Road 22039               streetNumber Is Invalid
+//   125 3rd Avenue South 57226       streetNumber Is Invalid
+//   110 Hinton Waters Avenue 36350   streetNumber Is Invalid
+//   212 West Main Street 97550       Invalid Zipcode
 
 export const ADDRESS_POOL = [
   // ----- AK -----
@@ -66,7 +84,6 @@ export const ADDRESS_POOL = [
   {"id":"al-36111-2901-mc-gehee-road","streetNumber":"2901","streetName":"Mc Gehee Road","streetDirection":"","city":"Montgomery","state":"AL","zipCode":"36111"},
   {"id":"al-36116-2837-east-south-boulevard","streetNumber":"2837","streetName":"East South Boulevard","streetDirection":"","city":"Montgomery","state":"AL","zipCode":"36116"},
   {"id":"al-36201-1100-gurnee-avenue","streetNumber":"1100","streetName":"Gurnee Avenue","streetDirection":"","city":"Anniston","state":"AL","zipCode":"36201"},
-  {"id":"al-36350-110-hinton-waters-avenue","streetNumber":"110","streetName":"Hinton Waters Avenue","streetDirection":"","city":"Midland City","state":"AL","zipCode":"36350"},
   {"id":"al-36371-1313-e-highway-134","streetNumber":"1313","streetName":"E Highway 134","streetDirection":"","city":"Pinckard","state":"AL","zipCode":"36371"},
   {"id":"al-36420-505-east-three-notch-street","streetNumber":"505","streetName":"East Three Notch Street","streetDirection":"","city":"Andalusia","state":"AL","zipCode":"36420"},
   {"id":"al-36507-608-d-olive-street","streetNumber":"608","streetName":"D Olive Street","streetDirection":"","city":"Bay Minette","state":"AL","zipCode":"36507"},
@@ -594,7 +611,6 @@ export const ADDRESS_POOL = [
   {"id":"la-70114-2500-general-de-gaulle-drive","streetNumber":"2500","streetName":"General de Gaulle Drive","streetDirection":"","city":"New Orleans","state":"LA","zipCode":"70114"},
   {"id":"la-70115-2000-louisiana-avenue","streetNumber":"2000","streetName":"Louisiana Avenue","streetDirection":"","city":"New Orleans","state":"LA","zipCode":"70115"},
   {"id":"la-70123-219-soniat-avenue","streetNumber":"219","streetName":"Soniat Avenue","streetDirection":"","city":"Harahan","state":"LA","zipCode":"70123"},
-  {"id":"la-70344-5106-little-caillou-road","streetNumber":"5106","streetName":"Little Caillou Road","streetDirection":"","city":"Chauvin","state":"LA","zipCode":"70344"},
   {"id":"la-70346-725-church-street","streetNumber":"725","streetName":"Church Street","streetDirection":"","city":"Donaldsonville","state":"LA","zipCode":"70346"},
   {"id":"la-70390-4813-highway-1","streetNumber":"4813","streetName":"Highway 1","streetDirection":"","city":"Napoleonville","state":"LA","zipCode":"70390"},
   {"id":"la-70433-15281-highway-1085","streetNumber":"15281","streetName":"Highway 1085","streetDirection":"","city":"Covington","state":"LA","zipCode":"70433"},
@@ -1075,7 +1091,6 @@ export const ADDRESS_POOL = [
   {"id":"nv-89029-1650-south-casino-drive","streetNumber":"1650","streetName":"South Casino Drive","streetDirection":"","city":"Laughlin","state":"NV","zipCode":"89029"},
   {"id":"nv-89043-720-main-street","streetNumber":"720","streetName":"Main Street","streetDirection":"","city":"Pioche","state":"NV","zipCode":"89043"},
   {"id":"nv-89060-1520-east-basin-avenue","streetNumber":"1520","streetName":"East Basin Avenue","streetDirection":"","city":"Pahrump","state":"NV","zipCode":"89060"},
-  {"id":"nv-89081-3120-east-azure-avenue","streetNumber":"3120","streetName":"East Azure Avenue","streetDirection":"","city":"North Las Vegas","state":"NV","zipCode":"89081"},
   {"id":"nv-89104-2232-south-nellis-boulevard","streetNumber":"2232","streetName":"South Nellis Boulevard","streetDirection":"","city":"Las Vegas","state":"NV","zipCode":"89104"},
   {"id":"nv-89113-7060-west-windmill-lane","streetNumber":"7060","streetName":"West Windmill Lane","streetDirection":"","city":"Las Vegas","state":"NV","zipCode":"89113"},
   {"id":"nv-89135-11025-lavender-hill-drive","streetNumber":"11025","streetName":"Lavender Hill Drive","streetDirection":"","city":"Las Vegas","state":"NV","zipCode":"89135"},
@@ -1219,7 +1234,6 @@ export const ADDRESS_POOL = [
   {"id":"or-97453-10656-highway-126","streetNumber":"10656","streetName":"Highway 126","streetDirection":"","city":"Mapleton","state":"OR","zipCode":"97453"},
   {"id":"or-97455-84899-tillicum-avenue","streetNumber":"84899","streetName":"Tillicum Avenue","streetDirection":"","city":"Pleasant Hill","state":"OR","zipCode":"97455"},
   {"id":"or-97459-1835-mcpherson-avenue","streetNumber":"1835","streetName":"McPherson Avenue","streetDirection":"","city":"North Bend","state":"OR","zipCode":"97459"},
-  {"id":"or-97550-212-west-main-street","streetNumber":"212","streetName":"West Main Street","streetDirection":"","city":"Mitchell","state":"OR","zipCode":"97550"},
   {"id":"or-97624-228-south-1st-avenue","streetNumber":"228","streetName":"South 1st Avenue","streetDirection":"","city":"Chiloquin","state":"OR","zipCode":"97624"},
   {"id":"or-97649-330-main-street","streetNumber":"330","streetName":"Main Street","streetDirection":"","city":"Riddle","state":"OR","zipCode":"97649"},
   {"id":"or-97703-61-northwest-oregon-avenue","streetNumber":"61","streetName":"Northwest Oregon Avenue","streetDirection":"","city":"Bend","state":"OR","zipCode":"97703"},
@@ -1299,7 +1313,6 @@ export const ADDRESS_POOL = [
   {"id":"sc-29455-1830-bohicket-road","streetNumber":"1830","streetName":"Bohicket Road","streetDirection":"","city":"Johns Island","state":"SC","zipCode":"29455"},
   {"id":"sc-29501-401-west-evans-street","streetNumber":"401","streetName":"West Evans Street","streetDirection":"","city":"Florence","state":"SC","zipCode":"29501"},
   {"id":"sc-29526-5443-highway-65","streetNumber":"5443","streetName":"Highway 65","streetDirection":"","city":"Conway","state":"SC","zipCode":"29526"},
-  {"id":"sc-29544-6700-juniper-bay-road","streetNumber":"6700","streetName":"Juniper Bay Road","streetDirection":"","city":"Galivants Feery","state":"SC","zipCode":"29544"},
   {"id":"sc-29545-2930-state-road-s-26-33","streetNumber":"2930","streetName":"State Road S-26-33","streetDirection":"","city":"Green Sea","state":"SC","zipCode":"29545"},
   {"id":"sc-29569-2865-highway-348","streetNumber":"2865","streetName":"Highway 348","streetDirection":"","city":"Loris","state":"SC","zipCode":"29569"},
   {"id":"sc-29575-420-u-s-highway-17-business","streetNumber":"420","streetName":"U.S. Highway 17 Business","streetDirection":"","city":"Surfside Beach","state":"SC","zipCode":"29575"},
@@ -1333,7 +1346,6 @@ export const ADDRESS_POOL = [
   {"id":"sd-57069-16-court-street","streetNumber":"16","streetName":"Court Street","streetDirection":"","city":"Vermillion","state":"SD","zipCode":"57069"},
   {"id":"sd-57105-2820-south-minnesota-avenue","streetNumber":"2820","streetName":"South Minnesota Avenue","streetDirection":"","city":"Sioux Falls","state":"SD","zipCode":"57105"},
   {"id":"sd-57108-4709-south-technopolis-drive","streetNumber":"4709","streetName":"South Technopolis Drive","streetDirection":"","city":"Sioux Falls","state":"SD","zipCode":"57108"},
-  {"id":"sd-57226-125-3rd-avenue-south","streetNumber":"125","streetName":"3rd Avenue South","streetDirection":"","city":"Clear Lake","state":"SD","zipCode":"57226"},
   {"id":"sd-57325-110-east-lawler-avenue","streetNumber":"110","streetName":"East Lawler Avenue","streetDirection":"","city":"Chamberlain","state":"SD","zipCode":"57325"},
   {"id":"sd-57341-229-main-street","streetNumber":"229","streetName":"Main Street","streetDirection":"","city":"Gann Valley","state":"SD","zipCode":"57341"},
   {"id":"sd-57368-404-east-davenport-street","streetNumber":"404","streetName":"East Davenport Street","streetDirection":"","city":"Plankinton","state":"SD","zipCode":"57368"},
@@ -1453,7 +1465,6 @@ export const ADDRESS_POOL = [
   // ----- VA -----
   {"id":"va-20124-12644-chapel-road","streetNumber":"12644","streetName":"Chapel Road","streetDirection":"","city":"Clifton","state":"VA","zipCode":"20124"},
   {"id":"va-22027-2302-gallows-road","streetNumber":"2302","streetName":"Gallows Road","streetDirection":"","city":"Dunn Loring","state":"VA","zipCode":"22027"},
-  {"id":"va-22039-5616-ox-road","streetNumber":"5616","streetName":"Ox Road","streetDirection":"","city":"Fairfax Station","state":"VA","zipCode":"22039"},
   {"id":"va-22041-6021-leesburg-pike","streetNumber":"6021","streetName":"Leesburg Pike","streetDirection":"","city":"Falls Church","state":"VA","zipCode":"22041"},
   {"id":"va-22044-6375-leesburg-pike","streetNumber":"6375","streetName":"Leesburg Pike","streetDirection":"","city":"Falls Church","state":"VA","zipCode":"22044"},
   {"id":"va-22116-8409-route-29","streetNumber":"8409","streetName":"Route 29","streetDirection":"","city":"Merrifield","state":"VA","zipCode":"22116"},
@@ -1489,7 +1500,6 @@ export const ADDRESS_POOL = [
   {"id":"vt-05251-200-raptor-lane","streetNumber":"200","streetName":"Raptor Lane","streetDirection":"","city":"Dorset","state":"VT","zipCode":"05251"},
   {"id":"vt-05254-4070-main-street","streetNumber":"4070","streetName":"Main Street","streetDirection":"","city":"Manchester","state":"VT","zipCode":"05254"},
   {"id":"vt-05255-6041-main-street","streetNumber":"6041","streetName":"Main Street","streetDirection":"","city":"Manchester","state":"VT","zipCode":"05255"},
-  {"id":"vt-05342-2939-route-100","streetNumber":"2939","streetName":"Route 100","streetDirection":"","city":"Jacksonville","state":"VT","zipCode":"05342"},
   {"id":"vt-05350-301-phelps-lane","streetNumber":"301","streetName":"Phelps Lane","streetDirection":"","city":"Readsboro","state":"VT","zipCode":"05350"},
   {"id":"vt-05404-32-malletts-bay-avenue","streetNumber":"32","streetName":"Malletts Bay Avenue","streetDirection":"","city":"Winooski","state":"VT","zipCode":"05404"},
   {"id":"vt-05445-115-ferry-road","streetNumber":"115","streetName":"Ferry Road","streetDirection":"","city":"Charlotte","state":"VT","zipCode":"05445"},
