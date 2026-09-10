@@ -87,6 +87,34 @@
                 setTimeout(() => overlay.querySelector('#_dp-date').focus(), 0);
             });
         }
+        // Text equivalent of showDatePrompt. Native prompt() renders the
+        // browser's own chrome, which does not belong in this UI.
+        function showTextPrompt(title, message, defaultValue, placeholder) {
+            return new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+                overlay.innerHTML =
+                    '<div class="bg-dark-800 border border-dark-600 rounded-xl p-6 max-w-sm w-full mx-4">' +
+                    '<h3 class="text-white font-semibold text-lg mb-2">' + esc(title) + '</h3>' +
+                    (message ? '<p class="text-gray-300 text-sm mb-4">' + esc(message) + '</p>' : '') +
+                    '<input id="_tp-text" type="text" class="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-200 mb-4" value="' + esc(defaultValue || '') + '" placeholder="' + esc(placeholder || '') + '">' +
+                    '<div class="flex justify-end gap-2">' +
+                    '<button id="_tp-cancel" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">Cancel</button>' +
+                    '<button id="_tp-ok" class="px-4 py-2 text-sm bg-accent hover:bg-green-400 text-white rounded transition">Save</button>' +
+                    '</div></div>';
+                document.body.appendChild(overlay);
+                const input = overlay.querySelector('#_tp-text');
+                const cleanup = (val) => { document.body.removeChild(overlay); resolve(val); };
+                overlay.querySelector('#_tp-cancel').onclick = () => cleanup(null);
+                overlay.querySelector('#_tp-ok').onclick = () => cleanup(input.value.trim() || null);
+                overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(null); });
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); cleanup(input.value.trim() || null); }
+                    if (e.key === 'Escape') { e.preventDefault(); cleanup(null); }
+                });
+                setTimeout(() => input.focus(), 0);
+            });
+        }
         function handleConfirm(confirmed) {
             const modal = document.getElementById('confirm-modal');
             if (modal) {
@@ -5354,14 +5382,16 @@ set verify_pending; schedule §C.3 poll
             };
         }
 
-        function saveCurrentSimsFilter() {
-            const name = (prompt('Name this filter') || '').trim();
+        async function saveCurrentSimsFilter() {
+            const raw = await showTextPrompt('Save filter', 'Name this view so you can come back to it.', '', 'e.g. Teltik offline');
+            const name = (raw || '').trim();
             if (!name) return;
             const list = loadSimsSavedFilters();
             const state = captureSimsFilterState();
             const existing = list.findIndex(function (f) { return f.name.toLowerCase() === name.toLowerCase(); });
             if (existing !== -1) {
-                if (!confirm('A filter named "' + name + '" already exists. Replace it?')) return;
+                const ok = await showConfirm('Replace filter', 'A filter named "' + name + '" already exists. Replace it?');
+                if (!ok) return;
                 list[existing] = { name: name, state: state };
             } else {
                 list.push({ name: name, state: state });
@@ -5402,8 +5432,9 @@ set verify_pending; schedule §C.3 poll
             if (needsRefetch) loadSims(true); else renderSims();
         }
 
-        function deleteSimsSavedFilter(name) {
-            if (!confirm('Delete saved filter "' + name + '"?')) return;
+        async function deleteSimsSavedFilter(name) {
+            const ok = await showConfirm('Delete filter', 'Delete saved filter "' + name + '"?');
+            if (!ok) return;
             persistSimsSavedFilters(loadSimsSavedFilters().filter(function (f) { return f.name !== name; }));
             renderSimsSavedFilters();
         }

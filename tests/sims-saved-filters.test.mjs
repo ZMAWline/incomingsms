@@ -107,7 +107,7 @@ test('the stale-SIMs dashboard tile still filters, via the computed column', () 
   assert.match(body, /notify_stale/, 'tile must target the notify_stale column');
 });
 
-test('saved filters round-trip through storage', () => {
+test('saved filters round-trip through storage', async () => {
   const src = [
     slice('const SIMS_SAVED_FILTERS_KEY', '// --- Per-column filter popover'),
     'function __setState(fs, cf, ts) { simsFilterState = fs; simsColumnFilters = cf; tableState = ts; }',
@@ -121,8 +121,9 @@ test('saved filters round-trip through storage', () => {
       setItem: (k, v) => store.set(k, v),
     },
     showToast: () => {},
-    prompt: () => 'Teltik offline',
-    confirm: () => true,
+    // In-page modals, not native dialogs.
+    showTextPrompt: async () => 'Teltik offline',
+    showConfirm: async () => true,
     document: { getElementById: () => null },
     simsFilterState: {
       status: ['active'], resellerIds: [], vendors: ['teltik'], gateways: [],
@@ -136,7 +137,7 @@ test('saved filters round-trip through storage', () => {
   vm.createContext(sandbox);
   vm.runInContext(src, sandbox);
 
-  sandbox.saveCurrentSimsFilter();
+  await sandbox.saveCurrentSimsFilter();
   const saved = sandbox.loadSimsSavedFilters();
   assert.equal(saved.length, 1);
   assert.equal(saved[0].name, 'Teltik offline');
@@ -180,7 +181,7 @@ test('applying a saved filter drops columns that no longer exist', () => {
   const sandbox = {
     console, JSON, Array, Object, String, Date, Number, Math, Set, Map,
     localStorage: { getItem: (k) => store.get(k) || null, setItem: (k, v) => store.set(k, v) },
-    showToast: () => {}, prompt: () => '', confirm: () => true,
+    showToast: () => {}, showTextPrompt: async () => '', showConfirm: async () => true,
     document: { getElementById: () => null },
     simsFilterState: { status: ['active'], resellerIds: [], vendors: [], gateways: [], activatedFrom: '', activatedTo: '', search: '' },
     simsColumnFilters: [],
@@ -194,4 +195,21 @@ test('applying a saved filter drops columns that no longer exist', () => {
   const applied = sandbox.__filters();
   assert.equal(applied.length, 1, 'the unknown column must be dropped, not matched blindly');
   assert.equal(applied[0].col, 'sms_count');
+});
+
+test('saved-filter dialogs use the in-page modals, never native ones', () => {
+  const start = HTML.indexOf('const SIMS_SAVED_FILTERS_KEY');
+  const block = HTML.slice(start, HTML.indexOf('// --- Per-column filter popover', start));
+  assert.ok(!/[^.\w]prompt\s*\(/.test(block), 'must not call native prompt()');
+  assert.ok(!/[^.\w]confirm\s*\(/.test(block), 'must not call native confirm()');
+  assert.match(block, /showTextPrompt\(/, 'must use the in-page text prompt');
+  assert.match(block, /showConfirm\(/, 'must use the in-page confirm');
+});
+
+test('showTextPrompt matches the existing modal markup', () => {
+  const fn = HTML.slice(HTML.indexOf('function showTextPrompt'));
+  const body = fn.slice(0, fn.indexOf('\n        }\n'));
+  assert.match(body, /bg-dark-800 border border-dark-600 rounded-xl/, 'same card treatment as showDatePrompt');
+  assert.match(body, /Escape/, 'Escape must cancel');
+  assert.match(body, /Enter/, 'Enter must submit');
 });
