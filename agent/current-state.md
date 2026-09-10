@@ -2,6 +2,7 @@
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
 > Last updated: 2026-09-10 (SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API)
+> Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
 ---
 
@@ -138,7 +139,14 @@ updating. The TEST key is at `/root/.config/incomingsms/agent-api-key.test` (mod
    created without a human password. PROD break-glass stays off.
 3. A throwaway TEST account `agent-api-verify` was created to exercise a real session
    and left **disabled**. Delete it whenever.
-4. `dashboard_audit_log` has no retention policy. It grows without bound.
+4. ~~`dashboard_audit_log` has no retention policy. It grows without bound.~~
+   **CLOSED 2026-09-10.** 90-day retention, `migrations/010_audit_log_retention.sql`.
+   `public.purge_dashboard_audit_log(retention_days int default 90)` deletes in
+   batches of 5000 and loops until a batch comes back empty; pg_cron job
+   `purge-dashboard-audit-log` runs it at 04:10 UTC nightly. Applied to both
+   projects (PROD jobid 3, TEST jobid 1 — pg_cron had to be enabled on TEST).
+   Verified on TEST with 12,000 seeded 200-day-old rows: 12,029 -> 29, the 29
+   real rows untouched, second run 0.
 
 ---
 
@@ -1257,6 +1265,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 
 | Date | Change | Worker(s) |
 |------|--------|-----------|
+| 2026-09-10 | **`dashboard_audit_log` retention: 90 days, purged nightly (`migrations/010_audit_log_retention.sql`).** The audit log was the one table in the schema with nothing ever deleted from it — a row per acting `/api/*` request carrying up to 8 KB of redacted body each. `public.purge_dashboard_audit_log(retention_days int default 90)` is the single source of truth for the window; the scheduled job calls it with no arguments, so changing the default changes the policy. Deletes via `ctid IN (SELECT ... ORDER BY ts LIMIT 5000)` and loops until empty, so the first run against a real backlog is never one enormous statement. `SECURITY DEFINER`, `search_path=''`, execute revoked from `anon`/`authenticated`, and it refuses `retention_days < 1` rather than treat it as "delete everything". Scheduled with pg_cron rather than the dashboard Worker because the database already runs `delete-old-sms` that way and TEST has Worker crons disabled, so a Worker-side purge would never have run there. pg_cron was enabled on TEST to match PROD. **Applied**: PROD jobid 3, TEST jobid 1, both `10 4 * * *` (cron.timezone GMT). No Worker deploy — this change is entirely database-side. | none (database) |
 | 2026-09-08 | **ATOMIC `portinStatus` 951 made terminal (PR #76).** `951` (`Result.reasonCode="CT"`) is the losing carrier rejecting the port, with the actionable cause embedded in the description as `statusReasonCode - <XX> ~ statusReasonDescription - <text>` (`8A` wrong account number, `6B` wrong T-Mobile transfer PIN). A rejection cannot clear itself, so the 5-min poll ran against it forever — SIM 36217 had been polling since 2026-09-04. Replaced the two-code ternary with a `TERMINAL_REASONS` map so each terminal code carries its own operator-facing reason, and added the carrier's own description to the terminal log line. Tests now parse the map and assert the terminal set is exactly `{910, 948, 951}` instead of matching source text. **Deployed**: details-finalizer `f30466c1`. SIM 36217 went terminal on the 18:45 tick; `portinStatus` traffic is now zero. | details-finalizer |
 | 2026-09-08 | **ATOMIC port-in auto-finalizer shipped (PR #72) — 42-SIM backlog drained.** The 5-min `portinStatus` poll was read-only and nothing ever cleared `port_in_pending`, so 42 SIMs had accumulated, burning **11,232 carrier calls/24h**, with completed ports stuck in `provisioning` for up to 14 days. Confirmed the status enum from live `carrier_api_logs` (the `atomic-wholesale-api` skill lists it as unknown): completion is `statusCode="00"` + `Result.reasonCode="CO"`; `948` = `"Error!!Port Request Does Not Exist"`; `951` carries `Result.reasonCode="CT"` with the real reason embedded in the description. `runAtomicPortinStatusFinalizer` now treats `948`/`910` as terminal and auto-finalizes `00`+`CO` via `subsriberInquiry` through the `MDN_ROTATOR` binding (writes `status='active'`, MDN, BAN, IMEI, activation date/zip, rolls `sim_numbers`); `port_in_pending` clears only after finalization succeeds. `mdn-rotator`'s `/atomic-inquiry` widened to return `ban`/`imei`/`activationDate`/`zipCode`/raw `result`. **Result: 26 SIMs auto-finalized to `active` with real BAN + activation dates, 13 marked terminal, backlog 42 → 4, poll volume ~39/tick → 1/tick.** All 22 `finalize_inquiry` calls returned `attStatus=Active`, zero errors. **Deployed**: mdn-rotator `f227a41c`, details-finalizer `356028b0` (both via `wrangler deploy` — Workers Builds is a PR check only, it does NOT deploy on merge). | details-finalizer, mdn-rotator |
 | 2026-06-16 | **Supabase security advisors cleared on prod (`lzjqegxazqlktttyybth`).** DB-only, no worker changes. Migration `lock_down_public_rls_critical`: enabled RLS on 10 RLS-off tables + dropped two `TO public USING(true)` policies (`sim_sms_daily`, `system_errors`). Migration `security_hardening_funcs_views`: pinned `search_path` on 18 functions, revoked `anon`/`authenticated`/`public` EXECUTE on 5 SECURITY DEFINER RPCs (`claim_rotation_slot`, `rotation_freshness`, `shop_claim_rental`, `shop_confirm_deposit`, `sweep_stuck_rotations`) + re-granted to `service_role` only, switched `helix_api_logs`/`shop_balances` views to `security_invoker`. Safe because backend is service-role-only (no anon/`createClient` usage anywhere); advisor now shows only INFO `rls_enabled_no_policy`. **Test project `lwapudjjlwkskijefxdz` still pending** — same SQL needs to be run there manually. | DB (no workers) |

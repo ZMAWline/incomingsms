@@ -155,6 +155,10 @@ request body — some handlers accept a `body.actor` field for display in their
 own tables, and you may set it, but it does not change who the audit says you
 are. Assume everything you do is attributable and reviewable.
 
+**Retention.** Audit rows are kept 90 days. A nightly pg_cron job
+(`purge-dashboard-audit-log`, 04:10 UTC) deletes anything older, so
+`GET /api/audit-log?since=` cannot reach further back than that.
+
 ---
 
 # Endpoints
