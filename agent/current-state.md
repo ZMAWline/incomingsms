@@ -1,11 +1,11 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-10 (Agent API — API keys + audit trail, DEPLOYED TO TEST ONLY)
+> Last updated: 2026-09-10 (Agent API — API keys + audit trail, DEPLOYED TO PROD, PR #103 merged)
 
 ---
 
-## Session 2026-09-10 — Agent API: API keys and an audit trail (branch `agent-api`)
+## Session 2026-09-10 — Agent API: API keys and an audit trail (branch `agent-api`, PR #103)
 
 An external AI agent can now perform every SIM action a human operator can, through
 the *same* dashboard handlers, so the DB side effects are identical whoever called.
@@ -59,17 +59,23 @@ secrets (TEST holds none) rather than on auth; `dashboard_audit_log` rows presen
 actor `apikey:agent-test`, `break-glass`, and a real session user; `last_used_at`
 updating. The TEST key is at `/root/.config/incomingsms/agent-api-key.test` (mode 600).
 
+**Deployed to PROD** (`dashboard.zalmen-531.workers.dev`, worker version
+`e21999ea-9cda-401a-b522-e399830d17ba` or later). PROD key `agent-prod` (role
+operator) created from the Users tab and lives at
+`/root/.config/incomingsms/agent-api-key.prod` (mode 600).
+
 **Deliberately NOT done — the remaining work**
 
-1. **No PROD deploy.** `dashboard` still runs the previous version. The DB tables exist
-   in PROD (migration applied), which is inert until the worker ships.
-2. **No PROD key.** Create it from the Users tab as an admin once PROD is deployed.
-   PROD keys are `zmaw_live_...`; the `DASHBOARD_ENV` var in `wrangler.toml` decides.
-3. **`DASHBOARD_BREAK_GLASS` is not off on TEST**, which is how the TEST key was
+1. **Operator keys can reach mutating admin-adjacent routes.** `/api/cancel`,
+   `/api/delete-sim`, `/api/debug-cancel`, and `/api/reset-to-provisioning` sit in
+   `ALWAYS_MUTATING`, so an operator-role key — not just an operator human — can hit
+   them. Decision pending from Zalmen on whether API keys should be fenced out of
+   these regardless of role.
+2. **`DASHBOARD_BREAK_GLASS` is not off on TEST**, which is how the TEST key was
    created without a human password. PROD break-glass stays off.
-4. A throwaway TEST account `agent-api-verify` was created to exercise a real session
+3. A throwaway TEST account `agent-api-verify` was created to exercise a real session
    and left **disabled**. Delete it whenever.
-5. The audit table has no retention policy. It grows without bound.
+4. `dashboard_audit_log` has no retention policy. It grows without bound.
 
 ---
 
