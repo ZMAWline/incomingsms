@@ -76,13 +76,26 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx wrangler deploy --config src/dashboard/wrangler.toml --env test
 
+      # Until PR #94 the dashboard answered an unauthenticated request with a
+      # Basic-auth challenge, so this asserted 401 + WWW-Authenticate. Named
+      # logins replaced that with a sign-in page, and the assertion has failed
+      # on every dashboard PR since. What matters now is the same property
+      # stated against the current design: an anonymous caller gets the login
+      # page and never the SPA, and the API stays shut.
       - name: Smoke-test preview auth challenge
         shell: bash
         run: |
           set -euo pipefail
           code=$(curl -sS -o /tmp/dashboard-preview-body.txt -w '%{http_code}' --max-time 30 "$PREVIEW_URL/")
-          test "$code" = "401"
-          grep -qi 'WWW-Authenticate' <(curl -sS -I --max-time 30 "$PREVIEW_URL/")
+          test "$code" = "200"
+          grep -qi '<title>Sign in</title>' /tmp/dashboard-preview-body.txt
+          # The SPA must not be served to an anonymous caller.
+          if grep -qi 'id="sims-table"' /tmp/dashboard-preview-body.txt; then
+            echo "SPA markup served without authentication" >&2
+            exit 1
+          fi
+          api=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$PREVIEW_URL/api/sims")
+          test "$api" = "401"
 
       # dashboard-test proxies SIM activation to bulk-activator-test over a service
       # binding, so a stale bulk-activator-test makes the shared preview lie about
