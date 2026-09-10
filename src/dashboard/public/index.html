@@ -33,10 +33,33 @@
             }
         }
 
+        function showAdHocConfirm(title, message) {
+            return new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+                overlay.innerHTML =
+                    '<div class="bg-dark-800 border border-dark-600 rounded-xl p-6 max-w-sm w-full mx-4">' +
+                    '<h3 class="text-white font-semibold text-lg mb-2">' + esc(title || 'Confirm') + '</h3>' +
+                    '<p class="text-gray-300 text-sm mb-5">' + esc(message || '') + '</p>' +
+                    '<div class="flex justify-end gap-2">' +
+                    '<button id="_ac-cancel" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">Cancel</button>' +
+                    '<button id="_ac-ok" class="px-4 py-2 text-sm bg-accent hover:bg-green-400 text-white rounded transition">Confirm</button>' +
+                    '</div></div>';
+                document.body.appendChild(overlay);
+                const cleanup = (val) => { document.body.removeChild(overlay); resolve(val); };
+                overlay.querySelector('#_ac-cancel').onclick = () => cleanup(false);
+                overlay.querySelector('#_ac-ok').onclick = () => cleanup(true);
+                overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(false); });
+            });
+        }
+
         let confirmPromiseResolver = null;
         function showConfirm(title, message) {
             const modal = document.getElementById('confirm-modal');
-            if (!modal) return Promise.resolve(confirm(message));
+            // The static #confirm-modal is the normal path. If it is missing,
+            // build an equivalent overlay rather than falling back to a native
+            // confirm() — the browser dialog is never acceptable in this UI.
+            if (!modal) return showAdHocConfirm(title, message);
             document.getElementById('confirm-title').textContent = title;
             document.getElementById('confirm-message').textContent = message;
             modal.classList.remove('hidden');
@@ -4895,8 +4918,8 @@ set verify_pending; schedule §C.3 poll
                 });
                 const data = await res.json().catch(function () { return {}; });
                 // The server refuses to strand the last admin; surface that reason.
-                if (!res.ok || !data.ok) alert(data.error || 'Update failed');
-            } catch (e) { alert('Update failed: ' + e.message); }
+                if (!res.ok || !data.ok) showToast(data.error || 'Update failed', 'error');
+            } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
             loadUsers();
         }
 
@@ -4910,11 +4933,11 @@ set verify_pending; schedule §C.3 poll
                     body: JSON.stringify({ role: role, username: username || null })
                 });
                 const data = await res.json().catch(function () { return {}; });
-                if (!res.ok || !data.ok) { alert(data.error || 'Could not create invite'); return; }
+                if (!res.ok || !data.ok) { showToast(data.error || 'Could not create invite', 'error'); return; }
                 document.getElementById('invite-link').value = window.location.origin + data.accept_path;
                 document.getElementById('invite-result').classList.remove('hidden');
                 loadUsers();
-            } catch (e) { alert('Could not create invite: ' + e.message); }
+            } catch (e) { showToast('Could not create invite: ' + e.message, 'error'); }
         }
 
         function copyInviteLink() {
@@ -10320,7 +10343,9 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function remediatorRunNow() {
-            if (!confirm('Trigger an immediate Auto-Remediator main tick now?\n\nThis runs the same logic as the 2-hour cron once. Reviewer kill-switch must be enabled or the tick will short-circuit.')) return;
+            const okRun = await showConfirm('Run Auto-Remediator now',
+                'This runs the same logic as the 2-hour cron once. The reviewer kill-switch must be enabled or the tick will short-circuit.');
+            if (!okRun) return;
             const out = document.getElementById('remediator-run-result');
             if (out) { out.classList.remove('hidden'); out.textContent = 'Running…'; }
             try {
@@ -10346,9 +10371,10 @@ async function sendSimOnline(simId, phoneNumber) {
 
         async function remediatorToggleKillSwitch(enabled) {
             const verb = enabled ? 'RESUME' : 'PAUSE';
-            if (!confirm(verb + ' the Auto-Remediator?\n\n' + (enabled
+            const okToggle = await showConfirm(verb + ' the Auto-Remediator', enabled
                 ? 'This re-enables the 2-hour cron. The next scheduled tick will process queued bad rentals.'
-                : 'This disables the 2-hour cron. Already-running attempts finish; no new actions will be taken until you resume.'))) return;
+                : 'This disables the 2-hour cron. Already-running attempts finish; no new actions will be taken until you resume.');
+            if (!okToggle) return;
             try {
                 const resp = await fetch(API_BASE + '/remediator/kill-switch', {
                     method: 'POST',
@@ -10358,7 +10384,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 await loadRemediatorStatus();
             } catch (e) {
-                alert('Toggle failed: ' + (e && e.message ? e.message : String(e)));
+                showToast('Toggle failed: ' + (e && e.message ? e.message : String(e)), 'error');
             }
         }
 
@@ -10419,7 +10445,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
         function openBadRentalEdit(reportId) {
             const r = (window._badRentalRowsById || {})[reportId];
-            if (!r) { alert('Report ' + reportId + ' not in current view; refresh first.'); return; }
+            if (!r) { showToast('Report ' + reportId + ' not in current view; refresh first.', 'error'); return; }
             const modal = document.getElementById('bad-rentals-edit-modal');
             if (!modal) return;
             document.getElementById('bad-rentals-edit-id').textContent = '#' + reportId;
@@ -10884,7 +10910,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const data = await resp.json().catch(function(){ return {}; });
                 if (!resp.ok) {
                     const message = (data && data.error) ? data.error : ('HTTP ' + resp.status);
-                    alert('Failed to queue auto rerun: ' + message);
+                    showToast('Failed to queue auto rerun: ' + message, 'error');
                     return;
                 }
                 if (typeof showToast === 'function') showToast('BRR #' + reportId + ' queued for auto rerun', 'success');
@@ -10892,7 +10918,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (typeof loadBadRentals === 'function') loadBadRentals();
                 if (typeof loadRemediatorStatus === 'function') loadRemediatorStatus();
             } catch(e) {
-                alert('Network error: ' + e.message);
+                showToast('Network error: ' + e.message, 'error');
                 console.error('[rerunBadRentalAuto]', e);
             }
         }
@@ -10919,7 +10945,7 @@ async function sendSimOnline(simId, phoneNumber) {
             if (action === null) return; // cancelled
             const trimmed = String(action || '').trim().toLowerCase();
             if (!allowed.includes(trimmed)) {
-                alert('Invalid action. Choose one of: ' + allowed.join(', '));
+                showToast('Invalid action. Choose one of: ' + allowed.join(', '), 'error');
                 return;
             }
             const note = window.prompt('Resolution note (≤500 chars):', defaultNote) || '';
@@ -10931,7 +10957,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 });
                 const data = await resp.json().catch(function(){ return {}; });
                 if (!resp.ok) {
-                    alert('Failed to mark fixed: ' + (data && data.error ? data.error : resp.status));
+                    showToast('Failed to mark fixed: ' + (data && data.error ? data.error : resp.status), 'error');
                     return;
                 }
                 // When the fix was an MDN swap and we know the current SIM, also push
@@ -10959,7 +10985,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
                 if (typeof loadBadRentals === 'function') loadBadRentals();
             } catch(e) {
-                alert('Network error: ' + e.message);
+                showToast('Network error: ' + e.message, 'error');
                 console.error('[markBadRentalFixed]', e);
             }
         }
@@ -13381,7 +13407,8 @@ async function sendSimOnline(simId, phoneNumber) {
         async function resetResellerCredentials(resellerId, resellerName, currentUsername) {
             let username = (currentUsername || '').trim().toLowerCase();
             if (!username) {
-                username = prompt('No username set yet. Choose a username for ' + resellerName + ' (a-z, 0-9, . _ -):') || '';
+                username = await showTextPrompt('Choose a username',
+                    'No username set yet for ' + resellerName + '. Allowed: a-z, 0-9, and . _ -', '', 'username') || '';
                 username = username.trim().toLowerCase();
                 if (!username || !/^[a-z0-9._-]{3,40}$/.test(username)) { showToast('Invalid username', 'error'); return; }
             }
@@ -13781,7 +13808,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function deleteInvoice(invoiceId) {
-            if (!confirm('Permanently delete this invoice? This frees the week so it can be re-generated. This cannot be undone.')) return;
+            if (!await showConfirm('Delete invoice', 'Permanently delete this invoice? This frees the week so it can be re-generated. This cannot be undone.')) return;
             try {
                 const resp = await fetch(API_BASE + '/qbo-invoices/' + invoiceId, { method: 'DELETE' });
                 const result = await resp.json();
@@ -15621,7 +15648,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function retryActivationItem(itemId) {
-            if (!confirm('Retry this activation item?')) return;
+            if (!await showConfirm('Retry item', 'Retry this activation item?')) return;
 
             try {
                 const resp = await fetch(`${API_BASE}/activation-runs`, {
@@ -15647,7 +15674,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const retryCount = (parseInt(document.getElementById('ar-detail-failed').textContent) || 0) +
                                (parseInt(document.getElementById('ar-detail-retry').textContent) || 0);
             if (retryCount === 0) return;
-            if (!confirm(`Retry all ${retryCount} failed/retry-needed items in this run?`)) return;
+            if (!await showConfirm('Retry all failed', `Retry all ${retryCount} failed/retry-needed items in this run?`)) return;
 
             try {
                 const resp = await fetch(`${API_BASE}/activation-runs`, {
