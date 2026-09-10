@@ -1357,17 +1357,7 @@
                                 </button>
                             </div>
                             <div class="flex flex-col gap-3 w-full">
-                                <div class="flex flex-wrap items-center gap-2">
-                                    <span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Quick</span>
-                                    <button data-preset="not_rotated_today"  onclick="toggleSimsPreset('not_rotated_today')"  class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Not rotated today</button>
-                                    <button data-preset="no_sms_12h"         onclick="toggleSimsPreset('no_sms_12h')"         class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No SMS in 12h</button>
-                                    <button data-preset="any_error"          onclick="toggleSimsPreset('any_error')"          class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Any error</button>
-                                    <button data-preset="no_reseller"        onclick="toggleSimsPreset('no_reseller')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No reseller</button>
-                                    <button data-preset="auto_paused"        onclick="toggleSimsPreset('auto_paused')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Auto-rotate paused</button>
-                                    <button data-preset="stuck_provisioning" onclick="toggleSimsPreset('stuck_provisioning')" class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Stuck provisioning &gt;1h</button>
-                                    <button data-preset="not_notified"       onclick="toggleSimsPreset('not_notified')"       class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="AT&T not notified today, T-Mobile not notified today or yesterday">Not Notified</button>
-                                    <button data-preset="portin_failed"      onclick="toggleSimsPreset('portin_failed')"      class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="Carrier returned a non-Success status for the port-in (948 port request does not exist, 910 SIM not on our ATOMIC account, 951 losing carrier rejected). These sit at status=provisioning and are otherwise invisible.">Port-in failed</button>
-                                </div>
+                                <div id="sims-saved-filters" class="flex flex-wrap items-center gap-2"></div>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <button id="sims-fb-status"   onclick="openSimsFilterMenu('status', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Status<span id="sims-fb-status-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
                                     <button id="sims-fb-vendor"   onclick="openSimsFilterMenu('vendor', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Vendor<span id="sims-fb-vendor-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
@@ -5028,7 +5018,6 @@ set verify_pending; schedule §C.3 poll
             resellerIds: [],        // 'none' sentinel = no-reseller; integer = reseller id
             vendors: [],
             gateways: [],
-            presets: new Set(),
             activatedFrom: '',
             activatedTo: '',
             search: '',
@@ -5095,20 +5084,9 @@ set verify_pending; schedule §C.3 poll
             // Unknown shape — show the raw code rather than invent a label.
             return 'Port-in ' + (code || '?');
         }
-        const SIM_PRESETS = {
-            not_rotated_today:  { label: 'Not rotated today',     test: simNotRotatedToday },
-            portin_failed:      { label: 'Port-in failed',        test: simPortInFailed },
-            no_sms_12h:         { label: 'No SMS in 12h',         test: simNoSms12h },
-            no_reseller:        { label: 'No reseller',           test: function(s){ return !s.reseller_id; } },
-            auto_paused:        { label: 'Auto-rotate paused',    test: function(s){ return s.rotation_eligible === false; } },
-            any_error:          { label: 'Any error',             test: function(s){ return ['error','helix_timeout','data_mismatch'].includes(s.status); } },
-            stuck_provisioning: { label: 'Stuck provisioning >1h', test: simStuckProvisioning1h },
-            not_notified:       { label: 'Not Notified',         test: simNotNotified },
-        };
         // --- Per-column filtering -------------------------------------------
         //
-        // The presets above are shortcuts for questions we already knew to ask.
-        // This registry is the general case: every column an operator can
+        // Every column an operator can
         // filter on, with the type that decides which operators it offers.
         // Filtering runs client-side over the loaded rows (~4.3k), so a filter
         // applies instantly and never costs a round trip.
@@ -5148,7 +5126,25 @@ set verify_pending; schedule §C.3 poll
             { key: 'port_in_pending',         label: 'Port-in Pending', type: 'bool' },
             { key: 'atomic_portin_status_code', label: 'Port-in Code', type: 'enum'  },
             { key: 'last_activation_error',   label: 'Activation Error', type: 'text' },
+            // Computed columns. These carry the judgement the old Quick preset
+            // chips encoded — vendor-specific notification windows, "not
+            // rotated today", a non-Success port-in code — which no single
+            // stored column expresses. As columns they can be combined with
+            // anything else and stored in a saved filter, which the chips could
+            // not do.
+            { key: 'notify_stale',       label: 'Notification Stale',  type: 'bool', compute: simNotNotified },
+            { key: 'not_rotated_today',  label: 'Not Rotated Today',   type: 'bool', compute: simNotRotatedToday },
+            { key: 'portin_failed',      label: 'Port-in Failed',      type: 'bool', compute: simPortInFailed },
+            { key: 'stuck_provisioning', label: 'Stuck Provisioning',  type: 'bool', compute: simStuckProvisioning1h },
+            { key: 'no_sms_12h',         label: 'No SMS in 12h',       type: 'bool', compute: simNoSms12h },
+            { key: 'no_reseller',        label: 'No Reseller',         type: 'bool', compute: function (s) { return !s.reseller_id; } },
         ];
+        // A column's value is either read straight off the row or derived.
+        function simColValue(row, col) {
+            if (!col) return undefined;
+            if (typeof col.compute !== 'function') return row[col.key];
+            try { return !!col.compute(row); } catch (e) { return undefined; }
+        }
         const SIMS_COLUMN_BY_KEY = SIMS_COLUMNS.reduce(function (acc, c) { acc[c.key] = c; return acc; }, {});
 
         // Operators offered per type. `arity` is how many value inputs the
@@ -5191,8 +5187,9 @@ set verify_pending; schedule §C.3 poll
 
         function simsDistinctValues(colKey) {
             const seen = new Map(); // normalized -> display
+            const col = SIMS_COLUMN_BY_KEY[colKey];
             for (const row of (tableState.sims.data || [])) {
-                const v = row[colKey];
+                const v = simColValue(row, col);
                 if (v == null || v === '') continue;
                 const s = String(v);
                 if (!seen.has(s)) seen.set(s, s);
@@ -5207,7 +5204,7 @@ set verify_pending; schedule §C.3 poll
         function simFilterMatches(row, f) {
             const col = SIMS_COLUMN_BY_KEY[f.col];
             if (!col) return true;
-            const raw = row[f.col];
+            const raw = simColValue(row, col);
             const isBlank = raw == null || raw === '';
 
             if (f.op === 'blank') return isBlank;
@@ -5313,6 +5310,123 @@ set verify_pending; schedule §C.3 poll
             simsColumnFilters = [];
             tableState.sims.page = 1;
             renderSims();
+        }
+
+        // --- Saved filters ---------------------------------------------------
+        //
+        // Replaces the fixed Quick preset chips. A saved filter captures the
+        // whole current state — server-side selections, the toolbar controls,
+        // the search box and every per-column filter — under a name, so the
+        // views an operator actually uses are theirs to define rather than
+        // whatever someone hardcoded.
+        //
+        // Stored in localStorage, like simsColumnVis. That makes them
+        // per-browser, not per-account: they do not follow you to another
+        // machine. Making them shared would need a table and a migration.
+        const SIMS_SAVED_FILTERS_KEY = 'simsSavedFilters';
+
+        function loadSimsSavedFilters() {
+            try {
+                const raw = JSON.parse(localStorage.getItem(SIMS_SAVED_FILTERS_KEY) || '[]');
+                return Array.isArray(raw) ? raw : [];
+            } catch (e) { return []; }
+        }
+
+        function persistSimsSavedFilters(list) {
+            try { localStorage.setItem(SIMS_SAVED_FILTERS_KEY, JSON.stringify(list)); }
+            catch (e) { showToast('Could not save filter (storage full?)', 'error'); }
+        }
+
+        // Sets are not JSON, and simsColumnFilters is copied rather than
+        // referenced so later edits do not mutate a saved view.
+        function captureSimsFilterState() {
+            return {
+                status: [...simsFilterState.status],
+                resellerIds: [...simsFilterState.resellerIds],
+                vendors: [...simsFilterState.vendors],
+                gateways: [...simsFilterState.gateways],
+                activatedFrom: simsFilterState.activatedFrom,
+                activatedTo: simsFilterState.activatedTo,
+                search: simsFilterState.search,
+                columnFilters: JSON.parse(JSON.stringify(simsColumnFilters)),
+                sortKey: tableState.sims.sortKey,
+                sortDir: tableState.sims.sortDir,
+            };
+        }
+
+        function saveCurrentSimsFilter() {
+            const name = (prompt('Name this filter') || '').trim();
+            if (!name) return;
+            const list = loadSimsSavedFilters();
+            const state = captureSimsFilterState();
+            const existing = list.findIndex(function (f) { return f.name.toLowerCase() === name.toLowerCase(); });
+            if (existing !== -1) {
+                if (!confirm('A filter named "' + name + '" already exists. Replace it?')) return;
+                list[existing] = { name: name, state: state };
+            } else {
+                list.push({ name: name, state: state });
+            }
+            persistSimsSavedFilters(list);
+            renderSimsSavedFilters();
+            showToast('Saved filter "' + name + '"', 'success');
+        }
+
+        function applySimsSavedFilter(name) {
+            const entry = loadSimsSavedFilters().find(function (f) { return f.name === name; });
+            if (!entry || !entry.state) return;
+            const st = entry.state;
+
+            // Status and reseller are applied server-side, so a change in either
+            // has to go back to the API; everything else is a local re-filter.
+            const needsRefetch =
+                JSON.stringify(st.status || []) !== JSON.stringify(simsFilterState.status) ||
+                JSON.stringify(st.resellerIds || []) !== JSON.stringify(simsFilterState.resellerIds);
+
+            simsFilterState.status = [...(st.status || [])];
+            simsFilterState.resellerIds = [...(st.resellerIds || [])];
+            simsFilterState.vendors = [...(st.vendors || [])];
+            simsFilterState.gateways = [...(st.gateways || [])];
+            simsFilterState.activatedFrom = st.activatedFrom || '';
+            simsFilterState.activatedTo = st.activatedTo || '';
+            simsFilterState.search = st.search || '';
+            // Drop filters naming a column that no longer exists, rather than
+            // silently matching nothing.
+            simsColumnFilters = (st.columnFilters || []).filter(function (f) { return SIMS_COLUMN_BY_KEY[f.col]; });
+            if (st.sortKey) { tableState.sims.sortKey = st.sortKey; tableState.sims.sortDir = st.sortDir || 'asc'; }
+
+            const fa = document.getElementById('filter-activated-from'); if (fa) fa.value = simsFilterState.activatedFrom;
+            const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = simsFilterState.activatedTo;
+            const sa = document.getElementById('sims-search');            if (sa) sa.value = simsFilterState.search;
+
+            tableState.sims.page = 1;
+            if (needsRefetch) loadSims(true); else renderSims();
+        }
+
+        function deleteSimsSavedFilter(name) {
+            if (!confirm('Delete saved filter "' + name + '"?')) return;
+            persistSimsSavedFilters(loadSimsSavedFilters().filter(function (f) { return f.name !== name; }));
+            renderSimsSavedFilters();
+        }
+
+        function renderSimsSavedFilters() {
+            const host = document.getElementById('sims-saved-filters');
+            if (!host) return;
+            const list = loadSimsSavedFilters();
+            const saveBtn = '<button onclick="saveCurrentSimsFilter()" title="Save the current filters and sort under a name" class="px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">+ Save current filter</button>';
+            if (!list.length) {
+                host.innerHTML = '<span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Saved</span>' + saveBtn +
+                    '<span class="text-xs text-gray-500 ml-1">No saved filters yet — set up a view, then save it.</span>';
+                return;
+            }
+            host.innerHTML = '<span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Saved</span>' +
+                list.map(function (f) {
+                    const n = esc(f.name);
+                    const attr = n.replace(/'/g, '&#39;');
+                    return '<span class="inline-flex items-center rounded-full border border-dark-500 bg-dark-700 overflow-hidden">' +
+                           '<button onclick="applySimsSavedFilter(\'' + attr + '\')" title="Apply this filter" class="px-2.5 py-1 text-xs text-gray-300 hover:bg-dark-600 transition">' + n + '</button>' +
+                           '<button onclick="deleteSimsSavedFilter(\'' + attr + '\')" title="Delete" class="px-1.5 py-1 text-xs text-gray-400 hover:text-white hover:bg-dark-600 transition">&times;</button>' +
+                           '</span>';
+                }).join('') + saveBtn;
         }
 
         // --- Per-column filter popover --------------------------------------
@@ -5541,11 +5655,6 @@ set verify_pending; schedule §C.3 poll
             tableState.sims.page = 1;
             renderSims();
         }
-        function onSimsPresetChange(v) {
-            simsFilterState.presets = new Set(v ? [v] : []);
-            tableState.sims.page = 1;
-            renderSims();
-        }
         function onSimsActivatedFromChange(v) {
             simsFilterState.activatedFrom = v || '';
             tableState.sims.page = 1;
@@ -5557,45 +5666,10 @@ set verify_pending; schedule §C.3 poll
             renderSims();
         }
 
-        // ===== SIMs filter UI: presets, multi-select popover, active chips =====
+        // ===== SIMs filter UI: saved filters, multi-select popover, active chips =====
         function getResellerOptions() {
             const cache = window._simsResellersCache || [];
             return cache.map(function(r){ return { value: String(r.id), text: r.name || ('#' + r.id) }; });
-        }
-        function renderSimsPresetChips() {
-            document.querySelectorAll('[data-preset]').forEach(function(btn){
-                const id = btn.getAttribute('data-preset');
-                const active = simsFilterState.presets.has(id);
-                btn.className = active
-                    ? 'sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-accent bg-accent text-white transition'
-                    : 'sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition';
-            });
-        }
-        function toggleSimsPreset(id) {
-            if (simsFilterState.presets.has(id)) {
-                // Toggling off — leave other filters alone.
-                simsFilterState.presets.delete(id);
-                tableState.sims.page = 1;
-                renderSimsPresetChips();
-                renderSims();
-                return;
-            }
-            // Activating preset: clear all non-preset filters first.
-            const hadServerFilters = simsFilterState.status.length > 0 || simsFilterState.resellerIds.length > 0;
-            simsFilterState.status = [];
-            simsFilterState.resellerIds = [];
-            simsFilterState.vendors = [];
-            simsFilterState.gateways = [];
-            simsFilterState.activatedFrom = '';
-            simsFilterState.activatedTo = '';
-            simsFilterState.search = '';
-            const fa = document.getElementById('filter-activated-from'); if (fa) fa.value = '';
-            const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = '';
-            const sa = document.getElementById('sims-search');            if (sa) sa.value = '';
-            simsFilterState.presets.add(id);
-            tableState.sims.page = 1;
-            renderSimsPresetChips();
-            if (hadServerFilters) loadSims(true); else renderSims();
         }
         function setSimsCountBadges() {
             function fmt(arr){ return (arr && arr.length > 0) ? '(' + arr.length + ')' : ''; }
@@ -5651,11 +5725,6 @@ set verify_pending; schedule §C.3 poll
                 }
                 chips.push(chipEl('reseller', v, display, 'Reseller'));
             });
-            // Presets
-            simsFilterState.presets.forEach(function(id){
-                const p = SIM_PRESETS[id];
-                if (p) chips.push(chipEl('preset', id, p.label, 'Preset'));
-            });
             // Date range
             if (simsFilterState.activatedFrom) chips.push(chipEl('activatedFrom', simsFilterState.activatedFrom, simsFilterState.activatedFrom, 'From'));
             if (simsFilterState.activatedTo)   chips.push(chipEl('activatedTo',   simsFilterState.activatedTo,   simsFilterState.activatedTo,   'To'));
@@ -5685,10 +5754,6 @@ set verify_pending; schedule §C.3 poll
                 loadSims(true);
                 return;
             }
-            else if (kind === 'preset') {
-                simsFilterState.presets.delete(key);
-                renderSimsPresetChips();
-            }
             else if (kind === 'activatedFrom') { simsFilterState.activatedFrom = ''; const el = document.getElementById('filter-activated-from'); if (el) el.value = ''; }
             else if (kind === 'activatedTo')   { simsFilterState.activatedTo = '';   const el = document.getElementById('filter-activated-to');   if (el) el.value = ''; }
             else if (kind === 'search') {        simsFilterState.search = '';        const el = document.getElementById('sims-search');           if (el) el.value = ''; }
@@ -5700,7 +5765,6 @@ set verify_pending; schedule §C.3 poll
             simsFilterState.resellerIds = [];
             simsFilterState.vendors = [];
             simsFilterState.gateways = [];
-            simsFilterState.presets = new Set();
             simsFilterState.activatedFrom = '';
             simsFilterState.activatedTo = '';
             simsFilterState.search = '';
@@ -5709,7 +5773,6 @@ set verify_pending; schedule §C.3 poll
             const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = '';
             const sa = document.getElementById('sims-search');            if (sa) sa.value = '';
             tableState.sims.page = 1;
-            renderSimsPresetChips();
             loadSims(true);
         }
         function openSimsFilterMenu(kind, anchorEl) {
@@ -5878,7 +5941,7 @@ set verify_pending; schedule §C.3 poll
             if (s.vendors.length)      params.set('vendor', s.vendors.join(','));
             if (s.gateways.length)     params.set('gateway', s.gateways.join(','));
             if (s.resellerIds.length)  params.set('reseller', s.resellerIds.join(','));
-            if (s.presets.size > 0)    params.set('presets', Array.from(s.presets).join(','));
+            if (simsColumnFilters.length) params.set('cols', JSON.stringify(simsColumnFilters));
             if (s.activatedFrom)       params.set('from', s.activatedFrom);
             if (s.activatedTo)         params.set('to', s.activatedTo);
             if (s.search)              params.set('search', s.search);
@@ -5911,7 +5974,26 @@ set verify_pending; schedule §C.3 poll
                     return Number.isFinite(n) ? n : v;
                 });
             }
-            if (params.has('presets'))   s.presets = new Set(params.get('presets').split(',').filter(Boolean));
+            if (params.has('cols')) {
+                // Unknown columns are dropped rather than left to match nothing.
+                try {
+                    const parsed = JSON.parse(params.get('cols'));
+                    if (Array.isArray(parsed)) {
+                        simsColumnFilters = parsed.filter(function(f){ return f && SIMS_COLUMN_BY_KEY[f.col]; });
+                    }
+                } catch (e) { /* malformed link: ignore rather than break the page */ }
+            }
+            // Links predating saved filters used ?presets=not_notified. Keep
+            // them working by mapping onto the computed column.
+            if (params.has('presets')) {
+                const legacy = { not_notified: 'notify_stale', not_rotated_today: 'not_rotated_today', portin_failed: 'portin_failed', stuck_provisioning: 'stuck_provisioning', no_sms_12h: 'no_sms_12h', no_reseller: 'no_reseller' };
+                params.get('presets').split(',').filter(Boolean).forEach(function(id){
+                    const col = legacy[id];
+                    if (col && !simsColumnFilters.some(function(f){ return f.col === col; })) {
+                        simsColumnFilters.push({ col: col, op: 'is_true' });
+                    }
+                });
+            }
             if (params.has('from'))      s.activatedFrom = params.get('from');
             if (params.has('to'))        s.activatedTo = params.get('to');
             if (params.has('search'))    s.search = params.get('search');
@@ -6050,7 +6132,8 @@ set verify_pending; schedule §C.3 poll
             const blank = (v) => v == null || v === '';
 
             return [...arr].sort((a, b) => {
-                const ra = a[key], rb = b[key];
+                const ra = col ? simColValue(a, col) : a[key];
+                const rb = col ? simColValue(b, col) : b[key];
                 if (blank(ra) && blank(rb)) return 0;
                 if (blank(ra)) return 1;
                 if (blank(rb)) return -1;
@@ -6266,7 +6349,7 @@ set verify_pending; schedule §C.3 poll
                         '<span class="tabular-nums w-16">' + v.total + '</span>' +
                         '<span class="text-xs text-gray-500 ml-1 w-10">' + pct + '%</span>' +
                         (stale > 0
-                            ? '<a href="/sims?presets=not_notified" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + stale + ' stale &rarr;</a>'
+                            ? '<a href="/sims?notify_stale=1" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + stale + ' stale &rarr;</a>'
                             : '<span class="ml-auto text-xs text-emerald-400">&#10003; all fresh</span>') +
                     '</div>';
             });
@@ -6279,7 +6362,7 @@ set verify_pending; schedule §C.3 poll
                 '<span class="text-white tabular-nums w-16">' + totalTotal + '</span>' +
                 '<span class="text-xs text-gray-500 ml-1 w-10">' + totalPct + '%</span>' +
                 (totalStale > 0
-                    ? '<a href="/sims?presets=not_notified" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + totalStale + ' stale &rarr;</a>'
+                    ? '<a href="/sims?notify_stale=1" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + totalStale + ' stale &rarr;</a>'
                     : '<span class="ml-auto text-xs text-emerald-400">&#10003; all fresh</span>') +
                 '</div>';
             rows.innerHTML = html;
@@ -6288,12 +6371,10 @@ set verify_pending; schedule §C.3 poll
         function goToStaleSims() {
             try {
                 if (typeof switchTab === 'function') switchTab('sims');
-                history.replaceState(null, '', '/sims?presets=not_notified');
+                history.replaceState(null, '', '/sims?notify_stale=1');
                 setTimeout(function(){
-                    if (typeof simsFilterState !== 'undefined') {
-                        simsFilterState.presets = new Set(['not_notified']);
-                        if (typeof renderSimsPresetChips === 'function') renderSimsPresetChips();
-                        if (typeof renderSims === 'function') renderSims();
+                    if (typeof setSimsColumnFilter === 'function') {
+                        setSimsColumnFilter({ col: 'notify_stale', op: 'is_true' });
                     }
                 }, 50);
             } catch(e) { console.error('goToStaleSims failed', e); }
@@ -6946,21 +7027,16 @@ function getFilteredSims() {
   // Activated date range
   if (simsFilterState.activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= simsFilterState.activatedFrom);
   if (simsFilterState.activatedTo) data = data.filter(s => s.activated_at && s.activated_at <= simsFilterState.activatedTo + 'T23:59:59');
-  // Presets (AND across active presets)
-  for (const pid of simsFilterState.presets) {
-    const p = SIM_PRESETS[pid];
-    if (p && p.test) data = data.filter(p.test);
-  }
   // Per-column filters (AND across columns), applied last so they narrow
-  // whatever the presets and toolbar selections already produced.
+  // whatever the toolbar selections already produced.
   data = applySimsColumnFilters(data);
   return genericSort(data, state.sortKey, state.sortDir, 'sims');
 }
 
 function renderSims() {
-  renderSimsPresetChips();
   renderSimsActiveChips();
   populateSimsAddFilter();
+  renderSimsSavedFilters();
   renderSimsColumnFilterChips();
   syncSimsColumnFilterIcons();
   setSimsCountBadges();
@@ -6980,7 +7056,7 @@ function renderSims() {
                 const fs = simsFilterState;
                 const hasFilters = (fs.status.length > 0 && !(fs.status.length === 1 && fs.status[0] === 'active'))
                     || fs.vendors.length || fs.gateways.length || fs.resellerIds.length
-                    || fs.presets.size > 0 || fs.activatedFrom || fs.activatedTo || fs.search
+                    || fs.activatedFrom || fs.activatedTo || fs.search
                     || simsColumnFilters.length;
                 if (hasFilters) {
                     tbody.innerHTML = '<tr><td colspan="16" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';

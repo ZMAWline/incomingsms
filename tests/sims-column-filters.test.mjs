@@ -24,14 +24,17 @@ const now = Date.now();
 const iso = (ms) => new Date(ms).toISOString();
 
 const ROWS = [
-  { id: 1, status: 'active',       vendor: 'teltik',   hosting_port_state: 'online',  sms_count: 12, last_sms_received: iso(now - 2 * 3600e3),  port: '1A', rotation_eligible: true,  iccid: '8901410000000000001', reseller_name: 'Acme' },
-  { id: 2, status: 'active',       vendor: 'atomic',   hosting_port_state: 'offline', sms_count: 0,  last_sms_received: null,                    port: '2B', rotation_eligible: false, iccid: '8901410000000000002', reseller_name: null },
-  { id: 3, status: 'provisioning', vendor: 'teltik',   hosting_port_state: 'online',  sms_count: 5,  last_sms_received: iso(now - 40 * 3600e3), port: '1A', rotation_eligible: true,  iccid: '8901410000000000003', reseller_name: 'Beta' },
-  { id: 4, status: 'suspended',    vendor: 'wing_iot', hosting_port_state: null,      sms_count: 99, last_sms_received: iso(now - 1 * 3600e3),  port: null, rotation_eligible: true,  iccid: '8901410000000000004', reseller_name: 'Acme' },
+  { id: 1, status: 'active',       vendor: 'teltik',   hosting_port_state: 'online',  sms_count: 12, last_sms_received: iso(now - 2 * 3600e3),  port: '1A', rotation_eligible: true,  iccid: '8901410000000000001', reseller_name: 'Acme', reseller_id: 12 },
+  { id: 2, status: 'active',       vendor: 'atomic',   hosting_port_state: 'offline', sms_count: 0,  last_sms_received: null,                    port: '2B', rotation_eligible: false, iccid: '8901410000000000002', reseller_name: null, reseller_id: null },
+  { id: 3, status: 'provisioning', vendor: 'teltik',   hosting_port_state: 'online',  sms_count: 5,  last_sms_received: iso(now - 40 * 3600e3), port: '1A', rotation_eligible: true,  iccid: '8901410000000000003', reseller_name: 'Beta', reseller_id: 7 },
+  { id: 4, status: 'suspended',    vendor: 'wing_iot', hosting_port_state: null,      sms_count: 99, last_sms_received: iso(now - 1 * 3600e3),  port: null, rotation_eligible: true,  iccid: '8901410000000000004', reseller_name: 'Acme', reseller_id: 12 },
 ];
 
 function makeEngine() {
   const src = [
+    // The computed columns reference these predicates at object-literal
+    // construction time, so they have to come along.
+    slice('function simNotRotatedToday(s)', 'const SIMS_COLUMNS = ['),
     slice('const SIMS_COLUMNS = [', 'let simsColumnVis'),
     slice('function genericSort(arr, key, dir, table)', 'function normalizePastedSearch'),
     // simsColumnFilters and SIMS_COLUMNS are let/const, so they are lexical
@@ -135,4 +138,63 @@ test('every visible sort header has a matching filter button', () => {
       'column ' + key + ' is sortable but has no filter button'
     );
   }
+});
+
+// --- computed columns --------------------------------------------------
+// These carry the judgement the removed Quick preset chips encoded. Unlike the
+// chips they compose with other filters and can live in a saved filter.
+
+test('computed columns derive their value instead of reading a field', () => {
+  const e = makeEngine();
+  // Row 2 has no reseller; the rest do.
+  assert.deepStrictEqual(e.filter([{ col: 'no_reseller', op: 'is_true' }]), [2]);
+  // Row 2 has no last_sms_received and row 3's is 40h old.
+  assert.deepStrictEqual(e.filter([{ col: 'no_sms_12h', op: 'is_true' }]), [2, 3]);
+});
+
+test('computed columns compose with ordinary ones', () => {
+  const e = makeEngine();
+  assert.deepStrictEqual(e.filter([
+    { col: 'no_sms_12h', op: 'is_true' },
+    { col: 'vendor', op: 'in', value: ['teltik'] },
+  ]), [3]);
+});
+
+test('a computed column that throws is treated as unknown, not a crash', () => {
+  const e = makeEngine();
+  // port_in_pending is absent on every fixture row, so portin_failed is false
+  // rather than throwing on the missing atomic_portin_status_code.
+  assert.deepStrictEqual(e.filter([{ col: 'portin_failed', op: 'is_true' }]), []);
+});
+
+test('the Quick preset chips and their machinery are gone', () => {
+  assert.ok(!/sim-preset-chip/.test(HTML), 'preset chip markup must be removed');
+  assert.ok(!/data-preset=/.test(HTML), 'preset chip buttons must be removed');
+  assert.ok(!/const SIM_PRESETS/.test(HTML), 'the preset registry must be removed');
+  assert.ok(!/function toggleSimsPreset/.test(HTML), 'preset toggling must be removed');
+  assert.ok(!/simsFilterState\.presets/.test(HTML), 'preset state must be removed');
+});
+
+test('saved filters capture and restore the whole filter state', () => {
+  assert.match(HTML, /function saveCurrentSimsFilter/);
+  assert.match(HTML, /function applySimsSavedFilter/);
+  assert.match(HTML, /function deleteSimsSavedFilter/);
+  assert.match(HTML, /simsSavedFilters/, 'must persist under a storage key');
+  // A saved view is worthless if it drops the per-column filters or the sort.
+  const capture = HTML.slice(HTML.indexOf('function captureSimsFilterState'));
+  const body = capture.slice(0, capture.indexOf('\n        }'));
+  for (const field of ['status', 'resellerIds', 'vendors', 'gateways', 'activatedFrom', 'activatedTo', 'search', 'columnFilters', 'sortKey', 'sortDir']) {
+    assert.match(body, new RegExp(field), 'saved filter must capture ' + field);
+  }
+});
+
+test('applying a saved filter refetches only when a server-side field changed', () => {
+  const apply = HTML.slice(HTML.indexOf('function applySimsSavedFilter'));
+  const body = apply.slice(0, apply.indexOf('\n        }\n\n'));
+  assert.match(body, /needsRefetch/, 'status and reseller are server-side and need a refetch');
+  assert.match(body, /if \(needsRefetch\) loadSims\(true\); else renderSims\(\)/);
+});
+
+test('legacy ?presets= links still resolve to the computed columns', () => {
+  assert.match(HTML, /not_notified: 'notify_stale'/, 'the stale-SIMs deep link must keep working');
 });
