@@ -162,10 +162,18 @@ export async function resolveApiKeyUser(env, request, ctx) {
 
 const SELECT_PUBLIC = 'id,name,key_prefix,role,enabled,created_by,created_at,last_used_at,revoked_at';
 
+// Unlike the auth path, this one surfaces a database failure instead of
+// swallowing it. "No keys yet" and "the table is unreachable" look identical
+// to an admin reading the list, and the wrong one of those invites them to
+// mint a duplicate key.
 async function handleList(env) {
-  const keys = await sbRows(env,
+  const r = await sb(env,
     'dashboard_api_keys?select=' + SELECT_PUBLIC + '&order=created_at.desc&limit=500');
-  return json({ ok: true, keys });
+  if (!r.ok) {
+    return json({ ok: false, error: 'supabase_' + r.status, detail: (await r.text()).slice(0, 300) }, 502);
+  }
+  const keys = await r.json().catch(() => []);
+  return json({ ok: true, keys: Array.isArray(keys) ? keys : [] });
 }
 
 async function handleCreate(request, env, user) {
