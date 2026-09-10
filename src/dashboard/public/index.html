@@ -6779,8 +6779,20 @@ set verify_pending; schedule §C.3 poll
         setTimeout(refreshReviewBadge, 2000);
 
         // ===== Teltik hosting port status (Sims table) =====
+        // Mirror of gatewayHostOf() in src/shared/gateway-host.mjs.
+        //
+        // gateway_host is the PHYSICAL gateway the card is seated in — 'skyline'
+        // or 'teltik'. vendor is the CARRIER ACCOUNT (teltik = T-Mobile,
+        // atomic/helix/wing_iot = AT&T) and must never decide the host: an
+        // AT&T SIM can sit in a Teltik gateway. sims.gateway_host is NOT NULL,
+        // so the fallback only fires for objects built in code; it resolves to
+        // teltik because SkyLine is legacy and always carries an explicit value.
+        function gatewayHostOf(sim) {
+            const h = sim && sim.gateway_host;
+            return (h === 'skyline' || h === 'teltik') ? h : 'teltik';
+        }
         function isTeltikHostedSim(sim) {
-            return sim.gateway_host === 'teltik' || (!sim.gateway_host && sim.vendor === 'teltik');
+            return gatewayHostOf(sim) === 'teltik';
         }
         // Latest persisted Hosting Port Status across ALL sources (cron, bulk,
         // SIM query, remediator) + uptime stats, straight from /api/sims.
@@ -7101,7 +7113,15 @@ function renderSims() {
                 const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
                 const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
                 const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-accent" title="Verified">&#10003;</span>' : '';
-                const gatewayDisplay = sim.gateway_code ? `<span class="font-medium text-gray-200">${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">${normalizePortDisplay(sim.port) || ''}</span>` : (sim.vendor === 'teltik' ? '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-pink-500/20 text-pink-300">T-Mobile</span>' : (normalizePortDisplay(sim.port) || '-'));
+                // Gateway has exactly two values: a SkyLine gateway, or hosted
+                // by Teltik. T-Mobile is the carrier (sim.vendor) and belongs in
+                // the Vendor column, not here.
+                const simHost = gatewayHostOf(sim);
+                const gatewayDisplay = simHost === 'skyline'
+                    ? (sim.gateway_code
+                        ? `<span class="font-medium text-gray-200">${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">${normalizePortDisplay(sim.port) || ''}</span>`
+                        : `<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-amber-500/20 text-amber-300" title="Marked SkyLine-hosted but assigned to no gateway — the row is inconsistent">SkyLine &mdash; unassigned</span>`)
+                    : '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-sky-500/20 text-sky-300" title="Hosted by Teltik — not seated in a SkyLine gateway">Teltik</span>';
                 const statusClass = {
                     'active': 'bg-accent/20 text-accent',
                     'provisioning': 'bg-yellow-500/20 text-yellow-400',
