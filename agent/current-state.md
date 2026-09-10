@@ -1,9 +1,51 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-10 (Agent API — destructive routes fenced from API keys, DEPLOYED TO PROD)
+> Last updated: 2026-09-10 (SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API)
 
 ---
+
+## Session 2026-09-10 — SIMs table: per-column filtering + saved filters (branch `table-redsign`, PR #104)
+
+**Shipped to PROD** as `ae5e4756`, reconciled with the Agent API (#103) — both
+changesets verified present in the downloaded bundle.
+
+- **Per-column filtering.** `SIMS_COLUMNS` registry with per-type operators (enum,
+  number, date, text, bool). Funnel button on every sortable header, plus a picker
+  for columns the table does not render. Filters AND together, show as chips, and
+  run client-side over the ~4.3k loaded rows.
+- **Named saved filters** replace the Quick preset chips. localStorage, so
+  per-browser not per-account. The six preset predicates became computed columns
+  (`notify_stale`, `not_rotated_today`, `portin_failed`, `stuck_provisioning`,
+  `no_sms_12h`, `no_reseller`) via a `compute` hook on the registry — needed because
+  `notify_stale`'s window is vendor-specific (48h Teltik / 24h otherwise) and no
+  plain date filter expresses it.
+- **`Cancelled (0)` fixed.** Counts tallied loaded rows while status is filtered
+  server-side (`status=neq.canceled`), so the count could only ever be 0 — 772
+  existed. New `GET /api/sims/status-counts` tallies the whole table; the menu falls
+  back to loaded rows if it fails. Also surfaces statuses missing from the hardcoded
+  list (`rotation_failed`, 6 SIMs, previously unfilterable).
+- **Gateway column showed the carrier.** Rendered "T-Mobile" for any SIM with
+  `vendor === 'teltik'`. `vendor` is the carrier account, `gateway_host` the
+  hardware — the exact conflation `src/shared/gateway-host.mjs` exists to prevent.
+  Now resolves the host: SkyLine code, or `Teltik`. Rows marked skyline with no
+  gateway assigned render "SkyLine — unassigned" instead of a bare dash.
+- **No native browser dialogs.** 17 `alert`/`confirm`/`prompt` calls converted to
+  `showToast`/`showConfirm`/`showTextPrompt` (new). No signature changed — every
+  `confirm`/`prompt` caller was already async. Guarded by a test.
+- **`/api/sims` load path:** ~23 round trips in 7 sequential stages → 3.
+  `supabaseGetAllArray` now reads the exact count from page one's `Content-Range`
+  and fetches the rest in parallel, falling back to serial paging if the header is
+  absent. All 16 callers benefit. The DB was never the bottleneck (8.7ms select,
+  ~6ms warm RPC) — it was the shape of the calls.
+- **`patch-dashboard` skill Steps 5 and 6 rewritten.** See decision log.
+
+879 tests pass.
+
+**Open:** 4 SIMs in TEST have `gateway_host='skyline'` with no `gateway_id`
+(ids 5345-5348, the highest ids — look like leftovers of the cohort `de1f1b7`
+fixed). Not written to. Saved filters are localStorage-only; making them
+per-account needs a table.
 
 ## Session 2026-09-10 — Agent API: API keys and an audit trail (branch `agent-api`, PR #103)
 
@@ -59,10 +101,19 @@ secrets (TEST holds none) rather than on auth; `dashboard_audit_log` rows presen
 actor `apikey:agent-test`, `break-glass`, and a real session user; `last_used_at`
 updating. The TEST key is at `/root/.config/incomingsms/agent-api-key.test` (mode 600).
 
-**Deployed to PROD** (`dashboard.zalmen-531.workers.dev`, worker version
-`e21999ea-9cda-401a-b522-e399830d17ba` or later). PROD key `agent-prod` (role
-operator) created from the Users tab and lives at
+**Deployed to PROD** (`dashboard.zalmen-531.workers.dev`). PROD key `agent-prod`
+(role operator) created from the Users tab and lives at
 `/root/.config/incomingsms/agent-api-key.prod` (mode 600).
+
+> **Correction (2026-09-10, later session).** The version originally recorded here,
+> `e21999ea-9cda-401a-b522-e399830d17ba`, was **not** this deploy — it was the
+> `table-redsign` session's build, which contained no Agent API. Two sessions
+> deployed to prod minutes apart and each removed the other's work: `e21999ea`
+> (redesign, no agent API) was replaced at 16:28 by `91b3d56c` (agent API, no
+> redesign). Reading "current prod version" and recording it as your own deploy is
+> unsafe while other sessions are live. Both changesets were reconciled by merging
+> and deploying once as `ae5e4756`; verified by downloading the running bundle and
+> finding both `/api/keys` and `/api/sims/status-counts` in it.
 
 **Deliberately NOT done — the remaining work**
 
@@ -730,7 +781,7 @@ INC-3 Phase 1 is fully live in production. Next: monitor for reseller intake, wa
 - **2026-05-28 (board-approved): deleted the 299 `DUP_EXTRA` test rows.** rentals(reseller 3) now 17,429 (17,369 with trustotp_id, 60 without). The 60: 12 are "End date updated" resends (correctly non-billable), 48 have no stored number.online response within 25h (40 on 05-26 AT&T — possible webhook-storage gap). Rental-mode total 05-14..28 = **$24,048.90**.
 - **dashboard-test enhancement (commit 200ab3e):** `computeRentalBilling` returns `total_with_trustotp_id`/`total_without_trustotp_id`; new paginated `/api/billing/rental-export` CSV (internal_rental_id, rental_date, carrier, sim_id, mdn, trustotp_rental_id); invoice preview shows authoritative matched/unmatched count + export button in rental mode. Deployed dashboard-test `346bc6f6`. Production dashboard NOT deployed.
 - **Pending child issue (approved, not yet created — no Paperclip API access from this runtime):** production dedup-key hardening so capture never mints a 2nd internal rental for a same-MDN resend lifetime; key on number lifetime + TrustOTP "Rental created" response. Gated: plan only, no prod deploy/cutover.
-- **Dashboard:** `/api/billing/preview` now accepts `?billing_mode=rental` (commit `7df2dbd`); absent ⇒ legacy. Deployed to **dashboard-test only** (`ae12461b`). Prod dashboard/portal/sync NOT redeployed; QBO invoice path stays legacy.
+- **Dashboard:** `/api/billing/preview` now accepts `?billing_mode=rental` (commit `7df2dbd`); absent ⇒ legacy. ~~Deployed to **dashboard-test only** (`ae12461b`). Prod NOT redeployed.~~ **Superseded:** `00895e9` made rental the default for preview and generate, with legacy behind a compare toggle, and prod has carried `billing_mode` since. This line held back three prod deploys in the 2026-09-10 session before it was checked against the running bundle.
 - Rental preview validated: total **$45.60** (24×$1.10 + 12×$1.60), `rate_fallback_used=false`.
 
 ## Session 61 (2026-05-26) — Relay (530) outage remediation + rotation stamp hardening
