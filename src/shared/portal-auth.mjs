@@ -163,8 +163,12 @@ export function isValidRole(role) {
 // listed as a read requires operator. A newly added route is therefore closed
 // to viewers by default, and adding a read route is a conscious edit here.
 
-// Admin-only regardless of method — managing who can log in.
-const ADMIN_ONLY_ALL = ['/api/users', '/api/invites'];
+// Admin-only regardless of method — managing who (or what) can log in.
+// /api/keys mints and revokes agent API keys, which are credentials in exactly
+// the sense a user account is; src/dashboard/api-keys.mjs adds the second half
+// of that fence, refusing the route to API keys of any role so a leaked key
+// cannot mint its own replacement.
+const ADMIN_ONLY_ALL = ['/api/users', '/api/invites', '/api/keys'];
 
 // Money. Readable by anyone logged in, mutable only by admins.
 const ADMIN_ONLY_WRITE = [
@@ -223,3 +227,40 @@ export function canAccess(role, method, pathname) {
   if (!have) return false;
   return have >= ROLE_RANK[requiredRole(method, pathname)];
 }
+
+// --- API-key fence --------------------------------------------------------
+//
+// A second, narrower gate that runs after canAccess() and only for callers who
+// authenticated with an API key (`authType === 'api_key'`). The role matrix
+// above answers "may this role do this?"; this list answers a different
+// question — "is this something a machine should be able to do unattended?" —
+// and the answer is no regardless of the key's role, admin included.
+//
+// These four routes end a line's life or rewind it: /api/cancel and
+// /api/debug-cancel deactivate at the carrier, /api/delete-sim removes the row,
+// /api/reset-to-provisioning wipes activated_at and sends the line back through
+// the activation machinery. /api/set-sim-status is here because its valid-status
+// list includes `canceled`, which also releases the reseller assignment
+// (see handleSetSimStatus in src/dashboard/index.js) — it is not a
+// suspend/restore toggle.
+//
+// Human sessions are untouched: an operator human keeps exactly the access the
+// role matrix grants. Deliberately a separate list from the role lists so that
+// widening a role never silently widens what a key can reach.
+const API_KEY_DENIED_ROUTES = [
+  '/api/cancel',
+  '/api/debug-cancel',
+  '/api/delete-sim',
+  '/api/reset-to-provisioning',
+  '/api/set-sim-status',
+];
+
+// True when an API-key caller may reach this path. Path-first (prefix match,
+// so sub-paths are covered) and method-blind, for the same reason the role
+// matrix is: a route that loses its method guard must stay fenced. Never
+// throws.
+export function apiKeyMayAccess(pathname) {
+  return !matches(String(pathname || ''), API_KEY_DENIED_ROUTES);
+}
+
+export { API_KEY_DENIED_ROUTES };

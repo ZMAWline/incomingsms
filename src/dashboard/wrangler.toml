@@ -9,8 +9,12 @@ workers_dev = true
 [triggers]
 crons = ["0 */12 * * *", "* * * * *"]
 
+# DASHBOARD_ENV names the environment inside generated agent API keys
+# (zmaw_live_… vs zmaw_test_…), so a key is self-identifying and a TEST key
+# pasted at PROD is a format mismatch rather than a puzzling 401.
 [vars]
 WING_EXPECTED_RATE = "5.00"
+DASHBOARD_ENV = "live"
 
 # Frontend (public/index.html + public/static/*) is deployed as static assets.
 # run_worker_first keeps the worker's Basic-auth gate in front of EVERYTHING —
@@ -83,6 +87,7 @@ crons = []
 
 [env.test.vars]
 WING_EXPECTED_RATE = "5.00"
+DASHBOARD_ENV = "test"
 
 [env.test.assets]
 directory = "./public"

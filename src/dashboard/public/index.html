@@ -1037,6 +1037,12 @@
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
                     <span class="text-sm">Profile</span>
                 </a>
+                <!-- Operator+ only. Unhidden by applyRoleToUi(); viewers never act, so
+                     an audit of actions has nothing in it for them. -->
+                <a id="nav-audit" href="/audit" onclick="event.preventDefault();switchTab('audit')" data-tab="audit" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200 hidden" title="Audit log">
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                    <span class="text-sm">Audit log</span>
+                </a>
                 <!-- Admin-only. Unhidden by applyRoleToUi() when /auth/me says admin. -->
                 <!-- `flex` and `hidden` together is intentional and matches the other
                      nav items: Tailwind emits .hidden after .flex, so display:none wins
@@ -1360,6 +1366,89 @@
                             </tr>
                         </thead>
                         <tbody id="invites-tbody"></tbody>
+                    </table>
+                </div>
+
+                <!-- Agent API keys. Same three roles as people, checked by the same
+                     matrix, so an operator key can do exactly what an operator can. -->
+                <h3 class="font-medium mt-8 mb-2">Agent API keys</h3>
+                <p class="text-sm text-dark-400 mb-3">Credentials for machine callers. The key is shown once, when you create it — it is stored hashed and cannot be shown again.</p>
+
+                <div class="mb-4 p-4 rounded-lg" style="background:var(--mc-paper);border:1px solid var(--mc-line);">
+                    <div class="flex flex-wrap items-end gap-3">
+                        <div>
+                            <label class="block text-xs mb-1" for="apikey-name">Name</label>
+                            <input id="apikey-name" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);" placeholder="agent-test">
+                        </div>
+                        <div>
+                            <label class="block text-xs mb-1" for="apikey-role">Role</label>
+                            <select id="apikey-role" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                                <option value="operator">Operator — SIM actions, no billing or users</option>
+                                <option value="viewer">Viewer — read only</option>
+                                <option value="admin">Admin — everything</option>
+                            </select>
+                        </div>
+                        <button onclick="createApiKey()" class="px-4 py-2 rounded text-sm font-medium" style="background:var(--mc-ink);color:var(--mc-paper);">Create key</button>
+                    </div>
+                    <div id="apikey-result" class="mt-3 text-sm hidden">
+                        <p class="mb-1">Copy this now. It will not be shown again.</p>
+                        <div class="flex gap-2">
+                            <input id="apikey-plaintext" readonly class="flex-1 px-3 py-2 rounded border text-xs font-mono" style="background:var(--mc-bg);border-color:var(--mc-line);">
+                            <button onclick="copyApiKey()" class="px-3 py-2 rounded text-sm border" style="border-color:var(--mc-line);">Copy</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overflow-x-auto rounded-lg" style="border:1px solid var(--mc-line);">
+                    <table class="w-full text-sm">
+                        <thead style="background:var(--mc-paper);">
+                            <tr class="text-left">
+                                <th class="px-4 py-2 font-medium">Name</th>
+                                <th class="px-4 py-2 font-medium">Prefix</th>
+                                <th class="px-4 py-2 font-medium">Role</th>
+                                <th class="px-4 py-2 font-medium">Status</th>
+                                <th class="px-4 py-2 font-medium">Last used</th>
+                                <th class="px-4 py-2 font-medium">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="apikeys-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="tab-audit" class="tab-content hidden">
+                <div class="mb-6">
+                    <h2 class="text-xl font-semibold">Audit log</h2>
+                    <p class="text-sm text-dark-400">Every acting request against the API, by the caller that made it. Newest first.</p>
+                </div>
+
+                <div class="flex flex-wrap items-end gap-3 mb-4">
+                    <div>
+                        <label class="block text-xs mb-1" for="audit-actor">Actor</label>
+                        <input id="audit-actor" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);" placeholder="apikey:agent-test" onkeydown="if(event.key==='Enter')loadAuditLog()">
+                    </div>
+                    <div>
+                        <label class="block text-xs mb-1" for="audit-path">Path</label>
+                        <input id="audit-path" class="px-3 py-2 rounded border text-sm" style="background:var(--mc-bg);border-color:var(--mc-line);" placeholder="/api/sim-action" onkeydown="if(event.key==='Enter')loadAuditLog()">
+                    </div>
+                    <button onclick="loadAuditLog()" class="px-4 py-2 rounded text-sm font-medium" style="background:var(--mc-ink);color:var(--mc-paper);">Filter</button>
+                </div>
+
+                <div class="overflow-x-auto rounded-lg" style="border:1px solid var(--mc-line);">
+                    <table class="w-full text-sm">
+                        <thead style="background:var(--mc-paper);">
+                            <tr class="text-left">
+                                <th class="px-4 py-2 font-medium">When</th>
+                                <th class="px-4 py-2 font-medium">Actor</th>
+                                <th class="px-4 py-2 font-medium">Method</th>
+                                <th class="px-4 py-2 font-medium">Path</th>
+                                <th class="px-4 py-2 font-medium">Subject</th>
+                                <th class="px-4 py-2 font-medium">Action</th>
+                                <th class="px-4 py-2 font-medium">Status</th>
+                                <th class="px-4 py-2 font-medium">ms</th>
+                            </tr>
+                        </thead>
+                        <tbody id="audit-tbody"></tbody>
                     </table>
                 </div>
             </div>
@@ -4728,6 +4817,7 @@ set verify_pending; schedule §C.3 poll
             'api-tester': '/api-tester',
             'activation-runs': '/activation-runs',
             'users': '/users',
+            'audit': '/audit',
             'profile': '/profile',
         };
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
@@ -4812,6 +4902,7 @@ set verify_pending; schedule §C.3 poll
                 try { if (tabName === 'workers') loadHostingPortJobs(); } catch(e) { console.error('switchTab autoLoad failed for workers', e); }
                 try { if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); } } catch(e) { console.error('switchTab autoLoad failed for activation-runs', e); }
                 try { if (tabName === 'users') loadUsers(); } catch(e) { console.error('switchTab autoLoad failed for users', e); }
+                try { if (tabName === 'audit') loadAuditLog(); } catch(e) { console.error('switchTab autoLoad failed for audit', e); }
                 try { if (tabName === 'profile') loadProfile(); } catch(e) { console.error('switchTab autoLoad failed for profile', e); }
             }
         }
@@ -4840,6 +4931,8 @@ set verify_pending; schedule §C.3 poll
             const role = CURRENT_USER && CURRENT_USER.role;
             const navUsers = document.getElementById('nav-users');
             if (navUsers) navUsers.classList.toggle('hidden', role !== 'admin');
+            const navAudit = document.getElementById('nav-audit');
+            if (navAudit) navAudit.classList.toggle('hidden', role !== 'admin' && role !== 'operator');
             // Viewers get a read-only surface: anything explicitly marked as a
             // write control is hidden rather than left to fail server-side.
             document.querySelectorAll('[data-requires-write]').forEach(function (el) {
@@ -4907,6 +5000,8 @@ set verify_pending; schedule §C.3 poll
             } catch (e) {
                 tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-3">Could not load users: ' + esc(e.message) + '</td></tr>';
             }
+            // The keys table shares the Users tab, so it loads with it.
+            loadApiKeys();
         }
 
         async function updateUser(id, patch) {
@@ -4944,6 +5039,121 @@ set verify_pending; schedule §C.3 poll
             const el = document.getElementById('invite-link');
             el.select();
             try { document.execCommand('copy'); } catch (e) { /* clipboard blocked */ }
+        }
+
+        // --- Agent API keys ------------------------------------------------
+        // Admin-only, and the server refuses the route to API keys of any role,
+        // so this section can only ever be driven by a signed-in person.
+
+        async function loadApiKeys() {
+            const tbody = document.getElementById('apikeys-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-3 text-dark-400">Loading...</td></tr>';
+            try {
+                const res = await fetch('/api/keys');
+                if (res.status === 403) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-3 text-dark-400">Admins only.</td></tr>';
+                    return;
+                }
+                const data = await res.json();
+                const keys = (data && data.keys) || [];
+                tbody.innerHTML = keys.length ? keys.map(function (k) {
+                    const dead = !k.enabled || !!k.revoked_at;
+                    return '<tr style="border-top:1px solid var(--mc-line);">'
+                        + '<td class="px-4 py-2">' + esc(k.name) + '</td>'
+                        + '<td class="px-4 py-2 font-mono text-xs">' + esc(k.key_prefix) + '&hellip;</td>'
+                        + '<td class="px-4 py-2">' + esc(k.role) + '</td>'
+                        + '<td class="px-4 py-2">' + (dead ? 'revoked' : 'active') + '</td>'
+                        + '<td class="px-4 py-2">' + esc(k.last_used_at ? fmtWhen(k.last_used_at) : 'never') + '</td>'
+                        + '<td class="px-4 py-2">'
+                        + (dead ? '' : '<button onclick="revokeApiKey(\'' + esc(k.name) + '\')" class="px-3 py-1 rounded text-xs border" style="border-color:var(--mc-line);">Revoke</button>')
+                        + '</td></tr>';
+                }).join('') : '<tr><td colspan="6" class="px-4 py-3 text-dark-400">No keys yet.</td></tr>';
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-3">Could not load keys: ' + esc(e.message) + '</td></tr>';
+            }
+        }
+
+        async function createApiKey() {
+            const name = document.getElementById('apikey-name').value.trim();
+            const role = document.getElementById('apikey-role').value;
+            if (!name) { showToast('Give the key a name first', 'error'); return; }
+            try {
+                const res = await fetch('/api/keys', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name, role: role })
+                });
+                const data = await res.json().catch(function () { return {}; });
+                if (!res.ok || !data.ok) { showToast(data.error || 'Could not create the key', 'error'); return; }
+                // Shown once. The server stores only a hash, so there is no
+                // second chance to read this value.
+                document.getElementById('apikey-plaintext').value = data.key;
+                document.getElementById('apikey-result').classList.remove('hidden');
+                document.getElementById('apikey-name').value = '';
+                showToast('Key created. Copy it now — it will not be shown again.', 'success');
+                loadApiKeys();
+            } catch (e) { showToast('Could not create the key: ' + e.message, 'error'); }
+        }
+
+        async function revokeApiKey(name) {
+            if (!(await showConfirm('Revoke API key', 'Revoke "' + name + '"? Anything using it stops working immediately.'))) return;
+            try {
+                const res = await fetch('/api/keys/revoke', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: name })
+                });
+                const data = await res.json().catch(function () { return {}; });
+                if (!res.ok || !data.ok) { showToast(data.error || 'Could not revoke the key', 'error'); return; }
+                showToast('Revoked ' + name, 'success');
+            } catch (e) { showToast('Could not revoke the key: ' + e.message, 'error'); }
+            loadApiKeys();
+        }
+
+        function copyApiKey() {
+            const el = document.getElementById('apikey-plaintext');
+            el.select();
+            try { document.execCommand('copy'); showToast('Copied', 'success'); }
+            catch (e) { showToast('Copy blocked by the browser — select and copy manually', 'error'); }
+        }
+
+        // --- Audit log -----------------------------------------------------
+
+        async function loadAuditLog() {
+            const tbody = document.getElementById('audit-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-3 text-dark-400">Loading...</td></tr>';
+            const actor = (document.getElementById('audit-actor') || {}).value || '';
+            const path = (document.getElementById('audit-path') || {}).value || '';
+            const qs = new URLSearchParams({ limit: '200' });
+            if (actor.trim()) qs.set('actor', actor.trim());
+            if (path.trim()) qs.set('path', path.trim());
+            try {
+                const res = await fetch('/api/audit-log?' + qs.toString());
+                if (res.status === 403) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-3 text-dark-400">Operators and admins only.</td></tr>';
+                    return;
+                }
+                const data = await res.json();
+                const rows = (data && data.rows) || [];
+                tbody.innerHTML = rows.length ? rows.map(function (r) {
+                    const subject = [r.sim_id ? '#' + r.sim_id : '', r.iccid || '', r.mdn || '']
+                        .filter(Boolean).join(' / ');
+                    return '<tr style="border-top:1px solid var(--mc-line);">'
+                        + '<td class="px-4 py-2 whitespace-nowrap">' + esc(fmtWhen(r.ts)) + '</td>'
+                        + '<td class="px-4 py-2">' + esc(r.actor || '') + '</td>'
+                        + '<td class="px-4 py-2">' + esc(r.method || '') + '</td>'
+                        + '<td class="px-4 py-2 font-mono text-xs">' + esc(r.path || '') + '</td>'
+                        + '<td class="px-4 py-2 font-mono text-xs">' + esc(subject) + '</td>'
+                        + '<td class="px-4 py-2">' + esc(r.action || '') + '</td>'
+                        + '<td class="px-4 py-2"' + (r.ok ? '' : ' style="color:#991b1b;"') + '>' + esc(r.status == null ? '' : r.status) + '</td>'
+                        + '<td class="px-4 py-2">' + esc(r.duration_ms == null ? '' : r.duration_ms) + '</td>'
+                        + '</tr>';
+                }).join('') : '<tr><td colspan="8" class="px-4 py-3 text-dark-400">Nothing logged yet for this filter.</td></tr>';
+            } catch (e) {
+                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-3">Could not load the audit log: ' + esc(e.message) + '</td></tr>';
+            }
         }
 
         async function logout() {
