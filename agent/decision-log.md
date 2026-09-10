@@ -1266,3 +1266,13 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 **Why:** The check queried Teltik `/v1/port-status` using the MDN from our own database. For a Teltik-hosted line that number is never right — Teltik keeps the FIRST MDN it ever saw and our rotations do not sync back, a rule already documented at the top of `src/shared/teltik-known-mdn.mjs`. Teltik answered `404 Incorrect Phone Number`, which is a wrong-key error, and it was read as a dead line. Proof on sim 36066 (`89012804332469395747`): port-status via our MDN `3855869698` returns 404; via Teltik's MDN `9297213581` it returns `{"success":true,"status":"online"}`. 101 of the original 107 are in `/v1/all-lines` with an MDN and a port.
 
 **Consequence:** For any Teltik host-level call, resolve the MDN through `resolveTeltikKnownMdn()` and treat `db_current_mdn_unconfirmed` as "this reading is not trustworthy" rather than as data. Endpoint facts worth not re-deriving: `/v1/get-phone-number?iccid=` returns `404 Invalid ICCID` for AT&T ICCIDs because it only covers Teltik's own T-Mobile SIMs; `/v1/all-lines` is the ICCID -> MDN source; `/v1/get-info` takes `mdn` only and rejects `iccid`. More generally: a 4xx from a carrier describes the request, not the line — confirm which before acting on it.
+
+---
+
+## 2026-09-10 — Agent API: machine callers go through the dashboard handlers, fenced from destructive routes
+
+**Decision:** External agents get per-key dashboard API keys (`dashboard_api_keys`, presented as `Bearer` or `X-Api-Key`) that hit the same `/api/*` handlers as portal buttons; keys carry a role but are additionally denied `API_KEY_DENIED_ROUTES` (cancel, delete-sim, debug-cancel, reset-to-provisioning, set-sim-status) regardless of role, and `/api/keys` is closed to keys of any role; every mutating call is written to `dashboard_audit_log` with the actor taken from the authenticated principal, never from a client-supplied body field.
+
+**Why:** The agent must never call carriers directly or the DB drifts; operators can cancel/delete in the portal, but an automated caller must not be able to remove lines; a leaked key must not mint its replacement; client-supplied actor strings are not a trustworthy trail.
+
+**Consequence:** Do not put a fenced route back by giving a key the admin role; add new destructive routes to `API_KEY_DENIED_ROUTES`; do not read `body.actor` for audit attribution; `dashboard_audit_log` has no retention policy yet.
