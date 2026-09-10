@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-10 (Agent API — API keys + audit trail, DEPLOYED TO PROD, PR #103 merged)
+> Last updated: 2026-09-10 (Agent API — destructive routes fenced from API keys, DEPLOYED TO PROD)
 
 ---
 
@@ -66,11 +66,23 @@ operator) created from the Users tab and lives at
 
 **Deliberately NOT done — the remaining work**
 
-1. **Operator keys can reach mutating admin-adjacent routes.** `/api/cancel`,
-   `/api/delete-sim`, `/api/debug-cancel`, and `/api/reset-to-provisioning` sit in
-   `ALWAYS_MUTATING`, so an operator-role key — not just an operator human — can hit
-   them. Decision pending from Zalmen on whether API keys should be fenced out of
-   these regardless of role.
+1. ~~**Operator keys can reach mutating admin-adjacent routes.**~~ **CLOSED
+   2026-09-10.** Decision from Zalmen: fence API keys out of the destructive routes
+   regardless of role. `API_KEY_DENIED_ROUTES` in `src/shared/portal-auth.mjs` +
+   `apiKeyMayAccess()`, applied in the dashboard router immediately after the
+   `canAccess` role gate and only when `authType === 'api_key'`. Fenced:
+   `/api/cancel`, `/api/debug-cancel`, `/api/delete-sim`, `/api/reset-to-provisioning`,
+   and `/api/set-sim-status` (its valid-status list includes `canceled`, which also
+   releases the reseller assignment — it is not a suspend/restore toggle). Path-first
+   prefix match, method-blind, so sub-paths and a dropped method guard stay closed.
+   Answers 403 `{ok:false, error:"forbidden", reason:"api_key_denied", …}` — no
+   `required_role`, because no role would help. Human sessions are unchanged; the role
+   lists were not touched. Denials land in `dashboard_audit_log` like any other 403.
+   Deployed TEST `d0016cf4-2f19-46ad-9dc7-00853f2e0c26`, PROD
+   `89823307-3a7f-4ff3-9048-9935fb6ef4dc`; verified with the real keys on both envs
+   (5 fenced routes → 403 `api_key_denied`, `GET /api/sims` → 200,
+   `POST /api/sim-action` → 400 from the handler). Pinned by
+   `tests/agent-api.test.mjs` (841 tests pass).
 2. **`DASHBOARD_BREAK_GLASS` is not off on TEST**, which is how the TEST key was
    created without a human password. PROD break-glass stays off.
 3. A throwaway TEST account `agent-api-verify` was created to exercise a real session

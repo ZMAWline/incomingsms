@@ -66,11 +66,27 @@ shape:
 }
 ```
 
+A second 403 shape means the route is closed to API keys whatever role they
+carry, so a higher-privileged key would not help either:
+
+```json
+{
+  "ok": false,
+  "error": "forbidden",
+  "reason": "api_key_denied",
+  "message": "This route is not available to API keys; ask a human operator"
+}
+```
+
+Tell the two apart by `reason`: `api_key_denied` present means no key can do
+this and there is nothing to escalate to except a person. Absent, and
+`required_role` tells you which role would have been enough.
+
 | Status | Meaning | What to do |
 |---|---|---|
 | 400 | Your request body is wrong | Fix the body. Retrying unchanged will not help. |
 | 401 | Key missing, malformed, revoked, or disabled | Stop and escalate. Do not retry. |
-| 403 | The key's role is not allowed here | Stop. `required_role` tells you what it would take. Do not retry. |
+| 403 | The key's role is not allowed here, or the route is closed to keys entirely | Stop. `required_role` tells you what role it would take; `reason: "api_key_denied"` means no key qualifies — ask a human operator. Do not retry either way. |
 | 404 | The SIM or record does not exist | Check the identifier. |
 | 409 | Conflicts with existing state | Read the message; the state is not what you assumed. |
 | 500 | Handler or carrier failure | Safe to retry once, after a pause. Then escalate. |
@@ -88,6 +104,10 @@ Your key carries a role from the same three the portal gives people:
 `viewer`, `operator`, `admin`. The agent key is **operator**. One matrix
 (`requiredRole()` in `src/shared/portal-auth.mjs`) decides every request, so an
 operator key is refused exactly where an operator human is refused.
+
+On top of that matrix sits one fence that applies only to API keys: a short
+list of destructive routes is closed to keys of *every* role, admin included.
+See "Blocked to API keys" below.
 
 The matrix is path-first, not method-first: a route is treated as mutating
 because of where it lives, not because you sent a POST. Anything not on the
@@ -108,6 +128,24 @@ retry them; ask a human.
 | `/api/reseller-keys`, `/api/reseller-credentials` (writes) | Third-party credentials. Reading the list is allowed — the keys come back masked — but creating or revoking one is not. |
 
 Reading billing data is allowed; changing it is not.
+
+**Blocked to API keys.** These return 403 with `reason: "api_key_denied"` and
+no `required_role`, because no role would help — the fence is on the credential
+type, not the role. A signed-in human operator still reaches all of them
+normally. The list lives in `API_KEY_DENIED_ROUTES` in
+`src/shared/portal-auth.mjs` and is matched path-first, so sub-paths are
+covered too.
+
+| Path | Why |
+|---|---|
+| `/api/cancel` | Deactivates the line at the carrier. Not reversible by re-running anything. |
+| `/api/debug-cancel` | Same carrier cancel, with the raw request/response returned. |
+| `/api/delete-sim` | Removes the SIM row outright. |
+| `/api/reset-to-provisioning` | Clears `activated_at` and sends the line back through activation. |
+| `/api/set-sim-status` | Its status list includes `canceled`, which also releases the reseller assignment — it is not a suspend/restore toggle. |
+
+To suspend and restore a line, use `/api/suspend` and `/api/restore`: both are
+reversible and both remain open to an operator key.
 
 ## Audit
 

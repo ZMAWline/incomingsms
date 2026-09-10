@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { requiredRole, canAccess } from '../src/shared/portal-auth.mjs';
+import { requiredRole, canAccess, apiKeyMayAccess } from '../src/shared/portal-auth.mjs';
 import { shouldAudit, redact, extractSubject, principal } from '../src/dashboard/audit-log.mjs';
 import { generateApiKey, keyEnvLabel, readApiKeyHeader, hasApiKeyHeader } from '../src/dashboard/api-keys.mjs';
 
@@ -61,6 +61,75 @@ test('the blocked list stays blocked to an operator', () => {
   ]) {
     assert.equal(requiredRole(method, path), 'admin', `${method} ${path} is no longer admin-only`);
   }
+});
+
+// --- the API-key fence ----------------------------------------------------
+//
+// The two gates in src/dashboard/index.js, in the order the router applies
+// them: the role matrix first, then the API-key fence. Mirrored here rather
+// than imported because the router is a Worker entrypoint, not a module a test
+// can call — if the order or the conjunction changes there, these tests are
+// the thing that should be updated in step.
+function mayCall(principal, method, path) {
+  if (!canAccess(principal.role, method, path)) return false;
+  if (principal.authType === 'api_key' && !apiKeyMayAccess(path)) return false;
+  return true;
+}
+
+// Every route that ends a line's life or rewinds it. /api/set-sim-status is
+// here because its status list includes `canceled`, which also releases the
+// reseller assignment — it is not a suspend/restore toggle.
+const FENCED_ROUTES = [
+  '/api/cancel', '/api/delete-sim', '/api/debug-cancel',
+  '/api/reset-to-provisioning', '/api/set-sim-status',
+];
+
+test('the destructive routes are closed to an API key of ANY role', () => {
+  for (const role of ['admin', 'operator']) {
+    for (const path of FENCED_ROUTES) {
+      // The role gate alone would let this through — that is the point.
+      assert.ok(canAccess(role, 'POST', path), `${role} lost role access to ${path}`);
+      assert.ok(!mayCall({ role, authType: 'api_key' }, 'POST', path),
+        `${role} api_key reached POST ${path}`);
+    }
+  }
+});
+
+test('the fence is path-first, so sub-paths and stray methods stay closed', () => {
+  for (const path of FENCED_ROUTES) {
+    for (const method of ['GET', 'POST', 'PUT', 'DELETE']) {
+      assert.ok(!mayCall({ role: 'admin', authType: 'api_key' }, method, path),
+        `admin api_key reached ${method} ${path}`);
+    }
+    assert.ok(!apiKeyMayAccess(path + '/bulk'), `${path}/bulk is not fenced`);
+  }
+  // A path that merely starts with the same characters is a different route.
+  assert.ok(apiKeyMayAccess('/api/cancellation-report'));
+});
+
+test('a human session keeps exactly the access it had', () => {
+  for (const path of FENCED_ROUTES) {
+    assert.ok(mayCall({ role: 'operator', authType: 'session' }, 'POST', path),
+      `session operator lost POST ${path}`);
+    assert.ok(mayCall({ role: 'admin', authType: 'session' }, 'POST', path));
+    assert.ok(!mayCall({ role: 'viewer', authType: 'session' }, 'POST', path),
+      `session viewer reached POST ${path}`);
+  }
+});
+
+test('the fence takes nothing else away from an operator key', () => {
+  const key = { role: 'operator', authType: 'api_key' };
+  for (const [method, path] of OPERATOR_ROUTES) {
+    assert.ok(mayCall(key, method, path), `operator key lost ${method} ${path}`);
+  }
+  for (const path of ['/api/sims', '/api/stats', '/api/errors']) {
+    assert.ok(mayCall(key, 'GET', path), `operator key lost GET ${path}`);
+  }
+  // /api/sim-action reaches its handler and validates the body there; the
+  // fence must not turn its 400 into a 403.
+  assert.ok(apiKeyMayAccess('/api/sim-action'));
+  assert.ok(apiKeyMayAccess('/api/suspend'));
+  assert.ok(apiKeyMayAccess('/api/restore'));
 });
 
 // --- key format -----------------------------------------------------------

@@ -7,7 +7,7 @@ import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
-import { canAccess, requiredRole } from '../shared/portal-auth.mjs';
+import { canAccess, requiredRole, apiKeyMayAccess } from '../shared/portal-auth.mjs';
 import { resolveUser, breakGlassUser, handleAuthRoutes } from './auth-routes.mjs';
 import { renderLoginPage, renderAcceptInvitePage } from './auth-pages.mjs';
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from './api-keys.mjs';
@@ -113,6 +113,21 @@ async function handleDashboardRequest(request, env, ctx, audit) {
         required_role: requiredRole(request.method, url.pathname),
         role: user.role,
         message: 'Your role (' + user.role + ') is not permitted to perform this action',
+      }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // The second fence, and the one the role matrix deliberately cannot
+    // express: a handful of routes end a line's life or rewind it, and those
+    // are closed to API-key callers of EVERY role, admin included. A human
+    // operator's access is unchanged — the question here is not "which role"
+    // but "may this be done unattended". See API_KEY_DENIED_ROUTES in
+    // shared/portal-auth.mjs for the list and why each route is on it.
+    if (isApiPath && user.authType === 'api_key' && !apiKeyMayAccess(url.pathname)) {
+      return new Response(JSON.stringify({
+        ok: false,
+        error: 'forbidden',
+        reason: 'api_key_denied',
+        message: 'This route is not available to API keys; ask a human operator',
       }), { status: 403, headers: { 'Content-Type': 'application/json' } });
     }
 
