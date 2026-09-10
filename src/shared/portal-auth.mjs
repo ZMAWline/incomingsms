@@ -186,7 +186,7 @@ const ALWAYS_MUTATING = [
 // /api/atomic-query, /api/teltik-query, /api/wing-check): those are read-only
 // at the carrier but still spend quota and write audit logs.
 const READ_ROUTES = [
-  '/api/stats', '/api/sims', '/api/messages', '/api/sms-usage', '/api/resellers',
+  '/api/stats', '/api/sims', '/api/sims/status-counts', '/api/messages', '/api/sms-usage', '/api/resellers',
   '/api/gateways', '/api/gateway-defective-slots', '/api/imei-pool', '/api/errors',
   '/api/error-logs', '/api/utilization', '/api/rotation-health', '/api/rotation-reviews',
   '/api/rotation-audit', '/api/bad-rentals', '/api/activation-runs', '/api/sim-webhooks',
