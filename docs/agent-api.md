@@ -105,7 +105,7 @@ retry them; ask a human.
 | `/api/keys`, `/api/keys/revoke` | Managing credentials. Also closed to API keys of *any* role, including admin: a leaked key must not mint its own replacement. |
 | `/api/billing/*` (writes), `/api/billing-ledger` (writes), `/api/bill-audit/*` (writes) | Money. Readable by any signed-in role, mutable only by admins. |
 | `/api/qbo*`, `/api/plan-rates` (writes), `/api/reseller-rates` (writes) | Money. |
-| `/api/reseller-keys`, `/api/reseller-credentials` | Third-party credentials. |
+| `/api/reseller-keys`, `/api/reseller-credentials` (writes) | Third-party credentials. Reading the list is allowed — the keys come back masked — but creating or revoking one is not. |
 
 Reading billing data is allowed; changing it is not.
 

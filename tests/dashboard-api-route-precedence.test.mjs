@@ -5,7 +5,8 @@
 // the catch-all `return serveApp(env)` / `env.ASSETS.fetch(request)` at the
 // bottom of the dispatcher (see src/dashboard/index.js's exported `fetch`).
 //
-// This test runs the *actual* top-level `fetch(request, env)` dispatcher
+// This test runs the *actual* dispatcher — `handleDashboardRequest`, which is
+// what index.js's exported `fetch` wraps in the audit logger
 // (lifted verbatim out of index.js, same pattern as
 // tests/dashboard-activation-runs-route.test.mjs) so a future route added in
 // the wrong place, or a mis-ordered `if`, fails a test instead of only
@@ -21,9 +22,11 @@ import { fileURLToPath } from 'node:url';
 // checkAuth() inline, so the sandbox is given the real implementations instead
 // of a lifted copy. Requests here carry Basic admin:test-pass, which
 // breakGlassUser accepts as admin (DASHBOARD_BREAK_GLASS is unset in env).
-import { canAccess } from '../src/shared/portal-auth.mjs';
+import { canAccess, requiredRole } from '../src/shared/portal-auth.mjs';
 import { resolveUser, breakGlassUser, handleAuthRoutes } from '../src/dashboard/auth-routes.mjs';
 import { renderLoginPage, renderAcceptInvitePage } from '../src/dashboard/auth-pages.mjs';
+import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from '../src/dashboard/api-keys.mjs';
+import { handleAuditLogQuery } from '../src/dashboard/audit-log.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -45,8 +48,9 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
   const assetCalls = [];
   const sandbox = {
     console, Response, URL, URLSearchParams, Request, atob,
-    canAccess, resolveUser, breakGlassUser, handleAuthRoutes,
+    canAccess, requiredRole, resolveUser, breakGlassUser, handleAuthRoutes,
     renderLoginPage, renderAcceptInvitePage,
+    resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes, handleAuditLogQuery,
     async fetch(url, init) {
       const u = String(url);
       supabaseCalls.push({ url: u, headers: (init && init.headers) || {} });
@@ -81,9 +85,12 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
     extractFn(SRC, 'async function handleActivationRunsList(env, corsHeaders, url) {'),
     extractFn(SRC, 'async function handleActivationRunDetail(env, corsHeaders, runId, url) {'),
     extractFn(SRC, 'async function serveApp(env) {'),
-    // Renamed to `dispatch` (not `fetch`) so it doesn't shadow the sandbox's
-    // mocked global `fetch` that supabaseGet relies on.
-    extractFn(SRC, '  async fetch(request, env) {').replace(/^\s*async fetch\(/, 'async function dispatch('),
+    // Renamed to `dispatch` so it doesn't collide with the sandbox's mocked
+    // global `fetch` that supabaseGet relies on. Called with two arguments, so
+    // `ctx` and `audit` arrive undefined — both are optional by design, since
+    // logging must never be load-bearing for routing.
+    extractFn(SRC, 'async function handleDashboardRequest(request, env, ctx, audit) {')
+      .replace(/^async function handleDashboardRequest\(/, 'async function dispatch('),
   ].join('\n\n');
   vm.runInContext(code, sandbox);
   return { sandbox, supabaseCalls, assetCalls };
