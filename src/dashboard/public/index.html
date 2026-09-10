@@ -33,10 +33,33 @@
             }
         }
 
+        function showAdHocConfirm(title, message) {
+            return new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+                overlay.innerHTML =
+                    '<div class="bg-dark-800 border border-dark-600 rounded-xl p-6 max-w-sm w-full mx-4">' +
+                    '<h3 class="text-white font-semibold text-lg mb-2">' + esc(title || 'Confirm') + '</h3>' +
+                    '<p class="text-gray-300 text-sm mb-5">' + esc(message || '') + '</p>' +
+                    '<div class="flex justify-end gap-2">' +
+                    '<button id="_ac-cancel" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">Cancel</button>' +
+                    '<button id="_ac-ok" class="px-4 py-2 text-sm bg-accent hover:bg-green-400 text-white rounded transition">Confirm</button>' +
+                    '</div></div>';
+                document.body.appendChild(overlay);
+                const cleanup = (val) => { document.body.removeChild(overlay); resolve(val); };
+                overlay.querySelector('#_ac-cancel').onclick = () => cleanup(false);
+                overlay.querySelector('#_ac-ok').onclick = () => cleanup(true);
+                overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(false); });
+            });
+        }
+
         let confirmPromiseResolver = null;
         function showConfirm(title, message) {
             const modal = document.getElementById('confirm-modal');
-            if (!modal) return Promise.resolve(confirm(message));
+            // The static #confirm-modal is the normal path. If it is missing,
+            // build an equivalent overlay rather than falling back to a native
+            // confirm() — the browser dialog is never acceptable in this UI.
+            if (!modal) return showAdHocConfirm(title, message);
             document.getElementById('confirm-title').textContent = title;
             document.getElementById('confirm-message').textContent = message;
             modal.classList.remove('hidden');
@@ -85,6 +108,34 @@
                 overlay.querySelector('#_dp-ok').onclick = () => cleanup(overlay.querySelector('#_dp-date').value || null);
                 overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(null); });
                 setTimeout(() => overlay.querySelector('#_dp-date').focus(), 0);
+            });
+        }
+        // Text equivalent of showDatePrompt. Native prompt() renders the
+        // browser's own chrome, which does not belong in this UI.
+        function showTextPrompt(title, message, defaultValue, placeholder) {
+            return new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+                overlay.innerHTML =
+                    '<div class="bg-dark-800 border border-dark-600 rounded-xl p-6 max-w-sm w-full mx-4">' +
+                    '<h3 class="text-white font-semibold text-lg mb-2">' + esc(title) + '</h3>' +
+                    (message ? '<p class="text-gray-300 text-sm mb-4">' + esc(message) + '</p>' : '') +
+                    '<input id="_tp-text" type="text" class="w-full bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-200 mb-4" value="' + esc(defaultValue || '') + '" placeholder="' + esc(placeholder || '') + '">' +
+                    '<div class="flex justify-end gap-2">' +
+                    '<button id="_tp-cancel" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">Cancel</button>' +
+                    '<button id="_tp-ok" class="px-4 py-2 text-sm bg-accent hover:bg-green-400 text-white rounded transition">Save</button>' +
+                    '</div></div>';
+                document.body.appendChild(overlay);
+                const input = overlay.querySelector('#_tp-text');
+                const cleanup = (val) => { document.body.removeChild(overlay); resolve(val); };
+                overlay.querySelector('#_tp-cancel').onclick = () => cleanup(null);
+                overlay.querySelector('#_tp-ok').onclick = () => cleanup(input.value.trim() || null);
+                overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(null); });
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); cleanup(input.value.trim() || null); }
+                    if (e.key === 'Escape') { e.preventDefault(); cleanup(null); }
+                });
+                setTimeout(() => input.focus(), 0);
             });
         }
         function handleConfirm(confirmed) {
@@ -1446,17 +1497,7 @@
                                 </button>
                             </div>
                             <div class="flex flex-col gap-3 w-full">
-                                <div class="flex flex-wrap items-center gap-2">
-                                    <span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Quick</span>
-                                    <button data-preset="not_rotated_today"  onclick="toggleSimsPreset('not_rotated_today')"  class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Not rotated today</button>
-                                    <button data-preset="no_sms_12h"         onclick="toggleSimsPreset('no_sms_12h')"         class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No SMS in 12h</button>
-                                    <button data-preset="any_error"          onclick="toggleSimsPreset('any_error')"          class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Any error</button>
-                                    <button data-preset="no_reseller"        onclick="toggleSimsPreset('no_reseller')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">No reseller</button>
-                                    <button data-preset="auto_paused"        onclick="toggleSimsPreset('auto_paused')"        class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Auto-rotate paused</button>
-                                    <button data-preset="stuck_provisioning" onclick="toggleSimsPreset('stuck_provisioning')" class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">Stuck provisioning &gt;1h</button>
-                                    <button data-preset="not_notified"       onclick="toggleSimsPreset('not_notified')"       class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="AT&T not notified today, T-Mobile not notified today or yesterday">Not Notified</button>
-                                    <button data-preset="portin_failed"      onclick="toggleSimsPreset('portin_failed')"      class="sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition" title="Carrier returned a non-Success status for the port-in (948 port request does not exist, 910 SIM not on our ATOMIC account, 951 losing carrier rejected). These sit at status=provisioning and are otherwise invisible.">Port-in failed</button>
-                                </div>
+                                <div id="sims-saved-filters" class="flex flex-wrap items-center gap-2"></div>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <button id="sims-fb-status"   onclick="openSimsFilterMenu('status', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Status<span id="sims-fb-status-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
                                     <button id="sims-fb-vendor"   onclick="openSimsFilterMenu('vendor', this)"   class="sims-filter-btn inline-flex items-center gap-1 text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-1.5 text-gray-300 hover:bg-dark-600 hover:border-dark-400 transition">Vendor<span id="sims-fb-vendor-count"   class="text-xs text-accent ml-1"></span><svg class="w-3 h-3 ml-0.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></button>
@@ -1471,6 +1512,12 @@
                                     <span id="sims-count" class="text-sm text-gray-500 ml-auto"></span>
                                 </div>
                                 <div id="sims-active-chips" class="flex flex-wrap items-center gap-2 hidden"></div>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <select id="sims-add-filter" onchange="onSimsAddFilterPick(this)" title="Filter on any column, including ones not shown in the table" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-2 py-1 text-gray-300 focus:outline-none focus:border-accent">
+                                        <option value="">+ Filter column&hellip;</option>
+                                    </select>
+                                    <div id="sims-colfilter-chips" class="flex flex-wrap items-center gap-2 hidden"></div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1479,20 +1526,20 @@
                             <thead>
                                 <tr class="text-left text-xs text-gray-500 uppercase border-b border-dark-600 sticky top-0 z-10 bg-dark-800">
                                     <th class="px-4 py-3 font-medium"><input type="checkbox" onchange="toggleAllSims(this)" class="accent-green-500"></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','id')">ID <span class="sort-arrow" data-table="sims" data-col="id"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','gateway_code')">Gateway <span class="sort-arrow" data-table="sims" data-col="gateway_code"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','iccid')">ICCID <span class="sort-arrow" data-table="sims" data-col="iccid"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','phone_number')">Phone <span class="sort-arrow" data-table="sims" data-col="phone_number"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','blimei')">BLIMEI <span class="sort-arrow" data-table="sims" data-col="blimei"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','status')">Status <span class="sort-arrow" data-table="sims" data-col="status"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','vendor')">Vendor <span class="sort-arrow" data-table="sims" data-col="vendor"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','hosting_port_state')" title="Latest persisted Teltik hosting port status (any source: cron, bulk, query, remediator)">Host Port <span class="sort-arrow" data-table="sims" data-col="hosting_port_state"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_rotation_at')">Last Rotated <span class="sort-arrow" data-table="sims" data-col="last_rotation_at"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','activated_at')">Activated <span class="sort-arrow" data-table="sims" data-col="activated_at"></span></th>
-                                    <th class="px-4 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('sims','last_notified_at')">Last Notified <span class="sort-arrow" data-table="sims" data-col="last_notified_at"></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','id')">ID <span class="sort-arrow" data-table="sims" data-col="id"></span></span><button type="button" data-colfilter-btn="id" onclick="openSimsColumnFilter('id', this)" title="Filter ID" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','gateway_code')">Gateway <span class="sort-arrow" data-table="sims" data-col="gateway_code"></span></span><button type="button" data-colfilter-btn="gateway_code" onclick="openSimsColumnFilter('gateway_code', this)" title="Filter Gateway" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','iccid')">ICCID <span class="sort-arrow" data-table="sims" data-col="iccid"></span></span><button type="button" data-colfilter-btn="iccid" onclick="openSimsColumnFilter('iccid', this)" title="Filter ICCID" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','phone_number')">Phone <span class="sort-arrow" data-table="sims" data-col="phone_number"></span></span><button type="button" data-colfilter-btn="phone_number" onclick="openSimsColumnFilter('phone_number', this)" title="Filter Phone" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','blimei')">BLIMEI <span class="sort-arrow" data-table="sims" data-col="blimei"></span></span><button type="button" data-colfilter-btn="blimei" onclick="openSimsColumnFilter('blimei', this)" title="Filter BLIMEI" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','status')">Status <span class="sort-arrow" data-table="sims" data-col="status"></span></span><button type="button" data-colfilter-btn="status" onclick="openSimsColumnFilter('status', this)" title="Filter Status" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','vendor')">Vendor <span class="sort-arrow" data-table="sims" data-col="vendor"></span></span><button type="button" data-colfilter-btn="vendor" onclick="openSimsColumnFilter('vendor', this)" title="Filter Vendor" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none" title="Latest persisted Teltik hosting port status (any source: cron, bulk, query, remediator)"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','hosting_port_state')">Host Port <span class="sort-arrow" data-table="sims" data-col="hosting_port_state"></span></span><button type="button" data-colfilter-btn="hosting_port_state" onclick="openSimsColumnFilter('hosting_port_state', this)" title="Filter Host Port" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></span><button type="button" data-colfilter-btn="reseller_name" onclick="openSimsColumnFilter('reseller_name', this)" title="Filter Reseller" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></span><button type="button" data-colfilter-btn="sms_count" onclick="openSimsColumnFilter('sms_count', this)" title="Filter SMS count" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></span><button type="button" data-colfilter-btn="last_sms_received" onclick="openSimsColumnFilter('last_sms_received', this)" title="Filter Last SMS" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','last_rotation_at')">Last Rotated <span class="sort-arrow" data-table="sims" data-col="last_rotation_at"></span></span><button type="button" data-colfilter-btn="last_rotation_at" onclick="openSimsColumnFilter('last_rotation_at', this)" title="Filter Last Rotated" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','activated_at')">Activated <span class="sort-arrow" data-table="sims" data-col="activated_at"></span></span><button type="button" data-colfilter-btn="activated_at" onclick="openSimsColumnFilter('activated_at', this)" title="Filter Activated" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','last_notified_at')">Last Notified <span class="sort-arrow" data-table="sims" data-col="last_notified_at"></span></span><button type="button" data-colfilter-btn="last_notified_at" onclick="openSimsColumnFilter('last_notified_at', this)" title="Filter Last Notified" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
                                     <th class="px-4 py-3 font-medium">Actions</th>
                                 </tr>
                             </thead>
@@ -4966,8 +5013,8 @@ set verify_pending; schedule §C.3 poll
                 });
                 const data = await res.json().catch(function () { return {}; });
                 // The server refuses to strand the last admin; surface that reason.
-                if (!res.ok || !data.ok) alert(data.error || 'Update failed');
-            } catch (e) { alert('Update failed: ' + e.message); }
+                if (!res.ok || !data.ok) showToast(data.error || 'Update failed', 'error');
+            } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
             loadUsers();
         }
 
@@ -4981,11 +5028,11 @@ set verify_pending; schedule §C.3 poll
                     body: JSON.stringify({ role: role, username: username || null })
                 });
                 const data = await res.json().catch(function () { return {}; });
-                if (!res.ok || !data.ok) { alert(data.error || 'Could not create invite'); return; }
+                if (!res.ok || !data.ok) { showToast(data.error || 'Could not create invite', 'error'); return; }
                 document.getElementById('invite-link').value = window.location.origin + data.accept_path;
                 document.getElementById('invite-result').classList.remove('hidden');
                 loadUsers();
-            } catch (e) { alert('Could not create invite: ' + e.message); }
+            } catch (e) { showToast('Could not create invite: ' + e.message, 'error'); }
         }
 
         function copyInviteLink() {
@@ -5232,11 +5279,22 @@ set verify_pending; schedule §C.3 poll
             resellerIds: [],        // 'none' sentinel = no-reseller; integer = reseller id
             vendors: [],
             gateways: [],
-            presets: new Set(),
             activatedFrom: '',
             activatedTo: '',
             search: '',
         };
+        // Fleet-wide { status: count }, from /api/sims/status-counts. Null until
+        // it loads, or if it fails — callers fall back to counting loaded rows.
+        let SIMS_STATUS_COUNTS = null;
+        async function loadSimsStatusCounts() {
+            try {
+                const res = await fetch(API_BASE + '/sims/status-counts');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data && data.ok && data.counts) SIMS_STATUS_COUNTS = data.counts;
+            } catch (e) { /* menu falls back to loaded-row counts */ }
+        }
+
         function simNotRotatedToday(s) {
             const todayUTC = new Date().toISOString().slice(0, 10);
             return !s.last_mdn_rotated_at || s.last_mdn_rotated_at.slice(0, 10) < todayUTC;
@@ -5287,16 +5345,546 @@ set verify_pending; schedule §C.3 poll
             // Unknown shape — show the raw code rather than invent a label.
             return 'Port-in ' + (code || '?');
         }
-        const SIM_PRESETS = {
-            not_rotated_today:  { label: 'Not rotated today',     test: simNotRotatedToday },
-            portin_failed:      { label: 'Port-in failed',        test: simPortInFailed },
-            no_sms_12h:         { label: 'No SMS in 12h',         test: simNoSms12h },
-            no_reseller:        { label: 'No reseller',           test: function(s){ return !s.reseller_id; } },
-            auto_paused:        { label: 'Auto-rotate paused',    test: function(s){ return s.rotation_eligible === false; } },
-            any_error:          { label: 'Any error',             test: function(s){ return ['error','helix_timeout','data_mismatch'].includes(s.status); } },
-            stuck_provisioning: { label: 'Stuck provisioning >1h', test: simStuckProvisioning1h },
-            not_notified:       { label: 'Not Notified',         test: simNotNotified },
+        // --- Per-column filtering -------------------------------------------
+        //
+        // Every column an operator can
+        // filter on, with the type that decides which operators it offers.
+        // Filtering runs client-side over the loaded rows (~4.3k), so a filter
+        // applies instantly and never costs a round trip.
+        //
+        //   type 'enum'   options are discovered from the loaded data
+        //   type 'number' numeric comparison, blank-aware
+        //   type 'date'   absolute range plus relative "within last N hours"
+        //   type 'text'   substring / exact, case-insensitive
+        //   type 'bool'   tri-state: true, false, or unset
+        const SIMS_COLUMNS = [
+            { key: 'id',                      label: 'ID',            type: 'number' },
+            { key: 'gateway_code',            label: 'Gateway',       type: 'enum'   },
+            { key: 'port',                    label: 'Port',          type: 'enum'   },
+            { key: 'iccid',                   label: 'ICCID',         type: 'text'   },
+            { key: 'phone_number',            label: 'Phone',         type: 'text'   },
+            { key: 'blimei',                  label: 'BLIMEI',        type: 'text'   },
+            { key: 'msisdn',                  label: 'MSISDN',        type: 'text'   },
+            { key: 'status',                  label: 'Status',        type: 'enum'   },
+            { key: 'vendor',                  label: 'Vendor',        type: 'enum'   },
+            { key: 'verification_status',     label: 'Verification',  type: 'enum'   },
+            { key: 'hosting_port_state',      label: 'Host Port',     type: 'enum'   },
+            { key: 'hosting_port_source',     label: 'Host Port Src', type: 'enum'   },
+            { key: 'hosting_port_checked_at', label: 'Host Port Checked', type: 'date' },
+            { key: 'hosting_port_online_24h', label: 'Online 24h',    type: 'number' },
+            { key: 'hosting_port_checks_24h', label: 'Checks 24h',    type: 'number' },
+            { key: 'reseller_name',           label: 'Reseller',      type: 'enum'   },
+            { key: 'sms_count',               label: 'SMS',           type: 'number' },
+            { key: 'last_sms_received',       label: 'Last SMS',      type: 'date'   },
+            { key: 'last_rotation_at',        label: 'Last Rotated',  type: 'date'   },
+            { key: 'last_mdn_rotated_at',     label: 'Last MDN Rot.', type: 'date'   },
+            { key: 'activated_at',            label: 'Activated',     type: 'date'   },
+            { key: 'last_notified_at',        label: 'Last Notified', type: 'date'   },
+            { key: 'carrier',                 label: 'Carrier',       type: 'enum'   },
+            { key: 'gateway_host',            label: 'Host',          type: 'enum'   },
+            { key: 'rotation_interval_hours', label: 'Rot. Interval', type: 'number' },
+            { key: 'rotation_eligible',       label: 'Auto-rotate',   type: 'bool'   },
+            { key: 'port_in_pending',         label: 'Port-in Pending', type: 'bool' },
+            { key: 'atomic_portin_status_code', label: 'Port-in Code', type: 'enum'  },
+            { key: 'last_activation_error',   label: 'Activation Error', type: 'text' },
+            // Computed columns. These carry the judgement the old Quick preset
+            // chips encoded — vendor-specific notification windows, "not
+            // rotated today", a non-Success port-in code — which no single
+            // stored column expresses. As columns they can be combined with
+            // anything else and stored in a saved filter, which the chips could
+            // not do.
+            { key: 'notify_stale',       label: 'Notification Stale',  type: 'bool', compute: simNotNotified },
+            { key: 'not_rotated_today',  label: 'Not Rotated Today',   type: 'bool', compute: simNotRotatedToday },
+            { key: 'portin_failed',      label: 'Port-in Failed',      type: 'bool', compute: simPortInFailed },
+            { key: 'stuck_provisioning', label: 'Stuck Provisioning',  type: 'bool', compute: simStuckProvisioning1h },
+            { key: 'no_sms_12h',         label: 'No SMS in 12h',       type: 'bool', compute: simNoSms12h },
+            { key: 'no_reseller',        label: 'No Reseller',         type: 'bool', compute: function (s) { return !s.reseller_id; } },
+        ];
+        // A column's value is either read straight off the row or derived.
+        function simColValue(row, col) {
+            if (!col) return undefined;
+            if (typeof col.compute !== 'function') return row[col.key];
+            try { return !!col.compute(row); } catch (e) { return undefined; }
+        }
+        const SIMS_COLUMN_BY_KEY = SIMS_COLUMNS.reduce(function (acc, c) { acc[c.key] = c; return acc; }, {});
+
+        // Operators offered per type. `arity` is how many value inputs the
+        // popover renders — 0 for blank checks, 2 for between/range.
+        const FILTER_OPS = {
+            enum:   [{ op: 'in',        label: 'is any of',    arity: 'multi' },
+                     { op: 'not_in',    label: 'is none of',   arity: 'multi' },
+                     { op: 'blank',     label: 'is blank',     arity: 0 },
+                     { op: 'not_blank', label: 'is not blank', arity: 0 }],
+            number: [{ op: 'eq',        label: '=',            arity: 1 },
+                     { op: 'ne',        label: '≠',       arity: 1 },
+                     { op: 'gt',        label: '>',            arity: 1 },
+                     { op: 'gte',       label: '≥',       arity: 1 },
+                     { op: 'lt',        label: '<',            arity: 1 },
+                     { op: 'lte',       label: '≤',       arity: 1 },
+                     { op: 'between',   label: 'between',      arity: 2 },
+                     { op: 'blank',     label: 'is blank',     arity: 0 },
+                     { op: 'not_blank', label: 'is not blank', arity: 0 }],
+            date:   [{ op: 'within_h',  label: 'in the last (hours)', arity: 1 },
+                     { op: 'older_h',   label: 'older than (hours)',  arity: 1 },
+                     { op: 'after',     label: 'on or after',  arity: 1, input: 'date' },
+                     { op: 'before',    label: 'on or before', arity: 1, input: 'date' },
+                     { op: 'between',   label: 'between',      arity: 2, input: 'date' },
+                     { op: 'blank',     label: 'is blank',     arity: 0 },
+                     { op: 'not_blank', label: 'is not blank', arity: 0 }],
+            text:   [{ op: 'contains',  label: 'contains',     arity: 1 },
+                     { op: 'not_contains', label: 'does not contain', arity: 1 },
+                     { op: 'eq',        label: 'equals',       arity: 1 },
+                     { op: 'starts',    label: 'starts with',  arity: 1 },
+                     { op: 'blank',     label: 'is blank',     arity: 0 },
+                     { op: 'not_blank', label: 'is not blank', arity: 0 }],
+            bool:   [{ op: 'is_true',   label: 'is yes',       arity: 0 },
+                     { op: 'is_false',  label: 'is no',        arity: 0 }],
         };
+
+        // Active per-column filters: { col, op, value }. One entry per column —
+        // setting a filter on a column already filtered replaces it, which
+        // keeps the chip row readable and matches how a spreadsheet behaves.
+        let simsColumnFilters = [];
+
+        function simsDistinctValues(colKey) {
+            const seen = new Map(); // normalized -> display
+            const col = SIMS_COLUMN_BY_KEY[colKey];
+            for (const row of (tableState.sims.data || [])) {
+                const v = simColValue(row, col);
+                if (v == null || v === '') continue;
+                const s = String(v);
+                if (!seen.has(s)) seen.set(s, s);
+            }
+            return [...seen.keys()].sort(function (a, b) {
+                const na = Number(a), nb = Number(b);
+                if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+                return a.localeCompare(b);
+            });
+        }
+
+        function simFilterMatches(row, f) {
+            const col = SIMS_COLUMN_BY_KEY[f.col];
+            if (!col) return true;
+            const raw = simColValue(row, col);
+            const isBlank = raw == null || raw === '';
+
+            if (f.op === 'blank') return isBlank;
+            if (f.op === 'not_blank') return !isBlank;
+            if (f.op === 'is_true') return raw === true;
+            if (f.op === 'is_false') return raw === false;
+
+            if (col.type === 'enum') {
+                const set = Array.isArray(f.value) ? f.value : [];
+                if (!set.length) return true;
+                const hit = !isBlank && set.includes(String(raw));
+                return f.op === 'not_in' ? !hit : hit;
+            }
+
+            if (col.type === 'number') {
+                if (isBlank) return false;
+                const n = Number(raw);
+                if (!Number.isFinite(n)) return false;
+                const a = Number(f.value), b = Number(f.value2);
+                switch (f.op) {
+                    case 'eq':  return n === a;
+                    case 'ne':  return n !== a;
+                    case 'gt':  return n > a;
+                    case 'gte': return n >= a;
+                    case 'lt':  return n < a;
+                    case 'lte': return n <= a;
+                    case 'between': return n >= Math.min(a, b) && n <= Math.max(a, b);
+                }
+                return true;
+            }
+
+            if (col.type === 'date') {
+                if (isBlank) return false;
+                const t = new Date(raw).getTime();
+                if (!Number.isFinite(t)) return false;
+                if (f.op === 'within_h') return t >= Date.now() - Number(f.value) * 3600000;
+                if (f.op === 'older_h')  return t <  Date.now() - Number(f.value) * 3600000;
+                // Date inputs are calendar days: 'after' means from 00:00 of that
+                // day, 'before' through 23:59:59 of it, so a single day range
+                // selects the whole day rather than an empty instant.
+                const from = f.value  ? new Date(f.value + 'T00:00:00').getTime() : null;
+                const to   = f.value2 ? new Date(f.value2 + 'T23:59:59.999').getTime() : null;
+                if (f.op === 'after')  return from == null || t >= from;
+                if (f.op === 'before') return from == null || t <= new Date(f.value + 'T23:59:59.999').getTime();
+                if (f.op === 'between') {
+                    if (from != null && t < from) return false;
+                    if (to != null && t > to) return false;
+                    return true;
+                }
+                return true;
+            }
+
+            // text
+            if (isBlank) return false;
+            const hay = String(raw).toLowerCase();
+            const needle = String(f.value == null ? '' : f.value).toLowerCase();
+            if (!needle) return true;
+            switch (f.op) {
+                case 'contains':     return hay.includes(needle);
+                case 'not_contains': return !hay.includes(needle);
+                case 'eq':           return hay === needle;
+                case 'starts':       return hay.startsWith(needle);
+            }
+            return true;
+        }
+
+        function applySimsColumnFilters(data) {
+            if (!simsColumnFilters.length) return data;
+            return data.filter(function (row) {
+                return simsColumnFilters.every(function (f) { return simFilterMatches(row, f); });
+            });
+        }
+
+        function simsFilterSummary(f) {
+            const col = SIMS_COLUMN_BY_KEY[f.col];
+            const label = col ? col.label : f.col;
+            const opDef = (FILTER_OPS[col ? col.type : 'text'] || []).find(function (o) { return o.op === f.op; });
+            const opLabel = opDef ? opDef.label : f.op;
+            if (opDef && opDef.arity === 0) return label + ' ' + opLabel;
+            if (opDef && opDef.arity === 'multi') {
+                const vals = Array.isArray(f.value) ? f.value : [];
+                const shown = vals.length > 2 ? vals.slice(0, 2).join(', ') + ' +' + (vals.length - 2) : vals.join(', ');
+                return label + ' ' + opLabel + ' ' + shown;
+            }
+            if (opDef && opDef.arity === 2) return label + ' ' + opLabel + ' ' + f.value + ' – ' + f.value2;
+            return label + ' ' + opLabel + ' ' + f.value;
+        }
+
+        function setSimsColumnFilter(f) {
+            simsColumnFilters = simsColumnFilters.filter(function (x) { return x.col !== f.col; });
+            simsColumnFilters.push(f);
+            tableState.sims.page = 1;
+            renderSims();
+        }
+
+        function clearSimsColumnFilter(colKey) {
+            simsColumnFilters = simsColumnFilters.filter(function (x) { return x.col !== colKey; });
+            tableState.sims.page = 1;
+            renderSims();
+        }
+
+        function clearAllSimsColumnFilters() {
+            simsColumnFilters = [];
+            tableState.sims.page = 1;
+            renderSims();
+        }
+
+        // --- Saved filters ---------------------------------------------------
+        //
+        // Replaces the fixed Quick preset chips. A saved filter captures the
+        // whole current state — server-side selections, the toolbar controls,
+        // the search box and every per-column filter — under a name, so the
+        // views an operator actually uses are theirs to define rather than
+        // whatever someone hardcoded.
+        //
+        // Stored in localStorage, like simsColumnVis. That makes them
+        // per-browser, not per-account: they do not follow you to another
+        // machine. Making them shared would need a table and a migration.
+        const SIMS_SAVED_FILTERS_KEY = 'simsSavedFilters';
+
+        function loadSimsSavedFilters() {
+            try {
+                const raw = JSON.parse(localStorage.getItem(SIMS_SAVED_FILTERS_KEY) || '[]');
+                return Array.isArray(raw) ? raw : [];
+            } catch (e) { return []; }
+        }
+
+        function persistSimsSavedFilters(list) {
+            try { localStorage.setItem(SIMS_SAVED_FILTERS_KEY, JSON.stringify(list)); }
+            catch (e) { showToast('Could not save filter (storage full?)', 'error'); }
+        }
+
+        // Sets are not JSON, and simsColumnFilters is copied rather than
+        // referenced so later edits do not mutate a saved view.
+        function captureSimsFilterState() {
+            return {
+                status: [...simsFilterState.status],
+                resellerIds: [...simsFilterState.resellerIds],
+                vendors: [...simsFilterState.vendors],
+                gateways: [...simsFilterState.gateways],
+                activatedFrom: simsFilterState.activatedFrom,
+                activatedTo: simsFilterState.activatedTo,
+                search: simsFilterState.search,
+                columnFilters: JSON.parse(JSON.stringify(simsColumnFilters)),
+                sortKey: tableState.sims.sortKey,
+                sortDir: tableState.sims.sortDir,
+            };
+        }
+
+        async function saveCurrentSimsFilter() {
+            const raw = await showTextPrompt('Save filter', 'Name this view so you can come back to it.', '', 'e.g. Teltik offline');
+            const name = (raw || '').trim();
+            if (!name) return;
+            const list = loadSimsSavedFilters();
+            const state = captureSimsFilterState();
+            const existing = list.findIndex(function (f) { return f.name.toLowerCase() === name.toLowerCase(); });
+            if (existing !== -1) {
+                const ok = await showConfirm('Replace filter', 'A filter named "' + name + '" already exists. Replace it?');
+                if (!ok) return;
+                list[existing] = { name: name, state: state };
+            } else {
+                list.push({ name: name, state: state });
+            }
+            persistSimsSavedFilters(list);
+            renderSimsSavedFilters();
+            showToast('Saved filter "' + name + '"', 'success');
+        }
+
+        function applySimsSavedFilter(name) {
+            const entry = loadSimsSavedFilters().find(function (f) { return f.name === name; });
+            if (!entry || !entry.state) return;
+            const st = entry.state;
+
+            // Status and reseller are applied server-side, so a change in either
+            // has to go back to the API; everything else is a local re-filter.
+            const needsRefetch =
+                JSON.stringify(st.status || []) !== JSON.stringify(simsFilterState.status) ||
+                JSON.stringify(st.resellerIds || []) !== JSON.stringify(simsFilterState.resellerIds);
+
+            simsFilterState.status = [...(st.status || [])];
+            simsFilterState.resellerIds = [...(st.resellerIds || [])];
+            simsFilterState.vendors = [...(st.vendors || [])];
+            simsFilterState.gateways = [...(st.gateways || [])];
+            simsFilterState.activatedFrom = st.activatedFrom || '';
+            simsFilterState.activatedTo = st.activatedTo || '';
+            simsFilterState.search = st.search || '';
+            // Drop filters naming a column that no longer exists, rather than
+            // silently matching nothing.
+            simsColumnFilters = (st.columnFilters || []).filter(function (f) { return SIMS_COLUMN_BY_KEY[f.col]; });
+            if (st.sortKey) { tableState.sims.sortKey = st.sortKey; tableState.sims.sortDir = st.sortDir || 'asc'; }
+
+            const fa = document.getElementById('filter-activated-from'); if (fa) fa.value = simsFilterState.activatedFrom;
+            const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = simsFilterState.activatedTo;
+            const sa = document.getElementById('sims-search');            if (sa) sa.value = simsFilterState.search;
+
+            tableState.sims.page = 1;
+            if (needsRefetch) loadSims(true); else renderSims();
+        }
+
+        async function deleteSimsSavedFilter(name) {
+            const ok = await showConfirm('Delete filter', 'Delete saved filter "' + name + '"?');
+            if (!ok) return;
+            persistSimsSavedFilters(loadSimsSavedFilters().filter(function (f) { return f.name !== name; }));
+            renderSimsSavedFilters();
+        }
+
+        function renderSimsSavedFilters() {
+            const host = document.getElementById('sims-saved-filters');
+            if (!host) return;
+            const list = loadSimsSavedFilters();
+            const saveBtn = '<button onclick="saveCurrentSimsFilter()" title="Save the current filters and sort under a name" class="px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">+ Save current filter</button>';
+            if (!list.length) {
+                host.innerHTML = '<span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Saved</span>' + saveBtn +
+                    '<span class="text-xs text-gray-500 ml-1">No saved filters yet — set up a view, then save it.</span>';
+                return;
+            }
+            host.innerHTML = '<span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Saved</span>' +
+                list.map(function (f) {
+                    const n = esc(f.name);
+                    const attr = n.replace(/'/g, '&#39;');
+                    return '<span class="inline-flex items-center rounded-full border border-dark-500 bg-dark-700 overflow-hidden">' +
+                           '<button onclick="applySimsSavedFilter(\'' + attr + '\')" title="Apply this filter" class="px-2.5 py-1 text-xs text-gray-300 hover:bg-dark-600 transition">' + n + '</button>' +
+                           '<button onclick="deleteSimsSavedFilter(\'' + attr + '\')" title="Delete" class="px-1.5 py-1 text-xs text-gray-400 hover:text-white hover:bg-dark-600 transition">&times;</button>' +
+                           '</span>';
+                }).join('') + saveBtn;
+        }
+
+        // --- Per-column filter popover --------------------------------------
+        let _simsColFilterOpen = null; // column key currently being edited
+
+        function simsColFilterPop() {
+            let el = document.getElementById('sims-colfilter-pop');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'sims-colfilter-pop';
+                // Matches #sims-filter-menu: dark-800 is the raised card (white
+                // in the light theme), dark-700 is a border tone and must not
+                // be used as a panel background.
+                el.className = 'hidden fixed z-50 w-72 bg-dark-800 border border-dark-600 rounded-lg shadow-xl p-3 text-sm';
+                document.body.appendChild(el);
+            }
+            return el;
+        }
+
+        function closeSimsColumnFilter() {
+            _simsColFilterOpen = null;
+            simsColFilterPop().classList.add('hidden');
+            document.removeEventListener('mousedown', simsColFilterMaybeClose);
+        }
+
+        function simsColFilterMaybeClose(e) {
+            const pop = simsColFilterPop();
+            if (pop.contains(e.target)) return;
+            if (e.target.closest && e.target.closest('[data-colfilter-btn]')) return;
+            closeSimsColumnFilter();
+        }
+
+        function openSimsColumnFilter(colKey, anchorEl) {
+            const col = SIMS_COLUMN_BY_KEY[colKey];
+            if (!col) return;
+            if (_simsColFilterOpen === colKey) { closeSimsColumnFilter(); return; }
+            _simsColFilterOpen = colKey;
+
+            const pop = simsColFilterPop();
+            const existing = simsColumnFilters.find(function (f) { return f.col === colKey; });
+            const ops = FILTER_OPS[col.type] || FILTER_OPS.text;
+            const activeOp = existing ? existing.op : ops[0].op;
+
+            pop.innerHTML =
+                '<div class="flex items-center justify-between mb-2">' +
+                  '<span class="font-medium text-gray-200">' + esc(col.label) + '</span>' +
+                  '<button onclick="closeSimsColumnFilter()" class="text-gray-500 hover:text-gray-300 px-1">&times;</button>' +
+                '</div>' +
+                '<select id="sims-colfilter-op" onchange="renderSimsColFilterValue()" class="w-full mb-2 text-sm bg-dark-700 border border-dark-600 rounded px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent">' +
+                  ops.map(function (o) {
+                      return '<option value="' + o.op + '"' + (o.op === activeOp ? ' selected' : '') + '>' + esc(o.label) + '</option>';
+                  }).join('') +
+                '</select>' +
+                '<div id="sims-colfilter-value" class="mb-3"></div>' +
+                '<div class="flex gap-2">' +
+                  '<button onclick="applySimsColumnFilterFromPopover()" class="flex-1 px-3 py-1.5 bg-accent hover:bg-green-400 text-white rounded transition">Apply</button>' +
+                  '<button onclick="clearSimsColumnFilter(\'' + colKey + '\'); closeSimsColumnFilter();" class="px-3 py-1.5 bg-dark-600 hover:bg-dark-500 text-gray-300 rounded transition">Clear</button>' +
+                '</div>';
+
+            renderSimsColFilterValue();
+
+            // Anchor under the header cell, nudged left if it would overflow.
+            const r = anchorEl.getBoundingClientRect();
+            pop.classList.remove('hidden');
+            const w = pop.offsetWidth;
+            pop.style.top = Math.min(r.bottom + 6, window.innerHeight - pop.offsetHeight - 8) + 'px';
+            pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+
+            setTimeout(function () { document.addEventListener('mousedown', simsColFilterMaybeClose); }, 0);
+        }
+
+        function renderSimsColFilterValue() {
+            const colKey = _simsColFilterOpen;
+            const col = SIMS_COLUMN_BY_KEY[colKey];
+            if (!col) return;
+            const opSel = document.getElementById('sims-colfilter-op');
+            const box = document.getElementById('sims-colfilter-value');
+            if (!opSel || !box) return;
+            const opDef = (FILTER_OPS[col.type] || FILTER_OPS.text).find(function (o) { return o.op === opSel.value; });
+            const existing = simsColumnFilters.find(function (f) { return f.col === colKey; });
+            const prior = existing && existing.op === opSel.value ? existing : null;
+
+            if (!opDef || opDef.arity === 0) { box.innerHTML = '<div class="text-xs text-gray-500">No value needed.</div>'; return; }
+
+            if (opDef.arity === 'multi') {
+                const vals = simsDistinctValues(colKey);
+                const chosen = new Set(prior && Array.isArray(prior.value) ? prior.value : []);
+                if (!vals.length) { box.innerHTML = '<div class="text-xs text-gray-500">No values in the loaded rows.</div>'; return; }
+                box.innerHTML =
+                    '<input id="sims-colfilter-search" oninput="simsColFilterOptionSearch(this.value)" placeholder="Search values" class="w-full mb-2 text-sm bg-dark-700 border border-dark-600 rounded px-2 py-1 text-gray-300 focus:outline-none focus:border-accent">' +
+                    '<div class="max-h-48 overflow-y-auto space-y-1">' +
+                      vals.map(function (v) {
+                          return '<label data-optrow="' + esc(v.toLowerCase()) + '" class="flex items-center gap-2 px-1 py-0.5 rounded hover:bg-dark-600 cursor-pointer">' +
+                                 '<input type="checkbox" class="sims-colfilter-opt accent-green-500" value="' + esc(v) + '"' + (chosen.has(v) ? ' checked' : '') + '>' +
+                                 '<span class="text-gray-300 truncate">' + esc(v) + '</span></label>';
+                      }).join('') +
+                    '</div>';
+                return;
+            }
+
+            const inputType = opDef.input === 'date' ? 'date' : (col.type === 'number' || opDef.op === 'within_h' || opDef.op === 'older_h' ? 'number' : 'text');
+            const v1 = prior ? (prior.value == null ? '' : prior.value) : '';
+            const v2 = prior ? (prior.value2 == null ? '' : prior.value2) : '';
+            let html = '<input id="sims-colfilter-v1" type="' + inputType + '" value="' + esc(v1) + '" class="w-full text-sm bg-dark-700 border border-dark-600 rounded px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent" placeholder="Value">';
+            if (opDef.arity === 2) {
+                html += '<div class="text-center text-xs text-gray-500 my-1">and</div>' +
+                        '<input id="sims-colfilter-v2" type="' + inputType + '" value="' + esc(v2) + '" class="w-full text-sm bg-dark-700 border border-dark-600 rounded px-2 py-1.5 text-gray-300 focus:outline-none focus:border-accent" placeholder="Value">';
+            }
+            box.innerHTML = html;
+        }
+
+        function simsColFilterOptionSearch(q) {
+            const needle = (q || '').toLowerCase();
+            document.querySelectorAll('#sims-colfilter-value [data-optrow]').forEach(function (row) {
+                row.classList.toggle('hidden', needle && !row.getAttribute('data-optrow').includes(needle));
+            });
+        }
+
+        function applySimsColumnFilterFromPopover() {
+            const colKey = _simsColFilterOpen;
+            const col = SIMS_COLUMN_BY_KEY[colKey];
+            if (!col) return;
+            const op = document.getElementById('sims-colfilter-op').value;
+            const opDef = (FILTER_OPS[col.type] || FILTER_OPS.text).find(function (o) { return o.op === op; });
+            const f = { col: colKey, op: op };
+
+            if (opDef && opDef.arity === 'multi') {
+                f.value = [...document.querySelectorAll('.sims-colfilter-opt:checked')].map(function (cb) { return cb.value; });
+                // An "is any of" with nothing ticked would match everything —
+                // treat it as clearing the filter rather than a silent no-op.
+                if (!f.value.length) { clearSimsColumnFilter(colKey); closeSimsColumnFilter(); return; }
+            } else if (opDef && opDef.arity >= 1) {
+                const v1 = document.getElementById('sims-colfilter-v1');
+                f.value = v1 ? v1.value : '';
+                if (opDef.arity === 2) {
+                    const v2 = document.getElementById('sims-colfilter-v2');
+                    f.value2 = v2 ? v2.value : '';
+                }
+                if (f.value === '' && (opDef.arity !== 2 || f.value2 === '')) { clearSimsColumnFilter(colKey); closeSimsColumnFilter(); return; }
+            }
+
+            setSimsColumnFilter(f);
+            closeSimsColumnFilter();
+        }
+
+        // Chip row for the active per-column filters, rendered above the table.
+        function renderSimsColumnFilterChips() {
+            const host = document.getElementById('sims-colfilter-chips');
+            if (!host) return;
+            if (!simsColumnFilters.length) { host.innerHTML = ''; host.classList.add('hidden'); return; }
+            host.classList.remove('hidden');
+            host.innerHTML =
+                simsColumnFilters.map(function (f) {
+                    return '<span class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300">' +
+                           esc(simsFilterSummary(f)) +
+                           '<button onclick="clearSimsColumnFilter(\'' + f.col + '\')" class="ml-1 text-gray-400 hover:text-white" title="Remove">&times;</button>' +
+                           '</span>';
+                }).join('') +
+                '<button onclick="clearAllSimsColumnFilters()" class="px-2 py-1 text-xs rounded bg-dark-600 hover:bg-dark-500 text-gray-300 transition">Clear all</button>';
+        }
+
+        // The header funnels only reach columns the table actually shows. This
+        // picker exposes the rest of the registry (MSISDN, carrier, host,
+        // uptime counters, the boolean flags) so "filter by anything" is true
+        // of every column, not just the visible ones.
+        let _simsAddFilterPopulated = false;
+        function populateSimsAddFilter() {
+            if (_simsAddFilterPopulated) return;
+            const sel = document.getElementById('sims-add-filter');
+            if (!sel) return;
+            sel.innerHTML = '<option value="">+ Filter column&hellip;</option>' +
+                SIMS_COLUMNS.map(function (c) {
+                    return '<option value="' + c.key + '">' + esc(c.label) + '</option>';
+                }).join('');
+            _simsAddFilterPopulated = true;
+        }
+
+        function onSimsAddFilterPick(sel) {
+            const key = sel.value;
+            sel.value = '';
+            if (key) openSimsColumnFilter(key, sel);
+        }
+
+        // Marks which headers currently carry a filter so the funnel icon can
+        // show active state without re-rendering the whole thead.
+        function syncSimsColumnFilterIcons() {
+            const active = new Set(simsColumnFilters.map(function (f) { return f.col; }));
+            document.querySelectorAll('[data-colfilter-btn]').forEach(function (btn) {
+                const on = active.has(btn.getAttribute('data-colfilter-btn'));
+                btn.classList.toggle('text-indigo-400', on);
+                btn.classList.toggle('text-gray-400', !on);
+            });
+        }
+
         let simsColumnVis = (function(){ try { return JSON.parse(localStorage.getItem('simsColumnVis') || '{}'); } catch(e) { return {}; } })();
         let _simsSearchTimer = null;
         function onSimsSearchInput(v) {
@@ -5331,11 +5919,6 @@ set verify_pending; schedule §C.3 poll
             tableState.sims.page = 1;
             renderSims();
         }
-        function onSimsPresetChange(v) {
-            simsFilterState.presets = new Set(v ? [v] : []);
-            tableState.sims.page = 1;
-            renderSims();
-        }
         function onSimsActivatedFromChange(v) {
             simsFilterState.activatedFrom = v || '';
             tableState.sims.page = 1;
@@ -5347,45 +5930,10 @@ set verify_pending; schedule §C.3 poll
             renderSims();
         }
 
-        // ===== SIMs filter UI: presets, multi-select popover, active chips =====
+        // ===== SIMs filter UI: saved filters, multi-select popover, active chips =====
         function getResellerOptions() {
             const cache = window._simsResellersCache || [];
             return cache.map(function(r){ return { value: String(r.id), text: r.name || ('#' + r.id) }; });
-        }
-        function renderSimsPresetChips() {
-            document.querySelectorAll('[data-preset]').forEach(function(btn){
-                const id = btn.getAttribute('data-preset');
-                const active = simsFilterState.presets.has(id);
-                btn.className = active
-                    ? 'sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-accent bg-accent text-white transition'
-                    : 'sim-preset-chip px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition';
-            });
-        }
-        function toggleSimsPreset(id) {
-            if (simsFilterState.presets.has(id)) {
-                // Toggling off — leave other filters alone.
-                simsFilterState.presets.delete(id);
-                tableState.sims.page = 1;
-                renderSimsPresetChips();
-                renderSims();
-                return;
-            }
-            // Activating preset: clear all non-preset filters first.
-            const hadServerFilters = simsFilterState.status.length > 0 || simsFilterState.resellerIds.length > 0;
-            simsFilterState.status = [];
-            simsFilterState.resellerIds = [];
-            simsFilterState.vendors = [];
-            simsFilterState.gateways = [];
-            simsFilterState.activatedFrom = '';
-            simsFilterState.activatedTo = '';
-            simsFilterState.search = '';
-            const fa = document.getElementById('filter-activated-from'); if (fa) fa.value = '';
-            const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = '';
-            const sa = document.getElementById('sims-search');            if (sa) sa.value = '';
-            simsFilterState.presets.add(id);
-            tableState.sims.page = 1;
-            renderSimsPresetChips();
-            if (hadServerFilters) loadSims(true); else renderSims();
         }
         function setSimsCountBadges() {
             function fmt(arr){ return (arr && arr.length > 0) ? '(' + arr.length + ')' : ''; }
@@ -5441,11 +5989,6 @@ set verify_pending; schedule §C.3 poll
                 }
                 chips.push(chipEl('reseller', v, display, 'Reseller'));
             });
-            // Presets
-            simsFilterState.presets.forEach(function(id){
-                const p = SIM_PRESETS[id];
-                if (p) chips.push(chipEl('preset', id, p.label, 'Preset'));
-            });
             // Date range
             if (simsFilterState.activatedFrom) chips.push(chipEl('activatedFrom', simsFilterState.activatedFrom, simsFilterState.activatedFrom, 'From'));
             if (simsFilterState.activatedTo)   chips.push(chipEl('activatedTo',   simsFilterState.activatedTo,   simsFilterState.activatedTo,   'To'));
@@ -5475,10 +6018,6 @@ set verify_pending; schedule §C.3 poll
                 loadSims(true);
                 return;
             }
-            else if (kind === 'preset') {
-                simsFilterState.presets.delete(key);
-                renderSimsPresetChips();
-            }
             else if (kind === 'activatedFrom') { simsFilterState.activatedFrom = ''; const el = document.getElementById('filter-activated-from'); if (el) el.value = ''; }
             else if (kind === 'activatedTo')   { simsFilterState.activatedTo = '';   const el = document.getElementById('filter-activated-to');   if (el) el.value = ''; }
             else if (kind === 'search') {        simsFilterState.search = '';        const el = document.getElementById('sims-search');           if (el) el.value = ''; }
@@ -5490,15 +6029,14 @@ set verify_pending; schedule §C.3 poll
             simsFilterState.resellerIds = [];
             simsFilterState.vendors = [];
             simsFilterState.gateways = [];
-            simsFilterState.presets = new Set();
             simsFilterState.activatedFrom = '';
             simsFilterState.activatedTo = '';
             simsFilterState.search = '';
+            simsColumnFilters = [];
             const fa = document.getElementById('filter-activated-from'); if (fa) fa.value = '';
             const ta = document.getElementById('filter-activated-to');   if (ta) ta.value = '';
             const sa = document.getElementById('sims-search');            if (sa) sa.value = '';
             tableState.sims.page = 1;
-            renderSimsPresetChips();
             loadSims(true);
         }
         function openSimsFilterMenu(kind, anchorEl) {
@@ -5519,9 +6057,26 @@ set verify_pending; schedule §C.3 poll
                 { value: 'data_mismatch', label: 'Data Mismatch' },
                 { value: '__all__', label: 'Include cancelled (server flag)' },
             ];
-                const counts = {};
-                data.forEach(function(s){ counts[s.status] = (counts[s.status]||0) + 1; });
+                // Prefer fleet-wide counts. Counting the loaded rows cannot work
+                // for status: the server filters on it, so any status excluded by
+                // the current query always tallied 0 — "Cancelled (0)" while
+                // hundreds existed. Falls back to loaded rows if the fetch failed.
+                const loaded = {};
+                data.forEach(function(s){ loaded[s.status] = (loaded[s.status]||0) + 1; });
+                const counts = SIMS_STATUS_COUNTS || loaded;
                 opts = STATUS_OPTS.map(function(o){ return { value: o.value, label: o.label, count: o.value === '__all__' ? 0 : (counts[o.value] || 0) }; });
+                // A status nobody thought to hardcode (rotation_failed, say) is
+                // otherwise unfilterable and invisible. Surface whatever the
+                // fleet actually contains.
+                const known = new Set(STATUS_OPTS.map(function(o){ return o.value; }));
+                Object.keys(counts).sort().forEach(function(st){
+                    if (known.has(st) || !counts[st]) return;
+                    opts.splice(opts.length - 1, 0, {
+                        value: st,
+                        label: st.replace(/_/g, ' ').replace(/\b\w/g, function(c){ return c.toUpperCase(); }),
+                        count: counts[st],
+                    });
+                });
             } else if (kind === 'vendor') {
             const VENDOR_OPTS = [
                 { value: 'helix', label: 'Helix (legacy)' },
@@ -5650,7 +6205,7 @@ set verify_pending; schedule §C.3 poll
             if (s.vendors.length)      params.set('vendor', s.vendors.join(','));
             if (s.gateways.length)     params.set('gateway', s.gateways.join(','));
             if (s.resellerIds.length)  params.set('reseller', s.resellerIds.join(','));
-            if (s.presets.size > 0)    params.set('presets', Array.from(s.presets).join(','));
+            if (simsColumnFilters.length) params.set('cols', JSON.stringify(simsColumnFilters));
             if (s.activatedFrom)       params.set('from', s.activatedFrom);
             if (s.activatedTo)         params.set('to', s.activatedTo);
             if (s.search)              params.set('search', s.search);
@@ -5683,7 +6238,26 @@ set verify_pending; schedule §C.3 poll
                     return Number.isFinite(n) ? n : v;
                 });
             }
-            if (params.has('presets'))   s.presets = new Set(params.get('presets').split(',').filter(Boolean));
+            if (params.has('cols')) {
+                // Unknown columns are dropped rather than left to match nothing.
+                try {
+                    const parsed = JSON.parse(params.get('cols'));
+                    if (Array.isArray(parsed)) {
+                        simsColumnFilters = parsed.filter(function(f){ return f && SIMS_COLUMN_BY_KEY[f.col]; });
+                    }
+                } catch (e) { /* malformed link: ignore rather than break the page */ }
+            }
+            // Links predating saved filters used ?presets=not_notified. Keep
+            // them working by mapping onto the computed column.
+            if (params.has('presets')) {
+                const legacy = { not_notified: 'notify_stale', not_rotated_today: 'not_rotated_today', portin_failed: 'portin_failed', stuck_provisioning: 'stuck_provisioning', no_sms_12h: 'no_sms_12h', no_reseller: 'no_reseller' };
+                params.get('presets').split(',').filter(Boolean).forEach(function(id){
+                    const col = legacy[id];
+                    if (col && !simsColumnFilters.some(function(f){ return f.col === col; })) {
+                        simsColumnFilters.push({ col: col, op: 'is_true' });
+                    }
+                });
+            }
             if (params.has('from'))      s.activatedFrom = params.get('from');
             if (params.has('to'))        s.activatedTo = params.get('to');
             if (params.has('search'))    s.search = params.get('search');
@@ -5808,18 +6382,40 @@ set verify_pending; schedule §C.3 poll
             else if (table === 'errors') renderErrors();
         }
 
-        function genericSort(arr, key, dir) {
+        // `table` is optional. When it is 'sims' the column registry supplies the
+        // declared type, so a date column sorts chronologically and a numeric
+        // column numerically even when the values arrive as strings. Without it
+        // the original loose behaviour is kept for the other tables.
+        //
+        // Blanks always sort last, in both directions. Treating them as '' put
+        // every never-rotated or never-messaged SIM at the top of an ascending
+        // sort, which buried the rows the operator was actually looking for.
+        function genericSort(arr, key, dir, table) {
+            const col = table === 'sims' ? SIMS_COLUMN_BY_KEY[key] : null;
+            const mul = dir === 'asc' ? 1 : -1;
+            const blank = (v) => v == null || v === '';
+
             return [...arr].sort((a, b) => {
-                let va = a[key], vb = b[key];
-                if (va == null) va = '';
-                if (vb == null) vb = '';
-                if (typeof va === 'number' && typeof vb === 'number') {
-                    return dir === 'asc' ? va - vb : vb - va;
+                const ra = col ? simColValue(a, col) : a[key];
+                const rb = col ? simColValue(b, col) : b[key];
+                if (blank(ra) && blank(rb)) return 0;
+                if (blank(ra)) return 1;
+                if (blank(rb)) return -1;
+
+                if (col && col.type === 'date') {
+                    const ta = new Date(ra).getTime(), tb = new Date(rb).getTime();
+                    if (Number.isFinite(ta) && Number.isFinite(tb)) return (ta - tb) * mul;
                 }
-                va = String(va).toLowerCase();
-                vb = String(vb).toLowerCase();
-                if (va < vb) return dir === 'asc' ? -1 : 1;
-                if (va > vb) return dir === 'asc' ? 1 : -1;
+                if (col && (col.type === 'number' || col.type === 'bool')) {
+                    const na = col.type === 'bool' ? (ra ? 1 : 0) : Number(ra);
+                    const nb = col.type === 'bool' ? (rb ? 1 : 0) : Number(rb);
+                    if (Number.isFinite(na) && Number.isFinite(nb)) return (na - nb) * mul;
+                }
+                if (typeof ra === 'number' && typeof rb === 'number') return (ra - rb) * mul;
+
+                const sa = String(ra).toLowerCase(), sb = String(rb).toLowerCase();
+                if (sa < sb) return -1 * mul;
+                if (sa > sb) return 1 * mul;
                 return 0;
             });
         }
@@ -6017,7 +6613,7 @@ set verify_pending; schedule §C.3 poll
                         '<span class="tabular-nums w-16">' + v.total + '</span>' +
                         '<span class="text-xs text-gray-500 ml-1 w-10">' + pct + '%</span>' +
                         (stale > 0
-                            ? '<a href="/sims?presets=not_notified" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + stale + ' stale &rarr;</a>'
+                            ? '<a href="/sims?notify_stale=1" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + stale + ' stale &rarr;</a>'
                             : '<span class="ml-auto text-xs text-emerald-400">&#10003; all fresh</span>') +
                     '</div>';
             });
@@ -6030,7 +6626,7 @@ set verify_pending; schedule §C.3 poll
                 '<span class="text-white tabular-nums w-16">' + totalTotal + '</span>' +
                 '<span class="text-xs text-gray-500 ml-1 w-10">' + totalPct + '%</span>' +
                 (totalStale > 0
-                    ? '<a href="/sims?presets=not_notified" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + totalStale + ' stale &rarr;</a>'
+                    ? '<a href="/sims?notify_stale=1" onclick="event.preventDefault();goToStaleSims();" class="ml-auto px-2 py-0.5 text-xs rounded bg-red-500/20 text-red-300 hover:bg-red-500/30 transition">' + totalStale + ' stale &rarr;</a>'
                     : '<span class="ml-auto text-xs text-emerald-400">&#10003; all fresh</span>') +
                 '</div>';
             rows.innerHTML = html;
@@ -6039,12 +6635,10 @@ set verify_pending; schedule §C.3 poll
         function goToStaleSims() {
             try {
                 if (typeof switchTab === 'function') switchTab('sims');
-                history.replaceState(null, '', '/sims?presets=not_notified');
+                history.replaceState(null, '', '/sims?notify_stale=1');
                 setTimeout(function(){
-                    if (typeof simsFilterState !== 'undefined') {
-                        simsFilterState.presets = new Set(['not_notified']);
-                        if (typeof renderSimsPresetChips === 'function') renderSimsPresetChips();
-                        if (typeof renderSims === 'function') renderSims();
+                    if (typeof setSimsColumnFilter === 'function') {
+                        setSimsColumnFilter({ col: 'notify_stale', op: 'is_true' });
                     }
                 }, 50);
             } catch(e) { console.error('goToStaleSims failed', e); }
@@ -6418,8 +7012,20 @@ set verify_pending; schedule §C.3 poll
         setTimeout(refreshReviewBadge, 2000);
 
         // ===== Teltik hosting port status (Sims table) =====
+        // Mirror of gatewayHostOf() in src/shared/gateway-host.mjs.
+        //
+        // gateway_host is the PHYSICAL gateway the card is seated in — 'skyline'
+        // or 'teltik'. vendor is the CARRIER ACCOUNT (teltik = T-Mobile,
+        // atomic/helix/wing_iot = AT&T) and must never decide the host: an
+        // AT&T SIM can sit in a Teltik gateway. sims.gateway_host is NOT NULL,
+        // so the fallback only fires for objects built in code; it resolves to
+        // teltik because SkyLine is legacy and always carries an explicit value.
+        function gatewayHostOf(sim) {
+            const h = sim && sim.gateway_host;
+            return (h === 'skyline' || h === 'teltik') ? h : 'teltik';
+        }
         function isTeltikHostedSim(sim) {
-            return sim.gateway_host === 'teltik' || (!sim.gateway_host && sim.vendor === 'teltik');
+            return gatewayHostOf(sim) === 'teltik';
         }
         // Latest persisted Hosting Port Status across ALL sources (cron, bulk,
         // SIM query, remediator) + uptime stats, straight from /api/sims.
@@ -6646,7 +7252,9 @@ set verify_pending; schedule §C.3 poll
                 if (force) params.set('force', 'true');
 
                 const url = API_BASE + '/sims?' + params.toString();
-                const response = await fetch(url);
+                // Fleet-wide status counts are independent of this query, so they
+                // ride along rather than adding a stage to the load.
+                const [response] = await Promise.all([fetch(url), loadSimsStatusCounts()]);
                 const sims = await response.json();
                 tableState.sims.data = sims;
                 lastSimsFetchedAt = Date.now();
@@ -6695,17 +7303,18 @@ function getFilteredSims() {
   // Activated date range
   if (simsFilterState.activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= simsFilterState.activatedFrom);
   if (simsFilterState.activatedTo) data = data.filter(s => s.activated_at && s.activated_at <= simsFilterState.activatedTo + 'T23:59:59');
-  // Presets (AND across active presets)
-  for (const pid of simsFilterState.presets) {
-    const p = SIM_PRESETS[pid];
-    if (p && p.test) data = data.filter(p.test);
-  }
-  return genericSort(data, state.sortKey, state.sortDir);
+  // Per-column filters (AND across columns), applied last so they narrow
+  // whatever the toolbar selections already produced.
+  data = applySimsColumnFilters(data);
+  return genericSort(data, state.sortKey, state.sortDir, 'sims');
 }
 
 function renderSims() {
-  renderSimsPresetChips();
   renderSimsActiveChips();
+  populateSimsAddFilter();
+  renderSimsSavedFilters();
+  renderSimsColumnFilterChips();
+  syncSimsColumnFilterIcons();
   setSimsCountBadges();
   syncSimsUrl();
   const state = tableState.sims;
@@ -6723,7 +7332,8 @@ function renderSims() {
                 const fs = simsFilterState;
                 const hasFilters = (fs.status.length > 0 && !(fs.status.length === 1 && fs.status[0] === 'active'))
                     || fs.vendors.length || fs.gateways.length || fs.resellerIds.length
-                    || fs.presets.size > 0 || fs.activatedFrom || fs.activatedTo || fs.search;
+                    || fs.activatedFrom || fs.activatedTo || fs.search
+                    || simsColumnFilters.length;
                 if (hasFilters) {
                     tbody.innerHTML = '<tr><td colspan="16" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';
                 } else {
@@ -6736,7 +7346,15 @@ function renderSims() {
                 const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
                 const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
                 const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-accent" title="Verified">&#10003;</span>' : '';
-                const gatewayDisplay = sim.gateway_code ? `<span class="font-medium text-gray-200">${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">${normalizePortDisplay(sim.port) || ''}</span>` : (sim.vendor === 'teltik' ? '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-pink-500/20 text-pink-300">T-Mobile</span>' : (normalizePortDisplay(sim.port) || '-'));
+                // Gateway has exactly two values: a SkyLine gateway, or hosted
+                // by Teltik. T-Mobile is the carrier (sim.vendor) and belongs in
+                // the Vendor column, not here.
+                const simHost = gatewayHostOf(sim);
+                const gatewayDisplay = simHost === 'skyline'
+                    ? (sim.gateway_code
+                        ? `<span class="font-medium text-gray-200">${sim.gateway_code}</span><span class="text-gray-500 text-xs ml-1">${normalizePortDisplay(sim.port) || ''}</span>`
+                        : `<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-amber-500/20 text-amber-300" title="Marked SkyLine-hosted but assigned to no gateway — the row is inconsistent">SkyLine &mdash; unassigned</span>`)
+                    : '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-sky-500/20 text-sky-300" title="Hosted by Teltik — not seated in a SkyLine gateway">Teltik</span>';
                 const statusClass = {
                     'active': 'bg-accent/20 text-accent',
                     'provisioning': 'bg-yellow-500/20 text-yellow-400',
@@ -9935,7 +10553,9 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function remediatorRunNow() {
-            if (!confirm('Trigger an immediate Auto-Remediator main tick now?\n\nThis runs the same logic as the 2-hour cron once. Reviewer kill-switch must be enabled or the tick will short-circuit.')) return;
+            const okRun = await showConfirm('Run Auto-Remediator now',
+                'This runs the same logic as the 2-hour cron once. The reviewer kill-switch must be enabled or the tick will short-circuit.');
+            if (!okRun) return;
             const out = document.getElementById('remediator-run-result');
             if (out) { out.classList.remove('hidden'); out.textContent = 'Running…'; }
             try {
@@ -9961,9 +10581,10 @@ async function sendSimOnline(simId, phoneNumber) {
 
         async function remediatorToggleKillSwitch(enabled) {
             const verb = enabled ? 'RESUME' : 'PAUSE';
-            if (!confirm(verb + ' the Auto-Remediator?\n\n' + (enabled
+            const okToggle = await showConfirm(verb + ' the Auto-Remediator', enabled
                 ? 'This re-enables the 2-hour cron. The next scheduled tick will process queued bad rentals.'
-                : 'This disables the 2-hour cron. Already-running attempts finish; no new actions will be taken until you resume.'))) return;
+                : 'This disables the 2-hour cron. Already-running attempts finish; no new actions will be taken until you resume.');
+            if (!okToggle) return;
             try {
                 const resp = await fetch(API_BASE + '/remediator/kill-switch', {
                     method: 'POST',
@@ -9973,7 +10594,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 await loadRemediatorStatus();
             } catch (e) {
-                alert('Toggle failed: ' + (e && e.message ? e.message : String(e)));
+                showToast('Toggle failed: ' + (e && e.message ? e.message : String(e)), 'error');
             }
         }
 
@@ -10034,7 +10655,7 @@ async function sendSimOnline(simId, phoneNumber) {
 
         function openBadRentalEdit(reportId) {
             const r = (window._badRentalRowsById || {})[reportId];
-            if (!r) { alert('Report ' + reportId + ' not in current view; refresh first.'); return; }
+            if (!r) { showToast('Report ' + reportId + ' not in current view; refresh first.', 'error'); return; }
             const modal = document.getElementById('bad-rentals-edit-modal');
             if (!modal) return;
             document.getElementById('bad-rentals-edit-id').textContent = '#' + reportId;
@@ -10499,7 +11120,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const data = await resp.json().catch(function(){ return {}; });
                 if (!resp.ok) {
                     const message = (data && data.error) ? data.error : ('HTTP ' + resp.status);
-                    alert('Failed to queue auto rerun: ' + message);
+                    showToast('Failed to queue auto rerun: ' + message, 'error');
                     return;
                 }
                 if (typeof showToast === 'function') showToast('BRR #' + reportId + ' queued for auto rerun', 'success');
@@ -10507,7 +11128,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (typeof loadBadRentals === 'function') loadBadRentals();
                 if (typeof loadRemediatorStatus === 'function') loadRemediatorStatus();
             } catch(e) {
-                alert('Network error: ' + e.message);
+                showToast('Network error: ' + e.message, 'error');
                 console.error('[rerunBadRentalAuto]', e);
             }
         }
@@ -10534,7 +11155,7 @@ async function sendSimOnline(simId, phoneNumber) {
             if (action === null) return; // cancelled
             const trimmed = String(action || '').trim().toLowerCase();
             if (!allowed.includes(trimmed)) {
-                alert('Invalid action. Choose one of: ' + allowed.join(', '));
+                showToast('Invalid action. Choose one of: ' + allowed.join(', '), 'error');
                 return;
             }
             const note = window.prompt('Resolution note (≤500 chars):', defaultNote) || '';
@@ -10546,7 +11167,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 });
                 const data = await resp.json().catch(function(){ return {}; });
                 if (!resp.ok) {
-                    alert('Failed to mark fixed: ' + (data && data.error ? data.error : resp.status));
+                    showToast('Failed to mark fixed: ' + (data && data.error ? data.error : resp.status), 'error');
                     return;
                 }
                 // When the fix was an MDN swap and we know the current SIM, also push
@@ -10574,7 +11195,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
                 if (typeof loadBadRentals === 'function') loadBadRentals();
             } catch(e) {
-                alert('Network error: ' + e.message);
+                showToast('Network error: ' + e.message, 'error');
                 console.error('[markBadRentalFixed]', e);
             }
         }
@@ -12996,7 +13617,8 @@ async function sendSimOnline(simId, phoneNumber) {
         async function resetResellerCredentials(resellerId, resellerName, currentUsername) {
             let username = (currentUsername || '').trim().toLowerCase();
             if (!username) {
-                username = prompt('No username set yet. Choose a username for ' + resellerName + ' (a-z, 0-9, . _ -):') || '';
+                username = await showTextPrompt('Choose a username',
+                    'No username set yet for ' + resellerName + '. Allowed: a-z, 0-9, and . _ -', '', 'username') || '';
                 username = username.trim().toLowerCase();
                 if (!username || !/^[a-z0-9._-]{3,40}$/.test(username)) { showToast('Invalid username', 'error'); return; }
             }
@@ -13396,7 +14018,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function deleteInvoice(invoiceId) {
-            if (!confirm('Permanently delete this invoice? This frees the week so it can be re-generated. This cannot be undone.')) return;
+            if (!await showConfirm('Delete invoice', 'Permanently delete this invoice? This frees the week so it can be re-generated. This cannot be undone.')) return;
             try {
                 const resp = await fetch(API_BASE + '/qbo-invoices/' + invoiceId, { method: 'DELETE' });
                 const result = await resp.json();
@@ -15236,7 +15858,7 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
         async function retryActivationItem(itemId) {
-            if (!confirm('Retry this activation item?')) return;
+            if (!await showConfirm('Retry item', 'Retry this activation item?')) return;
 
             try {
                 const resp = await fetch(`${API_BASE}/activation-runs`, {
@@ -15262,7 +15884,7 @@ async function sendSimOnline(simId, phoneNumber) {
             const retryCount = (parseInt(document.getElementById('ar-detail-failed').textContent) || 0) +
                                (parseInt(document.getElementById('ar-detail-retry').textContent) || 0);
             if (retryCount === 0) return;
-            if (!confirm(`Retry all ${retryCount} failed/retry-needed items in this run?`)) return;
+            if (!await showConfirm('Retry all failed', `Retry all ${retryCount} failed/retry-needed items in this run?`)) return;
 
             try {
                 const resp = await fetch(`${API_BASE}/activation-runs`, {

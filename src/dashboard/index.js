@@ -166,6 +166,10 @@ async function handleDashboardRequest(request, env, ctx, audit) {
       return handleSims(env, corsHeaders, url);
     }
 
+    if (url.pathname === '/api/sims/status-counts') {
+      return handleSimsStatusCounts(env, corsHeaders);
+    }
+
     if (url.pathname === '/api/messages') {
       return handleMessages(env, corsHeaders, url);
     }
@@ -1067,6 +1071,38 @@ async function handleSmsUsage(env, corsHeaders, url) {
   }
 }
 
+// Fleet-wide tally of SIMs per status.
+//
+// The SIMs filter menu used to count whatever rows happened to be loaded, but
+// status is filtered server-side: the default query appends status=neq.canceled,
+// so no cancelled row is ever present and "Cancelled (0)" was structurally
+// guaranteed regardless of how many exist. Same for any status the current
+// query excludes. This counts the table itself, so the menu can show what is
+// really there rather than what is on screen.
+//
+// Only the status column is selected, so this stays a small payload even at
+// full fleet size, and needs no new DB function.
+async function handleSimsStatusCounts(env, corsHeaders) {
+  try {
+    const rows = await supabaseGetAllArray(env, 'sims?select=status');
+    const counts = {};
+    for (const row of rows) {
+      const key = row && row.status ? row.status : 'unknown';
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return new Response(JSON.stringify({ ok: true, counts, total: rows.length }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  } catch (error) {
+    // The menu falls back to counting loaded rows if this fails, so a failure
+    // here degrades the counts rather than breaking the filter.
+    return new Response(JSON.stringify({ ok: false, error: String(error) }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
+}
+
 async function handleSims(env, corsHeaders, url) {
   try {
     // Parse filter params
@@ -1103,65 +1139,68 @@ async function handleSims(env, corsHeaders, url) {
       );
     }
 
-    // Get SMS stats via DB-side aggregation, chunked into batches of 500
-    // sim_ids per RPC call. PostgREST caps response rows at 1000, so a single
-    // call with all sim_ids silently truncates once >1000 SIMs have messages.
-    const simIds = filteredSims.map(s => s.id);
-    const smsMap = {}; // sim_id -> { count, last_received }
-    if (simIds.length > 0) {
-      const CHUNK = 500;
-      const chunks = [];
-      for (let i = 0; i < simIds.length; i += CHUNK) chunks.push(simIds.slice(i, i + CHUNK));
-      const smsUrl = env.SUPABASE_URL + '/rest/v1/rpc/get_sms_counts_24h';
-      const rpcHeaders = {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      };
-      const responses = await Promise.all(chunks.map(chunk =>
-        fetch(smsUrl, {
-          method: 'POST',
-          headers: rpcHeaders,
-          body: JSON.stringify({ sim_ids: chunk }),
-        }).then(r => r.json())
-      ));
-      for (const rows of responses) {
-        if (!Array.isArray(rows)) continue;
-        for (const row of rows) {
-          smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
-        }
-      }
-    }
+    // SMS stats and Teltik hosting-port status both come from DB-side
+    // aggregation RPCs, chunked into batches of 500 sim_ids per call. PostgREST
+    // caps response rows at 1000, so a single call with every sim_id silently
+    // truncates once >1000 SIMs have rows.
+    //
+    // The two RPC groups depend only on the sim id list, never on each other,
+    // so they are launched together and awaited once. Previously the
+    // hosting-port calls did not start until every SMS call had come back,
+    // which spent a whole extra round-trip stage for no reason.
+    const CHUNK = 500;
+    const chunkIds = (ids) => {
+      const out = [];
+      for (let i = 0; i < ids.length; i += CHUNK) out.push(ids.slice(i, i + CHUNK));
+      return out;
+    };
+    const rpcHeaders = {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    };
+    const callRpc = (rpcPath, simIdChunk) => fetch(env.SUPABASE_URL + '/rest/v1/' + rpcPath, {
+      method: 'POST',
+      headers: rpcHeaders,
+      body: JSON.stringify({ sim_ids: simIdChunk }),
+    });
 
-    // Latest persisted Teltik hosting port status + uptime stats, derived from
-    // the canonical hosting_port_status_checks history across ALL check
-    // sources. Missing RPC/table (pre-migration) degrades to nulls.
-    const hostPortMap = {}; // sim_id -> get_hosting_port_status_summary row
+    const simIds = filteredSims.map(s => s.id);
     const teltikHostedIds = filteredSims
       .filter(s => s.gateway_host === 'teltik' || (!s.gateway_host && s.vendor === 'teltik'))
       .map(s => s.id);
-    if (teltikHostedIds.length > 0) {
-      const CHUNK = 500;
-      const hpChunks = [];
-      for (let i = 0; i < teltikHostedIds.length; i += CHUNK) hpChunks.push(teltikHostedIds.slice(i, i + CHUNK));
-      const hpUrl = env.SUPABASE_URL + '/rest/v1/rpc/get_hosting_port_status_summary';
-      const hpHeaders = {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      };
-      try {
-        const hpResponses = await Promise.all(hpChunks.map(chunk =>
-          fetch(hpUrl, { method: 'POST', headers: hpHeaders, body: JSON.stringify({ sim_ids: chunk }) })
-            .then(r => r.ok ? r.json() : null)
+
+    const smsPromise = simIds.length === 0
+      ? Promise.resolve([])
+      : Promise.all(chunkIds(simIds).map(chunk =>
+          callRpc('rpc/get_sms_counts_24h', chunk).then(r => r.json())
         ));
-        for (const rows of hpResponses) {
-          if (!Array.isArray(rows)) continue;
-          for (const row of rows) hostPortMap[row.sim_id] = row;
-        }
-      } catch (_) { /* pre-migration or transient RPC failure: no host-port data */ }
+
+    // Latest persisted Teltik hosting port status + uptime stats, derived from
+    // the canonical hosting_port_status_checks history across ALL check
+    // sources. A missing RPC/table (pre-migration) or a transient failure
+    // degrades to nulls rather than failing the whole SIMs request.
+    const hostPortPromise = teltikHostedIds.length === 0
+      ? Promise.resolve([])
+      : Promise.all(chunkIds(teltikHostedIds).map(chunk =>
+          callRpc('rpc/get_hosting_port_status_summary', chunk).then(r => r.ok ? r.json() : null)
+        )).catch(() => []);
+
+    const [smsResponses, hpResponses] = await Promise.all([smsPromise, hostPortPromise]);
+
+    const smsMap = {}; // sim_id -> { count, last_received }
+    for (const rows of smsResponses) {
+      if (!Array.isArray(rows)) continue;
+      for (const row of rows) {
+        smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
+      }
+    }
+
+    const hostPortMap = {}; // sim_id -> get_hosting_port_status_summary row
+    for (const rows of hpResponses) {
+      if (!Array.isArray(rows)) continue;
+      for (const row of rows) hostPortMap[row.sim_id] = row;
     }
 
     const formatted = filteredSims.map(sim => {
@@ -3399,7 +3438,10 @@ async function recomputeActivationRunCounts(env, runId) {
   await supabasePatch(env, `activation_runs?id=eq.${runId}`, patch);
 }
 
-async function supabaseGetAllArray(env, pathWithoutLimit) {
+// Serial fallback for supabaseGetAllArray, used only when PostgREST does not
+// give back a usable exact count. Walks pages one at a time, each request
+// waiting on the one before it.
+async function supabaseGetAllArraySerial(env, pathWithoutLimit) {
   const pageSize = 1000;
   const out = [];
   for (let offset = 0; ; offset += pageSize) {
@@ -3414,6 +3456,49 @@ async function supabaseGetAllArray(env, pathWithoutLimit) {
     if (!Array.isArray(batch)) return batch;
     out.push(...batch);
     if (batch.length < pageSize) break;
+  }
+  return out;
+}
+
+// Fetch every row of a PostgREST query, without the serial round trips.
+//
+// Paging serially cannot know how many pages exist, so each request has to wait
+// on the one before it. Here page 1 is asked for with Prefer: count=exact, so
+// PostgREST answers with a Content-Range of "0-999/4331" — the total, up front.
+// Every remaining page is then requested at once, turning N sequential round
+// trips into two. On the SIMs table (~4.3k rows) that is 5 stages down to 2.
+//
+// If the count header is absent (older PostgREST, or a view Postgres will not
+// count) this falls back to serial paging rather than guessing at a total, so a
+// missing header can never silently truncate the result.
+async function supabaseGetAllArray(env, pathWithoutLimit) {
+  const pageSize = 1000;
+  const sep = pathWithoutLimit.includes('?') ? '&' : '?';
+  const pageUrl = (offset) => pathWithoutLimit + sep + 'limit=' + pageSize + '&offset=' + offset;
+  const readPage = async (resp) => {
+    if (!resp.ok) {
+      throw new Error('PostgREST fetch failed: ' + resp.status + ' ' + (await resp.text()));
+    }
+    return resp.json();
+  };
+
+  const firstResp = await supabaseGet(env, pageUrl(0), { Prefer: 'count=exact' });
+  const firstPage = await readPage(firstResp);
+  if (!Array.isArray(firstPage)) return firstPage;
+  if (firstPage.length < pageSize) return firstPage;
+
+  const total = Number.parseInt(String(firstResp.headers.get('content-range') || '').split('/')[1], 10);
+  if (!Number.isFinite(total)) return supabaseGetAllArraySerial(env, pathWithoutLimit);
+
+  const offsets = [];
+  for (let offset = pageSize; offset < total; offset += pageSize) offsets.push(offset);
+  const rest = await Promise.all(
+    offsets.map((offset) => supabaseGet(env, pageUrl(offset)).then(readPage))
+  );
+
+  const out = firstPage;
+  for (const batch of rest) {
+    if (Array.isArray(batch)) out.push(...batch);
   }
   return out;
 }

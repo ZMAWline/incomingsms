@@ -1276,3 +1276,62 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 **Why:** The agent must never call carriers directly or the DB drifts; operators can cancel/delete in the portal, but an automated caller must not be able to remove lines; a leaked key must not mint its replacement; client-supplied actor strings are not a trustworthy trail.
 
 **Consequence:** Do not put a fenced route back by giving a key the admin role; add new destructive routes to `API_KEY_DENIED_ROUTES`; do not read `body.actor` for audit attribution; `dashboard_audit_log` has no retention policy yet.
+## 2026-09-10 — Publish dashboard changes as preview versions, not deploys
+
+**Decision:** `patch-dashboard` Step 5 now tells sessions to run
+`wrangler versions upload --env test`, which returns a per-version preview URL,
+instead of `wrangler deploy --env test`. Promoting to live test and deploying to
+prod are separate steps that need the user to ask.
+
+**Why:** `dashboard-test` and `dashboard` are each a single Worker with no
+locking — the last deploy wins, silently, whatever branch it came from. Several
+Claude sessions run against this repo at once and every one of them followed a
+skill that said "deploy to test". They overwrote each other three times in two
+days: twice on `dashboard-test` (2026-09-09 19:29, 2026-09-10 16:08) and once on
+**prod**, where `e21999ea` (SIMs redesign) and `91b3d56c` (Agent API) each
+removed the other's work within six minutes. A preview URL is per-version and
+immutable, so parallel sessions cannot collide.
+
+**Consequence:** Do not "simplify" Step 5 back to a plain deploy. The cost is one
+sign-in per preview host, because the session cookie is host-only and the preview
+is a different hostname — that is the trade, and it is worth it. Preview versions
+inherit every secret and binding, so nothing needs re-provisioning. A per-workstream
+`[env.*]` was tried first and rejected: a new env is a new Worker, and secrets are
+per-Worker, so it would start with no `SUPABASE_URL` and no auth.
+
+## 2026-09-10 — Verify what is running, not what the tool printed
+
+**Decision:** After deploying, confirm by downloading the live bundle from the
+Cloudflare API and grepping for a symbol you added. `patch-dashboard` Step 6 now
+says so explicitly.
+
+**Why:** Two false "it's deployed" reports in one session. A wrangler `Uploaded`
+line proves the upload happened, not that your code is being served — another
+session replaced it forty seconds later and the tool had no way to say so. And a
+`401` from an `/api` path proves nothing about whether a route exists: the auth
+gate answers before routing, so `/api/zzz-nonsense` returns 401 too. Both were
+reported to the user as confirmation, and both were wrong.
+
+**Consequence:** "Deployed successfully" is not a verification. For frontend-only
+changes, re-running the publish command is a valid check — "No updated asset files
+to upload" means Cloudflare's copy hash-matches the local file. Do not record a
+prod version id read from `deployments status` as your own deploy while other
+sessions are live; that is how the Agent API session came to cite `e21999ea`, a
+build that never contained it.
+
+## 2026-09-10 — Preset chips became computed columns, not deleted logic
+
+**Decision:** Removing the SIMs Quick preset chips kept every predicate, as
+computed columns on the filter registry (`compute` hook) rather than dropping them.
+
+**Why:** The chips encoded judgement no stored column holds. `notify_stale` is the
+clearest: its staleness window is vendor-specific — 48h for Teltik, 24h for
+everything else — so no date filter on `last_notified_at` reproduces it. As
+columns they also gained what chips never had: they combine with other filters and
+persist inside a saved view.
+
+**Consequence:** `simNotNotified`, `simNotRotatedToday`, `simPortInFailed`,
+`simStuckProvisioning1h` and `simNoSms12h` are load-bearing. `simPortInFailed` is
+also used by the port-in badge in `renderSims`. Filtering, sorting and the distinct
+option lists all read through `simColValue()`, so a new computed column works
+everywhere by adding one registry entry.
