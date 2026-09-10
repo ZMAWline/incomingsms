@@ -72,8 +72,10 @@ export default {
     if (authResponse) return authResponse;
 
     // Central role enforcement, applied once for every /api route. Deliberately
-    // path-based rather than method-based: several action routes below have no
-    // method guard, so a bare GET /api/cancel really cancels a line. See the
+    // path-based rather than method-based, and it stays that way even though
+    // every action route below now carries `request.method === 'POST'`: the
+    // path-first model is the defence-in-depth layer that does not silently
+    // fall open if a future route is added without its method guard. See the
     // ALWAYS_MUTATING list in shared/portal-auth.mjs.
     if (isApiPath && !canAccess(user.role, request.method, url.pathname)) {
       return new Response(JSON.stringify({
@@ -131,23 +133,23 @@ export default {
       return handleRunWorker(request, env, workerName, corsHeaders);
     }
 
-    if (url.pathname === '/api/rotate-sim') {
+    if (url.pathname === '/api/rotate-sim' && request.method === 'POST') {
       return handleRotateSim(request, env, corsHeaders);
     }
 
-    if (url.pathname === '/api/cancel') {
+    if (url.pathname === '/api/cancel' && request.method === 'POST') {
       return handleCancelSims(request, env, corsHeaders);
     }
 
-    if (url.pathname === '/api/suspend') {
+    if (url.pathname === '/api/suspend' && request.method === 'POST') {
       return handleSuspendSims(request, env, corsHeaders);
     }
 
-    if (url.pathname === '/api/restore') {
+    if (url.pathname === '/api/restore' && request.method === 'POST') {
       return handleRestoreSims(request, env, corsHeaders);
     }
 
-    if (url.pathname === '/api/activate') {
+    if (url.pathname === '/api/activate' && request.method === 'POST') {
       return handleActivateSims(request, env, corsHeaders);
     }
 
@@ -165,7 +167,7 @@ export default {
       return handleActivationRunDetail(env, corsHeaders, runId, url);
     }
 
-    if (url.pathname === '/api/sim-online') {
+    if (url.pathname === '/api/sim-online' && request.method === 'POST') {
       return handleSimOnline(request, env, corsHeaders);
     }
 
@@ -183,7 +185,7 @@ export default {
       return handleHelixQueryBulk(request, env, corsHeaders);
     }
 
-    if (url.pathname === '/api/send-test-sms') {
+    if (url.pathname === '/api/send-test-sms' && request.method === 'POST') {
       return handleSendTestSms(request, env, corsHeaders);
     }
 
@@ -199,7 +201,7 @@ export default {
       return handleKasaProxy(request, env, url, corsHeaders);
     }
 
-    if (url.pathname === '/api/fix-sim') {
+    if (url.pathname === '/api/fix-sim' && request.method === 'POST') {
       return handleFixSim(request, env, corsHeaders);
     }
 
@@ -523,7 +525,7 @@ export default {
     }
 
     // Debug endpoint to test worker-to-worker connectivity via service binding
-    if (url.pathname === '/api/debug-cancel') {
+    if (url.pathname === '/api/debug-cancel' && request.method === 'POST') {
       try {
         const hasBinding = !!env.SIM_CANCELLER;
         if (!hasBinding) {

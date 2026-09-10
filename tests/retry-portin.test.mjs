@@ -157,3 +157,61 @@ test('the plain /retry path is documented as unsafe for port-ins', () => {
   // without them. Keep the warning attached to the code that has the trap.
   assert.match(ACTIVATOR, /Never point \/retry at a port-in SIM/);
 });
+
+/* ── guard 3: the carrier's live view ────────────────────────────────────── */
+
+test('/retry-portin refuses a SIM that already has active service', () => {
+  // portinStatus answers 948 both when no port was ever created AND when a
+  // port completed long enough ago that its request record aged out. Those are
+  // indistinguishable from that endpoint, and on 2026-09-08 the ambiguity cost
+  // 12 pointless carrier calls, all answered "Number already assigned to NBI".
+  const fn = retryPortInFn();
+  assert.match(fn, /const subscriberState = await atomicSubscriberState\(env, iccid\)/);
+  assert.match(fn, /subscriberState === 'active'/);
+  assert.match(fn, /already has active service/);
+});
+
+test('guard 3 runs before anything is queued', () => {
+  const fn = retryPortInFn();
+  assert.ok(
+    fn.indexOf('atomicSubscriberState') < fn.indexOf('toQueue.push'),
+    'the inquiry must gate the enqueue, not follow it'
+  );
+});
+
+test('an inquiry failure lets the retry proceed rather than blocking it', () => {
+  // A duplicate port is refused by the carrier with no state change, so it is
+  // harmless. An ATOMIC outage must not stop every retry.
+  const fn = ACTIVATOR.slice(
+    ACTIVATOR.indexOf('async function atomicSubscriberState'),
+    ACTIVATOR.indexOf('// Removes an address permanently')
+  );
+  assert.match(fn, /if \(!res\.ok\) return 'unknown'/);
+  assert.match(fn, /catch/);
+  assert.match(fn, /return 'unknown'/);
+  // Only an explicit 'active' blocks — 'unknown' must not.
+  const guard = retryPortInFn();
+  assert.ok(!/subscriberState !== 'inactive'/.test(guard), "must not block on anything but an explicit 'active'");
+});
+
+test('the inquiry never carries port credentials', () => {
+  // subsriberInquiry takes the SIM only. Sending account/PIN on the wrong
+  // requestType would leak them for no reason.
+  const fn = ACTIVATOR.slice(
+    ACTIVATOR.indexOf('async function atomicSubscriberState'),
+    ACTIVATOR.indexOf('// Removes an address permanently')
+  );
+  assert.match(fn, /requestType: 'subsriberInquiry', MSISDN: '', sim: iccid/);
+  for (const leak of ['portPin', 'port_pin', 'billingAccountPassword', 'old_service_provider']) {
+    assert.ok(!fn.includes(leak), `inquiry must not include ${leak}`);
+  }
+});
+
+test('the response says whether the identity was redrawn or replayed', () => {
+  // new_identity swaps the address but the reason text said "original" — an
+  // operator debugging a repeat failure would chase the wrong variable.
+  const fn = retryPortInFn();
+  assert.match(fn, /reason: newIdentity/);
+  assert.match(fn, /freshly drawn subscriber name and address/);
+  assert.match(fn, /original portinRequest unchanged/);
+});

@@ -150,11 +150,14 @@ export function isValidRole(role) {
 // --- Route permission matrix ----------------------------------------------
 //
 // IMPORTANT: this deliberately does NOT trust the HTTP method to tell reads
-// from writes. Many dashboard action routes have no method guard, so a plain
-// GET performs the action — verified against src/dashboard/index.js:
-// /api/activate, /api/cancel, /api/suspend, /api/restore, /api/rotate-sim,
-// /api/fix-sim, /api/send-test-sms, /api/sim-online, /api/debug-cancel.
-// A method-based model would let a viewer activate and cancel real lines.
+// from writes. The action routes below (/api/activate, /api/cancel,
+// /api/suspend, /api/restore, /api/rotate-sim, /api/fix-sim,
+// /api/send-test-sms, /api/sim-online, /api/debug-cancel) each carry a
+// `request.method === 'POST'` guard in src/dashboard/index.js as of
+// 2026-09-09 — but that guard is one edit away from being dropped, and it was
+// absent entirely before then. Keeping this layer path-first means a route
+// that loses (or never gains) its method guard still cannot be reached by a
+// viewer with a bare GET.
 //
 // So the classification is path-first and fails safe: anything not explicitly
 // listed as a read requires operator. A newly added route is therefore closed
