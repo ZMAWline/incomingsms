@@ -12,27 +12,39 @@ on:
       - 'package-lock.json'
       - '.github/workflows/dashboard-pr-preview.yml'
   workflow_dispatch:
+    inputs:
+      deploy_live_test:
+        description: 'Also overwrite the shared live *-test workers (needed only to exercise service bindings)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   pull-requests: write
 
+# Per-PR, not global. Previews are per-version now, so two PRs no longer contend
+# for one target and must not cancel each other's runs. The old shared group
+# meant a second PR silently killed the first PR's in-flight check.
 concurrency:
-  group: dashboard-shared-preview
+  group: dashboard-preview-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
-  PREVIEW_URL: https://dashboard-test.zalmen-531.workers.dev
   BULK_ACTIVATOR_TEST_URL: https://bulk-activator-test.zalmen-531.workers.dev
 
 jobs:
   deploy-preview:
-    name: Deploy shared dashboard preview
+    name: Deploy dashboard preview
     if: github.event_name == 'workflow_dispatch' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # Overwriting the shared live test workers is opt-in. It is only needed to
+      # exercise a service binding, because a preview version's bindings resolve
+      # to the *live* bound worker — a dashboard preview always calls the live
+      # bulk-activator-test, never a preview of it.
+      DEPLOY_LIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.deploy_live_test) || contains(github.event.pull_request.labels.*.name, 'deploy-test') }}
     steps:
       - name: Check out PR code
         uses: actions/checkout@v4
@@ -56,40 +68,42 @@ jobs:
       - name: Dry-run dashboard test deploy
         run: npx wrangler deploy --config src/dashboard/wrangler.toml --env test --dry-run
 
-      - name: Set DASHBOARD_AUTH secret on test worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          DASHBOARD_AUTH: ${{ secrets.DASHBOARD_AUTH }}
-        # Resolve the target worker from the config's [env.test] name, like every
-        # other step here. `--env test --name dashboard-test` made wrangler append
-        # the env suffix to the explicit name and write to `dashboard-test-test`,
-        # a phantom worker it created on 2026-08-25 — so DASHBOARD_AUTH never
-        # reached the real dashboard-test.
-        # printf, never echo: echo appends a newline and corrupts the secret
-        # (constraints.md #4).
-        run: printf '%s' "$DASHBOARD_AUTH" | npx wrangler secret put DASHBOARD_AUTH --config src/dashboard/wrangler.toml --env test
+      # `versions upload` publishes a build and returns its own immutable URL
+      # WITHOUT changing what dashboard-test serves.
+      #
+      # This step used to be `wrangler deploy --env test`, which overwrote the
+      # one shared dashboard-test on every PR push. With several PRs open,
+      # whoever pushed last owned the test dashboard: on 2026-09-09 a run on
+      # fix/retry-portin-reason-text replaced another branch's build and served
+      # the wrong dashboard for ~40 minutes. The version inherits every secret
+      # and binding, so nothing needs re-provisioning.
+      - name: Upload dashboard preview version
+        id: preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler versions upload --config src/dashboard/wrangler.toml --env test 2>&1 | tee /tmp/upload.log
+          url=$(grep -oE 'https://[0-9a-f-]+-dashboard-test\.[a-z0-9.-]+workers\.dev' /tmp/upload.log | head -1)
+          if [ -z "$url" ]; then
+            echo "Could not parse a preview URL from wrangler output" >&2
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Preview: $url"
 
-      - name: Deploy dashboard test preview
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler deploy --config src/dashboard/wrangler.toml --env test
-
-      # Until PR #94 the dashboard answered an unauthenticated request with a
-      # Basic-auth challenge, so this asserted 401 + WWW-Authenticate. Named
-      # logins replaced that with a sign-in page, and the assertion has failed
-      # on every dashboard PR since. What matters now is the same property
-      # stated against the current design: an anonymous caller gets the login
-      # page and never the SPA, and the API stays shut.
+      # An anonymous caller must get the sign-in page and never the SPA, and the
+      # API must stay shut. Until PR #94 this asserted 401 + WWW-Authenticate;
+      # named logins replaced the Basic challenge with a login page, and the old
+      # assertion then failed on every dashboard PR.
       - name: Smoke-test preview auth challenge
         shell: bash
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
         run: |
           set -euo pipefail
           code=$(curl -sS -o /tmp/dashboard-preview-body.txt -w '%{http_code}' --max-time 30 "$PREVIEW_URL/")
           test "$code" = "200"
           grep -qi '<title>Sign in</title>' /tmp/dashboard-preview-body.txt
-          # The SPA must not be served to an anonymous caller.
           if grep -qi 'id="sims-table"' /tmp/dashboard-preview-body.txt; then
             echo "SPA markup served without authentication" >&2
             exit 1
@@ -97,16 +111,28 @@ jobs:
           api=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$PREVIEW_URL/api/sims")
           test "$api" = "401"
 
-      # dashboard-test proxies SIM activation to bulk-activator-test over a service
-      # binding, so a stale bulk-activator-test makes the shared preview lie about
-      # what the PR under review actually does. Keep it deployed alongside dashboard-test.
       - name: Dry-run bulk-activator test deploy
         run: npx wrangler deploy --config src/bulk-activator/wrangler.toml --env test --dry-run
 
-      - name: Deploy bulk-activator test preview
-        run: npx wrangler deploy --config src/bulk-activator/wrangler.toml --env test
+      # Opt-in only. dashboard-test proxies SIM activation to bulk-activator-test
+      # over a service binding, and a preview cannot bind to a preview — so
+      # exercising a bulk-activator change end to end still needs the live test
+      # worker. Label the PR `deploy-test` when that is what you are doing, and
+      # expect to overwrite the shared test environment for everyone.
+      - name: Deploy live test workers (opt-in)
+        if: env.DEPLOY_LIVE == 'true'
+        env:
+          DASHBOARD_AUTH: ${{ secrets.DASHBOARD_AUTH }}
+        run: |
+          set -euo pipefail
+          # printf, never echo: echo appends a newline and corrupts the secret
+          # (constraints.md #4).
+          printf '%s' "$DASHBOARD_AUTH" | npx wrangler secret put DASHBOARD_AUTH --config src/dashboard/wrangler.toml --env test
+          npx wrangler deploy --config src/dashboard/wrangler.toml --env test
+          npx wrangler deploy --config src/bulk-activator/wrangler.toml --env test
 
-      - name: Smoke-test bulk-activator preview returns JSON on auth failure
+      - name: Smoke-test bulk-activator returns JSON on auth failure
+        if: env.DEPLOY_LIVE == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -119,22 +145,29 @@ jobs:
       - name: Comment preview URL on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          DEPLOY_LIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.deploy_live_test) || contains(github.event.pull_request.labels.*.name, 'deploy-test') }}
         with:
           script: |
             const previewUrl = process.env.PREVIEW_URL;
+            const deployedLive = process.env.DEPLOY_LIVE === 'true';
             const sha = '${{ github.event.pull_request.head.sha }}';
             const body = [
-              'Ready to review preview deployed.',
+              'Preview version uploaded.',
               '',
               `Preview URL: ${previewUrl}`,
               `Commit: ${sha}`,
               '',
               'What to test:',
-              '- Log in with the dashboard test credentials.',
+              '- Sign in with the dashboard test credentials. This is a different hostname from `dashboard-test`, and the session cookie is host-only, so you will sign in once per preview URL. Same account, same database.',
               '- Exercise the changed dashboard flow.',
-              '- Confirm API calls use dashboard test service bindings, not production.',
               '',
-              'Safety: this shared preview deploys with `src/dashboard/wrangler.toml` `[env.test]` and `src/bulk-activator/wrangler.toml` `[env.test]`, preserving existing Cloudflare Worker secrets already attached to `dashboard-test` / `bulk-activator-test` and binding service calls to `*-test` workers.',
+              'This URL belongs to this build alone. It does not change what `dashboard-test` serves, and another PR cannot overwrite it.',
+              '',
+              deployedLive
+                ? 'This run also deployed the live `*-test` workers, because the PR is labelled `deploy-test`. The shared test environment now reflects this branch.'
+                : 'The shared `dashboard-test` was left untouched. Service bindings on a preview resolve to the live `*-test` workers, so if you need to exercise a bulk-activator change end to end, label this PR `deploy-test` and re-run.',
             ].join('\n');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -144,11 +177,11 @@ jobs:
             });
 
   note-preview-closed:
-    name: Note shared preview on close
+    name: Note preview on close
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
     steps:
-      - name: Comment shared preview behavior
+      - name: Comment preview behavior
         uses: actions/github-script@v7
         with:
           script: |
@@ -156,5 +189,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: 'PR closed. Shared dashboard preview remains available for the next review deploy: https://dashboard-test.zalmen-531.workers.dev',
+              body: 'PR closed. This PR\'s preview versions stay reachable at their own URLs; nothing needs tearing down, and `dashboard-test` was never pointed at them.',
             });
