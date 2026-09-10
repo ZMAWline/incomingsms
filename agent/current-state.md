@@ -1,7 +1,75 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-09 (dashboard shared password replaced with named users, invites and roles — LIVE IN PROD, break-glass off)
+> Last updated: 2026-09-10 (Agent API — API keys + audit trail, DEPLOYED TO TEST ONLY)
+
+---
+
+## Session 2026-09-10 — Agent API: API keys and an audit trail (branch `agent-api`)
+
+An external AI agent can now perform every SIM action a human operator can, through
+the *same* dashboard handlers, so the DB side effects are identical whoever called.
+The point is state: a carrier call made outside this API changes the carrier and
+nothing else, and every worker that reads `sims` then acts on a wrong picture.
+
+**What went in**
+
+- `migrations/009_dashboard_api_keys.sql` — `dashboard_api_keys` (SHA-256 of the key
+  only, never the key) and `dashboard_audit_log`.
+- `src/dashboard/api-keys.mjs` — key format `zmaw_<env>_<32 base62>`, generated with
+  rejection sampling; `Authorization: Bearer` or `X-Api-Key`; admin-only
+  `GET/POST /api/keys` and `POST /api/keys/revoke`.
+- `src/dashboard/audit-log.mjs` — one row per acting request, written from
+  `ctx.waitUntil` after the response exists. Never blocks, never fails a request.
+- `src/dashboard/index.js` — the route chain is now `handleDashboardRequest()`,
+  wrapped by `withAuditLog()`. `fetch` takes `ctx` (it did not before).
+- `src/shared/portal-auth.mjs` — `/api/keys` added to `ADMIN_ONLY_ALL`.
+- `src/dashboard/public/index.html` — API keys section in the Users tab, new
+  operator+ Audit log tab.
+- `docs/agent-api.md`, `docs/agent-api-examples.sh`.
+
+**Design points worth not relitigating**
+
+- A key is just a third way to authenticate. It resolves to the same principal shape
+  `resolveUser()` returns and carries one of the same three roles, so `canAccess()`
+  fences an operator key exactly where it fences an operator human. There is no
+  per-key route list, because a second list drifts out of step with the first.
+- Key management is admin-only *and* closed to API keys of any role, including admin.
+  A leaked key must not be able to mint its own replacement.
+- The audit actor comes from the authenticated principal only. Several handlers accept
+  `body.actor` for display in their own tables (`rental_reports`, remediator control);
+  that value is client-supplied, is captured inside `request_body`, and is deliberately
+  not what lands in the `actor` column.
+- Plain GETs are not audited — they are the dashboard's polling traffic and would
+  drown the table. Carrier-query routes are audited regardless of method.
+
+**The thing that cost time: TEST and PROD are DIFFERENT Supabase projects.**
+`.dev.vars` `SUPABASE_URL` points at `lzjqegxazqlktttyybth` (PROD). The
+`dashboard-test` worker has its own `SUPABASE_URL` secret pointing at
+`lwapudjjlwkskijefxdz` (`incomingsms-test`). A migration applied to one is invisible
+to the other, and PostgREST reports the gap as `PGRST205 ... not found in the schema
+cache`, which reads like a cache problem rather than a wrong-database problem.
+**Migration 009 has been applied to both projects.** Apply future migrations to both.
+
+**Verified on TEST** (`https://dashboard-test.zalmen-531.workers.dev`, version
+`3a921945`): unauthenticated 401 JSON; bad key 401; operator key 403 on `/api/users`,
+`/api/keys` and `/api/plan-rates` with `required_role`; `GET /api/sims?id=5345` 200;
+`atomic-query` and `teltik-query` reach their handlers and fail on missing carrier
+secrets (TEST holds none) rather than on auth; `dashboard_audit_log` rows present with
+actor `apikey:agent-test`, `break-glass`, and a real session user; `last_used_at`
+updating. The TEST key is at `/root/.config/incomingsms/agent-api-key.test` (mode 600).
+
+**Deliberately NOT done — the remaining work**
+
+1. **No PROD deploy.** `dashboard` still runs the previous version. The DB tables exist
+   in PROD (migration applied), which is inert until the worker ships.
+2. **No PROD key.** Create it from the Users tab as an admin once PROD is deployed.
+   PROD keys are `zmaw_live_...`; the `DASHBOARD_ENV` var in `wrangler.toml` decides.
+3. **`DASHBOARD_BREAK_GLASS` is not off on TEST**, which is how the TEST key was
+   created without a human password. PROD break-glass stays off.
+4. A throwaway TEST account `agent-api-verify` was created to exercise a real session
+   and left **disabled**. Delete it whenever.
+5. The audit table has no retention policy. It grows without bound.
 
 ---
 

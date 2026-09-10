@@ -7,9 +7,11 @@ import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
-import { canAccess } from '../shared/portal-auth.mjs';
+import { canAccess, requiredRole } from '../shared/portal-auth.mjs';
 import { resolveUser, breakGlassUser, handleAuthRoutes } from './auth-routes.mjs';
 import { renderLoginPage, renderAcceptInvitePage } from './auth-pages.mjs';
+import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from './api-keys.mjs';
+import { withAuditLog, handleAuditLogQuery } from './audit-log.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -20,8 +22,13 @@ function normalizeImeiPoolPort(port) {
   if (letterMatch) return letterMatch[1] + '.' + String(letterToSlot[letterMatch[2].toUpperCase()] || 1).padStart(2, '0');
   return port;
 }
-export default {
-  async fetch(request, env) {
+// The whole request chain, lifted out of `fetch` so withAuditLog() can time
+// it, read the status off the finished response and log the authenticated
+// actor without every route having to know that auditing exists.
+//
+// `audit` is a mutable box: the auth block below drops the resolved principal
+// into it, which is the one thing the wrapper cannot work out for itself.
+async function handleDashboardRequest(request, env, ctx, audit) {
     const url = new URL(request.url);
 
     // WING gateway-status: external partner endpoint with its own API-key auth.
@@ -42,8 +49,19 @@ export default {
     // still works as break-glass while DASHBOARD_BREAK_GLASS !== 'off', and
     // counts as admin — that is also how the first admin bootstraps before any
     // account exists.
-    const user = (await resolveUser(env, request)) || breakGlassUser(env, request);
+    //
+    // API keys are the third way in, for the external agent. A key resolves to
+    // the same principal shape and one of the same three roles, so everything
+    // downstream — canAccess, the route chain, the handlers — treats it as an
+    // ordinary caller. Sessions win when both are presented; a person debugging
+    // the agent's key in their own browser should not silently escalate to
+    // their own role.
+    const user = (await resolveUser(env, request))
+      || breakGlassUser(env, request)
+      || (await resolveApiKeyUser(env, request, ctx));
     const isApiPath = url.pathname.startsWith('/api/');
+    const isKeyCaller = hasApiKeyHeader(request);
+    if (audit) audit.user = user;
 
     if (!user) {
       if ((url.pathname === '/auth/login' || url.pathname === '/auth/accept-invite')
@@ -55,8 +73,14 @@ export default {
           headers: { 'Content-Type': 'text/html; charset=utf-8' },
         });
       }
-      if (isApiPath || url.pathname.startsWith('/auth/')) {
-        return new Response(JSON.stringify({ ok: false, error: 'Not authenticated' }), {
+      // `isKeyCaller` widens this past /api/ on purpose: a caller that
+      // presented a key gets JSON whatever it asked for. An agent handed a 200
+      // and a login form sees success and a wall of HTML, which is far harder
+      // to diagnose than a 401.
+      if (isApiPath || isKeyCaller || url.pathname.startsWith('/auth/')) {
+        return new Response(JSON.stringify({
+          ok: false, error: 'unauthorized', message: 'Not authenticated',
+        }), {
           status: 401, headers: { 'Content-Type': 'application/json' },
         });
       }
@@ -77,10 +101,18 @@ export default {
     // path-first model is the defence-in-depth layer that does not silently
     // fall open if a future route is added without its method guard. See the
     // ALWAYS_MUTATING list in shared/portal-auth.mjs.
+    //
+    // One matrix, one answer, whichever way the caller authenticated: an
+    // operator key is refused exactly where an operator human is. The response
+    // carries required_role so an agent can tell "wrong credential" from "this
+    // is not yours to do" without parsing prose.
     if (isApiPath && !canAccess(user.role, request.method, url.pathname)) {
       return new Response(JSON.stringify({
         ok: false,
-        error: 'Your role (' + user.role + ') is not permitted to perform this action',
+        error: 'forbidden',
+        required_role: requiredRole(request.method, url.pathname),
+        role: user.role,
+        message: 'Your role (' + user.role + ') is not permitted to perform this action',
       }), { status: 403, headers: { 'Content-Type': 'application/json' } });
     }
 
@@ -93,6 +125,17 @@ export default {
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
+    }
+
+    // Agent API key management. Admin-only via ADMIN_ONLY_ALL in
+    // portal-auth.mjs; the handler adds the second fence, refusing API-key
+    // callers of any role so a leaked key cannot mint its own replacement.
+    const apiKeyResponse = await handleApiKeyRoutes(request, env, url, user);
+    if (apiKeyResponse) return apiKeyResponse;
+
+    // Who did what. Operator+ by the path-first matrix (not a READ_ROUTE).
+    if (url.pathname === '/api/audit-log' && request.method === 'GET') {
+      return handleAuditLogQuery(env, url, corsHeaders);
     }
 
     // API Routes
@@ -642,6 +685,14 @@ export default {
     }
     // Serve HTML dashboard for all non-API paths (SPA routing)
     return serveApp(env);
+}
+
+export default {
+  // withAuditLog runs the chain above and then writes one dashboard_audit_log
+  // row per acting request, from ctx.waitUntil after the response exists. It
+  // cannot delay a response and cannot fail one; see audit-log.mjs.
+  async fetch(request, env, ctx) {
+    return withAuditLog(request, env, ctx, handleDashboardRequest);
   },
 
   // Two schedules (wrangler.toml [triggers]): the 12h cron enqueues one
@@ -2754,6 +2805,20 @@ async function handleHostingPortStatusJobGet(jobId, env, corsHeaders) {
   }
 }
 
+// Cancel-side cleanup shared by every path that lands a SIM in 'canceled':
+// expire its active MDN and end the reseller assignment. Idempotent — the
+// filters mean no rows are touched when these are already in the desired
+// state, so it is safe to call repeatedly.
+//
+// Any new code that sets sims.status='canceled' MUST call this. Skipping it
+// leaves reseller_sims.active=true on a dead line, which keeps the SIM in the
+// billable set that computeBillingBreakdown counts (src/shared/billing.js:145).
+async function deactivateSimAssignments(env, simId) {
+  const nowIso = new Date().toISOString();
+  await sbPatch(env, 'sim_numbers?sim_id=eq.' + encodeURIComponent(String(simId)) + '&valid_to=is.null', { valid_to: nowIso });
+  await sbPatch(env, 'reseller_sims?sim_id=eq.' + encodeURIComponent(String(simId)) + '&active=eq.true', { active: false });
+}
+
 async function syncCancelledSim(env, subId, helixData) {
   try {
     const sims = await sbGet(env, 'sims?mobility_subscription_id=eq.' + encodeURIComponent(subId) + '&select=id,iccid,status&limit=1');
@@ -2770,11 +2835,7 @@ async function syncCancelledSim(env, subId, helixData) {
       result.status_already_canceled = true;
     }
 
-    // Idempotent cancel-side cleanup: expire active sim_numbers and remove from reseller_sims.active.
-    // Filters ensure no work happens if these are already in the desired state — safe to call repeatedly.
-    const nowIsoCancel = new Date().toISOString();
-    await sbPatch(env, 'sim_numbers?sim_id=eq.' + sim.id + '&valid_to=is.null', { valid_to: nowIsoCancel });
-    await sbPatch(env, 'reseller_sims?sim_id=eq.' + sim.id + '&active=eq.true', { active: false });
+    await deactivateSimAssignments(env, sim.id);
 
     const hist = await sbGet(env, 'sim_status_history?sim_id=eq.' + sim.id + '&new_status=eq.canceled&limit=1');
     if (!Array.isArray(hist) || hist.length === 0) {
@@ -6553,6 +6614,10 @@ async function handleSetSimStatus(request, env, corsHeaders) {
     const text = await res.text();
     return new Response(JSON.stringify({ error: 'DB error: ' + text }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
+  // Setting a SIM canceled by hand must release it the same way the carrier
+  // sync does. Only 'canceled' — the other statuses here (including 'error')
+  // are retryable, and dropping the reseller assignment would lose it.
+  if (status === 'canceled') await deactivateSimAssignments(env, sim_id);
   return new Response(JSON.stringify({ ok: true, sim_id, status }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
@@ -9310,6 +9375,10 @@ async function handleAtomicSubAction(request, env, corsHeaders) {
     }
 
     await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(sim.id)), { status: spec.status });
+    // 'deactivate' is terminal at the carrier — release the MDN and end the
+    // reseller assignment so the line drops out of the billable set.
+    // suspend/restore/reconnect are reversible and keep their assignment.
+    if (spec.status === 'canceled') await deactivateSimAssignments(env, sim.id);
     return json({ ok: true, sim_id: sim.id, iccid: sim.iccid, msisdn, op, requestType: spec.requestType, new_status: spec.status, response: data });
   } catch (error) {
     return json({ ok: false, error: String(error) }, 500);
