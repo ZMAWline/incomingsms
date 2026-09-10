@@ -163,8 +163,12 @@ export function isValidRole(role) {
 // listed as a read requires operator. A newly added route is therefore closed
 // to viewers by default, and adding a read route is a conscious edit here.
 
-// Admin-only regardless of method — managing who can log in.
-const ADMIN_ONLY_ALL = ['/api/users', '/api/invites'];
+// Admin-only regardless of method — managing who (or what) can log in.
+// /api/keys mints and revokes agent API keys, which are credentials in exactly
+// the sense a user account is; src/dashboard/api-keys.mjs adds the second half
+// of that fence, refusing the route to API keys of any role so a leaked key
+// cannot mint its own replacement.
+const ADMIN_ONLY_ALL = ['/api/users', '/api/invites', '/api/keys'];
 
 // Money. Readable by anyone logged in, mutable only by admins.
 const ADMIN_ONLY_WRITE = [
