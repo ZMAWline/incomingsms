@@ -107,94 +107,227 @@ test('the stale-SIMs dashboard tile still filters, via the computed column', () 
   assert.match(body, /notify_stale/, 'tile must target the notify_stale column');
 });
 
-test('saved filters round-trip through storage', async () => {
+// The saved-filter block, wired to a fake fetch and a fake localStorage so the
+// whole per-account path — first load, the one-time migration off
+// localStorage, save, rename, delete — can be exercised in-process.
+function makeSavedFilterSandbox(opts) {
+  const o = opts || {};
+  const calls = [];
   const src = [
-    slice('const SIMS_SAVED_FILTERS_KEY', '// --- Per-column filter popover'),
-    'function __setState(fs, cf, ts) { simsFilterState = fs; simsColumnFilters = cf; tableState = ts; }',
+    slice('function simNotRotatedToday(s)', 'const SIMS_COLUMNS = ['),
+    slice('const SIMS_COLUMNS = [', 'let simsColumnVis'),
+    'function __cache() { return simsSavedFilters; }',
+    'function __filters() { return simsColumnFilters; }',
+    // The SIMS_COLUMNS slice re-declares simsFilterState/simsColumnFilters, so
+    // the live state has to be installed after it runs, not before.
+    'function __setLive(fs, cf) { simsFilterState = fs; simsColumnFilters = cf; }',
   ].join('\n');
 
-  const store = new Map();
+  const store = new Map(o.storage || []);
+  const server = new Map(o.server || []);   // name -> filter object
   const sandbox = {
-    console, JSON, Array, Object, String, Date,
+    console, JSON, Array, Object, String, Date, Number, Math, Set, Map,
+    encodeURIComponent, decodeURIComponent, Promise,
+    API_BASE: '/api',
     localStorage: {
       getItem: (k) => (store.has(k) ? store.get(k) : null),
       setItem: (k, v) => store.set(k, v),
+      removeItem: (k) => store.delete(k),
     },
-    showToast: () => {},
-    // In-page modals, not native dialogs.
-    showTextPrompt: async () => 'Teltik offline',
-    showConfirm: async () => true,
+    toasts: [],
+    showToast: (msg, kind) => sandbox.toasts.push([msg, kind]),
+    showTextPrompt: async () => (o.promptAnswer === undefined ? 'Teltik offline' : o.promptAnswer),
+    showConfirm: async () => (o.confirmAnswer === undefined ? true : o.confirmAnswer),
     document: { getElementById: () => null },
-    simsFilterState: {
+    esc: (s) => String(s),
+    simsFilterState: o.filterState || {
       status: ['active'], resellerIds: [], vendors: ['teltik'], gateways: [],
       activatedFrom: '', activatedTo: '', search: 'abc',
     },
-    simsColumnFilters: [{ col: 'hosting_port_state', op: 'in', value: ['offline'] }],
-    tableState: { sims: { sortKey: 'sms_count', sortDir: 'desc', page: 3 } },
+    simsColumnFilters: o.columnFilters
+      || [{ col: 'hosting_port_state', op: 'in', value: ['offline'] }],
+    tableState: { sims: { sortKey: 'sms_count', sortDir: 'desc', page: 3, data: [] } },
     loadSims: () => {},
     renderSims: () => {},
+    fetch: async (url, init) => {
+      const method = (init && init.method) || 'GET';
+      calls.push([method, url]);
+      if (o.failAll) return { ok: false, status: 502, json: async () => ({ ok: false, error: 'supabase_502' }) };
+      if (method === 'GET') {
+        const filters = [...server.entries()]
+          .sort((x, y) => x[0].localeCompare(y[0]))
+          .map(([name, filter]) => ({ id: name, name, filter }));
+        return { ok: true, status: 200, json: async () => ({ ok: true, filters }) };
+      }
+      const name = decodeURIComponent(url.slice('/api/saved-filters/'.length));
+      if (method === 'PUT') {
+        if (o.failWrites) return { ok: false, status: 502, json: async () => ({ ok: false, error: 'supabase_502' }) };
+        server.set(name, JSON.parse(init.body).filter);
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      if (method === 'DELETE') {
+        if (!server.has(name)) return { ok: false, status: 404, json: async () => ({ ok: false, error: 'missing' }) };
+        server.delete(name);
+        return { ok: true, status: 200, json: async () => ({ ok: true, deleted: name }) };
+      }
+      throw new Error('unexpected method ' + method);
+    },
   };
   vm.createContext(sandbox);
   vm.runInContext(src, sandbox);
+  sandbox.__setLive(sandbox.simsFilterState, sandbox.simsColumnFilters);
+  return { sandbox, server, store, calls };
+}
+
+test('saved filters round-trip through the account API, not localStorage', async () => {
+  const { sandbox, server, calls } = makeSavedFilterSandbox();
 
   await sandbox.saveCurrentSimsFilter();
-  const saved = sandbox.loadSimsSavedFilters();
-  assert.equal(saved.length, 1);
-  assert.equal(saved[0].name, 'Teltik offline');
-  assert.deepStrictEqual(saved[0].state.vendors, ['teltik']);
-  assert.equal(saved[0].state.search, 'abc');
-  assert.equal(saved[0].state.sortKey, 'sms_count');
-  assert.deepStrictEqual(saved[0].state.columnFilters,
+
+  assert.deepStrictEqual(calls, [['PUT', '/api/saved-filters/Teltik%20offline']],
+    'saving must be one PUT to the account, and must not touch any other route');
+  const saved = server.get('Teltik offline');
+  assert.ok(saved, 'the filter must exist on the server');
+  assert.deepStrictEqual(saved.vendors, ['teltik']);
+  assert.equal(saved.search, 'abc');
+  assert.equal(saved.sortKey, 'sms_count');
+  assert.deepStrictEqual(saved.columnFilters,
     [{ col: 'hosting_port_state', op: 'in', value: ['offline'] }]);
 
   // The stored copy must not alias live state.
   sandbox.simsColumnFilters.push({ col: 'vendor', op: 'in', value: ['atomic'] });
-  assert.equal(sandbox.loadSimsSavedFilters()[0].state.columnFilters.length, 1,
+  assert.equal(server.get('Teltik offline').columnFilters.length, 1,
     'a saved filter must not change when the live filters change');
+
+  // And the in-memory cache the chip row renders from is updated in step.
+  assert.deepStrictEqual([...sandbox.__cache()].map((f) => f.name), ['Teltik offline']);
 });
 
-test('applying a saved filter drops columns that no longer exist', () => {
-  // simsColumnVis comes after the saved-filter block, so this one slice
-  // already carries both the registry and the saved-filter functions.
-  // simsColumnVis comes after the saved-filter block, so this one slice
-  // already carries both the registry and the saved-filter functions. The
-  // computed columns call the predicates while the array literal is built, so
-  // those have to load first.
-  const src = [
-    slice('function simNotRotatedToday(s)', 'const SIMS_COLUMNS = ['),
-    slice('const SIMS_COLUMNS = [', 'let simsColumnVis'),
-    'function __filters() { return simsColumnFilters; }',
-  ].join('\n');
+test('nothing is written to localStorage any more', async () => {
+  const { sandbox, store } = makeSavedFilterSandbox();
+  await sandbox.saveCurrentSimsFilter();
+  assert.equal(store.get('simsSavedFilters'), undefined,
+    'saved filters must not be persisted per-browser');
+  assert.ok(!HTML.includes("localStorage.setItem(SIMS_SAVED_FILTERS_KEY"),
+    'the localStorage write path must be gone');
+});
 
-  const store = new Map([['simsSavedFilters', JSON.stringify([{
-    name: 'legacy',
-    state: {
+test('a failed save surfaces an error and does not fake success', async () => {
+  const { sandbox, server } = makeSavedFilterSandbox({ failWrites: true });
+  await sandbox.saveCurrentSimsFilter();
+  assert.equal(server.size, 0);
+  assert.equal(sandbox.__cache().length, 0, 'the chip row must not show a filter that was never stored');
+  assert.ok(sandbox.toasts.some(([, kind]) => kind === 'error'), 'the operator must be told');
+});
+
+test('legacy localStorage filters are uploaded once, then the key is cleared', async () => {
+  const legacy = JSON.stringify([
+    { name: 'from this browser', state: { status: ['active'], resellerIds: [], columnFilters: [] } },
+    { name: 'already mine', state: { status: ['canceled'], resellerIds: [], columnFilters: [] } },
+  ]);
+  const { sandbox, server, store, calls } = makeSavedFilterSandbox({
+    storage: [['simsSavedFilters', legacy]],
+    // The account already has a view under this name, edited from another
+    // machine; the account copy must win.
+    server: [['already mine', { status: ['provisioning'], resellerIds: [], columnFilters: [] }]],
+  });
+
+  await sandbox.ensureSimsSavedFilters();
+
+  assert.ok(calls.some(([m, u]) => m === 'PUT' && u.includes('from%20this%20browser')),
+    'the browser-only filter must be uploaded');
+  assert.ok(!calls.some(([m, u]) => m === 'PUT' && u.includes('already%20mine')),
+    'a name the account already has must not be overwritten by the browser copy');
+  assert.deepStrictEqual(server.get('already mine').status, ['provisioning']);
+  assert.equal(store.get('simsSavedFilters'), undefined, 'localStorage must be cleared after the upload');
+  assert.deepStrictEqual([...sandbox.__cache()].map((f) => f.name).sort(),
+    ['already mine', 'from this browser']);
+
+  // Second load must not re-upload anything.
+  const before = calls.length;
+  await sandbox.ensureSimsSavedFilters();
+  assert.equal(calls.length, before, 'the migration is one-time');
+});
+
+test('a failed migration upload keeps localStorage so the next load retries', async () => {
+  const legacy = JSON.stringify([{ name: 'keep me', state: { status: [], resellerIds: [], columnFilters: [] } }]);
+  const { sandbox, store } = makeSavedFilterSandbox({
+    storage: [['simsSavedFilters', legacy]],
+    failWrites: true,
+  });
+  await sandbox.ensureSimsSavedFilters();
+  assert.equal(store.get('simsSavedFilters'), legacy,
+    'a filter that failed to upload must not be dropped');
+  assert.ok(sandbox.toasts.some(([, kind]) => kind === 'error'));
+});
+
+test('delete goes to the account, not to a browser copy', async () => {
+  const { sandbox, server, calls } = makeSavedFilterSandbox({
+    server: [['mine', { status: [], resellerIds: [], columnFilters: [] }]],
+  });
+  await sandbox.ensureSimsSavedFilters();
+  await sandbox.deleteSimsSavedFilter('mine');
+  assert.ok(calls.some(([m, u]) => m === 'DELETE' && u === '/api/saved-filters/mine'));
+  assert.equal(server.size, 0);
+  assert.equal(sandbox.__cache().length, 0);
+});
+
+test('rename writes the new name before removing the old one', async () => {
+  const { sandbox, server, calls } = makeSavedFilterSandbox({
+    server: [['old name', { status: ['active'], resellerIds: [], columnFilters: [] }]],
+    promptAnswer: 'new name',
+  });
+  await sandbox.ensureSimsSavedFilters();
+  await sandbox.renameSimsSavedFilter('old name');
+
+  const writes = calls.filter(([m]) => m === 'PUT' || m === 'DELETE').map(([m]) => m);
+  assert.deepStrictEqual(writes, ['PUT', 'DELETE'],
+    'write-then-delete: the other order can lose the view outright');
+  assert.deepStrictEqual([...server.keys()], ['new name']);
+  assert.deepStrictEqual(server.get('new name').status, ['active'], 'the view itself must survive the rename');
+});
+
+test('a rename whose delete fails leaves both copies rather than none', async () => {
+  const { sandbox, server } = makeSavedFilterSandbox({
+    server: [['old name', { status: ['active'], resellerIds: [], columnFilters: [] }]],
+    promptAnswer: 'new name',
+  });
+  await sandbox.ensureSimsSavedFilters();
+  const realFetch = sandbox.fetch;
+  sandbox.fetch = async (url, init) => {
+    if (init && init.method === 'DELETE') return { ok: false, status: 502, json: async () => ({ ok: false, error: 'boom' }) };
+    return realFetch(url, init);
+  };
+  await sandbox.renameSimsSavedFilter('old name');
+  assert.deepStrictEqual([...server.keys()].sort(), ['new name', 'old name']);
+  assert.ok(sandbox.toasts.some(([, kind]) => kind === 'error'));
+});
+
+test('applying a saved filter drops columns that no longer exist', async () => {
+  const { sandbox } = makeSavedFilterSandbox({
+    server: [['legacy', {
       status: ['active'], resellerIds: [], vendors: [], gateways: [],
       activatedFrom: '', activatedTo: '', search: '',
       columnFilters: [
         { col: 'sms_count', op: 'gt', value: 1 },
         { col: 'a_column_that_was_deleted', op: 'eq', value: 'x' },
       ],
-    },
-  }])]]);
-
-  const sandbox = {
-    console, JSON, Array, Object, String, Date, Number, Math, Set, Map,
-    localStorage: { getItem: (k) => store.get(k) || null, setItem: (k, v) => store.set(k, v) },
-    showToast: () => {}, showTextPrompt: async () => '', showConfirm: async () => true,
-    document: { getElementById: () => null },
-    simsFilterState: { status: ['active'], resellerIds: [], vendors: [], gateways: [], activatedFrom: '', activatedTo: '', search: '' },
-    simsColumnFilters: [],
-    tableState: { sims: { sortKey: 'id', sortDir: 'asc', page: 1 } },
-    loadSims: () => {}, renderSims: () => {},
-  };
-  vm.createContext(sandbox);
-  vm.runInContext(src, sandbox);
+    }]],
+    filterState: { status: ['active'], resellerIds: [], vendors: [], gateways: [], activatedFrom: '', activatedTo: '', search: '' },
+    columnFilters: [],
+  });
+  await sandbox.ensureSimsSavedFilters();
 
   sandbox.applySimsSavedFilter('legacy');
   const applied = sandbox.__filters();
   assert.equal(applied.length, 1, 'the unknown column must be dropped, not matched blindly');
   assert.equal(applied[0].col, 'sms_count');
+});
+
+test('the chip row distinguishes "still loading" from "you have none"', () => {
+  const block = slice('const SIMS_SAVED_FILTERS_KEY', '// --- Per-column filter popover');
+  assert.match(block, /simsSavedFiltersLoaded/,
+    'an empty chip row before the fetch lands must not claim the account has no filters');
 });
 
 test('saved-filter dialogs use the in-page modals, never native ones', () => {

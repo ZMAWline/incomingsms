@@ -1,10 +1,58 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-10 (SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API)
+> Last updated: 2026-09-17 (SIMs-table saved filters are now per-account — `dashboard_saved_filters`, migration 011. Migration NOT yet applied to TEST or PROD; not deployed to prod.)
+> 2026-09-10: SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API.
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
 ---
+
+## Session 2026-09-17 — Saved filters moved off localStorage onto the account (branch `saved-filters-per-account`)
+
+PR #104's named saved filters were per-browser. They are now per-account, which
+closes the "Open" item that session left behind.
+
+- **`migrations/011_dashboard_saved_filters.sql`** — `dashboard_saved_filters`
+  (id, owner, name, filter jsonb, created_at, updated_at; UNIQUE (owner, name)).
+  Numbered 011 because 010 is already `010_audit_log_retention.sql`.
+  `owner` is the authenticated principal's **username**, the same text
+  `dashboard_audit_log.actor` records — deliberately not `dashboard_users.id`,
+  because break-glass and API-key callers have no row there and a nullable FK
+  would collapse every keyless caller into one shared bucket. RLS on, no
+  policies, per the 2026-06-16 decision.
+- **`src/dashboard/saved-filters.mjs`** — `GET /api/saved-filters` (list mine),
+  `PUT /api/saved-filters/:name` (upsert), `DELETE /api/saved-filters/:name`.
+  Every query is pinned to `owner=eq.<caller>`; there is no `owner` field in any
+  payload, so one account cannot address another's views even by guessing a name.
+  Caps: 80-char names, 64 KB per filter, 200 filters per owner.
+- **`src/shared/portal-auth.mjs`** — new `SELF_SERVICE_ROUTES`, currently one
+  entry. This is the one deliberate exception to "a write needs operator": a
+  viewer who cannot change a SIM can still name the view they read it in.
+  A route belongs there only if the caller's own identity is the only row it can
+  reach. Audit and the API-key fence are unchanged — the PUT and DELETE are
+  audited automatically by `shouldAudit`, and nothing here ends a line's life,
+  so API keys reach it (under their own `apikey:<name>` namespace).
+- **Frontend** — the chip row renders from an in-memory cache filled once per
+  page load by `ensureSimsSavedFilters()`, called from `loadSims()` and
+  deliberately not awaited so a cached SIM list is not held up by a second
+  request. Save/rename/delete go through the API; rename is write-then-delete so
+  a half-failure leaves two visible copies rather than none. Still no native
+  dialogs.
+- **One-time migration off localStorage.** First load uploads any `simsSavedFilters`
+  entries the browser still holds and then clears the key. A name the account
+  already has wins (that copy is the one being edited from elsewhere), and the
+  key is only cleared once every upload has succeeded, so a failure retries on
+  the next load instead of dropping views.
+
+911 tests pass (879 before; +32).
+
+**Open — the migration is NOT applied.** Both Supabase projects still need
+`migrations/011_dashboard_saved_filters.sql`: TEST `lwapudjjlwkskijefxdz` and
+PROD `lzjqegxazqlktttyybth`. They are different projects; applying to one is
+invisible to the other. Until then the chip row shows "Could not load your saved
+filters" and `GET /api/saved-filters` returns 502 `supabase_404` / PGRST205 —
+confirmed on the preview version `e5115fa2`, which is how the route was verified
+live. No PROD deploy of the dashboard Worker from this session.
 
 ## Session 2026-09-10 — SIMs table: per-column filtering + saved filters (branch `table-redsign`, PR #104)
 
