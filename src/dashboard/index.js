@@ -7,7 +7,7 @@ import { resolveTeltikKnownMdn as resolveSharedTeltikKnownMdn } from '../shared/
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState, runHostingPortSweep, enqueueHostingPortJob, getHostingPortJob, listHostingPortJobs, processHostingPortJobs } from '../shared/hosting-port-status.mjs';
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
-import { canAccess, requiredRole, apiKeyMayAccess } from '../shared/portal-auth.mjs';
+import { canAccess, requiredRole, apiKeyMayAccess, constantTimeEqual } from '../shared/portal-auth.mjs';
 import { resolveUser, breakGlassUser, handleAuthRoutes } from './auth-routes.mjs';
 import { renderLoginPage, renderAcceptInvitePage } from './auth-pages.mjs';
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from './api-keys.mjs';
@@ -38,11 +38,13 @@ async function handleDashboardRequest(request, env, ctx, audit) {
       return handleGatewayStatus(request, env);
     }
 
-    // Public daily Bad Rental escalation CSV — no operator credentials, so it
-    // can be fetched by anything that can't hold Basic-auth. Must also run
-    // BEFORE the auth gate below. See handlePublicBadRentalEscalationToday.
+    // Daily Bad Rental escalation CSV — no operator credentials, so it can be
+    // fetched by anything that can't hold Basic-auth. It is NOT public: it
+    // carries reseller names, customer MDNs and ICCIDs, so it needs the shared
+    // BAD_RENTAL_CSV_KEY (X-Api-Key header or ?key=). Must still run BEFORE the
+    // auth gate below. See handlePublicBadRentalEscalationToday.
     if (url.pathname === '/public/bad-rental-escalations-today.csv' && request.method === 'GET') {
-      return handlePublicBadRentalEscalationToday(env);
+      return handlePublicBadRentalEscalationToday(request, env);
     }
 
     // --- Authentication ---------------------------------------------------
@@ -5103,16 +5105,45 @@ async function handleTeltikPortOfflineExport(env, corsHeaders, url) {
   return handleBadRentalEscalationExport(env, corsHeaders, target);
 }
 
-// Public, unauthenticated alias of the escalation export, fixed to today's
-// New York day. Delegates to the same handleBadRentalEscalationExport used by
-// the authenticated route so the CSV shape/content rules never diverge; the
+// Session-less alias of the escalation export, fixed to today's New York day.
+// Delegates to the same handleBadRentalEscalationExport used by the
+// authenticated route so the CSV shape/content rules never diverge; the
 // incoming request URL is never passed through, so this route can't be used
 // to pull arbitrary date ranges, formats, or scopes — only today's CSV.
-async function handlePublicBadRentalEscalationToday(env) {
+//
+// It runs before the operator auth gate so a cron/report feed needs no login
+// session, but the CSV contains reseller names, customer MDNs, ICCIDs and
+// rental ids, so it is NOT open: callers must present the shared
+// BAD_RENTAL_CSV_KEY, via the X-Api-Key header or a ?key= query param (same
+// shape as /api/gateway-status). Fails CLOSED — if the secret is not set on
+// the Worker, the route answers 503 rather than serving customer data.
+async function handlePublicBadRentalEscalationToday(request, env) {
   const cors = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key',
   };
+  const jsonRes = (obj, status) => new Response(JSON.stringify(obj), {
+    status,
+    headers: { ...cors, 'Content-Type': 'application/json' },
+  });
+
+  const configuredKey = env && env.BAD_RENTAL_CSV_KEY;
+  if (!configuredKey) {
+    return jsonRes({ error: 'bad-rental escalation CSV endpoint not configured (BAD_RENTAL_CSV_KEY unset)' }, 503);
+  }
+
+  let presentedKey = '';
+  if (request) {
+    const headerKey = request.headers && request.headers.get ? request.headers.get('X-Api-Key') : null;
+    let queryKey = null;
+    try { queryKey = new URL(request.url).searchParams.get('key'); } catch { queryKey = null; }
+    presentedKey = headerKey || queryKey || '';
+  }
+  if (!presentedKey || !constantTimeEqual(presentedKey, configuredKey)) {
+    return jsonRes({ error: 'unauthorized' }, 401);
+  }
+
   const todayUrl = new URL('https://dashboard/api/bad-rentals/escalation-export');
   return handleBadRentalEscalationExport(env, cors, todayUrl);
 }

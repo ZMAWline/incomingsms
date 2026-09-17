@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { constantTimeEqual } from '../src/shared/portal-auth.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -56,6 +57,9 @@ function makeSandbox(routes) {
     console,
     Response,
     URL,
+    Request,
+    // The public handler compares the presented key with the real shared helper.
+    constantTimeEqual,
     async fetch(url, init) {
       const u = String(url);
       calls.push(u);
@@ -70,14 +74,26 @@ function makeSandbox(routes) {
     extractFn('async function supabaseGet(env, path, extraHeaders) {'),
     extractFn('function csvEscape(value) {'),
     extractFn('async function handleTeltikPortOfflineExport(env, corsHeaders, url) {'),
-    extractFn('async function handlePublicBadRentalEscalationToday(env) {'),
+    extractFn('async function handlePublicBadRentalEscalationToday(request, env) {'),
     extractEscalationRegion(),
   ].join('\n\n');
   vm.runInContext(code, sandbox);
   return { sandbox, calls };
 }
 
-const ENV = { SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'srv' };
+const PUBLIC_CSV_KEY = 'test-bad-rental-csv-key-0123456789';
+const ENV = {
+  SUPABASE_URL: 'https://sb.test',
+  SUPABASE_SERVICE_ROLE_KEY: 'srv',
+  BAD_RENTAL_CSV_KEY: PUBLIC_CSV_KEY,
+};
+
+// A request for the key-gated daily CSV route, carrying the key in the header.
+function publicCsvRequest(key = PUBLIC_CSV_KEY) {
+  return new Request('https://dashboard/public/bad-rental-escalations-today.csv', {
+    headers: { 'X-Api-Key': key },
+  });
+}
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), { status });
@@ -583,7 +599,7 @@ test('the old teltik-port-offline export still works and now carries a date rang
 });
 
 // ---------------------------------------------------------
-// Public, unauthenticated daily CSV
+// Key-gated daily CSV (session-less, still before the operator auth gate)
 // ---------------------------------------------------------
 
 test('the public escalation CSV route is registered before the operator auth gate and needs no Authorization header', () => {
@@ -592,8 +608,8 @@ test('the public escalation CSV route is registered before the operator auth gat
   assert.notEqual(routeIdx, -1, 'public route not registered');
   assert.notEqual(authGateIdx, -1, 'auth gate marker not found');
   assert.ok(routeIdx < authGateIdx, 'public route must be checked before the Basic-auth gate');
-  assert.match(SRC, /return handlePublicBadRentalEscalationToday\(env\);/,
-    'the route must call the public handler with only env — no request/url, so it cannot honor query overrides');
+  assert.match(SRC, /return handlePublicBadRentalEscalationToday\(request, env\);/,
+    'the route must call the handler with the request (for the shared key) and env');
 });
 
 test('the public handler ignores query overrides and always queries "today" in New York', async () => {
@@ -603,7 +619,7 @@ test('the public handler ignores query overrides and always queries "today" in N
   assert.equal(today.error, undefined);
 
   const { sandbox, calls } = makeSandbox(fixtureRoutes({ reports: [] }));
-  const resp = await sandbox.handlePublicBadRentalEscalationToday(ENV);
+  const resp = await sandbox.handlePublicBadRentalEscalationToday(publicCsvRequest(), ENV);
   assert.equal(resp.status, 200);
 
   const reportCall = decodeURIComponent(calls.find(c => c.includes('/rental_reports?select=')));
@@ -618,7 +634,7 @@ test('the public CSV matches the authenticated export\'s zero-row shape when not
   const today = rangeSandbox.parseEscalationExportRange(exportUrl(''), now);
 
   const publicRun = makeSandbox(fixtureRoutes({ reports: [] }));
-  const publicResp = await publicRun.sandbox.handlePublicBadRentalEscalationToday(ENV);
+  const publicResp = await publicRun.sandbox.handlePublicBadRentalEscalationToday(publicCsvRequest(), ENV);
 
   const authRun = makeSandbox(fixtureRoutes({ reports: [] }));
   const authResp = await authRun.sandbox.handleBadRentalEscalationExport(
@@ -653,7 +669,7 @@ test('the public CSV matches the authenticated export\'s content for a day with 
   };
 
   const publicRun = makeSandbox(fixtureRoutes({ reports: [report] }));
-  const publicResp = await publicRun.sandbox.handlePublicBadRentalEscalationToday(ENV);
+  const publicResp = await publicRun.sandbox.handlePublicBadRentalEscalationToday(publicCsvRequest(), ENV);
 
   const authRun = makeSandbox(fixtureRoutes({ reports: [report] }));
   const authResp = await authRun.sandbox.handleBadRentalEscalationExport(
