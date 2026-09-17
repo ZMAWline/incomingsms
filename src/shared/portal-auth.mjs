@@ -200,6 +200,19 @@ const READ_ROUTES = [
   '/api/bill-audit/export', '/api/qbo-invoices', '/api/plan-rates', '/api/reseller-rates',
 ];
 
+// Routes where a caller only ever acts on their OWN record, and the record is
+// a personal preference rather than fleet state. These are the one deliberate
+// exception to "a write needs operator": /api/saved-filters stores the named
+// SIMs-table views the caller made for themselves, scoped by the authenticated
+// username inside src/dashboard/saved-filters.mjs, and a viewer who cannot
+// change a single SIM should still be able to name the view they read it in.
+//
+// Keep this list tiny and keep the rule intact: a route belongs here only if
+// the caller's own identity is the only row it can reach. Anything that can
+// touch another principal's data, or anything on the fleet, is an ordinary
+// write and must not be added.
+const SELF_SERVICE_ROUTES = ['/api/saved-filters'];
+
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 function matches(pathname, list) {
@@ -211,6 +224,10 @@ function matches(pathname, list) {
 export function requiredRole(method, pathname) {
   const p = String(pathname || '');
   if (matches(p, ADMIN_ONLY_ALL)) return ROLES.ADMIN;
+
+  // Checked before the read/write split so it covers both directions at once:
+  // a viewer may list and edit their own saved views, whatever the method.
+  if (matches(p, SELF_SERVICE_ROUTES)) return ROLES.VIEWER;
 
   const isWrite = WRITE_METHODS.has(String(method || '').toUpperCase())
     || matches(p, ALWAYS_MUTATING);
@@ -263,4 +280,4 @@ export function apiKeyMayAccess(pathname) {
   return !matches(String(pathname || ''), API_KEY_DENIED_ROUTES);
 }
 
-export { API_KEY_DENIED_ROUTES };
+export { API_KEY_DENIED_ROUTES, SELF_SERVICE_ROUTES };

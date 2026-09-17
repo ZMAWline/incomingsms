@@ -12,6 +12,7 @@ import { resolveUser, breakGlassUser, handleAuthRoutes } from './auth-routes.mjs
 import { renderLoginPage, renderAcceptInvitePage } from './auth-pages.mjs';
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from './api-keys.mjs';
 import { withAuditLog, handleAuditLogQuery } from './audit-log.mjs';
+import { handleSavedFilterRoutes } from './saved-filters.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -152,6 +153,14 @@ async function handleDashboardRequest(request, env, ctx, audit) {
     if (url.pathname === '/api/audit-log' && request.method === 'GET') {
       return handleAuditLogQuery(env, url, corsHeaders);
     }
+
+    // The caller's own SIMs-table saved filters. Scoped inside the handler to
+    // `user.username` — the path carries only the filter's name, never an
+    // owner, so there is no way to address someone else's views. Placed above
+    // the `/api/sims` routes so the `/api/saved-filters/<name>` sub-paths are
+    // matched before any prefix route can claim them.
+    const savedFilterResponse = await handleSavedFilterRoutes(request, env, url, user);
+    if (savedFilterResponse) return savedFilterResponse;
 
     // API Routes
     if (url.pathname === '/api/stats') {

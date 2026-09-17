@@ -5581,21 +5581,110 @@ set verify_pending; schedule §C.3 poll
         // views an operator actually uses are theirs to define rather than
         // whatever someone hardcoded.
         //
-        // Stored in localStorage, like simsColumnVis. That makes them
-        // per-browser, not per-account: they do not follow you to another
-        // machine. Making them shared would need a table and a migration.
+        // Stored per ACCOUNT, in dashboard_saved_filters via /api/saved-filters,
+        // so a view set up on one machine is there on the next. PR #104 shipped
+        // them in localStorage, which made them per-browser; that key is now
+        // read exactly once, uploaded, and removed (migrateLegacySimsSavedFilters
+        // below).
+        //
+        // renderSims() calls renderSimsSavedFilters() synchronously on every
+        // render, so the chip row reads this in-memory cache and never a fetch.
+        // The cache is filled once per page load, on the first loadSims().
         const SIMS_SAVED_FILTERS_KEY = 'simsSavedFilters';
+        let simsSavedFilters = [];
+        let simsSavedFiltersLoaded = false;
 
         function loadSimsSavedFilters() {
-            try {
-                const raw = JSON.parse(localStorage.getItem(SIMS_SAVED_FILTERS_KEY) || '[]');
-                return Array.isArray(raw) ? raw : [];
-            } catch (e) { return []; }
+            return simsSavedFilters;
         }
 
-        function persistSimsSavedFilters(list) {
-            try { localStorage.setItem(SIMS_SAVED_FILTERS_KEY, JSON.stringify(list)); }
-            catch (e) { showToast('Could not save filter (storage full?)', 'error'); }
+        // One-time move of the PR #104 localStorage filters onto the account.
+        // Deliberately additive: a name that already exists on the account wins,
+        // because the account copy is the one the operator has been editing from
+        // other machines. localStorage is cleared only after every upload that
+        // was going to happen has happened, so a failed run retries next load
+        // rather than dropping views on the floor.
+        async function migrateLegacySimsSavedFilters(serverNames) {
+            let legacy;
+            try { legacy = JSON.parse(localStorage.getItem(SIMS_SAVED_FILTERS_KEY) || '[]'); }
+            catch (e) { legacy = null; }
+            if (!Array.isArray(legacy)) {
+                try { localStorage.removeItem(SIMS_SAVED_FILTERS_KEY); } catch (e) {}
+                return false;
+            }
+            if (!legacy.length) {
+                try { localStorage.removeItem(SIMS_SAVED_FILTERS_KEY); } catch (e) {}
+                return false;
+            }
+
+            let uploaded = 0;
+            let failed = 0;
+            for (const entry of legacy) {
+                const name = entry && typeof entry.name === 'string' ? entry.name.trim() : '';
+                if (!name || !entry.state) continue;
+                if (serverNames.has(name)) continue;
+                const res = await putSimsSavedFilter(name, entry.state);
+                if (res.ok) uploaded++; else failed++;
+            }
+            if (failed) {
+                showToast('Could not move ' + failed + ' saved filter(s) to your account — will retry', 'error');
+                return uploaded > 0;
+            }
+            try { localStorage.removeItem(SIMS_SAVED_FILTERS_KEY); } catch (e) {}
+            if (uploaded) showToast('Moved ' + uploaded + ' saved filter(s) to your account', 'success');
+            return uploaded > 0;
+        }
+
+        async function putSimsSavedFilter(name, state) {
+            try {
+                const res = await fetch(API_BASE + '/saved-filters/' + encodeURIComponent(name), {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filter: state }),
+                });
+                const data = await res.json().catch(function () { return null; });
+                if (!res.ok || !data || !data.ok) {
+                    return { ok: false, error: (data && data.error) || ('HTTP ' + res.status) };
+                }
+                return { ok: true };
+            } catch (e) {
+                return { ok: false, error: 'network error' };
+            }
+        }
+
+        // Rows come back as {name, filter}; the rest of this file has always
+        // called the captured view `state`, so map once here rather than
+        // renaming it everywhere.
+        async function fetchSimsSavedFilters(options) {
+            const opts = options || {};
+            try {
+                const res = await fetch(API_BASE + '/saved-filters');
+                const data = await res.json().catch(function () { return null; });
+                if (!res.ok || !data || !data.ok || !Array.isArray(data.filters)) {
+                    if (!opts.quiet) showToast('Could not load your saved filters', 'error');
+                    return false;
+                }
+                simsSavedFilters = data.filters.map(function (f) {
+                    return { name: f.name, state: f.filter || {} };
+                });
+                simsSavedFiltersLoaded = true;
+                return true;
+            } catch (e) {
+                if (!opts.quiet) showToast('Could not load your saved filters', 'error');
+                return false;
+            }
+        }
+
+        // Called from loadSims(), so the chips are populated whenever the SIMs
+        // tab is opened. Runs the localStorage migration on the first pass only.
+        async function ensureSimsSavedFilters() {
+            if (simsSavedFiltersLoaded) return;
+            const ok = await fetchSimsSavedFilters();
+            if (!ok) return;
+            const names = new Set(simsSavedFilters.map(function (f) { return f.name; }));
+            const changed = await migrateLegacySimsSavedFilters(names);
+            if (changed) await fetchSimsSavedFilters({ quiet: true });
+            renderSimsSavedFilters();
         }
 
         // Sets are not JSON, and simsColumnFilters is copied rather than
@@ -5616,22 +5705,28 @@ set verify_pending; schedule §C.3 poll
         }
 
         async function saveCurrentSimsFilter() {
-            const raw = await showTextPrompt('Save filter', 'Name this view so you can come back to it.', '', 'e.g. Teltik offline');
+            const raw = await showTextPrompt('Save filter', 'Name this view so you can come back to it. Saved to your account, not this browser.', '', 'e.g. Teltik offline');
             const name = (raw || '').trim();
             if (!name) return;
-            const list = loadSimsSavedFilters();
             const state = captureSimsFilterState();
-            const existing = list.findIndex(function (f) { return f.name.toLowerCase() === name.toLowerCase(); });
+            const existing = simsSavedFilters.findIndex(function (f) { return f.name.toLowerCase() === name.toLowerCase(); });
             if (existing !== -1) {
-                const ok = await showConfirm('Replace filter', 'A filter named "' + name + '" already exists. Replace it?');
+                const ok = await showConfirm('Replace filter', 'A filter named "' + simsSavedFilters[existing].name + '" already exists. Replace it?');
                 if (!ok) return;
-                list[existing] = { name: name, state: state };
+                // Replacing "teltik" with "Teltik" would otherwise leave two rows:
+                // the unique index is on the exact name, so write the one that is
+                // already there.
+                const res = await putSimsSavedFilter(simsSavedFilters[existing].name, state);
+                if (!res.ok) { showToast('Could not save filter: ' + res.error, 'error'); return; }
+                simsSavedFilters[existing].state = state;
             } else {
-                list.push({ name: name, state: state });
+                const res = await putSimsSavedFilter(name, state);
+                if (!res.ok) { showToast('Could not save filter: ' + res.error, 'error'); return; }
+                simsSavedFilters.push({ name: name, state: state });
+                simsSavedFilters.sort(function (x, y) { return x.name.localeCompare(y.name); });
             }
-            persistSimsSavedFilters(list);
             renderSimsSavedFilters();
-            showToast('Saved filter "' + name + '"', 'success');
+            showToast('Saved filter "' + name + '" to your account', 'success');
         }
 
         function applySimsSavedFilter(name) {
@@ -5665,21 +5760,63 @@ set verify_pending; schedule §C.3 poll
             if (needsRefetch) loadSims(true); else renderSims();
         }
 
-        async function deleteSimsSavedFilter(name) {
-            const ok = await showConfirm('Delete filter', 'Delete saved filter "' + name + '"?');
-            if (!ok) return;
-            persistSimsSavedFilters(loadSimsSavedFilters().filter(function (f) { return f.name !== name; }));
+        // Rename is write-then-delete, in that order: if the delete fails the
+        // operator is left with two copies of a view they can see and remove,
+        // which is recoverable. The other order can lose one.
+        async function renameSimsSavedFilter(name) {
+            const entry = simsSavedFilters.find(function (f) { return f.name === name; });
+            if (!entry) return;
+            const raw = await showTextPrompt('Rename filter', 'Rename "' + name + '".', name, 'Filter name');
+            const next = (raw || '').trim();
+            if (!next || next === name) return;
+            const clash = simsSavedFilters.find(function (f) { return f.name.toLowerCase() === next.toLowerCase(); });
+            if (clash) {
+                const ok = await showConfirm('Replace filter', 'A filter named "' + clash.name + '" already exists. Replace it?');
+                if (!ok) return;
+            }
+            const put = await putSimsSavedFilter(next, entry.state);
+            if (!put.ok) { showToast('Could not rename filter: ' + put.error, 'error'); return; }
+            const del = await deleteSimsSavedFilterRequest(name);
+            if (!del.ok) { showToast('Renamed, but the old copy could not be removed', 'error'); }
+            await fetchSimsSavedFilters({ quiet: true });
             renderSimsSavedFilters();
+            if (del.ok) showToast('Renamed to "' + next + '"', 'success');
+        }
+
+        async function deleteSimsSavedFilterRequest(name) {
+            try {
+                const res = await fetch(API_BASE + '/saved-filters/' + encodeURIComponent(name), { method: 'DELETE' });
+                const data = await res.json().catch(function () { return null; });
+                if (!res.ok || !data || !data.ok) {
+                    return { ok: false, error: (data && data.error) || ('HTTP ' + res.status) };
+                }
+                return { ok: true };
+            } catch (e) {
+                return { ok: false, error: 'network error' };
+            }
+        }
+
+        async function deleteSimsSavedFilter(name) {
+            const ok = await showConfirm('Delete filter', 'Delete saved filter "' + name + '"? It is removed from your account, on every browser.');
+            if (!ok) return;
+            const res = await deleteSimsSavedFilterRequest(name);
+            if (!res.ok) { showToast('Could not delete filter: ' + res.error, 'error'); return; }
+            simsSavedFilters = simsSavedFilters.filter(function (f) { return f.name !== name; });
+            renderSimsSavedFilters();
+            showToast('Deleted "' + name + '"', 'success');
         }
 
         function renderSimsSavedFilters() {
             const host = document.getElementById('sims-saved-filters');
             if (!host) return;
             const list = loadSimsSavedFilters();
-            const saveBtn = '<button onclick="saveCurrentSimsFilter()" title="Save the current filters and sort under a name" class="px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">+ Save current filter</button>';
+            const saveBtn = '<button onclick="saveCurrentSimsFilter()" title="Save the current filters and sort under a name, on your account" class="px-2.5 py-1 text-xs rounded-full border border-dark-500 bg-dark-700 text-gray-300 hover:bg-dark-600 transition">+ Save current filter</button>';
             if (!list.length) {
+                const hint = simsSavedFiltersLoaded
+                    ? 'No saved filters yet — set up a view, then save it.'
+                    : 'Loading your saved filters…';
                 host.innerHTML = '<span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Saved</span>' + saveBtn +
-                    '<span class="text-xs text-gray-500 ml-1">No saved filters yet — set up a view, then save it.</span>';
+                    '<span class="text-xs text-gray-500 ml-1">' + hint + '</span>';
                 return;
             }
             host.innerHTML = '<span class="text-xs uppercase tracking-wide text-gray-500 mr-1">Saved</span>' +
@@ -5688,6 +5825,7 @@ set verify_pending; schedule §C.3 poll
                     const attr = n.replace(/'/g, '&#39;');
                     return '<span class="inline-flex items-center rounded-full border border-dark-500 bg-dark-700 overflow-hidden">' +
                            '<button onclick="applySimsSavedFilter(\'' + attr + '\')" title="Apply this filter" class="px-2.5 py-1 text-xs text-gray-300 hover:bg-dark-600 transition">' + n + '</button>' +
+                           '<button onclick="renameSimsSavedFilter(\'' + attr + '\')" title="Rename" class="px-1.5 py-1 text-xs text-gray-400 hover:text-white hover:bg-dark-600 transition">&#9998;</button>' +
                            '<button onclick="deleteSimsSavedFilter(\'' + attr + '\')" title="Delete" class="px-1.5 py-1 text-xs text-gray-400 hover:text-white hover:bg-dark-600 transition">&times;</button>' +
                            '</span>';
                 }).join('') + saveBtn;
@@ -7224,6 +7362,12 @@ set verify_pending; schedule §C.3 poll
         const SIM_CACHE_MS = 30 * 60 * 1000; // 30 minutes
 
         async function loadSims(force = false) {
+            // Saved filters live on the account, so they are fetched once per
+            // page load when the SIMs tab first opens. Deliberately not awaited
+            // and deliberately above the cache check: a cached SIM list still
+            // needs its chip row, and blocking the table on a second request
+            // would undo the load-path work from PR #104.
+            ensureSimsSavedFilters();
             // Check cache: if data loaded < 30 min ago and not forced, skip fetch
             const now = Date.now();
             if (!force && lastSimsFetchedAt && (now - lastSimsFetchedAt) < SIM_CACHE_MS && tableState.sims.data.length > 0) {
