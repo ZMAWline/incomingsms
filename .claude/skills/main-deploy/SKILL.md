@@ -12,7 +12,7 @@ Ships merged work to production. The operator is not a developer - be explicit, 
 - **Runs only from the main checkout.** If `git rev-parse --abbrev-ref HEAD` is not `main`, STOP. Tell the user which folder to switch to (the workspace named `main`, marked `primary` in Orca). Do not deploy from a task worktree, ever.
 - **Never use `ALLOW_UNSAFE_DEPLOY=1`.** If `scripts/deploy.sh` refuses, that refusal is the answer. Report it and stop.
 - **Deploy only workers that actually changed.** Never bulk-deploy everything - a 2026-06-12 bulk deploy from a stale checkout silently reverted a live feature.
-- **Never apply a database migration as part of a deploy.** Flag them and let the user decide (see Step 5).
+- **Never apply a database migration as part of a deploy.** Flag them and let the user decide (see Step 6).
 
 ## Step 1 - Confirm where you are, and get current
 
@@ -27,7 +27,33 @@ git pull --ff-only origin main
 - Uncommitted changes under `src/` -> STOP. Production would get code that is not committed anywhere. Show the files and ask.
 - `git pull --ff-only` fails -> STOP and report. It means local `main` has commits that are not on origin, which needs a human decision.
 
-## Step 2 - Work out what has not been deployed
+## Step 2 - Merge finished work into main
+
+Work sitting on a pushed branch is not live, no matter how many times you deploy. Bringing finished branches in is part of shipping, and it happens here - never from a task worktree.
+
+List the candidates:
+
+```bash
+git branch -r --no-merged origin/main --sort=-committerdate \
+  --format='%(refname:short)  %(committerdate:relative)  %(contents:subject)' | head -15
+```
+
+Show that list and ask which branches to merge. **Do not guess and do not merge all of them** - some are abandoned experiments. If the user says something loose like "the job I just finished", match it to the most recent branch, then confirm it by name before touching anything.
+
+For each branch the user confirms:
+
+```bash
+git merge --no-ff origin/<branch> -m "merge <branch> into main"
+```
+
+- **Merge conflict** -> STOP. Run `git merge --abort`, leave `main` untouched, and tell the user which files conflicted. A conflict needs whoever wrote the branch, not a deploy.
+- **After all merges, run `npm test`.** If tests pass on the branch but fail once merged, the change is fine alone and broken in combination. STOP. Do not push, do not deploy, and say exactly that - this is the failure the merge step exists to catch.
+- Then `git push origin main`.
+
+If the user says there is nothing to merge, skip ahead and deploy whatever is already on `main` but not yet shipped.
+
+
+## Step 3 - Work out what has not been deployed
 
 The marker for "what is live" is the git tag `deployed/prod`.
 
@@ -58,7 +84,7 @@ Then ask which of those they actually want deployed now, deploy only those, and 
 
 **If nothing changed**, say "Nothing to deploy - production matches `main`" and stop. Do not deploy anything to prove it works.
 
-## Step 3 - Show the plan and get a yes
+## Step 4 - Show the plan and get a yes
 
 Before deploying anything, print:
 
@@ -75,7 +101,7 @@ Not deploying: <workers unchanged>
 
 Wait for the user to confirm. One confirmation covers the whole list.
 
-## Step 4 - Pre-flight checks, once
+## Step 5 - Pre-flight checks, once
 
 ```bash
 npm test
@@ -91,7 +117,7 @@ node --input-type=module --check < src/dashboard/index.js
 node _check_frontend_js.js
 ```
 
-## Step 5 - Migrations: flag, never apply
+## Step 6 - Migrations: flag, never apply
 
 ```bash
 git diff --name-only deployed/prod..HEAD | grep '^supabase/migrations/'
@@ -105,7 +131,7 @@ If any migration files are new in this range, STOP before deploying and tell the
 
 Ask whether they have been applied to PROD. If the user does not know, offer to check the live schema before deploying. Only continue once they say to.
 
-## Step 6 - Deploy, one worker at a time
+## Step 7 - Deploy, one worker at a time
 
 For each worker in the confirmed list:
 
@@ -123,7 +149,7 @@ Notes:
 - `scripts/deploy.sh` re-runs the test suite per worker. That is slow with several workers but it is the sanctioned path - do not bypass it by calling `npx wrangler deploy` directly.
 - If a deploy fails, STOP. Do not continue to the next worker. Report which ones already shipped and which did not, so the user knows the real state.
 
-## Step 7 - Move the marker
+## Step 8 - Move the marker
 
 Only after every worker in the list deployed successfully:
 
@@ -134,7 +160,7 @@ git push -f origin deployed/prod
 
 If some deploys succeeded and others failed, do NOT move the marker. Leave it where it is and say so - a marker that lies is worse than no marker.
 
-## Step 8 - Report, and name the loose ends
+## Step 9 - Report, and name the loose ends
 
 ```
 ## Deployed

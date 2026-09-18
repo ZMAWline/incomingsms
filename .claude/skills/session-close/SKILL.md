@@ -124,7 +124,7 @@ On Path A this push also publishes the branch, which is what makes the work visi
 **Workers touched:** <list, or "none - documentation only">
 **Deployed:** nothing, by design (task worktree)
 
-**Your next step:** merge `<branch>` into `main`, then run the `main-deploy` skill from the main checkout.
+**Your next step:** switch to the `main` workspace and say "deploy". The `main-deploy` skill merges this branch into `main` and ships whatever needs shipping. Do not merge from here.
 ```
 
 **Path B format:**
