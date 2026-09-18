@@ -56,12 +56,18 @@ The sequence, every time: work in your own worktree -> `git fetch origin && git 
 ## Quick Reference
 
 ### Deploy a worker
+
+Production deploys run from the `main` checkout via the **`main-deploy`** skill. Never deploy from a task worktree, and never use bare `npx wrangler deploy` - that bypasses the test suite, the DB-constraint check and the stale-checkout guard (rule 8).
+
 ```bash
-cd src/<worker-name>
-npx wrangler deploy
-# Or for a specific env:
-npx wrangler deploy --env test
+scripts/deploy.sh <worker-name>              # production - only from an up-to-date main
+scripts/deploy.sh <worker-name> --env test   # preview - safe from any worktree
+scripts/deploy.sh dashboard --env=""         # dashboard prod requires the explicit env
+scripts/deploy.sh --all-test                 # all workers to the test environment
 ```
+
+When wrapping up work inside a task worktree, use the **`session-close`** skill. It commits, updates state, pushes the branch, and deliberately does not deploy.
+
 
 ### Add a secret to a worker
 ```bash
