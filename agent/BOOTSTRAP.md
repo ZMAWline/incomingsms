@@ -22,7 +22,7 @@ The `.claude/` memory files contain supplementary reference material (Helix endp
 
 ---
 
-## The 6 Rules You Cannot Break
+## The 8 Rules You Cannot Break
 
 **1. EVERY edit to `src/dashboard/index.js` MUST go through the `patch-dashboard` skill. No exceptions.**
 Before touching the dashboard for any reason — new feature, bug fix, one-line tweak, adding a column, changing a label — invoke the skill first (`Skill` tool with `skill: "patch-dashboard"`). The skill enforces the CRLF-safe Node.js patch-script workflow, the two required syntax checks (outer Worker + frontend JS via `_check_frontend_js.js`), and the explicit-`--env` deploy rule. Do not write a patch script freehand, do not use the Edit tool, do not deploy without running both syntax checks. Violations have repeatedly broken prod (see the 2026-04-15 regex-in-char-class incident where a freehand patch produced invalid regex only the frontend check would have caught). The dashboard file uses CRLF line endings and embeds ALL frontend JS inside a template literal — every backtick and `${...}` must be escaped. Standard tools silently corrupt it.
@@ -44,6 +44,12 @@ Wrangler/esbuild bundles shared modules automatically via relative imports.
 
 **7. All external API calls must use `relayFetch(env, url, init)` — never bare `fetch(url)`.**
 CF Workers cannot reach CF-proxied origins (causes HTTP 522). The relay at `relay.zmawsolutions.com` solves this. Every new carrier API call, webhook, or third-party HTTP call must go through `relayFetch`. Supabase calls and service bindings are exempt. Run `node _check_relay.js` before deploying to verify. See `agent/constraints.md §11` for the full pattern.
+
+**8. Build in worktrees. Deploy production from an up-to-date `main` -- never from a feature branch.**
+`wrangler deploy` REPLACES the whole worker with the current working copy. It is not a patch. So deploying from a checkout that is behind `main` silently reverts every commit that checkout never saw -- tests pass, nothing errors, a working feature just stops working. That is the 2026-06-12 `RENTAL_CAPTURE_ENABLED` revert (`agent/current-state.md`), and the `fix/atomic-portin-finalizer-record` branch that sat unmerged for weeks while the carrier backlog grew.
+The sequence, every time: work in your own worktree -> `git fetch origin && git rebase origin/main` (this is the step that pulls the other agents' work in) -> re-run `npm test` **after** the rebase -> merge to `main` -> deploy from a `main` checkout. To see your own branch running without touching production, use `scripts/deploy.sh <worker> --env test`.
+`scripts/deploy.sh` now enforces this: a production deploy from a non-`main` or behind-`main` checkout is refused outright. The override is `ALLOW_UNSAFE_DEPLOY=1` and it means "I accept that I may be reverting other work in production" -- never use it to get past a refusal you did not read.
+**The DB is not worktree-isolated.** There is one Supabase instance and no copies of it. Additive migrations (new column, new index, new function) are safe to land while another agent is mid-task. Renames, drops, type changes and function-signature changes are not -- the other agent's running code still expects the old shape and breaks the moment the migration lands. Hold those until the parallel work has merged, then do them in one pass.
 
 ---
 
