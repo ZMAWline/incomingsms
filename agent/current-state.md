@@ -1,11 +1,30 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-17 (SIMs-table saved filters are now per-account — `dashboard_saved_filters`, migration 011. Migration NOT yet applied to TEST or PROD; not deployed to prod.)
+> Last updated: 2026-09-18 (Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4-594f-43f1-8199-151371ed6ea2`. The 2026-09-17 note below saying the migration was not applied is stale.)
 > 2026-09-10: SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API.
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
 ---
+
+## Session 2026-09-18 — Dashboard Worker deployed to PROD (branch `docs/prod-deploy-2026-09-18`)
+
+Deployed `origin/main` (`9af5027`) to `dashboard.zalmen-531.workers.dev` on explicit
+user authorization. From a clean detached worktree, not the dirty main checkout:
+
+- Both mandated syntax checks passed (outer Worker module, frontend inline `<script>`s).
+- `npm test`: 923/923 pass, 0 fail (923 vs. the 911 recorded in the 2026-09-17 note above —
+  that note's count is stale, not a regression).
+- `npx wrangler deploy --env=""` → Version ID `17e0f0c4-594f-43f1-8199-151371ed6ea2`.
+- Verified, not just trusted wrangler's output: `GET /api/saved-filters` → 401 (route
+  live, auth required); the deployed Worker script (Cloudflare API,
+  `workers/scripts/dashboard`) contains `saved-filters` (3 matches). `/` itself is the
+  sign-in page (auth-gated), so the feature markup can't be curled anonymously.
+- Checked the stop condition this skill calls out before a prod deploy: the
+  2026-09-17 note above claimed migration 011 (`dashboard_saved_filters`) was not
+  applied to PROD. `list_migrations` on the PROD Supabase project
+  (`lzjqegxazqlktttyybth`) shows it applied as `20260917213954` — the note was
+  stale, written before that migration ran. No rollback needed.
 
 ## Session 2026-09-17 — Saved filters moved off localStorage onto the account (branch `saved-filters-per-account`)
 
