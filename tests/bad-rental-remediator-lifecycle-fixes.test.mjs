@@ -71,6 +71,7 @@ test('R1: TH2 pending host-port-read exhausts after 2 classify_only looks -> dis
   const fetchStub = async (url, init = {}) => {
     const u = String(url);
     const method = (init && init.method) || 'GET';
+    if (u.includes('api.smsgateway.xyz/v1/all-lines')) return jsonResp([{ iccid: '890141000009001', mdn: '5559009001', nickname: '890141000009001' }]);
     // Teltik port-status always errors -> port read never usable -> TH2 pending.
     if (u.includes('api.smsgateway.xyz/v1/port-status')) return jsonResp({ success: false }, 500);
     if (u.startsWith('https://atomic.test')) {
@@ -233,6 +234,7 @@ test('R3: Teltik host port offline + get-info shows gateway_id 0/port null -> te
   const fetchStub = async (url, init = {}) => {
     const u = String(url);
     const method = (init && init.method) || 'GET';
+    if (u.includes('api.smsgateway.xyz/v1/all-lines')) return jsonResp([{ iccid: '890141000009003', mdn: '5559009003', nickname: '890141000009003' }]);
     if (u.includes('api.smsgateway.xyz/v1/port-status')) return jsonResp({ success: true, status: 'offline' });
     if (u.includes('api.smsgateway.xyz/v1/get-info')) return jsonResp({ gateway_id: 0, port: null, iccid: sim.iccid, line_state: 'active' });
     if (u.includes('api.smsgateway.xyz/v1/reset-port')) { resetPortCalls++; return jsonResp({ success: true, request_id: 'rp-1' }); }
