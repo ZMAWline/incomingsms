@@ -1,13 +1,71 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
+> Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
+> Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
 > 2026-09-17 (SIMs-table saved filters are now per-account — `dashboard_saved_filters`, migration 011. Migration NOT yet applied to TEST or PROD; not deployed to prod.)
 > 2026-09-10: SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API.
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
 ---
+
+## Session 2026-09-18 — 8 live PROD functions captured into migrations (PR #108), TEST DB partially reconciled
+
+**PR #108 merged to `main`** (squash, branch deleted). It adds eight
+`supabase/migrations/20260918_*.sql` files that are exact copies of functions
+already running in PROD but written down nowhere in the repo, plus
+`tests/rpc-functions-have-migrations.test.mjs`, which fails if any RPC name
+called from `src/` has no definition in either migration directory. Full suite
+green at 925 tests. No database was changed by the PR itself.
+
+**TEST Supabase (`lwapudjjlwkskijefxdz`) — 8 of the 13 code-called RPCs now
+exist.** Before this session it had 2 (`claim_address_pool_entry`,
+`get_sms_counts_24h`). Applied today, TEST only, PROD untouched:
+
+- `claim_rotation_slot`
+- `increment_rotation_fail`
+- `list_zips_needing_refill`
+- `rotation_freshness`
+- `teltik_hold_morning_batch`
+- `claim_rotation_retry_slot`
+- `get_sms_counts_24h` (re-applied so it matches PROD byte for byte)
+
+Smoke-tested on TEST after applying: `rotation_freshness()` returned 3 vendor
+rows, `list_zips_needing_refill(5)` and `get_sms_counts_24h(...)` both executed
+and returned 0 rows. All three run.
+
+**5 functions are BLOCKED on missing TEST tables.** Each one needs a table TEST
+does not have, so nothing was applied for them and no schema was invented:
+
+| Function | Missing table on TEST |
+|---|---|
+| `attempts_today` | `remediation_attempts` |
+| `get_ledger_months` | `billing_ledger` |
+| `get_sms_usage_summary` | `sim_sms_daily` |
+| `get_hosting_port_status_summary` | `hosting_port_status_checks` |
+| `get_teltik_currently_offline` | `hosting_port_status_checks` |
+
+`hosting_port_status_checks` is the easy one — `migrations/20260804_hosting_port_status_checks.sql`
+creates the table and both of its functions in one idempotent file, so applying
+that file to TEST unblocks two of the five. The other three tables
+(`remediation_attempts`, `billing_ledger`, `sim_sms_daily`) have **no CREATE
+TABLE anywhere in the repo** — same gap this session just closed for functions,
+now visible for tables. Worth an audit.
+
+**Two open items on the captured functions** — both are documented in the file
+headers and were deliberately NOT changed, so the captures stay a faithful
+record of what PROD runs:
+
+1. `rotation_freshness` decides freshness with `LIKE '%"rentalId"%'` against a
+   partner's stored HTTP response body. If that partner rewords its response,
+   the whole fleet silently reads as stale. It also hardcodes its window off
+   `sims.carrier` rather than `sims.rotation_interval_hours`, so it can disagree
+   with the interval `claim_rotation_slot` actually enforces.
+2. `teltik_hold_morning_batch` is `SECURITY DEFINER` with no pinned
+   `search_path` — the shape Supabase's own linter flags. Reproduced live-exact.
+
+Fixing either is a change against PROD and should be its own PR.
 
 ## Session 2026-09-18 — Bad Rental escalation CSV is now keyed in PROD
 
