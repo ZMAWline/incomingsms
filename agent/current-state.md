@@ -1,7 +1,8 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
+> Last updated: 2026-09-18 (`scripts/deploy.sh` now refuses PRODUCTION deploys from a non-main or stale checkout — commit `feb91d7`; `agent/BOOTSTRAP.md` rule 8 added. Override is `ALLOW_UNSAFE_DEPLOY=1`.)
+> Also 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
 > 2026-09-17 (SIMs-table saved filters are now per-account — `dashboard_saved_filters`, migration 011. Migration NOT yet applied to TEST or PROD; not deployed to prod.)
@@ -9,6 +10,28 @@
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
 ---
+
+## Session 2026-09-18 — Production deploys now refuse stale or non-main checkouts (commit `feb91d7`)
+
+**`scripts/deploy.sh` gained a production guard.** Landed on `main` as
+`feb91d7`. A PRODUCTION deploy is now refused when:
+
+- `HEAD` is not `main`, or
+- `main` is behind `origin/main`.
+
+It **warns but does not block** on uncommitted changes under `src/`. Preview
+deploys (`--env test`, `--all-test`) are unaffected. Emergency override is
+`ALLOW_UNSAFE_DEPLOY=1`.
+
+**`agent/BOOTSTRAP.md` gained rule 8:** build in worktrees, deploy production
+from an up-to-date `main`. It also records that the Supabase schema is shared
+across worktrees — additive migrations are safe while other agents work;
+renames and drops are not.
+
+**Why:** `wrangler deploy` replaces the whole Worker with the current working
+copy, so deploying from a stale checkout silently reverts every commit that
+checkout never saw. This is the same failure mode as the 2026-06-12
+`RENTAL_CAPTURE_ENABLED` revert.
 
 ## Session 2026-09-18 — 8 live PROD functions captured into migrations (PR #108), TEST DB partially reconciled
 
