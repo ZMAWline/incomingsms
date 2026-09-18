@@ -1,11 +1,41 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Last updated: 2026-09-18 (Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4-594f-43f1-8199-151371ed6ea2`. The 2026-09-17 note below saying the migration was not applied is stale.)
+> Last updated: 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
+> Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
+> 2026-09-17 (SIMs-table saved filters are now per-account — `dashboard_saved_filters`, migration 011. Migration NOT yet applied to TEST or PROD; not deployed to prod.)
 > 2026-09-10: SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API.
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
 ---
+
+## Session 2026-09-18 — Bad Rental escalation CSV is now keyed in PROD
+
+`GET /public/bad-rental-escalations-today.csv` on the dashboard Worker now
+requires the shared secret `BAD_RENTAL_CSV_KEY` (commit `08076ad`, already on
+`main`; no PR was opened for it — the commit was pushed to `main` directly, so
+branch `fix/public-bad-rental-csv-key` is 0 commits ahead and there is nothing
+left to merge).
+
+- **Secret set** on both Workers: `dashboard-test` and `dashboard` (PROD).
+  The key value lives on this server at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`
+  (dir `0700`, file `0600`). It is not in the repo and must not be pasted into
+  chat, issues or docs.
+- **PROD deployed** — dashboard version `40642f28-3593-4402-96ce-fe52b4911b9a`.
+  TEST got a preview version `9afd4055` (`versions upload`, not promoted).
+- **Before the secret was set PROD was failing closed with 503** ("BAD_RENTAL_CSV_KEY
+  unset") — the keyed code was already live from an earlier deploy but the secret
+  had never been created. Live verification after the fix: no key → **401**,
+  wrong key → **401**, correct key in `X-Api-Key` → **200** `text/csv`, correct
+  key as `?key=` → **200** `text/csv`.
+- **Known and accepted:** the old 9AM automation that pulled this CSV now gets
+  401. Owner's decision — that consumer is dead.
+
+**TODO (2026-09-18) — Key/secret management.** The project has many secrets
+spread across Worker envs, `.dev.vars`, `~/.config/cloudflare/env` and now
+`~/.config/incomingsms/`. Owner wants one clear way to manage all keys: an
+inventory of every secret, where it lives, who consumes it, and how to rotate
+it. **Not started.**
 
 ## Session 2026-09-18 — Dashboard Worker deployed to PROD (branch `docs/prod-deploy-2026-09-18`)
 
