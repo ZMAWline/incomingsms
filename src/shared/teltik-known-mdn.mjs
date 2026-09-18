@@ -167,14 +167,14 @@ export async function fetchWithTimeout(url, opts = {}, timeoutMs = TELTIK_FETCH_
   }
 }
 
-function relayUrl(env, url) {
+export function relayUrl(env, url) {
   return env && env.RELAY_URL ? env.RELAY_URL + '/' + url : url;
 }
-function relayHeaders(env) {
+export function relayHeaders(env) {
   return env && env.RELAY_KEY ? { 'x-relay-key': env.RELAY_KEY } : {};
 }
 
-async function teltikGetJson(env, url, timeoutMs) {
+export async function teltikGetJson(env, url, timeoutMs) {
   const resp = await fetchWithTimeout(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) }, timeoutMs);
   const text = await resp.text();
   let json = null;

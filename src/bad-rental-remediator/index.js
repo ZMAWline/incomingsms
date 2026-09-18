@@ -33,6 +33,7 @@ import { classifyExpiredReport } from './stale-classifier.mjs';
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
 import { resolveTeltikKnownMdn } from '../shared/teltik-known-mdn.mjs';
+import { ensureTeltikAlias, summarizeAliasResult, ALIAS_REASON_MISSING } from '../shared/teltik-alias.mjs';
 import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortState } from '../shared/hosting-port-status.mjs';
 import {
   evaluateHealthyEvidence, proofWindow,
@@ -99,6 +100,11 @@ const ISSUE_GATEWAY_PORT_OFFLINE_UNRESOLVED = 'Gateway port offline unresolved';
 // is not physically seated in any gateway port — reset-port can never fix
 // that, so it gets its own distinct escalation instead of looping resets.
 const ISSUE_TELTIK_LINE_NOT_SEATED = 'Teltik line not seated in gateway';
+// TH6: a foreign-vendor (Atomic/Wing/Helix) line hosted on Teltik whose Teltik
+// nickname is not its ICCID. teltik-worker matches inbound SMS by ICCID-in-
+// nickname, so without it the line's SMS never reaches this sims row — that is
+// a routing fault, not a carrier/no-SMS fault, and gets its own reason.
+const ISSUE_TELTIK_ALIAS_MISSING = 'Teltik alias (nickname) is not the ICCID';
 // R6: PreResolveGate actions that succeeded but cannot be SMS-verified while
 // the global outbound-SMS kill switch is on.
 const ISSUE_VERIFY_SMS_DISABLED = 'Verify impossible: SMS sending disabled';
@@ -1632,6 +1638,39 @@ async function classifySharedLadder(env, report, evidence) {
     }
   }
 
+  // TH6 — Teltik alias check for foreign-vendor lines hosted on Teltik. Runs
+  // BEFORE TH2's resend_online and BEFORE the vendor classifier can label the
+  // report a no-SMS / vendor failure: gatherEvidence already read the Teltik
+  // nickname, repaired it to the ICCID when missing/wrong, and read back. A
+  // verified alias (noop or repaired this tick) falls through — the existing
+  // provider-vs-host ladder then applies unchanged. Anything else is explicit
+  // missing_teltik_alias evidence: nonterminal so the next tick re-reads and
+  // re-repairs, escalating with its own reason after the usual classify_only
+  // budget (mirrors TH2's teltik_host_port_read_failed pattern).
+  if (evidence.sim && isTeltikHosted(evidence.sim)
+      && String(evidence.sim.vendor || '').toLowerCase() !== 'teltik'
+      && evidence.teltikAlias && evidence.teltikAlias.ok !== true) {
+    const priorClassifyOnly = (evidence.priorActionAttempts && evidence.priorActionAttempts.classify_only) || 0;
+    const aliasEvidence = {
+      reason: ALIAS_REASON_MISSING,
+      issue_type: ISSUE_TELTIK_ALIAS_MISSING,
+      gateway_host: evidence.sim.gateway_host || null,
+      vendor: evidence.sim.vendor || null,
+      iccid: evidence.sim.iccid || null,
+      teltik_alias: summarizeAliasResult(evidence.teltikAlias),
+      teltik_alias_trail: evidence.teltikAlias.trail || null,
+      teltik_known_mdn: evidence.teltikKnownMdn || null,
+      prior_classify_only_attempts: priorClassifyOnly,
+    };
+    if (priorClassifyOnly >= 2) {
+      return terminal('TH6', 'escalate', 'escalate', aliasEvidence, ALIAS_REASON_MISSING, ISSUE_TELTIK_ALIAS_MISSING);
+    }
+    return nonTerminal('TH6', 'classify_only', 'no_change', {
+      ...aliasEvidence,
+      pending_reason: 'pending_teltik_alias_repair',
+    }, ALIAS_REASON_MISSING, ISSUE_TELTIK_ALIAS_MISSING);
+  }
+
   // TH2 — non-Teltik-provider SIM hosted on a Teltik/Celtic gateway, provider
   // active. The HOST path owns assessment BEFORE the vendor classifier: stale
   // webhook-delivered evidence otherwise routes A1 atomic_ota. Zalmen's
@@ -2092,6 +2131,29 @@ async function gatherEvidence(env, report) {
         evidence.teltikHostLineInfo = await teltikGetInfo(env, { mdn: hostReadMdn });
       } catch (err) {
         evidence.teltikHostLineInfo = { ok: false, error: String(err && err.message || err) };
+      }
+    }
+    // Teltik alias (nickname) = ICCID for foreign-vendor lines on Teltik.
+    // Inbound Teltik SMS is matched to this sims row by ICCID-in-nickname, so
+    // a missing/wrong nickname reads exactly like "no SMS received". Check it,
+    // repair it (POST /v1/update-nickname keyed by the Teltik-known MDN — the
+    // DB provider MDN is never used to key the write), read back. Result feeds
+    // TH6 in the ladder. Teltik-vendor SIMs are exempt: their payload MDN is
+    // already the DB MDN.
+    if (String(evidence.sim.vendor || '').toLowerCase() !== 'teltik') {
+      try {
+        evidence.teltikAlias = await ensureTeltikAlias(env, {
+          id: evidence.sim.id,
+          iccid: evidence.sim.iccid,
+          vendor: evidence.sim.vendor,
+          current_mdn_e164: evidence.sim.current_mdn_e164,
+        }, { knownMdn: evidence.teltikKnownMdn || null });
+      } catch (err) {
+        evidence.teltikAlias = { ok: false, action: 'none', reason: 'teltik_alias_check_crashed', error: String(err && err.message || err), trail: [] };
+      }
+      if (evidence.teltikAlias && evidence.teltikAlias.ok !== true) {
+        console.log('[Remediator] teltik alias not verified for report ' + report.id
+          + ' iccid=' + evidence.sim.iccid + ' reason=' + (evidence.teltikAlias.reason || 'unknown'));
       }
     }
   }

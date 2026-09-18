@@ -212,22 +212,32 @@ async function fetchCurrentlyOfflineLines(env) {
 const TELTIK_PORTAL_URL_DEFAULT = 'https://teltik-portal.zalmen-531.workers.dev';
 
 function buildFleetOfflineMessage(env, offline) {
-  const shown = offline.slice(0, FLEET_OFFLINE_LIST_CAP);
-  const lines = shown.map((l) => '• `' + (l.iccid || 'unknown') + '`' + (l.mdn ? ' — ' + l.mdn : ''));
-  if (offline.length > shown.length) lines.push('_...and ' + (offline.length - shown.length) + ' more_');
+  const groups = new Map();
+  for (const line of offline) {
+    const vendor = String(line.vendor || 'unknown').trim().toLowerCase() || 'unknown';
+    if (!groups.has(vendor)) groups.set(vendor, []);
+    groups.get(vendor).push(line);
+  }
+  const summary = [...groups.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([vendor, lines]) => vendor + ': ' + lines.length)
+    .join(' · ');
+  const lines = ['*Summary:* ' + summary + ' · total: ' + offline.length];
+  for (const [vendor, vendorLines] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push('\n*' + vendor + ' (' + vendorLines.length + ')*');
+    lines.push(...vendorLines.slice(0, FLEET_OFFLINE_LIST_CAP).map((l) => '• `' + (l.iccid || 'unknown') + '`' + (l.mdn ? ' — ' + l.mdn : '')));
+    if (vendorLines.length > FLEET_OFFLINE_LIST_CAP) lines.push('_...and ' + (vendorLines.length - FLEET_OFFLINE_LIST_CAP) + ' more_');
+  }
   const portalUrl = (env && env.TELTIK_PORTAL_URL) || TELTIK_PORTAL_URL_DEFAULT;
   return {
     blocks: [
-      {
-        type: 'header',
-        text: { type: 'plain_text', text: ':rotating_light: ' + offline.length + ' Teltik line(s) currently offline', emoji: true },
-      },
+      { type: 'header', text: { type: 'plain_text', text: ':rotating_light: Active Teltik-hosted offline summary', emoji: true } },
       { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
       {
         type: 'context',
         elements: [{
           type: 'mrkdwn',
-          text: '<' + portalUrl + '/offline|View all offline lines> — generated ' + new Date().toISOString(),
+          text: '<' + portalUrl + '/offline|View all active offline lines> — generated ' + new Date().toISOString(),
         }],
       },
     ],

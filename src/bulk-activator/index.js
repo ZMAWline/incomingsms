@@ -1,5 +1,7 @@
 import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-picker.mjs';
 import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseAtomicPortInRequest, parseCsv, pickRandomPortIdentity, isAddressRejection, validateActivationSim } from '../shared/activation-bulk.mjs';
+import { isTeltikHosted } from '../shared/gateway-host.mjs';
+import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -254,6 +256,13 @@ export default {
         if (resellerId) await assignSimToReseller(env, resellerId, simId);
 
         console.log(`[Activator] ${iccid}: activated via ${vendor}, simId=${simId}`);
+
+        // Atomic SIM seated in a Teltik gateway: Teltik must know the line by
+        // its ICCID (nickname) or inbound SMS never matches this sims row.
+        // Idempotent, logged, and never fails the activation itself.
+        if (vendor === 'atomic') {
+          await ensureTeltikAliasAfterActivation(env, simId, iccid, runId, result);
+        }
 
         // Update job item to done
         if (jobRunId) {
@@ -1277,6 +1286,47 @@ async function supabaseInsert(env, table, rows) {
   if (!res.ok) throw new Error(`Supabase INSERT ${res.status}: ${text.slice(0, 300)}`);
   if (!text.trim()) return [];
   try { return JSON.parse(text); } catch (e) { throw new Error(`Supabase INSERT parse failed: ${e}`); }
+}
+
+// Activation-time Teltik alias check for Atomic SIMs hosted on Teltik
+// (gateway_host='teltik'). Resolves the Teltik-known host MDN, sets the Teltik
+// nickname to the ICCID when missing/wrong, reads back and verifies. Records a
+// clear success/failure row in carrier_api_logs (vendor='teltik',
+// step='teltik_alias'); never writes sims.vendor / gateway_host / msisdn and
+// never throws — an alias problem must not undo a completed carrier activation.
+async function ensureTeltikAliasAfterActivation(env, simId, iccid, runId, result) {
+  try {
+    const rows = await supabaseSelect(env, `sims?select=id,iccid,vendor,gateway_host,msisdn&id=eq.${encodeURIComponent(String(simId))}&limit=1`);
+    const sim = rows?.[0];
+    if (!sim || !isTeltikHosted(sim)) return null;
+    const alias = await ensureTeltikAlias(env, {
+      id: sim.id,
+      iccid: sim.iccid || iccid,
+      vendor: sim.vendor,
+      current_mdn_e164: (result && result.msisdn) || sim.msisdn || null,
+    });
+    const summary = summarizeAliasResult(alias);
+    console.log(`[Activator] ${iccid}: teltik alias ${alias.ok ? 'OK' : 'FAILED'} action=${alias.action} reason=${alias.reason || 'none'} host_mdn=${alias.mdn10 || 'unresolved'}`);
+    await logCarrierApiCall(env, {
+      run_id: runId,
+      step: 'teltik_alias',
+      iccid,
+      imei: null,
+      vendor: 'teltik',
+      request_url: (alias.update && alias.update.url) || 'https://api.smsgateway.xyz/v1/update-nickname',
+      request_method: alias.update ? 'POST' : 'GET',
+      request_body: { nickname: iccid, mdn: alias.mdn10 || null, action: alias.action },
+      response_status: alias.update ? alias.update.http_status : (alias.ok ? 200 : 0),
+      response_ok: !!alias.ok,
+      response_body_text: JSON.stringify({ summary, trail: alias.trail }),
+      response_body_json: summary,
+      error: alias.ok ? null : `Teltik alias not verified: ${alias.reason}`,
+    });
+    return alias;
+  } catch (e) {
+    console.error(`[Activator] ${iccid}: teltik alias check crashed: ${e}`);
+    return null;
+  }
 }
 
 async function upsertSim(env, iccid, subId) {

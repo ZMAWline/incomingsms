@@ -164,8 +164,11 @@ test('notifyOfflineFleetSummary: nothing offline posts nothing and does not cons
   assert.equal(kv.store.size, 0, 'an empty check must not burn the digest dedup window');
 });
 
-test('notifyOfflineFleetSummary: posts one batch message listing offline lines, capped with a "+N more"', async () => {
-  const rows = Array.from({ length: 20 }, (_, i) => ({ sim_id: i + 1, iccid: 'ICC' + i, mdn: '212555' + String(i).padStart(4, '0') }));
+test('notifyOfflineFleetSummary: posts one batch message grouped by vendor with a summary and per-vendor caps', async () => {
+  const rows = [
+    ...Array.from({ length: 20 }, (_, i) => ({ sim_id: i + 1, iccid: 'ATOMIC' + i, mdn: '212555' + String(i).padStart(4, '0'), vendor: 'atomic' })),
+    { sim_id: 21, iccid: 'TELTIK1', mdn: '6465550001', vendor: 'teltik' },
+  ];
   let posted = null;
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url));
@@ -176,12 +179,13 @@ test('notifyOfflineFleetSummary: posts one batch message listing offline lines, 
   const env = { SLACK_WEBHOOK_URL: 'https://hooks.slack.test/x', SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'k', REMEDIATOR_KV: fakeKv() };
   const res = await notifyOfflineFleetSummary(env, { now: MORNING_WINDOW });
   assert.equal(res.ok, true);
-  assert.equal(res.offline_count, 20);
+  assert.equal(res.offline_count, 21);
   const text = JSON.stringify(posted);
-  assert.ok(text.includes('20 Teltik line'));
-  assert.ok(text.includes('ICC0'), 'first line listed');
-  assert.ok(text.includes('...and 5 more'), 'list capped at 15 with a remainder note');
-  assert.ok(text.includes('<https://teltik-portal.zalmen-531.workers.dev/offline|View all offline lines>'), 'links straight to the pre-filtered offline view');
+  assert.ok(text.includes('*Summary:* atomic: 20 · teltik: 1 · total: 21'), 'summary is first');
+  assert.ok(text.includes('*atomic (20)*'), 'atomic section');
+  assert.ok(text.includes('*teltik (1)*'), 'teltik section');
+  assert.ok(text.includes('...and 5 more'), 'atomic list capped at 15');
+  assert.ok(text.includes('<https://teltik-portal.zalmen-531.workers.dev/offline|View all active offline lines>'), 'links to active offline view');
 });
 
 test('notifyOfflineFleetSummary: TELTIK_PORTAL_URL overrides the default link target', async () => {
@@ -198,7 +202,7 @@ test('notifyOfflineFleetSummary: TELTIK_PORTAL_URL overrides the default link ta
     REMEDIATOR_KV: fakeKv(), TELTIK_PORTAL_URL: 'https://status.example.com',
   };
   await notifyOfflineFleetSummary(env, { now: MORNING_WINDOW });
-  assert.ok(JSON.stringify(posted).includes('<https://status.example.com/offline|View all offline lines>'));
+  assert.ok(JSON.stringify(posted).includes('<https://status.example.com/offline|View all active offline lines>'));
 });
 
 test('notifyOfflineFleetSummary: a second call in the same window is deduped, no second post', async () => {

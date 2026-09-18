@@ -75,6 +75,12 @@ function makeHarness({ attStatus = 'active', portStatuses = [], webhookDelivered
       if (state === 'error') return new Response(JSON.stringify({ success: false, error: 'port_read_failed' }), { status: 500 });
       return new Response(JSON.stringify({ success: true, status: state }), { status: 200 });
     }
+    if (u.includes('api.smsgateway.xyz/v1/all-lines')) {
+      return new Response(JSON.stringify([{ iccid: sim.iccid, mdn: '5551116817', nickname: sim.iccid }]), { status: 200 });
+    }
+    if (u.includes('api.smsgateway.xyz/v1/update-nickname')) {
+      return new Response(JSON.stringify({ message: 'Nickname updated successfully.' }), { status: 200 });
+    }
     if (u.includes('api.smsgateway.xyz/v1/reset-port')) {
       return new Response(JSON.stringify({ success: true, request_id: 'rp-1' }), { status: 200 });
     }
@@ -207,7 +213,7 @@ test('7182: Atomic active + Teltik host port online → resend_online after both
     assert.equal(a.evidence.provider_status, 'healthy');
     assert.equal(a.evidence.host_provider, 'teltik');
     assert.equal(a.evidence.host_status, 'healthy');
-    assert.equal(a.evidence.teltik_host_mdn, '+15550006817');
+    assert.equal(a.evidence.teltik_host_mdn, '5551116817');
     assert.equal(a.evidence.sim_id, 'sim-6817');
 
     // Resend is not a terminal proof of SMS receipt — report stays open/queued.

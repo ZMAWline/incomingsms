@@ -18,6 +18,8 @@ import { PLAYBOOK, classifyFailure, UNCLASSIFIED_BUCKET } from '../shared/rotati
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
+import { isTeltikHosted } from '../shared/gateway-host.mjs';
+import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
@@ -1278,6 +1280,13 @@ async function finalizeCompletedAtomicPortin(env, sim) {
   }
 
   await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+
+  // Port completed: the Atomic line is live. If it is seated in a Teltik
+  // gateway, make sure Teltik's nickname is the ICCID (idempotent read → POST
+  // /v1/update-nickname → read back). Logged, never throws, never touches
+  // vendor/gateway_host/msisdn.
+  const teltikAlias = await ensureTeltikAliasAfterPortin(env, { ...sim, msisdn: msisdn || sim.msisdn });
+
   return {
     ok: true,
     msisdn,
@@ -1286,7 +1295,39 @@ async function finalizeCompletedAtomicPortin(env, sim) {
     ban: ban || null,
     imei: imei || null,
     activated_at: patch.activated_at || null,
+    teltik_alias: teltikAlias,
   };
+}
+
+async function ensureTeltikAliasAfterPortin(env, sim) {
+  try {
+    if (!sim || !isTeltikHosted(sim)) return null;
+    const alias = await ensureTeltikAlias(env, {
+      id: sim.id,
+      iccid: sim.iccid,
+      vendor: 'atomic',
+      current_mdn_e164: sim.msisdn || null,
+    });
+    const summary = summarizeAliasResult(alias);
+    console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: teltik alias ${alias.ok ? 'OK' : 'FAILED'} action=${alias.action} reason=${alias.reason || 'none'} host_mdn=${alias.mdn10 || 'unresolved'}`);
+    await logTeltikApiCall(env, {
+      run_id: null,
+      step: 'teltik_alias',
+      iccid: sim.iccid,
+      request_url: (alias.update && alias.update.url) || 'https://api.smsgateway.xyz/v1/update-nickname',
+      request_method: alias.update ? 'POST' : 'GET',
+      request_body: { nickname: sim.iccid, mdn: alias.mdn10 || null, action: alias.action },
+      response_status: alias.update ? alias.update.http_status : (alias.ok ? 200 : 0),
+      response_ok: !!alias.ok,
+      response_body_text: JSON.stringify({ summary, trail: alias.trail }),
+      response_body_json: summary,
+      error: alias.ok ? null : `Teltik alias not verified: ${alias.reason}`,
+    });
+    return summary;
+  } catch (e) {
+    console.error(`[Finalizer/AtomicPortinStatus] SIM ${sim && sim.iccid}: teltik alias check crashed: ${e}`);
+    return null;
+  }
 }
 
 async function runAtomicPortinStatusFinalizer(env, limit) {
@@ -1299,7 +1340,7 @@ async function runAtomicPortinStatusFinalizer(env, limit) {
 
   const sims = (await supabaseSelect(
     env,
-    `sims?select=id,iccid,msisdn,atomic_portin_status_code,atomic_portin_checked_at&vendor=eq.atomic&status=eq.provisioning&port_in_pending=eq.true&limit=${limit}`
+    `sims?select=id,iccid,msisdn,gateway_host,atomic_portin_status_code,atomic_portin_checked_at&vendor=eq.atomic&status=eq.provisioning&port_in_pending=eq.true&limit=${limit}`
   )) || [];
   if (sims.length === 0) return { ok: true, processed: 0, checked: 0 };
 
