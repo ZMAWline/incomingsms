@@ -2056,23 +2056,36 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       wholeSaleRequest: { requestType: 'subsriberInquiry', MSISDN: '', sim: iccid },
     },
   };
-  const preInqRes = await relayFetch(env, url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(preInqBody),
-  });
-  const preInqText = await preInqRes.text();
-  let preInqJson = {};
-  try { preInqJson = JSON.parse(preInqText); } catch {}
+  // A timeout or network error here happens before any swap, so no MDN was used:
+  // restore the claim stamp and throw a transport error so processBatch counts it
+  // toward the outage breaker and moves on to the next SIM.
+  let preInqRes, preInqText, preInqJson = {}, preInqNetworkError = null;
+  try {
+    preInqRes = await relayFetch(env, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(preInqBody),
+    });
+    preInqText = await preInqRes.text();
+    try { preInqJson = JSON.parse(preInqText); } catch {}
+  } catch (err) {
+    preInqNetworkError = err;
+    preInqText = String(err);
+  }
   const preInqR = preInqJson?.wholeSaleApi?.wholeSaleResponse;
   await logCarrierApiCall(env, {
     run_id: runId, step: 'pre_swap_inquiry', iccid, imei: null, vendor: 'atomic',
     request_url: url, request_method: 'POST', request_body: preInqBody,
-    response_status: preInqRes.status, response_ok: preInqRes.ok,
-    response_body_text: preInqText, response_body_json: preInqJson,
-    error: (preInqRes.ok && preInqR?.statusCode === '00') ? null :
-      `ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`,
+    response_status: preInqRes?.status ?? 0, response_ok: preInqRes?.ok ?? false,
+    response_body_text: preInqText || '', response_body_json: preInqJson,
+    error: preInqNetworkError ? `ATOMIC pre-swap inquiry network error: ${preInqNetworkError}`
+      : (preInqRes.ok && preInqR?.statusCode === '00') ? null
+      : `ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`,
   });
+  if (preInqNetworkError) {
+    await restoreRotationStamp();
+    throw new Error(`ATOMIC pre-swap inquiry network error: ${String(preInqNetworkError).slice(0, 300)}`);
+  }
   if (!preInqRes.ok || preInqR?.statusCode !== '00') {
     await restoreRotationStamp();
     throw new Error(`ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`);

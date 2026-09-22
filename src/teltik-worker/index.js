@@ -787,6 +787,7 @@ async function rotateTeltikSims(env) {
   console.log(`[Rotate] ${sims.length} active Teltik SIMs, ${due.length} due, ${retryList.length} eligible for in-window retry`);
 
   let rotated = 0, errors = 0, skipped = 0, retried = 0, retrySkipped = 0;
+  const failedAfterCarrier = [];
 
   // Bounded-concurrency pool + graceful time budget (speed-up approved
   // 2026-06-12). The old serial loop did ~6/min and was KILLED at the 15-min
@@ -829,6 +830,7 @@ async function rotateTeltikSims(env) {
           if (result.skipped) { if (isRetry) retrySkipped++; else skipped++; }
           else if (result.ok) { if (isRetry) retried++; else rotated++; }
           else errors++;
+          if (result.failed_after_carrier) failedAfterCarrier.push({ sim_id: result.sim_id, iccid: result.iccid });
           if (result.ok || result.skipped || !isTransportError(result.error)) {
             consecutiveTransportFails = 0;
           } else if (++consecutiveTransportFails >= BREAKER_THRESHOLD) {
@@ -872,6 +874,7 @@ async function rotateTeltikSims(env) {
     retry_skipped: retrySkipped,
     time_budget_hit: timedOut,
     breaker_tripped: breakerTripped,
+    failed_after_carrier: failedAfterCarrier,
     concurrency: lanes,
   };
 }
@@ -952,13 +955,27 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
       const rawOld = changeData.old_msisdn || '';
       const oldBare = rawOld ? String(rawOld).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
 
-      // Close the prior number window, open the new one.
-      await supabasePatch(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`, { valid_to: nowIso }).catch(() => {});
-      await supabaseInsert(env, 'sim_numbers', [{
-        sim_id: sim.id, e164: newE164, valid_from: nowIso, verification_status: 'verified',
-      }]).catch((e) => console.error(`[Rotate] SIM ${sim.iccid}: sim_numbers insert failed: ${e}`));
+      // Teltik has already changed the number, so every write below must land.
+      // A failed write is collected, not thrown: the carrier call is never
+      // retried, and increment_rotation_fail is skipped because a 'failed'
+      // rotation_status would put the SIM in the retry pass and burn another MDN.
+      const dbWriteFailures = [];
+      const checkWrite = async (label, write) => {
+        try {
+          const res = await write;
+          if (!res.ok) dbWriteFailures.push({ write: label, status: res.status, body: (await res.text().catch(() => '')).slice(0, 300) });
+        } catch (e) {
+          dbWriteFailures.push({ write: label, status: 0, body: String(e).slice(0, 300) });
+        }
+      };
 
-      await supabasePatch(env, `sims?id=eq.${sim.id}`, {
+      // Close the prior number window, open the new one.
+      await checkWrite('sim_numbers close', supabasePatch(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`, { valid_to: nowIso }));
+      await checkWrite('sim_numbers insert', supabaseInsert(env, 'sim_numbers', [{
+        sim_id: sim.id, e164: newE164, valid_from: nowIso, verification_status: 'verified',
+      }]));
+
+      await checkWrite('sims patch', supabasePatch(env, `sims?id=eq.${sim.id}`, {
         msisdn: newMdnBare,
         status: 'active',
         rotation_status: 'success',
@@ -966,13 +983,20 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
         last_rotation_error: null,
         rotation_fail_count: 0,
         rotation_hold_until: null, // night-migration hold satisfied once it rotates
-      });
+      }));
 
       // Reseller webhooks: old number offline, new number online.
       try {
         await sendTeltikSwapWebhooks(env, { ...sim, msisdn: oldBare }, sim.iccid, newE164, newMdnBare, nowIso);
       } catch (err) {
         console.error(`[Rotate] SIM ${sim.iccid}: reseller webhook err: ${err}`);
+      }
+
+      if (dbWriteFailures.length) {
+        const summary = dbWriteFailures.map(f => `${f.write} HTTP ${f.status}: ${f.body}`).join('; ');
+        console.error(`[Rotate] SIM ${sim.id} (${sim.iccid}): Teltik changed ${oldBare || '?'} → ${newMdnBare} but DB writes failed — ${summary}`);
+        await logRotationDbWriteFailure(env, sim, { oldBare, newMdnBare, requestId, failures: dbWriteFailures });
+        return { ok: false, iccid: sim.iccid, sim_id: sim.id, new_mdn: newE164, failed_after_carrier: true, error: `DB write failed after Teltik number change: ${summary}` };
       }
 
       console.log(`[Rotate] SIM ${sim.iccid}: rotated inline ${oldBare || '?'} → ${newMdnBare} (synchronous change-number response, requestId=${requestId})`);
@@ -1113,6 +1137,26 @@ async function supabasePatch(env, path, data) {
     headers: sbHeaders(env, { 'Content-Type': 'application/json', Prefer: 'return=minimal' }),
     body: JSON.stringify(data),
   });
+}
+
+// Teltik changed the number but the DB did not record it: the dashboard and
+// resellers still see the old number, so surface it to an operator.
+async function logRotationDbWriteFailure(env, sim, { oldBare, newMdnBare, requestId, failures }) {
+  try {
+    const res = await supabaseInsert(env, 'system_errors', [{
+      source: 'teltik-worker',
+      action: 'teltik_rotation_db_write_failed',
+      sim_id: sim.id,
+      iccid: sim.iccid,
+      error_message: `Teltik changed the number to ${newMdnBare} but ${failures.map(f => f.write).join(', ')} failed; the DB may still show ${oldBare || 'the old number'}`,
+      error_details: { old_msisdn: oldBare, new_msisdn: newMdnBare, request_id: requestId, failures },
+      severity: 'error',
+      status: 'open',
+    }]);
+    if (!res.ok) console.error(`[Rotate] SIM ${sim.id}: system_errors insert failed HTTP ${res.status}`);
+  } catch (e) {
+    console.error(`[Rotate] SIM ${sim.id}: system_errors insert failed: ${e}`);
+  }
 }
 
 async function logCarrierApiCall(env, logData) {
