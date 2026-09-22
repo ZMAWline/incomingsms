@@ -24,7 +24,7 @@ import { executeAction } from './actions.mjs';
 import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
 import { notifyPortOffline, notifyOfflineFleetSummary } from './notify.mjs';
 import {
-  runOfflineLifecycleTick, offlineLifecycleEnabled, offlineLifecycleDryRun,
+  runOfflineLifecycleTick, runOfflineProbeRun, offlineLifecycleEnabled, offlineLifecycleDryRun,
 } from './offline-lifecycle.mjs';
 import { teltikPortStatus, readVendorView, teltikGetInfo } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
@@ -83,6 +83,10 @@ const TICK_LOCK_TTL_S = 120;
 // already live; report processing and the lifecycle never touch each other.
 const LAST_OFFLINE_LIFECYCLE_TICK_KEY = 'bad_rental_remediator_last_offline_lifecycle_tick';
 const OFFLINE_LIFECYCLE_CRON = '0 * * * *';
+// Probe runs for the lifecycle, off the quarter-hour so they never share a
+// minute with the intake or decision ticks.
+const LAST_OFFLINE_PROBE_RUN_KEY = 'bad_rental_remediator_last_offline_probe_run';
+const OFFLINE_PROBE_CRON = '5,20,35,50 * * * *';
 // R5: KV flag written whenever a tick has to fall back to the pre-migration
 // next_review_at-free query/patch shape (schema drift — the 20260729 column
 // missing). Not sticky across ticks: each tick overwrites it with its own
@@ -225,14 +229,30 @@ export default {
     //                      (2h → */5 on 2026-06-12, → */15 on 2026-08-06.
     //                      Tick lock + claim CAS make any frequency safe;
     //                      idle ticks are one indexed query.)
-    //   - '0 * * * *'    → offline SIM lifecycle: probe reseller-assigned and
-    //                      already-offline lines, then pause/unassign on a
-    //                      confirmed outage and restore on recovery. Gated by
-    //                      OFFLINE_LIFECYCLE_ENABLED, which defaults to off.
+    //   - '0 * * * *'    → offline SIM lifecycle decisions: pause/unassign on
+    //                      a confirmed outage and restore on recovery.
+    //   - '5,20,35,50 * * * *' → offline SIM lifecycle probes: record fresh
+    //                      port-status checks for the stalest candidates.
+    //   Both lifecycle crons are gated by OFFLINE_LIFECYCLE_ENABLED, which
+    //   defaults to off.
     // event.cron is the literal expression the trigger fired on. Minute 0 of
     // every hour fires all three expressions; each gets its own branch and its
     // own KV summary, so they never share state.
     const cron = (event && event.cron) || '';
+    if (cron === OFFLINE_PROBE_CRON) {
+      const startedAt = Date.now();
+      ctx.waitUntil(runOfflineProbeRun(env).then(summary => (
+        recordLastTick(env, LAST_OFFLINE_PROBE_RUN_KEY, {
+          ...summary, completed_at: new Date().toISOString(), ms: Date.now() - startedAt,
+        })
+      )).catch(err => {
+        console.log('[Remediator] offline-probe error: ' + err);
+        return recordLastTick(env, LAST_OFFLINE_PROBE_RUN_KEY, {
+          completed_at: new Date().toISOString(), error: String(err), ms: Date.now() - startedAt,
+        });
+      }));
+      return;
+    }
     if (cron === OFFLINE_LIFECYCLE_CRON) {
       const startedAt = Date.now();
       ctx.waitUntil(runOfflineLifecycleTick(env).then(summary => (
@@ -561,10 +581,11 @@ async function recordLastTick(env, key, summary) {
 
 async function buildStatus(env) {
   const enabled = await killSwitchEnabled(env);
-  const [lastMain, lastVerify, lastOfflineLifecycle, openCounts, actionDisables, escalationBacklog] = await Promise.all([
+  const [lastMain, lastVerify, lastOfflineLifecycle, lastOfflineProbe, openCounts, actionDisables, escalationBacklog] = await Promise.all([
     readJsonKv(env, LAST_MAIN_TICK_KEY),
     readJsonKv(env, LAST_VERIFY_POLL_KEY),
     readJsonKv(env, LAST_OFFLINE_LIFECYCLE_TICK_KEY),
+    readJsonKv(env, LAST_OFFLINE_PROBE_RUN_KEY),
     fetchOpenCounts(env),
     listDisabledActions(env),
     fetchEscalationBacklog(env).catch(err => ({ error: String(err).slice(0, 200) })),
@@ -574,6 +595,7 @@ async function buildStatus(env) {
     last_main_tick: lastMain,
     last_verify_poll: lastVerify,
     last_offline_lifecycle_tick: lastOfflineLifecycle,
+    last_offline_probe_run: lastOfflineProbe,
     offline_lifecycle: {
       enabled: offlineLifecycleEnabled(env),
       dry_run: offlineLifecycleDryRun(env),
@@ -585,6 +607,7 @@ async function buildStatus(env) {
       main_cron: '*/15 * * * *',
       verify_poll_cron: '*/1 * * * *',
       offline_lifecycle_cron: OFFLINE_LIFECYCLE_CRON,
+      offline_probe_cron: OFFLINE_PROBE_CRON,
       intake_limit: INTAKE_LIMIT,
       scan_cap: SCAN_CAP,
       concurrency: CONCURRENCY,

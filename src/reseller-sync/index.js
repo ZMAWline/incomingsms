@@ -61,18 +61,26 @@ export default {
     // Offline SIM lifecycle (bad-rental-remediator hourly tick): the reseller's
     // rental on this line is being closed because the host port is down, so the
     // OLD number has to go offline before reseller_sims.active flips to false.
-    // Same guard as /resend-online; this worker owns webhook sending, so the
-    // remediator reaches it here instead of growing a second sender.
+    // This worker owns webhook sending, so the remediator reaches it here
+    // instead of growing a second sender. Sending number.offline makes the
+    // reseller close a rental, so this route requires FINALIZER_RUN_SECRET and
+    // does not accept the spoofable X-Internal-Caller header.
     if (url.pathname === "/send-offline" && request.method === 'POST') {
-      if (!internalOk) return new Response("Unauthorized", { status: 401 });
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
       let body;
       try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
       const simId = body && body.simId;
       const reason = body && body.reason;
+      const offlineSince = body && body.offlineSince;
       if (!simId || !Number.isFinite(Number(simId))) return json({ ok: false, error: 'simId required' }, 400);
       if (reason !== 'line_offline') return json({ ok: false, error: 'reason must be line_offline' }, 400);
+      if (!offlineSince || Number.isNaN(Date.parse(offlineSince))) {
+        return json({ ok: false, error: 'offlineSince (ISO timestamp) required' }, 400);
+      }
       try {
-        const result = await sendOfflineForSim(env, Number(simId), reason);
+        const result = await sendOfflineForSim(env, Number(simId), reason, offlineSince);
         const httpStatus = result.ok ? 200
                          : result.status === 404 ? 404
                          : result.status === 412 ? 412
@@ -412,9 +420,11 @@ async function resendOneSim(env, simId, source) {
 //
 // Dedup: generateMessageIdAsync hashes number.offline per calendar day over
 // (eventType, simId, iccid, number, from). `from` is the only free slot in that
-// tuple, so the reason rides there to keep a host-offline event from colliding
-// with the same day's rotation offline for the same MDN.
-async function sendOfflineForSim(env, simId, reason) {
+// tuple, so it carries the reason plus the start of the outage: the reason
+// keeps a host-offline event from colliding with the same day's rotation
+// offline, and offlineSince keeps a second outage on the same day from being
+// dropped as a duplicate of the first.
+async function sendOfflineForSim(env, simId, reason, offlineSince) {
   const rows = await sbGetArray(
     env,
     `sims?select=id,iccid,status,vendor,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))` +
@@ -451,7 +461,7 @@ async function sendOfflineForSim(env, simId, reason) {
       verified: true,
     },
   }, {
-    idComponents: { simId: sim.id, iccid: sim.iccid, number: currentNumber, from: reason },
+    idComponents: { simId: sim.id, iccid: sim.iccid, number: currentNumber, from: reason + ':' + offlineSince },
     resellerId,
     simId: sim.id,
     source: reason,

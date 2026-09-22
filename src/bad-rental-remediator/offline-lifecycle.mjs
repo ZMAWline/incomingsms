@@ -1,27 +1,31 @@
 // =========================================================
-// Offline SIM lifecycle executor (hourly cron branch).
+// Offline SIM lifecycle executor (probe cron + hourly decision cron).
 //
 // Decisions live in src/shared/offline-lifecycle.mjs (pure, unit-tested). This
 // file is the IO half: probe, read history, execute, record. It owns no policy
 // beyond ordering and budgets.
 //
-// One tick:
-//   1. Gate on OFFLINE_LIFECYCLE_ENABLED. Off (the default) means log and
-//      return, no query, no write, no carrier call.
-//   2. Collect candidates: SIMs on an active reseller assignment, plus SIMs
-//      already latched offline_state='offline'. Teltik-hosted and status=active
-//      only; port_in_pending lines are dropped.
-//   3. Probe a bounded slice of them through checkAndRecordTeltikHostPort, the
-//      same recorder every other port-status caller uses. A KV cursor advances
-//      each tick so the whole candidate set is covered over several hours
-//      instead of blowing the per-invocation subrequest budget in one go.
-//   4. Read the recent check history for every candidate and run the pure
-//      planners. Execute at most OFFLINE_LIFECYCLE_MAX_ACTIONS transitions.
+// Both runs gate on OFFLINE_LIFECYCLE_ENABLED. Off (the default) means log and
+// return, no query, no write, no carrier call.
 //
-// OFFLINE_LIFECYCLE_DRY_RUN short-circuits steps 3 and 4's writes: no probe (a
-// probe is a carrier call and a DB insert), no webhook, no rotation, no PATCH.
-// The planned actions go to the existing Slack digest instead, which is the
-// artifact to review before enabling writes in PROD.
+// Candidates: SIMs on an active reseller assignment, plus SIMs already latched
+// offline_state='offline'. Teltik-hosted and status=active only;
+// port_in_pending lines are dropped.
+//
+// Probe run (PROBE_CRON, 4x per hour): probe the candidates whose newest check
+// is oldest, through checkAndRecordTeltikHostPort, the same recorder every
+// other port-status caller uses. It is a separate invocation from the decision
+// tick because ~750 candidates cannot all be probed within 6h from an hourly
+// tick without passing the per-invocation subrequest budget.
+//
+// Decision tick (hourly): read the newest checks for every candidate and run
+// the pure planners. Execute at most OFFLINE_LIFECYCLE_MAX_ACTIONS transitions.
+//
+// OFFLINE_LIFECYCLE_DRY_RUN still probes (a probe only records a check row, the
+// same thing read-only dashboard queries do), so the digest reflects real
+// readings. The decision tick then makes no webhook send, no rotation and no
+// write to sims or reseller_sims; the planned actions go to the existing Slack
+// digest instead, which is the artifact to review before enabling writes.
 //
 // Reuse, not reimplementation, is the rule here:
 //   number.offline   -> RESELLER_SYNC /send-offline
@@ -35,23 +39,25 @@
 import { checkAndRecordTeltikHostPort } from '../shared/hosting-port-status.mjs';
 import {
   shouldConfirmOffline, shouldConfirmOnline, isLifecycleEligible,
-  planOfflineActions, planRecoveryActions,
-  OFFLINE_PAUSE_REASON, OFFLINE_WEBHOOK_REASON,
+  planOfflineActions, planRecoveryActions, offlineEpisodeStart,
+  OFFLINE_PAUSE_REASON, OFFLINE_WEBHOOK_REASON, CHECK_HISTORY_WINDOW_MS,
 } from '../shared/offline-lifecycle.mjs';
 import { notifyOfflineLifecyclePlan } from './notify.mjs';
 
 const CHECK_SOURCE = 'bad_rental_remediator';
-// KV cursor over the candidate list, so consecutive ticks probe different
-// slices instead of re-checking the head of the fleet forever.
-const PROBE_CURSOR_KEY = 'bad_rental_remediator_offline_lifecycle_cursor';
 // Per-SIM recovery cooldown. A line that flaps online/offline/online would
 // otherwise re-send number.online (or worse, force-rotate) every hour.
 const RECOVERY_COOLDOWN_KEY_PREFIX = 'bad_rental_remediator_offline_lifecycle_recovered:';
 const RECOVERY_COOLDOWN_S = 60 * 60;
-// Each probe costs ~4-6 subrequests (MDN resolve, port-status read, api-log
-// mirror, check insert). 100 keeps a tick well inside the ~1000 per-invocation
-// cap once the transition writes below are counted too.
-const DEFAULT_PROBE_LIMIT = 100;
+// Probe cadence. The probe cron fires 4 times an hour; each run probes
+// ceil(candidates / PROBE_RUNS_PER_CYCLE) of the stalest candidates, so every
+// candidate is visited within 20 runs (5h), inside the 6h freshness rule.
+export const PROBE_RUNS_PER_CYCLE = 20;
+// Subrequest ceiling per probe run. A probe costs about 5 subrequests (MDN
+// resolve, port-status read, api-log mirror, check insert) and up to 9 on the
+// wrong-MDN retry path. 50 x 9 = 450, plus 2 candidate queries and up to 4
+// history reads, stays under 500. 50 per run covers 1000 candidates per cycle.
+export const MAX_PROBES_PER_RUN = 50;
 const PROBE_CONCURRENCY = 5;
 // Real transitions per tick. Every one of these can reach a carrier or a
 // reseller, so the cap is the blast-radius control the flag protects.
@@ -59,11 +65,14 @@ const DEFAULT_MAX_ACTIONS = 25;
 // Candidate scan bound. Well above the current assigned-line count; exists so a
 // runaway query can never build an unbounded in-memory list.
 const CANDIDATE_CAP = 2000;
-// Stop probing (not deciding) once the tick has spent this long, so a slow
-// Teltik never starves the decision half of the tick.
+// SIMs per get_recent_hosting_port_checks call. The RPC returns one row per
+// SIM, so this keeps each response under the 1000-row PostgREST limit.
+const CHECK_BATCH = 500;
+// Stop a probe run once it has spent this long, so a slow Teltik cannot keep
+// the invocation open until the next run starts.
 const PROBE_BUDGET_MS = 60_000;
 // How much check history the planners get. Two rows decide an outage; a few
-// more make the ordering robust against a retry attempt landing out of order.
+// more let offlineEpisodeStart find the start of a longer outage.
 const CHECKS_PER_SIM = 6;
 const ROTATE_TIMEOUT_MS = 75_000;
 
@@ -100,6 +109,18 @@ async function sbGetArray(env, path) {
   return Array.isArray(rows) ? rows : [];
 }
 
+async function sbRpc(env, fn, args) {
+  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/' + fn, {
+    method: 'POST', headers: sbHeaders(env), body: JSON.stringify(args),
+  });
+  if (!resp.ok) {
+    console.log('[OfflineLifecycle] rpc ' + fn + ' failed HTTP ' + resp.status);
+    return [];
+  }
+  const rows = await resp.json().catch(() => null);
+  return Array.isArray(rows) ? rows : [];
+}
+
 async function sbPatch(env, path, body) {
   try {
     const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
@@ -118,9 +139,9 @@ async function sbPatch(env, path, body) {
 // gatewayHostOf() semantics in PostgREST: explicit teltik host, or no explicit
 // host and teltik vendor. Same predicate runHostingPortSweep uses.
 const TELTIK_HOST_FILTER = 'or=(gateway_host.eq.teltik,and(gateway_host.is.null,vendor.eq.teltik))';
-const SIM_SELECT = 'id,iccid,vendor,gateway_host,status,port_in_pending,offline_state,offline_since,'
-  + 'rotation_eligible,rotation_pause_reason,rotation_interval_hours,last_mdn_rotated_at,'
-  + 'sim_numbers(e164),reseller_sims(reseller_id,active,deactivated_reason)';
+const SIM_COLUMNS = 'id,iccid,vendor,gateway_host,status,port_in_pending,offline_state,offline_since,'
+  + 'rotation_eligible,rotation_pause_reason,rotation_interval_hours,last_mdn_rotated_at,sim_numbers(e164)';
+const ASSIGNMENT_COLUMNS = '(reseller_id,active,deactivated_reason)';
 
 // The assignment row the lifecycle cares about: the active one if there is one,
 // otherwise the one we closed ourselves (the restore target).
@@ -141,58 +162,60 @@ function shapeSim(sim) {
 
 // Assigned lines plus already-latched-offline lines, deduped by id. Two queries
 // because PostgREST cannot express "embedded reseller_sims.active=true OR a
-// column on the parent" in a single `or=`.
+// column on the parent" in a single `or=`. The assigned query uses !inner, so
+// the embed filter drops unassigned SIMs instead of only their embedded rows.
 async function fetchCandidates(env) {
   const [assigned, latched] = await Promise.all([
-    sbGetArray(env, 'sims?select=' + SIM_SELECT
+    sbGetArray(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims!inner' + ASSIGNMENT_COLUMNS
       + '&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true'
       + '&' + TELTIK_HOST_FILTER + '&order=id.asc&limit=' + CANDIDATE_CAP),
-    sbGetArray(env, 'sims?select=' + SIM_SELECT
+    sbGetArray(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims' + ASSIGNMENT_COLUMNS
       + '&status=eq.active&offline_state=eq.offline&sim_numbers.valid_to=is.null'
       + '&' + TELTIK_HOST_FILTER + '&order=id.asc&limit=' + CANDIDATE_CAP),
   ]);
   const byId = new Map();
-  // The assigned query filters the embedded reseller_sims rows down to the
-  // active one, so the latched query (unfiltered embed) wins on conflict: it is
-  // the only one that can carry a deactivated_reason.
+  // The assigned query's embed only holds the active row, so the latched query
+  // (unfiltered embed) wins on conflict: it is the only one that can carry a
+  // deactivated_reason.
   for (const sim of assigned) byId.set(sim.id, sim);
   for (const sim of latched) byId.set(sim.id, sim);
   return [...byId.values()].map(shapeSim).filter(isLifecycleEligible);
 }
 
-async function readCursor(env, total) {
-  if (!env.REMEDIATOR_KV || !total) return 0;
-  try {
-    const raw = await env.REMEDIATOR_KV.get(PROBE_CURSOR_KEY);
-    const n = parseInt(raw || '0', 10);
-    return Number.isFinite(n) && n > 0 ? n % total : 0;
-  } catch {
-    return 0;
+// Newest checks per SIM, newest-first, from get_recent_hosting_port_checks.
+// The RPC caps the history per SIM, so no SIM can starve the others.
+async function fetchChecks(env, simIds, at) {
+  const byId = new Map();
+  const since = new Date(at.getTime() - CHECK_HISTORY_WINDOW_MS).toISOString();
+  for (let i = 0; i < simIds.length; i += CHECK_BATCH) {
+    const rows = await sbRpc(env, 'get_recent_hosting_port_checks', {
+      p_sim_ids: simIds.slice(i, i + CHECK_BATCH), p_per_sim: CHECKS_PER_SIM, p_since: since,
+    });
+    for (const row of rows) byId.set(row.sim_id, Array.isArray(row.checks) ? row.checks : []);
   }
+  return byId;
 }
 
-async function writeCursor(env, value) {
-  if (!env.REMEDIATOR_KV) return;
-  try {
-    await env.REMEDIATOR_KV.put(PROBE_CURSOR_KEY, String(value));
-  } catch (err) {
-    console.log('[OfflineLifecycle] cursor write failed: ' + err);
-  }
+// Probes per run: enough to visit every candidate within PROBE_RUNS_PER_CYCLE
+// runs, capped by the subrequest budget.
+export function probeLimitFor(candidateCount) {
+  return Math.min(MAX_PROBES_PER_RUN, Math.ceil(candidateCount / PROBE_RUNS_PER_CYCLE));
 }
 
-// Probe `limit` candidates starting at the persisted cursor, wrapping around.
-async function probeSlice(env, candidates, limit, startedAt) {
-  const total = candidates.length;
-  const start = await readCursor(env, total);
-  const slice = [];
-  for (let i = 0; i < Math.min(limit, total); i++) slice.push(candidates[(start + i) % total]);
+// Epoch ms of a SIM's newest check, or -Infinity when it has none, so
+// never-probed SIMs sort first.
+function newestCheckMs(checks) {
+  const ts = checks && checks[0] ? Date.parse(checks[0].checked_at || '') : NaN;
+  return Number.isNaN(ts) ? -Infinity : ts;
+}
 
+async function probeSims(env, sims, startedAt) {
   let idx = 0;
   let probed = 0;
-  const workers = Array.from({ length: Math.min(PROBE_CONCURRENCY, slice.length || 1) }, async () => {
-    while (idx < slice.length) {
+  const workers = Array.from({ length: Math.min(PROBE_CONCURRENCY, sims.length || 1) }, async () => {
+    while (idx < sims.length) {
       if (Date.now() - startedAt > PROBE_BUDGET_MS) return;
-      const sim = slice[idx++];
+      const sim = sims[idx++];
       try {
         await checkAndRecordTeltikHostPort(env, {
           id: sim.id, iccid: sim.iccid, vendor: sim.vendor,
@@ -205,25 +228,44 @@ async function probeSlice(env, candidates, limit, startedAt) {
     }
   });
   await Promise.all(workers);
-  await writeCursor(env, total ? (start + slice.length) % total : 0);
-  return { probed, slice_size: slice.length, cursor_from: start };
+  return probed;
 }
 
-// Recent checks for the given SIMs, grouped newest-first per sim. One query, so
-// the decision half of the tick costs a single subrequest.
-async function fetchChecks(env, simIds) {
-  if (!simIds.length) return new Map();
-  const rows = await sbGetArray(env, 'hosting_port_status_checks?select=sim_id,state,checked_at'
-    + '&sim_id=in.(' + simIds.join(',') + ')'
-    + '&order=sim_id.asc,checked_at.desc'
-    + '&limit=' + (simIds.length * CHECKS_PER_SIM));
-  const byId = new Map();
-  for (const row of rows) {
-    const list = byId.get(row.sim_id) || [];
-    if (list.length < CHECKS_PER_SIM) list.push(row);
-    byId.set(row.sim_id, list);
+// One probe run: the stalest candidates first. Ordering by the newest recorded
+// check (from any source, not only this run) is what bounds every candidate's
+// check age, even as SIMs join or leave the candidate list between runs.
+// Runs in dry run too: recording a check row is not a lifecycle write.
+export async function runOfflineProbeRun(env, { now } = {}) {
+  const startedAt = Date.now();
+  const at = now instanceof Date ? now : new Date();
+  if (!offlineLifecycleEnabled(env)) {
+    console.log('[OfflineLifecycle] OFFLINE_LIFECYCLE_ENABLED is not true; skipping probe run.');
+    return { skipped: 'disabled', candidates: 0, probed: 0 };
   }
-  return byId;
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.log('[OfflineLifecycle] missing Supabase credentials; skipping probe run.');
+    return { skipped: 'missing_credentials', candidates: 0, probed: 0 };
+  }
+
+  const candidates = await fetchCandidates(env);
+  const checksBySim = await fetchChecks(env, candidates.map((s) => s.id), at);
+  const limit = probeLimitFor(candidates.length);
+  const stalest = candidates
+    .map((sim) => ({ sim, newest: newestCheckMs(checksBySim.get(sim.id)) }))
+    .sort((x, y) => x.newest - y.newest)
+    .slice(0, limit)
+    .map((x) => x.sim);
+  const probed = await probeSims(env, stalest, startedAt);
+
+  const summary = {
+    candidates: candidates.length, probe_limit: limit, probed,
+    // True when the candidate list outgrew what MAX_PROBES_PER_RUN can cover
+    // within the freshness window.
+    coverage_short: candidates.length > MAX_PROBES_PER_RUN * PROBE_RUNS_PER_CYCLE,
+    ms: Date.now() - startedAt,
+  };
+  console.log('[OfflineLifecycle] probe run ' + JSON.stringify(summary));
+  return summary;
 }
 
 async function recoveryCoolingDown(env, simId) {
@@ -247,10 +289,13 @@ async function markRecovered(env, simId) {
 
 // --- action executors -----------------------------------------------------
 
+// FINALIZER_RUN_SECRET is the hard credential reseller-sync checks; the header
+// only identifies the caller in its logs.
 async function callResellerSync(env, path, body) {
   if (!env.RESELLER_SYNC) return { ok: false, error: 'RESELLER_SYNC binding missing' };
+  const url = 'https://reseller-sync' + path + '?secret=' + encodeURIComponent(env.FINALIZER_RUN_SECRET || '');
   try {
-    const resp = await env.RESELLER_SYNC.fetch(new Request('https://reseller-sync' + path, {
+    const resp = await env.RESELLER_SYNC.fetch(new Request(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-internal-caller': 'reseller-portal' },
       body: JSON.stringify(body),
@@ -286,22 +331,34 @@ async function forceRotate(env, sim, target) {
   }
 }
 
-async function executeAction(env, sim, action, nowIso) {
+// Returns true (done), false (failed; the plan stops) or 'skipped' (nothing to
+// do; the plan continues).
+async function executeAction(env, sim, action, nowIso, ctx) {
   switch (action.type) {
     case 'pause_rotation':
       return sbPatch(env, 'sims?id=eq.' + sim.id,
         { rotation_eligible: false, rotation_pause_reason: OFFLINE_PAUSE_REASON });
-    case 'send_offline_webhook':
-      return (await callResellerSync(env, '/send-offline',
-        { simId: Number(sim.id), reason: OFFLINE_WEBHOOK_REASON })).ok;
+    case 'send_offline_webhook': {
+      const result = await callResellerSync(env, '/send-offline',
+        { simId: Number(sim.id), reason: OFFLINE_WEBHOOK_REASON, offlineSince: action.offline_since });
+      // 412: the reseller has no enabled webhook. There is no one to notify,
+      // and retrying every hour cannot change that, so the unassign proceeds.
+      if (result.status === 412) {
+        console.log('[OfflineLifecycle] sim=' + sim.id + ' reseller=' + action.reseller_id
+          + ' has no enabled webhook; number.offline skipped, unassigning anyway');
+        return 'skipped';
+      }
+      if (result.ok) ctx.notified = true;
+      return result.ok;
+    }
     case 'unassign_reseller':
       return sbPatch(env, 'reseller_sims?sim_id=eq.' + sim.id + '&active=eq.true',
         { active: false, deactivated_reason: OFFLINE_PAUSE_REASON, deactivated_at: nowIso });
     case 'latch_offline':
       return sbPatch(env, 'sims?id=eq.' + sim.id, {
         offline_state: 'offline',
-        offline_since: sim.offline_since || nowIso,
-        offline_notified_at: nowIso,
+        offline_since: action.offline_since || nowIso,
+        offline_notified_at: ctx.notified ? nowIso : null,
       });
     case 'restore_assignment':
       return sbPatch(env,
@@ -330,9 +387,11 @@ async function executeAction(env, sim, action, nowIso) {
 // reseller_sims.active=true.
 async function executePlan(env, sim, actions, nowIso) {
   const done = [];
+  const ctx = { notified: false };
   for (const action of actions) {
-    const ok = await executeAction(env, sim, action, nowIso);
-    done.push({ type: action.type, ok });
+    const result = await executeAction(env, sim, action, nowIso, ctx);
+    const ok = result === true || result === 'skipped';
+    done.push(result === 'skipped' ? { type: action.type, ok, skipped: true } : { type: action.type, ok });
     if (!ok) {
       console.log('[OfflineLifecycle] sim=' + sim.id + ' action ' + action.type + ' failed; stopping plan');
       break;
@@ -349,31 +408,22 @@ export async function runOfflineLifecycleTick(env, { now } = {}) {
 
   if (!offlineLifecycleEnabled(env)) {
     console.log('[OfflineLifecycle] OFFLINE_LIFECYCLE_ENABLED is not true; skipping tick.');
-    return { skipped: 'disabled', candidates: 0, probed: 0, offline: 0, recovered: 0 };
+    return { skipped: 'disabled', candidates: 0, offline: 0, recovered: 0 };
   }
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
     console.log('[OfflineLifecycle] missing Supabase credentials; skipping tick.');
-    return { skipped: 'missing_credentials', candidates: 0, probed: 0, offline: 0, recovered: 0 };
+    return { skipped: 'missing_credentials', candidates: 0, offline: 0, recovered: 0 };
   }
 
   const dryRun = offlineLifecycleDryRun(env);
-  const probeLimit = positiveInt(env.OFFLINE_LIFECYCLE_PROBE_LIMIT, DEFAULT_PROBE_LIMIT);
   const maxActions = positiveInt(env.OFFLINE_LIFECYCLE_MAX_ACTIONS, DEFAULT_MAX_ACTIONS);
 
   const candidates = await fetchCandidates(env);
-  let probe = { probed: 0, slice_size: 0, cursor_from: 0 };
-  if (!dryRun && candidates.length) {
-    probe = await probeSlice(env, candidates, probeLimit, startedAt);
-  }
-
-  const checksBySim = await fetchChecks(env, candidates.map((s) => s.id));
+  const checksBySim = await fetchChecks(env, candidates.map((s) => s.id), at);
   const nowIso = at.toISOString();
   const summary = {
     dry_run: dryRun,
     candidates: candidates.length,
-    probed: probe.probed,
-    probe_slice: probe.slice_size,
-    probe_cursor_from: probe.cursor_from,
     offline: 0,
     recovered: 0,
     cooling_down: 0,
@@ -391,7 +441,7 @@ export async function runOfflineLifecycleTick(env, { now } = {}) {
     let actions = null;
     if (!latched && shouldConfirmOffline(checks, at)) {
       kind = 'offline';
-      actions = planOfflineActions(sim, sim.assignment);
+      actions = planOfflineActions(sim, sim.assignment, offlineEpisodeStart(checks));
     } else if (latched && shouldConfirmOnline(checks, at)) {
       if (await recoveryCoolingDown(env, sim.id)) {
         summary.cooling_down++;
@@ -422,7 +472,7 @@ export async function runOfflineLifecycleTick(env, { now } = {}) {
 
   summary.ms = Date.now() - startedAt;
   console.log('[OfflineLifecycle] tick ' + JSON.stringify({
-    dry_run: summary.dry_run, candidates: summary.candidates, probed: summary.probed,
+    dry_run: summary.dry_run, candidates: summary.candidates,
     offline: summary.offline, recovered: summary.recovered, cooling_down: summary.cooling_down,
     capped: summary.capped, ms: summary.ms,
   }));

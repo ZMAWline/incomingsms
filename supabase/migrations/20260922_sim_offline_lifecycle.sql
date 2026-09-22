@@ -77,33 +77,41 @@ CREATE INDEX IF NOT EXISTS idx_reseller_sims_deactivated_reason
   WHERE deactivated_reason IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- get_teltik_recovered_lines(): the mirror of get_teltik_currently_offline
+-- get_recent_hosting_port_checks(): newest N checks per SIM, one row per SIM
 -- ---------------------------------------------------------------------------
--- Lines whose LATEST recorded check is 'online' but which are still latched
--- offline, i.e. exactly the recovery-transition candidates. Same DISTINCT ON
--- shape as get_teltik_currently_offline
--- (migrations/20260821_teltik_currently_offline.sql): the state filter lives on
--- the OUTER query, after the per-sim latest row is picked, because filtering
--- inside the DISTINCT ON would find "the most recent ONLINE check" even on a
--- line that has since gone down again.
+-- The lifecycle decides on the newest few checks of every candidate. A plain
+-- PostgREST read ordered by (sim_id, checked_at desc) returns each SIM's full
+-- history, so the first SIMs use up the row limit (1000 by default) and the
+-- rest are never decided. This caps the history per SIM in the database and
+-- folds it into one row per SIM, so a batch of 500 SIMs is at most 500 rows.
+--
+-- p_since bounds how far back the history goes. The caller passes a window
+-- wider than the 6h freshness rule, because only the NEWEST check has to be
+-- recent; the check before it may come from the previous probe cycle.
 
-DROP FUNCTION IF EXISTS get_teltik_recovered_lines();
+CREATE INDEX IF NOT EXISTS idx_hosting_port_status_checks_sim_checked_at
+  ON public.hosting_port_status_checks (sim_id, checked_at DESC);
 
-CREATE OR REPLACE FUNCTION get_teltik_recovered_lines()
-RETURNS TABLE (sim_id bigint, iccid text, mdn text, vendor text, last_checked_at timestamptz)
+DROP FUNCTION IF EXISTS get_recent_hosting_port_checks(bigint[], integer, timestamptz);
+
+CREATE OR REPLACE FUNCTION get_recent_hosting_port_checks(
+  p_sim_ids bigint[], p_per_sim integer, p_since timestamptz
+)
+RETURNS TABLE (sim_id bigint, checks jsonb)
 LANGUAGE sql STABLE AS $$
-  SELECT latest.sim_id, latest.iccid, latest.mdn, s.vendor, latest.checked_at
+  SELECT ranked.sim_id,
+         jsonb_agg(jsonb_build_object('state', ranked.state, 'checked_at', ranked.checked_at)
+                   ORDER BY ranked.checked_at DESC)
   FROM (
-    SELECT DISTINCT ON (c.sim_id) c.sim_id, c.iccid, c.mdn, c.state, c.checked_at
+    SELECT c.sim_id, c.state, c.checked_at,
+           row_number() OVER (PARTITION BY c.sim_id ORDER BY c.checked_at DESC) AS rn
     FROM hosting_port_status_checks c
-    WHERE c.sim_id IS NOT NULL
-    ORDER BY c.sim_id, c.checked_at DESC
-  ) latest
-  JOIN sims s ON s.id = latest.sim_id
-  WHERE latest.state = 'online'
-    AND s.status = 'active'
-    AND s.offline_state = 'offline'
+    WHERE c.sim_id = ANY (p_sim_ids)
+      AND c.checked_at >= p_since
+  ) ranked
+  WHERE ranked.rn <= p_per_sim
+  GROUP BY ranked.sim_id
 $$;
 
-REVOKE ALL ON FUNCTION public.get_teltik_recovered_lines() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.get_teltik_recovered_lines() TO service_role;
+REVOKE ALL ON FUNCTION public.get_recent_hosting_port_checks(bigint[], integer, timestamptz) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_recent_hosting_port_checks(bigint[], integer, timestamptz) TO service_role;

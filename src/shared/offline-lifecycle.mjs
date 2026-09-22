@@ -21,7 +21,8 @@
 //      rotation_fail_count for nothing.
 //   2. rotation_eligible is only resumed when WE paused it
 //      (rotation_pause_reason='host_offline'). NULL means an operator paused
-//      the line and recovery must leave it alone.
+//      the line and recovery must leave it alone: no resume and no forced
+//      rotation, only the restore and a re-sent number.online.
 // =========================================================
 
 // Written to sims.rotation_pause_reason and reseller_sims.deactivated_reason
@@ -35,10 +36,15 @@ export const OFFLINE_WEBHOOK_REASON = 'line_offline';
 // is a line. Combined with the offline_state latch this is the whole
 // anti-flapping story on the way down.
 export const MIN_CONSECUTIVE_OFFLINE_CHECKS = 2;
-// A check older than this is history, not a reading. Without the bound, a tick
-// that resumes after the prober was down for a day would act on yesterday's
-// state; with it, the tick waits for fresh checks instead.
+// The NEWEST check must be younger than this to count as a reading. Without the
+// bound, a tick that resumes after the prober was down for a day would act on
+// yesterday's state. Only the newest check is held to it: the prober visits
+// each candidate about every 5h, so the check before the newest one is usually
+// from the previous cycle and may be older than 6h.
 export const CHECK_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+// How far back the executor reads history. Wide enough to reach the previous
+// probe cycle's check; the freshness rule above still applies to the newest.
+export const CHECK_HISTORY_WINDOW_MS = 24 * 60 * 60 * 1000;
 // Teltik lines rotate on a per-SIM interval; this mirrors the default used by
 // rotateTeltikSims and isTeltikDue (src/shared/rotation-baseline.mjs).
 export const DEFAULT_TELTIK_INTERVAL_HOURS = 48;
@@ -70,7 +76,8 @@ function nowMs(now) {
 }
 
 // A confirmed outage: the two newest checks both say offline, and the newest
-// one is recent enough to be a reading. 'error' and 'unknown' never count as
+// one is recent enough to be a reading. The older one is not held to
+// CHECK_MAX_AGE_MS (see above). 'error' and 'unknown' never count as
 // offline (normalizeHostPortState guarantees a read failure is 'error'), so a
 // Teltik API outage can never mass-unassign the fleet.
 export function shouldConfirmOffline(checks, now) {
@@ -89,6 +96,20 @@ export function shouldConfirmOnline(checks, now) {
   if (!ordered.length) return false;
   if (!isFresh(ordered[0], now)) return false;
   return ordered[0].state === 'online';
+}
+
+// Start of the current offline run: checked_at of the oldest check in the
+// unbroken run of 'offline' checks at the head of the history. It identifies
+// the outage episode, so it is stable across ticks that retry the same outage
+// and differs between two outages on the same day. Null if the newest check is
+// not offline.
+export function offlineEpisodeStart(checks) {
+  let start = null;
+  for (const c of newestFirst(checks)) {
+    if (c.state !== 'offline' || Number.isNaN(c._ts)) break;
+    start = new Date(c._ts).toISOString();
+  }
+  return start;
 }
 
 // YYYY-MM-DD in America/New_York, DST-aware. Same Intl approach as
@@ -142,7 +163,9 @@ function isRestorable(assignment) {
 // unassign because the webhook senders resolve the reseller through
 // reseller_sims.active=true and early-return once the row is inactive.
 // A never-assigned SIM gets the rotation pause and the latch only.
-export function planOfflineActions(sim, assignment) {
+// offlineSince (offlineEpisodeStart) keys the webhook dedup id and becomes
+// sims.offline_since.
+export function planOfflineActions(sim, assignment, offlineSince) {
   const actions = [];
   if (sim && sim.rotation_eligible !== false) {
     actions.push({ type: 'pause_rotation', reason: OFFLINE_PAUSE_REASON });
@@ -152,10 +175,11 @@ export function planOfflineActions(sim, assignment) {
       type: 'send_offline_webhook',
       reason: OFFLINE_WEBHOOK_REASON,
       reseller_id: assignment.reseller_id,
+      offline_since: offlineSince,
     });
     actions.push({ type: 'unassign_reseller', reason: OFFLINE_PAUSE_REASON, reseller_id: assignment.reseller_id });
   }
-  actions.push({ type: 'latch_offline' });
+  actions.push({ type: 'latch_offline', offline_since: offlineSince });
   return actions;
 }
 
@@ -171,10 +195,14 @@ export function planRecoveryActions(sim, assignment, now) {
   if (sim && sim.rotation_pause_reason === OFFLINE_PAUSE_REASON) {
     actions.push({ type: 'resume_rotation' });
   }
+  // Anything other than our own pause reason (NULL included) means an operator
+  // owns the rotation state, so recovery must not rotate the line either.
+  const operatorOwnsRotation = !sim || sim.rotation_pause_reason !== OFFLINE_PAUSE_REASON;
   if (restorable || isAssigned(assignment)) {
-    if (insideRotationWindow(sim, now)) {
+    if (operatorOwnsRotation || insideRotationWindow(sim, now)) {
       // Same number, no carrier write: the reseller's current rental reopens
-      // on the existing sim_number_id and normal cadence rotates it later.
+      // on the existing sim_number_id and normal cadence (or the operator)
+      // rotates it later.
       actions.push({ type: 'resend_online', reseller_id: (assignment && assignment.reseller_id) || null });
     } else {
       actions.push({
