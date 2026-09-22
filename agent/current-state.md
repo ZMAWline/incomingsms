@@ -32,9 +32,15 @@ atomic/helix = same America/New_York calendar day as now. Inside the window we
 NEVER call change-number: for Teltik the carrier rejects it inside 48h
 (`status=FAILED`) and the rejection increments `rotation_fail_count`.
 
-**Where it runs.** `bad-rental-remediator`, new hourly cron `0 * * * *`, own
-branch in `scheduled()`, own KV summary key
-(`bad_rental_remediator_last_offline_lifecycle_tick`, surfaced in `/status`).
+**Where it runs.** `bad-rental-remediator`, two new crons with their own
+branches in `scheduled()` and KV summary keys (both surfaced in `/status`):
+hourly `0 * * * *` decides and acts
+(`bad_rental_remediator_last_offline_lifecycle_tick`); `5,20,35,50 * * * *`
+probes the stalest candidates (`bad_rental_remediator_last_offline_probe_run`).
+Each probe run probes `min(50, ceil(candidates / 20))` SIMs, so every candidate
+gets a fresh check within 5h, inside the 6h freshness rule; worst case is about
+456 subrequests per probe run and about 107 per decision tick. Candidates are
+SIMs with `reseller_sims.active=true` plus SIMs latched `offline_state='offline'`.
 Manual trigger: `POST /offline-lifecycle/run?secret=$ADMIN_RUN_SECRET`.
 Decisions are pure in `src/shared/offline-lifecycle.mjs`; IO is in
 `src/bad-rental-remediator/offline-lifecycle.mjs`.
@@ -44,17 +50,22 @@ Decisions are pure in `src/shared/offline-lifecycle.mjs`; IO is in
 | Var | Default | Meaning |
 |---|---|---|
 | `OFFLINE_LIFECYCLE_ENABLED` | unset (off) | `"true"` arms the tick. Anything else makes the hourly tick log one line and return. |
-| `OFFLINE_LIFECYCLE_DRY_RUN` | unset | `"true"` decides but writes nothing: no probe, no webhook, no rotation, no PATCH. Posts the intended-action list to `SLACK_WEBHOOK_URL`. |
-| `OFFLINE_LIFECYCLE_PROBE_LIMIT` | 100 | port-status probes per tick. A KV cursor advances each tick so the candidate set is covered over several hours. |
+| `OFFLINE_LIFECYCLE_DRY_RUN` | unset | `"true"` still probes (records check rows), but makes no webhook send, no rotation and no write to `sims` or `reseller_sims`. Posts the intended-action list to `SLACK_WEBHOOK_URL`. |
 | `OFFLINE_LIFECYCLE_MAX_ACTIONS` | 25 | real transitions per tick: the blast-radius cap. |
+
+**New secret on `bad-rental-remediator`:** `FINALIZER_RUN_SECRET` (same value
+as reseller-sync's). Set it before enabling, or `/send-offline` returns 401.
 
 **New bindings on `bad-rental-remediator`:** `TELTIK_WORKER`, `MDN_ROTATOR`
 (both `-test` in `[env.test]`). Both force-rotate through each worker's existing
 `/rotate-sim?iccid=...&force=true` route with the shared `ADMIN_RUN_SECRET`,
 the same pattern `details-finalizer#forceRotateSim` already uses. No new rotate
 endpoint was added. `reseller-sync` DID gain one new internal route,
-`POST /send-offline` (same `internalOk` guard as `/resend-online`), because it
-owns webhook sending and had no offline sender a service binding could reach.
+`POST /send-offline`, which requires `?secret=$FINALIZER_RUN_SECRET` (the
+`X-Internal-Caller` header alone is rejected), because it owns webhook sending
+and had no offline sender a service binding could reach. Its dedup id includes
+the outage start, so a second outage on the same day is still sent. A reseller
+with no enabled webhook (412) is logged and the unassign continues.
 
 **New DB state** (`supabase/migrations/20260922_sim_offline_lifecycle.sql`,
 NOT yet applied to TEST or PROD):
@@ -62,8 +73,9 @@ NOT yet applied to TEST or PROD):
 `sims.offline_since`, `sims.offline_notified_at`, `sims.rotation_pause_reason`
 (`'host_offline'` only when the lifecycle paused rotation; NULL means an
 operator did and recovery must not touch it), `reseller_sims.deactivated_reason`
-/ `deactivated_at`, and `get_teltik_recovered_lines()` (the mirror of
-`get_teltik_currently_offline`). `claim_rotation_slot` still does not exist in
+/ `deactivated_at`, and `get_recent_hosting_port_checks(sim_ids, per_sim,
+since)` (newest N checks per SIM, one row per SIM, so no SIM starves the
+1000-row PostgREST limit). `claim_rotation_slot` still does not exist in
 TEST; apply it there too or the force-rotate leg cannot be exercised.
 
 **Safety rails:** default-off flag, dry run, per-tick action cap, 2-check

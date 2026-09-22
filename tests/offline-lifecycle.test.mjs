@@ -18,10 +18,13 @@ import { fileURLToPath } from 'node:url';
 
 import {
   shouldConfirmOffline, shouldConfirmOnline, insideRotationWindow,
-  isLifecycleEligible, planOfflineActions, planRecoveryActions,
-  OFFLINE_PAUSE_REASON, OFFLINE_WEBHOOK_REASON, CHECK_MAX_AGE_MS,
+  isLifecycleEligible, planOfflineActions, planRecoveryActions, offlineEpisodeStart,
+  OFFLINE_PAUSE_REASON, OFFLINE_WEBHOOK_REASON, CHECK_MAX_AGE_MS, CHECK_HISTORY_WINDOW_MS,
 } from '../src/shared/offline-lifecycle.mjs';
-import { runOfflineLifecycleTick } from '../src/bad-rental-remediator/offline-lifecycle.mjs';
+import {
+  runOfflineLifecycleTick, runOfflineProbeRun, probeLimitFor,
+  MAX_PROBES_PER_RUN, PROBE_RUNS_PER_CYCLE,
+} from '../src/bad-rental-remediator/offline-lifecycle.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = (...p) => fs.readFileSync(path.join(__dirname, '..', ...p), 'utf8');
@@ -57,6 +60,29 @@ test('confirmation ignores stale history', () => {
   const stale = CHECK_MAX_AGE_MS + 60_000;
   assert.equal(shouldConfirmOffline([check('offline', stale), check('offline', stale + 1000)], NOW), false);
   assert.equal(shouldConfirmOnline([check('online', stale)], NOW), false);
+});
+
+test('only the newest check must be fresh; the prior one may be older', () => {
+  // The prober visits each candidate about every 5h, so the check before the
+  // newest one usually comes from the previous cycle.
+  const older = CHECK_MAX_AGE_MS + 3600_000;
+  assert.equal(shouldConfirmOffline([check('offline', 0), check('offline', older)], NOW), true);
+  assert.equal(shouldConfirmOffline([check('offline', CHECK_MAX_AGE_MS + 1000), check('offline', older)], NOW), false);
+  // The history window reaches back past the freshness rule, so the older
+  // check is actually returned by the executor's read.
+  assert.ok(CHECK_HISTORY_WINDOW_MS > CHECK_MAX_AGE_MS + 5 * 3600_000);
+});
+
+test('offlineEpisodeStart is the oldest check of the current offline run', () => {
+  const first = [check('offline', 0), check('offline', 3600_000), check('online', 7200_000)];
+  assert.equal(offlineEpisodeStart(first), iso(3600_000));
+  // A second outage later the same day starts at a different check, so its
+  // number.offline dedup id differs from the first outage's.
+  const second = [check('offline', 0), check('offline', 1800_000), check('online', 2700_000),
+    check('offline', 3600_000)];
+  assert.equal(offlineEpisodeStart(second), iso(1800_000));
+  assert.notEqual(offlineEpisodeStart(first), offlineEpisodeStart(second));
+  assert.equal(offlineEpisodeStart([check('online', 0)]), null);
 });
 
 test('shouldConfirmOffline sorts by checked_at, not array order', () => {
@@ -120,8 +146,11 @@ test('planOfflineActions sends the offline webhook BEFORE the unassign', () => {
   const sim = { id: 1, vendor: 'teltik', rotation_eligible: true };
   const types = planOfflineActions(sim, assigned).map((a) => a.type);
   assert.deepEqual(types, ['pause_rotation', 'send_offline_webhook', 'unassign_reseller', 'latch_offline']);
-  const webhook = planOfflineActions(sim, assigned).find((a) => a.type === 'send_offline_webhook');
+  const plan = planOfflineActions(sim, assigned, iso(3600_000));
+  const webhook = plan.find((a) => a.type === 'send_offline_webhook');
   assert.equal(webhook.reason, OFFLINE_WEBHOOK_REASON);
+  assert.equal(webhook.offline_since, iso(3600_000));
+  assert.equal(plan.find((a) => a.type === 'latch_offline').offline_since, iso(3600_000));
 });
 
 test('planOfflineActions on a never-assigned SIM only pauses and latches', () => {
@@ -183,6 +212,20 @@ test('recovery leaves an operator-paused rotation alone', () => {
   assert.deepEqual(types, ['restore_assignment', 'resend_online', 'latch_online']);
 });
 
+test('recovery never force-rotates a line an operator paused, even in a new window', () => {
+  // rotation_pause_reason NULL on a latched line: the operator had already
+  // paused rotation before the outage, so pause_rotation never ran.
+  const sim = {
+    id: 1, vendor: 'teltik', rotation_interval_hours: 48, rotation_eligible: false,
+    rotation_pause_reason: null, last_mdn_rotated_at: iso(60 * 3600_000),
+  };
+  assert.deepEqual(planRecoveryActions(sim, closedByUs, NOW).map((a) => a.type),
+    ['restore_assignment', 'resend_online', 'latch_online']);
+  const atomic = { id: 2, vendor: 'atomic', rotation_pause_reason: null, last_mdn_rotated_at: '2026-09-20T20:00:00Z' };
+  assert.deepEqual(planRecoveryActions(atomic, closedByUs, NOW).map((a) => a.type),
+    ['restore_assignment', 'resend_online', 'latch_online']);
+});
+
 test('recovery of a never-assigned SIM only clears the latch', () => {
   const sim = { id: 1, vendor: 'teltik', rotation_pause_reason: null, last_mdn_rotated_at: iso(10 * 3600_000) };
   assert.deepEqual(planRecoveryActions(sim, null, NOW).map((a) => a.type), ['latch_online']);
@@ -196,23 +239,29 @@ test('recovery ignores an assignment an operator closed for another reason', () 
 
 // --- executor harness -----------------------------------------------------
 
-function makeHarness({ sims, checks, dryRun = false, enabled = true }) {
+function makeHarness({ sims, checks, dryRun = false, enabled = true, resellerSync = null }) {
   const calls = [];
+  const syncRequests = [];
+  const patches = [];
+  const rpcCalls = [];
   const kv = new Map();
   const env = {
     SUPABASE_URL: 'https://sb.test',
     SUPABASE_SERVICE_ROLE_KEY: 'srv',
     ADMIN_RUN_SECRET: 'sek',
+    FINALIZER_RUN_SECRET: 'fin',
     OFFLINE_LIFECYCLE_ENABLED: enabled ? 'true' : undefined,
     OFFLINE_LIFECYCLE_DRY_RUN: dryRun ? 'true' : undefined,
-    OFFLINE_LIFECYCLE_PROBE_LIMIT: '1',
     REMEDIATOR_KV: {
       get: async (k) => (kv.has(k) ? kv.get(k) : null),
       put: async (k, v) => { kv.set(k, v); },
     },
     RESELLER_SYNC: {
       fetch: async (req) => {
-        calls.push('RESELLER_SYNC ' + new URL(req.url).pathname);
+        const u = new URL(req.url);
+        calls.push('RESELLER_SYNC ' + u.pathname);
+        syncRequests.push({ path: u.pathname, secret: u.searchParams.get('secret'), body: await req.json() });
+        if (resellerSync) return resellerSync(u.pathname);
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
       },
     },
@@ -237,19 +286,34 @@ function makeHarness({ sims, checks, dryRun = false, enabled = true }) {
     calls.push(method + ' ' + table);
     if (method === 'GET' && table === 'sims') {
       // The latched query carries offline_state=eq.offline; the assigned query
-      // does not. Mirror PostgREST closely enough for the merge to be exercised.
+      // must use an inner embed so unassigned SIMs are dropped, not returned
+      // with an empty reseller_sims list.
       const latched = u.includes('offline_state=eq.offline');
+      if (!latched && !u.includes('reseller_sims!inner')) return new Response(JSON.stringify(sims), { status: 200 });
       const rows = sims.filter((s) => (latched ? s.offline_state === 'offline'
         : (s.reseller_sims || []).some((r) => r.active === true)));
       return new Response(JSON.stringify(rows), { status: 200 });
     }
-    if (method === 'GET' && table === 'hosting_port_status_checks') {
-      return new Response(JSON.stringify(checks), { status: 200 });
+    if (method === 'POST' && u.includes('/rest/v1/rpc/get_recent_hosting_port_checks')) {
+      // Mirror the SQL: newest p_per_sim checks per SIM since p_since, one row
+      // per SIM.
+      const args = JSON.parse(init.body);
+      rpcCalls.push(args);
+      const out = [];
+      for (const id of args.p_sim_ids) {
+        const list = checks.filter((c) => c.sim_id === id && c.checked_at >= args.p_since)
+          .sort((a, b) => b.checked_at.localeCompare(a.checked_at))
+          .slice(0, args.p_per_sim)
+          .map(({ state, checked_at }) => ({ state, checked_at }));
+        if (list.length) out.push({ sim_id: id, checks: list });
+      }
+      return new Response(JSON.stringify(out), { status: 200 });
     }
+    if (method === 'PATCH') patches.push({ table, url: u, body: JSON.parse(init.body) });
     return new Response('[]', { status: 200 });
   };
 
-  return { env, calls, fakeFetch };
+  return { env, calls, syncRequests, patches, rpcCalls, fakeFetch };
 }
 
 async function withFetch(fakeFetch, fn) {
@@ -287,11 +351,81 @@ test('dry run plans the offline transition but writes nothing', async () => {
   const summary = await withFetch(h.fakeFetch, () => runOfflineLifecycleTick(h.env, { now: NOW }));
   assert.equal(summary.dry_run, true);
   assert.equal(summary.offline, 1);
-  assert.equal(summary.probed, 0, 'a probe is a carrier call; dry run must not make one');
   assert.deepEqual(summary.plans[0].actions,
     ['pause_rotation', 'send_offline_webhook', 'unassign_reseller', 'latch_offline']);
-  assert.ok(h.calls.every((c) => c.startsWith('GET ')), 'dry run made a write: ' + h.calls.join(', '));
-  assert.ok(!h.calls.some((c) => c.startsWith('RESELLER_SYNC') || c.startsWith('TELTIK_WORKER')));
+  // Reads only: the two candidate GETs and the history RPC.
+  assert.ok(h.calls.every((c) => c.startsWith('GET ') || c === 'POST rpc'), 'dry run made a write: ' + h.calls.join(', '));
+  assert.equal(h.patches.length, 0);
+  assert.ok(!h.calls.some((c) => /RESELLER_SYNC|TELTIK_WORKER|MDN_ROTATOR/.test(c)));
+});
+
+test('dry run still probes, so the digest reflects real readings', async () => {
+  const h = makeHarness({ sims: [OFFLINE_SIM], checks: [], dryRun: true });
+  const summary = await withFetch(h.fakeFetch, () => runOfflineProbeRun(h.env, { now: NOW }));
+  assert.equal(summary.probed, 1);
+  assert.ok(h.calls.includes('POST hosting_port_status_checks'), 'the probe must record a check row');
+  assert.equal(h.patches.length, 0, 'a probe never writes sims or reseller_sims');
+  assert.ok(!h.calls.some((c) => /RESELLER_SYNC|TELTIK_WORKER|MDN_ROTATOR/.test(c)));
+});
+
+test('the probe run is a no-op when OFFLINE_LIFECYCLE_ENABLED is unset', async () => {
+  const h = makeHarness({ sims: [OFFLINE_SIM], checks: [], enabled: false });
+  const summary = await withFetch(h.fakeFetch, () => runOfflineProbeRun(h.env, { now: NOW }));
+  assert.equal(summary.skipped, 'disabled');
+  assert.deepEqual(h.calls, []);
+});
+
+test('the probe run visits the stalest candidates first', async () => {
+  const sims = [1, 2, 3, 4].map((id) => ({ ...OFFLINE_SIM, id, iccid: '890' + id }));
+  const checks = [
+    { sim_id: 1, ...check('online', 60_000) },
+    { sim_id: 2, ...check('online', 4 * 3600_000) },
+    // sim 3 has never been checked.
+    { sim_id: 4, ...check('online', 2 * 3600_000) },
+  ];
+  const h = makeHarness({ sims, checks });
+  const probedIds = [];
+  const fetchSpy = async (url, init) => {
+    if (String(url).includes('/hosting_port_status_checks') && init && init.method === 'POST') {
+      probedIds.push(JSON.parse(init.body).sim_id);
+    }
+    return h.fakeFetch(url, init);
+  };
+  // 4 candidates -> ceil(4 / 20) = 1 probe per run.
+  const summary = await withFetch(fetchSpy, () => runOfflineProbeRun(h.env, { now: NOW }));
+  assert.equal(summary.probe_limit, 1);
+  assert.deepEqual(probedIds, [3]);
+});
+
+test('every candidate is probed within 6h without passing ~500 subrequests', () => {
+  // Probe cron: 4 runs an hour. PROBE_RUNS_PER_CYCLE runs must fit in 6h.
+  assert.ok(PROBE_RUNS_PER_CYCLE / 4 < CHECK_MAX_AGE_MS / 3600_000);
+  for (const n of [1, 100, 750, 1000]) {
+    const limit = probeLimitFor(n);
+    assert.ok(Math.ceil(n / limit) <= PROBE_RUNS_PER_CYCLE, 'n=' + n + ' needs more than one cycle');
+  }
+  assert.equal(probeLimitFor(750), 38);
+  assert.equal(probeLimitFor(5000), MAX_PROBES_PER_RUN);
+  // Worst case per probe run: 9 subrequests per probe (wrong-MDN retry path),
+  // 2 candidate queries, and ceil(2000 / 500) history reads.
+  assert.ok(MAX_PROBES_PER_RUN * 9 + 2 + 4 < 500);
+});
+
+test('the history read goes through the per-SIM capped RPC in batches', async () => {
+  const sims = Array.from({ length: 600 }, (_, i) => ({ ...OFFLINE_SIM, id: 1000 + i }));
+  const h = makeHarness({ sims, checks: [] });
+  await withFetch(h.fakeFetch, () => runOfflineLifecycleTick(h.env, { now: NOW }));
+  assert.equal(h.rpcCalls.length, 2, '600 SIMs must be read in two batches of at most 500');
+  assert.ok(h.rpcCalls.every((a) => a.p_sim_ids.length <= 500 && a.p_per_sim === 6));
+  assert.equal(h.rpcCalls[0].p_since, new Date(NOW.getTime() - CHECK_HISTORY_WINDOW_MS).toISOString());
+  assert.ok(!h.calls.includes('GET hosting_port_status_checks'), 'no unbounded history read');
+});
+
+test('unassigned SIMs are not candidates', async () => {
+  const unassigned = { ...OFFLINE_SIM, id: 12, reseller_sims: [] };
+  const h = makeHarness({ sims: [OFFLINE_SIM, unassigned], checks: [] });
+  const summary = await withFetch(h.fakeFetch, () => runOfflineLifecycleTick(h.env, { now: NOW }));
+  assert.equal(summary.candidates, 1);
 });
 
 test('a live offline transition notifies the reseller before unassigning', async () => {
@@ -308,6 +442,58 @@ test('a live offline transition notifies the reseller before unassigning', async
   const unassign = h.calls.indexOf('PATCH reseller_sims');
   assert.ok(sendOffline >= 0 && unassign >= 0);
   assert.ok(sendOffline < unassign, 'number.offline must precede the unassign');
+  // The shared secret rides on every reseller-sync call, and the outage start
+  // (the oldest offline check) keys the dedup id and becomes offline_since.
+  const req = h.syncRequests.find((r) => r.path === '/send-offline');
+  assert.equal(req.secret, 'fin');
+  assert.equal(req.body.offlineSince, iso(3600_000));
+  const latch = h.patches.find((p) => p.table === 'sims' && p.body.offline_state === 'offline');
+  assert.equal(latch.body.offline_since, iso(3600_000));
+  assert.equal(latch.body.offline_notified_at, NOW.toISOString());
+});
+
+test('a reseller with no webhook is still unassigned and latched, without retries', async () => {
+  const h = makeHarness({
+    sims: [OFFLINE_SIM],
+    checks: [{ sim_id: 11, ...check('offline', 0) }, { sim_id: 11, ...check('offline', 3600_000) }],
+    resellerSync: () => new Response(JSON.stringify({ ok: false, status: 412 }), { status: 412 }),
+  });
+  const summary = await withFetch(h.fakeFetch, () => runOfflineLifecycleTick(h.env, { now: NOW }));
+  const results = summary.plans[0].results;
+  assert.deepEqual(results.map((r) => r.type),
+    ['pause_rotation', 'send_offline_webhook', 'unassign_reseller', 'latch_offline']);
+  assert.ok(results.every((r) => r.ok));
+  assert.equal(results[1].skipped, true);
+  assert.ok(h.patches.some((p) => p.table === 'reseller_sims' && p.body.active === false));
+  const latch = h.patches.find((p) => p.table === 'sims' && p.body.offline_state === 'offline');
+  assert.ok(latch, 'the latch must be set so the next tick does not retry');
+  assert.equal(latch.body.offline_notified_at, null, 'nobody was notified');
+});
+
+test('a non-412 /send-offline failure still stops the plan before the unassign', async () => {
+  const h = makeHarness({
+    sims: [OFFLINE_SIM],
+    checks: [{ sim_id: 11, ...check('offline', 0) }, { sim_id: 11, ...check('offline', 3600_000) }],
+    resellerSync: () => new Response(JSON.stringify({ ok: false }), { status: 500 }),
+  });
+  const summary = await withFetch(h.fakeFetch, () => runOfflineLifecycleTick(h.env, { now: NOW }));
+  assert.deepEqual(summary.plans[0].results.map((r) => r.type), ['pause_rotation', 'send_offline_webhook']);
+  assert.ok(!h.patches.some((p) => p.table === 'reseller_sims'));
+});
+
+test('recovery of an operator-paused line re-sends online and never rotates or resumes', async () => {
+  const sim = {
+    ...OFFLINE_SIM, offline_state: 'offline', rotation_eligible: false,
+    rotation_pause_reason: null,
+    last_mdn_rotated_at: iso(60 * 3600_000),
+    reseller_sims: [{ reseller_id: 7, active: false, deactivated_reason: OFFLINE_PAUSE_REASON }],
+  };
+  const h = makeHarness({ sims: [sim], checks: [{ sim_id: 11, ...check('online', 0) }] });
+  const summary = await withFetch(h.fakeFetch, () => runOfflineLifecycleTick(h.env, { now: NOW }));
+  assert.equal(summary.recovered, 1);
+  assert.ok(h.calls.includes('RESELLER_SYNC /resend-online'));
+  assert.ok(!h.calls.some((c) => c.includes('/rotate-sim')));
+  assert.ok(!h.patches.some((p) => p.body.rotation_eligible === true), 'rotation must stay paused');
 });
 
 test('recovery inside the teltik window re-sends online and never calls /rotate-sim', async () => {
@@ -372,19 +558,29 @@ test('the recovery cooldown stops a flapping line looping', async () => {
 test('the migration adds every column and RPC the executor reads', () => {
   for (const needle of [
     'offline_state', 'offline_since', 'offline_notified_at', 'rotation_pause_reason',
-    'deactivated_reason', 'deactivated_at', 'get_teltik_recovered_lines',
+    'deactivated_reason', 'deactivated_at', 'get_recent_hosting_port_checks',
   ]) {
     assert.ok(MIGRATION.includes(needle), 'migration is missing ' + needle);
   }
   assert.ok(/CHECK \(offline_state IN \('online', 'offline'\)\)/.test(MIGRATION));
-  // Recovery candidates are lines whose latest check is online while the latch
-  // still says offline.
-  assert.ok(MIGRATION.includes("latest.state = 'online'"));
-  assert.ok(MIGRATION.includes("s.offline_state = 'offline'"));
+  // Unused RPCs are not shipped.
+  assert.ok(!MIGRATION.includes('get_teltik_recovered_lines'));
 });
 
-test('the hourly cron and both rotate bindings are declared', () => {
+test('get_recent_hosting_port_checks caps the history per SIM in SQL', () => {
+  const fn = MIGRATION.slice(MIGRATION.indexOf('CREATE OR REPLACE FUNCTION get_recent_hosting_port_checks'));
+  assert.ok(fn.includes('row_number() OVER (PARTITION BY c.sim_id ORDER BY c.checked_at DESC)'));
+  assert.ok(fn.includes('ranked.rn <= p_per_sim'));
+  assert.ok(fn.includes('c.checked_at >= p_since'));
+  assert.ok(fn.includes('c.sim_id = ANY (p_sim_ids)'));
+  // One row per SIM keeps a 500-SIM batch under the 1000-row PostgREST limit.
+  assert.ok(fn.includes('GROUP BY ranked.sim_id'));
+  assert.ok(EXECUTOR_SRC.includes("'get_recent_hosting_port_checks'"));
+});
+
+test('the hourly cron, the probe cron and both rotate bindings are declared', () => {
   assert.ok(REMEDIATOR_TOML.includes('"0 * * * *"'), 'hourly cron missing from wrangler.toml');
+  assert.ok(REMEDIATOR_TOML.includes('"5,20,35,50 * * * *"'), 'probe cron missing from wrangler.toml');
   for (const block of ['binding = "TELTIK_WORKER"', 'binding = "MDN_ROTATOR"']) {
     assert.ok(REMEDIATOR_TOML.includes(block), 'missing ' + block);
   }
@@ -397,6 +593,9 @@ test('scheduled() routes the hourly cron to the lifecycle, not the intake tick',
   assert.ok(REMEDIATOR_SRC.includes("const OFFLINE_LIFECYCLE_CRON = '0 * * * *'"));
   assert.ok(REMEDIATOR_SRC.includes('if (cron === OFFLINE_LIFECYCLE_CRON)'));
   assert.ok(REMEDIATOR_SRC.includes('runOfflineLifecycleTick(env)'));
+  assert.ok(REMEDIATOR_SRC.includes("const OFFLINE_PROBE_CRON = '5,20,35,50 * * * *'"));
+  assert.ok(REMEDIATOR_SRC.includes('if (cron === OFFLINE_PROBE_CRON)'));
+  assert.ok(REMEDIATOR_SRC.includes('runOfflineProbeRun(env)'));
 });
 
 test('the executor reuses the existing senders and rotate routes', () => {
@@ -407,6 +606,21 @@ test('the executor reuses the existing senders and rotate routes', () => {
   // force_rotate is the ONLY path that may reach a rotate route.
   const rotateCalls = EXECUTOR_SRC.split('\n').filter((l) => l.includes('await forceRotate(env'));
   assert.equal(rotateCalls.length, 1);
+});
+
+test('reseller-sync /send-offline requires the shared secret, not the header', () => {
+  const start = RESELLER_SYNC_SRC.indexOf('url.pathname === "/send-offline"');
+  const route = RESELLER_SYNC_SRC.slice(start, RESELLER_SYNC_SRC.indexOf('\n    }\n', start));
+  assert.ok(route.includes('if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET)'));
+  assert.ok(!route.includes('internalOk'), 'the spoofable X-Internal-Caller header must not be enough');
+  assert.ok(EXECUTOR_SRC.includes("'?secret=' + encodeURIComponent(env.FINALIZER_RUN_SECRET"));
+});
+
+test('the number.offline dedup id includes the outage start', () => {
+  const fn = RESELLER_SYNC_SRC.slice(RESELLER_SYNC_SRC.indexOf('async function sendOfflineForSim'));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.ok(body.includes("from: reason + ':' + offlineSince"));
+  assert.ok(RESELLER_SYNC_SRC.includes('offlineSince (ISO timestamp) required'));
 });
 
 test('reseller-sync /send-offline carries reason=line_offline and no replaced_by', () => {
