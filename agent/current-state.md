@@ -4,6 +4,7 @@
 > 2026-09-22: Brief A done. PRs #88 (`87cc4bf`) and #84 (`6584492`) are squash-merged, not deployed. 989 tests pass. #84 frontend filename gap is open. See "Brief A done".
 > Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
 > Also 2026-09-22: Brief B steps 1–2 done — `FINALIZER_RUN_SECRET` set on `bad-rental-remediator` (test + prod), and PROD redeployed with `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` as version `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`. See "Brief B steps 1–2 done" below. Next: wait 5h for one full probe cycle, read the Slack digest, get owner sign-off, then remove DRY_RUN (step 5).
+> 2026-09-22 (latest): PR #112 merged and DEPLOYED to PROD with #110, #88 and #84 — dashboard `3b69cf80`, details-finalizer `1f22a644`, reseller-portal `e6e18c80`. `deployed/prod` moved 6ec5620 → 7b18ed4. See "Deployed 2026-09-22 (ship 2)".
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
@@ -14,6 +15,19 @@
 > Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
 
 ---
+
+## Deployed 2026-09-22 (ship 2) — PR #112 plus everything queued since the last deploy
+
+- **PR #112 merged** (squash, `7b18ed4`, "Dashboard: validate and encode request values before they reach the database"). Branch deleted.
+- **Shipped range:** `6ec5620..7b18ed4` — #112, #110 (details-finalizer records ATOMIC port-in outcomes), #88 (Messages search accepts number lists), #84 (QBO CSV filename fix), #111 (anon lockdown migration, already applied to PROD earlier), plus agent notes.
+- **Workers deployed** via `scripts/deploy.sh` (1018/1018 tests, DB constraint check, both dashboard syntax checks passed first):
+  - dashboard (`--env=""`): `3b69cf80-01c6-45df-bc6b-d0d09e06727c`
+  - details-finalizer: `1f22a644-f178-4a45-806f-7c8a97752d02` (changed by #110; also imports `shared/atomic-portin-outcomes.mjs`)
+  - reseller-portal: `e6e18c80-5c28-44e0-ba50-116bfe311811` (imports changed `shared/billing.js`)
+- **Migrations:** none applied by this deploy. `supabase/migrations/20260922_lock_down_anon.sql` was already applied to PROD (see below). The `sims.atomic_portin_reason_code` / `_reason_description` / `_status_attempted_at` columns that #110 writes were confirmed present in PROD before deploying — so Brief C's migration is effectively applied in PROD; the worker now writes to it.
+- **Live probes:** dashboard `/` 200; `/public/bad-rental-escalations-today.csv` with X-Api-Key 200 (18,663 bytes); `/api/sims?status=active&select=*` unauthenticated 401 (route up, auth enforced); reseller-portal `/` 200.
+- **Marker:** `deployed/prod` moved `6ec5620dea013f2c26dc43634342d6582a6006cf` → `7b18ed4f1314c04582883b16959f610911e16ae2`.
+- **Rollback:** `npx wrangler rollback` in the worker's dir (`--env=""` for dashboard), or redeploy from `6ec5620`.
 
 ## PROD anon lockdown applied 2026-09-22 — PR #111 merged
 
