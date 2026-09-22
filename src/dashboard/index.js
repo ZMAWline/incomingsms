@@ -1126,7 +1126,7 @@ async function handleSims(env, corsHeaders, url) {
     const iccidFilter = url.searchParams.get('iccid');
 
     // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,imei,msisdn,port,status,vendor,gateway_host,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_rotation_at,activated_at,last_activation_error,last_notified_at,port_in_pending,atomic_portin_status_code,atomic_portin_description,atomic_portin_checked_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
+    let query = `sims?select=id,iccid,imei,msisdn,port,status,vendor,gateway_host,carrier,rotation_interval_hours,rotation_eligible,rotation_pause_reason,offline_state,offline_since,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_rotation_at,activated_at,last_activation_error,last_notified_at,port_in_pending,atomic_portin_status_code,atomic_portin_description,atomic_portin_checked_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
 
     if (idFilter) {
       query += `&id=eq.${encodeURIComponent(idFilter)}`;
@@ -1254,6 +1254,9 @@ async function handleSims(env, corsHeaders, url) {
         atomic_portin_checked_at: sim.atomic_portin_checked_at || null,
         rotation_interval_hours: sim.rotation_interval_hours || 24,
         rotation_eligible: sim.rotation_eligible !== false,
+        rotation_pause_reason: sim.rotation_pause_reason || null,
+        offline_state: sim.offline_state || 'online',
+        offline_since: sim.offline_since || null,
         hosting_port_state: hp ? hp.last_state : null,
         hosting_port_checked_at: hp ? hp.last_checked_at : null,
         hosting_port_source: hp ? hp.last_source : null,

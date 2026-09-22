@@ -58,6 +58,39 @@ export default {
       }
     }
 
+    // Offline SIM lifecycle (bad-rental-remediator hourly tick): the reseller's
+    // rental on this line is being closed because the host port is down, so the
+    // OLD number has to go offline before reseller_sims.active flips to false.
+    // This worker owns webhook sending, so the remediator reaches it here
+    // instead of growing a second sender. Sending number.offline makes the
+    // reseller close a rental, so this route requires FINALIZER_RUN_SECRET and
+    // does not accept the spoofable X-Internal-Caller header.
+    if (url.pathname === "/send-offline" && request.method === 'POST') {
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      let body;
+      try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
+      const simId = body && body.simId;
+      const reason = body && body.reason;
+      const offlineSince = body && body.offlineSince;
+      if (!simId || !Number.isFinite(Number(simId))) return json({ ok: false, error: 'simId required' }, 400);
+      if (reason !== 'line_offline') return json({ ok: false, error: 'reason must be line_offline' }, 400);
+      if (!offlineSince || Number.isNaN(Date.parse(offlineSince))) {
+        return json({ ok: false, error: 'offlineSince (ISO timestamp) required' }, 400);
+      }
+      try {
+        const result = await sendOfflineForSim(env, Number(simId), reason, offlineSince);
+        const httpStatus = result.ok ? 200
+                         : result.status === 404 ? 404
+                         : result.status === 412 ? 412
+                         : 500;
+        return json(result, httpStatus);
+      } catch (e) {
+        return json({ ok: false, error: String(e) }, 500);
+      }
+    }
+
     if (url.pathname === "/resync-reseller" && request.method === 'POST') {
       if (!internalOk) return new Response("Unauthorized", { status: 401 });
       let body;
@@ -371,6 +404,74 @@ async function resendOneSim(env, simId, source) {
     error: result.error || null,
     responseBody: result.responseBody || null,
     rental_id: rentalId,
+    sim_id: sim.id,
+    reseller_id: resellerId,
+    number: currentNumber,
+  };
+}
+
+// Emit number.offline for a SIM's CURRENT number because the line itself went
+// down, not because the number is being replaced. Deliberately carries no
+// replaced_by: nothing is taking over this route.
+//
+// Must be called BEFORE reseller_sims.active flips to false, because the
+// reseller/webhook lookup below (like every other sender in this repo) resolves
+// through the active assignment.
+//
+// Dedup: generateMessageIdAsync hashes number.offline per calendar day over
+// (eventType, simId, iccid, number, from). `from` is the only free slot in that
+// tuple, so it carries the reason plus the start of the outage: the reason
+// keeps a host-offline event from colliding with the same day's rotation
+// offline, and offlineSince keeps a second outage on the same day from being
+// dropped as a duplicate of the first.
+async function sendOfflineForSim(env, simId, reason, offlineSince) {
+  const rows = await sbGetArray(
+    env,
+    `sims?select=id,iccid,status,vendor,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))` +
+    `&id=eq.${encodeURIComponent(simId)}` +
+    `&sim_numbers.valid_to=is.null` +
+    `&reseller_sims.active=eq.true` +
+    `&limit=1`
+  );
+
+  if (!rows.length) {
+    return { ok: false, status: 404, attempts: 0, error: 'SIM not found, not active, or has no current number' };
+  }
+
+  const sim = rows[0];
+  const currentNumber = sim.sim_numbers?.[0]?.e164;
+  const resellerId = sim.reseller_sims?.[0]?.reseller_id;
+  const webhook = sim.reseller_sims?.[0]?.resellers?.reseller_webhooks?.find(w => w.enabled);
+  const webhookUrl = webhook?.url;
+
+  if (!currentNumber) return { ok: false, status: 404, attempts: 0, error: 'No current number on this SIM' };
+  if (!resellerId)    return { ok: false, status: 404, attempts: 0, error: 'No reseller assigned to this SIM' };
+  if (!webhookUrl)    return { ok: false, status: 412, attempts: 0, error: 'Reseller has no enabled webhook configured' };
+
+  const result = await sendWebhookWithDeduplication(env, webhookUrl, {
+    event_type: "number.offline",
+    created_at: new Date().toISOString(),
+    data: {
+      sim_id: sim.id,
+      iccid: sim.iccid,
+      number: currentNumber,
+      online: false,
+      reason,
+      carrier: sim.vendor === 'teltik' ? 'T-Mobile' : 'att',
+      verified: true,
+    },
+  }, {
+    idComponents: { simId: sim.id, iccid: sim.iccid, number: currentNumber, from: reason + ':' + offlineSince },
+    resellerId,
+    simId: sim.id,
+    source: reason,
+  });
+
+  return {
+    ok: !!result.ok,
+    status: result.status || 0,
+    attempts: result.attempts || 0,
+    error: result.error || null,
     sim_id: sim.id,
     reseller_id: resellerId,
     number: currentNumber,

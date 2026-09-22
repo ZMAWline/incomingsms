@@ -1534,6 +1534,7 @@
                                     <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','status')">Status <span class="sort-arrow" data-table="sims" data-col="status"></span></span><button type="button" data-colfilter-btn="status" onclick="openSimsColumnFilter('status', this)" title="Filter Status" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
                                     <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','vendor')">Vendor <span class="sort-arrow" data-table="sims" data-col="vendor"></span></span><button type="button" data-colfilter-btn="vendor" onclick="openSimsColumnFilter('vendor', this)" title="Filter Vendor" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
                                     <th class="px-4 py-3 font-medium select-none" title="Latest persisted Teltik hosting port status (any source: cron, bulk, query, remediator)"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','hosting_port_state')">Host Port <span class="sort-arrow" data-table="sims" data-col="hosting_port_state"></span></span><button type="button" data-colfilter-btn="hosting_port_state" onclick="openSimsColumnFilter('hosting_port_state', this)" title="Filter Host Port" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
+                                    <th class="px-4 py-3 font-medium select-none" title="Offline lifecycle latch: Online, or Offline since the hourly tick unassigned it"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','offline_state')">Host <span class="sort-arrow" data-table="sims" data-col="offline_state"></span></span><button type="button" data-colfilter-btn="offline_state" onclick="openSimsColumnFilter('offline_state', this)" title="Filter Host" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
                                     <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','reseller_name')">Reseller <span class="sort-arrow" data-table="sims" data-col="reseller_name"></span></span><button type="button" data-colfilter-btn="reseller_name" onclick="openSimsColumnFilter('reseller_name', this)" title="Filter Reseller" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
                                     <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','sms_count')">SMS <span class="sort-arrow" data-table="sims" data-col="sms_count"></span></span><button type="button" data-colfilter-btn="sms_count" onclick="openSimsColumnFilter('sms_count', this)" title="Filter SMS count" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
                                     <th class="px-4 py-3 font-medium select-none"><span class="inline-flex items-center gap-1"><span class="cursor-pointer hover:text-gray-300" onclick="sortTable('sims','last_sms_received')">Last SMS <span class="sort-arrow" data-table="sims" data-col="last_sms_received"></span></span><button type="button" data-colfilter-btn="last_sms_received" onclick="openSimsColumnFilter('last_sms_received', this)" title="Filter Last SMS" class="text-gray-400 hover:text-indigo-300 transition"><svg class="w-3 h-3" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2h14l-5.5 6.5V14l-3-1.5V8.5z"/></svg></button></span></th>
@@ -1544,7 +1545,7 @@
                                 </tr>
                             </thead>
                             <tbody id="sims-table" class="text-sm">
-                                <tr><td colspan="16" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
+                                <tr><td colspan="17" class="px-4 py-4 text-center text-gray-500">Loading...</td></tr>
                             </tbody>
                         </table>
                     <div id="sims-pagination" class="px-4 py-3 border-t border-dark-600 flex items-center justify-between"></div>
@@ -5369,6 +5370,8 @@ set verify_pending; schedule §C.3 poll
             { key: 'vendor',                  label: 'Vendor',        type: 'enum'   },
             { key: 'verification_status',     label: 'Verification',  type: 'enum'   },
             { key: 'hosting_port_state',      label: 'Host Port',     type: 'enum'   },
+            { key: 'offline_state',           label: 'Host',          type: 'enum'   },
+            { key: 'offline_since',           label: 'Offline Since', type: 'date'   },
             { key: 'hosting_port_source',     label: 'Host Port Src', type: 'enum'   },
             { key: 'hosting_port_checked_at', label: 'Host Port Checked', type: 'date' },
             { key: 'hosting_port_online_24h', label: 'Online 24h',    type: 'number' },
@@ -5381,7 +5384,7 @@ set verify_pending; schedule §C.3 poll
             { key: 'activated_at',            label: 'Activated',     type: 'date'   },
             { key: 'last_notified_at',        label: 'Last Notified', type: 'date'   },
             { key: 'carrier',                 label: 'Carrier',       type: 'enum'   },
-            { key: 'gateway_host',            label: 'Host',          type: 'enum'   },
+            { key: 'gateway_host',            label: 'Gateway Host',  type: 'enum'   },
             { key: 'rotation_interval_hours', label: 'Rot. Interval', type: 'number' },
             { key: 'rotation_eligible',       label: 'Auto-rotate',   type: 'bool'   },
             { key: 'port_in_pending',         label: 'Port-in Pending', type: 'bool' },
@@ -6451,6 +6454,7 @@ set verify_pending; schedule §C.3 poll
                 blimei: 'BLIMEI',
                 vendor: 'Vendor',
                 hosting_port_state: 'Host Port',
+                offline_state: 'Host',
                 reseller_name: 'Reseller',
                 sms_count: 'SMS',
                 last_sms_received: 'Last SMS',
@@ -7196,6 +7200,22 @@ set verify_pending; schedule §C.3 poll
                 + '</div>';
         }
 
+        // Offline lifecycle latch (sims.offline_state) plus the rotation pause
+        // it owns. The pause badge only shows when the lifecycle tick paused
+        // rotation (rotation_pause_reason='host_offline'), not an operator.
+        function hostCell(sim) {
+            const pauseBadge = sim.rotation_pause_reason === 'host_offline'
+                ? '<div class="mt-0.5"><span class="px-1.5 py-0.5 text-xs font-medium rounded bg-yellow-500/20 text-yellow-400 whitespace-nowrap" title="Auto-rotate is off because the host went offline. Recovery turns it back on.">rotation paused: host offline</span></div>'
+                : '';
+            if (sim.offline_state !== 'offline') {
+                return '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-accent/20 text-accent">Online</span>' + pauseBadge;
+            }
+            const since = sim.offline_since ? new Date(sim.offline_since) : null;
+            const label = since ? 'Offline since ' + timeAgo(since) : 'Offline';
+            const tip = since ? 'Offline since ' + since.toLocaleString() : 'Offline (no start time recorded)';
+            return '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-red-500/20 text-red-400 whitespace-nowrap" title="' + escapeHtml(tip) + '">' + label + '</span>' + pauseBadge;
+        }
+
         // Bulk action: run Teltik hosting port-status for the selected SIMs.
         // Persists via the shared recorder server-side and refreshes the table
         // so the Host Port column shows the new latest status.
@@ -7479,9 +7499,9 @@ function renderSims() {
                     || fs.activatedFrom || fs.activatedTo || fs.search
                     || simsColumnFilters.length;
                 if (hasFilters) {
-                    tbody.innerHTML = '<tr><td colspan="16" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="17" class="px-4 py-8 text-center"><div class="text-gray-400 mb-3">No SIMs match these filters</div><button onclick="clearAllSimsFilters()" class="px-3 py-1.5 text-xs bg-accent hover:bg-green-400 text-white rounded transition">Clear all filters</button></td></tr>';
                 } else {
-                    tbody.innerHTML = '<tr><td colspan="16" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="17" class="px-4 py-4 text-center text-gray-500">No SIMs found</td></tr>';
                 }
                 applySimsColumnVisibility();
                 return;
@@ -7526,6 +7546,7 @@ function renderSims() {
                     </td>
                     <td class="px-4 py-3">${vendorBadge}</td>
                     <td class="px-4 py-3">${hostPortCell(sim)}</td>
+                    <td class="px-4 py-3">${hostCell(sim)}</td>
                     <td class="px-4 py-3 text-gray-400">${sim.reseller_name || '-'}</td>
                     <td class="px-4 py-3 text-gray-300">${sim.sms_count || 0}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">${lastSms}</td>
@@ -14883,6 +14904,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 _sdField('Reseller', sim.reseller_name || '') +
                 _sdField('Gateway / Port', '<span class="font-mono">' + (gatewayPort || '') + '</span>') +
                 _sdField('Subscription ID', '<span class="font-mono text-xs">' + (sim.mobility_subscription_id || '') + '</span>') +
+                _sdField('Host', hostCell(sim)) +
                 _sdField('Rotation Interval', sim.rotation_interval_hours ? sim.rotation_interval_hours + 'h' : '') +
                 _sdField('SMS (24h)', String(sim.sms_count || 0)) +
                 _sdField('Last Rotated', sim.last_rotation_at ? new Date(sim.last_rotation_at).toLocaleString() : '') +
