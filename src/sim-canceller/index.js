@@ -1,5 +1,6 @@
 import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
+import { buildNumberEvent } from '../shared/number-event.mjs';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -121,6 +122,15 @@ export default {
             }
           );
 
+          // Resolve the reseller webhook and current number now: both lookups
+          // read the active rows that the next two writes close.
+          let notify = null;
+          try {
+            notify = await findNotifyTarget(env, simId);
+          } catch (lookupError) {
+            console.log(`Webhook lookup error for ${iccid}:`, String(lookupError));
+          }
+
           // Expire current phone number
           const now = new Date().toISOString();
           await sbPatch(
@@ -136,22 +146,19 @@ export default {
             { active: false }
           );
 
-          // Send webhook notification (if configured)
+          // Tell the reseller the number is offline. A webhook failure is
+          // logged only; the cancel itself has already succeeded.
           try {
-            const resellerId = await findResellerIdBySimId(env, simId);
-            if (resellerId) {
-              const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
-              if (webhookUrl) {
-                await postResellerWebhook(webhookUrl, {
-                  event_type: "sim.cancelled",
-                  created_at: new Date().toISOString(),
-                  data: {
-                    sim_id: simId,
-                    iccid: iccid,
-                    mobility_subscription_id: subId
-                  }
-                });
-              }
+            if (notify) {
+              await postResellerWebhook(env, notify.webhookUrl, await buildNumberEvent({
+                online: false,
+                simId,
+                iccid,
+                number: notify.number || msisdn,
+                mobilitySubscriptionId: subId,
+                vendor,
+                reason: 'canceled',
+              }));
             }
           } catch (webhookError) {
             console.log(`Webhook error for ${iccid}:`, String(webhookError));
@@ -448,7 +455,18 @@ async function findWebhookUrlByResellerId(env, resellerId) {
   return Array.isArray(res) && res[0]?.url ? res[0].url : null;
 }
 
-async function postResellerWebhook(webhookUrl, payload) {
+// { webhookUrl, number } for a SIM with an active reseller and an enabled
+// webhook, else null.
+async function findNotifyTarget(env, simId) {
+  const resellerId = await findResellerIdBySimId(env, simId);
+  if (!resellerId) return null;
+  const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
+  if (!webhookUrl) return null;
+  const numbers = await sbGet(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(simId))}&valid_to=is.null&limit=1`);
+  return { webhookUrl, number: numbers?.[0]?.e164 || null };
+}
+
+async function postResellerWebhook(env, webhookUrl, payload) {
   if (!webhookUrl) return;
 
   console.log(`[Cancel Webhook] Sending to ${webhookUrl}:`, JSON.stringify(payload));

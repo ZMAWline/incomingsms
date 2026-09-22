@@ -1,5 +1,6 @@
 import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
+import { buildNumberEvent } from '../shared/number-event.mjs';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -28,7 +29,6 @@ export default {
     const reasonCode = "CR";
     const reasonCodeId = action === "suspend" ? 22 : 35;
     const newDbStatus = action === "suspend" ? "suspended" : "active";
-    const webhookEvent = action === "suspend" ? "sim.suspended" : "sim.restored";
 
     try {
       const body = await request.json();
@@ -155,23 +155,24 @@ export default {
             }
           );
 
-          // Send webhook notification (if configured)
+          // Tell the reseller: a suspended line is offline, a restored one is
+          // online. A webhook failure is logged only; the status change has
+          // already succeeded.
           try {
             const resellerId = await findResellerIdBySimId(env, simId);
             if (resellerId) {
               const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
               if (webhookUrl) {
-                await postResellerWebhook(webhookUrl, {
-                  event_type: webhookEvent,
-                  created_at: new Date().toISOString(),
-                  data: {
-                    sim_id: simId,
-                    iccid: iccid,
-                    phone_number: phoneNumber,
-                    mobility_subscription_id: subId,
-                    action: subscriberState
-                  }
-                });
+                const numbers = await sbGet(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(simId))}&valid_to=is.null&limit=1`);
+                await postResellerWebhook(env, webhookUrl, await buildNumberEvent({
+                  online: action === "restore",
+                  simId,
+                  iccid,
+                  number: numbers?.[0]?.e164 || phoneNumber,
+                  mobilitySubscriptionId: subId,
+                  vendor,
+                  reason: action === "restore" ? "restored" : "suspended",
+                }));
               }
             }
           } catch (webhookError) {
@@ -428,7 +429,7 @@ async function findWebhookUrlByResellerId(env, resellerId) {
   return Array.isArray(res) && res[0]?.url ? res[0].url : null;
 }
 
-async function postResellerWebhook(webhookUrl, payload) {
+async function postResellerWebhook(env, webhookUrl, payload) {
   if (!webhookUrl) return;
 
   console.log(`[Status Webhook] Sending to ${webhookUrl}:`, JSON.stringify(payload));
