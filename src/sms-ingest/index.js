@@ -5,6 +5,7 @@
 // =========================================================
 
 import { constantTimeEqual } from "../shared/portal-auth.mjs";
+import { supabaseFetch, webhookFetch } from "../shared/fetch-timeout.mjs";
 
 export default {
   async fetch(request, env, ctx) {
@@ -270,12 +271,12 @@ export default {
 
 function relayFetch(env, url, init) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return webhookFetch(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return webhookFetch(env, url, init);
 }
 
 // ====================
@@ -316,7 +317,7 @@ function extractSmsBody(text) {
 // Supabase helpers
 // ====================
 async function supabaseGet(env, path) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "GET",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -326,7 +327,7 @@ async function supabaseGet(env, path) {
 }
 
 async function supabaseInsert(env, table, rows) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
     method: "POST",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -389,7 +390,7 @@ async function updateSimPortAndGateway(env, simId, port, mac, gatewayIdHint = nu
     // If we know both gateway and port, evict any other SIM currently claiming
     // this slot — the gateway's ICCID report is the physical source of truth.
     if (updates.gateway_id && updates.port) {
-      const evictRes = await fetch(
+      const evictRes = await supabaseFetch(env,
         `${env.SUPABASE_URL}/rest/v1/sims?gateway_id=eq.${updates.gateway_id}&port=eq.${encodeURIComponent(updates.port)}&id=neq.${simId}`,
         {
           method: "PATCH",
@@ -412,7 +413,7 @@ async function updateSimPortAndGateway(env, simId, port, mac, gatewayIdHint = nu
       }
     }
 
-    const res = await fetch(
+    const res = await supabaseFetch(env,
       `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${encodeURIComponent(String(simId))}`,
       {
         method: "PATCH",
@@ -532,7 +533,7 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await fetch(
+  const res = await supabaseFetch(env,
     `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
     {
       method: 'GET',
@@ -551,7 +552,7 @@ async function wasWebhookDelivered(env, messageId) {
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts } = delivery;
 
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
