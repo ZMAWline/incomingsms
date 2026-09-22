@@ -5268,7 +5268,7 @@ set verify_pending; schedule §C.3 poll
 
         // ===== Sort & Filter Engine =====
         const tableState = {
-            sims: { data: [], sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
+            sims: { data: [], total: 0, sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
             messages: { data: [], sortKey: 'received_at', sortDir: 'desc', page: 1, pageSize: 50 },
             imei: { data: [], sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
             errors: { data: [], sortKey: 'id', sortDir: 'desc', page: 1, pageSize: 50 },
@@ -5350,10 +5350,13 @@ set verify_pending; schedule §C.3 poll
         //
         // Every column an operator can
         // filter on, with the type that decides which operators it offers.
-        // Filtering runs client-side over the loaded rows (~4.3k), so a filter
-        // applies instantly and never costs a round trip.
+        // The table filters, sorts and pages on the server: loadSims() sends
+        // these filters to /api/sims, and src/dashboard/sims-query.mjs turns
+        // them into a database query with the semantics simFilterMatches()
+        // below defines. That engine is the reference for the server, not the
+        // table's runtime path.
         //
-        //   type 'enum'   options are discovered from the loaded data
+        //   type 'enum'   options come from /api/sims/facets (whole fleet)
         //   type 'number' numeric comparison, blank-aware
         //   type 'date'   absolute range plus relative "within last N hours"
         //   type 'text'   substring / exact, case-insensitive
@@ -5449,14 +5452,35 @@ set verify_pending; schedule §C.3 poll
         // keeps the chip row readable and matches how a spreadsheet behaves.
         let simsColumnFilters = [];
 
+        // Fleet-wide { column: { value: count } } from /api/sims/facets, for the
+        // filter menus and the enum column-filter options. The table holds one
+        // page, so counting loaded rows would count that page. Null until it
+        // loads, or if it fails; callers then fall back to the loaded page.
+        // SMS and hosting-port columns are not in it (they come from RPCs), so
+        // their options are the values on the current page.
+        let SIMS_FACETS = null;
+        async function loadSimsFacets() {
+            try {
+                const res = await fetch(API_BASE + '/sims/facets');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data && data.ok && data.facets) SIMS_FACETS = data.facets;
+            } catch (e) { /* menus fall back to the loaded page */ }
+        }
+
         function simsDistinctValues(colKey) {
             const seen = new Map(); // normalized -> display
             const col = SIMS_COLUMN_BY_KEY[colKey];
-            for (const row of (tableState.sims.data || [])) {
-                const v = simColValue(row, col);
-                if (v == null || v === '') continue;
-                const s = String(v);
-                if (!seen.has(s)) seen.set(s, s);
+            const fleet = SIMS_FACETS && SIMS_FACETS[colKey];
+            if (fleet) {
+                for (const v of Object.keys(fleet)) seen.set(v, v);
+            } else {
+                for (const row of (tableState.sims.data || [])) {
+                    const v = simColValue(row, col);
+                    if (v == null || v === '') continue;
+                    const s = String(v);
+                    if (!seen.has(s)) seen.set(s, s);
+                }
             }
             return [...seen.keys()].sort(function (a, b) {
                 const na = Number(a), nb = Number(b);
@@ -5919,7 +5943,7 @@ set verify_pending; schedule §C.3 poll
             if (opDef.arity === 'multi') {
                 const vals = simsDistinctValues(colKey);
                 const chosen = new Set(prior && Array.isArray(prior.value) ? prior.value : []);
-                if (!vals.length) { box.innerHTML = '<div class="text-xs text-gray-500">No values in the loaded rows.</div>'; return; }
+                if (!vals.length) { box.innerHTML = '<div class="text-xs text-gray-500">No values found.</div>'; return; }
                 box.innerHTML =
                     '<input id="sims-colfilter-search" oninput="simsColFilterOptionSearch(this.value)" placeholder="Search values" class="w-full mb-2 text-sm bg-dark-700 border border-dark-600 rounded px-2 py-1 text-gray-300 focus:outline-none focus:border-accent">' +
                     '<div class="max-h-48 overflow-y-auto space-y-1">' +
@@ -6027,14 +6051,13 @@ set verify_pending; schedule §C.3 poll
         }
 
         let simsColumnVis = (function(){ try { return JSON.parse(localStorage.getItem('simsColumnVis') || '{}'); } catch(e) { return {}; } })();
-        let _simsSearchTimer = null;
+        // No timer here: renderSims() debounces the server fetch (300 ms), so
+        // the chip row updates as the operator types and the query goes out
+        // once they pause.
         function onSimsSearchInput(v) {
-            clearTimeout(_simsSearchTimer);
-            _simsSearchTimer = setTimeout(function(){
-                simsFilterState.search = (v || '').trim();
-                tableState.sims.page = 1;
-                renderSims();
-            }, 250);
+            simsFilterState.search = (v || '').trim();
+            tableState.sims.page = 1;
+            renderSims();
         }
         function onSimsStatusChange(v) {
             if (v === '') simsFilterState.status = [];
@@ -6180,6 +6203,14 @@ set verify_pending; schedule §C.3 poll
             tableState.sims.page = 1;
             loadSims(true);
         }
+        // { value: count } for a filter menu: the whole fleet from
+        // /api/sims/facets, or the loaded page if that has not loaded.
+        function simsMenuCounts(facetKey, rows, pick) {
+            if (SIMS_FACETS && SIMS_FACETS[facetKey]) return SIMS_FACETS[facetKey];
+            const counts = {};
+            rows.forEach(function(s){ const v = pick(s); if (v != null && v !== '') counts[v] = (counts[v]||0) + 1; });
+            return counts;
+        }
         function openSimsFilterMenu(kind, anchorEl) {
             const menu = document.getElementById('sims-filter-menu');
             if (!menu) return;
@@ -6225,19 +6256,21 @@ set verify_pending; schedule §C.3 poll
                 { value: 'wing_iot', label: 'Wing IoT' },
                 { value: 'teltik', label: 'Teltik' },
             ];
-                const counts = {};
-                data.forEach(function(s){ counts[s.vendor] = (counts[s.vendor]||0) + 1; });
+                const counts = simsMenuCounts('vendor', data, function(s){ return s.vendor; });
                 opts = VENDOR_OPTS.map(function(o){ return { value: o.value, label: o.label, count: counts[o.value] || 0 }; });
             } else if (kind === 'gateway') {
-                const counts = {};
-                data.forEach(function(s){ if (s.gateway_code) counts[s.gateway_code] = (counts[s.gateway_code]||0) + 1; });
+                const counts = simsMenuCounts('gateway_code', data, function(s){ return s.gateway_code; });
                 opts = Object.keys(counts).sort().map(function(g){ return { value: g, label: g, count: counts[g] }; });
-                if (opts.length === 0) opts = [{ value: '', label: '(no gateways in current data)', count: 0 }];
+                if (opts.length === 0) opts = [{ value: '', label: '(no gateways)', count: 0 }];
             } else if (kind === 'reseller') {
                 const cache = window._simsResellersCache || [];
-                const counts = {};
-                data.forEach(function(s){ if (s.reseller_id != null) counts[s.reseller_id] = (counts[s.reseller_id]||0) + 1; });
-                const noneCount = data.filter(function(s){ return !s.reseller_id; }).length;
+                const counts = simsMenuCounts('reseller_id', data, function(s){ return s.reseller_id; });
+                // The facets count assigned SIMs only; unassigned is the rest
+                // of the fleet.
+                const fleetTotal = SIMS_FACETS && SIMS_FACETS.status
+                    ? Object.values(SIMS_FACETS.status).reduce(function(a, n){ return a + n; }, 0) : null;
+                const assigned = Object.values(counts).reduce(function(a, n){ return a + n; }, 0);
+                const noneCount = fleetTotal != null ? Math.max(0, fleetTotal - assigned) : data.filter(function(s){ return !s.reseller_id; }).length;
                 opts = [{ value: 'none', label: '(unassigned)', count: noneCount }];
                 cache.forEach(function(r){
                     opts.push({ value: String(r.id), label: r.name || ('#' + r.id), count: counts[r.id] || 0 });
@@ -7378,9 +7411,75 @@ set verify_pending; schedule §C.3 poll
             }, 5000);
         }
 
-                let lastSimsFetchedAt = 0;
+        let lastSimsFetchedAt = 0;
         const SIM_CACHE_MS = 30 * 60 * 1000; // 30 minutes
+        const SIMS_FETCH_DEBOUNCE_MS = 300;
+        // What the rows in tableState.sims.data were fetched for: the filter
+        // part and the page part (page, size, sort) of the query, separately,
+        // so a page click fetches at once and a filter edit is debounced.
+        let _simsLoaded = { filters: null, page: null };
+        let _simsFetchTimer = null;
+        let _simsFetchSeq = 0;
 
+        // Day-based date filters are local calendar days in the browser, so
+        // they are sent as the instants those days start and end here.
+        function simsFilterToWire(f) {
+            const col = SIMS_COLUMN_BY_KEY[f.col];
+            if (!col || col.type !== 'date') return f;
+            const dayStart = function (d) { return d ? new Date(d + 'T00:00:00').toISOString() : ''; };
+            const dayEnd = function (d) { return d ? new Date(d + 'T23:59:59.999').toISOString() : ''; };
+            if (f.op === 'after') return { col: f.col, op: f.op, value: dayStart(f.value) };
+            if (f.op === 'before') return { col: f.col, op: f.op, value: dayEnd(f.value) };
+            if (f.op === 'between') return { col: f.col, op: f.op, value: dayStart(f.value), value2: dayEnd(f.value2) };
+            return f;
+        }
+
+        // The filter half of the /api/sims query: toolbar selections, search
+        // box and per-column filters. Saved filters are these same fields.
+        function simsFilterParams() {
+            const p = new URLSearchParams();
+            const sArr = simsFilterState.status;
+            if (sArr.includes('__all__')) p.set('include_cancelled', '1');
+            else if (sArr.length) p.set('status', sArr.join(','));
+            if (simsFilterState.resellerIds.length) p.set('reseller_ids', simsFilterState.resellerIds.join(','));
+            if (simsFilterState.vendors.length) p.set('vendors', simsFilterState.vendors.join(','));
+            if (simsFilterState.gateways.length) p.set('gateways', simsFilterState.gateways.join(','));
+            if (simsFilterState.activatedFrom) p.set('activated_from', simsFilterState.activatedFrom);
+            if (simsFilterState.activatedTo) p.set('activated_to', simsFilterState.activatedTo);
+            if (simsFilterState.search) p.set('search', simsFilterState.search);
+            if (simsColumnFilters.length) p.set('filters', JSON.stringify(simsColumnFilters.map(simsFilterToWire)));
+            return p;
+        }
+
+        // The page half: page, size and sort. Computed columns are not
+        // sortable on the server, so an old saved sort on one falls back to id.
+        function simsPageParams() {
+            const t = tableState.sims;
+            const col = SIMS_COLUMN_BY_KEY[t.sortKey];
+            const sortable = col && typeof col.compute !== 'function';
+            const p = new URLSearchParams();
+            p.set('page', String(t.page));
+            p.set('page_size', String(t.pageSize));
+            p.set('sort', sortable ? t.sortKey : 'id');
+            p.set('dir', sortable && t.sortDir === 'asc' ? 'asc' : 'desc');
+            return p;
+        }
+
+        // Called by renderSims() on every render: fetches when the state no
+        // longer matches the loaded rows. Filter edits wait for a 300 ms pause;
+        // page and sort changes go at once.
+        function scheduleSimsFetch() {
+            const filters = simsFilterParams().toString();
+            const page = simsPageParams().toString();
+            if (filters === _simsLoaded.filters && page === _simsLoaded.page) return;
+            clearTimeout(_simsFetchTimer);
+            const delay = filters === _simsLoaded.filters ? 0 : SIMS_FETCH_DEBOUNCE_MS;
+            _simsFetchTimer = setTimeout(function () { loadSims(true); }, delay);
+        }
+
+        // Fetches the current page of SIMs for the current filters and sort.
+        // Polling (loadData, hourly) and every action's refresh call this with
+        // force=true, so they refresh the current page only.
         async function loadSims(force = false) {
             // Saved filters live on the account, so they are fetched once per
             // page load when the SIMs tab first opens. Deliberately not awaited
@@ -7388,45 +7487,47 @@ set verify_pending; schedule §C.3 poll
             // needs its chip row, and blocking the table on a second request
             // would undo the load-path work from PR #104.
             ensureSimsSavedFilters();
-            // Check cache: if data loaded < 30 min ago and not forced, skip fetch
+            const filters = simsFilterParams();
+            const page = simsPageParams();
+            const filtersKey = filters.toString();
+            const pageKey = page.toString();
+            // Check cache: if this exact page was loaded < 30 min ago and not forced, skip fetch
             const now = Date.now();
-            if (!force && lastSimsFetchedAt && (now - lastSimsFetchedAt) < SIM_CACHE_MS && tableState.sims.data.length > 0) {
+            if (!force && lastSimsFetchedAt && (now - lastSimsFetchedAt) < SIM_CACHE_MS
+                && filtersKey === _simsLoaded.filters && pageKey === _simsLoaded.page) {
                 const cacheAge = Math.round((now - lastSimsFetchedAt) / 60000);
                 const cacheLabel = document.getElementById('sims-cache-label');
                 if (cacheLabel) cacheLabel.textContent = '(cached ' + cacheAge + 'm ago)';
                 renderSims();
                 return;
             }
+            clearTimeout(_simsFetchTimer);
+            const seq = ++_simsFetchSeq;
             try {
-                const params = new URLSearchParams();
-                const sArr = simsFilterState.status;
-                const includeCancelled = sArr.includes('__all__') || sArr.includes('canceled');
-                if (includeCancelled) {
-                    params.set('hide_cancelled', 'false');
-                }
-                if (sArr.length === 1 && sArr[0] !== '__all__') {
-                    params.set('status', sArr[0]);
-                }
-                // Multi-status without canceled/__all__: server hides cancelled (default),
-                // returning a smaller set. renderSims() filters the union client-side.
-                const rIds = simsFilterState.resellerIds;
-                if (rIds.length === 1 && rIds[0] !== 'none') {
-                    params.set('reseller_id', String(rIds[0]));
-                }
-                if (force) params.set('force', 'true');
-
+                const params = new URLSearchParams(filtersKey + '&' + pageKey);
                 const url = API_BASE + '/sims?' + params.toString();
-                // Fleet-wide status counts are independent of this query, so they
-                // ride along rather than adding a stage to the load.
-                const [response] = await Promise.all([fetch(url), loadSimsStatusCounts()]);
-                const sims = await response.json();
-                tableState.sims.data = sims;
+                // Fleet-wide counts are independent of this query, so they ride
+                // along rather than adding a stage to the load. Facets are
+                // fetched once, then again on a forced refresh.
+                const side = [loadSimsStatusCounts()];
+                if (force || !SIMS_FACETS) side.push(loadSimsFacets());
+                const [response] = await Promise.all([fetch(url), ...side]);
+                const body = await response.json().catch(function () { return null; });
+                // A newer request went out while this one was in flight.
+                if (seq !== _simsFetchSeq) return;
+                if (!response.ok || !body || !Array.isArray(body.rows)) {
+                    showToast('Error loading SIMs: ' + ((body && body.error) || ('HTTP ' + response.status)), 'error');
+                    return;
+                }
+                tableState.sims.data = body.rows;
+                tableState.sims.total = body.total;
+                _simsLoaded = { filters: filtersKey, page: pageKey };
                 lastSimsFetchedAt = Date.now();
                 // Populate gateway dropdown
                 const gwSel = document.getElementById('filter-gateway');
                 if (gwSel) {
                   const current = gwSel.value;
-                  const gateways = [...new Set(sims.map(s => s.gateway_code).filter(Boolean))].sort();
+                  const gateways = Object.keys(simsMenuCounts('gateway_code', body.rows, function (s) { return s.gateway_code; })).sort();
                   gwSel.innerHTML = '<option value="">All Gateways</option>' + gateways.map(g => `<option value="${g}"${current===g?' selected':''}>${g}</option>`).join('');
                 }
                 const cacheLabel = document.getElementById('sims-cache-label');
@@ -7435,44 +7536,11 @@ set verify_pending; schedule §C.3 poll
                 if (lastUpdated) lastUpdated.textContent = 'Updated ' + new Date().toLocaleTimeString();
                 renderSims();
             } catch (error) {
+                if (seq !== _simsFetchSeq) return;
                 showToast('Error loading SIMs', 'error');
                 console.error(error);
             }
         }
-// Apply the active SIMs filters + sort and return the matching rows (pre-pagination).
-// Shared by renderSims() (for display) and exportSimsCsv() (for export).
-function getFilteredSims() {
-  const state = tableState.sims;
-  let data = state.data;
-  // Search (debounced upstream via onSimsSearchInput)
-  if (simsFilterState.search) data = data.filter(s => matchesSearch(s, simsFilterState.search));
-  // Reseller (multi: 'none' sentinel = unassigned, otherwise numeric id)
-  const rIds = simsFilterState.resellerIds;
-  if (rIds.length > 0) {
-    data = data.filter(s => rIds.some(id => id === 'none' ? !s.reseller_id : (s.reseller_id === id || s.reseller_id === parseInt(id, 10))));
-  }
-  // Gateway (multi)
-  if (simsFilterState.gateways.length > 0) {
-    data = data.filter(s => simsFilterState.gateways.includes(s.gateway_code));
-  }
-  // Vendor (multi)
-  if (simsFilterState.vendors.length > 0) {
-    data = data.filter(s => simsFilterState.vendors.includes(s.vendor));
-  }
-  // Status (only client-filter when multi-select; single-status case already filtered server-side)
-  const sArr = simsFilterState.status;
-  if (sArr.length > 1 && !sArr.includes('__all__')) {
-    data = data.filter(s => sArr.includes(s.status));
-  }
-  // Activated date range
-  if (simsFilterState.activatedFrom) data = data.filter(s => s.activated_at && s.activated_at >= simsFilterState.activatedFrom);
-  if (simsFilterState.activatedTo) data = data.filter(s => s.activated_at && s.activated_at <= simsFilterState.activatedTo + 'T23:59:59');
-  // Per-column filters (AND across columns), applied last so they narrow
-  // whatever the toolbar selections already produced.
-  data = applySimsColumnFilters(data);
-  return genericSort(data, state.sortKey, state.sortDir, 'sims');
-}
-
 function renderSims() {
   renderSimsActiveChips();
   populateSimsAddFilter();
@@ -7481,16 +7549,23 @@ function renderSims() {
   syncSimsColumnFilterIcons();
   setSimsCountBadges();
   syncSimsUrl();
+  // The server filters, sorts and pages: tableState.sims.data is the page,
+  // tableState.sims.total the number of SIMs matching the filters.
   const state = tableState.sims;
-  let data = getFilteredSims();
+  const data = state.data;
 
   const tbody = document.getElementById('sims-table');
   const countEl = document.getElementById('sims-count');
-  countEl.textContent = `${data.length} of ${state.data.length} SIM(s)`;
+  const first = state.total ? (state.page - 1) * state.pageSize + 1 : 0;
+  countEl.textContent = state.total
+      ? `${first}–${first + data.length - 1} of ${state.total} SIM(s)`
+      : '0 SIM(s)';
 
-            const totalFiltered = data.length;
-            data = paginate(data, 'sims');
-            renderPaginationControls('sims-pagination', 'sims', totalFiltered);
+            renderPaginationControls('sims-pagination', 'sims', state.total);
+            // If the filters, sort or page changed (the pager above may also
+            // have pulled the page back in range), fetch; this render shows
+            // the rows we have until the new page arrives.
+            scheduleSimsFetch();
 
             if (data.length === 0) {
                 const fs = simsFilterState;
@@ -7568,11 +7643,36 @@ function renderSims() {
 
         // Export SIMs to CSV. If any rows are selected (checkboxes), export only those;
         // otherwise export every SIM matching the current filters. Columns mirror the table.
-        function exportSimsCsv() {
+        // Every SIM matching the current filters and sort, fetched from
+        // /api/sims 500 at a time (the largest page it serves).
+        async function fetchAllFilteredSims() {
+            const filters = simsFilterParams();
+            const page = simsPageParams();
+            const out = [];
+            for (let n = 1; ; n++) {
+                const params = new URLSearchParams(filters.toString());
+                params.set('sort', page.get('sort'));
+                params.set('dir', page.get('dir'));
+                params.set('page', String(n));
+                params.set('page_size', '500');
+                const res = await fetch(API_BASE + '/sims?' + params.toString());
+                const body = await res.json().catch(function () { return null; });
+                if (!res.ok || !body || !Array.isArray(body.rows)) throw new Error((body && body.error) || ('HTTP ' + res.status));
+                out.push(...body.rows);
+                if (body.rows.length < 500 || out.length >= body.total) return out;
+            }
+        }
+
+        async function exportSimsCsv() {
             const selectedIds = new Set([...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value)));
-            const rows = selectedIds.size > 0
-                ? tableState.sims.data.filter(s => selectedIds.has(s.id))
-                : getFilteredSims();
+            let rows;
+            if (selectedIds.size > 0) {
+                rows = tableState.sims.data.filter(s => selectedIds.has(s.id));
+            } else {
+                showToast('Exporting ' + tableState.sims.total + ' SIM(s)…', 'info');
+                try { rows = await fetchAllFilteredSims(); }
+                catch (e) { showToast('Export failed: ' + e.message, 'error'); return; }
+            }
             if (!rows.length) {
                 showToast('No SIMs to export', 'error');
                 return;

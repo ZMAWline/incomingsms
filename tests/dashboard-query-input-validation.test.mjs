@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import * as simsQuery from '../src/dashboard/sims-query.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -51,6 +52,8 @@ const HANDLERS = [
   'async function supabaseGetAllArray(env, pathWithoutLimit) {',
   'async function sbGet(env, path) {',
   'async function handleSims(env, corsHeaders, url) {',
+  'async function loadSimStats(env, sims) {',
+  'function simStatFields(simId, smsMap, hostPortMap) {',
   'async function handleErrors(env, corsHeaders, url) {',
   'async function handleActivationRunsList(env, corsHeaders, url) {',
   'async function handleSimOnline(request, env, corsHeaders) {',
@@ -67,6 +70,7 @@ function makeSandbox(respond = () => null) {
     Response,
     URL,
     logSystemError: async () => {}, // handleSimAction logs failures; not under test
+    ...simsQuery, // handleSims imports its query builder from sims-query.mjs
     async fetch(url) {
       const u = String(url);
       calls.push(u);
@@ -100,10 +104,13 @@ test('parsePositiveInt accepts only positive whole numbers', () => {
 
 // --- /api/sims status filter ----------------------------------------------
 
-for (const status of ['bogus', 'active&select=*', 'active)or(id.gt.0', 'active,canceled']) {
-  test(`/api/sims rejects status=${status} with 400 and never queries`, async () => {
+// The paged table takes a comma list of statuses; ?all=1 keeps the original
+// single-status parameter. Both allow-list every value.
+for (const [status, all] of [['bogus', false], ['active&select=*', false], ['active)or(id.gt.0', false], ['active,bogus', false],
+  ['bogus', true], ['active&select=*', true], ['active)or(id.gt.0', true], ['active,canceled', true]]) {
+  test(`/api/sims${all ? '?all=1' : ''} rejects status=${status} with 400 and never queries`, async () => {
     const { sandbox, calls } = makeSandbox();
-    const q = new URLSearchParams({ status });
+    const q = new URLSearchParams(all ? { all: '1', status } : { status });
     const resp = await sandbox.handleSims(ENV, CORS, url('/api/sims?' + q));
     assert.equal(resp.status, 400);
     assert.match((await resp.json()).error, /Invalid status/);
@@ -113,7 +120,7 @@ for (const status of ['bogus', 'active&select=*', 'active)or(id.gt.0', 'active,c
 
 test('/api/sims passes a valid status through as an exact filter', async () => {
   const { sandbox, calls } = makeSandbox();
-  const resp = await sandbox.handleSims(ENV, CORS, url('/api/sims?status=rotation_failed'));
+  const resp = await sandbox.handleSims(ENV, CORS, url('/api/sims?all=1&status=rotation_failed'));
   assert.equal(resp.status, 200);
   assert.ok(calls[0].includes('&status=eq.rotation_failed&'), calls[0]);
 });
@@ -131,12 +138,14 @@ test('/api/sims encodes an iccid lookup', async () => {
   assert.ok(calls[0].includes('&iccid=eq.8901%26select%3D*'), calls[0]);
 });
 
-test('/api/sims answers 502 when Supabase fails', async () => {
-  const { sandbox } = makeSandbox(supabaseDown);
-  const resp = await sandbox.handleSims(ENV, CORS, url('/api/sims?status=active'));
-  assert.equal(resp.status, 502);
-  assert.match((await resp.json()).detail, /db down/);
-});
+for (const qs of ['status=active', 'all=1&status=active']) {
+  test(`/api/sims?${qs} answers 502 when Supabase fails`, async () => {
+    const { sandbox } = makeSandbox(supabaseDown);
+    const resp = await sandbox.handleSims(ENV, CORS, url('/api/sims?' + qs));
+    assert.equal(resp.status, 502);
+    assert.match((await resp.json()).detail, /db down/);
+  });
+}
 
 // --- /api/errors ------------------------------------------------------------
 
