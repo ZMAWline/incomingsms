@@ -3,6 +3,7 @@ import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10,
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
 import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPost, sbPatch, sbDelete } from '../shared/supabase-rest.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -201,7 +202,7 @@ export default {
         // clearing msisdn/mobility_subscription_id, so a canceled (or errored)
         // SIM being re-activated/re-ported still carries its old identifiers and
         // must NOT be mistaken for "already activated" here.
-        const existing = await supabaseSelect(
+        const existing = await sbGet(
           env,
           `sims?select=id,mobility_subscription_id,msisdn,vendor,status&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
         );
@@ -421,7 +422,7 @@ async function handleRetryJson(request, env) {
   try {
     for (const item of items) {
       const newAttempt = (item.attempt || 0) + 1;
-      await supabasePatch(env, `activation_job_items?id=eq.${item.id}`, {
+      await sbPatch(env, `activation_job_items?id=eq.${item.id}`, {
         status: 'queued',
         attempt: newAttempt,
         error_message: null,
@@ -494,7 +495,7 @@ async function handleRetryPortInJson(request, env) {
     const skip = (reason) => results.push({ iccid, requeued: false, reason });
 
     // Newest portinRequest we ever sent for this SIM — the call being retried.
-    const reqLogs = await supabaseSelect(
+    const reqLogs = await sbGet(
       env,
       `carrier_api_logs?select=request_body,response_body_json,created_at&iccid=eq.${encodeURIComponent(iccid)}&step=eq.portin&order=created_at.desc&limit=1`
     );
@@ -504,7 +505,7 @@ async function handleRetryPortInJson(request, env) {
       continue;
     }
 
-    const statusLogs = await supabaseSelect(
+    const statusLogs = await sbGet(
       env,
       `carrier_api_logs?select=response_body_json,created_at&iccid=eq.${encodeURIComponent(iccid)}&step=eq.portin_status&order=created_at.desc&limit=1`
     );
@@ -573,7 +574,7 @@ async function handleRetryPortInJson(request, env) {
       continue;
     }
 
-    const simRows = await supabaseSelect(
+    const simRows = await sbGet(
       env,
       `sims?select=id,imei,vendor,reseller_sims(reseller_id)&iccid=eq.${encodeURIComponent(iccid)}&reseller_sims.active=eq.true&limit=1`
     );
@@ -651,7 +652,7 @@ async function handleRetryPortInJson(request, env) {
 // environment keep working rather than failing activations.
 async function loadAddressPool(env) {
   try {
-    const rows = await supabaseSelect(
+    const rows = await sbGet(
       env,
       'address_pool?select=address_id,street_number,street_name,street_direction,city,state,zip_code&limit=5000'
     );
@@ -717,12 +718,12 @@ async function atomicSubscriberState(env, iccid) {
 async function deletePoolAddress(env, addressId, reason, carrierStep) {
   if (!addressId) return;
   try {
-    await supabaseInsert(env, 'address_pool_deletions', [{
+    await sbPost(env, 'address_pool_deletions', [{
       address_id: addressId,
       reason: String(reason || '').slice(0, 500),
       carrier_step: carrierStep || null,
-    }]);
-    await supabaseDelete(env, `address_pool?address_id=eq.${encodeURIComponent(addressId)}`);
+    }], { prefer: 'return=representation' });
+    await sbDelete(env, `address_pool?address_id=eq.${encodeURIComponent(addressId)}`);
     console.log(`[Activator] deleted address ${addressId} from the pool: ${reason}`);
   } catch (e) {
     console.warn(`[Activator] could not delete address ${addressId}: ${e}`);
@@ -747,7 +748,7 @@ function relayFetch(env, url, init, send = carrierFetch) {
 /* ── Activation Run / Job Item DB helpers ─────────────────────────────────── */
 
 async function createActivationRun(env, { source, totalItems, createdBy }) {
-  const rows = await supabaseInsert(env, 'activation_runs', [{
+  const rows = await sbPost(env, 'activation_runs', [{
     source,
     status: 'queued',
     total_items: totalItems,
@@ -759,7 +760,7 @@ async function createActivationRun(env, { source, totalItems, createdBy }) {
     skipped_items: 0,
     created_by: createdBy,
     started_at: new Date().toISOString(),
-  }]);
+  }], { prefer: 'return=representation' });
   if (!rows?.[0]?.id) throw new Error('Failed to create activation run');
   return rows[0].id;
 }
@@ -768,7 +769,7 @@ async function createActivationRun(env, { source, totalItems, createdBy }) {
 // per-item loop this replaced was the dominant cost of a bulk /activate call.
 async function createActivationJobItems(env, runId, sims) {
   const queuedAt = new Date().toISOString();
-  const rows = await supabaseInsert(env, 'activation_job_items', sims.map(sim => ({
+  const rows = await sbPost(env, 'activation_job_items', sims.map(sim => ({
     run_id: runId,
     iccid: sim.iccid,
     imei: sim.imei,
@@ -778,7 +779,7 @@ async function createActivationJobItems(env, runId, sims) {
     attempt: 0,
     max_attempts: 3,
     queued_at: queuedAt,
-  })));
+  })), { prefer: 'return=representation' });
   if (rows.length !== sims.length) throw new Error(`Expected ${sims.length} activation job items, got ${rows.length}`);
   return rows;
 }
@@ -792,7 +793,7 @@ async function sendQueueBatch(queue, messages) {
 
 async function updateActivationRunCounts(env, runId, { queuedItems = 0, validationErrors = 0, rowErrors = [] }) {
   const status = validationErrors > 0 ? 'failed' : 'processing';
-  await supabasePatch(env, `activation_runs?id=eq.${runId}`, {
+  await sbPatch(env, `activation_runs?id=eq.${runId}`, {
     status,
     queued_items: queuedItems,
     processing_items: status === 'processing' ? queuedItems : 0,
@@ -813,7 +814,7 @@ async function updateJobItemStatus(env, runId, iccid, status, { started_at = nul
   if (carrier_log_id) patch.carrier_log_id = carrier_log_id;
   if (attempt_increment) {
     // We need to read current attempt first, then increment
-    const existing = await supabaseSelect(env, `activation_job_items?select=attempt&run_id=eq.${runId}&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+    const existing = await sbGet(env, `activation_job_items?select=attempt&run_id=eq.${runId}&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
     if (existing?.[0]) {
       patch.attempt = (existing[0].attempt || 0) + 1;
       // If attempts >= max_attempts, mark as retry_needed
@@ -822,7 +823,7 @@ async function updateJobItemStatus(env, runId, iccid, status, { started_at = nul
       }
     }
   }
-  await supabasePatch(env, `activation_job_items?run_id=eq.${runId}&iccid=eq.${encodeURIComponent(iccid)}`, patch);
+  await sbPatch(env, `activation_job_items?run_id=eq.${runId}&iccid=eq.${encodeURIComponent(iccid)}`, patch);
   await recomputeActivationRunCounts(env, runId);
 }
 
@@ -831,7 +832,7 @@ async function updateJobItemStatus(env, runId, iccid, status, { started_at = nul
 // counter, since Cloudflare Queue consumers can process a run's items across
 // concurrent invocations and a read-then-increment would race.
 async function recomputeActivationRunCounts(env, runId) {
-  const items = await supabaseSelect(env, `activation_job_items?select=status&run_id=eq.${runId}`);
+  const items = await sbGet(env, `activation_job_items?select=status&run_id=eq.${runId}`);
   const counts = { queued: 0, processing: 0, done: 0, failed: 0, retry_needed: 0, skipped: 0 };
   for (const item of items) {
     if (Object.prototype.hasOwnProperty.call(counts, item.status)) counts[item.status]++;
@@ -853,7 +854,7 @@ async function recomputeActivationRunCounts(env, runId) {
   } else {
     patch.status = 'processing';
   }
-  await supabasePatch(env, `activation_runs?id=eq.${runId}`, patch);
+  await sbPatch(env, `activation_runs?id=eq.${runId}`, patch);
 }
 
 /* ── Vendor-specific activation functions ──────────────────────────────────── */
@@ -1235,62 +1236,6 @@ async function hxActivate(env, token, iccid, imei, runId) {
   throw new Error(`Activation returned ${res.status} but no mobilitySubscriptionId. Raw: ${responseText.slice(0, 200)}`);
 }
 
-/* ── Supabase ───────────────────────────────────────────────────────────────── */
-
-async function supabaseSelect(env, path) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Supabase SELECT ${res.status}: ${text.slice(0, 300)}`);
-  if (!text.trim()) return [];
-  try { return JSON.parse(text); } catch (e) { throw new Error(`Supabase SELECT parse failed: ${e}. Raw: ${text.slice(0, 300)}`); }
-}
-
-async function supabasePatch(env, path, body) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'PATCH',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Supabase PATCH ${res.status}: ${await res.text().catch(() => '')}`);
-}
-
-async function supabaseDelete(env, path) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'DELETE',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  if (!res.ok) throw new Error(`Supabase DELETE ${res.status}: ${await res.text().catch(() => '')}`);
-}
-
-async function supabaseInsert(env, table, rows) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=representation',
-    },
-    body: JSON.stringify(rows),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Supabase INSERT ${res.status}: ${text.slice(0, 300)}`);
-  if (!text.trim()) return [];
-  try { return JSON.parse(text); } catch (e) { throw new Error(`Supabase INSERT parse failed: ${e}`); }
-}
-
 // Activation-time Teltik alias check for Atomic SIMs hosted on Teltik
 // (gateway_host='teltik'). Resolves the Teltik-known host MDN, sets the Teltik
 // nickname to the ICCID when missing/wrong, reads back and verifies. Records a
@@ -1299,7 +1244,7 @@ async function supabaseInsert(env, table, rows) {
 // never throws — an alias problem must not undo a completed carrier activation.
 async function ensureTeltikAliasAfterActivation(env, simId, iccid, runId, result) {
   try {
-    const rows = await supabaseSelect(env, `sims?select=id,iccid,vendor,gateway_host,msisdn&id=eq.${encodeURIComponent(String(simId))}&limit=1`);
+    const rows = await sbGet(env, `sims?select=id,iccid,vendor,gateway_host,msisdn&id=eq.${encodeURIComponent(String(simId))}&limit=1`);
     const sim = rows?.[0];
     if (!sim || !isTeltikHosted(sim)) return null;
     const alias = await ensureTeltikAlias(env, {
@@ -1333,22 +1278,22 @@ async function ensureTeltikAliasAfterActivation(env, simId, iccid, runId, result
 }
 
 async function upsertSim(env, iccid, subId) {
-  const existing = await supabaseSelect(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+  const existing = await sbGet(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
   if (existing?.[0]?.id) {
-    await supabasePatch(env, `sims?id=eq.${existing[0].id}`, {
+    await sbPatch(env, `sims?id=eq.${existing[0].id}`, {
       mobility_subscription_id: subId,
       status: 'provisioning',
       last_activation_error: null,
     });
     return existing[0].id;
   }
-  const inserted = await supabaseInsert(env, 'sims', [{ iccid, mobility_subscription_id: subId, status: 'provisioning' }]);
+  const inserted = await sbPost(env, 'sims', [{ iccid, mobility_subscription_id: subId, status: 'provisioning' }], { prefer: 'return=representation' });
   if (!inserted?.[0]?.id) throw new Error('Supabase INSERT returned no rows');
   return inserted[0].id;
 }
 
 async function upsertSimWithVendor(env, iccid, result, vendor) {
-  const existing = await supabaseSelect(env, `sims?select=id,activated_at&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+  const existing = await sbGet(env, `sims?select=id,activated_at&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
 
   // Build payload based on vendor
   const payload = {
@@ -1392,7 +1337,7 @@ async function upsertSimWithVendor(env, iccid, result, vendor) {
   }
 
   if (existing?.[0]?.id) {
-    await supabasePatch(env, `sims?id=eq.${existing[0].id}`, payload);
+    await sbPatch(env, `sims?id=eq.${existing[0].id}`, payload);
     // If we have an MSISDN, also create the sim_numbers entry
     if (result.msisdn) {
       await createSimNumber(env, existing[0].id, result.msisdn);
@@ -1400,7 +1345,7 @@ async function upsertSimWithVendor(env, iccid, result, vendor) {
     return existing[0].id;
   }
 
-  const inserted = await supabaseInsert(env, 'sims', [{ iccid, ...payload }]);
+  const inserted = await sbPost(env, 'sims', [{ iccid, ...payload }], { prefer: 'return=representation' });
   if (!inserted?.[0]?.id) throw new Error('Supabase INSERT returned no rows');
 
   // Create sim_numbers entry for immediate MDN
@@ -1416,23 +1361,23 @@ async function createSimNumber(env, simId, mdn) {
   const e164 = mdn.startsWith('+1') ? mdn : mdn.startsWith('1') ? `+${mdn}` : `+1${mdn}`;
 
   // Close any existing numbers for this SIM
-  await supabasePatch(env, `sim_numbers?sim_id=eq.${simId}&valid_to=is.null`, {
+  await sbPatch(env, `sim_numbers?sim_id=eq.${simId}&valid_to=is.null`, {
     valid_to: new Date().toISOString(),
   });
 
   // Insert new number
-  await supabaseInsert(env, 'sim_numbers', [{
+  await sbPost(env, 'sim_numbers', [{
     sim_id: simId,
     e164,
     valid_from: new Date().toISOString(),
     valid_to: null,
     verified_at: new Date().toISOString(), // Pre-verified (no SMS verification needed)
     verification_status: 'verified',
-  }]);
+  }], { prefer: 'return=representation' });
 }
 
 async function upsertSimError(env, iccid, errorMessage, vendor = 'helix') {
-  const existing = await supabaseSelect(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+  const existing = await sbGet(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
   const payload = {
     status: 'error',
     last_activation_error: `Activation failed: ${errorMessage}`,
@@ -1440,19 +1385,19 @@ async function upsertSimError(env, iccid, errorMessage, vendor = 'helix') {
     carrier: 'att',
   };
   if (existing?.[0]?.id) {
-    await supabasePatch(env, `sims?id=eq.${existing[0].id}`, payload);
+    await sbPatch(env, `sims?id=eq.${existing[0].id}`, payload);
   } else {
-    await supabaseInsert(env, 'sims', [{ iccid, ...payload }]);
+    await sbPost(env, 'sims', [{ iccid, ...payload }], { prefer: 'return=representation' });
   }
 }
 
 async function assignSimToReseller(env, resellerId, simId) {
-  const existing = await supabaseSelect(
+  const existing = await sbGet(
     env,
     `reseller_sims?select=reseller_id&reseller_id=eq.${resellerId}&sim_id=eq.${simId}&limit=1`
   );
   if (existing.length) return;
-  await supabaseInsert(env, 'reseller_sims', [{ reseller_id: resellerId, sim_id: simId, active: true }]);
+  await sbPost(env, 'reseller_sims', [{ reseller_id: resellerId, sim_id: simId, active: true }], { prefer: 'return=representation' });
 }
 
 /* ── Carrier API logging ───────────────────────────────────────────────────── */
