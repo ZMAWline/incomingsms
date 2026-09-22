@@ -16,6 +16,7 @@ const read = (...p) => fs.readFileSync(path.join(__dirname, '..', ...p), 'utf8')
 
 const MDN_ROTATOR = read('src', 'mdn-rotator', 'index.js');
 const FINALIZER = read('src', 'details-finalizer', 'index.js');
+const PORTIN_POLLER = read('src', 'details-finalizer', 'atomic-portin-poller.mjs');
 const FINALIZER_TOML = read('src', 'details-finalizer', 'wrangler.toml');
 const BULK_ACTIVATOR = read('src', 'bulk-activator', 'index.js');
 const DASHBOARD_SRC = read('src', 'dashboard', 'index.js');
@@ -127,11 +128,11 @@ test('details-finalizer runs the ATOMIC port-in status finalizer every tick (man
 });
 
 test('runAtomicPortinStatusFinalizer polls only vendor=atomic, status=provisioning, port_in_pending=true SIMs', () => {
-  const start = FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer');
+  const start = PORTIN_POLLER.indexOf('async function runAtomicPortinStatusFinalizer');
   assert.ok(start > 0, 'finalizer function defined');
-  const end = FINALIZER.indexOf('/* ── Rotation Review', start);
+  const end = PORTIN_POLLER.length;
   assert.ok(end > start, 'function body bounded');
-  const fn = FINALIZER.slice(start, end);
+  const fn = PORTIN_POLLER.slice(start, end);
 
   assert.match(fn, /vendor=eq\.atomic&status=eq\.provisioning&port_in_pending=eq\.true/);
   assert.match(fn, /env\.MDN_ROTATOR\.fetch\(url/, 'reaches ATOMIC only via the mdn-rotator service binding');
@@ -150,23 +151,23 @@ function terminalReasons(src) {
 }
 
 test('details-finalizer treats exactly 948/910/951 as terminal, each with a reason', () => {
-  const reasons = terminalReasons(FINALIZER);
+  const reasons = terminalReasons(PORTIN_POLLER);
   assert.deepEqual(Object.keys(reasons).sort(), ['910', '948', '951']);
   for (const [code, text] of Object.entries(reasons)) {
     assert.ok(text.length > 20, `${code} needs an operator-facing reason`);
   }
-  assert.match(FINALIZER, /TERMINAL_CODES = new Set\(Object\.keys\(TERMINAL_REASONS\)\)/);
-  assert.match(FINALIZER, /port_in_pending: false/);
+  assert.match(PORTIN_POLLER, /TERMINAL_CODES = new Set\(Object\.keys\(TERMINAL_REASONS\)\)/);
+  assert.match(PORTIN_POLLER, /port_in_pending: false/);
 });
 
 test('details-finalizer 948 reason says the port never existed', () => {
-  assert.match(terminalReasons(FINALIZER)['948'], /never created|cancelled/i);
-  assert.match(FINALIZER, /Port Request Does Not Exist/, 'header comment documents the carrier text');
+  assert.match(terminalReasons(PORTIN_POLLER)['948'], /never created|cancelled/i);
+  assert.match(PORTIN_POLLER, /Port Request Does Not Exist/, 'header comment documents the carrier text');
 });
 
 test('details-finalizer 910 reason says the SIM is not on our ATOMIC account', () => {
-  assert.match(terminalReasons(FINALIZER)['910'], /not under our ATOMIC account/i);
-  assert.match(FINALIZER, /sim does not belong to this MVNO/, 'header comment documents the carrier text');
+  assert.match(terminalReasons(PORTIN_POLLER)['910'], /not under our ATOMIC account/i);
+  assert.match(PORTIN_POLLER, /sim does not belong to this MVNO/, 'header comment documents the carrier text');
 });
 
 // 951 carries Result.reasonCode="CT" and embeds the real cause in the
@@ -174,31 +175,31 @@ test('details-finalizer 910 reason says the SIM is not on our ATOMIC account', (
 // number required or incorrect"). A rejection cannot clear itself by polling,
 // so it must stop rather than poll forever.
 test('details-finalizer 951 reason says the port was rejected and needs resubmission', () => {
-  const reason = terminalReasons(FINALIZER)['951'];
+  const reason = terminalReasons(PORTIN_POLLER)['951'];
   assert.match(reason, /rejected/i);
   assert.match(reason, /resubmit/i);
-  assert.match(FINALIZER, /statusReasonDescription/, 'header comment documents the embedded-reason format');
+  assert.match(PORTIN_POLLER, /statusReasonDescription/, 'header comment documents the embedded-reason format');
 });
 
 test('details-finalizer terminal log line carries the carrier description', () => {
-  assert.match(FINALIZER, /TERMINAL - \$\{reason\} \(carrier said: \$\{description\}\)/);
+  assert.match(PORTIN_POLLER, /TERMINAL - \$\{reason\} \(carrier said: \$\{description\}\)/);
 });
 
 test('details-finalizer auto-finalizes statusCode 00 + reasonCode CO by subscriber inquiry', () => {
-  const fnBody = FINALIZER.slice(
-    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer'),
-    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer') + 7000
+  const fnBody = PORTIN_POLLER.slice(
+    PORTIN_POLLER.indexOf('async function runAtomicPortinStatusFinalizer'),
+    PORTIN_POLLER.length
   );
-  assert.match(FINALIZER, /async function finalizeCompletedAtomicPortin/);
-  assert.match(FINALIZER, /\/atomic-inquiry\?secret=.*iccid=/);
+  assert.match(PORTIN_POLLER, /async function finalizeCompletedAtomicPortin/);
+  assert.match(PORTIN_POLLER, /\/atomic-inquiry\?secret=.*iccid=/);
   assert.match(fnBody, /finalizeCompletedAtomicPortin\(env, sim\)/);
   assert.match(fnBody, /Auto-finalized from ATOMIC subsriberInquiry/);
 });
 
 test('details-finalizer completed port-in finalization writes active SIM fields and stops polling', () => {
-  const helperBody = FINALIZER.slice(
-    FINALIZER.indexOf('async function finalizeCompletedAtomicPortin'),
-    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer')
+  const helperBody = PORTIN_POLLER.slice(
+    PORTIN_POLLER.indexOf('async function finalizeCompletedAtomicPortin'),
+    PORTIN_POLLER.indexOf('async function runAtomicPortinStatusFinalizer')
   );
   assert.match(helperBody, /status: 'active'/);
   assert.match(helperBody, /port_in_pending: false/);
@@ -212,45 +213,45 @@ test('details-finalizer completed port-in finalization writes active SIM fields 
 });
 
 test('details-finalizer does not clear port_in_pending before completed inquiry finalization succeeds', () => {
-  const completedBranch = FINALIZER.slice(
-    FINALIZER.indexOf('} else if (isCompleted) {'),
-    FINALIZER.indexOf('} else {', FINALIZER.indexOf('} else if (isCompleted) {'))
+  const completedBranch = PORTIN_POLLER.slice(
+    PORTIN_POLLER.indexOf('} else if (isCompleted) {'),
+    PORTIN_POLLER.indexOf('} else {', PORTIN_POLLER.indexOf('} else if (isCompleted) {'))
   );
   assert.match(completedBranch, /const finalized = await finalizeCompletedAtomicPortin\(env, sim\)/);
   assert.doesNotMatch(completedBranch, /supabasePatch\([^\n]*port_in_pending: false/);
 });
 
 test('details-finalizer logs operator-facing reason for terminal cases', () => {
-  assert.match(FINALIZER, /TERMINAL/);
-  assert.match(FINALIZER, /COMPLETED/);
-  assert.match(FINALIZER, /auto-finalized from subscriber inquiry/i);
+  assert.match(PORTIN_POLLER, /TERMINAL/);
+  assert.match(PORTIN_POLLER, /COMPLETED/);
+  assert.match(PORTIN_POLLER, /auto-finalized from subscriber inquiry/i);
 });
 
 test('details-finalizer auto-transitions completed ports to active/success', () => {
-  const helperBody = FINALIZER.slice(
-    FINALIZER.indexOf('async function finalizeCompletedAtomicPortin'),
-    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer')
+  const helperBody = PORTIN_POLLER.slice(
+    PORTIN_POLLER.indexOf('async function finalizeCompletedAtomicPortin'),
+    PORTIN_POLLER.indexOf('async function runAtomicPortinStatusFinalizer')
   );
   assert.match(helperBody, /status: 'active'/);
   assert.match(helperBody, /rotation_status: 'success'/);
 });
 
 test('details-finalizer records the port-in outcome for terminal and completed results before finalizing', () => {
-  assert.match(FINALIZER, /import \{ recordPortinStatusOutcome \} from '\.\.\/shared\/atomic-portin-outcomes\.mjs'/);
-  const fnBody = FINALIZER.slice(
-    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer'),
-    FINALIZER.indexOf('/* ── Rotation Review')
+  assert.match(PORTIN_POLLER, /import \{ recordPortinStatusOutcome \} from '\.\.\/shared\/atomic-portin-outcomes\.mjs'/);
+  const fnBody = PORTIN_POLLER.slice(
+    PORTIN_POLLER.indexOf('async function runAtomicPortinStatusFinalizer'),
+    PORTIN_POLLER.length
   );
-  const recordAt = fnBody.indexOf('if (isTerminalCode || isCompleted) {\n        await recordPortinStatusOutcome({');
+  const recordAt = fnBody.indexOf('if (isTerminalCode || isCompleted) {\n          await recordPortinStatusOutcome({');
   assert.ok(recordAt > 0, 'outcome recorded for terminal and completed results');
   assert.ok(recordAt < fnBody.indexOf('finalizeCompletedAtomicPortin(env, sim)'), 'recorded before completion finalization');
   assert.match(fnBody.slice(recordAt), /patch: \(body\) => supabasePatch\(env, `sims\?id=eq\./);
 });
 
 test('details-finalizer continues polling for non-terminal codes', () => {
-  const fnBody = FINALIZER.slice(
-    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer'),
-    FINALIZER.indexOf('/* ── Rotation Review')
+  const fnBody = PORTIN_POLLER.slice(
+    PORTIN_POLLER.indexOf('async function runAtomicPortinStatusFinalizer'),
+    PORTIN_POLLER.length
   );
   assert.match(fnBody, /terminal: false/);
   assert.match(fnBody, /continuing poll/);
