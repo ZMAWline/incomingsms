@@ -4,7 +4,8 @@
 > 2026-09-22: Brief A done. PRs #88 (`87cc4bf`) and #84 (`6584492`) are squash-merged, not deployed. 989 tests pass. #84 frontend filename gap is open. See "Brief A done".
 > Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
 > Also 2026-09-22: Brief B steps 1–2 done — `FINALIZER_RUN_SECRET` set on `bad-rental-remediator` (test + prod), and PROD redeployed with `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` as version `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`. See "Brief B steps 1–2 done" below. Next: wait 5h for one full probe cycle, read the Slack digest, get owner sign-off, then remove DRY_RUN (step 5).
-> 2026-09-22 (latest): PR #112 merged and DEPLOYED to PROD with #110, #88 and #84 — dashboard `3b69cf80`, details-finalizer `1f22a644`, reseller-portal `e6e18c80`. `deployed/prod` moved 6ec5620 → 7b18ed4. See "Deployed 2026-09-22 (ship 2)".
+> 2026-09-22: PR #112 merged and DEPLOYED to PROD with #110, #88 and #84 — dashboard `3b69cf80`, details-finalizer `1f22a644`, reseller-portal `e6e18c80`. `deployed/prod` moved 6ec5620 → 7b18ed4. See "Deployed 2026-09-22 (ship 2)".
+> 2026-09-22 (latest): PR #113 + #115 merged and DEPLOYED to PROD with #114 — dashboard `5d424a79`, details-finalizer `49029305`, bad-rental-remediator `ecb01e83`. `deployed/prod` moved 7b18ed4 → 320bd40. See "Deployed 2026-09-22 (ship 3)".
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
@@ -15,6 +16,20 @@
 > Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
 
 ---
+
+## Deployed 2026-09-22 (ship 3) — PR #113 and #115, plus #114
+
+- **PRs merged** (squash, branches deleted): #113 "Dashboard: break-glass admin login is off unless explicitly turned on" (`c5c84bc`); #115 "Port-in poller: back off and stop after 14 days instead of polling forever" (`320bd40`, merged clean, no rebase needed). #114 (bad-rental-remediator offline lifecycle paging past the 1000-row clamp, `e89dc66`) was already on main from another chat and shipped in the same range.
+- **Workers deployed** via `scripts/deploy.sh` (1036/1036 tests, DB constraint check, both dashboard syntax checks passed first):
+  - dashboard (`--env=""`): `5d424a79-f86f-457a-8be7-8fc84e737390`
+  - details-finalizer: `49029305-b1b4-46c3-b604-e2cb54fed29b`
+  - bad-rental-remediator: `ecb01e83-6dfa-4b72-adc3-bbc930bde186` (probe cron changed from `5,20,35,50 * * * *` to `2-59/3 * * * *`, per #114)
+- **Migrations:** none in range. No `src/shared` changes.
+- **Live probes:** dashboard `/` 200; bad-rental CSV with X-Api-Key 200 (18,579 bytes); live dashboard script contains "break-glass login used"; live details-finalizer script contains `ATOMIC_PORTIN_MAX_AGE_DAYS`.
+- **Cron tail:** one details-finalizer `*/5` tick at 20:25 UTC, outcome ok, zero log lines — no port-in SIM was polled, escalated, or finalized in that tick. The poller does not log skipped (backed-off) SIMs, so polled-vs-skipped counts are not observable from logs.
+- **Break-glass:** now off by default in both PROD and TEST. It works only when the break-glass secret is set to `on`.
+- **Marker:** `deployed/prod` moved `7b18ed4f1314c04582883b16959f610911e16ae2` → `320bd403a6fe957e746505e0f3f23202224ef5d5`.
+- **Rollback:** `npx wrangler rollback` in the worker's dir (`--env=""` for dashboard), or redeploy from `7b18ed4`.
 
 ## Deployed 2026-09-22 (ship 2) — PR #112 plus everything queued since the last deploy
 
