@@ -28,6 +28,7 @@ import { renderLoginPage, renderAcceptInvitePage } from '../src/dashboard/auth-p
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from '../src/dashboard/api-keys.mjs';
 import { handleAuditLogQuery } from '../src/dashboard/audit-log.mjs';
 import { handleSavedFilterRoutes } from '../src/dashboard/saved-filters.mjs';
+import { corsHeadersFor } from '../src/dashboard/cors.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -52,7 +53,7 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
     canAccess, requiredRole, resolveUser, breakGlassUser, handleAuthRoutes,
     renderLoginPage, renderAcceptInvitePage,
     resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes, handleAuditLogQuery,
-    handleSavedFilterRoutes,
+    handleSavedFilterRoutes, corsHeadersFor,
     async fetch(url, init) {
       const u = String(url);
       supabaseCalls.push({ url: u, headers: (init && init.headers) || {} });

@@ -33,7 +33,7 @@ If `src/dashboard/index.js` or `src/dashboard/public/index.html` changed in this
 
 ```bash
 node --input-type=module --check < src/dashboard/index.js   # Worker module
-node _check_frontend_js.js                                  # inline <script> blocks
+node scripts/check-frontend-js.js                                  # inline <script> blocks
 ```
 
 Check 1 alone is insufficient. If either fails, flag it immediately and do not close out quietly.

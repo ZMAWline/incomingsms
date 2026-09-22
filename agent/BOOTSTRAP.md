@@ -25,7 +25,7 @@ The `.claude/` memory files contain supplementary reference material (Helix endp
 ## The 8 Rules You Cannot Break
 
 **1. EVERY edit to `src/dashboard/index.js` MUST go through the `patch-dashboard` skill. No exceptions.**
-Before touching the dashboard for any reason — new feature, bug fix, one-line tweak, adding a column, changing a label — invoke the skill first (`Skill` tool with `skill: "patch-dashboard"`). The skill enforces the CRLF-safe Node.js patch-script workflow, the two required syntax checks (outer Worker + frontend JS via `_check_frontend_js.js`), and the explicit-`--env` deploy rule. Do not write a patch script freehand, do not use the Edit tool, do not deploy without running both syntax checks. Violations have repeatedly broken prod (see the 2026-04-15 regex-in-char-class incident where a freehand patch produced invalid regex only the frontend check would have caught). The dashboard file uses CRLF line endings and embeds ALL frontend JS inside a template literal — every backtick and `${...}` must be escaped. Standard tools silently corrupt it.
+Before touching the dashboard for any reason — new feature, bug fix, one-line tweak, adding a column, changing a label — invoke the skill first (`Skill` tool with `skill: "patch-dashboard"`). The skill enforces the CRLF-safe Node.js patch-script workflow, the two required syntax checks (outer Worker + frontend JS via `scripts/check-frontend-js.js`), and the explicit-`--env` deploy rule. Do not write a patch script freehand, do not use the Edit tool, do not deploy without running both syntax checks. Violations have repeatedly broken prod (see the 2026-04-15 regex-in-char-class incident where a freehand patch produced invalid regex only the frontend check would have caught). The dashboard file uses CRLF line endings and embeds ALL frontend JS inside a template literal — every backtick and `${...}` must be escaped. Standard tools silently corrupt it.
 
 **2. Always call `op=save` after setting an IMEI on the gateway.**
 The gateway does not persist IMEI changes across reboots unless you explicitly flush to flash. The `handleSetImei` function in `src/skyline-gateway/index.js` already does this — do not remove it.
@@ -78,7 +78,7 @@ printf "the-secret-value" | npx wrangler secret put SECRET_NAME
 ### Syntax-check the dashboard after any patch (TWO checks required — both non-negotiable)
 ```bash
 node --input-type=module --check < src/dashboard/index.js   # outer Worker module
-node _check_frontend_js.js                                   # frontend JS inside <script>
+node scripts/check-frontend-js.js                                   # frontend JS inside <script>
 ```
 Check 1 alone is insufficient — escaping bugs in the frontend JS appear as strings to Node and pass Check 1 while breaking the browser. The `patch-dashboard` skill runs both automatically; do not skip either.
 

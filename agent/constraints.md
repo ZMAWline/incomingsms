@@ -21,7 +21,7 @@ Adding a UI feature that surfaces a new DB column usually touches both: add the 
 - Run BOTH syntax checks after any dashboard edit:
   ```bash
   node --input-type=module --check < src/dashboard/index.js   # Worker module
-  node _check_frontend_js.js                                   # inline <script> blocks in public/index.html
+  node scripts/check-frontend-js.js                                   # inline <script> blocks in public/index.html
   ```
   Check 1 alone is insufficient. It validates only the Worker; a syntax error in `public/index.html` is invisible to it, so the Worker deploys fine and the browser gets broken JS — `loadData()` never runs and the page renders empty. That is the recurring "data not loading" bug.
 - Deploy with an explicit env: `cd src/dashboard && npx wrangler deploy --env=""` (prod) or `--env test`. Never bare `npx wrangler deploy`.

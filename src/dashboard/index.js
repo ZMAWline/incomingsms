@@ -8,6 +8,7 @@ import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortStat
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
 import { canAccess, requiredRole, apiKeyMayAccess, constantTimeEqual } from '../shared/portal-auth.mjs';
+import { corsHeadersFor } from './cors.mjs';
 import { resolveUser, breakGlassUser, handleAuthRoutes } from './auth-routes.mjs';
 import { renderLoginPage, renderAcceptInvitePage } from './auth-pages.mjs';
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from './api-keys.mjs';
@@ -134,12 +135,9 @@ async function handleDashboardRequest(request, env, ctx, audit) {
       }), { status: 403, headers: { 'Content-Type': 'application/json' } });
     }
 
-    // CORS headers for API requests
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    };
+    // CORS headers for API requests: only the dashboard's own origins are
+    // echoed back (see cors.mjs).
+    const corsHeaders = corsHeadersFor(request);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
