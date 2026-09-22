@@ -104,7 +104,7 @@ cd src/dashboard && npx wrangler versions upload --env test
 That uploads your build and prints a unique preview URL
 (`https://<version-id>-dashboard-test.zalmen-531.workers.dev`) **without changing
 what `dashboard-test` serves**. The version inherits every secret and binding, so
-Supabase, sessions and break-glass all work. Give that URL to the user.
+Supabase and sessions work, and break-glass works if `DASHBOARD_BREAK_GLASS=on` is set on `dashboard-test`. Give that URL to the user.
 
 **Why this is the default.** `dashboard-test` is one shared Worker with no
 locking: the last deploy wins, silently, whatever branch it came from. Several

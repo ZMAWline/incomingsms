@@ -4,6 +4,14 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-09-22 — Break-glass is off unless explicitly turned on
+
+**Decision:** `breakGlassUser` now accepts the shared `DASHBOARD_AUTH` password only while `DASHBOARD_BREAK_GLASS` is exactly `on` (any case). Unset, empty, `off`, or any other value means off. The password compare uses `constantTimeEqual`, and each break-glass login logs one `[Auth] break-glass login used` line.
+
+**Why:** The old rule was "on unless the flag says `off`", so a missing or mistyped secret silently re-opened an admin login guarded by one shared password. Fail-closed is the safer default now that PROD has a real admin account.
+
+**Consequence:** Deleting the secret no longer re-enables break-glass; setting it to `on` does. PROD had the secret set (break-glass already off), so nothing changes there. `dashboard-test` had no secret, so break-glass stops working on TEST after this deploys unless the secret is set to `on` there.
+
 ## 2026-09-22 — The anon and authenticated roles get nothing; RLS on everywhere with no policies
 
 **Decision:** `supabase/migrations/20260922_lock_down_anon.sql` drops every anon/authenticated/PUBLIC policy in `public`, revokes all their table, sequence and function grants plus the future-object defaults, and enables RLS on every table. Nothing is granted back. Applied to TEST 2026-09-22; PROD waits for owner approval.
@@ -1255,7 +1263,7 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 
 **Why:** The dashboard is the control surface for ~4,000 live billable lines. A bug in a brand-new login path with no fallback means nobody can reach production operations until a fix is written and deployed. Break-glass also solves bootstrapping: the first admin has to be created by someone, and no user exists yet.
 
-**Consequence:** Break-glass is now `off` in production and `dashboard123` is dead (verified 401). It remains available on `dashboard-test`. If a future auth change risks lockout, re-enable by deleting the `DASHBOARD_BREAK_GLASS` secret — `DASHBOARD_AUTH` is still set. Break-glass has no `dashboard_users` row, so it cannot use the Profile tab; `/auth/me` reports `has_profile: false`.
+**Consequence:** Break-glass is now `off` in production and `dashboard123` is dead (verified 401). If a future auth change risks lockout, re-enable by setting the `DASHBOARD_BREAK_GLASS` secret to `on` — `DASHBOARD_AUTH` is still set. Break-glass has no `dashboard_users` row, so it cannot use the Profile tab; `/auth/me` reports `has_profile: false`.
 
 ---
 

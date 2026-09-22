@@ -16,6 +16,7 @@
 import {
   ROLES, hashPassword, verifyPassword, foldUsername, randomHex, sha256Hex,
   signDashboardSession, readDashboardSession, isValidRole, canAccess,
+  constantTimeEqual,
 } from '../shared/portal-auth.mjs';
 
 export const AUTH_COOKIE = 'dsh_auth';
@@ -103,19 +104,20 @@ export async function resolveUser(env, request) {
   return { id: u.id, username: u.username, role: u.role, sessionId: s.id };
 }
 
-// Break-glass: the legacy shared Basic password still works while
-// DASHBOARD_BREAK_GLASS is not 'off', and counts as admin. This is the escape
-// hatch if the session path breaks, and the way the first admin bootstraps
-// itself before any user exists. Turn it off once real accounts exist.
+// Break-glass: the legacy shared Basic password works only while
+// DASHBOARD_BREAK_GLASS is exactly 'on' (any case), and counts as admin.
+// Unset or any other value means off. This is the escape hatch if the session
+// path breaks: set the flag to 'on', sign in, fix, then remove it again.
 export function breakGlassUser(env, request) {
-  if (String(env.DASHBOARD_BREAK_GLASS || '').toLowerCase() === 'off') return null;
+  if (String(env.DASHBOARD_BREAK_GLASS || '').toLowerCase() !== 'on') return null;
   if (!env.DASHBOARD_AUTH) return null;
   const header = request.headers.get('Authorization') || '';
   const [scheme, credentials] = header.split(' ');
   if (scheme !== 'Basic' || !credentials) return null;
   let decoded;
   try { decoded = atob(credentials); } catch { return null; }
-  if (decoded !== env.DASHBOARD_AUTH) return null;
+  if (!constantTimeEqual(decoded, env.DASHBOARD_AUTH)) return null;
+  console.log('[Auth] break-glass login used: ' + request.method + ' ' + new URL(request.url).pathname);
   return { id: null, username: 'break-glass', role: ROLES.ADMIN, sessionId: null };
 }
 
