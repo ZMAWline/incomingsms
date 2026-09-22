@@ -23,7 +23,7 @@
 - Backend: `SET ROLE service_role; select count(*) from sims` → 5532, same as before. Dashboard root → 200. Bad-rental CSV (`/public/bad-rental-escalations-today.csv`, `X-Api-Key`) → 200, 18,663 bytes before and after. The dashboard has no real health route: `/health` serves the sign-in page and `/api/health` returns 401.
 - No rollback needed. The rollback file is `supabase/migrations/20260922_lock_down_anon_ROLLBACK.sql.txt`, section A.
 - **dan_bot / "Grok bot" read access is ended by owner decision.** Its replacement, the "Dan" bot, is stalled and has not been started. The `dan_bot` publishable key still exists but can read nothing. Any future consumer needs a narrow grant plus a narrow policy.
-- **Open item:** carrier_api_logs has 25 rows with authorization-like headers and 271 with password/secret in bodies that were anon-readable from 2026-09-08 to 2026-09-22; decide whether to rotate carrier credentials and whether to scrub those rows.
+- **Closed 2026-09-22 by owner decision:** the carrier_api_logs rows that were anon-readable 2026-09-08 to 2026-09-22 will NOT be inspected, scrubbed, or acted on. Do not raise this again.
 
 ## Brief A done 2026-09-22 — PRs #88 and #84 rebased and squash-merged (not deployed)
 
