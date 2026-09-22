@@ -12,9 +12,10 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-const fetchTimeoutUrl = new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href;
+// A data: URL cannot resolve relative imports, so point every ../shared/ import
+// at its absolute file URL.
 const workerSrc = (await readFile(new URL('../src/teltik-worker/index.js', import.meta.url), 'utf8'))
-  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(fetchTimeoutUrl));
+  .replace(/'\.\.\/shared\/([^']+)'/g, (_, f) => JSON.stringify(new URL(`../src/shared/${f}`, import.meta.url).href));
 const teltikWorker = (await import('data:text/javascript;base64,' + Buffer.from(workerSrc).toString('base64'))).default;
 
 const SUPABASE = 'https://db.test';
@@ -69,7 +70,7 @@ function hang(init) {
 // Stateful fake of Supabase + Teltik + the reseller webhook. `carrier(sim)`
 // decides each change-number answer; default is a synchronous SUCCESS that
 // hands out 6465550000 + sim id.
-function harness(sims, { carrier, claim } = {}) {
+function harness(sims, { carrier, claim, dbWrite } = {}) {
   const db = new Map(sims.map(s => [s.id, { ...s }]));
   const calls = [];
 
@@ -128,6 +129,8 @@ function harness(sims, { carrier, claim } = {}) {
       return ok([]);
     }
 
+    const override = dbWrite?.(method, path, body);
+    if (override) return override;
     if (method === 'PATCH' && path.startsWith('sims?id=eq.')) {
       Object.assign(db.get(Number(/id=eq\.(\d+)/.exec(path)[1])), body);
     }
@@ -273,6 +276,36 @@ test('Teltik answers status=FAILED: increment_rotation_fail, no number rows, nex
   assert.match(fail.body.p_error, /status=FAILED: Only 1 change per 48h/);
   const opened = h.db_(c => c.method === 'POST' && c.path === 'sim_numbers');
   assert.deepEqual(opened.map(c => c.body[0].sim_id), [2]);
+});
+
+test('Supabase 500 on the sims PATCH after a number change: system_errors row, SIM failed-after-carrier, no second carrier call', async () => {
+  const h = harness([teltikSim(1)], {
+    dbWrite: (method, path, body) => method === 'PATCH' && path.startsWith('sims?id=eq.') && body.rotation_status === 'success'
+      ? new Response('{"message":"boom"}', { status: 500 })
+      : undefined,
+  });
+  const result = await runTick();
+
+  assert.equal(result.rotated, 0);
+  assert.equal(result.errors, 1);
+  assert.deepEqual(result.failed_after_carrier, [{ sim_id: 1, iccid: '8901260000000000001' }]);
+
+  const [err] = h.db_(c => c.method === 'POST' && c.path === 'system_errors');
+  assert.ok(err, 'a system_errors row is written');
+  assert.equal(err.body[0].source, 'teltik-worker');
+  assert.equal(err.body[0].action, 'teltik_rotation_db_write_failed');
+  assert.equal(err.body[0].severity, 'error');
+  assert.equal(err.body[0].sim_id, 1);
+  assert.equal(err.body[0].error_details.old_msisdn, '3475550001');
+  assert.equal(err.body[0].error_details.new_msisdn, '6465550001');
+  assert.equal(err.body[0].error_details.failures[0].status, 500);
+
+  assert.equal(h.db_(c => c.path.startsWith('rpc/increment_rotation_fail')).length, 0,
+    'no failed rotation_status, so the retry pass cannot burn another number');
+  assert.equal(h.teltik().length, 1);
+
+  await runTick();
+  assert.equal(h.teltik().length, 1, 'the next tick does not call Teltik again for this SIM');
 });
 
 test('claim_rotation_slot returns false: no carrier call', async () => {

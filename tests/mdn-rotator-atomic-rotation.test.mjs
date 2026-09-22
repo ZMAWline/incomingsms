@@ -427,13 +427,17 @@ test('claim_rotation_slot returns false: no carrier call and no writes', async (
   assert.deepEqual(h.sequence(), ['POST rpc/claim_rotation_slot']);
 });
 
-test('pre-swap inquiry timeout restores the claim stamp', {
-  todo: 'bug: a thrown fetch at the pre-swap inquiry skips restoreRotationStamp (src/mdn-rotator/index.js:2059)',
-}, async () => {
-  const sim = atomicSim(1);
-  const h = harness([sim], { carrier: (req, s, init) => hang(init) });
-  await runTick();
-  assert.equal(h.db.get(1).last_mdn_rotated_at, sim.last_mdn_rotated_at);
+test('pre-swap inquiry timeout restores the claim stamp, counts as a failure and moves on to the next SIM', async () => {
+  const s1 = atomicSim(1);
+  const h = harness([s1, atomicSim(2)], {
+    carrier: (req, s, init) => (s.id === 1 ? hang(init) : undefined),
+  });
+  const result = await runTick();
+  assert.equal(h.db.get(1).last_mdn_rotated_at, s1.last_mdn_rotated_at);
+  assert.equal(result.failed, 1);
+  assert.equal(result.ok_count, 1, 'the second SIM still rotates');
+  const [fail] = h.db_(c => c.path.startsWith('rpc/increment_rotation_fail'));
+  assert.match(fail.body.p_error, /pre-swap inquiry network error: .*timeout after 20ms/);
 });
 
 // ---------------------------------------------------------------
