@@ -2,6 +2,7 @@ import { pickNextPpuAddress, markAddressVerifyFailure } from '../shared/address-
 import { buildAtomicActivateRequest, buildAtomicPortInRequest, normalizePhone10, parseAtomicPortInRequest, parseCsv, pickRandomPortIdentity, isAddressRejection, validateActivationSim } from '../shared/activation-bulk.mjs';
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
+import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -187,9 +188,11 @@ export default {
         port_old_last_name: portOldLastName = '',
       } = msg.body;
 
-      // Update job item to processing
+      // Update job item to processing. Progress bookkeeping only: a failed
+      // write must not abort the rest of the batch.
       if (jobRunId) {
-        await updateJobItemStatus(env, jobRunId, iccid, 'processing', { started_at: new Date().toISOString() });
+        await updateJobItemStatus(env, jobRunId, iccid, 'processing', { started_at: new Date().toISOString() })
+          .catch(err => console.error(`[Activator] ${iccid}: processing status write failed: ${err}`));
       }
 
       try {
@@ -286,7 +289,7 @@ export default {
             error_message: errorMsg,
             attempt_increment: true,
             carrier_log_id: e?.carrierLogId || null,
-          });
+          }).catch(err => console.error(`[Activator] ${iccid}: failed status write failed: ${err}`));
         }
 
         msg.ack(); // ACK to prevent infinite retry — error recorded in DB
@@ -728,9 +731,9 @@ async function deletePoolAddress(env, addressId, reason, carrierStep) {
 
 /* ── Relay fetch helper (routes through VPS to avoid CF-to-CF blocking) ─────── */
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: {
         ...(init?.headers || {}),
@@ -738,7 +741,7 @@ function relayFetch(env, url, init) {
       },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 /* ── Activation Run / Job Item DB helpers ─────────────────────────────────── */
@@ -1235,7 +1238,7 @@ async function hxActivate(env, token, iccid, imei, runId) {
 /* ── Supabase ───────────────────────────────────────────────────────────────── */
 
 async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -1248,7 +1251,7 @@ async function supabaseSelect(env, path) {
 }
 
 async function supabasePatch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1261,7 +1264,7 @@ async function supabasePatch(env, path, body) {
 }
 
 async function supabaseDelete(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'DELETE',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1272,7 +1275,7 @@ async function supabaseDelete(env, path) {
 }
 
 async function supabaseInsert(env, table, rows) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1476,7 +1479,7 @@ async function logCarrierApiCall(env, logData) {
     created_at: new Date().toISOString(),
   };
   console.log(`[${vendor.toUpperCase()} API] ${logData.request_method} ${logData.request_url} -> ${logData.response_status} ${logData.response_ok ? 'OK' : 'FAIL'}`);
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,

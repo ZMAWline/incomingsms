@@ -5,6 +5,7 @@
 // =========================================================
 
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
+import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 
 export default {
   async fetch(request, env, ctx) {
@@ -216,7 +217,7 @@ async function runResellerSync(env, limit, force = false) {
       });
 
       if (result.ok && !result.skipped) {
-        await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
+        await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
           method: 'PATCH',
           headers: {
             apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -232,7 +233,7 @@ async function runResellerSync(env, limit, force = false) {
         // Reseller responds with a body like {"success":true,"rentalId":1401254}.
         const rentalId = parseRentalIdFromResponse(result.responseBody);
         if (rentalId != null) {
-          await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${simId}`, {
+          await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${simId}`, {
             method: 'PATCH',
             headers: {
               apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -384,7 +385,7 @@ async function resendOneSim(env, simId, source) {
   if (result.ok && !result.skipped) {
     rentalId = parseRentalIdFromResponse(result.responseBody);
     if (rentalId != null) {
-      await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${sim.id}`, {
+      await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${sim.id}`, {
         method: 'PATCH',
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -544,20 +545,20 @@ async function resyncReseller(env, resellerId) {
 
 /* ---------------- Relay ---------------- */
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 /* ---------------- Supabase ---------------- */
 
 async function sbGetArray(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "GET",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -579,7 +580,7 @@ async function sbGetArray(env, path) {
 }
 
 async function sbPatch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -666,7 +667,7 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await fetch(
+  const res = await supabaseFetch(env,
     `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
     {
       method: 'GET',
@@ -699,7 +700,7 @@ async function recordWebhookDelivery(env, delivery) {
     simId = Number.isFinite(n) ? n : null;
   }
 
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -738,7 +739,7 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
+      }, webhookFetch);
 
       lastStatus = res.status;
 

@@ -15,6 +15,7 @@
 // passed (compute) or upsertRental is explicitly called (capture).
 
 import { estDateFromDate } from './billing.js';
+import { supabaseFetch } from './fetch-timeout.mjs';
 
 // Approved forward-only cutover: rentals minted before this EST date are not
 // billed in rental mode (past invoices stay on the legacy engine, no backfill).
@@ -41,7 +42,7 @@ async function sbGetAll(env, pathWithoutLimit) {
   for (let offset = 0; ; offset += pageSize) {
     const sep = pathWithoutLimit.includes('?') ? '&' : '?';
     const url = `${env.SUPABASE_URL}/rest/v1/` + pathWithoutLimit + sep + 'limit=' + pageSize + '&offset=' + offset;
-    const resp = await fetch(url, { headers: sbHeaders(env, { Accept: 'application/json' }) });
+    const resp = await supabaseFetch(env, url, { headers: sbHeaders(env, { Accept: 'application/json' }) });
     if (!resp.ok) throw new Error('PostgREST fetch failed: ' + resp.status + ' ' + (await resp.text()));
     const batch = await resp.json();
     if (!Array.isArray(batch)) return batch;
@@ -77,7 +78,7 @@ export async function upsertRental(env, { resellerId, simId, simNumberId, vendor
     minted_at: when.toISOString(),
   };
   try {
-    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/rentals?on_conflict=reseller_id,sim_number_id`, {
+    const resp = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rentals?on_conflict=reseller_id,sim_number_id`, {
       method: 'POST',
       headers: sbHeaders(env, { Prefer: 'resolution=ignore-duplicates,return=representation' }),
       body: JSON.stringify(row),

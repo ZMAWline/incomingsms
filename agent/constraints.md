@@ -153,40 +153,32 @@ Cloudflare Workers cannot reach Cloudflare-proxied origins directly (results in 
 - QuickBooks Online (`oauth.platform.intuit.com`, `quickbooks.api.intuit.com`)
 - Any other third-party HTTP endpoint
 
-**What does NOT need relay (exempt — direct fetch is correct):**
-- Supabase (`env.SUPABASE_URL`) — Supabase is not CF-proxied
+**What does NOT need relay (exempt — no relay, but still timed; see below):**
+- Supabase (`env.SUPABASE_URL`) — Supabase is not CF-proxied; call it with `supabaseFetch(env, url, init)`
 - Service bindings (`env.MDN_ROTATOR.fetch(...)`, `env.SKYLINE_GATEWAY.fetch(...)`) — internal CF routing
 - KV/DO operations — not HTTP
 
+**Every outbound call is timed (`src/shared/fetch-timeout.mjs`).** A hung carrier, Supabase or webhook call otherwise holds the invocation until the platform kills it, and the batch is neither finished nor retried. Use `supabaseFetch` (15s), `carrierFetch` (45s) or `webhookFetch` (10s); override per worker with `FETCH_TIMEOUT_SUPABASE_MS` / `FETCH_TIMEOUT_CARRIER_MS` / `FETCH_TIMEOUT_WEBHOOK_MS`. `tests/fetch-timeout.test.mjs` fails on any bare `fetch(` in worker code outside `src/dashboard`; a deliberate exception needs `// timeout-exempt: <why>`.
+
 **Standard `relayFetch` pattern (copy exactly into each JS worker):**
 ```js
-function relayFetch(env, url, init) {
+import { carrierFetch } from '../shared/fetch-timeout.mjs';
+
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 ```
+Reseller webhooks and Slack pass `webhookFetch` as the fourth argument: `relayFetch(env, webhookUrl, init, webhookFetch)`.
 
-For TypeScript workers, add typed version:
-```ts
-function relayFetch(env: Env, url: string, init?: RequestInit): Promise<Response> {
-    if (env.RELAY_URL && env.RELAY_KEY) {
-        return fetch(`${env.RELAY_URL}/${url}`, {
-            ...init,
-            headers: { ...(init?.headers as Record<string, string> || {}), 'x-relay-key': env.RELAY_KEY },
-        });
-    }
-    return fetch(url, init);
-}
-```
-
-**Before adding a new external API call, check it by hand:**
+**Before adding a new external API call, run `npm test`** — the source scan in `tests/fetch-timeout.test.mjs` catches a bare `fetch(`. To find calls that skip the relay:
 ```bash
-grep -rn "await fetch(" src/<worker>/ | grep -v "SUPABASE_URL" | grep -v relayFetch
+grep -rn "Fetch(env, " src/<worker>/ | grep -v "SUPABASE_URL" | grep -v relayFetch
 ```
 Anything that survives that filter is a direct call to a third party and must go through `relayFetch`.
 

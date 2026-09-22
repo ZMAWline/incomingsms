@@ -1,3 +1,4 @@
+import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
 const TPLINK_BASE = 'https://wap.tplinkcloud.com/';
 
 export default {
@@ -99,7 +100,7 @@ async function fetchActiveGatewayCodes(env) {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Supabase credentials not configured on kasa-control');
   }
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways?select=code&active=eq.true`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/gateways?select=code&active=eq.true`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -110,14 +111,14 @@ async function fetchActiveGatewayCodes(env) {
   return Array.isArray(rows) ? rows.map(r => r.code).filter(Boolean) : [];
 }
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(env.RELAY_URL + '/' + url, {
+    return send(env, env.RELAY_URL + '/' + url, {
       ...init,
       headers: { ...((init && init.headers) || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 async function kasaPost(env, token, appServerUrl, body) {

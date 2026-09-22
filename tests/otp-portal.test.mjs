@@ -13,9 +13,11 @@ import { hashPassword } from '../src/otp-portal/auth.mjs';
 
 const logicUrl = new URL('../src/otp-portal/logic.mjs', import.meta.url).href;
 const authUrl = new URL('../src/otp-portal/auth.mjs', import.meta.url).href;
+const fetchTimeoutUrl = new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href;
 const workerSrc = (await readFile(new URL('../src/otp-portal/index.js', import.meta.url), 'utf8'))
   .replace("'./logic.mjs'", JSON.stringify(logicUrl))
-  .replace("'./auth.mjs'", JSON.stringify(authUrl));
+  .replace("'./auth.mjs'", JSON.stringify(authUrl))
+  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(fetchTimeoutUrl));
 const otpPortal = (await import('data:text/javascript;base64,' + Buffer.from(workerSrc).toString('base64'))).default;
 
 const realFetch = globalThis.fetch;

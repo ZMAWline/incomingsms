@@ -25,6 +25,7 @@ import {
   toTeltik10Digit,
 } from '../shared/hosting-port-status.mjs';
 import { verifyPassword, signSession, verifySession, constantTimeEqual, foldUsername } from './auth.mjs';
+import { fetchWithTimeout, supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 const AUTH_COOKIE_NAME = 'tprt_auth';
 const DEFAULT_LOGIN_TTL_MINUTES = 720; // 12h
@@ -54,13 +55,13 @@ function sbHeaders(env, extra) {
 }
 
 async function sbSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, { headers: sbHeaders(env) });
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, { headers: sbHeaders(env) });
   if (!res.ok) throw new Error('PostgREST GET ' + res.status + ': ' + (await res.text().catch(() => '')));
   return res.json();
 }
 
 async function sbRpc(env, fn, args) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
     method: 'POST',
     headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
     body: JSON.stringify(args),
@@ -75,7 +76,7 @@ async function sbRpc(env, fn, args) {
 async function sbCount(env, path) {
   const sep = path.includes('?') ? '&' : '?';
   const url = `${env.SUPABASE_URL}/rest/v1/${path}${sep}select=id&limit=1`;
-  const res = await fetch(url, { headers: sbHeaders(env, { Prefer: 'count=exact' }) });
+  const res = await supabaseFetch(env, url, { headers: sbHeaders(env, { Prefer: 'count=exact' }) });
   if (!res.ok) {
     console.log('[TeltikPortal] sbCount HTTP ' + res.status + ' for ' + url + ': ' + (await res.text().catch(() => '')).slice(0, 300));
     return null;
@@ -179,7 +180,7 @@ async function fetchHostedLines(env) {
 // reset action itself.
 async function logResetPortCarrierApi(env, { iccid, mdnDigits, httpStatus, ok, bodyJson, bodyText, error }) {
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
       method: 'POST',
       headers: sbHeaders(env, { 'Content-Type': 'application/json', Prefer: 'return=minimal' }),
       body: JSON.stringify({
@@ -222,19 +223,15 @@ async function resetPort(env, sim) {
   const fetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + url : url;
   const headers = env.RELAY_KEY ? { 'x-relay-key': env.RELAY_KEY } : {};
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error('reset-port timeout after ' + RESET_TIMEOUT_MS + 'ms')), RESET_TIMEOUT_MS);
   let res, text;
   try {
-    res = await fetch(fetchUrl, { method: 'GET', headers, signal: ctrl.signal });
+    res = await fetchWithTimeout(fetchUrl, { method: 'GET', headers }, { timeoutMs: RESET_TIMEOUT_MS, label: 'Teltik reset-port' });
     text = await res.text();
   } catch (e) {
-    clearTimeout(timer);
     const error = 'reset-port exception: ' + (e && e.message || e);
     await logResetPortCarrierApi(env, { iccid: sim.iccid, mdnDigits, httpStatus: null, ok: false, bodyJson: null, bodyText: null, error });
     return { ok: false, error };
   }
-  clearTimeout(timer);
 
   let body = null;
   try { body = JSON.parse(text); } catch { body = null; }

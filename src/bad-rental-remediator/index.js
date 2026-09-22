@@ -42,6 +42,7 @@ import {
   evaluateHealthyEvidence, proofWindow,
   HEALTHY_EVIDENCE_MODE, HEALTHY_EVIDENCE_ACTION, HEALTHY_EVIDENCE_OUTCOME, HEALTHY_EVIDENCE_REASON,
 } from './healthy-evidence.mjs';
+import { supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const LAST_MAIN_TICK_KEY = 'bad_rental_remediator_last_main_tick';
@@ -731,7 +732,7 @@ async function sweepAgedOutEscalationInboxItems(env, limit) {
   let agedOut = 0, failed = 0;
   for (const row of rows) {
     try {
-      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/pending_review_items?id=eq.' + encodeURIComponent(row.id), {
+      const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/pending_review_items?id=eq.' + encodeURIComponent(row.id), {
         method: 'PATCH',
         headers: supabaseHeaders(env, false),
         body: JSON.stringify({
@@ -2372,7 +2373,7 @@ async function claimReport(env, report) {
   const filter = '?id=eq.' + encodeURIComponent(report.id)
     + '&or=(auto_remediation_state.is.null,auto_remediation_state.eq.queued)';
   const patch = { auto_remediation_state: 'in_progress', last_auto_attempt_at: new Date().toISOString() };
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
     method: 'PATCH',
     headers: { ...supabaseHeaders(env, false), Prefer: 'return=minimal, count=exact' },
     body: JSON.stringify(patch),
@@ -2460,7 +2461,7 @@ async function applyClassificationState(env, report, classification, exec) {
         new Date(Date.now() - INTAKE_DEFER_MS + exec.intakeEligibleInMs).toISOString();
     }
   }
-  let resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
+  let resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
     method: 'PATCH',
     headers: supabaseHeaders(env, false),
     body: JSON.stringify(patch),
@@ -2472,7 +2473,7 @@ async function applyClassificationState(env, report, classification, exec) {
     // so make every occurrence loud instead of invisible.
     nextReviewAtFallbackCount++;
     const { next_review_at: _nr, ...legacy } = patch;
-    resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
+    resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
       method: 'PATCH',
       headers: supabaseHeaders(env, false),
       body: JSON.stringify(legacy),
@@ -2486,7 +2487,7 @@ async function applyClassificationState(env, report, classification, exec) {
   // terminal close so the timeline matches a manual close.
   if (patch.status === 'remediated') {
     try {
-      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+      await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_events', {
         method: 'POST',
         headers: supabaseHeaders(env, false),
         body: JSON.stringify({
@@ -2517,7 +2518,7 @@ async function applyClassificationState(env, report, classification, exec) {
   if (patch.auto_remediation_state === 'escalated') {
     try {
       const unchangedStatus = patch.status || report.status || null;
-      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+      await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_events', {
         method: 'POST',
         headers: supabaseHeaders(env, false),
         body: JSON.stringify({
@@ -2568,7 +2569,7 @@ function computeNextReviewAt(classification, exec, nowIsoStr) {
 }
 
 async function insertAttempt(env, row) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_remediation_attempts', {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_remediation_attempts', {
     method: 'POST',
     headers: supabaseHeaders(env, false),
     body: JSON.stringify(row),
@@ -2591,7 +2592,7 @@ async function recoverStaleClaims(env, thresholdMs) {
     + '&or=(last_auto_attempt_at.lt.' + encodeURIComponent(cutoff) + ',last_auto_attempt_at.is.null)'
     + '&status=in.(received,in_triage)';
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
       method: 'PATCH',
       headers: { ...supabaseHeaders(env, true), Prefer: 'return=representation,count=exact' },
       body: JSON.stringify({ auto_remediation_state: 'queued' }),
@@ -2609,7 +2610,7 @@ async function recoverStaleClaims(env, thresholdMs) {
     // raced tick, not just infer it from attempt-row gaps.
     for (const row of recovered) {
       try {
-        await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+        await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_events', {
           method: 'POST',
           headers: supabaseHeaders(env, false),
           body: JSON.stringify({
@@ -2641,7 +2642,7 @@ async function recoverStaleClaims(env, thresholdMs) {
 async function releaseClaimedToQueued(env, reportId, reportStatus) {
   const filter = '?id=eq.' + encodeURIComponent(reportId)
     + '&auto_remediation_state=eq.in_progress';
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
     method: 'PATCH',
     headers: supabaseHeaders(env, false),
     body: JSON.stringify({ auto_remediation_state: 'queued' }),
@@ -2653,7 +2654,7 @@ async function releaseClaimedToQueued(env, reportId, reportStatus) {
   // R4: same claim_recovered audit trail as recoverStaleClaims, for the
   // single-row crash-recovery path.
   try {
-    await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+    await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_events', {
       method: 'POST',
       headers: supabaseHeaders(env, false),
       body: JSON.stringify({
@@ -2776,13 +2777,13 @@ function supabaseHeaders(env, returnRep) {
 }
 
 async function supabaseGet(env, path) {
-  return fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
+  return supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + path, {
     headers: { apikey: env['SUPABASE_SERVICE_ROLE_KEY'], Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY },
   });
 }
 
 async function supabaseExactCount(env, path) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + path, {
     headers: {
       apikey: env['SUPABASE_SERVICE_ROLE_KEY'],
       Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,

@@ -1,3 +1,4 @@
+import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 // =========================================================
 // Slack notifications for Teltik gateway-port offline events.
 //
@@ -30,28 +31,24 @@
 
 const FIRST_DETECTION_TTL_S = 60 * 60; // 1h — re-alert if a line is still offline an hour later
 const STILL_OFFLINE_TTL_S = 24 * 60 * 60; // 24h — mirrors the teltik_reset_port cooldown gating this branch
-const SLACK_POST_TIMEOUT_MS = 8000;
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(env.RELAY_URL + '/' + url, {
+    return send(env, env.RELAY_URL + '/' + url, {
       ...init,
       headers: { ...(init && init.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 async function postToSlack(env, webhookUrl, payload) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error('slack post timeout after ' + SLACK_POST_TIMEOUT_MS + 'ms')), SLACK_POST_TIMEOUT_MS);
   try {
     const res = await relayFetch(env, webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: ctrl.signal,
-    });
+    }, webhookFetch);
     if (!res.ok) {
       console.log('[Remediator] Slack post failed HTTP ' + res.status);
       return { ok: false, status: res.status };
@@ -60,8 +57,6 @@ async function postToSlack(env, webhookUrl, payload) {
   } catch (err) {
     console.log('[Remediator] Slack post exception: ' + (err && err.message || err));
     return { ok: false, status: 0, error: String(err && err.message || err) };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -157,7 +152,6 @@ const DIGEST_WINDOWS = [
 const DIGEST_WINDOW_MINUTES = 15; // matches the */15 cron tick spacing
 const DIGEST_DEDUP_TTL_S = 18 * 60 * 60; // clears well before the same window recurs next day
 const FLEET_OFFLINE_LIST_CAP = 15;
-const SB_FETCH_TIMEOUT_MS = 15000;
 
 // Hour/minute/date in America/New_York, DST-aware via Intl. hour12:false can
 // report midnight as "24" in some ICU builds, so normalize with %24 the same
@@ -190,21 +184,14 @@ function sbHeaders(env) {
 }
 
 async function fetchCurrentlyOfflineLines(env) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error('fetch timeout after ' + SB_FETCH_TIMEOUT_MS + 'ms')), SB_FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/get_teltik_currently_offline', {
-      method: 'POST',
-      headers: sbHeaders(env),
-      body: JSON.stringify({}),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error('get_teltik_currently_offline HTTP ' + res.status);
-    const rows = await res.json();
-    return Array.isArray(rows) ? rows : [];
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rpc/get_teltik_currently_offline', {
+    method: 'POST',
+    headers: sbHeaders(env),
+    body: JSON.stringify({}),
+  });
+  if (!res.ok) throw new Error('get_teltik_currently_offline HTTP ' + res.status);
+  const rows = await res.json();
+  return Array.isArray(rows) ? rows : [];
 }
 
 // Overridable via TELTIK_PORTAL_URL so the link can follow a future custom

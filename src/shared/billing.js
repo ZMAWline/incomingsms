@@ -1,3 +1,4 @@
+import { supabaseFetch } from './fetch-timeout.mjs';
 // Shared billing math used by both the admin dashboard's invoice preview
 // and the reseller-portal's drill-down view. Keeping a single source of
 // truth prevents the two from drifting (the math has subtle ordering and
@@ -23,7 +24,7 @@ export function nextEstDate(yyyyMmDd) {
 }
 
 async function sbGet(env, path) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,

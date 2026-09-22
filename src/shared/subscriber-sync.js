@@ -1,3 +1,4 @@
+import { supabaseFetch } from './fetch-timeout.mjs';
 /**
  * syncSimFromHelixDetails — universal Helix → DB sync
  *
@@ -139,7 +140,7 @@ export async function syncSimFromHelixDetails(env, simRow, d, { isFinalization =
 // ── Minimal Supabase helpers (private to this module) ────────────────────────
 
 async function _select(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -150,7 +151,7 @@ async function _select(env, path) {
 }
 
 async function _patch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -163,7 +164,7 @@ async function _patch(env, path, body) {
 }
 
 async function _insert(env, table, rows) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,

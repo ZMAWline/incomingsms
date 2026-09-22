@@ -23,7 +23,6 @@
 
 import {
   TELTIK_FETCH_TIMEOUT_MS,
-  fetchWithTimeout,
   relayUrl,
   relayHeaders,
   teltikGetJson,
@@ -32,6 +31,7 @@ import {
   isInventoryMdnSource,
   MDN_SOURCE_SMS_PAYLOAD,
 } from './teltik-known-mdn.mjs';
+import { fetchWithTimeout } from './fetch-timeout.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
@@ -168,7 +168,7 @@ export async function teltikUpdateNickname(env, { mdn10, nickname } = {}, opts =
       method: 'POST',
       headers: { ...relayHeaders(env), 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
-    }, timeoutMs);
+    }, { timeoutMs });
     const text = await resp.text();
     let json = null;
     try { json = JSON.parse(text); } catch { json = null; }
