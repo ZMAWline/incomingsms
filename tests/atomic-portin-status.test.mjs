@@ -235,6 +235,18 @@ test('details-finalizer auto-transitions completed ports to active/success', () 
   assert.match(helperBody, /rotation_status: 'success'/);
 });
 
+test('details-finalizer records the port-in outcome for terminal and completed results before finalizing', () => {
+  assert.match(FINALIZER, /import \{ recordPortinStatusOutcome \} from '\.\.\/shared\/atomic-portin-outcomes\.mjs'/);
+  const fnBody = FINALIZER.slice(
+    FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer'),
+    FINALIZER.indexOf('/* ── Rotation Review')
+  );
+  const recordAt = fnBody.indexOf('if (isTerminalCode || isCompleted) {\n        await recordPortinStatusOutcome({');
+  assert.ok(recordAt > 0, 'outcome recorded for terminal and completed results');
+  assert.ok(recordAt < fnBody.indexOf('finalizeCompletedAtomicPortin(env, sim)'), 'recorded before completion finalization');
+  assert.match(fnBody.slice(recordAt), /patch: \(body\) => supabasePatch\(env, `sims\?id=eq\./);
+});
+
 test('details-finalizer continues polling for non-terminal codes', () => {
   const fnBody = FINALIZER.slice(
     FINALIZER.indexOf('async function runAtomicPortinStatusFinalizer'),
