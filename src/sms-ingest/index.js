@@ -6,6 +6,7 @@
 
 import { constantTimeEqual } from "../shared/portal-auth.mjs";
 import { supabaseFetch, webhookFetch } from "../shared/fetch-timeout.mjs";
+import { sbGet, sbPost, SupabaseError } from "../shared/supabase-rest.mjs";
 
 export default {
   async fetch(request, env, ctx) {
@@ -137,8 +138,8 @@ export default {
 
       if (inserts.length === 0) return new Response("OK", { status: 200 });
 
-      const ins = await supabaseInsert(env, "inbound_sms", inserts);
-      if (!ins.ok) return new Response(await ins.text(), { status: 500 });
+      const failed = await insertInboundSms(env, inserts);
+      if (failed) return failed;
 
       // Auto IMEI change for AT&T unsupported device messages
       for (const row of inserts) {
@@ -206,7 +207,7 @@ export default {
     }
 
     // Insert the SMS
-    const ins = await supabaseInsert(env, "inbound_sms", [
+    const failed = await insertInboundSms(env, [
       {
         sim_id: simId,
         to_number: toNumber,
@@ -224,7 +225,7 @@ export default {
       },
     ]);
 
-    if (!ins.ok) return new Response(await ins.text(), { status: 500 });
+    if (failed) return failed;
 
     // Auto IMEI change for AT&T unsupported device messages
     if (simId && isAttUnsupportedDeviceMsg(body)) {
@@ -316,45 +317,42 @@ function extractSmsBody(text) {
 // ====================
 // Supabase helpers
 // ====================
-async function supabaseGet(env, path) {
-  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "GET",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
+
+// Inserts inbound_sms rows. Returns a 500 Response carrying the PostgREST
+// error body when the insert is rejected, null on success.
+async function insertInboundSms(env, rows) {
+  try {
+    await sbPost(env, "inbound_sms", rows, { prefer: "return=minimal" });
+    return null;
+  } catch (err) {
+    if (!(err instanceof SupabaseError)) throw err;
+    return new Response(err.body, { status: 500 });
+  }
 }
 
-async function supabaseInsert(env, table, rows) {
-  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: "POST",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=minimal",
-    },
-    body: JSON.stringify(rows),
-  });
+// First row for a lookup, or null. A PostgREST error also yields null so a
+// failed lookup degrades to "not found", as the finders below always did.
+async function lookupFirst(env, path) {
+  try {
+    return await sbGet(env, path, { single: true });
+  } catch (err) {
+    if (!(err instanceof SupabaseError)) throw err;
+    return null;
+  }
 }
 
 // Check if message already exists (deduplication)
 async function checkDuplicateMessage(env, messageId) {
   const q = `inbound_sms?select=id&message_id=eq.${encodeURIComponent(messageId)}&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return false;
-  const data = await res.json();
-  return Array.isArray(data) && data.length > 0;
+  const row = await lookupFirst(env, q);
+  return !!row;
 }
 
 // Find sim_id by ICCID
 async function findSimIdByIccid(env, iccid) {
   const q = `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+  const row = await lookupFirst(env, q);
+  return row?.id ? row.id : null;
 }
 
 function dotPortToLetter(dotPort) {
@@ -442,10 +440,8 @@ async function updateSimPortAndGateway(env, simId, port, mac, gatewayIdHint = nu
 // Find sim_id by gateway_id + port (fallback when ICCID is absent)
 async function findSimIdByGatewayPort(env, gatewayId, port) {
   const q = `sims?select=id&gateway_id=eq.${gatewayId}&port=eq.${encodeURIComponent(port)}&status=neq.canceled&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+  const row = await lookupFirst(env, q);
+  return row?.id ? row.id : null;
 }
 
 // Trigger a background slot sync on mdn-rotator so the next SMS routes correctly
@@ -464,10 +460,8 @@ async function triggerGatewaySlotSync(env, gatewayId) {
 async function findGatewayIdByMac(env, mac) {
   if (!mac) return null;
   const q = `gateways?select=id&mac_address=eq.${encodeURIComponent(mac)}&active=eq.true&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+  const row = await lookupFirst(env, q);
+  return row?.id ? row.id : null;
 }
 
 // Find CURRENT number for sim_id (valid_to is null)
@@ -475,10 +469,8 @@ async function findCurrentNumberBySimId(env, simId) {
   const q = `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(
     String(simId)
   )}&valid_to=is.null&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return "";
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.e164 ? data[0].e164 : "";
+  const row = await lookupFirst(env, q);
+  return row?.e164 ? row.e164 : "";
 }
 
 // Optional helper if you ever route by number
@@ -486,28 +478,22 @@ async function findSimIdByCurrentNumber(env, e164) {
   const q = `sim_numbers?select=sim_id&e164=eq.${encodeURIComponent(
     e164
   )}&valid_to=is.null&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.sim_id ? data[0].sim_id : null;
+  const row = await lookupFirst(env, q);
+  return row?.sim_id ? row.sim_id : null;
 }
 
 async function findResellerIdBySimId(env, simId) {
   if (!simId) return null;
   const q = `reseller_sims?select=reseller_id&sim_id=eq.${encodeURIComponent(String(simId))}&active=eq.true&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.reseller_id ? data[0].reseller_id : null;
+  const row = await lookupFirst(env, q);
+  return row?.reseller_id ? row.reseller_id : null;
 }
 
 async function findWebhookUrlByResellerId(env, resellerId) {
   if (!resellerId) return null;
   const q = `reseller_webhooks?select=url&reseller_id=eq.${encodeURIComponent(String(resellerId))}&enabled=eq.true&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.url ? data[0].url : null;
+  const row = await lookupFirst(env, q);
+  return row?.url ? row.url : null;
 }
 
 // ====================
@@ -533,20 +519,10 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await supabaseFetch(env,
-    `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
-    {
-      method: 'GET',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const row = await lookupFirst(env,
+    `webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`
   );
-
-  if (!res.ok) return false;
-  const data = await res.json();
-  return Array.isArray(data) && data.length > 0;
+  return !!row;
 }
 
 async function recordWebhookDelivery(env, delivery) {

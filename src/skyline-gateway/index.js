@@ -1,4 +1,5 @@
 import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, SupabaseError } from '../shared/supabase-rest.mjs';
 // =========================================================
 // SKYLINE GATEWAY WORKER
 // Centralizes all SkyLine API calls for multi-gateway support.
@@ -391,20 +392,16 @@ async function handlePortInfo(url, env) {
   }
 
   // Also fetch SIM-to-number mapping from Supabase for this gateway
-  const simsRes = await supabaseFetch(env,
-    `${env.SUPABASE_URL}/rest/v1/sims?select=id,iccid,port,slot,status,sim_numbers(e164,verification_status)&gateway_id=eq.${encodeURIComponent(gatewayId)}&sim_numbers.valid_to=is.null&order=id.asc`,
-    {
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        Accept: "application/json",
-      },
-    }
-  );
+  // A PostgREST error leaves the map empty rather than failing the port list.
+  const sims = await sbGet(env,
+    `sims?select=id,iccid,port,slot,status,sim_numbers(e164,verification_status)&gateway_id=eq.${encodeURIComponent(gatewayId)}&sim_numbers.valid_to=is.null&order=id.asc`
+  ).catch((err) => {
+    if (err instanceof SupabaseError) return null;
+    throw err;
+  });
 
   let simMap = {};
-  if (simsRes.ok) {
-    const sims = await simsRes.json();
+  if (sims) {
     for (const sim of sims) {
       if (sim.iccid) {
         simMap[sim.iccid] = {
@@ -506,24 +503,16 @@ async function loadAndHandshake(env, gatewayId) {
 }
 
 async function loadGateway(env, gatewayId) {
-  const res = await supabaseFetch(env,
-    `${env.SUPABASE_URL}/rest/v1/gateways?select=id,code,name,host,api_port,username,password,total_ports,slots_per_port&id=eq.${encodeURIComponent(gatewayId)}&limit=1`,
-    {
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        Accept: "application/json",
-      },
-    }
-  );
-
-  if (!res.ok) {
-    console.log(`[SkylineGateway] Supabase error loading gateway: ${res.status}`);
+  try {
+    return await sbGet(env,
+      `gateways?select=id,code,name,host,api_port,username,password,total_ports,slots_per_port&id=eq.${encodeURIComponent(gatewayId)}&limit=1`,
+      { single: true }
+    );
+  } catch (err) {
+    if (!(err instanceof SupabaseError)) throw err;
+    console.log(`[SkylineGateway] Supabase error loading gateway: ${err.status}`);
     return null;
   }
-
-  const gateways = await res.json();
-  return gateways?.[0] || null;
 }
 
 /**

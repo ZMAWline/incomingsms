@@ -26,47 +26,13 @@ import {
   filterAssignmentMessages,
 } from './logic.mjs';
 import { verifyPassword, signSession, verifySession, randomHex, constantTimeEqual, foldUsername } from './auth.mjs';
-import { supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbRpc, SupabaseError } from '../shared/supabase-rest.mjs';
 
 const AUTH_COOKIE_NAME = 'otpp_auth';
 const SID_COOKIE_NAME = 'otpp_sid';
 const DEFAULT_TTL_MINUTES = 60;
 const DEFAULT_LOGIN_TTL_MINUTES = 720; // 12h
 const MAX_CLAIM_ATTEMPTS = 5;
-
-// ---------------------------------------------------------------------------
-// Supabase (PostgREST) helpers — same shape as src/storefront/index.js,
-// minus relayFetch (not needed: Supabase calls are exempt, and this worker
-// makes no other outbound HTTP call).
-// ---------------------------------------------------------------------------
-function sbHeaders(env, extra) {
-  return {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    Accept: 'application/json',
-    ...(extra || {}),
-  };
-}
-
-async function sbSelect(env, path) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, { headers: sbHeaders(env) });
-  if (!res.ok) {
-    throw new Error('PostgREST GET ' + res.status + ': ' + (await res.text().catch(() => '')));
-  }
-  return res.json();
-}
-
-// Returns { ok, status, text } so callers can distinguish "lost the race"
-// (sim_taken, raised by the RPC) from a real failure.
-async function sbRpc(env, fn, args) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
-    method: 'POST',
-    headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-    body: JSON.stringify(args),
-  });
-  const text = await res.text().catch(() => '');
-  return { ok: res.ok, status: res.status, text };
-}
 
 function chunk(arr, n) {
   const out = [];
@@ -79,7 +45,7 @@ async function selectIn(env, table, column, ids, rest) {
   const out = [];
   for (const part of chunk(ids, 150)) {
     const list = part.map((v) => encodeURIComponent(v)).join(',');
-    out.push(...(await sbSelect(env, `${table}?${column}=in.(${list})&${rest}`)));
+    out.push(...(await sbGet(env, `${table}?${column}=in.(${list})&${rest}`)));
   }
   return out;
 }
@@ -178,7 +144,7 @@ function handleLogout() {
 // aren't already spoken for (by a paying customer or another otp-portal
 // session). Mirrors storefront's availableSims() query shape.
 async function fetchCandidatePool(env) {
-  const pool = await sbSelect(env, 'shop_pool?select=sim_id');
+  const pool = await sbGet(env, 'shop_pool?select=sim_id');
   const poolIds = pool.map((r) => r.sim_id);
   if (!poolIds.length) return [];
 
@@ -208,16 +174,20 @@ async function tryClaim(env, minutes) {
     if (!pick) break;
     const sessionId = randomHex(24);
     const carrier = vendorToCarrier(pick.vendor);
-    const rpc = await sbRpc(env, 'otp_portal_claim', {
-      p_session_token: sessionId,
-      p_sim_id: pick.sim_id,
-      p_e164: pick.e164,
-      p_carrier: carrier,
-      p_ttl_minutes: minutes,
-    });
-    if (rpc.ok) {
-      const assignmentId = Number(JSON.parse(rpc.text));
+    // Any PostgREST rejection (sim_taken when another claim won the race,
+    // or any other DB error) moves on to the next candidate; a timeout or
+    // network error still throws.
+    try {
+      const assignmentId = Number(await sbRpc(env, 'otp_portal_claim', {
+        p_session_token: sessionId,
+        p_sim_id: pick.sim_id,
+        p_e164: pick.e164,
+        p_carrier: carrier,
+        p_ttl_minutes: minutes,
+      }));
       return { sessionId, assignmentId };
+    } catch (err) {
+      if (!(err instanceof SupabaseError)) throw err;
     }
     candidates = candidates.filter((c) => c.sim_id !== pick.sim_id);
   }
@@ -225,14 +195,14 @@ async function tryClaim(env, minutes) {
 }
 
 async function loadAssignmentBySession(env, sessionId) {
-  const rows = await sbSelect(env,
+  const rows = await sbGet(env,
     `otp_portal_assignments?session_token=eq.${encodeURIComponent(sessionId)}` +
     '&select=sim_id,e164,carrier,assigned_at,expires_at&limit=1');
   return rows[0] || null;
 }
 
 async function loadAssignmentById(env, id) {
-  const rows = await sbSelect(env,
+  const rows = await sbGet(env,
     `otp_portal_assignments?id=eq.${id}&select=sim_id,e164,carrier,assigned_at,expires_at&limit=1`);
   return rows[0] || null;
 }
@@ -289,7 +259,7 @@ async function handleMessages(request, env) {
   const expired = Date.parse(a.expires_at) <= Date.now();
   const assignedAtMs = Date.parse(a.assigned_at);
 
-  const sms = await sbSelect(env,
+  const sms = await sbGet(env,
     `inbound_sms?sim_id=eq.${a.sim_id}` +
     `&received_at=gte.${encodeURIComponent(a.assigned_at)}` +
     '&select=to_number,from_number,body,received_at&order=received_at.desc&limit=100');

@@ -13,9 +13,11 @@ import { startVerify } from '../src/bad-rental-remediator/verify-runner.mjs';
 // absolute file: URL first (data: modules can't resolve relative specifiers).
 const sharedUrl = new URL('../src/shared/sms-availability.mjs', import.meta.url).href;
 const fetchTimeoutUrl = new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href;
+const supabaseRestUrl = new URL('../src/shared/supabase-rest.mjs', import.meta.url).href;
 const gatewaySrc = (await readFile(new URL('../src/skyline-gateway/index.js', import.meta.url), 'utf8'))
   .replace('"../shared/sms-availability.mjs"', JSON.stringify(sharedUrl))
-  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(fetchTimeoutUrl));
+  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(fetchTimeoutUrl))
+  .replace("'../shared/supabase-rest.mjs'", JSON.stringify(supabaseRestUrl));
 const skylineGateway = (await import('data:text/javascript;base64,' + Buffer.from(gatewaySrc).toString('base64'))).default;
 
 const realFetch = globalThis.fetch;

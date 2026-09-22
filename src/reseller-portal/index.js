@@ -6,6 +6,7 @@ import {
 } from '../shared/report-bad-resolver.js';
 import { buildStatusFilter } from '../shared/rental-report-status.js';
 import { supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { sbHeaders, sbGetAll, sbPost } from '../shared/supabase-rest.mjs';
 
 const COOKIE_NAME = 'rp_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
@@ -25,47 +26,12 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'Authorization, Content-Type',
 };
 
+// TODO(shared-supabase): this sbGet returns the raw Response, and about twenty
+// call sites (plus resolveRentalForReport in src/shared/report-bad-resolver.js)
+// branch on resp.ok with their own status mapping. Moving them to the shared
+// throwing sbGet is a per-call-site rewrite left for a follow-up.
 async function sbGet(env, path) {
-  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      Accept: 'application/json',
-    },
-  });
-}
-
-async function sbGetAll(env, pathWithoutLimit) {
-  const pageSize = 1000;
-  const out = [];
-  for (let offset = 0; ; offset += pageSize) {
-    const sep = pathWithoutLimit.includes('?') ? '&' : '?';
-    const url = pathWithoutLimit + sep + 'limit=' + pageSize + '&offset=' + offset;
-    const resp = await sbGet(env, url);
-    if (!resp.ok) throw new Error('PostgREST: ' + resp.status + ' ' + (await resp.text()));
-    const batch = await resp.json();
-    if (!Array.isArray(batch)) return batch;
-    out.push(...batch);
-    if (batch.length < pageSize) break;
-  }
-  return out;
-}
-
-async function sbPost(env, path, body) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error('PostgREST POST ' + res.status + ': ' + t);
-  }
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, { headers: sbHeaders(env) });
 }
 
 // --- Rate limits ---

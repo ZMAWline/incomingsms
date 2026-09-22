@@ -6,6 +6,7 @@
 
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
 
 export default {
   async fetch(request, env, ctx) {
@@ -139,7 +140,7 @@ async function runResellerSync(env, limit, force = false) {
   // the reseller's view (incident: 2026-05-09 — 71 teltik SIMs invisible after Teltik 502 outage).
   // The is.null branch is required because PostgreSQL evaluates `NULL != 'failed'` as NULL
   // (not TRUE), so a bare `neq.failed` would silently drop fresh activations with NULL status.
-  const sims = await sbGetArray(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,last_rotation_at,sim_numbers!inner(id,e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=last_notified_at.asc.nullsfirst&limit=${limit}`
   );
@@ -326,7 +327,7 @@ async function resendOneSim(env, simId, source) {
 
   // Fetch the SIM + its current number + reseller webhook in one query, mirroring runResellerSync's
   // select shape (line 59-62) but constrained to a single sim_id.
-  const rows = await sbGetArray(
+  const rows = await sbGet(
     env,
     `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_mdn_rotated_at,last_rotation_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))` +
     `&id=eq.${encodeURIComponent(simId)}` +
@@ -426,7 +427,7 @@ async function resendOneSim(env, simId, source) {
 // offline, and offlineSince keeps a second outage on the same day from being
 // dropped as a duplicate of the first.
 async function sendOfflineForSim(env, simId, reason, offlineSince) {
-  const rows = await sbGetArray(
+  const rows = await sbGet(
     env,
     `sims?select=id,iccid,status,vendor,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))` +
     `&id=eq.${encodeURIComponent(simId)}` +
@@ -497,7 +498,7 @@ async function resyncReseller(env, resellerId) {
   const pageSize = 1000;
   const allRows = [];
   for (let offset = 0; ; offset += pageSize) {
-    const page = await sbGetArray(
+    const page = await sbGet(
       env,
       `reseller_sims?select=sim_id&reseller_id=eq.${encodeURIComponent(resellerId)}&active=eq.true&order=sim_id.asc&limit=${pageSize}&offset=${offset}`
     );
@@ -555,47 +556,6 @@ function relayFetch(env, url, init, send = carrierFetch) {
   return send(env, url, init);
 }
 
-/* ---------------- Supabase ---------------- */
-
-async function sbGetArray(env, path) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "GET",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-
-  const text = await res.text();
-  let data;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { raw: text };
-  }
-
-  if (!res.ok) throw new Error(`Supabase ${res.status}: ${JSON.stringify(data)}`);
-  if (!Array.isArray(data)) throw new Error(`Supabase returned non-array: ${JSON.stringify(data)}`);
-  return data;
-}
-
-async function sbPatch(env, path, body) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'PATCH',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Supabase PATCH ${res.status}: ${t}`);
-  }
-}
-
 /* ---------------- Offline retry sweep ---------------- */
 // Iterates webhook_deliveries rows where event_type='number.offline' AND status='failed'
 // AND created_at within the last 24h. Re-posts each one with the original message_id
@@ -603,7 +563,7 @@ async function sbPatch(env, path, body) {
 
 async function runOfflineRetrySweep(env) {
   const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const failed = await sbGetArray(env,
+  const failed = await sbGet(env,
     `webhook_deliveries?select=id,webhook_url,payload,attempts,reseller_id,message_id` +
     `&event_type=eq.number.offline&status=eq.failed` +
     `&created_at=gte.${encodeURIComponent(since)}` +
