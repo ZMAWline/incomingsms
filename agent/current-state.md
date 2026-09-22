@@ -1,6 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
+> Also 2026-09-22: Offline SIM lifecycle on branch `unassign-offline-sims-from-reseller`. New hourly cron on `bad-rental-remediator`, gated by `OFFLINE_LIFECYCLE_ENABLED` (defaults off). Migration `20260922_sim_offline_lifecycle.sql` NOT applied to TEST or PROD; nothing deployed.
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
@@ -9,6 +10,70 @@
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
 ---
+
+## Session 2026-09-22 — Offline SIM lifecycle (branch `unassign-offline-sims-from-reseller`)
+
+A Teltik-hosted line that goes offline used to stay `reseller_sims.active=true`,
+so the reseller kept counting our dead line as a broken rental. The offline
+signal (`hosting_port_status_checks`) now drives three coupled effects.
+
+**On a confirmed outage** (2 consecutive `offline` checks, `offline_state='online'`):
+pause rotation, send `number.offline` (`reason=line_offline`, no `replaced_by`),
+set `reseller_sims.active=false`, latch `offline_state='offline'`.
+
+**On a confirmed recovery** (latest check `online`, `offline_state='offline'`):
+restore `reseller_sims.active=true` FIRST (every webhook sender resolves the
+reseller through the active assignment), un-pause rotation, then either re-send
+`number.online` for the SAME number (inside the current rotation window) or
+force-rotate to a fresh one (new window). Latch back to `online`.
+
+Rotation window: teltik = `last_mdn_rotated_at + rotation_interval_hours > now`;
+atomic/helix = same America/New_York calendar day as now. Inside the window we
+NEVER call change-number: for Teltik the carrier rejects it inside 48h
+(`status=FAILED`) and the rejection increments `rotation_fail_count`.
+
+**Where it runs.** `bad-rental-remediator`, new hourly cron `0 * * * *`, own
+branch in `scheduled()`, own KV summary key
+(`bad_rental_remediator_last_offline_lifecycle_tick`, surfaced in `/status`).
+Manual trigger: `POST /offline-lifecycle/run?secret=$ADMIN_RUN_SECRET`.
+Decisions are pure in `src/shared/offline-lifecycle.mjs`; IO is in
+`src/bad-rental-remediator/offline-lifecycle.mjs`.
+
+**Env vars** (plain vars on `bad-rental-remediator`, none are secrets):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `OFFLINE_LIFECYCLE_ENABLED` | unset (off) | `"true"` arms the tick. Anything else makes the hourly tick log one line and return. |
+| `OFFLINE_LIFECYCLE_DRY_RUN` | unset | `"true"` decides but writes nothing: no probe, no webhook, no rotation, no PATCH. Posts the intended-action list to `SLACK_WEBHOOK_URL`. |
+| `OFFLINE_LIFECYCLE_PROBE_LIMIT` | 100 | port-status probes per tick. A KV cursor advances each tick so the candidate set is covered over several hours. |
+| `OFFLINE_LIFECYCLE_MAX_ACTIONS` | 25 | real transitions per tick: the blast-radius cap. |
+
+**New bindings on `bad-rental-remediator`:** `TELTIK_WORKER`, `MDN_ROTATOR`
+(both `-test` in `[env.test]`). Both force-rotate through each worker's existing
+`/rotate-sim?iccid=...&force=true` route with the shared `ADMIN_RUN_SECRET`,
+the same pattern `details-finalizer#forceRotateSim` already uses. No new rotate
+endpoint was added. `reseller-sync` DID gain one new internal route,
+`POST /send-offline` (same `internalOk` guard as `/resend-online`), because it
+owns webhook sending and had no offline sender a service binding could reach.
+
+**New DB state** (`supabase/migrations/20260922_sim_offline_lifecycle.sql`,
+NOT yet applied to TEST or PROD):
+`sims.offline_state` (`'online'|'offline'`, NOT NULL DEFAULT `'online'`),
+`sims.offline_since`, `sims.offline_notified_at`, `sims.rotation_pause_reason`
+(`'host_offline'` only when the lifecycle paused rotation; NULL means an
+operator did and recovery must not touch it), `reseller_sims.deactivated_reason`
+/ `deactivated_at`, and `get_teltik_recovered_lines()` (the mirror of
+`get_teltik_currently_offline`). `claim_rotation_slot` still does not exist in
+TEST; apply it there too or the force-rotate leg cannot be exercised.
+
+**Safety rails:** default-off flag, dry run, per-tick action cap, 2-check
+confirm plus the `offline_state` latch (one notification per outage, not one per
+tick), a 1h per-SIM recovery cooldown, `port_in_pending` SIMs skipped entirely,
+and the rule that a read failure is `error` and never `offline`, so a Teltik API
+outage cannot mass-unassign the fleet.
+
+**Rollout order:** deploy with the flag off, run one hourly cycle with
+`OFFLINE_LIFECYCLE_DRY_RUN=true` and read the Slack digest, then enable writes.
 
 ## Session 2026-09-18 — 8 live PROD functions captured into migrations (PR #108), TEST DB partially reconciled
 

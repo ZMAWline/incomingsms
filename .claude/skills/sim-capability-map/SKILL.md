@@ -115,4 +115,12 @@ stored but not forwarded. This is generic post-rotation behavior, not Teltik-spe
 6. **Deploy set**: the workers that read/route on SIM state:
    `mdn-rotator`, `dashboard`, `teltik-worker`, `bad-rental-remediator`,
    `details-finalizer`.
-7. **Never use an em dash** anywhere (hard project rule); use commas/colons/parens.
+7. **Lifecycle state**: if the new distinction can go bad at runtime (a host port
+   dropping, a carrier suspending a line), decide what it does to the reseller
+   assignment and to rotation, and wire it into the hourly offline SIM lifecycle
+   (`src/shared/offline-lifecycle.mjs` for the decision,
+   `src/bad-rental-remediator/offline-lifecycle.mjs` for the IO). Two standing
+   rules there: a reseller-facing event must be sent BEFORE
+   `reseller_sims.active` flips to false and AFTER it flips back to true, and
+   inside the current rotation window nothing may call change-number.
+8. **Never use an em dash** anywhere (hard project rule); use commas/colons/parens.
