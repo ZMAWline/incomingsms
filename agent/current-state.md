@@ -20,6 +20,20 @@
 - Tests: 989/989 pass on each rebased branch. Both are on main but not deployed. Run `/main-deploy` to ship the dashboard Worker.
 - **Open gap in #84:** the dashboard frontend sets its own download name, so the server-side fix does not reach the UI buttons. `src/dashboard/public/index.html` still builds `invoice_<name>_<start>_<end>.csv` in the preview download and `invoice_<id>.csv` in the history download. `a.download` overrides the server filename, so QuickBooks still gets underscored names from the dashboard. This was already on the PR's base, so the rebase did not cause it. Needs a follow-up fix.
 
+## Brief B optional item done 2026-09-22 — offline lifecycle migrations applied to TEST
+
+Applied to TEST Supabase (`incomingsms-test`, ref `lwapudjjlwkskijefxdz`) only:
+`migrations/20260804_hosting_port_status_checks.sql` then
+`supabase/migrations/20260922_sim_offline_lifecycle.sql`. Verified via
+information_schema: `hosting_port_status_checks` table, 4 `sims` offline columns,
+2 `reseller_sims` columns, and `get_hosting_port_status_summary`,
+`get_recent_hosting_port_checks`, `claim_rotation_slot` all present. The
+migration header saying `claim_rotation_slot` is missing on TEST is stale.
+
+Brief B step 3 clock: dry-run version `6dcacae8` went live 2026-09-22 19:24 UTC.
+Earliest time to read the Slack digest (step 4): 2026-09-23 00:30 UTC. Step 5
+(remove `OFFLINE_LIFECYCLE_DRY_RUN`) waits for Zalmen's yes.
+
 ## Brief B steps 1–2 done 2026-09-22 — `FINALIZER_RUN_SECRET` set, dry-run deploy live
 
 Working tree was found checked out on `feat/wire-portin-outcomes` (clean, 0 commits

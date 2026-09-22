@@ -1,6 +1,6 @@
 # Brief B — turn on the Offline SIM lifecycle (PR #109)
 
-Status: OPEN. Owner: Zalmen. Created 2026-09-22 after the main-deploy run.
+Status: IN PROGRESS — steps 1–2 and the optional TEST migration done 2026-09-22; waiting on step 3 (5h probe cycle, earliest digest read 2026-09-23 00:30 UTC). Owner: Zalmen. Created 2026-09-22 after the main-deploy run.
 
 The code is live in PROD on `bad-rental-remediator` (version 89f93b91) and `dashboard` (77c607df). The PROD migration is applied. The feature is switched OFF.
 
