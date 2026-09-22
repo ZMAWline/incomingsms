@@ -76,7 +76,7 @@ This is especially critical for URL-valued secrets (SUPABASE_URL, webhook URLs) 
 - **FK disambiguation:** When a table has multiple FK relationships to another table, use explicit syntax: `sims!imei_pool_sim_id_fkey(...)`.
 - **Upsert requires:** `?on_conflict=<column>` in URL + `Prefer: resolution=merge-duplicates` header.
 - **Nested filter limit (PGRST108):** Cannot filter on a column 3+ levels deep via top-level query param. Fix: add the column to `select` and filter client-side.
-- **RLS is enabled** on all public tables. Workers use service_role key and bypass RLS automatically. If a query returns empty unexpectedly, check if you're accidentally using the anon key.
+- **RLS is enabled with no policies** on all public tables, and `anon`/`authenticated` hold no grants (`20260922_lock_down_anon.sql`; TEST applied 2026-09-22, PROD pending). Workers use the service_role key and bypass RLS. The anon key gets `401 permission denied` on every table and RPC. Never add an anon/authenticated grant or policy without a named consumer and a narrow policy; the migration test enforces an `-- anon-grant-approved:` comment.
 
 ---
 

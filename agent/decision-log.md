@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-09-22 — The anon and authenticated roles get nothing; RLS on everywhere with no policies
+
+**Decision:** `supabase/migrations/20260922_lock_down_anon.sql` drops every anon/authenticated/PUBLIC policy in `public`, revokes all their table, sequence and function grants plus the future-object defaults, and enables RLS on every table. Nothing is granted back. Applied to TEST 2026-09-22; PROD waits for owner approval.
+
+**Why:** The anon key is public by design, and no code in the repo uses it. On PROD, the 2026-09-08 migration `anon_readonly_all_except_credential_tables` (applied for a "Grok bot", also reachable through the `dan_bot` publishable key) let that key read 60+ tables. Those tables included `inbound_sms` bodies (customers' OTP codes), `carrier_api_logs` request headers and bodies, and `dashboard_sessions`. Its exclusion list missed `dashboard_sessions`. PROD API logs showed no anon traffic on 2026-09-09 or 2026-09-22. On TEST, anon had read-write policies on `sims`, `gateways`, `resellers` and 9 more tables. This restores the 2026-06-16 decision below.
+
+**Consequence:** Applying to PROD ends the Grok bot's read access. If a bot needs data again, give it a narrow, named path: a dedicated Postgres role with SELECT on specific tables/columns, or a Worker endpoint behind its own key. Do not reopen the anon role. `tests/migrations-no-anon-grants.test.mjs` fails any new migration that grants to anon/authenticated without an `-- anon-grant-approved: <reason>` comment. Rollback: `supabase/migrations/20260922_lock_down_anon_ROLLBACK.sql.txt`.
+
+---
+
 ## 2026-09-08 — ATOMIC portinStatus enum is now confirmed; the finalizer may interpret it. Workers Builds does not deploy on merge.
 
 **Decision:** (1) `runAtomicPortinStatusFinalizer` now interprets the carrier's `portinStatus` response instead of only recording it — `948`/`910` end the poll, `statusCode="00"` + `Result.reasonCode="CO"` auto-finalizes the SIM to `active` from a `subsriberInquiry`. This reverses the deliberate 2026-08 choice to stay read-only. (2) `port_in_pending` is cleared **only after** finalization succeeds, never alongside the status write. (3) Deploys of these two workers are manual `wrangler deploy`, `mdn-rotator` first.

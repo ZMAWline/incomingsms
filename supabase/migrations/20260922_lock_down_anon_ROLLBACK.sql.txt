@@ -1,0 +1,134 @@
+-- ROLLBACK for 20260922_lock_down_anon.sql. NOT auto-applied (the .txt suffix
+-- keeps the Supabase CLI from picking it up). Run it by hand, via
+-- apply_migration, only if the lockdown breaks something and you need the old
+-- access back immediately.
+--
+-- It restores the grants, policies and defaults captured live on 2026-09-22,
+-- before the lockdown. It contains two sections. Run only the section for the
+-- project you are rolling back.
+--
+-- It does NOT turn RLS back off anywhere except hosting_port_status_checks on
+-- TEST, the one table that had RLS off before.
+--
+-- Restoring the PROD section re-opens anon read access to 60+ tables,
+-- including inbound SMS bodies and carrier API logs. Prefer fixing forward
+-- (a narrow grant plus a narrow policy for the specific consumer).
+
+
+-- ===========================================================================
+-- SECTION A: PROD (lzjqegxazqlktttyybth), state captured 2026-09-22
+-- ===========================================================================
+BEGIN;
+
+-- authenticated had every table privilege on every table and view.
+GRANT ALL ON ALL TABLES IN SCHEMA public TO authenticated;
+
+-- anon had SELECT on every table and view...
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO anon;
+-- ...plus every privilege on these five tables, which were created after
+-- 2026-09-08 and picked up the default grants.
+GRANT ALL ON public.address_pool, public.address_pool_deletions, public.dashboard_api_keys,
+             public.dashboard_audit_log, public.dashboard_saved_filters TO anon;
+
+-- anon_readonly_all (SELECT, USING true) existed on every table EXCEPT these 13.
+DO $$
+DECLARE
+  t text;
+  excluded text[] := ARRAY[
+    'dashboard_invites', 'dashboard_users', 'gateways', 'otp_portal_assignments',
+    'reseller_api_keys', 'resellers', 'shop_customers', 'shop_sessions',
+    'address_pool', 'address_pool_deletions', 'dashboard_api_keys',
+    'dashboard_audit_log', 'dashboard_saved_filters'
+  ];
+BEGIN
+  FOR t IN
+    SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r' AND NOT (c.relname = ANY(excluded))
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS anon_readonly_all ON public.%I', t);
+    EXECUTE format('CREATE POLICY anon_readonly_all ON public.%I FOR SELECT TO anon USING (true)', t);
+  END LOOP;
+END $$;
+
+-- Both roles had USAGE, SELECT, UPDATE on every sequence.
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
+
+-- Function EXECUTE (SECURITY DEFINER functions were already closed; not listed).
+GRANT EXECUTE ON FUNCTION public.attempts_today(p_sim_id bigint, p_action text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.claim_address_pool_entry(p_exclude_state text, p_exclude_zip text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.claim_rotation_retry_slot(p_sim_id bigint) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.cleanup_old_sms() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.cleanup_old_webhook_deliveries() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_hosting_port_status_summary(sim_ids bigint[]) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_ledger_months() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_recent_hosting_port_checks(p_sim_ids bigint[], p_per_sim integer, p_since timestamp with time zone) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_sms_counts_24h(sim_ids bigint[]) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_sms_usage_summary(p_cycle_start date, p_today date, p_trend_days integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_teltik_currently_offline() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_teltik_daily_uptime(days_back integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.increment_rotation_fail(p_sim_id bigint, p_error text, p_today_start timestamp with time zone) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.increment_sim_sms_daily() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.list_zips_needing_refill(p_limit integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.log_sim_status_change() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.mark_verification_timeouts(timeout_minutes integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.rental_reports_touch_updated_at() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.rentals_touch_updated_at() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.reseller_rates_touch_updated_at() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.reseller_rental_rates_touch_updated_at() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.reset_gateway_imei_sync_on_suspend() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.rotate_sim_number(p_sim_id bigint, p_e164 text, p_valid_from timestamp with time zone) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.touch_updated_at() TO PUBLIC;
+
+-- Default privileges for future objects.
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, PUBLIC;
+-- supabase_admin defaults (skip if the running role cannot change them):
+-- ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated;
+-- ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated;
+-- ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, PUBLIC;
+
+COMMIT;
+
+
+-- ===========================================================================
+-- SECTION B: TEST (lwapudjjlwkskijefxdz), state captured 2026-09-22
+-- ===========================================================================
+BEGIN;
+
+-- Both roles had every privilege on every table and sequence.
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
+
+-- 12 read-write policies for anon (FOR ALL, USING true, WITH CHECK true).
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY[
+    'sims', 'gateways', 'resellers', 'sim_numbers', 'reseller_webhooks',
+    'sim_status_history', 'system_errors', 'webhook_deliveries', 'rotation_audit',
+    'inbound_sms', 'sim_edit_log', 'reseller_sims'
+  ] LOOP
+    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', 'anon_all_' || t, t);
+    EXECUTE format('CREATE POLICY %I ON public.%I FOR ALL TO anon USING (true) WITH CHECK (true)', 'anon_all_' || t, t);
+  END LOOP;
+END $$;
+
+-- hosting_port_status_checks had RLS off.
+ALTER TABLE public.hosting_port_status_checks DISABLE ROW LEVEL SECURITY;
+
+-- Function EXECUTE.
+GRANT EXECUTE ON FUNCTION public.get_sms_counts_24h(sim_ids bigint[]) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.claim_address_pool_entry(p_exclude_state text, p_exclude_zip text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.increment_rotation_fail(p_sim_id bigint, p_error text, p_today_start timestamp with time zone) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.list_zips_needing_refill(p_limit integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.claim_rotation_retry_slot(p_sim_id bigint) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_hosting_port_status_summary(sim_ids bigint[]) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_recent_hosting_port_checks(p_sim_ids bigint[], p_per_sim integer, p_since timestamp with time zone) TO anon, authenticated;
+
+-- Default privileges (same as PROD).
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, PUBLIC;
+
+COMMIT;
