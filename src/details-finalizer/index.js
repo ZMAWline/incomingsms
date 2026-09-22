@@ -20,6 +20,7 @@ import { iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
+import { recordPortinStatusOutcome } from '../shared/atomic-portin-outcomes.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
@@ -1390,6 +1391,13 @@ async function runAtomicPortinStatusFinalizer(env, limit) {
         atomic_portin_checked_at: new Date().toISOString(),
       });
       checked++;
+
+      if (isTerminalCode || isCompleted) {
+        await recordPortinStatusOutcome({
+          patch: (body) => supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, body),
+          iccid: sim.iccid, statusCode, description, result, msisdn,
+        });
+      }
 
       if (isTerminalCode) {
         await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {

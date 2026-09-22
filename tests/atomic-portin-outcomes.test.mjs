@@ -4,6 +4,7 @@ import {
   classifyPortinRequest,
   shouldCheckPortinStatus,
   classifyPortinStatus,
+  recordPortinStatusOutcome,
 } from '../src/shared/atomic-portin-outcomes.mjs';
 
 const now = '2026-09-04T12:00:00.000Z';
@@ -79,4 +80,64 @@ test('a non-complete one-shot status result does not become recurring polling', 
   });
   assert.equal(result.status, 'error');
   assert.equal(shouldCheckPortinStatus({ ...fields, ...result, now: '2026-09-05T00:00:00.000Z' }), false);
+});
+
+test('recordPortinStatusOutcome writes the completed reason to the outcome columns', async () => {
+  const writes = [];
+  const classification = await recordPortinStatusOutcome({
+    patch: async (body) => { writes.push(body); },
+    iccid: '89010000000000000001',
+    statusCode: '00',
+    description: 'Success',
+    result: { MSISDN: '9297134496', reasonCode: 'CO', reasonDescription: 'Completed' },
+    msisdn: '9297134496',
+    now,
+  });
+  assert.equal(classification, 'completed');
+  assert.deepEqual(writes, [{
+    atomic_portin_reason_code: 'CO',
+    atomic_portin_reason_description: 'Completed',
+    atomic_portin_status_attempted_at: now,
+  }]);
+});
+
+test('recordPortinStatusOutcome records a carrier rejection with its description', async () => {
+  const writes = [];
+  const description = 'Portin status fail.Conflict statusReasonCode - 8A ~ statusReasonDescription - account number incorrect';
+  const classification = await recordPortinStatusOutcome({
+    patch: async (body) => { writes.push(body); },
+    iccid: '89010000000000000001',
+    statusCode: '951',
+    description,
+    result: { reasonCode: 'CT' },
+    msisdn: '9297134496',
+    now,
+  });
+  assert.equal(classification, 'failed');
+  assert.deepEqual(writes, [{
+    atomic_portin_reason_code: 'CT',
+    atomic_portin_reason_description: description,
+    atomic_portin_status_attempted_at: now,
+  }]);
+});
+
+test('recordPortinStatusOutcome is non-fatal when the write fails', async () => {
+  const originalError = console.error;
+  const logged = [];
+  console.error = (msg) => logged.push(msg);
+  try {
+    const classification = await recordPortinStatusOutcome({
+      patch: async () => { throw new Error('Supabase PATCH 500'); },
+      iccid: '89010000000000000001',
+      statusCode: '00',
+      result: { MSISDN: '9297134496', reasonCode: 'CO', reasonDescription: 'Completed' },
+      msisdn: '9297134496',
+      now,
+    });
+    assert.equal(classification, null);
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /89010000000000000001: outcome write failed: Error: Supabase PATCH 500/);
 });

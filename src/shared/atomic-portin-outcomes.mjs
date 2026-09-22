@@ -70,3 +70,25 @@ export function classifyPortinStatus({ httpStatus, response = {}, expectedMsisdn
     reasonDescription: initiation?.reasonDescription || r.description || desc || null,
   }};
 }
+
+// Records the reason behind a terminal portinStatus result (completed or
+// failed) on the sims row. Never throws: a failed write is logged and the
+// caller's finalization continues.
+export async function recordPortinStatusOutcome({ patch, iccid, statusCode, description, result, msisdn, now = new Date().toISOString() }) {
+  try {
+    const outcome = classifyPortinStatus({
+      httpStatus: 200,
+      response: { statusCode, description, Result: result || {} },
+      expectedMsisdn: msisdn,
+    });
+    await patch({
+      atomic_portin_reason_code: outcome.primaryError?.reasonCode ?? result?.reasonCode ?? null,
+      atomic_portin_reason_description: outcome.primaryError?.reasonDescription ?? result?.reasonDescription ?? description ?? null,
+      atomic_portin_status_attempted_at: now,
+    });
+    return outcome.classification;
+  } catch (e) {
+    console.error(`[AtomicPortinOutcome] SIM ${iccid}: outcome write failed: ${e}`);
+    return null;
+  }
+}
