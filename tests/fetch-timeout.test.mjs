@@ -116,14 +116,10 @@ test('webhookFetch labels by host only: a Slack webhook path is itself the secre
 // exempt. Anything else needs `// timeout-exempt: <why>` on the line or the
 // line above.
 
-// Owned by a concurrent branch when this test landed (2026-09-22); wire its
-// calls through the helper, then remove it from this list.
-const PENDING_WORKERS = new Set(['sms-ingest']);
-
 function workerSourceFiles() {
   const out = [];
   for (const dir of fs.readdirSync(path.join(ROOT, 'src'))) {
-    if (dir === 'dashboard' || PENDING_WORKERS.has(dir)) continue;
+    if (dir === 'dashboard') continue;
     const abs = path.join(ROOT, 'src', dir);
     if (!fs.statSync(abs).isDirectory()) continue;
     for (const f of fs.readdirSync(abs)) {
