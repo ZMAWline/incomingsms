@@ -96,7 +96,7 @@ test('a deletion always writes an audit row before removing the address', () => 
     ACTIVATOR.indexOf('/* ── Relay fetch helper')
   );
   assert.ok(
-    fn.indexOf("address_pool_deletions") < fn.indexOf('supabaseDelete'),
+    fn.indexOf("address_pool_deletions") < fn.indexOf('sbDelete('),
     'audit row must be written before the delete, or a failed delete loses the reason'
   );
 });
