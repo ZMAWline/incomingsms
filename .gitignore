@@ -31,3 +31,13 @@ nul
 update-secrets.sh
 *.secret
 *.key
+
+# Ad-hoc data exports and audit artifacts.
+# These contain customer ICCID / IMEI / MSISDN data -- never commit them.
+/*.csv
+/*.xlsx
+imei-audit/
+
+# Local tooling scratch
+.hermes-backups/
+.worktrees/
