@@ -9,8 +9,10 @@
 //      (calls mdn-rotator's /atomic-inquiry via service binding since it holds ATOMIC creds)
 //   5) ATOMIC port-in status finalizer — read-only portinStatus poll for SIMs
 //      awaiting a port-in submitted via portinRequest (sims.port_in_pending=true),
-//      via mdn-rotator's /atomic-portin-status. Terminal carrier responses stop
-//      polling; completed ports auto-finalize from ATOMIC subscriber inquiry.
+//      via mdn-rotator's /atomic-portin-status. Backs off as the port ages and
+//      escalates after the max age (atomic-portin-poller.mjs). Terminal carrier
+//      responses stop polling; completed ports auto-finalize from ATOMIC
+//      subscriber inquiry.
 // =========================================================
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
@@ -18,9 +20,7 @@ import { PLAYBOOK, classifyFailure, UNCLASSIFIED_BUCKET } from '../shared/rotati
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
-import { isTeltikHosted } from '../shared/gateway-host.mjs';
-import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
-import { recordPortinStatusOutcome } from '../shared/atomic-portin-outcomes.mjs';
+import { createAtomicPortinPoller } from './atomic-portin-poller.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
@@ -1184,256 +1184,13 @@ async function runAtomicFinalizer(env, limit) {
 }
 
 /* ── ATOMIC port-in status finalizer ──────────────────────────────────────── */
-// Read-only poll of ATOMIC's portinStatus for SIMs awaiting port-in
-// completion (sims.port_in_pending = true, set by bulk-activator when a
-// portinRequest is submitted — a distinct signal from rotation_status=
-// 'mdn_pending', which runAtomicFinalizer's bucket already owns for stuck
-// swapMSISDN recovery). Talks to ATOMIC only via mdn-rotator's
-// /atomic-portin-status route (mdn-rotator holds the ATOMIC credentials, same
-// as the /atomic-inquiry call above).
-//
-// Terminal status codes that stop polling:
-// - 948 "Port Request Does Not Exist" — the port was never created or was
-//   cancelled on the carrier side. No point continuing to poll.
-// - 910 "sim does not belong to this MVNO" — the SIM/ICCID is not under our
-//   ATOMIC account. This is a configuration error, not a transient state.
-// - 951 "Portin status fail.Conflict" (Result.reasonCode=CT) — the losing
-//   carrier rejected the port. The real reason is embedded in the description
-//   as "statusReasonCode - <XX> ~ statusReasonDescription - <text>" (seen: 8A
-//   account number incorrect, 6B T-Mobile transfer PIN incorrect). Polling
-//   cannot clear a rejection — the details must be corrected and the port
-//   resubmitted — so stop and leave it for an operator.
-// - 00 with Result.reasonCode=CO (Completed) — port completed successfully.
-//   Immediately run regular ATOMIC subsriberInquiry by ICCID and auto-finalize
-//   the SIM from that response. Only clear port_in_pending after that
-//   finalization succeeds, so transient inquiry failures keep the 5-minute poll
-//   alive for retry.
-//
-// For non-terminal codes (e.g., 01 Pending, 02 In Progress, etc.), we record
-// the carrier's raw statusCode/description on the sims row every tick and
-// continue polling. The dashboard's manual Check Port-In Status button remains
-// read-only and available for operator review.
-function pickAtomicInquiryField(data, keys) {
-  const result = data?.result || {};
-  for (const key of keys) {
-    if (data && data[key] !== undefined && data[key] !== null && data[key] !== '') return data[key];
-    if (result && result[key] !== undefined && result[key] !== null && result[key] !== '') return result[key];
-  }
-  return null;
-}
-
-function normalizeAtomicMdn(value) {
-  const digits = String(value || '').replace(/\D/g, '');
-  if (digits.length === 10) return digits;
-  if (digits.length === 11 && digits.startsWith('1')) return digits.slice(1);
-  return null;
-}
-
-async function finalizeCompletedAtomicPortin(env, sim) {
-  const inqUrl = `https://mdn-rotator/atomic-inquiry?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&iccid=${encodeURIComponent(sim.iccid)}`;
-  const inqRes = await env.MDN_ROTATOR.fetch(inqUrl, { method: 'GET' });
-  if (!inqRes.ok) {
-    throw new Error(`subscriber inquiry ${inqRes.status}`);
-  }
-  const data = await inqRes.json().catch(() => ({}));
-  if (!data.ok || data.statusCode !== '00') {
-    throw new Error(`subscriber inquiry failed: ${data.description || data.statusCode || 'unknown'}`);
-  }
-
-  const attStatus = String(pickAtomicInquiryField(data, ['attStatus', 'status']) || '').trim();
-  if (attStatus && attStatus.toLowerCase() !== 'active') {
-    throw new Error(`subscriber inquiry not Active (got ${attStatus})`);
-  }
-
-  const msisdn = normalizeAtomicMdn(pickAtomicInquiryField(data, ['msisdn', 'MSISDN']));
-  const e164 = msisdn ? `+1${msisdn}` : null;
-  const patch = {
-    status: 'active',
-    status_reason: null,
-    port_in_pending: false,
-    rotation_status: 'success',
-    rotation_fail_count: 0,
-    rotation_eligible: true,
-    last_activation_error: null,
-    last_rotation_error: null,
-  };
-
-  if (msisdn) patch.msisdn = msisdn;
-  const ban = pickAtomicInquiryField(data, ['ban', 'BAN', 'attBan', 'billingAccountNumber']);
-  if (ban) patch.att_ban = String(ban);
-  const imei = pickAtomicInquiryField(data, ['imei', 'IMEI', 'BLIMEI', 'blimei', 'billingImei']);
-  if (imei) patch.imei = String(imei);
-  const activationDate = pickAtomicInquiryField(data, ['activationDate', 'activatedAt', 'activation_date']);
-  if (activationDate) {
-    const parsed = new Date(activationDate);
-    if (!isNaN(parsed.getTime())) patch.activated_at = parsed.toISOString();
-  }
-  const zipCode = pickAtomicInquiryField(data, ['zipCode', 'zip']);
-  if (zipCode) patch.activation_zip = String(zipCode);
-
-  if (e164) {
-    const openRows = await supabaseSelect(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&limit=1`);
-    const openE164 = Array.isArray(openRows) && openRows[0] ? openRows[0].e164 : null;
-    if (openE164 !== e164) {
-      await closeCurrentNumber(env, sim.id);
-      await insertNewNumber(env, sim.id, e164);
-    }
-  }
-
-  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
-
-  // Port completed: the Atomic line is live. If it is seated in a Teltik
-  // gateway, make sure Teltik's nickname is the ICCID (idempotent read → POST
-  // /v1/update-nickname → read back). Logged, never throws, never touches
-  // vendor/gateway_host/msisdn.
-  const teltikAlias = await ensureTeltikAliasAfterPortin(env, { ...sim, msisdn: msisdn || sim.msisdn });
-
-  return {
-    ok: true,
-    msisdn,
-    e164,
-    attStatus,
-    ban: ban || null,
-    imei: imei || null,
-    activated_at: patch.activated_at || null,
-    teltik_alias: teltikAlias,
-  };
-}
-
-async function ensureTeltikAliasAfterPortin(env, sim) {
-  try {
-    if (!sim || !isTeltikHosted(sim)) return null;
-    const alias = await ensureTeltikAlias(env, {
-      id: sim.id,
-      iccid: sim.iccid,
-      vendor: 'atomic',
-      current_mdn_e164: sim.msisdn || null,
-    });
-    const summary = summarizeAliasResult(alias);
-    console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: teltik alias ${alias.ok ? 'OK' : 'FAILED'} action=${alias.action} reason=${alias.reason || 'none'} host_mdn=${alias.mdn10 || 'unresolved'}`);
-    await logTeltikApiCall(env, {
-      run_id: null,
-      step: 'teltik_alias',
-      iccid: sim.iccid,
-      request_url: (alias.update && alias.update.url) || 'https://api.smsgateway.xyz/v1/update-nickname',
-      request_method: alias.update ? 'POST' : 'GET',
-      request_body: { nickname: sim.iccid, mdn: alias.mdn10 || null, action: alias.action },
-      response_status: alias.update ? alias.update.http_status : (alias.ok ? 200 : 0),
-      response_ok: !!alias.ok,
-      response_body_text: JSON.stringify({ summary, trail: alias.trail }),
-      response_body_json: summary,
-      error: alias.ok ? null : `Teltik alias not verified: ${alias.reason}`,
-    });
-    return summary;
-  } catch (e) {
-    console.error(`[Finalizer/AtomicPortinStatus] SIM ${sim && sim.iccid}: teltik alias check crashed: ${e}`);
-    return null;
-  }
-}
-
-async function runAtomicPortinStatusFinalizer(env, limit) {
-  if (!env.MDN_ROTATOR) {
-    return { processed: 0, checked: 0, message: 'mdn_rotator_binding_missing' };
-  }
-  if (!env.ADMIN_RUN_SECRET) {
-    return { processed: 0, checked: 0, message: 'admin_run_secret_missing' };
-  }
-
-  const sims = (await supabaseSelect(
-    env,
-    `sims?select=id,iccid,msisdn,gateway_host,atomic_portin_status_code,atomic_portin_checked_at&vendor=eq.atomic&status=eq.provisioning&port_in_pending=eq.true&limit=${limit}`
-  )) || [];
-  if (sims.length === 0) return { ok: true, processed: 0, checked: 0 };
-
-  let processed = 0;
-  let checked = 0;
-  let errors = 0;
-  let terminal = 0;
-  const results = [];
-
-  // Carrier statusCode -> what it means for us. The carrier's own text is kept
-  // verbatim in atomic_portin_description; these say why we stop polling.
-  const TERMINAL_REASONS = {
-    '948': 'port was never created or was cancelled on carrier side',
-    '910': 'SIM/ICCID not under our ATOMIC account',
-    '951': 'port rejected by the losing carrier — correct the details and resubmit; polling cannot clear a rejection',
-  };
-  const TERMINAL_CODES = new Set(Object.keys(TERMINAL_REASONS));
-  const COMPLETED_REASON_CODES = new Set(['CO']);
-
-  for (const sim of sims) {
-    processed++;
-    const msisdn = String(sim.msisdn || '').replace(/\D/g, '');
-    if (!/^\d{10}$/.test(msisdn)) {
-      errors++;
-      results.push({ iccid: sim.iccid, ok: false, error: 'no valid 10-digit MSISDN on file' });
-      continue;
-    }
-    try {
-      const url = `https://mdn-rotator/atomic-portin-status?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&msisdn=${encodeURIComponent(msisdn)}&iccid=${encodeURIComponent(sim.iccid)}`;
-      const res = await env.MDN_ROTATOR.fetch(url, { method: 'GET' });
-      if (!res.ok) {
-        errors++;
-        results.push({ iccid: sim.iccid, ok: false, error: `portin-status ${res.status}` });
-        continue;
-      }
-      const data = await res.json().catch(() => ({}));
-      const statusCode = data.statusCode ?? null;
-      const description = data.description ?? null;
-      const result = data.result ?? null;
-      const reasonCode = result?.reasonCode ?? null;
-      const isTerminalCode = statusCode && TERMINAL_CODES.has(String(statusCode));
-      const isCompleted = statusCode === '00' && reasonCode && COMPLETED_REASON_CODES.has(reasonCode);
-
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-        atomic_portin_status_code: statusCode,
-        atomic_portin_description: description,
-        atomic_portin_checked_at: new Date().toISOString(),
-      });
-      checked++;
-
-      if (isTerminalCode || isCompleted) {
-        await recordPortinStatusOutcome({
-          patch: (body) => supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, body),
-          iccid: sim.iccid, statusCode, description, result, msisdn,
-        });
-      }
-
-      if (isTerminalCode) {
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-          port_in_pending: false,
-        });
-        terminal++;
-        const reason = `Atomic portinStatus returned ${statusCode} — ${TERMINAL_REASONS[String(statusCode)]}`;
-        results.push({ iccid: sim.iccid, ok: true, statusCode, description, reasonCode, terminal: true, reason });
-        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: TERMINAL - ${reason} (carrier said: ${description})`);
-      } else if (isCompleted) {
-        const finalized = await finalizeCompletedAtomicPortin(env, sim);
-        terminal++;
-        results.push({
-          iccid: sim.iccid,
-          ok: true,
-          statusCode,
-          description,
-          reasonCode,
-          terminal: true,
-          finalized: true,
-          ...finalized,
-          reason: 'Port completed (reasonCode=CO). Auto-finalized from ATOMIC subsriberInquiry.',
-        });
-        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: COMPLETED - auto-finalized from subscriber inquiry`);
-      } else {
-        results.push({ iccid: sim.iccid, ok: true, statusCode, description, reasonCode, terminal: false });
-        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: statusCode=${statusCode} reasonCode=${reasonCode} — continuing poll`);
-      }
-    } catch (e) {
-      errors++;
-      results.push({ iccid: sim.iccid, ok: false, error: String(e) });
-      console.error(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: ${e}`);
-    }
-  }
-
-  return { ok: true, processed, checked, errors, terminal, results };
+// Implementation, poll schedule, and max-age escalation live in
+// atomic-portin-poller.mjs.
+function runAtomicPortinStatusFinalizer(env, limit) {
+  const poller = createAtomicPortinPoller({
+    supabaseSelect, supabasePatch, supabaseInsert, closeCurrentNumber, insertNewNumber, logTeltikApiCall,
+  });
+  return poller.runAtomicPortinStatusFinalizer(env, limit);
 }
 
 /* ── Rotation Review (daily 12:30 UTC) ────────────────────────────────────── */
