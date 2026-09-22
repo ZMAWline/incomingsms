@@ -46,7 +46,7 @@ const LINES_HARD_CAP = 20000;
 // Count-only query (Prefer: count=exact, limit=1 so no rows are actually
 // transferred). Logs and returns null on a PostgREST error or a missing
 // Content-Range, so the analytics tile shows "unknown" instead of failing.
-async function sbCount(env, path) {
+async function countOrNull(env, path) {
   const sep = path.includes('?') ? '&' : '?';
   const countPath = `${path}${sep}select=id&limit=1`;
   try {
@@ -366,7 +366,7 @@ async function fetchResetAttempts30d(env) {
     + '?action=in.(teltik_reset_port,teltik_reset_network)'
     + '&outcome=not.in.(' + outcomeExclusion + ')'
     + '&attempted_at=gte.' + encodeURIComponent(since);
-  const count = await sbCount(env, path);
+  const count = await countOrNull(env, path);
   return count == null ? null : count;
 }
 
