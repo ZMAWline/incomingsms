@@ -1,6 +1,6 @@
 # Brief A — resolve the two conflicting PRs (#88, #84)
 
-Status: OPEN. Owner: Zalmen. Created 2026-09-22 after the main-deploy run.
+Status: DONE (2026-09-22). #88 merged as `87cc4bf`, #84 merged as `6584492`, 989/989 tests. Follow-up: the #84 frontend download filenames, see agent/current-state.md. Owner: Zalmen. Created 2026-09-22 after the main-deploy run.
 
 Two open PRs hold real work but conflict with `main`:
 - **PR #88** `feat/messages-search-multi-number` — dashboard Messages search accepts several phone numbers at once.

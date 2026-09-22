@@ -1,6 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
+> 2026-09-22: Brief A done. PRs #88 (`87cc4bf`) and #84 (`6584492`) are squash-merged, not deployed. 989 tests pass. #84 frontend filename gap is open. See "Brief A done".
 > Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
@@ -11,6 +12,13 @@
 
 ---
 
+## Brief A done 2026-09-22 — PRs #88 and #84 rebased and squash-merged (not deployed)
+
+- **#88** Messages search accepts space-separated number lists → squash `87cc4bf`. One conflict, `src/dashboard/index.js` import block: kept main's auth/audit/saved-filter imports and added `splitSearchTerms`. `handleMessages` uses `splitSearchTerms(search, 10)`.
+- **#84** QBO CSV invoice filenames without separators → squash `6584492`. Rebased with no conflicts.
+- Tests: 989/989 pass on each rebased branch. Both are on main but not deployed. Run `/main-deploy` to ship the dashboard Worker.
+- **Open gap in #84:** the dashboard frontend sets its own download name, so the server-side fix does not reach the UI buttons. `src/dashboard/public/index.html` still builds `invoice_<name>_<start>_<end>.csv` in the preview download and `invoice_<id>.csv` in the history download. `a.download` overrides the server filename, so QuickBooks still gets underscored names from the dashboard. This was already on the PR's base, so the rebase did not cause it. Needs a follow-up fix.
+
 ## Deployed 2026-09-22 — offline SIM lifecycle to PROD (feature ships OFF)
 
 - **main:** `6ec5620` (tag `deployed/prod` now points here; it did not exist before).
@@ -18,7 +26,7 @@
 - **Verified:** dashboard root returns 200 (sign-in page); live dashboard script contains `offline_state`; `wrangler deployments list` shows both versions at 100%.
 - **Migration:** `supabase/migrations/20260922_sim_offline_lifecycle.sql` applied to PROD `lzjqegxazqlktttyybth` as `sim_offline_lifecycle`; all 6 columns and `get_recent_hosting_port_checks` confirmed present. NOT applied to TEST: TEST lacks `hosting_port_status_checks`, which the migration indexes and reads.
 - **New migration on main, not applied:** `migrations/20260904_atomic_portin_outcomes.sql` (from PR #79). Its module `src/shared/atomic-portin-outcomes.mjs` is not imported by any worker yet.
-- **PRs merged:** #82 (ops scripts + data-export ignores), #79 (ATOMIC port-in outcomes module). **Left open:** #80 (TrustOTP weekly invoice) — its tests assert a Friday cron, dashboard wiring and QuickBooks-worker removal that do not exist, 4 failures; #81 (specs for unbuilt features) — 6 failures, as expected. Both skipped because a red suite blocks every future deploy. #88 and #84 still conflict and await the owner.
+- **PRs merged:** #82 (ops scripts + data-export ignores), #79 (ATOMIC port-in outcomes module). **Left open:** #80 (TrustOTP weekly invoice) — its tests assert a Friday cron, dashboard wiring and QuickBooks-worker removal that do not exist, 4 failures; #81 (specs for unbuilt features) — 6 failures, as expected. Both skipped because a red suite blocks every future deploy. #88 and #84 were merged later the same day (see "Brief A done").
 - **Branches deleted:** chore/recover-ops-scripts-and-ignore-data, feat/atomic-portin-outcomes (merged), plus redesign/sims-table-v2, task/t_f479e342-brr-dashboard, fix/atomic-port-in-fields, fix/parked-teltik-recovery, claude/celtic-sims-rotation-timing-8oer9s, claude/gateway-host-awareness, claude/sim-1374-api-logs-gtamyj, feat/inc-23-dashboard-surfacing, inc-18-vendor-classifier, inc-13-imei-device-type, inc-10-teltik-import-paginate, fix/qbo-csv-filenames.
 - **Still missing:** `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod). Until set, `/send-offline` returns 401.
 - **Remaining rollout steps:** (1) set `FINALIZER_RUN_SECRET` (same value as reseller-sync's) with `printf`; (2) set `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` and let it run 5h (one full probe cycle); (3) review the Slack digest of intended actions; (4) remove `OFFLINE_LIFECYCLE_DRY_RUN` to enable for real.
