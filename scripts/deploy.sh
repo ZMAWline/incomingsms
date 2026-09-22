@@ -10,6 +10,7 @@
 #   scripts/deploy.sh <worker-name>            # deploy to production
 #   scripts/deploy.sh <worker-name> --env test # deploy to the -test preview
 #   scripts/deploy.sh --all-test               # deploy ALL workers to -test
+#   ... --allow-var-drop                       # deploy even if it deletes live vars
 #
 # <worker-name> is a directory under src/ (e.g. dashboard, mdn-rotator).
 set -euo pipefail
@@ -102,6 +103,34 @@ run_checks() {
   npm run check:db-constraints
 }
 
+# ---------------------------------------------------------------------------
+# The live-var guard
+#
+# WHY THIS EXISTS: a plain var set with `--var` lives only until the next
+# deploy that does not repeat it. On 2026-09-22 the offline-lifecycle dry-run
+# flags were dropped this way by three routine deploys. Plain vars belong in
+# wrangler.toml [vars]; this refuses a deploy that would delete one that is
+# live but not in the toml. Non-fatal if the Cloudflare API cannot be read.
+# ---------------------------------------------------------------------------
+guard_live_vars() {
+  local dir="$1"; shift
+  local env_name="" var_names=() prev="" a
+  for a in "$@"; do
+    if [[ "$prev" == "--env" ]]; then env_name="$a"; fi
+    if [[ "$a" == --env=* ]]; then env_name="${a#--env=}"; fi
+    if [[ "$prev" == "--var" ]]; then var_names+=("${a%%:*}"); fi
+    if [[ "$a" == --var=* ]]; then a="${a#--var=}"; var_names+=("${a%%:*}"); fi
+    prev="$a"
+  done
+  if ! python3 "$ROOT/scripts/check_live_vars.py" "$dir" "$env_name" "${var_names[@]}"; then
+    if [[ "$ALLOW_VAR_DROP" == "1" ]]; then
+      echo "!!! --allow-var-drop -- deploying anyway; the vars above will be deleted. !!!" >&2
+    else
+      exit 1
+    fi
+  fi
+}
+
 deploy_one() {
   local worker="$1"; shift
   local dir="$WORKERS_DIR/$worker"
@@ -109,9 +138,17 @@ deploy_one() {
     echo "ERROR: no wrangler.toml in src/$worker -- not a deployable worker" >&2
     exit 1
   fi
+  guard_live_vars "$dir" "$@"
   echo "==> Deploying $worker $*"
   (cd "$dir" && npx wrangler deploy "$@")
 }
+
+ALLOW_VAR_DROP=0
+ARGS=()
+for a in "$@"; do
+  if [[ "$a" == "--allow-var-drop" ]]; then ALLOW_VAR_DROP=1; else ARGS+=("$a"); fi
+done
+set -- "${ARGS[@]}"
 
 if [[ "${1:-}" == "--all-test" ]]; then
   run_checks

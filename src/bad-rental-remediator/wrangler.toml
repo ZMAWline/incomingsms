@@ -73,7 +73,7 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 # /status -> escalation_backlog.
 #
 # Offline SIM lifecycle (hourly `0 * * * *` branch, offline-lifecycle.mjs).
-# Plain vars, set with `wrangler deploy --var` or a [vars] block per environment;
+# Plain vars, set in the [vars] block per environment (never `--var`, which the next deploy drops);
 # none of them are secrets.
 #   OFFLINE_LIFECYCLE_ENABLED      "true" arms the tick. ANY other value (including
 #                                  unset, the default) makes the hourly tick a
@@ -94,6 +94,16 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 #                         /resend-online. Without it /send-offline returns 401.
 #     npx wrangler secret put FINALIZER_RUN_SECRET -c src/bad-rental-remediator/wrangler.toml
 #     npx wrangler secret put FINALIZER_RUN_SECRET -c src/bad-rental-remediator/wrangler.toml --env test
+
+# Offline lifecycle flags live here, not in `wrangler deploy --var`: a --var
+# is dropped by the next plain `scripts/deploy.sh` run (it was, three times, on
+# 2026-09-22). The code arms only on the exact string "true", so any other value
+# or a missing line is off.
+# DRY_RUN: remove this line to enable for real (the code treats a missing line
+# as off); set via toml so scripts/deploy.sh keeps it.
+[vars]
+OFFLINE_LIFECYCLE_ENABLED = "true"
+OFFLINE_LIFECYCLE_DRY_RUN = "true"
 
 # Service bindings used during shared-situation classification.
 # RESELLER_SYNC: resend webhook + check rental status (cancel-guard §E), plus
@@ -127,6 +137,13 @@ name = "bad-rental-remediator-test"
 
 [env.test.triggers]
 crons = []
+
+# Same flags as PROD. TEST has no crons and no SUPABASE_* secrets, so the tick
+# never runs here; the block keeps the two environments in step.
+# DRY_RUN: remove this line to enable for real; set via toml so scripts/deploy.sh keeps it.
+[env.test.vars]
+OFFLINE_LIFECYCLE_ENABLED = "true"
+OFFLINE_LIFECYCLE_DRY_RUN = "true"
 
 [[env.test.kv_namespaces]]
 binding = "REMEDIATOR_KV"
