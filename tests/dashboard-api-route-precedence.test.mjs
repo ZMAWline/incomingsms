@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 // The dispatcher now imports its auth from modules rather than defining
 // checkAuth() inline, so the sandbox is given the real implementations instead
 // of a lifted copy. Requests here carry Basic admin:test-pass, which
-// breakGlassUser accepts as admin (DASHBOARD_BREAK_GLASS is unset in env).
+// breakGlassUser accepts as admin (DASHBOARD_BREAK_GLASS is 'on' in env).
 import { canAccess, requiredRole } from '../src/shared/portal-auth.mjs';
 import { resolveUser, breakGlassUser, handleAuthRoutes } from '../src/dashboard/auth-routes.mjs';
 import { renderLoginPage, renderAcceptInvitePage } from '../src/dashboard/auth-pages.mjs';
@@ -63,6 +63,7 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
     },
     env: {
       DASHBOARD_AUTH: 'admin:test-pass',
+      DASHBOARD_BREAK_GLASS: 'on',
       SUPABASE_URL: 'https://sb.test',
       SUPABASE_SERVICE_ROLE_KEY: 'srv',
       ASSETS: {

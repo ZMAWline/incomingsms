@@ -50,9 +50,8 @@ async function handleDashboardRequest(request, env, ctx, audit) {
 
     // --- Authentication ---------------------------------------------------
     // Named users with revocable sessions. The legacy shared Basic password
-    // still works as break-glass while DASHBOARD_BREAK_GLASS !== 'off', and
-    // counts as admin — that is also how the first admin bootstraps before any
-    // account exists.
+    // works as break-glass only while DASHBOARD_BREAK_GLASS is 'on', and
+    // counts as admin — the escape hatch if the session login ever breaks.
     //
     // API keys are the third way in, for the external agent. A key resolves to
     // the same principal shape and one of the same three roles, so everything
@@ -753,7 +752,7 @@ export default {
 
 // checkAuth() lived here. Replaced by named-user sessions; the equivalent
 // shared-password check now survives only as breakGlassUser() in
-// auth-routes.mjs, which additionally honours DASHBOARD_BREAK_GLASS=off.
+// auth-routes.mjs, which only accepts it while DASHBOARD_BREAK_GLASS=on.
 // Note the old version returned TRUE when DASHBOARD_AUTH was unset — an unset
 // secret meant no authentication at all. The replacement fails closed.
 

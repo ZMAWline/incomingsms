@@ -456,8 +456,10 @@ updating. The TEST key is at `/root/.config/incomingsms/agent-api-key.test` (mod
    (5 fenced routes → 403 `api_key_denied`, `GET /api/sims` → 200,
    `POST /api/sim-action` → 400 from the handler). Pinned by
    `tests/agent-api.test.mjs` (841 tests pass).
-2. **`DASHBOARD_BREAK_GLASS` is not off on TEST**, which is how the TEST key was
-   created without a human password. PROD break-glass stays off.
+2. **`DASHBOARD_BREAK_GLASS` was unset on TEST**, which under the old default meant
+   break-glass was on; that is how the TEST key was created without a human password.
+   Since the break-glass default flip (2026-09-22), unset means off everywhere; set the
+   flag to `on` to use break-glass. PROD break-glass stays off.
 3. A throwaway TEST account `agent-api-verify` was created to exercise a real session
    and left **disabled**. Delete it whenever.
 4. ~~`dashboard_audit_log` has no retention policy. It grows without bound.~~
@@ -483,7 +485,10 @@ tab. Deployed as dashboard version `d0d68a5f`; `DASHBOARD_BREAK_GLASS=off` since
 shared password no longer works. `DASHBOARD_SESSION_SECRET` is set on both `dashboard`
 and `dashboard-test`; values are in the repo `.dev.vars` as `DASHBOARD_SESSION_SECRET_PROD`
 / `_TEST`. `DASHBOARD_AUTH` is still set on prod but inert while break-glass is off — that
-is the re-entry path if auth ever breaks (delete the `DASHBOARD_BREAK_GLASS` secret).
+is the re-entry path if auth ever breaks. Since 2026-09-22 break-glass is off unless
+`DASHBOARD_BREAK_GLASS` is exactly `on` (any case); unset or any other value is off. To
+re-enter: set the secret to `on`, sign in with the shared password, fix, then set it back
+to `off` or delete it. Every break-glass login logs `[Auth] break-glass login used`.
 
 **The finding that shaped the design:** many dashboard action routes have no HTTP method
 guard, so a bare GET performs the action (`/api/activate`, `/api/cancel`, `/api/suspend`,
