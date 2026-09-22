@@ -120,7 +120,18 @@ function resolveRate(rules, day, vendor, perVendorActive, allAttActive, fallback
 // for that bucket is chosen by tier (all-at-rate). AT&T vendors aggregate
 // into a single per-date entry when they all resolve to the same rate
 // (preserves legacy output shape for resellers with no rules).
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 export async function computeBillingBreakdown(env, { resellerId, start, end, billing_mode, cutover }) {
+  // start/end/cutover go into a PostgREST or=(...) filter below. URL encoding
+  // does not protect that spot (PostgREST decodes before parsing the list), so
+  // anything but a plain date is rejected here.
+  if (!ISO_DATE_RE.test(String(start)) || !ISO_DATE_RE.test(String(end))) {
+    throw new Error('start and end must be YYYY-MM-DD dates');
+  }
+  if (cutover !== undefined && !ISO_DATE_RE.test(String(cutover))) {
+    throw new Error('cutover must be a YYYY-MM-DD date');
+  }
   // INC-2: forward-only rental engine, dormant by default. Only the explicit
   // string 'rental' diverts here; anything else (including undefined) runs the
   // legacy EST-day / 48h-block engine below. Lazy import keeps the legacy path

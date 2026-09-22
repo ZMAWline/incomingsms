@@ -48,6 +48,8 @@ function makeSandbox(routes) {
   };
   vm.createContext(sandbox);
   const code = [
+    SRC.match(/^const UUID_RE = .*$/m)[0],
+    extractFn(SRC, 'function badRequest(corsHeaders, error) {'),
     extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
     extractFn(SRC, 'async function handleActivationRunRetry(request, env, corsHeaders) {'),
   ].join('\n\n');
@@ -55,9 +57,9 @@ function makeSandbox(routes) {
   return { sandbox, calls, bindingCalls };
 }
 
-const RUN = { id: 'run-1', source: 'json', status: 'failed' };
+const RUN = { id: '11111111-1111-4111-8111-111111111111', source: 'json', status: 'failed' };
 const ITEM = {
-  id: 'item-1', run_id: 'run-1', iccid: '89012804332468992577', imei: '359729444337382',
+  id: '22222222-2222-4222-8222-222222222222', run_id: '11111111-1111-4111-8111-111111111111', iccid: '89012804332468992577', imei: '359729444337382',
   reseller_id: 3, vendor: 'atomic', status: 'failed', attempt: 1, max_attempts: 3,
 };
 
@@ -86,14 +88,14 @@ test('retry never calls env.ACTIVATION_QUEUE directly — it has no such binding
 
 test('retry forwards eligible items to bulk-activator over the BULK_ACTIVATOR service binding', async () => {
   const { sandbox, calls } = makeSandbox([
-    ['/activation_runs?select=*&id=eq.run-1', () => new Response(JSON.stringify([RUN]), { status: 200 })],
-    ['/activation_job_items', (u) => u.includes('run_id=eq.run-1')
+    ['/activation_runs?select=*&id=eq.11111111-1111-4111-8111-111111111111', () => new Response(JSON.stringify([RUN]), { status: 200 })],
+    ['/activation_job_items', (u) => u.includes('run_id=eq.11111111-1111-4111-8111-111111111111')
       ? new Response(JSON.stringify([ITEM]), { status: 200 })
       : new Response('[]', { status: 200 })],
   ]);
 
   const bulkActivator = makeBulkActivatorBinding(() =>
-    new Response(JSON.stringify({ ok: true, retried: 1, run_id: 'run-1' }), { status: 200 }));
+    new Response(JSON.stringify({ ok: true, retried: 1, run_id: '11111111-1111-4111-8111-111111111111' }), { status: 200 }));
 
   const env = {
     SUPABASE_URL: 'https://sb.test',
@@ -102,29 +104,29 @@ test('retry forwards eligible items to bulk-activator over the BULK_ACTIVATOR se
     BULK_ACTIVATOR: bulkActivator,
   };
 
-  const fakeRequest = { json: async () => ({ run_id: 'run-1', item_ids: ['item-1'] }) };
+  const fakeRequest = { json: async () => ({ run_id: '11111111-1111-4111-8111-111111111111', item_ids: ['22222222-2222-4222-8222-222222222222'] }) };
 
   const res = await sandbox.handleActivationRunRetry(fakeRequest, env, {});
   const body = await res.json();
 
   assert.equal(res.status, 200);
-  assert.deepEqual(body, { ok: true, retried: 1, run_id: 'run-1' });
+  assert.deepEqual(body, { ok: true, retried: 1, run_id: '11111111-1111-4111-8111-111111111111' });
 
   assert.equal(bulkActivator.calls.length, 1, 'exactly one call forwarded to bulk-activator');
   assert.match(bulkActivator.calls[0].url, /^https:\/\/bulk-activator\/retry\?secret=test-secret$/);
   assert.equal(bulkActivator.calls[0].method, 'POST');
-  assert.equal(bulkActivator.calls[0].body.run_id, 'run-1');
+  assert.equal(bulkActivator.calls[0].body.run_id, '11111111-1111-4111-8111-111111111111');
   assert.deepEqual(bulkActivator.calls[0].body.items, [ITEM]);
 });
 
 test('retry returns 500 with a clear error when BULK_RUN_SECRET is not configured', async () => {
   const { sandbox } = makeSandbox([
-    ['/activation_runs?select=*&id=eq.run-1', () => new Response(JSON.stringify([RUN]), { status: 200 })],
+    ['/activation_runs?select=*&id=eq.11111111-1111-4111-8111-111111111111', () => new Response(JSON.stringify([RUN]), { status: 200 })],
     ['/activation_job_items', () => new Response(JSON.stringify([ITEM]), { status: 200 })],
   ]);
 
   const env = { SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'srv' };
-  const fakeRequest = { json: async () => ({ run_id: 'run-1', item_ids: ['item-1'] }) };
+  const fakeRequest = { json: async () => ({ run_id: '11111111-1111-4111-8111-111111111111', item_ids: ['22222222-2222-4222-8222-222222222222'] }) };
 
   const res = await sandbox.handleActivationRunRetry(fakeRequest, env, {});
   assert.equal(res.status, 500);
@@ -134,18 +136,18 @@ test('retry returns 500 with a clear error when BULK_RUN_SECRET is not configure
 
 test('retry propagates bulk-activator\'s error status and body verbatim', async () => {
   const { sandbox } = makeSandbox([
-    ['/activation_runs?select=*&id=eq.run-1', () => new Response(JSON.stringify([RUN]), { status: 200 })],
+    ['/activation_runs?select=*&id=eq.11111111-1111-4111-8111-111111111111', () => new Response(JSON.stringify([RUN]), { status: 200 })],
     ['/activation_job_items', () => new Response(JSON.stringify([ITEM]), { status: 200 })],
   ]);
 
   const bulkActivator = makeBulkActivatorBinding(() =>
-    new Response(JSON.stringify({ ok: false, error: 'Retry failed: boom', retried: 0, run_id: 'run-1' }), { status: 502 }));
+    new Response(JSON.stringify({ ok: false, error: 'Retry failed: boom', retried: 0, run_id: '11111111-1111-4111-8111-111111111111' }), { status: 502 }));
 
   const env = {
     SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'srv',
     BULK_RUN_SECRET: 'test-secret', BULK_ACTIVATOR: bulkActivator,
   };
-  const fakeRequest = { json: async () => ({ run_id: 'run-1', item_ids: ['item-1'] }) };
+  const fakeRequest = { json: async () => ({ run_id: '11111111-1111-4111-8111-111111111111', item_ids: ['22222222-2222-4222-8222-222222222222'] }) };
 
   const res = await sandbox.handleActivationRunRetry(fakeRequest, env, {});
   assert.equal(res.status, 502);
