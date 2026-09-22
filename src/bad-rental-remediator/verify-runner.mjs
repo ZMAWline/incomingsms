@@ -431,6 +431,11 @@ async function patchReport(env, reportId, patch) {
   }
 }
 
+// TODO(shared-supabase): this file builds Supabase requests inline with
+// supabaseFetch and reads the raw Response; each call site maps a failed
+// status its own way (skip, count, log). Moving to the throwing shared helpers
+// in src/shared/supabase-rest.mjs is a per-call-site rewrite left for a
+// follow-up.
 async function supabaseGet(env, path) {
   return supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + path, {
     headers: {

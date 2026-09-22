@@ -2766,6 +2766,11 @@ async function killSwitchEnabled(env) {
   }
 }
 
+// TODO(shared-supabase): this file builds Supabase requests inline with
+// supabaseFetch and reads the raw Response; each call site maps a failed
+// status its own way (skip, count, log). Moving to the throwing shared helpers
+// in src/shared/supabase-rest.mjs is a per-call-site rewrite left for a
+// follow-up.
 function supabaseHeaders(env, returnRep) {
   const h = {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,

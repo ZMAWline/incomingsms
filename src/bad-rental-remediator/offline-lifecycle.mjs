@@ -43,7 +43,7 @@ import {
   OFFLINE_PAUSE_REASON, OFFLINE_WEBHOOK_REASON, CHECK_HISTORY_WINDOW_MS,
 } from '../shared/offline-lifecycle.mjs';
 import { notifyOfflineLifecyclePlan } from './notify.mjs';
-import { supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { sbGetAll, sbPatch, sbRpc, SupabaseError } from '../shared/supabase-rest.mjs';
 
 const CHECK_SOURCE = 'bad_rental_remediator';
 // Per-SIM recovery cooldown. A line that flaps online/offline/online would
@@ -64,9 +64,6 @@ const PROBE_CONCURRENCY = 5;
 // Real transitions per tick. Every one of these can reach a carrier or a
 // reseller, so the cap is the blast-radius control the flag protects.
 const DEFAULT_MAX_ACTIONS = 25;
-// PostgREST clamps every response to max-rows (1000 on Supabase), so candidate
-// queries page through the whole set instead of asking for one big page.
-const PAGE_SIZE = 1000;
 // SIMs per get_recent_hosting_port_checks call. The RPC returns one row per
 // SIM, so this keeps each response under the 1000-row PostgREST limit.
 const CHECK_BATCH = 500;
@@ -91,58 +88,44 @@ function positiveInt(value, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-function sbHeaders(env, prefer) {
-  const h = {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-    'Content-Type': 'application/json',
-  };
-  if (prefer) h.Prefer = prefer;
-  return h;
-}
+// The reads and writes below tolerate a PostgREST error on purpose: this
+// sweep runs every cron tick, and one failed query or patch must not stop the
+// rest of the fleet. A timeout or network error still throws.
 
-// Every row of a query, read PAGE_SIZE at a time until a short page. `path`
-// must carry a stable order. Any failed page fails the whole read (empty list),
-// the same outcome a failed single query had.
-async function sbGetAll(env, path) {
-  const out = [];
-  for (let offset = 0; ; offset += PAGE_SIZE) {
-    const url = env.SUPABASE_URL + '/rest/v1/' + path + '&limit=' + PAGE_SIZE + '&offset=' + offset;
-    const resp = await supabaseFetch(env, url, { headers: sbHeaders(env) });
-    if (!resp.ok) {
-      console.log('[OfflineLifecycle] query failed HTTP ' + resp.status + ' ' + path.slice(0, 120));
-      return [];
-    }
-    const rows = await resp.json().catch(() => null);
-    if (!Array.isArray(rows)) return [];
-    out.push(...rows);
-    if (rows.length < PAGE_SIZE) return out;
-  }
-}
-
-async function sbRpc(env, fn, args) {
-  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rpc/' + fn, {
-    method: 'POST', headers: sbHeaders(env), body: JSON.stringify(args),
-  });
-  if (!resp.ok) {
-    console.log('[OfflineLifecycle] rpc ' + fn + ' failed HTTP ' + resp.status);
+// Every row of a query. `path` must carry a stable order. A failed page fails
+// the whole read (empty list), the same outcome a failed single query had.
+async function readAllOrEmpty(env, path) {
+  try {
+    return await sbGetAll(env, path);
+  } catch (err) {
+    if (!(err instanceof SupabaseError)) throw err;
+    console.log('[OfflineLifecycle] query failed HTTP ' + err.status + ' ' + path.slice(0, 120));
     return [];
   }
-  const rows = await resp.json().catch(() => null);
-  return Array.isArray(rows) ? rows : [];
 }
 
-async function sbPatch(env, path, body) {
+async function rpcRowsOrEmpty(env, fn, args) {
   try {
-    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + path, {
-      method: 'PATCH',
-      headers: sbHeaders(env, 'return=minimal'),
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) console.log('[OfflineLifecycle] PATCH failed HTTP ' + resp.status + ' ' + path.slice(0, 120));
-    return resp.ok;
+    const rows = await sbRpc(env, fn, args);
+    return Array.isArray(rows) ? rows : [];
   } catch (err) {
-    console.log('[OfflineLifecycle] PATCH exception: ' + (err && err.message || err));
+    if (!(err instanceof SupabaseError)) throw err;
+    console.log('[OfflineLifecycle] rpc ' + fn + ' failed HTTP ' + err.status);
+    return [];
+  }
+}
+
+// true when the patch landed. Never throws.
+async function patchOk(env, path, body) {
+  try {
+    await sbPatch(env, path, body, { prefer: 'return=minimal' });
+    return true;
+  } catch (err) {
+    if (err instanceof SupabaseError) {
+      console.log('[OfflineLifecycle] PATCH failed HTTP ' + err.status + ' ' + path.slice(0, 120));
+    } else {
+      console.log('[OfflineLifecycle] PATCH exception: ' + (err && err.message || err));
+    }
     return false;
   }
 }
@@ -177,10 +160,10 @@ function shapeSim(sim) {
 // the embed filter drops unassigned SIMs instead of only their embedded rows.
 async function fetchCandidates(env) {
   const [assigned, latched] = await Promise.all([
-    sbGetAll(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims!inner' + ASSIGNMENT_COLUMNS
+    readAllOrEmpty(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims!inner' + ASSIGNMENT_COLUMNS
       + '&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true'
       + '&' + TELTIK_HOST_FILTER + '&order=id.asc'),
-    sbGetAll(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims' + ASSIGNMENT_COLUMNS
+    readAllOrEmpty(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims' + ASSIGNMENT_COLUMNS
       + '&status=eq.active&offline_state=eq.offline&sim_numbers.valid_to=is.null'
       + '&' + TELTIK_HOST_FILTER + '&order=id.asc'),
   ]);
@@ -199,7 +182,7 @@ async function fetchChecks(env, simIds, at) {
   const byId = new Map();
   const since = new Date(at.getTime() - CHECK_HISTORY_WINDOW_MS).toISOString();
   for (let i = 0; i < simIds.length; i += CHECK_BATCH) {
-    const rows = await sbRpc(env, 'get_recent_hosting_port_checks', {
+    const rows = await rpcRowsOrEmpty(env, 'get_recent_hosting_port_checks', {
       p_sim_ids: simIds.slice(i, i + CHECK_BATCH), p_per_sim: CHECKS_PER_SIM, p_since: since,
     });
     for (const row of rows) byId.set(row.sim_id, Array.isArray(row.checks) ? row.checks : []);
@@ -347,7 +330,7 @@ async function forceRotate(env, sim, target) {
 async function executeAction(env, sim, action, nowIso, ctx) {
   switch (action.type) {
     case 'pause_rotation':
-      return sbPatch(env, 'sims?id=eq.' + sim.id,
+      return patchOk(env, 'sims?id=eq.' + sim.id,
         { rotation_eligible: false, rotation_pause_reason: OFFLINE_PAUSE_REASON });
     case 'send_offline_webhook': {
       const result = await callResellerSync(env, '/send-offline',
@@ -363,20 +346,20 @@ async function executeAction(env, sim, action, nowIso, ctx) {
       return result.ok;
     }
     case 'unassign_reseller':
-      return sbPatch(env, 'reseller_sims?sim_id=eq.' + sim.id + '&active=eq.true',
+      return patchOk(env, 'reseller_sims?sim_id=eq.' + sim.id + '&active=eq.true',
         { active: false, deactivated_reason: OFFLINE_PAUSE_REASON, deactivated_at: nowIso });
     case 'latch_offline':
-      return sbPatch(env, 'sims?id=eq.' + sim.id, {
+      return patchOk(env, 'sims?id=eq.' + sim.id, {
         offline_state: 'offline',
         offline_since: action.offline_since || nowIso,
         offline_notified_at: ctx.notified ? nowIso : null,
       });
     case 'restore_assignment':
-      return sbPatch(env,
+      return patchOk(env,
         'reseller_sims?sim_id=eq.' + sim.id + '&deactivated_reason=eq.' + OFFLINE_PAUSE_REASON,
         { active: true, deactivated_reason: null, deactivated_at: null });
     case 'resume_rotation':
-      return sbPatch(env, 'sims?id=eq.' + sim.id,
+      return patchOk(env, 'sims?id=eq.' + sim.id,
         { rotation_eligible: true, rotation_pause_reason: null });
     case 'resend_online':
       return (await callResellerSync(env, '/resend-online',
@@ -384,7 +367,7 @@ async function executeAction(env, sim, action, nowIso, ctx) {
     case 'force_rotate':
       return (await forceRotate(env, sim, action.target)).ok;
     case 'latch_online':
-      return sbPatch(env, 'sims?id=eq.' + sim.id, { offline_state: 'online', offline_since: null });
+      return patchOk(env, 'sims?id=eq.' + sim.id, { offline_state: 'online', offline_since: null });
     default:
       console.log('[OfflineLifecycle] unknown action ' + action.type);
       return false;
