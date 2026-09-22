@@ -1,3 +1,4 @@
+import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 // =========================================================
 // TELTIK WORKER
 // Manages T-Mobile SIMs via Teltik REST API (api.smsgateway.xyz)
@@ -442,9 +443,16 @@ async function reconcileWithTeltik(env) {
     if (!u.mdn) { unresolved.push(u); continue; }
     await sleep(120);
     const mdnDigits = u.mdn.replace('+', '');
-    const r = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${apiKey}&mdn=${encodeURIComponent(mdnDigits)}`);
+    let r, info;
+    try {
+      r = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${apiKey}&mdn=${encodeURIComponent(mdnDigits)}`);
+      if (r.ok) info = await r.json();
+    } catch (err) {
+      // One MDN's lookup failing (timeout, network) must not abort the reconcile.
+      unresolved.push({ ...u, error: `get-info ${err}` });
+      continue;
+    }
     if (!r.ok) { unresolved.push({ ...u, error: `get-info ${r.status}` }); continue; }
-    const info = await r.json();
     if (info.iccid) teltikIccids.add(String(info.iccid));
     else unresolved.push({ ...u, info });
   }
@@ -1026,14 +1034,14 @@ async function setupTeltikForwardUrl(env) {
 // Relay
 // =========================================================
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 // =========================================================
@@ -1079,7 +1087,7 @@ function jsonResponse(obj, status = 200) {
 // =========================================================
 
 async function supabaseGetArray(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'GET',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1100,7 +1108,7 @@ async function supabaseGetAllArray(env, path) {
   const pageSize = 1000;
   let offset = 0;
   while (true) {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+    const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
       method: 'GET',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1128,7 +1136,7 @@ async function supabaseGetOne(env, path) {
 }
 
 async function supabaseInsert(env, table, rows) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1141,7 +1149,7 @@ async function supabaseInsert(env, table, rows) {
 }
 
 async function supabaseUpsert(env, table, data, onConflict) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${table}?on_conflict=${onConflict}`, {
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}?on_conflict=${onConflict}`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1154,7 +1162,7 @@ async function supabaseUpsert(env, table, data, onConflict) {
 }
 
 async function supabasePatch(env, path, data) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1185,7 +1193,7 @@ async function logCarrierApiCall(env, logData) {
     created_at: new Date().toISOString(),
   };
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1203,7 +1211,7 @@ async function logCarrierApiCall(env, logData) {
 // Calls a Supabase RPC and returns the parsed body (for scalar returns this is
 // the raw value, e.g. boolean for claim_rotation_slot).
 async function supabaseRpc(env, fnName, args) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1244,7 +1252,7 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await fetch(
+  const res = await supabaseFetch(env,
     `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
     {
       method: 'GET',
@@ -1261,7 +1269,7 @@ async function wasWebhookDelivered(env, messageId) {
 
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts } = delivery;
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1295,7 +1303,7 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
+      }, webhookFetch);
       lastStatus = res.status;
       const responseBody = await res.text().catch(() => '');
       if (res.ok) return { ok: true, status: res.status, attempts: attempt, responseBody };
@@ -1390,7 +1398,7 @@ async function handleTeltikLifecycleWebhook(request, env) {
 
   // Insert dedup row. If event_id already exists, the upsert is a no-op and
   // we return early so re-deliveries don't re-apply the side effects.
-  const insRes = await fetch(`${env.SUPABASE_URL}/rest/v1/teltik_lifecycle_events?on_conflict=event_id`, {
+  const insRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/teltik_lifecycle_events?on_conflict=event_id`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,

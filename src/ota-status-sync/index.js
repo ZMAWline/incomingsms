@@ -7,6 +7,7 @@
 //   - Teltik: Skip (handled by teltik-worker)
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
+import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 export default {
   async fetch(request, env) {
@@ -35,14 +36,14 @@ export default {
 // ===========================
 // Relay fetch helper
 // ===========================
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 // ===========================
@@ -370,7 +371,7 @@ async function hxOtaRefresh(env, token, data, runId, iccid) {
 // Supabase helpers
 // ===========================
 async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "GET",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -383,7 +384,7 @@ async function supabaseSelect(env, path) {
 }
 
 async function supabasePatch(env, path, bodyObj) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "PATCH",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -405,7 +406,7 @@ async function logCarrierApiCall(env, logData) {
   console.log(`[${vendor.toUpperCase()} API] ${logData.request_method} ${logData.request_url} -> ${logData.response_status} ${logData.response_ok ? "OK" : "FAIL"}`);
 
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,

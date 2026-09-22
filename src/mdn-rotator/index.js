@@ -4,6 +4,7 @@ import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { gatewaySupports } from '../shared/gateway-host.mjs';
 import { buildAtomicPortInStatusRequest } from '../shared/activation-bulk.mjs';
 import { resolveMsisdn, resolveZip, buildSwapImeiRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
+import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -651,7 +652,7 @@ export default {
             // Upsert new IMEI in pool as in_use for this slot
             if (!allocatedEntry) {
               // Manual IMEI: add to pool as in_use
-              const upsertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
+              const upsertRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
                 method: 'POST',
                 headers: {
                   apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2573,7 +2574,7 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
 
   if (result.ok) {
     try {
-      await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
+      await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
         method: 'PATCH',
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3320,7 +3321,7 @@ function parseImeiPoolConflict(status, bodyText) {
 async function logImeiPoolConflict(env, message, details) {
   console.error('[IMEI Pool Conflict]', message, details);
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/system_errors`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/system_errors`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3360,7 +3361,7 @@ async function allocateImeiFromPool(env, simId, deviceType = 'phone') {
   const entry = available[0];
 
   // Claim it with status filter for safety (prevents double-allocation)
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry.id}&status=eq.available&device_type=eq.${deviceType}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry.id}&status=eq.available&device_type=eq.${deviceType}`, {
     method: "PATCH",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3398,7 +3399,7 @@ async function allocateImeiFromPool(env, simId, deviceType = 'phone') {
       throw new Error(`No available ${deviceType} IMEIs in pool (retry after race condition)`);
     }
     const entry2 = available2[0];
-    const res2 = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry2.id}&status=eq.available&device_type=eq.${deviceType}`, {
+    const res2 = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry2.id}&status=eq.available&device_type=eq.${deviceType}`, {
       method: "PATCH",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3905,9 +3906,9 @@ async function hxActivate(env, token, iccid, imei) {
   throw new Error('Activate returned ' + res.status + ' but no mobilitySubscriptionId. Raw: ' + responseText.slice(0, 200));
 }
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: {
         ...(init?.headers || {}),
@@ -3915,7 +3916,7 @@ function relayFetch(env, url, init) {
       },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 async function retryActivateViaAtomic(env, iccid, imei, runId) {
@@ -4147,7 +4148,7 @@ async function logCarrierApiCall(env, logData) {
     created_at: new Date().toISOString(),
   };
   console.log('[' + vendor.toUpperCase() + ' API] ' + logData.request_method + ' ' + logData.request_url + ' -> ' + logData.response_status + ' ' + (logData.response_ok ? 'OK' : 'FAIL'));
-  const res = await fetch(env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
+  const res = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4359,7 +4360,7 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
     if (activateResult.msisdn) {
       const e164 = '+1' + activateResult.msisdn.replace(/\D/g, '');
       await supabasePatch(env, 'sim_numbers?sim_id=eq.' + encodeURIComponent(String(simId)) + '&valid_to=is.null', { valid_to: now914 });
-      await fetch(`${env.SUPABASE_URL}/rest/v1/sim_numbers`, {
+      await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sim_numbers`, {
         method: 'POST',
         headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json', Prefer: 'resolution=ignore-duplicates' },
         body: JSON.stringify([{ sim_id: simId, e164, valid_from: now914, verification_status: 'verified', verified_at: now914 }]),
@@ -4389,7 +4390,7 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
   // Insert MDN into sim_numbers
   if (activateResult.msisdn) {
     const e164 = '+1' + activateResult.msisdn;
-    const simNumRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sim_numbers`, {
+    const simNumRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sim_numbers`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4424,7 +4425,7 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 // should proceed with the external rotation. p_force=true bypasses the
 // per-vendor interval guard AND the activation-day skip — reserved for manual.
 async function claimRotationSlot(env, simId, force) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/claim_rotation_slot`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/claim_rotation_slot`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4466,7 +4467,7 @@ function getNYMidnightISO() {
 }
 
 async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "GET",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4484,7 +4485,7 @@ async function supabaseSelectOne(env, path) {
 }
 
 async function supabasePatch(env, path, bodyObj) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "PATCH",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4506,7 +4507,7 @@ async function supabasePatch(env, path, bodyObj) {
 }
 
 async function supabaseInsert(env, table, rows) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
     method: "POST",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4556,7 +4557,7 @@ async function logHelixApiCall(env, logData) {
   console.log(`[Helix API] Response: ${JSON.stringify(logData.response_body_json)}`);
 
   try {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
+    const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4622,7 +4623,7 @@ async function updateSimRotationTimestamp(env, simId) {
 async function updateSimRotationError(env, simId, errorMessage) {
   console.log(`[DB] Recording rotation error for sim_id=${simId}`);
   const todayNY = getNYMidnightISO();
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/increment_rotation_fail`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/increment_rotation_fail`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4642,7 +4643,7 @@ async function updateSimRotationError(env, simId, errorMessage) {
 async function findResellerIdBySimId(env, simId) {
   if (!simId) return null;
   const q = `reseller_sims?select=reseller_id&sim_id=eq.${encodeURIComponent(String(simId))}&active=eq.true&limit=1`;
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${q}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${q}`, {
     method: "GET",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4657,7 +4658,7 @@ async function findResellerIdBySimId(env, simId) {
 async function findWebhookUrlByResellerId(env, resellerId) {
   if (!resellerId) return null;
   const q = `reseller_webhooks?select=url&reseller_id=eq.${encodeURIComponent(String(resellerId))}&enabled=eq.true&limit=1`;
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${q}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${q}`, {
     method: "GET",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4700,7 +4701,7 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await fetch(
+  const res = await supabaseFetch(env,
     `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
     {
       method: 'GET',
@@ -4719,7 +4720,7 @@ async function wasWebhookDelivered(env, messageId) {
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts, responseBody } = delivery;
 
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4756,7 +4757,7 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
+      }, webhookFetch);
 
       lastStatus = res.status;
 
@@ -5033,7 +5034,7 @@ async function postToSlack(env, webhookUrl, payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
-    });
+    }, webhookFetch);
 
     if (!res.ok) {
       const txt = await res.text().catch(() => "");

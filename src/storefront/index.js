@@ -20,6 +20,7 @@ import {
   durationFromHours,
   parseBearerToken,
 } from './logic.mjs';
+import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 const COOKIE_NAME = 'nb_session';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -36,9 +37,9 @@ const PRICES_SELECT =
 // to the relay's egress IP when RELAY_URL/RELAY_KEY are configured. With no
 // relay configured it is a plain fetch.
 // ---------------------------------------------------------------------------
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: {
         ...(init?.headers || {}),
@@ -46,7 +47,7 @@ function relayFetch(env, url, init) {
       },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 // ---------------------------------------------------------------------------
@@ -65,7 +66,7 @@ function sbHeaders(env, extra) {
 async function sbSelect(env, path) {
   const res = await relayFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: sbHeaders(env),
-  });
+  }, supabaseFetch);
   if (!res.ok) {
     throw new Error('PostgREST GET ' + res.status + ': ' + (await res.text().catch(() => '')));
   }
@@ -81,7 +82,7 @@ async function sbInsert(env, table, body) {
       Prefer: 'return=representation',
     }),
     body: JSON.stringify(body),
-  });
+  }, supabaseFetch);
   const text = await res.text().catch(() => '');
   if (!res.ok) {
     const err = new Error('PostgREST POST ' + table + ' ' + res.status + ': ' + text);
@@ -98,7 +99,7 @@ async function sbPatch(env, path, body) {
     method: 'PATCH',
     headers: sbHeaders(env, { 'Content-Type': 'application/json', Prefer: 'return=minimal' }),
     body: JSON.stringify(body),
-  });
+  }, supabaseFetch);
   if (!res.ok) {
     throw new Error('PostgREST PATCH ' + res.status + ': ' + (await res.text().catch(() => '')));
   }
@@ -108,7 +109,7 @@ async function sbDelete(env, path) {
   const res = await relayFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'DELETE',
     headers: sbHeaders(env, { Prefer: 'return=minimal' }),
-  });
+  }, supabaseFetch);
   if (!res.ok) {
     throw new Error('PostgREST DELETE ' + res.status + ': ' + (await res.text().catch(() => '')));
   }
@@ -121,7 +122,7 @@ async function sbRpc(env, fn, args) {
     method: 'POST',
     headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
     body: JSON.stringify(args),
-  });
+  }, supabaseFetch);
   const text = await res.text().catch(() => '');
   return { ok: res.ok, status: res.status, text };
 }

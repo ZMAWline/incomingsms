@@ -1,3 +1,4 @@
+import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -218,14 +219,14 @@ export default {
 
 /* ================= RELAY ================= */
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 /* ================= HELPERS ================= */
@@ -380,7 +381,7 @@ async function hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reas
 async function logCarrierApi(env, data) {
   const vendor = data.vendor || 'helix';
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -415,7 +416,7 @@ async function logHelixApi(env, data) {
 /* ================= SUPABASE ================= */
 
 async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -441,7 +442,7 @@ async function supabaseSelect(env, path) {
 }
 
 async function supabasePatch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "PATCH",
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -485,7 +486,7 @@ async function postResellerWebhook(webhookUrl, payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    });
+    }, webhookFetch);
 
     if (!res.ok) {
       const txt = await res.text().catch(() => "");

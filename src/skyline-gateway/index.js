@@ -1,3 +1,4 @@
+import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
 // =========================================================
 // SKYLINE GATEWAY WORKER
 // Centralizes all SkyLine API calls for multi-gateway support.
@@ -390,7 +391,7 @@ async function handlePortInfo(url, env) {
   }
 
   // Also fetch SIM-to-number mapping from Supabase for this gateway
-  const simsRes = await fetch(
+  const simsRes = await supabaseFetch(env,
     `${env.SUPABASE_URL}/rest/v1/sims?select=id,iccid,port,slot,status,sim_numbers(e164,verification_status)&gateway_id=eq.${encodeURIComponent(gatewayId)}&sim_numbers.valid_to=is.null&order=id.asc`,
     {
       headers: {
@@ -505,7 +506,7 @@ async function loadAndHandshake(env, gatewayId) {
 }
 
 async function loadGateway(env, gatewayId) {
-  const res = await fetch(
+  const res = await supabaseFetch(env,
     `${env.SUPABASE_URL}/rest/v1/gateways?select=id,code,name,host,api_port,username,password,total_ports,slots_per_port&id=eq.${encodeURIComponent(gatewayId)}&limit=1`,
     {
       headers: {
@@ -533,7 +534,7 @@ async function bridgeFetch(env, targetUrl, method, headers, payload) {
   const bridgeUrl = `${env.SUPABASE_URL}/functions/v1/skyline-bridge`;
 
   try {
-    const res = await fetch(bridgeUrl, {
+    const res = await carrierFetch(env, bridgeUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -653,7 +654,7 @@ async function skylineFetchGet(env, gateway, endpoint, cmdParams) {
 async function logSkylineApiCall(env, logData) {
   const runId = `sk_${Date.now().toString(36)}`;
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/skyline_api_logs`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/skyline_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,

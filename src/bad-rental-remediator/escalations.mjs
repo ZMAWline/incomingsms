@@ -1,3 +1,4 @@
+import { supabaseFetch } from '../shared/fetch-timeout.mjs';
 // =========================================================
 // INC-22 / INC-16f — Operator escalations (§H.3) + vendor batch ticket (§H.4)
 //
@@ -218,7 +219,7 @@ export async function reserveEscalation(env, batch) {
     paperclip_parent_id: batch.parentIssueId || null,
     status: 'queued',
   };
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/operator_escalations', {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/operator_escalations', {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -254,7 +255,7 @@ export function buildInboxSummary(row) {
 export async function deliverEscalation(env, reservedRow, notice) {
   let inboxResp;
   try {
-    inboxResp = await fetch(env.SUPABASE_URL + '/rest/v1/pending_review_items', {
+    inboxResp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/pending_review_items', {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -306,7 +307,7 @@ async function markDeliveryFailed(env, id, lastError) {
 }
 
 async function updateEscalationRow(env, id, patch) {
-  return fetch(env.SUPABASE_URL + '/rest/v1/operator_escalations?id=eq.' + encodeURIComponent(id), {
+  return supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/operator_escalations?id=eq.' + encodeURIComponent(id), {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -463,7 +464,7 @@ export async function fetchEscalationBacklog(env, { detail = true } = {}) {
 
   let resp;
   try {
-    resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + base + select, {
+    resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + base + select, {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
@@ -561,7 +562,7 @@ export async function drainQueuedEscalations(env, { limit = DRAIN_DEFAULT_LIMIT,
   const n = Math.max(1, Math.min(Number(limit) || DRAIN_DEFAULT_LIMIT, DRAIN_MAX_LIMIT));
   const q = 'operator_escalations?' + DRAIN_STATUS_FILTER + '&paperclip_issue_id=is.null'
     + '&select=*&order=created_at.asc&limit=' + n;
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + q, {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + q, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
@@ -626,7 +627,7 @@ async function fetchTerminalSuspendedIccids(env, vendor, sinceIso) {
     + '&status=in.' + statusFilter
     + '&deactivated_at=gte.' + encodeURIComponent(sinceIso)
     + '&select=iccid&limit=1000';
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + q, {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + q, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,

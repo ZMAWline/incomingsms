@@ -20,10 +20,12 @@ const SHARED_MODULES = [
   ['../shared/gateway-host.mjs', 'src/shared/gateway-host.mjs', false],
   ['../shared/activation-bulk.mjs', 'src/shared/activation-bulk.mjs', false],
   ['../shared/sim-swap.mjs', 'src/shared/sim-swap.mjs', false],
+  ['../shared/fetch-timeout.mjs', 'src/shared/fetch-timeout.mjs', false],
 ];
 
 async function toDataUrl(relPath) {
-  const src = await readFile(new URL('../' + relPath, import.meta.url), 'utf8');
+  const src = (await readFile(new URL('../' + relPath, import.meta.url), 'utf8'))
+    .replace("'./fetch-timeout.mjs'", JSON.stringify(new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href));
   return 'data:text/javascript;base64,' + Buffer.from(src).toString('base64');
 }
 

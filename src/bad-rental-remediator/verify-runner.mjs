@@ -27,6 +27,7 @@
 
 import { mintNonce, buildVerifyBody, cleanRecheckPredicate } from './verify.mjs';
 import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
+import { supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 const RECEIVE_WINDOW_MS = 5 * 60 * 1000; // §C.3 — 5 min, 30 × 10s polls.
 const SEND_MAX_ATTEMPTS = 3;             // §C.2
@@ -187,7 +188,7 @@ export async function resolvePendingVerify(env, report, opts) {
     });
     // Mirror the dashboard/applyClassificationState timeline row for a remediated close.
     try {
-      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+      await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_events', {
         method: 'POST',
         headers: supabaseHeaders(env, false),
         body: JSON.stringify({
@@ -233,7 +234,7 @@ export async function resolvePendingVerify(env, report, opts) {
     // in_triage), so to_status carries the unchanged status and the real
     // transition rides in evidence, matching the dashboard's convention.
     try {
-      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+      await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_events', {
         method: 'POST',
         headers: supabaseHeaders(env, false),
         body: JSON.stringify({
@@ -407,7 +408,7 @@ async function fetchVerifyPendingReports(env, limit) {
 }
 
 async function insertAttempt(env, row) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_remediation_attempts', {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_remediation_attempts', {
     method: 'POST',
     headers: supabaseHeaders(env, false),
     body: JSON.stringify(row),
@@ -419,7 +420,7 @@ async function insertAttempt(env, row) {
 }
 
 async function patchReport(env, reportId, patch) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(reportId), {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(reportId), {
     method: 'PATCH',
     headers: supabaseHeaders(env, false),
     body: JSON.stringify(patch),
@@ -431,7 +432,7 @@ async function patchReport(env, reportId, patch) {
 }
 
 async function supabaseGet(env, path) {
-  return fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
+  return supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + path, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,

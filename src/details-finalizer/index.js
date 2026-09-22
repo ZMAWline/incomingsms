@@ -22,6 +22,7 @@ import { iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
 import { createAtomicPortinPoller } from './atomic-portin-poller.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
+import { carrierFetch, fetchWithTimeout, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
@@ -685,7 +686,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
     },
   };
   try {
-    const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/rotation_audit`, {
+    const insertRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rotation_audit`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -972,7 +973,7 @@ async function logTeltikApiCall(env, logData) {
     created_at: new Date().toISOString(),
   };
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1229,7 +1230,7 @@ async function rotationReviewQuery(env, fragment) {
 
   // Small intentional limits (≤1000) — simple fetch, no pagination needed
   if (limitVal <= 1000) {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${fragment}`, {
+    const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${fragment}`, {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -1245,7 +1246,7 @@ async function rotationReviewQuery(env, fragment) {
   const all = [];
   let offset = 0;
   while (true) {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${base}`, {
+    const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${base}`, {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -1270,7 +1271,7 @@ async function rotationReviewQuery(env, fragment) {
 // (covers crashed/killed prior runs).
 async function acquireReviewLock(env, kind = 'rotation_review') {
   // Mark stale runs first
-  await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs?kind=eq.${kind}&status=eq.running&started_at=lt.${encodeURIComponent(new Date(Date.now() - 30 * 60 * 1000).toISOString())}`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/cron_runs?kind=eq.${kind}&status=eq.running&started_at=lt.${encodeURIComponent(new Date(Date.now() - 30 * 60 * 1000).toISOString())}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1281,7 +1282,7 @@ async function acquireReviewLock(env, kind = 'rotation_review') {
     body: JSON.stringify({ status: 'stale', ended_at: new Date().toISOString() }),
   }).catch(() => {});
 
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/cron_runs`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1304,7 +1305,7 @@ async function acquireReviewLock(env, kind = 'rotation_review') {
 async function releaseReviewLock(env, runDbId, status, summary, reportMd) {
   const body = { status, ended_at: new Date().toISOString(), summary };
   if (reportMd) body.report_md = reportMd;
-  await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs?id=eq.${runDbId}`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/cron_runs?id=eq.${runDbId}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1330,7 +1331,7 @@ async function findOpenPendingForSim(env, simId, kind) {
 }
 
 async function insertPendingItem(env, item) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/pending_review_items`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1345,7 +1346,7 @@ async function insertPendingItem(env, item) {
 
 async function markPendingItemSeen(env, ids) {
   if (!ids || ids.length === 0) return;
-  await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items?id=in.(${ids.join(',')})`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/pending_review_items?id=in.(${ids.join(',')})`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1358,7 +1359,7 @@ async function markPendingItemSeen(env, ids) {
 }
 
 async function recordAttempt(env, simId, runId, action, result, error) {
-  await fetch(`${env.SUPABASE_URL}/rest/v1/remediation_attempts`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/remediation_attempts`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1371,7 +1372,7 @@ async function recordAttempt(env, simId, runId, action, result, error) {
 }
 
 async function attemptsToday(env, simId, action) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/attempts_today`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/attempts_today`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1462,7 +1463,7 @@ async function sendReportEmail(env, subject, markdown) {
   }
   // Minimal markdown → HTML conversion (the report uses a tiny subset)
   const html = markdownToHtml(markdown);
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = await webhookFetch(env, 'https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${env.RESEND_API_KEY}`,
@@ -1656,7 +1657,7 @@ async function runCatchupSweep(env, opts = {}) {
       if (dryRun) continue;
       if (entry.action === 'flip_to_mdn_pending' && sims.length > 0) {
         const ids = sims.map(s => s.id).join(',');
-        const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
+        const flipRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
           method: 'PATCH',
           headers: {
             apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1851,7 +1852,7 @@ async function runRotationReview(env, opts = {}) {
       if (entry.action === 'flip_to_mdn_pending') {
         if (!dryRun && sims.length > 0) {
           const ids = sims.map(s => s.id).join(',');
-          const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
+          const flipRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
             method: 'PATCH',
             headers: {
               apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1894,7 +1895,7 @@ async function runRotationReview(env, opts = {}) {
               await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', 'get-info returned same iccid — SIM may be deprovisioned on Teltik');
               continue;
             }
-            const patchRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${sim.id}`, {
+            const patchRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${sim.id}`, {
               method: 'PATCH',
               headers: {
                 apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1967,7 +1968,7 @@ async function runRotationReview(env, opts = {}) {
 
     // ── 5. Pool health ───────────────────────────────────────────────────────
     async function poolCount(filter) {
-      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/address_pool_usage?${filter}&select=address_id&limit=1`, {
+      const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/address_pool_usage?${filter}&select=address_id&limit=1`, {
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
           Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -2231,7 +2232,7 @@ async function runRotationReview(env, opts = {}) {
     // Single non-blocking query; failure just omits the line rather than
     // breaking the rotation review.
     try {
-      const badResp = await fetch(
+      const badResp = await supabaseFetch(env,
         `${env.SUPABASE_URL}/rest/v1/rental_reports?select=id&status=in.(received,in_triage)&limit=1000`,
         {
           headers: {
@@ -2304,6 +2305,8 @@ async function runRotationReview(env, opts = {}) {
 // pick on next rotation since last_used_at is NULL.
 
 const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+// Query carries [timeout:60] server-side; the client bound sits just above it.
+const OVERPASS_TIMEOUT_MS = 75_000;
 const REFILL_DEFAULT_MAX_ZIPS = 5;
 const REFILL_QUERY_DELAY_MS   = 5000; // polite delay between Overpass queries
 
@@ -2341,14 +2344,14 @@ async function overpassFetchByZip(env, state, zip) {
       // mirror — relay routing adds latency without value and the relay appears
       // to time out on long-running Overpass queries. Relay exists for AT&T /
       // Helix IP allowlist needs, not for public APIs like OSM.
-      const res = await fetch(OVERPASS_URL, {
+      const res = await fetchWithTimeout(OVERPASS_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'User-Agent':   'incomingsms address-pool refill (https://github.com/ZMAWline/incomingsms)',
         },
         body: `data=${encodeURIComponent(query)}`,
-      });
+      }, { timeoutMs: OVERPASS_TIMEOUT_MS, label: 'Overpass POST' });
       if (!res.ok) {
         const text = (await res.text().catch(() => '')).slice(0, 200);
         if ((res.status === 429 || res.status === 504) && attempt === 1) {
@@ -2377,7 +2380,7 @@ async function overpassFetchByZip(env, state, zip) {
 }
 
 async function supabaseRpc(env, fn, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
     method: 'POST',
     headers: {
       apikey:        env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2420,7 +2423,7 @@ async function runAddressPoolRefill(env, opts = {}) {
         const newId = `${target.state.toLowerCase()}-${target.zip_code}-${fresh.housenumber}-${refillSlug(fresh.street)}`;
         if (!dryRun) {
           // Use ON CONFLICT DO NOTHING via Prefer header to swallow rare slug collisions.
-          const insRes = await fetch(`${env.SUPABASE_URL}/rest/v1/address_pool_usage?on_conflict=address_id`, {
+          const insRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/address_pool_usage?on_conflict=address_id`, {
             method: 'POST',
             headers: {
               apikey:          env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2459,14 +2462,14 @@ async function runAddressPoolRefill(env, opts = {}) {
 
 /* ── Relay ────────────────────────────────────────────────────────────────── */
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 /* ── Helix ────────────────────────────────────────────────────────────────── */
@@ -2517,7 +2520,7 @@ async function resolveTeltikKnownMdnForFinalizer(env, sim) {
 /* ── Supabase ─────────────────────────────────────────────────────────────── */
 
 async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -2528,7 +2531,7 @@ async function supabaseSelect(env, path) {
 }
 
 async function supabasePatch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2541,7 +2544,7 @@ async function supabasePatch(env, path, body) {
 }
 
 async function supabaseInsert(env, table, rows) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2790,7 +2793,7 @@ async function wasWebhookDelivered(env, messageId) {
 
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts, responseBody } = delivery;
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2824,7 +2827,7 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
+      }, webhookFetch);
       lastStatus = res.status;
       const responseBody = await res.text().catch(() => '');
       if (res.ok) {

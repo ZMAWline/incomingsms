@@ -5,6 +5,7 @@ import {
   REPORT_REASON_CODES,
 } from '../shared/report-bad-resolver.js';
 import { buildStatusFilter } from '../shared/rental-report-status.js';
+import { supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 const COOKIE_NAME = 'rp_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
@@ -25,7 +26,7 @@ const corsHeaders = {
 };
 
 async function sbGet(env, path) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -51,7 +52,7 @@ async function sbGetAll(env, pathWithoutLimit) {
 }
 
 async function sbPost(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -812,7 +813,7 @@ async function insertOrReturnExistingReport(env, resellerId, resolved, body, sou
   };
   let insertResp;
   try {
-    insertResp = await fetch(`${env.SUPABASE_URL}/rest/v1/rental_reports`, {
+    insertResp = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rental_reports`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1231,7 +1232,7 @@ function switchTab(name) {
 document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
 
 async function api(path) {
-  const r = await fetch(path, { credentials: 'include' });
+  const r = await fetch(path, { credentials: 'include' }); // timeout-exempt: browser same-origin call in portal HTML
   if (r.status === 401) { window.location.href = '/'; return null; }
   if (!r.ok) throw new Error('API ' + r.status);
   return r.json();

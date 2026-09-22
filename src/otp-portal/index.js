@@ -26,6 +26,7 @@ import {
   filterAssignmentMessages,
 } from './logic.mjs';
 import { verifyPassword, signSession, verifySession, randomHex, constantTimeEqual, foldUsername } from './auth.mjs';
+import { supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 const AUTH_COOKIE_NAME = 'otpp_auth';
 const SID_COOKIE_NAME = 'otpp_sid';
@@ -48,7 +49,7 @@ function sbHeaders(env, extra) {
 }
 
 async function sbSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, { headers: sbHeaders(env) });
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, { headers: sbHeaders(env) });
   if (!res.ok) {
     throw new Error('PostgREST GET ' + res.status + ': ' + (await res.text().catch(() => '')));
   }
@@ -58,7 +59,7 @@ async function sbSelect(env, path) {
 // Returns { ok, status, text } so callers can distinguish "lost the race"
 // (sim_taken, raised by the RPC) from a real failure.
 async function sbRpc(env, fn, args) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
     method: 'POST',
     headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
     body: JSON.stringify(args),

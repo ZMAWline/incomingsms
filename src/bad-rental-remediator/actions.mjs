@@ -46,6 +46,7 @@ import {
 } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import { HEALTHY_EVIDENCE_OUTCOME, HEALTHY_EVIDENCE_REASON } from './healthy-evidence.mjs';
+import { supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 export const SAFE_ACTIONS = Object.freeze([
   'db_sync_upsert',
@@ -218,7 +219,7 @@ async function execDbSyncUpsert(env, ctx) {
     return { ok: true, status: 'noop', evidence: { reason: 'db_already_matches_vendor', sim_id: sim.id } };
   }
 
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(sim.id), {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(sim.id), {
     method: 'PATCH',
     headers: supabaseHeaders(env, false),
     body: JSON.stringify(patch),
@@ -305,7 +306,7 @@ async function execCloseDuplicate(env, ctx) {
 
   // Fetch current row so we preserve triaged_at / closed_at semantics like the
   // dashboard handler does — keeps audit timestamps coherent.
-  const curResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
+  const curResp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
     + encodeURIComponent(report.id) + '&select=id,status,triaged_at,closed_at', {
     headers: supabaseHeaders(env, false),
   });
@@ -325,7 +326,7 @@ async function execCloseDuplicate(env, ctx) {
   };
   if (fromStatus === 'received' && !cur.triaged_at) patch.triaged_at = nowIso;
 
-  const patchResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
+  const patchResp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
     + encodeURIComponent(report.id), {
     method: 'PATCH',
     headers: supabaseHeaders(env, false),
@@ -341,7 +342,7 @@ async function execCloseDuplicate(env, ctx) {
   if (ctx.evidenceBundle) evidence.classifier = ctx.evidenceBundle;
   if (duplicateOf) evidence.duplicate_of = duplicateOf;
   try {
-    await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+    await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_events', {
       method: 'POST',
       headers: supabaseHeaders(env, false),
       body: JSON.stringify({
@@ -390,7 +391,7 @@ async function execHealthyEvidenceAutoResolve(env, ctx) {
   }
   const nowIso = new Date().toISOString();
 
-  const curResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
+  const curResp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
     + encodeURIComponent(report.id) + '&select=id,status,triaged_at,closed_at', {
     headers: supabaseHeaders(env, false),
   });
@@ -409,7 +410,7 @@ async function execHealthyEvidenceAutoResolve(env, ctx) {
   };
   if (fromStatus === 'received' && !cur.triaged_at) patch.triaged_at = nowIso;
 
-  const patchResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
+  const patchResp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
     + encodeURIComponent(report.id), {
     method: 'PATCH',
     headers: supabaseHeaders(env, false),
@@ -442,7 +443,7 @@ async function execHealthyEvidenceAutoResolve(env, ctx) {
   };
   if (ctx.evidenceBundle) evidence.classifier = ctx.evidenceBundle;
   try {
-    await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
+    await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rental_report_events', {
       method: 'POST',
       headers: supabaseHeaders(env, false),
       body: JSON.stringify({
@@ -638,7 +639,7 @@ async function execTeltikSyncIccid(env, ctx) {
     last_rotation_error: null,
     status_reason: 'ICCID swapped from ' + sim.iccid + ' to ' + newIccid + ' on ' + nowIso(),
   };
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(sim.id), {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(sim.id), {
     method: 'PATCH',
     headers: supabaseHeaders(env, false),
     body: JSON.stringify(patch),

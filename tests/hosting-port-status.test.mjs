@@ -17,8 +17,8 @@ import {
   readTeltikPortStatus,
   runHostingPortSweep,
   CHECK_SOURCES,
-  fetchWithTimeout,
 } from '../src/shared/hosting-port-status.mjs';
+import { fetchWithTimeout } from '../src/shared/fetch-timeout.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = (...p) => fs.readFileSync(path.join(__dirname, '..', ...p), 'utf8');
@@ -198,7 +198,7 @@ test('skipped/error attempts (missing credentials) still mirror to carrier_api_l
 
 // --- vendor fetch timeout --------------------------------------------------
 // Teltik/relay can hang until the Worker invocation is killed, so the job's
-// progress/failure PATCH never runs. Every vendor fetch must be AbortController-
+// progress/failure PATCH never runs. Every vendor fetch must be timeout-
 // bounded so a hang becomes a normal recorded error attempt.
 
 test('fetchWithTimeout aborts a hung vendor fetch instead of hanging forever', async () => {
@@ -208,7 +208,7 @@ test('fetchWithTimeout aborts a hung vendor fetch instead of hanging forever', a
     opts.signal.addEventListener('abort', () => reject(opts.signal.reason || new Error('aborted')));
   });
   try {
-    await assert.rejects(() => fetchWithTimeout('https://api.smsgateway.xyz/v1/port-status', {}, 25), /timeout/);
+    await assert.rejects(() => fetchWithTimeout('https://api.smsgateway.xyz/v1/port-status', {}, { timeoutMs: 25 }), /timeout/);
   } finally { globalThis.fetch = orig; }
 });
 
@@ -235,8 +235,6 @@ test('a timed-out port-status read records a normal error attempt, still mirrore
 });
 
 test('both Teltik call sites (port-status and get-phone-number retry) go through fetchWithTimeout', () => {
-  assert.match(SHARED_SRC, /const ctrl = new AbortController\(\)/);
-  assert.match(SHARED_SRC, /signal: ctrl\.signal/);
   assert.match(SHARED_SRC, /await fetchWithTimeout\(relayUrl\(env, url\)/);
   assert.match(SHARED_SRC, /teltikInventoryLookup\(env/);
   assert.match(TELTIK_KNOWN_SRC, /get-phone-number/);

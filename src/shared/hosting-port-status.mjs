@@ -28,6 +28,7 @@ import {
   isInventoryMdnSource,
   retryMdnSource,
 } from './teltik-known-mdn.mjs';
+import { fetchWithTimeout, supabaseFetch } from './fetch-timeout.mjs';
 
 export const CHECK_SOURCES = ['cron', 'manual_bulk', 'manual_sweep', 'single_query', 'bad_rental_remediator', 'teltik_portal'];
 
@@ -78,16 +79,6 @@ export function buildHostingPortCheckRow({
 // which records as an 'error' attempt and lets the batch move on.
 export const VENDOR_FETCH_TIMEOUT_MS = 15_000;
 
-export async function fetchWithTimeout(url, opts = {}, timeoutMs = VENDOR_FETCH_TIMEOUT_MS) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error('vendor fetch timeout after ' + timeoutMs + 'ms')), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 function relayUrl(env, url) {
   return env.RELAY_URL ? env.RELAY_URL + '/' + url : url;
 }
@@ -106,7 +97,7 @@ function sbHeaders(env) {
 // operation that ran the check (missing table before migration included).
 export async function recordHostingPortCheck(env, row) {
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_checks', {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/hosting_port_status_checks', {
       method: 'POST',
       headers: { ...sbHeaders(env), Prefer: 'return=minimal' },
       body: JSON.stringify(row),
@@ -124,7 +115,7 @@ export async function recordHostingPortCheck(env, row) {
 // redacted. Never throws — logging must not break the check.
 async function logPortStatusCarrierApi(env, iccid, requestUrl, out) {
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
       method: 'POST',
       headers: { ...sbHeaders(env), Prefer: 'return=minimal' },
       body: JSON.stringify({
@@ -168,7 +159,7 @@ export async function readTeltikPortStatus(env, mdn, meta = {}) {
       + '&mdn=' + encodeURIComponent(norm);
     let resp, text;
     try {
-      resp = await fetchWithTimeout(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) });
+      resp = await fetchWithTimeout(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) }, { timeoutMs: VENDOR_FETCH_TIMEOUT_MS });
       text = await resp.text();
     } catch (e) {
       out = { http_status: null, body: null, state: 'error', error: 'port-status exception: ' + (e && e.message || e) };
@@ -271,7 +262,7 @@ export async function runHostingPortSweep(env, { simIds = null, source = 'manual
   let sims = [];
   let totalAvailable = null;
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + query, {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + query, {
       headers: { ...sbHeaders(env), Prefer: 'count=exact' },
     });
     const rows = resp.ok ? await resp.json() : null;
@@ -350,13 +341,13 @@ export async function enqueueHostingPortJob(env, { source = 'manual_sweep', maxS
   if (!Number.isInteger(maxSims) || maxSims < 1) maxSims = ASYNC_JOB_MAX_SIMS;
   maxSims = Math.min(maxSims, ASYNC_JOB_MAX_SIMS);
   try {
-    const pendingResp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs'
+    const pendingResp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs'
       + '?select=id,status&status=in.(queued,running)&order=created_at.asc&limit=1', { headers: sbHeaders(env) });
     const pending = pendingResp.ok ? await pendingResp.json() : null;
     if (Array.isArray(pending) && pending[0]) {
       return { ok: true, job_id: pending[0].id, status: pending[0].status, already_pending: true };
     }
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs', {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs', {
       method: 'POST',
       headers: { ...sbHeaders(env), Prefer: 'return=representation' },
       body: JSON.stringify({ source, max_sims: maxSims, created_by: createdBy }),
@@ -374,7 +365,7 @@ export async function enqueueHostingPortJob(env, { source = 'manual_sweep', maxS
 export async function listHostingPortJobs(env, { limit = 5 } = {}) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 50) limit = 5;
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs'
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs'
       + '?select=*&order=created_at.desc&limit=' + limit, { headers: sbHeaders(env) });
     const rows = resp.ok ? await resp.json() : null;
     return Array.isArray(rows) ? rows : [];
@@ -385,7 +376,7 @@ export async function listHostingPortJobs(env, { limit = 5 } = {}) {
 
 export async function getHostingPortJob(env, jobId) {
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?id=eq.'
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?id=eq.'
       + encodeURIComponent(jobId) + '&limit=1', { headers: sbHeaders(env) });
     const rows = resp.ok ? await resp.json() : null;
     return Array.isArray(rows) && rows[0] ? rows[0] : null;
@@ -410,7 +401,7 @@ function rowMatchesPatch(row, patch) {
 
 async function patchHostingPortJob(env, filter, patch) {
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?' + filter, {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?' + filter, {
       method: 'PATCH',
       headers: { ...sbHeaders(env), Prefer: 'return=representation' },
       body: JSON.stringify(patch),
@@ -443,7 +434,7 @@ export async function processHostingPortJobs(env, { maxJobs = 1, leaseMs = JOB_L
     const claimable = 'or=(status.eq.queued,and(status.eq.running,updated_at.lt.' + staleIso + '))';
     let job = null;
     try {
-      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?select=*&'
+      const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/hosting_port_status_jobs?select=*&'
         + claimable + '&order=created_at.asc&limit=1', { headers: sbHeaders(env) });
       const rows = resp.ok ? await resp.json() : null;
       job = Array.isArray(rows) && rows[0] ? rows[0] : null;

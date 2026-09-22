@@ -1,3 +1,4 @@
+import { fetchWithTimeout, supabaseFetch } from './fetch-timeout.mjs';
 // =========================================================
 // Teltik-known MDN resolution — the ONE rule every Teltik per-line call obeys.
 //
@@ -157,16 +158,6 @@ export function mdnFromAllLines(json, { iccid = null, mdn = null } = {}) {
 // every vendor fetch turns a hang into a normal caught exception.
 export const TELTIK_FETCH_TIMEOUT_MS = 15_000;
 
-export async function fetchWithTimeout(url, opts = {}, timeoutMs = TELTIK_FETCH_TIMEOUT_MS) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(new Error('vendor fetch timeout after ' + timeoutMs + 'ms')), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 export function relayUrl(env, url) {
   return env && env.RELAY_URL ? env.RELAY_URL + '/' + url : url;
 }
@@ -175,7 +166,7 @@ export function relayHeaders(env) {
 }
 
 export async function teltikGetJson(env, url, timeoutMs) {
-  const resp = await fetchWithTimeout(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) }, timeoutMs);
+  const resp = await fetchWithTimeout(relayUrl(env, url), { method: 'GET', headers: relayHeaders(env) }, { timeoutMs: timeoutMs || TELTIK_FETCH_TIMEOUT_MS });
   const text = await resp.text();
   let json = null;
   try { json = JSON.parse(text); } catch { json = null; }
@@ -238,7 +229,7 @@ export async function teltikInventoryLookup(env, { iccid = null, mdn = null } = 
 async function fetchLatestTeltikSms(env, simId) {
   if (!env || !env.SUPABASE_URL || !simId) return null;
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + latestTeltikSmsQuery(simId), {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + latestTeltikSmsQuery(simId), {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,

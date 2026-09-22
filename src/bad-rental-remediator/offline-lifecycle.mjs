@@ -43,6 +43,7 @@ import {
   OFFLINE_PAUSE_REASON, OFFLINE_WEBHOOK_REASON, CHECK_HISTORY_WINDOW_MS,
 } from '../shared/offline-lifecycle.mjs';
 import { notifyOfflineLifecyclePlan } from './notify.mjs';
+import { supabaseFetch } from '../shared/fetch-timeout.mjs';
 
 const CHECK_SOURCE = 'bad_rental_remediator';
 // Per-SIM recovery cooldown. A line that flaps online/offline/online would
@@ -107,7 +108,7 @@ async function sbGetAll(env, path) {
   const out = [];
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const url = env.SUPABASE_URL + '/rest/v1/' + path + '&limit=' + PAGE_SIZE + '&offset=' + offset;
-    const resp = await fetch(url, { headers: sbHeaders(env) });
+    const resp = await supabaseFetch(env, url, { headers: sbHeaders(env) });
     if (!resp.ok) {
       console.log('[OfflineLifecycle] query failed HTTP ' + resp.status + ' ' + path.slice(0, 120));
       return [];
@@ -120,7 +121,7 @@ async function sbGetAll(env, path) {
 }
 
 async function sbRpc(env, fn, args) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/' + fn, {
+  const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rpc/' + fn, {
     method: 'POST', headers: sbHeaders(env), body: JSON.stringify(args),
   });
   if (!resp.ok) {
@@ -133,7 +134,7 @@ async function sbRpc(env, fn, args) {
 
 async function sbPatch(env, path, body) {
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
+    const resp = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + path, {
       method: 'PATCH',
       headers: sbHeaders(env, 'return=minimal'),
       body: JSON.stringify(body),
