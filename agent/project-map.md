@@ -161,3 +161,5 @@ Dashboard or CSV → POST to bulk-activator or sim-activation-queue
 | `supabase.ts` | `supabaseGet`, `supabaseSelect`, `supabaseInsert`, `supabasePatch` |
 | `utils.ts` | `sleep`, `normalizeToE164`, `generateMessageIdAsync`, `retryWithBackoff` |
 | `types.ts` | `Env` interface (all secrets + bindings) |
+| `supabase-rest.mjs` | `sbHeaders`, `sbGet`, `sbGetAll`, `sbPost`, `sbPatch`, `sbDelete`, `sbRpc`, `SupabaseError`, `PAGE_SIZE`. PostgREST calls with the service-role key through `supabaseFetch`; a non-2xx throws `SupabaseError`. Used by most workers since #120 (see TODO(shared-supabase) for the ones not moved yet). |
+| `fetch-timeout.mjs` | `supabaseFetch`, `carrierFetch`, `webhookFetch`, `fetchWithTimeout`, `timeoutFor`, `CARRIER_TIMEOUT_MS` (45 s), `SUPABASE_TIMEOUT_MS` (15 s), `WEBHOOK_TIMEOUT_MS` (10 s). Every carrier, database and webhook call outside the dashboard goes through one of these (#117); override per worker with `FETCH_TIMEOUT_*_MS`. |

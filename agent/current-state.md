@@ -6,7 +6,8 @@
 > Also 2026-09-22: Brief B steps 1–2 done — `FINALIZER_RUN_SECRET` set on `bad-rental-remediator` (test + prod), and PROD redeployed with `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` as version `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`. See "Brief B steps 1–2 done" below. Next: wait 5h for one full probe cycle, read the Slack digest, get owner sign-off, then remove DRY_RUN (step 5).
 > 2026-09-22: PR #112 merged and DEPLOYED to PROD with #110, #88 and #84 — dashboard `3b69cf80`, details-finalizer `1f22a644`, reseller-portal `e6e18c80`. `deployed/prod` moved 6ec5620 → 7b18ed4. See "Deployed 2026-09-22 (ship 2)".
 > 2026-09-22: PR #113 + #115 merged and DEPLOYED to PROD with #114 — dashboard `5d424a79`, details-finalizer `49029305`, bad-rental-remediator `ecb01e83`. `deployed/prod` moved 7b18ed4 → 320bd40. See "Deployed 2026-09-22 (ship 3)".
-> 2026-09-22 (latest): PR #116, #117 and #118 merged and DEPLOYED to PROD — all 19 workers (shared fetch-timeout helper touched every worker). `deployed/prod` moved 320bd40 → d2af4a3. Open owner decision: reseller webhooks from sim-canceller / sim-status-changer. See "Deployed 2026-09-22 (ship 4)".
+> 2026-09-22 (latest): PR #119, #120, #121 and #122 merged and DEPLOYED to PROD — 18 workers (shared supabase-rest helper). Migration `sims_paging_indexes` applied TEST + PROD. `deployed/prod` moved d2af4a3 → ee9ae2b. Check mdn-rotator's first tick after 04:00 UTC for `timeout after` errors. See "Deployed 2026-09-22 (ship 5)".
+> 2026-09-22: PR #116, #117 and #118 merged and DEPLOYED to PROD — all 19 workers (shared fetch-timeout helper touched every worker). `deployed/prod` moved 320bd40 → d2af4a3. Open owner decision: reseller webhooks from sim-canceller / sim-status-changer. See "Deployed 2026-09-22 (ship 4)".
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
@@ -17,6 +18,45 @@
 > Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
 
 ---
+
+## Deployed 2026-09-22 (ship 5) — PR #119, #120, #121 and #122, 18 workers
+
+- **PRs merged** (squash, branches deleted, no rebases needed): #119 "Behaviour tests for ATOMIC and Teltik rotation paths" (`888d811`); #120 "Share one Supabase REST helper across workers instead of twenty copies" (`47e066f`); #121 "SIMs table: page, filter and sort on the server" (`f5a2552`); #122 "Rotation: restore the claim stamp on inquiry timeout; stop ignoring failed DB writes after a Teltik number change" (`ee9ae2b`).
+- **Combination break caught after merging #119 + #120:** the teltik rotation test loads the worker from a `data:` URL and rewrote only the `fetch-timeout.mjs` import; #120 added `../shared/supabase-rest.mjs`, so the whole file failed to load. Fixed in #122 (the loader now rewrites every `../shared/` import). No worker code was affected.
+- **#122 — the two bugs #119 found:**
+  - mdn-rotator: a timeout or network error on the pre-swap `subsriberInquiry` now restores `last_mdn_rotated_at` and throws `ATOMIC pre-swap inquiry network error: ...`, which the batch counts as a transport failure (outage breaker) before moving on. Before, the SIM was locked out of rotation until the next NY day. Test 13 is now a real test (was todo) and fails on the old code.
+  - teltik-worker: after a Teltik number change, the `sim_numbers` close/insert and `sims` PATCH now check `res.ok`. On failure: `console.error` with SIM id, status and body; a `system_errors` row (`source=teltik-worker`, `action=teltik_rotation_db_write_failed`, `severity=error`, `error_details` has old/new msisdn and the failed writes); the SIM is counted as an error and listed in the tick result's new `failed_after_carrier` array. No carrier retry, and `increment_rotation_fail` is NOT called (a `failed` rotation_status would put the SIM in the retry pass and burn another number). New test covers a 500 on the sims PATCH and fails on the old code.
+- **Migration** `supabase/migrations/20260922_sims_paging_indexes.sql` (view `sims_dashboard`, function `sims_dashboard_facets()`, index `idx_reseller_sims_sim_id_active`), applied with `apply_migration` name `sims_paging_indexes`. Re-runnable (CREATE OR REPLACE / IF NOT EXISTS).
+  - TEST: `sims_dashboard` 5,348 rows = `sims` 5,348; facets return 11 columns; index present. Preview `0ce244b0-dashboard-test`: `/` 200, `/api/sims` 401.
+  - PROD: `sims_dashboard` 5,532 rows = `sims` 5,532; facets return 11 columns (status: active 4,287, canceled 1,201, error 20, rotation_failed 20, provisioning 4); index present.
+- **Workers deployed** via `scripts/deploy.sh`, one at a time (1151/1151 tests, 0 todo, DB constraint check, both dashboard syntax checks passed first). Root probe before → after, no changes:
+  - dashboard (`--env=""`): `2fcdac7d-399b-4f21-abd4-bd4bc8773f19` (200 → 200)
+  - details-finalizer: `938a566a-5017-414d-852a-b2510af3626e` (200 → 200)
+  - mdn-rotator: `e5a885a0-6173-4626-8296-b6359bad1c4e` (200 → 200)
+  - teltik-worker: `8290c4b0-8f4a-46d4-90c5-d83bb405ce8c` (200 → 200)
+  - bulk-activator: `55f47c3d-8382-4b34-b2f7-26c8176a5dd8` (200 → 200)
+  - bad-rental-remediator: `078e2550-5bb3-47be-8f3e-689c707d7301` (404 → 404)
+  - reseller-sync: `2772aca0-3c79-4a3c-bb16-c454429951e8` (200 → 200)
+  - kasa-control: `c8799fbc-e1ad-4364-8bed-da2e99a7c9f3` (404 → 404)
+  - ota-status-sync: `252a6ba3-5753-46cd-a4f9-93ac9a9e719f` (401 → 401)
+  - otp-portal: `10bd5c7c-a4de-4987-b9ee-8b52237ecbb7` (200 → 200)
+  - phone-number-sync: `d38d98ef-adca-474f-aa35-0e74bfca2738` (200 → 200)
+  - reseller-portal: `9c4c19bf-c6cd-4771-8697-8b33e2ffdd71` (200 → 200)
+  - sim-canceller: `23d608c7-ae4c-4eb7-936e-ee09f92906b3` (200 → 200)
+  - sim-status-changer: `785dbc29-a570-495b-89b8-deb9537065b6` (200 → 200)
+  - skyline-gateway: `af149a92-b872-492a-9eb8-ca64ac007a79` (200 → 200)
+  - sms-ingest: `8a6e32df-abe4-4589-98f5-bf71a131e46f` (405 → 405)
+  - storefront: `cd1502f0-7a66-444a-aae7-08bfb4d9b2d3` (200 → 200)
+  - teltik-portal: `26539d21-b72d-4457-84b4-3160c0a4099c` (200 → 200)
+  - Not deployed: quickbooks (unchanged; imports only `fetch-timeout.mjs`).
+- **Live probes:** dashboard `/` 200; `/api/sims` unauthenticated 401 (not 502); bad-rental CSV with X-Api-Key 200 (18,581 bytes); live dashboard script contains `sims_dashboard` (3); live mdn-rotator contains `restoreRotationStamp` (8) and the new `pre-swap inquiry network error` branch calls it.
+- **Workers Builds also deploys on push:** details-finalizer got an automatic version `792b67a8` at 21:22:41 UTC (Source "Unknown", right after main was pushed), 90 s before `scripts/deploy.sh` put `938a566a` live. Ours is the current 100% version.
+- **UX changes from #121 (SIMs tab):** searching by ID is now an exact match (not substring); search no longer matches formatted dates or SMS counts (they are not columns in the view); auto-refresh polls only the current page; filter-menu counts come from `sims_dashboard_facets()` over the whole fleet.
+- **TODO(shared-supabase) leftovers from #120** (still on their own Supabase helpers): storefront (calls go through relayFetch), reseller-portal `sbGet` (returns raw Response, ~20 callers), teltik-worker write helpers (return raw Response; #122 checks the rotation writes only), bad-rental-remediator `index.js` / `actions.mjs` / `verify-runner.mjs` (inline requests), mdn-rotator (not moved).
+- **project-map.md:** shared-module table now lists `supabase-rest.mjs` and `fetch-timeout.mjs`.
+- **TODO:** check mdn-rotator's first tick after 04:00 UTC (cron `*/5 4-14 * * *`) for `timeout after` errors and for any `pre-swap inquiry network error` lines.
+- **Marker:** `deployed/prod` moved `d2af4a32494f0d10bfca97991dd3dffce48980cb` → `ee9ae2b998c20c0cfddc99d6ebdad7d4b1591256`.
+- **Rollback:** `npx wrangler rollback` in the worker's dir (`--env=""` for dashboard), or redeploy from `d2af4a3`. The migration only adds a view, a function and an index; the old dashboard does not use them.
 
 ## Deployed 2026-09-22 (ship 4) — PR #116, #117 and #118, all 19 workers
 
