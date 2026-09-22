@@ -17,11 +17,11 @@ workers_dev = true
 # intake cadence does NOT change Paperclip ticket volume.
 # The hourly `0 * * * *` trigger is the offline SIM lifecycle decision tick
 # (pause rotation, close the reseller rental, restore on recovery), and
-# `5,20,35,50 * * * *` is its probe run (records fresh port-status checks so
-# every candidate is read within 5h). Both have their own branch in scheduled()
+# `2-59/3 * * * *` is its probe run, every 3 minutes (records fresh port-status
+# checks so every candidate is read within 5h). Both have their own branch in scheduled()
 # and share one flag, OFFLINE_LIFECYCLE_ENABLED, which defaults to off: until it
 # is set to "true" each run logs one line and returns.
-crons = ["*/15 * * * *", "*/1 * * * *", "0 * * * *", "5,20,35,50 * * * *"]
+crons = ["*/15 * * * *", "*/1 * * * *", "0 * * * *", "2-59/3 * * * *"]
 
 # Kill-switch + cooldown state. Same KV namespace as token cache for now to
 # avoid bootstrapping a new namespace; the keyspace is namespaced by prefix

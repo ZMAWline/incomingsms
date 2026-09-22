@@ -83,10 +83,10 @@ const TICK_LOCK_TTL_S = 120;
 // already live; report processing and the lifecycle never touch each other.
 const LAST_OFFLINE_LIFECYCLE_TICK_KEY = 'bad_rental_remediator_last_offline_lifecycle_tick';
 const OFFLINE_LIFECYCLE_CRON = '0 * * * *';
-// Probe runs for the lifecycle, off the quarter-hour so they never share a
-// minute with the intake or decision ticks.
+// Probe runs for the lifecycle, every 3 minutes and off the quarter-hour so they
+// never share a minute with the intake or decision ticks.
 const LAST_OFFLINE_PROBE_RUN_KEY = 'bad_rental_remediator_last_offline_probe_run';
-const OFFLINE_PROBE_CRON = '5,20,35,50 * * * *';
+const OFFLINE_PROBE_CRON = '2-59/3 * * * *';
 // R5: KV flag written whenever a tick has to fall back to the pre-migration
 // next_review_at-free query/patch shape (schema drift — the 20260729 column
 // missing). Not sticky across ticks: each tick overwrites it with its own
@@ -231,7 +231,7 @@ export default {
     //                      idle ticks are one indexed query.)
     //   - '0 * * * *'    → offline SIM lifecycle decisions: pause/unassign on
     //                      a confirmed outage and restore on recovery.
-    //   - '5,20,35,50 * * * *' → offline SIM lifecycle probes: record fresh
+    //   - '2-59/3 * * * *' → offline SIM lifecycle probes: record fresh
     //                      port-status checks for the stalest candidates.
     //   Both lifecycle crons are gated by OFFLINE_LIFECYCLE_ENABLED, which
     //   defaults to off.

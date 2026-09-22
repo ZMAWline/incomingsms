@@ -12,11 +12,11 @@
 // offline_state='offline'. Teltik-hosted and status=active only;
 // port_in_pending lines are dropped.
 //
-// Probe run (PROBE_CRON, 4x per hour): probe the candidates whose newest check
-// is oldest, through checkAndRecordTeltikHostPort, the same recorder every
-// other port-status caller uses. It is a separate invocation from the decision
-// tick because ~750 candidates cannot all be probed within 6h from an hourly
-// tick without passing the per-invocation subrequest budget.
+// Probe run (PROBE_CRON, every 3 minutes): probe the candidates whose newest
+// check is oldest, through checkAndRecordTeltikHostPort, the same recorder
+// every other port-status caller uses. It is a separate invocation from the
+// decision tick because ~4300 candidates cannot all be probed within 6h from an
+// hourly tick without passing the per-invocation subrequest budget.
 //
 // Decision tick (hourly): read the newest checks for every candidate and run
 // the pure planners. Execute at most OFFLINE_LIFECYCLE_MAX_ACTIONS transitions.
@@ -49,22 +49,23 @@ const CHECK_SOURCE = 'bad_rental_remediator';
 // otherwise re-send number.online (or worse, force-rotate) every hour.
 const RECOVERY_COOLDOWN_KEY_PREFIX = 'bad_rental_remediator_offline_lifecycle_recovered:';
 const RECOVERY_COOLDOWN_S = 60 * 60;
-// Probe cadence. The probe cron fires 4 times an hour; each run probes
+// Probe cadence. The probe cron fires 20 times an hour; each run probes
 // ceil(candidates / PROBE_RUNS_PER_CYCLE) of the stalest candidates, so every
-// candidate is visited within 20 runs (5h), inside the 6h freshness rule.
-export const PROBE_RUNS_PER_CYCLE = 20;
+// candidate is visited within 100 runs (5h), inside the 6h freshness rule.
+export const PROBE_RUNS_PER_CYCLE = 100;
 // Subrequest ceiling per probe run. A probe costs about 5 subrequests (MDN
 // resolve, port-status read, api-log mirror, check insert) and up to 9 on the
-// wrong-MDN retry path. 50 x 9 = 450, plus 2 candidate queries and up to 4
-// history reads, stays under 500. 50 per run covers 1000 candidates per cycle.
+// wrong-MDN retry path. 50 x 9 = 450, plus the paged candidate queries and
+// history reads (17 at 5000 candidates), stays under 500. 50 per run covers
+// 5000 candidates per cycle.
 export const MAX_PROBES_PER_RUN = 50;
 const PROBE_CONCURRENCY = 5;
 // Real transitions per tick. Every one of these can reach a carrier or a
 // reseller, so the cap is the blast-radius control the flag protects.
 const DEFAULT_MAX_ACTIONS = 25;
-// Candidate scan bound. Well above the current assigned-line count; exists so a
-// runaway query can never build an unbounded in-memory list.
-const CANDIDATE_CAP = 2000;
+// PostgREST clamps every response to max-rows (1000 on Supabase), so candidate
+// queries page through the whole set instead of asking for one big page.
+const PAGE_SIZE = 1000;
 // SIMs per get_recent_hosting_port_checks call. The RPC returns one row per
 // SIM, so this keeps each response under the 1000-row PostgREST limit.
 const CHECK_BATCH = 500;
@@ -99,14 +100,23 @@ function sbHeaders(env, prefer) {
   return h;
 }
 
-async function sbGetArray(env, path) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + path, { headers: sbHeaders(env) });
-  if (!resp.ok) {
-    console.log('[OfflineLifecycle] query failed HTTP ' + resp.status + ' ' + path.slice(0, 120));
-    return [];
+// Every row of a query, read PAGE_SIZE at a time until a short page. `path`
+// must carry a stable order. Any failed page fails the whole read (empty list),
+// the same outcome a failed single query had.
+async function sbGetAll(env, path) {
+  const out = [];
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const url = env.SUPABASE_URL + '/rest/v1/' + path + '&limit=' + PAGE_SIZE + '&offset=' + offset;
+    const resp = await fetch(url, { headers: sbHeaders(env) });
+    if (!resp.ok) {
+      console.log('[OfflineLifecycle] query failed HTTP ' + resp.status + ' ' + path.slice(0, 120));
+      return [];
+    }
+    const rows = await resp.json().catch(() => null);
+    if (!Array.isArray(rows)) return [];
+    out.push(...rows);
+    if (rows.length < PAGE_SIZE) return out;
   }
-  const rows = await resp.json().catch(() => null);
-  return Array.isArray(rows) ? rows : [];
 }
 
 async function sbRpc(env, fn, args) {
@@ -166,12 +176,12 @@ function shapeSim(sim) {
 // the embed filter drops unassigned SIMs instead of only their embedded rows.
 async function fetchCandidates(env) {
   const [assigned, latched] = await Promise.all([
-    sbGetArray(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims!inner' + ASSIGNMENT_COLUMNS
+    sbGetAll(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims!inner' + ASSIGNMENT_COLUMNS
       + '&status=eq.active&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true'
-      + '&' + TELTIK_HOST_FILTER + '&order=id.asc&limit=' + CANDIDATE_CAP),
-    sbGetArray(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims' + ASSIGNMENT_COLUMNS
+      + '&' + TELTIK_HOST_FILTER + '&order=id.asc'),
+    sbGetAll(env, 'sims?select=' + SIM_COLUMNS + ',reseller_sims' + ASSIGNMENT_COLUMNS
       + '&status=eq.active&offline_state=eq.offline&sim_numbers.valid_to=is.null'
-      + '&' + TELTIK_HOST_FILTER + '&order=id.asc&limit=' + CANDIDATE_CAP),
+      + '&' + TELTIK_HOST_FILTER + '&order=id.asc'),
   ]);
   const byId = new Map();
   // The assigned query's embed only holds the active row, so the latched query

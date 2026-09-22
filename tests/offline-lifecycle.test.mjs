@@ -289,9 +289,14 @@ function makeHarness({ sims, checks, dryRun = false, enabled = true, resellerSyn
       // must use an inner embed so unassigned SIMs are dropped, not returned
       // with an empty reseller_sims list.
       const latched = u.includes('offline_state=eq.offline');
-      if (!latched && !u.includes('reseller_sims!inner')) return new Response(JSON.stringify(sims), { status: 200 });
-      const rows = sims.filter((s) => (latched ? s.offline_state === 'offline'
-        : (s.reseller_sims || []).some((r) => r.active === true)));
+      const matched = !latched && !u.includes('reseller_sims!inner') ? sims
+        : sims.filter((s) => (latched ? s.offline_state === 'offline'
+          : (s.reseller_sims || []).some((r) => r.active === true)));
+      // Mirror PostgREST paging, including the 1000-row max-rows clamp.
+      const params = new URL(u).searchParams;
+      const offset = Number(params.get('offset') || 0);
+      const limit = Math.min(Number(params.get('limit') || Infinity), 1000);
+      const rows = [...matched].sort((a, b) => a.id - b.id).slice(offset, offset + limit);
       return new Response(JSON.stringify(rows), { status: 200 });
     }
     if (method === 'POST' && u.includes('/rest/v1/rpc/get_recent_hosting_port_checks')) {
@@ -391,24 +396,55 @@ test('the probe run visits the stalest candidates first', async () => {
     }
     return h.fakeFetch(url, init);
   };
-  // 4 candidates -> ceil(4 / 20) = 1 probe per run.
+  // 4 candidates -> ceil(4 / 100) = 1 probe per run.
   const summary = await withFetch(fetchSpy, () => runOfflineProbeRun(h.env, { now: NOW }));
   assert.equal(summary.probe_limit, 1);
   assert.deepEqual(probedIds, [3]);
 });
 
 test('every candidate is probed within 6h without passing ~500 subrequests', () => {
-  // Probe cron: 4 runs an hour. PROBE_RUNS_PER_CYCLE runs must fit in 6h.
-  assert.ok(PROBE_RUNS_PER_CYCLE / 4 < CHECK_MAX_AGE_MS / 3600_000);
-  for (const n of [1, 100, 750, 1000]) {
+  // Probe cron: 20 runs an hour. PROBE_RUNS_PER_CYCLE runs must fit in 6h.
+  assert.ok(PROBE_RUNS_PER_CYCLE / 20 < CHECK_MAX_AGE_MS / 3600_000);
+  for (const n of [1, 100, 750, 1000, 4285, 5000]) {
     const limit = probeLimitFor(n);
     assert.ok(Math.ceil(n / limit) <= PROBE_RUNS_PER_CYCLE, 'n=' + n + ' needs more than one cycle');
   }
-  assert.equal(probeLimitFor(750), 38);
-  assert.equal(probeLimitFor(5000), MAX_PROBES_PER_RUN);
-  // Worst case per probe run: 9 subrequests per probe (wrong-MDN retry path),
-  // 2 candidate queries, and ceil(2000 / 500) history reads.
-  assert.ok(MAX_PROBES_PER_RUN * 9 + 2 + 4 < 500);
+  assert.equal(probeLimitFor(4285), 43);
+  assert.equal(probeLimitFor(10000), MAX_PROBES_PER_RUN);
+  // Worst case per probe run at 5000 candidates: 9 subrequests per probe
+  // (wrong-MDN retry path), 5 + 1 candidate pages, and 5000 / 500 history reads.
+  assert.ok(MAX_PROBES_PER_RUN * 9 + 6 + 10 < 500);
+});
+
+test('candidate queries page past the 1000-row PostgREST clamp', async () => {
+  const sims = Array.from({ length: 2500 }, (_, i) => ({ ...OFFLINE_SIM, id: 629 + i, iccid: 'i' + i }));
+  const h = makeHarness({ sims, checks: [] });
+  const summary = await withFetch(h.fakeFetch, () => runOfflineLifecycleTick(h.env, { now: NOW }));
+  assert.equal(summary.candidates, 2500);
+  // Assigned query: pages of 1000, 1000, 500. Latched query: one empty page.
+  assert.equal(h.calls.filter((c) => c === 'GET sims').length, 4);
+});
+
+test('the probe run reaches stale SIMs beyond the first page', async () => {
+  // 2500 candidates; every SIM on the first page was checked recently, so the
+  // stalest ones only exist on later pages.
+  const sims = Array.from({ length: 2500 }, (_, i) => ({ ...OFFLINE_SIM, id: 1 + i, iccid: 'i' + i }));
+  const checks = sims.map((s) => ({
+    sim_id: s.id, ...check('online', s.id <= 1000 ? 60_000 : 4 * 3600_000 - s.id * 1000),
+  }));
+  const h = makeHarness({ sims, checks });
+  const probedIds = [];
+  const fetchSpy = async (url, init) => {
+    if (String(url).includes('/hosting_port_status_checks') && init && init.method === 'POST') {
+      probedIds.push(JSON.parse(init.body).sim_id);
+    }
+    return h.fakeFetch(url, init);
+  };
+  // 2500 candidates -> ceil(2500 / 100) = 25 probes, least recently checked first.
+  const summary = await withFetch(fetchSpy, () => runOfflineProbeRun(h.env, { now: NOW }));
+  assert.equal(summary.candidates, 2500);
+  assert.equal(summary.probe_limit, 25);
+  assert.deepEqual([...probedIds].sort((a, b) => a - b), Array.from({ length: 25 }, (_, i) => 1001 + i));
 });
 
 test('the history read goes through the per-SIM capped RPC in batches', async () => {
@@ -580,7 +616,7 @@ test('get_recent_hosting_port_checks caps the history per SIM in SQL', () => {
 
 test('the hourly cron, the probe cron and both rotate bindings are declared', () => {
   assert.ok(REMEDIATOR_TOML.includes('"0 * * * *"'), 'hourly cron missing from wrangler.toml');
-  assert.ok(REMEDIATOR_TOML.includes('"5,20,35,50 * * * *"'), 'probe cron missing from wrangler.toml');
+  assert.ok(REMEDIATOR_TOML.includes('"2-59/3 * * * *"'), 'probe cron missing from wrangler.toml');
   for (const block of ['binding = "TELTIK_WORKER"', 'binding = "MDN_ROTATOR"']) {
     assert.ok(REMEDIATOR_TOML.includes(block), 'missing ' + block);
   }
@@ -593,7 +629,7 @@ test('scheduled() routes the hourly cron to the lifecycle, not the intake tick',
   assert.ok(REMEDIATOR_SRC.includes("const OFFLINE_LIFECYCLE_CRON = '0 * * * *'"));
   assert.ok(REMEDIATOR_SRC.includes('if (cron === OFFLINE_LIFECYCLE_CRON)'));
   assert.ok(REMEDIATOR_SRC.includes('runOfflineLifecycleTick(env)'));
-  assert.ok(REMEDIATOR_SRC.includes("const OFFLINE_PROBE_CRON = '5,20,35,50 * * * *'"));
+  assert.ok(REMEDIATOR_SRC.includes("const OFFLINE_PROBE_CRON = '2-59/3 * * * *'"));
   assert.ok(REMEDIATOR_SRC.includes('if (cron === OFFLINE_PROBE_CRON)'));
   assert.ok(REMEDIATOR_SRC.includes('runOfflineProbeRun(env)'));
 });
