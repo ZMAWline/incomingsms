@@ -272,3 +272,51 @@ export async function notifyOfflineFleetSummary(env, { now } = {}) {
     return { ok: false, error: String(err && err.message || err) };
   }
 }
+
+// =========================================================
+// Offline SIM lifecycle dry-run digest.
+//
+// OFFLINE_LIFECYCLE_DRY_RUN makes the hourly tick decide but never write. The
+// decisions still have to be reviewable, so they land in the same Slack channel
+// as the offline digest above, one message per tick listing what the tick would
+// have done. This is the artifact to read before flipping
+// OFFLINE_LIFECYCLE_ENABLED on in PROD.
+//
+// No dedup: each tick's plan is its own message, and a dry run posts nothing at
+// all when there is nothing to do.
+// =========================================================
+
+const LIFECYCLE_PLAN_LIST_CAP = 20;
+
+function buildOfflineLifecycleMessage(plans) {
+  const offline = plans.filter((p) => p.kind === 'offline');
+  const recovered = plans.filter((p) => p.kind === 'recovery');
+  const lines = ['*Would act on ' + plans.length + ' line(s)* · offline: ' + offline.length + ' · recovery: ' + recovered.length];
+  for (const plan of plans.slice(0, LIFECYCLE_PLAN_LIST_CAP)) {
+    lines.push('• `' + (plan.iccid || plan.sim_id) + '` (' + (plan.vendor || 'unknown') + ', '
+      + plan.kind + (plan.reseller_id ? ', reseller ' + plan.reseller_id : ', unassigned') + '): '
+      + plan.actions.join(' → '));
+  }
+  if (plans.length > LIFECYCLE_PLAN_LIST_CAP) {
+    lines.push('_...and ' + (plans.length - LIFECYCLE_PLAN_LIST_CAP) + ' more_');
+  }
+  return {
+    blocks: [
+      { type: 'header', text: { type: 'plain_text', text: ':mag: Offline SIM lifecycle (DRY RUN)', emoji: true } },
+      { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: 'No writes were made. Generated: ' + new Date().toISOString() }] },
+    ],
+  };
+}
+
+// Never throws: a Slack outage must not fail the tick.
+export async function notifyOfflineLifecyclePlan(env, plans) {
+  try {
+    if (!env.SLACK_WEBHOOK_URL) return { ok: false, skipped: 'no_webhook' };
+    if (!Array.isArray(plans) || !plans.length) return { ok: true, skipped: 'nothing_planned' };
+    return await postToSlack(env, env.SLACK_WEBHOOK_URL, buildOfflineLifecycleMessage(plans));
+  } catch (err) {
+    console.log('[Remediator] notifyOfflineLifecyclePlan error: ' + (err && err.message || err));
+    return { ok: false, error: String(err && err.message || err) };
+  }
+}

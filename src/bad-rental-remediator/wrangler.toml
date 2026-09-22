@@ -15,7 +15,11 @@ workers_dev = true
 # the §C nonce window is only 5 min.
 # Escalation batching still dedups on 2h tick_id slots (computeTickId), so the
 # intake cadence does NOT change Paperclip ticket volume.
-crons = ["*/15 * * * *", "*/1 * * * *"]
+# The hourly `0 * * * *` trigger is the offline SIM lifecycle (pause rotation,
+# close the reseller rental, restore on recovery). It has its own branch in
+# scheduled() and its own flag, OFFLINE_LIFECYCLE_ENABLED, which defaults to
+# off: until it is set to "true" the hourly tick logs one line and returns.
+crons = ["*/15 * * * *", "*/1 * * * *", "0 * * * *"]
 
 # Kill-switch + cooldown state. Same KV namespace as token cache for now to
 # avoid bootstrapping a new namespace; the keyspace is namespaced by prefix
@@ -66,9 +70,31 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 # Depth is visible without credentials at GET /escalations/backlog and in
 # /status -> escalation_backlog.
 #
+# Offline SIM lifecycle (hourly `0 * * * *` branch, offline-lifecycle.mjs).
+# Plain vars, set with `wrangler deploy --var` or a [vars] block per environment;
+# none of them are secrets.
+#   OFFLINE_LIFECYCLE_ENABLED      "true" arms the tick. ANY other value (including
+#                                  unset, the default) makes the hourly tick a
+#                                  no-op that only logs. Nothing ships enabled.
+#   OFFLINE_LIFECYCLE_DRY_RUN      "true" decides but writes nothing: no probe, no
+#                                  webhook, no rotation, no PATCH. The intended
+#                                  actions are posted to SLACK_WEBHOOK_URL instead.
+#                                  Run one hourly cycle in this mode and read the
+#                                  digest before enabling writes.
+#   OFFLINE_LIFECYCLE_PROBE_LIMIT  port-status probes per tick (default 100). A KV
+#                                  cursor advances each tick so the candidate set
+#                                  is covered over several hours.
+#   OFFLINE_LIFECYCLE_MAX_ACTIONS  real transitions per tick (default 25). This is
+#                                  the blast-radius cap on carrier/reseller calls.
+# The lifecycle also needs ADMIN_RUN_SECRET (shared across workers) to call the
+# two /rotate-sim routes over the service bindings below.
+
 # Service bindings used during shared-situation classification.
-# RESELLER_SYNC: resend webhook + check rental status (cancel-guard §E).
+# RESELLER_SYNC: resend webhook + check rental status (cancel-guard §E), plus
+#   /send-offline and /resend-online for the offline SIM lifecycle.
 # SKYLINE_GATEWAY: gateway port-status for S5; /send-sms wired in INC-16c.
+# TELTIK_WORKER / MDN_ROTATOR: force-rotate one SIM on recovery in a NEW rotation
+#   window, via each worker's existing /rotate-sim?force=true route.
 [[services]]
 binding = "RESELLER_SYNC"
 service = "reseller-sync"
@@ -76,6 +102,14 @@ service = "reseller-sync"
 [[services]]
 binding = "SKYLINE_GATEWAY"
 service = "skyline-gateway"
+
+[[services]]
+binding = "TELTIK_WORKER"
+service = "teltik-worker"
+
+[[services]]
+binding = "MDN_ROTATOR"
+service = "mdn-rotator"
 
 [observability.logs]
 enabled = true
@@ -99,6 +133,14 @@ service = "reseller-sync-test"
 [[env.test.services]]
 binding = "SKYLINE_GATEWAY"
 service = "skyline-gateway-test"
+
+[[env.test.services]]
+binding = "TELTIK_WORKER"
+service = "teltik-worker-test"
+
+[[env.test.services]]
+binding = "MDN_ROTATOR"
+service = "mdn-rotator-test"
 
 [env.test.observability.logs]
 enabled = true
