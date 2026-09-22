@@ -85,9 +85,9 @@ node --input-type=module --check < src/dashboard/index.js
 
 **Check 2: frontend JS inside `<script>` tags**
 ```bash
-node _check_frontend_js.js
+node scripts/check-frontend-js.js
 ```
-`_check_frontend_js.js` is committed at the repo root. It pulls every inline `<script>` block out of `public/index.html` and runs `node --check` over each one.
+`scripts/check-frontend-js.js` is committed in the repo. It pulls every inline `<script>` block out of `public/index.html` and runs `node --check` over each one.
 
 **Why two checks?** Check 1 only validates the Worker module, which no longer contains any frontend code. A syntax error in `public/index.html` is invisible to it — the Worker deploys fine and the browser gets broken JS, so `loadData()` never runs and the page renders empty. That is the recurring "data not loading" bug.
 

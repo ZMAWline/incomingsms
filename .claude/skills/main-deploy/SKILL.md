@@ -114,7 +114,7 @@ If `src/dashboard/` is in the deploy list, also run both dashboard checks now:
 
 ```bash
 node --input-type=module --check < src/dashboard/index.js
-node _check_frontend_js.js
+node scripts/check-frontend-js.js
 ```
 
 ## Step 6 - Migrations: flag, never apply

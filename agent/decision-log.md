@@ -262,7 +262,7 @@ The single-table approach is async by nature (operator's reply gets picked up on
 - **Node scripts (verifier, tests, seeder):** these run under raw Node, which respects `package.json` `"type"` and requires `.mjs` for ESM under a CommonJS package.
 
 Two alternatives were considered and rejected:
-1. **Flip `package.json` to `"type": "module"`** — would have let `.js` stay `.js` cleanly. Rejected because the project has one CommonJS file (`src/mdn-rotator/_patch_queue_token.js`, a dev helper) that would have needed renaming to `.cjs`, and the change affects how Node interprets *every* `.js` file in the repo — potential subtle effects on root-level dev scripts (`_check_frontend_js.js`, `_check_relay.js`, `fix_both.js`) that weren't going to be verified exhaustively in-session. The blast radius was too wide for what's effectively a one-file problem.
+1. **Flip `package.json` to `"type": "module"`** — would have let `.js` stay `.js` cleanly. Rejected because the project has one CommonJS file (`src/mdn-rotator/_patch_queue_token.js`, a dev helper) that would have needed renaming to `.cjs`, and the change affects how Node interprets *every* `.js` file in the repo — potential subtle effects on root-level dev scripts (`scripts/check-frontend-js.js`, `_check_relay.js`, `fix_both.js`) that weren't going to be verified exhaustively in-session. The blast radius was too wide for what's effectively a one-file problem.
 2. **Use `require()` / dynamic `import()` in the Node scripts** — would have let the workers keep `.js` but made the test/seeder code messier and forced async-IIFE wrapping. Rejected as ugly.
 
 The `.mjs` rename is one file (plus updating two worker import lines), zero runtime risk, and clearly localized.
@@ -928,13 +928,13 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 
 **Decision:** Every change to `src/dashboard/index.js` — without exception and regardless of size — must be performed by invoking the `patch-dashboard` skill (`Skill` tool, `skill: "patch-dashboard"`) before writing any patch script. Freehand patch scripts are prohibited even when they appear to follow the pattern. This rule is now hardcoded in `agent/BOOTSTRAP.md` Rule 1, `agent/constraints.md §1`, and the user's auto-memory.
 
-**Why:** On 2026-04-15 a freehand `_add_gateway_export.js` patch shipped invalid JS to prod: the CSV-escape helper contained `/[",\n\r]/` which became a multi-line regex literal after the template literal evaluated `\n` and `\r` as escape sequences. The outer-Worker syntax check (Check 1) read the frontend JS as a string and passed. Only Check 2 (`_check_frontend_js.js`, which executes `getHTML()` via `vm` and syntax-checks the extracted browser JS) would have caught it — and I had skipped it because I didn't invoke the skill. The skill enforces both checks and the `--env=""` deploy.
+**Why:** On 2026-04-15 a freehand `_add_gateway_export.js` patch shipped invalid JS to prod: the CSV-escape helper contained `/[",\n\r]/` which became a multi-line regex literal after the template literal evaluated `\n` and `\r` as escape sequences. The outer-Worker syntax check (Check 1) read the frontend JS as a string and passed. Only Check 2 (`scripts/check-frontend-js.js`, which executes `getHTML()` via `vm` and syntax-checks the extracted browser JS) would have caught it — and I had skipped it because I didn't invoke the skill. The skill enforces both checks and the `--env=""` deploy.
 
 **Consequence:**
 - Do NOT handcraft a patch script and run the outer-module check only. Always open the skill first so the frontend-JS check runs.
 - Do NOT deploy the dashboard with bare `npx wrangler deploy` — always `--env=""` (prod) or `--env test`.
 - If a future session discovers this rule is overbearing (e.g. a docs-only change), the skill itself must be amended — not bypassed.
-- `_check_frontend_js.js` is load-bearing. Do not delete.
+- `scripts/check-frontend-js.js` is load-bearing. Do not delete.
 
 ---
 
@@ -979,11 +979,11 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 
 ## 2026-03-24 — Frontend JS check must execute getHTML() via vm, not regex substitution
 
-**Decision:** `_check_frontend_js.js` uses Node `vm.runInContext` to actually execute the `getHTML()` function and extract the resulting HTML string, rather than regex-replacing `\`` → `` ` `` and `\${` → `${` on the raw file text.
+**Decision:** `scripts/check-frontend-js.js` uses Node `vm.runInContext` to actually execute the `getHTML()` function and extract the resulting HTML string, rather than regex-replacing `\`` → `` ` `` and `\${` → `${` on the raw file text.
 
 **Why:** The regex approach misses all other template literal escape evaluations: `\n` → newline, `\t` → tab, `\\` → `\`, etc. A file with `dbLines.join('\n')` (single backslash-n inside single-quoted string) passed the regex check because node's own `--check` sees `'\n'` as a valid newline escape — but the template literal evaluates `\n` to a literal newline char, so the browser actually receives an unclosed string literal → syntax error. This caused recurring "data not loading" bugs that appeared fixed but weren't.
 
-**Consequence:** Always use `node _check_frontend_js.js` (the vm-based version at the repo root) as Step 4b. Never revert to the regex version. The check must faithfully reproduce what the browser receives.
+**Consequence:** Always use `node scripts/check-frontend-js.js` (the vm-based version at the repo root) as Step 4b. Never revert to the regex version. The check must faithfully reproduce what the browser receives.
 
 ---
 

@@ -4,6 +4,8 @@
 // Includes: deduplication and retry
 // =========================================================
 
+import { constantTimeEqual } from "../shared/portal-auth.mjs";
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
@@ -13,10 +15,14 @@ export default {
     const url = new URL(request.url);
 
     // =========================
-    // AUTH (3 supported ways)
-    // 1) Header: x-gateway-secret: <secret>
-    // 2) Query:  ?secret=<secret>
-    // 3) Path:   /s/<secret>   (BEST for gateways that always append ?params)
+    // AUTH
+    // Preferred (header):
+    //   X-Ingest-Secret: <secret>
+    //   Authorization: Bearer <secret>
+    //   x-gateway-secret: <secret>   (older header name, still accepted)
+    // Deprecated (secret in the URL, lands in access logs):
+    //   ?secret=<secret>
+    //   /s/<secret>   (for gateways that always append ?params)
     // =========================
     const pathParts = url.pathname.split("/").filter(Boolean);
     const secretFromPath =
@@ -26,14 +32,21 @@ export default {
     const gatewayIdFromPath = (pathParts[2] === "gw" && pathParts[3])
       ? parseInt(pathParts[3]) : null;
 
-    const gotSecret =
+    const auth = request.headers.get("authorization") || "";
+    const bearer = /^Bearer\s+/i.test(auth) ? auth.replace(/^Bearer\s+/i, "").trim() : "";
+    const headerSecret =
+      request.headers.get("x-ingest-secret") ||
+      bearer ||
       request.headers.get("x-gateway-secret") ||
-      url.searchParams.get("secret") ||
-      secretFromPath ||
       "";
+    const urlSecret = url.searchParams.get("secret") || secretFromPath || "";
+    const gotSecret = headerSecret || urlSecret;
 
-    if (!env.GATEWAY_SECRET || gotSecret !== env.GATEWAY_SECRET) {
+    if (!env.GATEWAY_SECRET || !gotSecret || !constantTimeEqual(gotSecret, env.GATEWAY_SECRET)) {
       return new Response("Unauthorized", { status: 401 });
+    }
+    if (!headerSecret) {
+      console.warn("[sms-ingest] deprecated: secret sent in the URL (" + (secretFromPath ? "/s/<secret>" : "?secret=") + "); send it as an X-Ingest-Secret header instead");
     }
 
     const ct = (request.headers.get("content-type") || "").toLowerCase();

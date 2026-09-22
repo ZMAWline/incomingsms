@@ -200,7 +200,7 @@ Manual:
 Verification before completion (per `superpowers:verification-before-completion`):
 - Run `npm run check:db-constraints` after the migration — required per memory `feedback_verify_db_constraints.md`.
 - Run `node _check_relay.js` to confirm no bare `fetch()` introduced in the resend path.
-- `node --input-type=module --check < src/dashboard/index.js` and `node _check_frontend_js.js` — only relevant if the dashboard ALSO changes; this spec touches `reseller-portal` not `dashboard`, so the `patch-dashboard` skill is not in scope. But run both anyway as a safety net.
+- `node --input-type=module --check < src/dashboard/index.js` and `node scripts/check-frontend-js.js` — only relevant if the dashboard ALSO changes; this spec touches `reseller-portal` not `dashboard`, so the `patch-dashboard` skill is not in scope. But run both anyway as a safety net.
 
 ## 11. Deployment plan
 
