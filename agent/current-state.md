@@ -3,6 +3,7 @@
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
 > 2026-09-22: Brief A done. PRs #88 (`87cc4bf`) and #84 (`6584492`) are squash-merged, not deployed. 989 tests pass. #84 frontend filename gap is open. See "Brief A done".
 > Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
+> Also 2026-09-22: Brief B steps 1–2 done — `FINALIZER_RUN_SECRET` set on `bad-rental-remediator` (test + prod), and PROD redeployed with `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` as version `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`. See "Brief B steps 1–2 done" below. Next: wait 5h for one full probe cycle, read the Slack digest, get owner sign-off, then remove DRY_RUN (step 5).
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
@@ -18,6 +19,32 @@
 - **#84** QBO CSV invoice filenames without separators → squash `6584492`. Rebased with no conflicts.
 - Tests: 989/989 pass on each rebased branch. Both are on main but not deployed. Run `/main-deploy` to ship the dashboard Worker.
 - **Open gap in #84:** the dashboard frontend sets its own download name, so the server-side fix does not reach the UI buttons. `src/dashboard/public/index.html` still builds `invoice_<name>_<start>_<end>.csv` in the preview download and `invoice_<id>.csv` in the history download. `a.download` overrides the server filename, so QuickBooks still gets underscored names from the dashboard. This was already on the PR's base, so the rebase did not cause it. Needs a follow-up fix.
+
+## Brief B steps 1–2 done 2026-09-22 — `FINALIZER_RUN_SECRET` set, dry-run deploy live
+
+Working tree was found checked out on `feat/wire-portin-outcomes` (clean, 0 commits
+ahead — leftover from the Brief A session) at task start; switched to `main`
+(up to date with `origin/main`) before doing anything, per the brief's instruction
+to deploy from the main workspace.
+
+- **`FINALIZER_RUN_SECRET`** found at `/root/projects/incomingsms/.dev.vars` line 17
+  (top-level, single shared `.dev.vars` for local dev — this repo does not keep a
+  per-worker copy). Confirmed the name already exists as a secret on `reseller-sync`
+  (`wrangler secret list`) before copying it. Set on `bad-rental-remediator` for
+  both prod and test via `wrangler secret put -c src/bad-rental-remediator/wrangler.toml
+  [--env test]`, value piped through stdin, never echoed. Confirmed present by name
+  on both (`wrangler secret list` / `wrangler secret list --env test`).
+- **Redeployed to PROD** via `scripts/deploy.sh bad-rental-remediator --var
+  OFFLINE_LIFECYCLE_ENABLED:true --var OFFLINE_LIFECYCLE_DRY_RUN:true` — `deploy.sh`
+  already forwards extra args to `wrangler deploy` via `"$@"`, no script change
+  needed. 989/989 tests passed, DB constraint check passed, then deployed.
+  **New PROD version:** `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`, confirmed live at
+  100% (`wrangler deployments list`) with both vars set (`wrangler versions view`:
+  `OFFLINE_LIFECYCLE_ENABLED="true"`, `OFFLINE_LIFECYCLE_DRY_RUN="true"`) and
+  `FINALIZER_RUN_SECRET` present in its secret list.
+- **Remaining (brief steps 3–5):** wait ≥5h for one full probe cycle, read the
+  Slack digest of intended actions, get the owner's sign-off, then redeploy with
+  `OFFLINE_LIFECYCLE_ENABLED:true` and DRY_RUN removed.
 
 ## Deployed 2026-09-22 — offline SIM lifecycle to PROD (feature ships OFF)
 
