@@ -11,7 +11,19 @@
 > 2026-09-10: SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API.
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
+> Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
+
 ---
+
+## PROD anon lockdown applied 2026-09-22 — PR #111 merged
+
+- Migration `20260922_lock_down_anon.sql` applied to PROD (`lzjqegxazqlktttyybth`) via `apply_migration`, name `lock_down_anon`. TEST already had it.
+- Before → after on PROD: grants to anon/authenticated **614 → 0**; policies for anon/authenticated/PUBLIC **58 → 0**; public tables without RLS **0 → 0**.
+- Anon probes (`/rest/v1/{sims,inbound_sms,carrier_api_logs,dashboard_sessions}?select=id&limit=1`): all **401** (`42501 permission denied`) with each of the three live keys: legacy anon JWT, `default` publishable, and `dan_bot` publishable.
+- Backend: `SET ROLE service_role; select count(*) from sims` → 5532, same as before. Dashboard root → 200. Bad-rental CSV (`/public/bad-rental-escalations-today.csv`, `X-Api-Key`) → 200, 18,663 bytes before and after. The dashboard has no real health route: `/health` serves the sign-in page and `/api/health` returns 401.
+- No rollback needed. The rollback file is `supabase/migrations/20260922_lock_down_anon_ROLLBACK.sql.txt`, section A.
+- **dan_bot / "Grok bot" read access is ended by owner decision.** Its replacement, the "Dan" bot, is stalled and has not been started. The `dan_bot` publishable key still exists but can read nothing. Any future consumer needs a narrow grant plus a narrow policy.
+- **Open item:** carrier_api_logs has 25 rows with authorization-like headers and 271 with password/secret in bodies that were anon-readable from 2026-09-08 to 2026-09-22; decide whether to rotate carrier credentials and whether to scrub those rows.
 
 ## Brief A done 2026-09-22 — PRs #88 and #84 rebased and squash-merged (not deployed)
 
