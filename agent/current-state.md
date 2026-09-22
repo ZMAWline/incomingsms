@@ -5,7 +5,8 @@
 > Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
 > Also 2026-09-22: Brief B steps 1–2 done — `FINALIZER_RUN_SECRET` set on `bad-rental-remediator` (test + prod), and PROD redeployed with `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` as version `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`. See "Brief B steps 1–2 done" below. Next: wait 5h for one full probe cycle, read the Slack digest, get owner sign-off, then remove DRY_RUN (step 5).
 > 2026-09-22: PR #112 merged and DEPLOYED to PROD with #110, #88 and #84 — dashboard `3b69cf80`, details-finalizer `1f22a644`, reseller-portal `e6e18c80`. `deployed/prod` moved 6ec5620 → 7b18ed4. See "Deployed 2026-09-22 (ship 2)".
-> 2026-09-22 (latest): PR #113 + #115 merged and DEPLOYED to PROD with #114 — dashboard `5d424a79`, details-finalizer `49029305`, bad-rental-remediator `ecb01e83`. `deployed/prod` moved 7b18ed4 → 320bd40. See "Deployed 2026-09-22 (ship 3)".
+> 2026-09-22: PR #113 + #115 merged and DEPLOYED to PROD with #114 — dashboard `5d424a79`, details-finalizer `49029305`, bad-rental-remediator `ecb01e83`. `deployed/prod` moved 7b18ed4 → 320bd40. See "Deployed 2026-09-22 (ship 3)".
+> 2026-09-22 (latest): PR #116, #117 and #118 merged and DEPLOYED to PROD — all 19 workers (shared fetch-timeout helper touched every worker). `deployed/prod` moved 320bd40 → d2af4a3. Open owner decision: reseller webhooks from sim-canceller / sim-status-changer. See "Deployed 2026-09-22 (ship 4)".
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
@@ -16,6 +17,38 @@
 > Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
 
 ---
+
+## Deployed 2026-09-22 (ship 4) — PR #116, #117 and #118, all 19 workers
+
+- **PRs merged** (squash, branches deleted): #116 "Tighten dashboard CORS, prefer header for SMS ingest secret, remove dead scripts, rewrite README" (`12bb6bc`); #117 "Add timeouts to every carrier, database and webhook call outside the dashboard" (`f8b3ea1`, merged clean, no rebase needed); #118 "sms-ingest: use the shared fetch timeouts" (`d2af4a3`, follow-up to #117: sms-ingest Supabase calls use `supabaseFetch`, reseller webhook delivery uses `webhookFetch`, and `PENDING_WORKERS` is removed from `tests/fetch-timeout.test.mjs`).
+- **Workers deployed** via `scripts/deploy.sh`, one at a time (1063/1063 tests, DB constraint check, both dashboard syntax checks passed first). Root probe before → after, no changes:
+  - dashboard (`--env=""`): `9511b400-ceae-4767-a73f-04dc7f077429` (200 → 200)
+  - details-finalizer: `b040f152-c8ab-4bdc-94e8-bf02184587fb` (200 → 200)
+  - mdn-rotator: `3d3101d4-081f-4751-a470-ec933a1e8f58` (200 → 200)
+  - bulk-activator: `2b5d1b6b-8e59-45fe-98a6-5939402e6942` (200 → 200)
+  - teltik-worker: `aa2743ae-be1b-4a91-8253-d200cc3872c6` (200 → 200)
+  - bad-rental-remediator: `84b281be-ae71-4207-8844-24042230a9cd` (404 → 404)
+  - reseller-sync: `16d8c3ad-6149-4c72-a4be-d12f6109b3b7` (200 → 200)
+  - sms-ingest: `9176677b-e669-4481-aea2-41a3188193a4` (405 → 405)
+  - kasa-control: `93f19cc7-ee7e-47ca-82c1-c1ebc330a250` (404 → 404)
+  - ota-status-sync: `39253636-eae5-4690-93aa-602a5d78771e` (401 → 401)
+  - otp-portal: `abb06fe5-5770-4814-8345-c3a59331575c` (200 → 200)
+  - phone-number-sync: `1e63f051-7045-483d-a2a7-4e837a8986cf` (200 → 200)
+  - quickbooks: `9be31522-d93e-459c-bc99-ca26d68f9ff8` (404 → 404)
+  - reseller-portal: `b5230acb-2ea0-44eb-8fa7-a1e2339f388a` (200 → 200)
+  - sim-canceller: `6a26c1b9-2dfa-4e69-8734-9d354f2be5ea` (200 → 200)
+  - sim-status-changer: `6e947c46-613d-4208-bacf-0269b49dba8b` (200 → 200)
+  - skyline-gateway: `03379dbc-5fe4-4c7b-889c-e82aaa20f84c` (200 → 200)
+  - storefront: `c44fee43-3381-4f0c-b884-8964356c5b95` (200 → 200)
+  - teltik-portal: `598cf066-b9ba-4706-a592-83a92562e2b2` (200 → 200)
+- **Migrations:** none in range.
+- **Live probes:** dashboard `/` 200; bad-rental CSV with X-Api-Key 200 (18,581 bytes); live mdn-rotator script contains `fetch-timeout` and `carrierFetch`.
+- **CORS probe:** unauthenticated `/api/sims` with `Origin: https://evil.example` returns 401 with no Access-Control header. The same request with the dashboard's own origin also has no header, because the auth gate returns 401 before the CORS headers are computed (`src/dashboard/index.js`), and that includes OPTIONS preflights. The echo for allowed origins is covered by `tests/dashboard-cors.test.mjs` only. It was not verified live because that needs an authenticated request.
+- **Cron tail:** details-finalizer ran one `*/5` tick at 20:55 UTC on `b040f152`, outcome ok, no exceptions, no timeout errors, 580 ms wall time. mdn-rotator had no events in the 400 s tail: its cron is `*/5 4-14 * * *` (04:00–14:59 UTC), and the tail ran at 20:51 UTC. Check the first tick after 04:00 UTC for `timeout after` errors.
+- **TEST note:** sms-ingest TEST (`sms-ingest-test`) deploys `index.ts`, not `index.js`, so the #116 auth change and the #118 timeouts are PROD-only.
+- **Open decision (owner):** `postResellerWebhook` in sim-canceller and sim-status-changer never sends, because `env` is not passed to it. Fixing that would START sending cancel/suspend/restore webhooks to resellers, which they have never received. Owner to decide before anyone fixes it.
+- **Marker:** `deployed/prod` moved `320bd403a6fe957e746505e0f3f23202224ef5d5` → `d2af4a32494f0d10bfca97991dd3dffce48980cb`.
+- **Rollback:** `npx wrangler rollback` in the worker's dir (`--env=""` for dashboard), or redeploy from `320bd40`.
 
 ## Deployed 2026-09-22 (ship 3) — PR #113 and #115, plus #114
 
