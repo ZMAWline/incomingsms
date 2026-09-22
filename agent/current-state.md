@@ -1,7 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Also 2026-09-22: Offline SIM lifecycle on branch `unassign-offline-sims-from-reseller`. New hourly cron on `bad-rental-remediator`, gated by `OFFLINE_LIFECYCLE_ENABLED` (defaults off). Migration `20260922_sim_offline_lifecycle.sql` NOT applied to TEST or PROD; nothing deployed.
+> Also 2026-09-22: Offline SIM lifecycle MERGED to `main` as d8753fe (PR #109, branch deleted). NOT deployed. Before enabling: apply migration `20260922_sim_offline_lifecycle.sql` (TEST then PROD) and `20260918_claim_rotation_slot.sql` to TEST, set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), deploy `reseller-sync`, `bad-rental-remediator`, `dashboard`, run one `OFFLINE_LIFECYCLE_DRY_RUN=true` cycle, review the Slack digest, then set `OFFLINE_LIFECYCLE_ENABLED=true`.
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
