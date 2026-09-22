@@ -1,13 +1,27 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> Also 2026-09-22: Offline SIM lifecycle MERGED to `main` as d8753fe (PR #109, branch deleted). NOT deployed. Before enabling: apply migration `20260922_sim_offline_lifecycle.sql` (TEST then PROD) and `20260918_claim_rotation_slot.sql` to TEST, set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), deploy `reseller-sync`, `bad-rental-remediator`, `dashboard`, run one `OFFLINE_LIFECYCLE_DRY_RUN=true` cycle, review the Slack digest, then set `OFFLINE_LIFECYCLE_ENABLED=true`.
+> Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
 > 2026-09-17 (SIMs-table saved filters are now per-account — `dashboard_saved_filters`, migration 011. Migration NOT yet applied to TEST or PROD; not deployed to prod.)
 > 2026-09-10: SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API.
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
+
+---
+
+## Deployed 2026-09-22 — offline SIM lifecycle to PROD (feature ships OFF)
+
+- **main:** `6ec5620` (tag `deployed/prod` now points here; it did not exist before).
+- **Workers deployed to PROD:** `bad-rental-remediator` version `89f93b91-fee6-485e-8359-d84b83d20734`; `dashboard` version `77c607df-0051-4900-a2df-00259cef5335`. `bulk-activator`, `details-finalizer`, `reseller-sync` were already byte-identical to main and were not redeployed. No `OFFLINE_LIFECYCLE_*` vars set.
+- **Verified:** dashboard root returns 200 (sign-in page); live dashboard script contains `offline_state`; `wrangler deployments list` shows both versions at 100%.
+- **Migration:** `supabase/migrations/20260922_sim_offline_lifecycle.sql` applied to PROD `lzjqegxazqlktttyybth` as `sim_offline_lifecycle`; all 6 columns and `get_recent_hosting_port_checks` confirmed present. NOT applied to TEST: TEST lacks `hosting_port_status_checks`, which the migration indexes and reads.
+- **New migration on main, not applied:** `migrations/20260904_atomic_portin_outcomes.sql` (from PR #79). Its module `src/shared/atomic-portin-outcomes.mjs` is not imported by any worker yet.
+- **PRs merged:** #82 (ops scripts + data-export ignores), #79 (ATOMIC port-in outcomes module). **Left open:** #80 (TrustOTP weekly invoice) — its tests assert a Friday cron, dashboard wiring and QuickBooks-worker removal that do not exist, 4 failures; #81 (specs for unbuilt features) — 6 failures, as expected. Both skipped because a red suite blocks every future deploy. #88 and #84 still conflict and await the owner.
+- **Branches deleted:** chore/recover-ops-scripts-and-ignore-data, feat/atomic-portin-outcomes (merged), plus redesign/sims-table-v2, task/t_f479e342-brr-dashboard, fix/atomic-port-in-fields, fix/parked-teltik-recovery, claude/celtic-sims-rotation-timing-8oer9s, claude/gateway-host-awareness, claude/sim-1374-api-logs-gtamyj, feat/inc-23-dashboard-surfacing, inc-18-vendor-classifier, inc-13-imei-device-type, inc-10-teltik-import-paginate, fix/qbo-csv-filenames.
+- **Still missing:** `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod). Until set, `/send-offline` returns 401.
+- **Remaining rollout steps:** (1) set `FINALIZER_RUN_SECRET` (same value as reseller-sync's) with `printf`; (2) set `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` and let it run 5h (one full probe cycle); (3) review the Slack digest of intended actions; (4) remove `OFFLINE_LIFECYCLE_DRY_RUN` to enable for real.
 
 ---
 
