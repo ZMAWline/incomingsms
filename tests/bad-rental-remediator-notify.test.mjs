@@ -129,7 +129,7 @@ function fakeOfflineRpc(rows, { rpcOk = true } = {}) {
     const u = new URL(String(url));
     if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') {
       if (!rpcOk) return { ok: false, status: 500, text: async () => 'boom' };
-      return { ok: true, status: 200, json: async () => rows };
+      return { ok: true, status: 200, text: async () => JSON.stringify(rows) };
     }
     throw new Error('unexpected fetch ' + u.pathname);
   };
@@ -172,7 +172,7 @@ test('notifyOfflineFleetSummary: posts one batch message grouped by vendor with 
   let posted = null;
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url));
-    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, json: async () => rows };
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, text: async () => JSON.stringify(rows) };
     posted = JSON.parse(init.body);
     return { ok: true, status: 200 };
   };
@@ -193,7 +193,7 @@ test('notifyOfflineFleetSummary: TELTIK_PORTAL_URL overrides the default link ta
   let posted = null;
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url));
-    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, json: async () => rows };
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, text: async () => JSON.stringify(rows) };
     posted = JSON.parse(init.body);
     return { ok: true, status: 200 };
   };
@@ -210,7 +210,7 @@ test('notifyOfflineFleetSummary: a second call in the same window is deduped, no
   let postCount = 0;
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url));
-    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, json: async () => rows };
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, text: async () => JSON.stringify(rows) };
     postCount++;
     return { ok: true, status: 200 };
   };
@@ -228,7 +228,7 @@ test('notifyOfflineFleetSummary: the afternoon window is not deduped against the
   let postCount = 0;
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url));
-    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, json: async () => rows };
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, text: async () => JSON.stringify(rows) };
     postCount++;
     return { ok: true, status: 200 };
   };
@@ -244,7 +244,7 @@ test('notifyOfflineFleetSummary: the same window sends again on a new day', asyn
   let postCount = 0;
   globalThis.fetch = async (url, init = {}) => {
     const u = new URL(String(url));
-    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, json: async () => rows };
+    if (u.pathname === '/rest/v1/rpc/get_teltik_currently_offline') return { ok: true, status: 200, text: async () => JSON.stringify(rows) };
     postCount++;
     return { ok: true, status: 200 };
   };

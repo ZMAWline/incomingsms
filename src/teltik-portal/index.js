@@ -26,6 +26,7 @@ import {
 } from '../shared/hosting-port-status.mjs';
 import { verifyPassword, signSession, verifySession, constantTimeEqual, foldUsername } from './auth.mjs';
 import { fetchWithTimeout, supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { sbHeaders, sbGet, sbRpc, SupabaseError } from '../shared/supabase-rest.mjs';
 
 const AUTH_COOKIE_NAME = 'tprt_auth';
 const DEFAULT_LOGIN_TTL_MINUTES = 720; // 12h
@@ -42,49 +43,28 @@ const SIMS_PAGE_SIZE = 1000;
 // the API response rather than silently dropped if ever actually hit.
 const LINES_HARD_CAP = 20000;
 
-// ---------------------------------------------------------------------------
-// Supabase (PostgREST) helpers
-// ---------------------------------------------------------------------------
-function sbHeaders(env, extra) {
-  return {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    Accept: 'application/json',
-    ...(extra || {}),
-  };
-}
-
-async function sbSelect(env, path) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, { headers: sbHeaders(env) });
-  if (!res.ok) throw new Error('PostgREST GET ' + res.status + ': ' + (await res.text().catch(() => '')));
-  return res.json();
-}
-
-async function sbRpc(env, fn, args) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
-    method: 'POST',
-    headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-    body: JSON.stringify(args),
-  });
-  if (!res.ok) return null;
-  return res.json().catch(() => null);
-}
-
 // Count-only query (Prefer: count=exact, limit=1 so no rows are actually
-// transferred) — same Content-Range-parsing pattern runHostingPortSweep
-// already uses for total_available (src/shared/hosting-port-status.mjs).
-async function sbCount(env, path) {
+// transferred). Logs and returns null on a PostgREST error or a missing
+// Content-Range, so the analytics tile shows "unknown" instead of failing.
+async function countOrNull(env, path) {
   const sep = path.includes('?') ? '&' : '?';
-  const url = `${env.SUPABASE_URL}/rest/v1/${path}${sep}select=id&limit=1`;
-  const res = await supabaseFetch(env, url, { headers: sbHeaders(env, { Prefer: 'count=exact' }) });
-  if (!res.ok) {
-    console.log('[TeltikPortal] sbCount HTTP ' + res.status + ' for ' + url + ': ' + (await res.text().catch(() => '')).slice(0, 300));
+  const countPath = `${path}${sep}select=id&limit=1`;
+  try {
+    const { count } = await sbGet(env, countPath, { count: 'exact' });
+    if (count == null) console.log('[TeltikPortal] sbCount: no parseable Content-Range for ' + countPath);
+    return count;
+  } catch (err) {
+    if (!(err instanceof SupabaseError)) throw err;
+    console.log('[TeltikPortal] sbCount HTTP ' + err.status + ' for ' + countPath + ': ' + String(err.body).slice(0, 300));
     return null;
   }
-  const range = res.headers.get('content-range');
-  const m = range && range.match(/\/(\d+)\s*$/);
-  if (!m) console.log('[TeltikPortal] sbCount: no parseable Content-Range (' + range + ') for ' + url);
-  return m ? Number(m[1]) : null;
+}
+
+// Turns a PostgREST rejection into null for call sites that tolerate it;
+// timeouts and network errors still throw.
+function swallowSupabaseError(err) {
+  if (err instanceof SupabaseError) return null;
+  throw err;
 }
 
 function chunk(arr, n) {
@@ -100,7 +80,7 @@ function chunk(arr, n) {
 const TELTIK_SCOPE = 'or=(gateway_host.eq.teltik,and(gateway_host.is.null,vendor.eq.teltik))';
 
 async function fetchScopedSim(env, simId) {
-  const rows = await sbSelect(env,
+  const rows = await sbGet(env,
     'sims?select=id,iccid,vendor,gateway_host,status,sim_numbers(e164)'
     + '&sim_numbers.valid_to=is.null'
     + '&id=eq.' + encodeURIComponent(simId)
@@ -122,7 +102,7 @@ async function fetchAllHostedSims(env) {
   let offset = 0;
   let truncated = false;
   while (true) {
-    const page = await sbSelect(env,
+    const page = await sbGet(env,
       'sims?select=id,iccid,vendor,gateway_host,status,sim_numbers(e164)'
       + '&sim_numbers.valid_to=is.null'
       + '&status=eq.active'
@@ -142,7 +122,9 @@ async function fetchHostedLines(env) {
   const ids = sims.map((s) => s.id);
   const summaryBySimId = {};
   for (const part of chunk(ids, 500)) {
-    const rows = await sbRpc(env, 'get_hosting_port_status_summary', { sim_ids: part });
+    // A failed summary call leaves those lines without port status rather
+    // than failing the whole page (the helper this replaced returned null).
+    const rows = await sbRpc(env, 'get_hosting_port_status_summary', { sim_ids: part }).catch(swallowSupabaseError);
     if (Array.isArray(rows)) for (const row of rows) summaryBySimId[row.sim_id] = row;
   }
 
@@ -384,7 +366,7 @@ async function fetchResetAttempts30d(env) {
     + '?action=in.(teltik_reset_port,teltik_reset_network)'
     + '&outcome=not.in.(' + outcomeExclusion + ')'
     + '&attempted_at=gte.' + encodeURIComponent(since);
-  const count = await sbCount(env, path);
+  const count = await countOrNull(env, path);
   return count == null ? null : count;
 }
 
@@ -392,7 +374,8 @@ async function handleAnalytics(request, env) {
   if (!(await isAuthenticated(request, env))) return json({ ok: false, error: 'unauthorized' }, 401);
   try {
     const [daily, resetAttempts] = await Promise.all([
-      sbRpc(env, 'get_teltik_daily_uptime', { days_back: ANALYTICS_DAYS_BACK }),
+      // A failed uptime call renders as an empty chart, not a 502.
+      sbRpc(env, 'get_teltik_daily_uptime', { days_back: ANALYTICS_DAYS_BACK }).catch(swallowSupabaseError),
       fetchResetAttempts30d(env),
     ]);
     return json({

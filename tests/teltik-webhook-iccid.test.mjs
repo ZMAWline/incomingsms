@@ -9,7 +9,8 @@ import { readFile } from 'node:fs/promises';
 // package.json is "type":"commonjs" — load the worker as ESM via data: URL
 // (same trick as teltik-import-guard.test.mjs).
 const src = (await readFile(new URL('../src/teltik-worker/index.js', import.meta.url), 'utf8'))
-  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href));
+  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href))
+  .replace("'../shared/supabase-rest.mjs'", JSON.stringify(new URL('../src/shared/supabase-rest.mjs', import.meta.url).href));
 const { processTeltikSmsItem, extractIccidFromAlias } =
   await import('data:text/javascript;base64,' + Buffer.from(src).toString('base64'));
 

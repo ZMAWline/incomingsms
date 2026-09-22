@@ -1,4 +1,5 @@
 import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -44,7 +45,7 @@ export default {
       for (const iccid of iccids) {
         try {
           // Get SIM from database
-          const sims = await supabaseSelect(
+          const sims = await sbGet(
             env,
             `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
           );
@@ -111,7 +112,7 @@ export default {
           }
 
           // Update SIM status to canceled
-          await supabasePatch(
+          await sbPatch(
             env,
             `sims?id=eq.${simId}`,
             {
@@ -122,14 +123,14 @@ export default {
 
           // Expire current phone number
           const now = new Date().toISOString();
-          await supabasePatch(
+          await sbPatch(
             env,
             `sim_numbers?sim_id=eq.${simId}&valid_to=is.null`,
             { valid_to: now }
           );
 
           // Remove from reseller's active fleet so billing & tier counts drop the SIM
-          await supabasePatch(
+          await sbPatch(
             env,
             `reseller_sims?sim_id=eq.${simId}&active=eq.true`,
             { active: false }
@@ -433,66 +434,17 @@ async function logHelixApi(env, data) {
   return logCarrierApi(env, { ...data, vendor: 'helix' });
 }
 
-/* ================= SUPABASE ================= */
-
-async function supabaseSelect(env, path) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      Accept: "application/json",
-    },
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Supabase select failed ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  if (!text.trim()) return [];
-
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw new Error(
-      `Supabase select JSON parse failed: ${String(e)}. Raw: ${text.slice(0, 300)}`
-    );
-  }
-}
-
-async function supabasePatch(env, path, body) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "PATCH",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Supabase patch failed ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  return true;
-}
-
 async function findResellerIdBySimId(env, simId) {
   if (!simId) return null;
   const q = `reseller_sims?select=reseller_id&sim_id=eq.${encodeURIComponent(String(simId))}&active=eq.true&limit=1`;
-  const res = await supabaseSelect(env, q);
+  const res = await sbGet(env, q);
   return Array.isArray(res) && res[0]?.reseller_id ? res[0].reseller_id : null;
 }
 
 async function findWebhookUrlByResellerId(env, resellerId) {
   if (!resellerId) return null;
   const q = `reseller_webhooks?select=url&reseller_id=eq.${encodeURIComponent(String(resellerId))}&enabled=eq.true&limit=1`;
-  const res = await supabaseSelect(env, q);
+  const res = await sbGet(env, q);
   return Array.isArray(res) && res[0]?.url ? res[0].url : null;
 }
 

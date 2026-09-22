@@ -12,10 +12,12 @@ import { hashPassword } from '../src/teltik-portal/auth.mjs';
 const authUrl = new URL('../src/teltik-portal/auth.mjs', import.meta.url).href;
 const hostingPortStatusUrl = new URL('../src/shared/hosting-port-status.mjs', import.meta.url).href;
 const fetchTimeoutUrl = new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href;
+const supabaseRestUrl = new URL('../src/shared/supabase-rest.mjs', import.meta.url).href;
 const workerSrc = (await readFile(new URL('../src/teltik-portal/index.js', import.meta.url), 'utf8'))
   .replace("'./auth.mjs'", JSON.stringify(authUrl))
   .replace("'../shared/hosting-port-status.mjs'", JSON.stringify(hostingPortStatusUrl))
-  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(fetchTimeoutUrl));
+  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(fetchTimeoutUrl))
+  .replace("'../shared/supabase-rest.mjs'", JSON.stringify(supabaseRestUrl));
 const teltikPortal = (await import('data:text/javascript;base64,' + Buffer.from(workerSrc).toString('base64'))).default;
 
 const realFetch = globalThis.fetch;

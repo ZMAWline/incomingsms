@@ -1,4 +1,5 @@
-import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { carrierFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbRpc } from '../shared/supabase-rest.mjs';
 // =========================================================
 // Slack notifications for Teltik gateway-port offline events.
 //
@@ -175,22 +176,8 @@ function currentDigestWindow(now = new Date()) {
   return win ? { key: win.key, date } : null;
 }
 
-function sbHeaders(env) {
-  return {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-    'Content-Type': 'application/json',
-  };
-}
-
 async function fetchCurrentlyOfflineLines(env) {
-  const res = await supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/rpc/get_teltik_currently_offline', {
-    method: 'POST',
-    headers: sbHeaders(env),
-    body: JSON.stringify({}),
-  });
-  if (!res.ok) throw new Error('get_teltik_currently_offline HTTP ' + res.status);
-  const rows = await res.json();
+  const rows = await sbRpc(env, 'get_teltik_currently_offline', {});
   return Array.isArray(rows) ? rows : [];
 }
 

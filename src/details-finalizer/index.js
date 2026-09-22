@@ -23,6 +23,7 @@ import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known
 import { createAtomicPortinPoller } from './atomic-portin-poller.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
 import { carrierFetch, fetchWithTimeout, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPost, sbPatch, sbRpc } from '../shared/supabase-rest.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
@@ -186,7 +187,7 @@ async function runHelixFinalizer(env, limit) {
   }
   const token = await hxGetBearerToken(env);
 
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,mobility_subscription_id,status,imei,activated_at,vendor&status=eq.provisioning&vendor=eq.helix&limit=${limit}`
   );
@@ -235,7 +236,7 @@ async function runHelixFinalizer(env, limit) {
     }
 
     const activatedAt = synced.activatedAt || sim.activated_at || new Date().toISOString();
-    await supabasePatch(
+    await sbPatch(
       env,
       `sims?id=eq.${encodeURIComponent(String(sim.id))}`,
       { status: 'active', status_reason: null, activated_at: activatedAt }
@@ -256,7 +257,7 @@ async function runWingIotFinalizer(env, limit) {
 
   // Catches both post-activation (msisdn IS NULL) and post-rotation (rotation_status='mdn_pending').
   // Both states use status='provisioning' — the unified signal that details-finalizer owns MDN sync.
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,msisdn,rotation_status,status,activated_at&vendor=eq.wing_iot&status=eq.provisioning&limit=${limit}`
   );
@@ -334,7 +335,7 @@ async function runWingIotFinalizer(env, limit) {
       // Backfill activated_at when it's null (first time the SIM becomes usable).
       // Never override an existing date — that's the real activation timestamp.
       if (!sim.activated_at) patch.activated_at = new Date().toISOString();
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
 
       await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare);
 
@@ -366,7 +367,7 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
     return { ok: false, error: 'wing_iot_credentials_missing' };
   }
 
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,msisdn,status,rotation_status,activated_at` +
     `&vendor=eq.wing_iot` +
@@ -432,7 +433,7 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
             // First-activation reconcile (no prior MDN) → leave last_rotation_at null.
             if (sim.msisdn && sim.msisdn !== msisdnBare) patch.last_rotation_at = new Date().toISOString();
             if (!sim.activated_at) patch.activated_at = new Date().toISOString();
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
             try {
               await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare);
               webhooks_sent++;
@@ -442,7 +443,7 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
             synced++;
             if (sample.length < 10) sample.push({ id: sim.id, iccid: sim.iccid, action: 'synced', mdn: msisdnBare });
           } else {
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
               rotation_status: 'failed',
               last_rotation_error: 'Sweep cleanup: plan="' + plan + '" mdn=' + mdnRaw + '. Flagged for mdn-rotator retry at ' + new Date().toISOString(),
             });
@@ -512,7 +513,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
   });
 
   // ── Bucket A — wing_iot stuck mdn_pending ─────────────────────────────────
-  const bucketA = (await supabaseSelect(
+  const bucketA = (await sbGet(
     env,
     `sims?select=id,iccid,msisdn,status,rotation_status,activated_at` +
       `&vendor=eq.wing_iot` +
@@ -526,7 +527,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
   // ── Bucket B — any vendor: rotated <24h ago, last_notified_at stale ───────
   // PostgREST doesn't allow column-to-column comparison in or=(), so fetch
   // candidates (rotated in last 24h) and filter in JS for stale notify.
-  const bucketBCandidates = (await supabaseSelect(
+  const bucketBCandidates = (await sbGet(
     env,
     `sims?select=id,iccid,msisdn,vendor,last_mdn_rotated_at,last_notified_at` +
       `&status=eq.active` +
@@ -541,7 +542,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
   log(`Bucket B (rotated, not notified): ${bucketB.length} SIMs`);
 
   // ── Bucket C — wing_iot eligible but not rotated in 24h (log only) ────────
-  const bucketC = (await supabaseSelect(
+  const bucketC = (await sbGet(
     env,
     `sims?select=id,iccid,vendor,last_mdn_rotated_at` +
       `&status=eq.active` +
@@ -621,7 +622,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
           // First-activation reconcile (no prior MDN) → leave last_rotation_at null.
           if (sim.msisdn && sim.msisdn !== msisdnBare) patch.last_rotation_at = new Date().toISOString();
           if (!sim.activated_at) patch.activated_at = new Date().toISOString();
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
           if (webhookFires < MAX_WEBHOOK_FIRES) {
             try {
               await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare, { force: true });
@@ -633,7 +634,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
           }
           aActions.synced++;
         } else {
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
             rotation_status: 'failed',
             last_rotation_error: `Reconcile: plan="${plan}" mdn=${mdnRaw} att_status=${wingStatus} at ${new Date().toISOString()}`,
           });
@@ -724,7 +725,7 @@ async function runOfflineTestBatch(env, { resellerId, limit, dryRun, force }) {
   // We over-fetch (limit*4) to allow filtering down to ones that have both an
   // open and a closed sim_numbers row.
   const overFetch = Math.min(limit * 4, 100);
-  const sims = await supabaseSelect(env,
+  const sims = await sbGet(env,
     `sims?select=id,iccid,vendor,msisdn,mobility_subscription_id,last_mdn_rotated_at,reseller_sims!inner(reseller_id,active)` +
     `&reseller_sims.reseller_id=eq.${resellerId}` +
     `&reseller_sims.active=eq.true` +
@@ -741,7 +742,7 @@ async function runOfflineTestBatch(env, { resellerId, limit, dryRun, force }) {
   const eligible = [];
   for (const sim of sims) {
     if (eligible.length >= limit) break;
-    const rows = await supabaseSelect(env,
+    const rows = await sbGet(env,
       `sim_numbers?select=e164,valid_from,valid_to&sim_id=eq.${sim.id}&order=valid_from.desc&limit=10`
     ).catch(() => []);
     const open = rows.find(r => r.valid_to === null);
@@ -824,7 +825,7 @@ async function runTeltikFinalizer(env, limit) {
   // Post-rotation: rotateOneTeltikSim flipped status=provisioning + rotation_status=mdn_pending.
   // sim.msisdn still holds the OLD MDN — we call get-phone-number; when the returned MDN
   // differs, the change-number actually took effect and we finalize.
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,rotation_interval_hours&vendor=eq.teltik&status=eq.provisioning&rotation_status=eq.mdn_pending&limit=${limit}`
   );
@@ -873,7 +874,7 @@ async function runTeltikFinalizer(env, limit) {
       if (!msisdnBare || msisdnBare === sim.msisdn) {
         if (ageMin >= STUCK_MINUTES) {
           failed++;
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
             rotation_status: 'failed',
             status: 'active',
             last_rotation_error: `MDN did not change within ${STUCK_MINUTES}m (Teltik returned ${msisdnBare || 'null'})`,
@@ -900,7 +901,7 @@ async function runTeltikFinalizer(env, limit) {
 
       await closeCurrentNumber(env, sim.id);
       await insertNewNumber(env, sim.id, e164);
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
         msisdn: msisdnBare,
         status: 'active',
         rotation_status: 'success',
@@ -948,7 +949,7 @@ async function sendTeltikNumberOnlineWebhook(env, sim, e164, msisdnBare) {
   }, { idComponents: { simId: sim.id, iccid: sim.iccid, number: e164 }, resellerId });
 
   if (result.ok) {
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       last_notified_at: new Date().toISOString(),
     }).catch(() => {});
   }
@@ -1014,7 +1015,7 @@ async function runAtomicFinalizer(env, limit) {
 
   // Bucket 1 (pending): post-rotation stuck ATOMIC SIMs — swapMSISDN returned 5xx or threw
   // a network error and we don't know the final state. mdn_pending is the signal.
-  const pendingSims = (await supabaseSelect(
+  const pendingSims = (await sbGet(
     env,
     `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error&vendor=eq.atomic&status=eq.provisioning&rotation_status=eq.mdn_pending&limit=${limit}`
   )) || [];
@@ -1023,7 +1024,7 @@ async function runAtomicFinalizer(env, limit) {
   // Inactive" because our stored MDN is stale while AT&T has the subscriber Active under a
   // DIFFERENT number. rotation_eligible=true excludes ones already escalated as non-healable.
   const desyncCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-  const parkedSims = (await supabaseSelect(
+  const parkedSims = (await sbGet(
     env,
     `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error` +
       `&vendor=eq.atomic&rotation_eligible=eq.true` +
@@ -1084,7 +1085,7 @@ async function runAtomicFinalizer(env, limit) {
             status: 'open',
           });
         }
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
           rotation_eligible: false,
           status: 'rotation_failed',
           last_rotation_error: `ATOMIC attStatus=${data.attStatus} (not healable, escalated)`,
@@ -1097,8 +1098,8 @@ async function runAtomicFinalizer(env, limit) {
       // (b) Active + DIFFERENT MDN → reconcile to AT&T's live number (the self-heal).
       if (attStatus === 'active' && attMsisdn && attMsisdn !== sim.msisdn) {
         // Collision guard: never adopt a number another SIM already holds.
-        const takenSim = await supabaseSelect(env, `sims?select=id&msisdn=eq.${encodeURIComponent(attMsisdn)}&id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
-        const takenNum = await supabaseSelect(env, `sim_numbers?select=sim_id&e164=eq.${encodeURIComponent(e164)}&valid_to=is.null&sim_id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
+        const takenSim = await sbGet(env, `sims?select=id&msisdn=eq.${encodeURIComponent(attMsisdn)}&id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
+        const takenNum = await sbGet(env, `sim_numbers?select=sim_id&e164=eq.${encodeURIComponent(e164)}&valid_to=is.null&sim_id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
         if ((Array.isArray(takenSim) && takenSim.length) || (Array.isArray(takenNum) && takenNum.length)) {
           const ex = await findOpenPendingForSim(env, sim.id, 'atomic_mdn_collision');
           if (!ex) {
@@ -1123,13 +1124,13 @@ async function runAtomicFinalizer(env, limit) {
           }
         }
         // Reconcile sim_numbers independently: only rewrite if the open row isn't already AT&T's number.
-        const openRows = await supabaseSelect(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&limit=1`);
+        const openRows = await sbGet(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&limit=1`);
         const openE164 = Array.isArray(openRows) && openRows[0] ? openRows[0].e164 : null;
         if (openE164 !== e164) {
           await closeCurrentNumber(env, sim.id);
           await insertNewNumber(env, sim.id, e164);
         }
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
           msisdn: attMsisdn,
           status: 'active',
           rotation_status: 'success',
@@ -1149,7 +1150,7 @@ async function runAtomicFinalizer(env, limit) {
       // (c) Active + SAME MDN → for a parked SIM, our DB already agrees with AT&T; un-park it
       //     so the normal rotation batch picks it up (it was only stuck on the stale swap-from).
       if (attStatus === 'active' && attMsisdn && attMsisdn === sim.msisdn && sim._parked) {
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
           status: 'active', rotation_status: 'success', rotation_fail_count: 0, last_rotation_error: null,
         });
         results.push({ iccid: sim.iccid, ok: true, note: 'unparked (active, in sync)' });
@@ -1160,7 +1161,7 @@ async function runAtomicFinalizer(env, limit) {
       if (!sim._parked) {
         if (ageMin >= STUCK_MINUTES) {
           failed++;
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
             rotation_status: 'failed',
             status: 'active',
             last_rotation_error: `ATOMIC inquiry: MDN unchanged within ${STUCK_MINUTES}m (got ${attMsisdn || 'null'})`,
@@ -1189,7 +1190,8 @@ async function runAtomicFinalizer(env, limit) {
 // atomic-portin-poller.mjs.
 function runAtomicPortinStatusFinalizer(env, limit) {
   const poller = createAtomicPortinPoller({
-    supabaseSelect, supabasePatch, supabaseInsert, closeCurrentNumber, insertNewNumber, logTeltikApiCall,
+    supabaseSelect: sbGet, supabasePatch: sbPatch, supabaseInsert: sbPost,
+    closeCurrentNumber, insertNewNumber, logTeltikApiCall,
   });
   return poller.runAtomicPortinStatusFinalizer(env, limit);
 }
@@ -2379,25 +2381,11 @@ async function overpassFetchByZip(env, state, zip) {
   throw lastErr;
 }
 
-async function supabaseRpc(env, fn, body) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
-    method: 'POST',
-    headers: {
-      apikey:        env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body || {}),
-  });
-  if (!res.ok) throw new Error(`Supabase RPC ${fn} ${res.status}: ${await res.text().catch(() => '')}`);
-  return res.json();
-}
-
 async function runAddressPoolRefill(env, opts = {}) {
   const maxZips = Math.min(Math.max(parseInt(opts.maxZips, 10) || REFILL_DEFAULT_MAX_ZIPS, 1), 20);
   const dryRun  = opts.dryRun === true;
 
-  const targets = await supabaseRpc(env, 'list_zips_needing_refill', { p_limit: maxZips });
+  const targets = await sbRpc(env, 'list_zips_needing_refill', { p_limit: maxZips });
   if (!Array.isArray(targets) || targets.length === 0) {
     console.log('[Refill] no zips needing refill');
     return { ok: true, attempted: 0, results: [] };
@@ -2508,7 +2496,7 @@ async function resolveTeltikKnownMdnForFinalizer(env, sim) {
   let latestTeltikSms = null;
   if (sim && sim.id) {
     try {
-      const rows = await supabaseSelect(env, latestTeltikSmsQuery(sim.id));
+      const rows = await sbGet(env, latestTeltikSmsQuery(sim.id));
       latestTeltikSms = Array.isArray(rows) && rows[0] ? rows[0] : null;
     } catch (_) {
       latestTeltikSms = null;
@@ -2517,50 +2505,10 @@ async function resolveTeltikKnownMdnForFinalizer(env, sim) {
   return pickTeltikKnownMdn(latestTeltikSms, dbCurrentMdn);
 }
 
-/* ── Supabase ─────────────────────────────────────────────────────────────── */
-
-async function supabaseSelect(env, path) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  if (!res.ok) throw new Error(`Supabase SELECT ${res.status}: ${await res.text().catch(() => '')}`);
-  return res.json();
-}
-
-async function supabasePatch(env, path, body) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'PATCH',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Supabase PATCH ${res.status}: ${await res.text().catch(() => '')}`);
-}
-
-async function supabaseInsert(env, table, rows) {
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(rows),
-  });
-  if (!res.ok) throw new Error(`Supabase INSERT ${res.status}: ${await res.text().catch(() => '')}`);
-}
-
 /* ── sim_numbers helpers ──────────────────────────────────────────────────── */
 
 async function closeCurrentNumber(env, simId) {
-  await supabasePatch(
+  await sbPatch(
     env,
     `sim_numbers?sim_id=eq.${encodeURIComponent(String(simId))}&valid_to=is.null`,
     { valid_to: new Date().toISOString() }
@@ -2568,7 +2516,7 @@ async function closeCurrentNumber(env, simId) {
 }
 
 async function insertNewNumber(env, simId, e164) {
-  await supabaseInsert(env, 'sim_numbers', [
+  await sbPost(env, 'sim_numbers', [
     {
       sim_id: simId,
       e164,
@@ -2596,7 +2544,7 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
   // Bypassed when opts.force=true — caller (reconciliation) already filtered
   // to rotation_status='success' so the guard read would be redundant.
   if (!opts.force) {
-    const guard = await supabaseSelect(env,
+    const guard = await sbGet(env,
       `sims?select=vendor,rotation_status&id=eq.${encodeURIComponent(String(simId))}&limit=1`
     ).catch(() => []);
     const guardRow = Array.isArray(guard) && guard[0];
@@ -2637,7 +2585,7 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
 
   if (result.ok) {
     try {
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
         last_notified_at: new Date().toISOString(),
       });
     } catch (err) {
@@ -2685,7 +2633,7 @@ async function sendNumberOfflineWebhook(env, simId, oldNumber, iccid, oldMobilit
 
 async function findResellerIdBySimId(env, simId) {
   if (!simId) return null;
-  const data = await supabaseSelect(
+  const data = await sbGet(
     env,
     `reseller_sims?select=reseller_id&sim_id=eq.${encodeURIComponent(String(simId))}&active=eq.true&limit=1`
   ).catch(() => null);
@@ -2694,7 +2642,7 @@ async function findResellerIdBySimId(env, simId) {
 
 async function findWebhookUrlByResellerId(env, resellerId) {
   if (!resellerId) return null;
-  const data = await supabaseSelect(
+  const data = await sbGet(
     env,
     `reseller_webhooks?select=url&reseller_id=eq.${encodeURIComponent(String(resellerId))}&enabled=eq.true&limit=1`
   ).catch(() => null);
@@ -2784,7 +2732,7 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const data = await supabaseSelect(
+  const data = await sbGet(
     env,
     `webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`
   ).catch(() => null);

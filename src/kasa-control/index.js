@@ -1,4 +1,5 @@
-import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { carrierFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet } from '../shared/supabase-rest.mjs';
 const TPLINK_BASE = 'https://wap.tplinkcloud.com/';
 
 export default {
@@ -100,14 +101,7 @@ async function fetchActiveGatewayCodes(env) {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Supabase credentials not configured on kasa-control');
   }
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/gateways?select=code&active=eq.true`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  if (!res.ok) throw new Error(`Supabase gateways fetch failed ${res.status}`);
-  const rows = await res.json();
+  const rows = await sbGet(env, 'gateways?select=code&active=eq.true');
   return Array.isArray(rows) ? rows.map(r => r.code).filter(Boolean) : [];
 }
 

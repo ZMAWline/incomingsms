@@ -54,6 +54,11 @@ function relayFetch(env, url, init, send = carrierFetch) {
 // Supabase (PostgREST) helpers — same shape as src/reseller-portal/index.js,
 // but routed through relayFetch per the constraint above.
 // ---------------------------------------------------------------------------
+// TODO(shared-supabase): these helpers send Supabase calls through relayFetch
+// (the relay URL, not SUPABASE_URL directly), and sbRpc returns
+// { ok, status, text } for status-to-HTTP mapping. The shared
+// src/shared/supabase-rest.mjs calls Supabase directly; moving over would
+// change the network path, so it needs its own decision.
 function sbHeaders(env, extra) {
   return {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,

@@ -4466,6 +4466,10 @@ function getNYMidnightISO() {
   return new Date(`${nyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
 }
 
+// TODO(shared-supabase): not moved to src/shared/supabase-rest.mjs yet.
+// About 100 call sites, supabasePatch/supabaseInsert log the affected row
+// count, and tests/mdn-rotator-change-imei.test.mjs loads this file with a
+// fixed list of shared imports that has to learn the new module first.
 async function supabaseSelect(env, path) {
   const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
     method: "GET",
