@@ -1266,6 +1266,10 @@ The 13 pending will clear in the next two 5-min finalizer cron ticks.
 
 ## In Progress / Pending Work
 
+### Open items from deleted branches (2026-09-22)
+- Idea from deleted branch fix/parked-teltik-recovery: a recovery step for Teltik SIMs that get parked mid-rotation (first seen SIM 8549); main has no equivalent.
+- Check from deleted branch fix/atomic-port-in-fields: confirm main does not log the ATOMIC port-in PIN in plain text; that branch fixed it and was never merged.
+
 ### Apex PPU-then-MDN — Phase 2 closed; live canary on SIM 2619 (session 57, 2026-05-20)
 **Status: apex flow shipped, flag ON, canary live on SIM 2619 only. End-to-end validated across 3 consecutive force-rotations with the new OSM pool. Tomorrow's `*/5 4-11 UTC` cron will exercise apex on production code path for SIM 2619 (legacy for the other ~625 atomic SIMs since their `canary_apex_ppu` is still false).**
 
