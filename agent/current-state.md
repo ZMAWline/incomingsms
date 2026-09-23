@@ -1842,3 +1842,12 @@ These items were verified to be working correctly as of their last check:
 ## Open Questions
 
 _None currently tracked._
+
+---
+
+## 2026-09-23 — morning check and secrets inventory (branch `docs/secrets-inventory`)
+
+- **mdn-rotator on the timeout code (first window, 04:00–04:26 UTC):** clean. PROD `system_errors` has 0 rows since 2026-09-22 20:00 UTC. 891 SIMs rotated since 04:00 (266 of 291 active ATOMIC, 625 Teltik). Tail of the 04:20 and 04:25 ticks: outcome ok, 0 exceptions, no `timeout after`, no `pre-swap inquiry network error`. Each tick logged Helix `Token failed: 429 too_many_attempts` (account blocked); 0 active Helix SIMs, so harmless, but the per-tick token fetch keeps the account locked.
+- **Offline lifecycle 04:00 tick:** acted. 25 SIMs now `offline_state = offline` (5507 online); 25 `reseller_sims` rows got `deactivated_reason = host_offline`, all in the 04:00 hour. 0 `system_errors` from bad-rental-remediator since 03:00.
+- **`agent/secrets-inventory.md`** added: 83 names, where each lives, how to rotate. Refresh with `python3 scripts/list-live-vars.py` (read-only, names only). Open items it raised: kasa-control PROD has no auth on `/outlet` and `/reboot-gateways` (workers.dev); 42 live secrets no code reads; TEST lacks 105 secrets PROD has (bad-rental-remediator-test has no Supabase or carrier keys).
+- `npm test` on `origin/main` (28312d1): 1151 pass, 5 fail, all in `tests/bad-rental-remediator-drain.test.mjs` and `tests/bad-rental-remediator-lifecycle-fixes.test.mjs`. Not caused by this branch (docs and a script only).
