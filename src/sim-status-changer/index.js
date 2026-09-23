@@ -26,8 +26,6 @@ export default {
     // Determine action based on path
     const action = url.pathname === "/suspend" ? "suspend" : "restore";
     const subscriberState = action === "suspend" ? "Suspend" : "Unsuspend";
-    const reasonCode = "CR";
-    const reasonCodeId = action === "suspend" ? 22 : 35;
     const newDbStatus = action === "suspend" ? "suspended" : "active";
 
     try {
@@ -36,12 +34,6 @@ export default {
 
       if (!Array.isArray(simIds) || simIds.length === 0) {
         return json({ ok: false, error: "sim_ids array is required" }, 400);
-      }
-
-      // Get Helix bearer token (only if Helix is enabled)
-      let token = null;
-      if (env.HELIX_ENABLED === 'true') {
-        token = await hxGetBearerToken(env);
       }
 
       let processed = 0;
@@ -70,7 +62,7 @@ export default {
 
           const sim = sims[0];
           const { iccid, mobility_subscription_id: subId, msisdn, status } = sim;
-          const vendor = sim.vendor || 'helix';
+          const vendor = sim.vendor;
 
           // Skip if already in target state
           if ((action === "suspend" && status === "suspended") ||
@@ -84,8 +76,8 @@ export default {
             continue;
           }
 
-          // Wing IoT and Teltik don't support suspend/restore
-          if (vendor === 'wing_iot' || vendor === 'teltik') {
+          // Only ATOMIC supports suspend/restore (Teltik has no carrier API for it)
+          if (vendor !== 'atomic') {
             errors++;
             results.push({
               sim_id: simId,
@@ -96,15 +88,6 @@ export default {
           }
 
           // Check for required identifier
-          if (vendor === 'helix' && !subId) {
-            errors++;
-            results.push({
-              sim_id: simId,
-              ok: false,
-              error: "No mobility_subscription_id found (helix)"
-            });
-            continue;
-          }
           if (vendor === 'atomic' && !msisdn) {
             errors++;
             results.push({
@@ -115,35 +98,7 @@ export default {
             continue;
           }
 
-          // Get current phone number for helix
-          let phoneNumber = msisdn;
-          if (vendor === 'helix') {
-            const numbers = await sbGet(
-              env,
-              `sim_numbers?select=e164&sim_id=eq.${simId}&valid_to=is.null&limit=1`
-            );
-            phoneNumber = numbers?.[0]?.e164;
-            if (!phoneNumber) {
-              errors++;
-              results.push({
-                sim_id: simId,
-                ok: false,
-                error: "No active phone number found"
-              });
-              continue;
-            }
-          }
-
-          // Call carrier API to change status based on vendor
-          if (vendor === 'atomic') {
-            await atomicChangeStatus(env, msisdn, action, iccid);
-          } else if (env.HELIX_ENABLED === 'true') {
-            // Strip +1 prefix for Helix API (expects 10-digit MDN)
-            const mdn = phoneNumber.replace(/^\+1/, "");
-            await hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reasonCodeId, iccid);
-          } else {
-            throw new Error(`Helix is disabled — cannot ${action} SIM ${sim.iccid}`);
-          }
+          await atomicChangeStatus(env, msisdn, action, iccid);
 
           // Update SIM status in database
           await sbPatch(
@@ -168,7 +123,7 @@ export default {
                   online: action === "restore",
                   simId,
                   iccid,
-                  number: numbers?.[0]?.e164 || phoneNumber,
+                  number: numbers?.[0]?.e164 || msisdn,
                   mobilitySubscriptionId: subId,
                   vendor,
                   reason: action === "restore" ? "restored" : "suspended",
@@ -184,7 +139,7 @@ export default {
           results.push({
             sim_id: simId,
             iccid,
-            phone_number: phoneNumber,
+            phone_number: msisdn,
             ok: true,
             action: subscriberState,
             mobility_subscription_id: subId
@@ -304,84 +259,9 @@ async function atomicChangeStatus(env, msisdn, action, iccid) {
   return responseData.json;
 }
 
-/* ================= HELIX API ================= */
-
-async function hxGetBearerToken(env) {
-  const res = await relayFetch(env, env.HX_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "password",
-      client_id: env.HX_CLIENT_ID,
-      audience: env.HX_AUDIENCE,
-      username: env.HX_GRANT_USERNAME,
-      password: env.HX_GRANT_PASSWORD,
-    }),
-  });
-
-  const { json, text } = await safeReadJsonOrText(res);
-
-  if (!res.ok || !json?.access_token) {
-    throw new Error(`Token failed ${res.status}: ${JSON.stringify(json ?? { raw: text })}`);
-  }
-  return json.access_token;
-}
-
-async function hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reasonCodeId, iccid) {
-  const runId = `status_${Date.now().toString(36)}`;
-
-  const statusUrl = `${env.HX_API_BASE}/api/mobility-subscriber/status`;
-  const statusBody = [{
-    subscriberNumber: mdn,
-    reasonCode,
-    reasonCodeId,
-    subscriberState
-  }];
-
-  const statusRes = await relayFetch(env, statusUrl, {
-    method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(statusBody),
-  });
-
-  const statusData = await safeReadJsonOrText(statusRes);
-
-  // Log the request
-  await logHelixApi(env, {
-    runId,
-    step: `change_status_${subscriberState.toLowerCase()}`,
-    iccid,
-    requestUrl: statusUrl,
-    requestMethod: "PATCH",
-    requestBody: statusBody,
-    responseStatus: statusRes.status,
-    responseOk: statusRes.ok,
-    responseBodyText: statusData.text,
-    responseBodyJson: statusData.json,
-  });
-
-  if (!statusRes.ok) {
-    throw new Error(
-      `Status change failed ${statusRes.status}: ${JSON.stringify(statusData.json ?? { raw: statusData.text })}`
-    );
-  }
-
-  // Check for rejected operations
-  if (statusData.json?.rejected?.length > 0) {
-    throw new Error(
-      `Status change rejected: ${JSON.stringify(statusData.json.rejected)}`
-    );
-  }
-
-  console.log(`[Helix] Successfully ${subscriberState} MDN ${mdn}`);
-  return statusData.json;
-}
 
 async function logCarrierApi(env, data) {
-  const vendor = data.vendor || 'helix';
+  const vendor = data.vendor || 'atomic';
   try {
     await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
@@ -408,11 +288,6 @@ async function logCarrierApi(env, data) {
   } catch (e) {
     console.log(`[LogCarrierApi] Failed to log: ${e}`);
   }
-}
-
-// Backward compatibility alias
-async function logHelixApi(env, data) {
-  return logCarrierApi(env, { ...data, vendor: 'helix' });
 }
 
 async function findResellerIdBySimId(env, simId) {

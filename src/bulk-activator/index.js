@@ -9,7 +9,7 @@ import { buildPortinOutcomeRow, recordPortinOutcomeRow } from '../shared/atomic-
 // =========================================================
 // SIM ACTIVATOR WORKER
 // Queues individual SIM activations — one SIM at a time.
-// Supports multiple vendors: helix, atomic, wing_iot
+// Activates ATOMIC SIMs (new number or port-in).
 // Queue consumer routes to appropriate carrier API per SIM.
 // Now with per-SIM job tracking via activation_runs / activation_job_items.
 // =========================================================
@@ -151,25 +151,6 @@ export default {
 
   // ── Queue consumer — one SIM at a time, routes by vendor ─────────────────
   async queue(batch, env) {
-    // Pre-fetch Helix token only if we have helix SIMs in batch
-    let helixToken = null;
-    const hasHelix = env.HELIX_ENABLED === 'true' && batch.messages.some(m => m.body.vendor === 'helix');
-    if (hasHelix) {
-      try {
-        helixToken = await hxGetBearerToken(env);
-      } catch (e) {
-        console.error(`[Activator] Helix token fetch failed: ${e} — leaving Helix messages in queue`);
-        // Only ack non-helix messages, retry helix ones
-        for (const msg of batch.messages) {
-          if (msg.body.vendor !== 'helix') {
-            // Process non-helix normally
-          } else {
-            // Don't ack helix messages - they'll retry
-          }
-        }
-      }
-    }
-
     for (const msg of batch.messages) {
       const {
         iccid,
@@ -238,20 +219,6 @@ export default {
               port_old_first_name: portOldFirstName, port_old_last_name: portOldLastName,
               port_address_id: msg.body.port_address_id || null,
             });
-            break;
-          case 'wing_iot':
-            result = await activateViaWingIot(env, iccid, runId);
-            break;
-          case 'helix':
-            if (env.HELIX_ENABLED !== 'true') {
-              console.warn(`[Activator] ${iccid}: Helix is disabled — acking without activation`);
-              msg.ack(); continue;
-            }
-            if (!helixToken) {
-              console.error(`[Activator] ${iccid}: No Helix token — skipping`);
-              continue; // Don't ack, will retry
-            }
-            result = await activateViaHelix(env, helixToken, iccid, imei, runId);
             break;
           default:
             throw new Error(`Unknown vendor: ${vendor}`);
@@ -1122,145 +1089,6 @@ function mapPortFields(options) {
   };
 }
 
-async function activateViaWingIot(env, iccid, runId) {
-  // Wing IoT activation - PUT with dialable plan
-  const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
-  const url = `${baseUrl}/v1/devices/${iccid}`;
-  const auth = `Basic ${btoa(`${env.WING_IOT_USERNAME}:${env.WING_IOT_API_KEY}`)}`;
-
-  const requestBody = {
-    communicationPlan: 'Wing Tel Inc - NON ABIR SMS MO/MT US',
-    status: 'ACTIVATED',
-  };
-
-  const res = await relayFetch(env, url, {
-    method: 'PUT',
-    headers: {
-      Authorization: auth,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(requestBody),
-  });
-
-  const responseText = await res.text();
-  let responseJson = {};
-  try { responseJson = JSON.parse(responseText); } catch {}
-
-  const carrierLogId = await logCarrierApiCall(env, {
-    run_id: runId,
-    step: 'activation',
-    iccid,
-    imei: null,
-    vendor: 'wing_iot',
-    request_url: url,
-    request_method: 'PUT',
-    request_body: requestBody,
-    response_status: res.status,
-    response_ok: res.ok,
-    response_body_text: responseText,
-    response_body_json: responseJson,
-    error: res.ok ? null : `Wing IoT activation failed: ${res.status}`,
-  });
-
-  if (!res.ok) {
-    throw new CarrierActivationError(`Wing IoT activation failed ${res.status}: ${responseText.slice(0, 300)}`, carrierLogId);
-  }
-
-  // MDN takes ~1-4 min to propagate — mdn-rotator's syncWingIotPendingMdns cron fills it in
-  return { msisdn: '', status: 'provisioning', carrierLogId };
-}
-
-async function activateViaHelix(env, token, iccid, imei, runId) {
-  const result = await hxActivate(env, token, iccid, imei, runId);
-  return {
-    mobilitySubscriptionId: String(result.mobilitySubscriptionId),
-    status: 'provisioning', // Helix needs details-finalizer to get MDN
-  };
-}
-
-/* ── Helix ─────────────────────────────────────────────────────────────────── */
-
-async function hxGetBearerToken(env) {
-  const res = await relayFetch(env, env.HX_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'password',
-      client_id: env.HX_CLIENT_ID,
-      audience: env.HX_AUDIENCE,
-      username: env.HX_GRANT_USERNAME,
-      password: env.HX_GRANT_PASSWORD,
-    }),
-  });
-  const text = await res.text();
-  let j = {};
-  try { j = JSON.parse(text); } catch {}
-  if (!res.ok || !j?.access_token) {
-    throw new Error(`Token failed ${res.status}: ${text.slice(0, 200)}`);
-  }
-  return j.access_token;
-}
-
-async function hxActivate(env, token, iccid, imei, runId) {
-  const addr = await pickNextPpuAddress(env, {});
-  const url = `${env.HX_API_BASE}/api/mobility-activation/activate`;
-  const requestBody = {
-    clientId: Number(env.HX_ACTIVATION_CLIENT_ID),
-    plan: { id: Number(env.HX_PLAN_ID) },
-    BAN: String(env.HX_BAN),
-    FAN: String(env.HX_FAN),
-    activationType: 'new_activation',
-    subscriber: { firstName: 'SUB', lastName: 'NINE' },
-    address: {
-      address1: `${addr.streetNumber} ${addr.streetName}`,
-      city: addr.city,
-      state: addr.state,
-      zipCode: addr.zipCode,
-    },
-    service: { iccid, imei },
-  };
-
-  const res = await relayFetch(env, url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify(requestBody),
-  });
-
-  const responseText = await res.text();
-  let responseJson = {};
-  try { responseJson = JSON.parse(responseText); } catch {}
-
-  logHelixApiCall(env, {
-    run_id: runId,
-    step: 'activation',
-    iccid,
-    imei,
-    request_url: url,
-    request_method: 'POST',
-    request_body: requestBody,
-    response_status: res.status,
-    response_ok: res.ok,
-    response_body_text: responseText,
-    response_body_json: responseJson,
-    error: res.ok ? null : `Activation failed: ${res.status}`,
-  }).catch(e => console.error(`[Helix Log] ${e}`));
-
-  if (!res.ok) {
-    if (/address.*verif|verif.*address/i.test(responseText)) {
-      await markAddressVerifyFailure(env, addr.id, `Helix activate rejected address: ${responseText.slice(0, 200)}`);
-    }
-    throw new Error(`Activation failed ${res.status}: ${responseText.slice(0, 300)}`);
-  }
-
-  if (responseJson?.mobilitySubscriptionId) return responseJson;
-
-  // Fallback: extract from raw text
-  const match = responseText.match(/"mobilitySubscriptionId"\s*:\s*"?(\d+)"?/);
-  if (match) return { mobilitySubscriptionId: match[1] };
-
-  throw new Error(`Activation returned ${res.status} but no mobilitySubscriptionId. Raw: ${responseText.slice(0, 200)}`);
-}
 
 // Activation-time Teltik alias check for Atomic SIMs hosted on Teltik
 // (gateway_host='teltik'). Resolves the Teltik-known host MDN, sets the Teltik
@@ -1329,8 +1157,8 @@ async function upsertSimWithVendor(env, iccid, result, vendor) {
     last_activation_error: null,
   };
 
-  if (vendor === 'atomic' || vendor === 'wing_iot') {
-    // ATOMIC and Wing IoT use MSISDN, not mobilitySubscriptionId
+  if (vendor === 'atomic') {
+    // ATOMIC uses MSISDN, not mobilitySubscriptionId
     payload.msisdn = result.msisdn;
     // New-number Activate is immediately active with MDN. Port-in is accepted
     // asynchronously by the losing carrier — activateViaAtomicPortIn returns
@@ -1346,17 +1174,12 @@ async function upsertSimWithVendor(env, iccid, result, vendor) {
     // reactivated via plain Activate after a prior port-in attempt must not
     // keep a stale port_in_pending=true, which would leave it stuck in
     // details-finalizer's portinStatus poll forever.
-    if (vendor === 'atomic') {
-      payload.port_in_pending = !!result.portInPending;
-    }
-  } else if (vendor === 'helix') {
-    payload.mobility_subscription_id = result.mobilitySubscriptionId;
-    payload.status = 'provisioning'; // Helix needs finalizer to get MDN
+    payload.port_in_pending = !!result.portInPending;
   }
 
-  // Stamp activation time. ATOMIC/Wing go straight to 'active' here, so unlike
-  // helix they never pass through the details-finalizer backfill that sets
-  // activated_at — without this they stay NULL until their first rotation.
+  // Stamp activation time. ATOMIC goes straight to 'active' here and never
+  // passes through a finalizer backfill that sets activated_at — without this
+  // it stays NULL until the first rotation.
   // Only set on first activation (preserve the original date on re-activation).
   if (payload.status === 'active' && !existing?.[0]?.activated_at) {
     payload.activated_at = new Date().toISOString();
@@ -1402,7 +1225,7 @@ async function createSimNumber(env, simId, mdn) {
   }], { prefer: 'return=representation' });
 }
 
-async function upsertSimError(env, iccid, errorMessage, vendor = 'helix') {
+async function upsertSimError(env, iccid, errorMessage, vendor = 'atomic') {
   const existing = await sbGet(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
   const payload = {
     status: 'error',
@@ -1432,7 +1255,7 @@ async function assignSimToReseller(env, resellerId, simId) {
 // activation_job_items.carrier_log_id) or null if logging was skipped/failed.
 async function logCarrierApiCall(env, logData) {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return null;
-  const vendor = logData.vendor || 'helix';
+  const vendor = logData.vendor || 'atomic';
   const payload = {
     run_id: logData.run_id,
     step: logData.step,
@@ -1478,11 +1301,6 @@ class CarrierActivationError extends Error {
     super(message);
     this.carrierLogId = carrierLogId ?? null;
   }
-}
-
-// Backward compatibility alias
-async function logHelixApiCall(env, logData) {
-  return logCarrierApiCall(env, { ...logData, vendor: 'helix' });
 }
 
 function normalizeRow(row, len) {

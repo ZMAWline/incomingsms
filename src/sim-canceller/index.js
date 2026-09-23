@@ -31,12 +31,6 @@ export default {
         return json({ ok: false, error: "iccids array is required" }, 400);
       }
 
-      // Get Helix bearer token (only if Helix is enabled)
-      let token = null;
-      if (env.HELIX_ENABLED === 'true') {
-        token = await hxGetBearerToken(env);
-      }
-
       let processed = 0;
       let cancelled = 0;
       let errors = 0;
@@ -63,7 +57,7 @@ export default {
 
           const sim = sims[0];
           const { id: simId, mobility_subscription_id: subId, msisdn, status } = sim;
-          const vendor = sim.vendor || 'helix';
+          const vendor = sim.vendor;
 
           // Skip if already canceled
           if (status === 'canceled') {
@@ -77,15 +71,6 @@ export default {
           }
 
           // Check for required identifier based on vendor
-          if (vendor === 'helix' && !subId) {
-            errors++;
-            results.push({
-              iccid,
-              ok: false,
-              error: "No mobility_subscription_id found (helix)"
-            });
-            continue;
-          }
           if (vendor === 'atomic' && !msisdn) {
             errors++;
             results.push({
@@ -99,17 +84,13 @@ export default {
           // Cancel based on vendor
           if (vendor === 'atomic') {
             await atomicCancelSubscription(env, msisdn, iccid);
-          } else if (vendor === 'wing_iot') {
-            // Wing IoT has no cancel API - just update DB
-            console.log(`[Wing IoT] ${iccid}: No cancel API, marking DB only`);
           } else if (vendor === 'teltik') {
             // Teltik has no cancel API - just update DB
             console.log(`[Teltik] ${iccid}: No cancel API, marking DB only`);
-          } else if (env.HELIX_ENABLED === 'true') {
-            // Helix
-            await hxCancelSubscription(env, token, subId, iccid);
           } else {
-            console.log(`[Cancel] ${iccid}: Helix is disabled — marking DB only`);
+            errors++;
+            results.push({ iccid, ok: false, error: `Cancel is not supported for vendor ${vendor}` });
+            continue;
           }
 
           // Update SIM status to canceled
@@ -284,130 +265,9 @@ async function atomicCancelSubscription(env, msisdn, iccid) {
   return responseData.json;
 }
 
-/* ================= HELIX API ================= */
-
-async function hxGetBearerToken(env) {
-  const res = await relayFetch(env, env.HX_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "password",
-      client_id: env.HX_CLIENT_ID,
-      audience: env.HX_AUDIENCE,
-      username: env.HX_GRANT_USERNAME,
-      password: env.HX_GRANT_PASSWORD,
-    }),
-  });
-
-  const { json, text } = await safeReadJsonOrText(res);
-
-  if (!res.ok || !json?.access_token) {
-    throw new Error(`Token failed ${res.status}: ${JSON.stringify(json ?? { raw: text })}`);
-  }
-  return json.access_token;
-}
-
-async function hxCancelSubscription(env, token, subscriptionId, iccid) {
-  const runId = `cancel_${Date.now().toString(36)}`;
-
-  // Step 1: Get the current phone number (MDN) from subscriber details
-  const detailsUrl = `${env.HX_API_BASE}/api/mobility-subscriber/details`;
-  const detailsBody = { mobilitySubscriptionId: subscriptionId };
-
-  const detailsRes = await relayFetch(env, detailsUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(detailsBody),
-  });
-
-  const detailsData = await safeReadJsonOrText(detailsRes);
-
-  // Log the details request
-  await logHelixApi(env, {
-    runId,
-    step: "cancel_get_details",
-    iccid,
-    requestUrl: detailsUrl,
-    requestMethod: "POST",
-    requestBody: detailsBody,
-    responseStatus: detailsRes.status,
-    responseOk: detailsRes.ok,
-    responseBodyText: detailsData.text,
-    responseBodyJson: detailsData.json,
-  });
-
-  if (!detailsRes.ok) {
-    throw new Error(
-      `Get subscriber details failed ${detailsRes.status}: ${JSON.stringify(detailsData.json ?? { raw: detailsData.text })}`
-    );
-  }
-
-  // Extract phone number from response (array format)
-  const details = Array.isArray(detailsData.json) ? detailsData.json[0] : detailsData.json;
-  const phoneNumber = details?.phoneNumber || details?.subscriberNumber;
-
-  if (!phoneNumber) {
-    throw new Error(`No phone number found for subscription ${subscriptionId}`);
-  }
-
-  console.log(`[Helix] Cancelling subscription ${subscriptionId} with MDN ${phoneNumber}`);
-
-  // Step 2: Cancel using the correct endpoint with MDN
-  const cancelUrl = `${env.HX_API_BASE}/api/mobility-subscriber/status`;
-  const cancelBody = [{
-    subscriberNumber: phoneNumber,
-    reasonCode: "CAN",
-    reasonCodeId: 1,
-    subscriberState: "Cancel"
-  }];
-
-  const cancelRes = await relayFetch(env, cancelUrl, {
-    method: "PATCH",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(cancelBody),
-  });
-
-  const cancelData = await safeReadJsonOrText(cancelRes);
-
-  // Log the cancel request
-  await logHelixApi(env, {
-    runId,
-    step: "cancel_subscription",
-    iccid,
-    requestUrl: cancelUrl,
-    requestMethod: "PATCH",
-    requestBody: cancelBody,
-    responseStatus: cancelRes.status,
-    responseOk: cancelRes.ok,
-    responseBodyText: cancelData.text,
-    responseBodyJson: cancelData.json,
-  });
-
-  if (!cancelRes.ok) {
-    throw new Error(
-      `Cancel subscription failed ${cancelRes.status}: ${JSON.stringify(cancelData.json ?? { raw: cancelData.text })}`
-    );
-  }
-
-  // Check for rejected cancellations
-  if (cancelData.json?.rejected?.length > 0) {
-    throw new Error(
-      `Cancel rejected: ${JSON.stringify(cancelData.json.rejected)}`
-    );
-  }
-
-  console.log(`[Helix] Successfully cancelled MDN ${phoneNumber}`);
-  return cancelData.json;
-}
 
 async function logCarrierApi(env, data) {
-  const vendor = data.vendor || 'helix';
+  const vendor = data.vendor || 'atomic';
   try {
     await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
@@ -434,11 +294,6 @@ async function logCarrierApi(env, data) {
   } catch (e) {
     console.log(`[LogCarrierApi] Failed to log: ${e}`);
   }
-}
-
-// Backward compatibility alias
-async function logHelixApi(env, data) {
-  return logCarrierApi(env, { ...data, vendor: 'helix' });
 }
 
 async function findResellerIdBySimId(env, simId) {

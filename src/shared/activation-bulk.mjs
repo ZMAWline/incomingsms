@@ -165,7 +165,8 @@ export function validateActivationSim(input, options = {}) {
   const errors = [];
 
   if (!/^\d{19,20}$/.test(sim.iccid)) errors.push(prefix + 'Invalid ICCID (expected 19-20 digits)');
-  if (sim.vendor !== 'wing_iot' && !/^\d{15}$/.test(sim.imei)) errors.push(prefix + 'Invalid IMEI (expected 15 digits)');
+  if (sim.vendor !== 'atomic') errors.push(prefix + `Unsupported vendor '${sim.vendor}' (only atomic)`);
+  if (!/^\d{15}$/.test(sim.imei)) errors.push(prefix + 'Invalid IMEI (expected 15 digits)');
   if (!Number.isFinite(sim.reseller_id)) errors.push(prefix + 'Invalid reseller_id (must be a number)');
 
   if (sim.port_in) {
