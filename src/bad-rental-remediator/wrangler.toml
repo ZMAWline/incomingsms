@@ -99,11 +99,11 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 # is dropped by the next plain `scripts/deploy.sh` run (it was, three times, on
 # 2026-09-22). The code arms only on the exact string "true", so any other value
 # or a missing line is off.
-# DRY_RUN: remove this line to enable for real (the code treats a missing line
-# as off); set via toml so scripts/deploy.sh keeps it.
+# Enabled for real in PROD on 2026-09-22 after the owner signed off the dry run.
+# A missing OFFLINE_LIFECYCLE_DRY_RUN line means dry run is off, so the tick writes.
 [vars]
+# To pause the feature: set this to "false" and deploy. To dry-run again: add OFFLINE_LIFECYCLE_DRY_RUN = "true".
 OFFLINE_LIFECYCLE_ENABLED = "true"
-OFFLINE_LIFECYCLE_DRY_RUN = "true"
 
 # Service bindings used during shared-situation classification.
 # RESELLER_SYNC: resend webhook + check rental status (cancel-guard §E), plus
