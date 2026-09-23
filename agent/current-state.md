@@ -8,7 +8,8 @@
 > 2026-09-22: PR #113 + #115 merged and DEPLOYED to PROD with #114 — dashboard `5d424a79`, details-finalizer `49029305`, bad-rental-remediator `ecb01e83`. `deployed/prod` moved 7b18ed4 → 320bd40. See "Deployed 2026-09-22 (ship 3)".
 > 2026-09-22 (latest): PR #119, #120, #121 and #122 merged and DEPLOYED to PROD — 18 workers (shared supabase-rest helper). Migration `sims_paging_indexes` applied TEST + PROD. `deployed/prod` moved d2af4a3 → ee9ae2b. Check mdn-rotator's first tick after 04:00 UTC for `timeout after` errors. See "Deployed 2026-09-22 (ship 5)".
 > 2026-09-22: PR #116, #117 and #118 merged and DEPLOYED to PROD — all 19 workers (shared fetch-timeout helper touched every worker). `deployed/prod` moved 320bd40 → d2af4a3. Open owner decision: reseller webhooks from sim-canceller / sim-status-changer. See "Deployed 2026-09-22 (ship 4)".
-> 2026-09-23 (latest): Offline SIM lifecycle ENABLED for real in PROD — `bad-rental-remediator` `572f4242` at 03:07:33 UTC (PR #125). To pause: set `OFFLINE_LIFECYCLE_ENABLED = "false"` in its wrangler.toml, merge, `scripts/deploy.sh bad-rental-remediator`. `deployed/prod` 11899f6 → abefc87. See "Deployed 2026-09-23 (ship 7)".
+> 2026-09-23 (ship 8, latest): PRs #126–#133 merged and DEPLOYED to PROD — 18 workers. kasa-control now requires a secret (`~/.config/incomingsms/KASA_ADMIN_RUN_SECRET`). `deployed/prod` abefc87 → 77d4a90. See "Deployed 2026-09-23 (ship 8)".
+> 2026-09-23: Offline SIM lifecycle ENABLED for real in PROD — `bad-rental-remediator` `572f4242` at 03:07:33 UTC (PR #125). To pause: set `OFFLINE_LIFECYCLE_ENABLED = "false"` in its wrangler.toml, merge, `scripts/deploy.sh bad-rental-remediator`. `deployed/prod` 11899f6 → abefc87. See "Deployed 2026-09-23 (ship 7)".
 > 2026-09-22: Offline-lifecycle dry-run flags were silently DROPPED by ships 3/4/5 (set with `--var`); now in `wrangler.toml` [vars] (PR #123) and redeployed as `505b4387` at 22:06 UTC — the 5h dry-run clock restarted then. `scripts/deploy.sh` now refuses to delete live vars. PR #124: sim-canceller/sim-status-changer reseller webhooks now actually send (`number.offline` on cancel/suspend, `number.online` on restore). `deployed/prod` ee9ae2b → 11899f6. See "Deployed 2026-09-22 (ship 6)".
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
@@ -20,6 +21,37 @@
 > Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
 
 ---
+
+## Deployed 2026-09-23 (ship 8) — PRs #126–#133, 18 workers
+
+- **Merged** (squash, no rebases needed): #130 test clock fix (`65af902`), #131 kasa-control auth (`177b950`), #126 secrets inventory (`b45ecce`), #129 db repo gaps (`715d4bc`), #128 shared helper finish + TEST entrypoints (`5530627`), #127 port-in outcomes (`cd50e29`), #132 docs (`c43970a`), #133 DB constraint check fix (`77d4a90`).
+- **Main was red 00:00–02:00 NY** (5 bad-rental-remediator tests). Cause: test fixtures built from the real clock went prior-NY-day and were dismissed by the expired-report sweep; latent since #48 (`a7f286d`) and #47 (`28c4895`). Fixed in the tests (#130), no worker code change.
+- **`check:db-constraints` failed after #128** on 4 false positives (result objects after an `sbPatch('sims?...')`), which blocked `scripts/deploy.sh`. Fixed in #133.
+- **Migrations:** none applied by this deploy. The 14 `supabase/migrations/20260923_*` files were already applied to TEST and PROD by the worker sessions. Spot check: PROD `atomic_portin_outcomes` = 164 rows.
+- **Pre-flight:** `npm test` 1187/1187, `check:db-constraints` pass, both dashboard syntax checks pass.
+- **Workers** (deploy list = changed dirs + every importer of `src/shared/supabase-rest.mjs` / `atomic-portin-outcomes.mjs`), via `scripts/deploy.sh`, one at a time, root probe before → after:
+  - dashboard (`--env=""`): `b375bdb6-eb44-432c-9aa3-f28b6c32052a` (200 → 200)
+  - bad-rental-remediator: `5d92613f-8eac-418e-9fdf-47733fc83f25` (404 → 404)
+  - bulk-activator: `55e45b70-9fa0-4854-9d2c-668fc120b18d` (200 → 200)
+  - details-finalizer: `94678117-959c-49a4-b6a7-d87b2147d9ee` (200 → 200)
+  - kasa-control: `f3606274-4ad4-440c-9784-2e602777b4a2` (404 → 401)
+  - mdn-rotator: `c3a3d5b8-0390-47b7-8544-844a106cb8d6` (200 → 200)
+  - ota-status-sync: `959c1e3f-736f-4ef4-9373-9208bcaf4790` (401 → 401)
+  - otp-portal: `64365b34-e457-4b86-babc-9df2ddf56b17` (200 → 200)
+  - phone-number-sync: `07f7b864-13b7-4a87-ba12-f4396499147a` (200 → 200)
+  - reseller-portal: `76492768-e804-47a2-92ca-1439ea296ccf` (200 → 200)
+  - reseller-sync: `b7ea1d2e-8dbf-4341-b69b-e132d2613652` (200 → 200)
+  - sim-canceller: `478b2c41-6f55-4ef7-9780-df0518a184c5` (200 → 200)
+  - sim-status-changer: `0dda11ff-9e5a-4e08-a634-405154af883c` (200 → 200)
+  - skyline-gateway: `eb7ad8db-a22d-482d-8833-ca36418031e5` (200 → 200)
+  - sms-ingest: `05462cc3-3254-4b12-ad9b-289ae3f08f78` (405 → 405)
+  - storefront: `cec56896-9532-41f3-9d9d-cc0ca883b095` (200 → 200)
+  - teltik-portal: `dc259b5f-37f8-4fec-9193-631540bd8494` (200 → 200)
+  - teltik-worker: `3ca87425-dfa6-42b4-b605-e1ec21bca5b2` (200 → 200)
+  - Not deployed: quickbooks (unchanged; no import of the changed shared modules).
+- **Live probes:** dashboard `/` 200; bad-rental CSV with X-Api-Key 200 (6,135 bytes); kasa-control `/` and `/outlets` without secret 401, with secret on an unknown path 404; dashboard has `KASA_ADMIN_RUN_SECRET` bound; live details-finalizer contains `atomic_portin_outcomes`; live mdn-rotator has no `supabaseSelect(`.
+- **Tail** details-finalizer 04:49–04:55 UTC: one `*/5` tick, outcome ok, 0 exceptions.
+- **Marker:** `deployed/prod` `abefc87313c808c42cc86bb58ac750d87b1cbc8a` → `77d4a901c5b7d3638742c223edd1ad0d7edbd0cd`.
 
 ## Open items and notes 2026-09-23
 
