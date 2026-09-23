@@ -186,8 +186,8 @@ const ALWAYS_MUTATING = [
 ];
 
 // Safe reads a viewer may perform. Everything absent from this list needs
-// operator or above, including carrier-query routes (/api/helix-query,
-// /api/atomic-query, /api/teltik-query, /api/wing-check): those are read-only
+// operator or above, including carrier-query routes (/api/atomic-query,
+// /api/teltik-query): those are read-only
 // at the carrier but still spend quota and write audit logs.
 const READ_ROUTES = [
   '/api/stats', '/api/sims', '/api/sims/status-counts', '/api/messages', '/api/sms-usage', '/api/resellers',

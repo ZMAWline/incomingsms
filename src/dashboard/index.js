@@ -249,20 +249,6 @@ async function handleDashboardRequest(request, env, ctx, audit) {
       return handleSimOnline(request, env, corsHeaders);
     }
 
-    if (url.pathname === '/api/wing-check') {
-      return handleWingCheck(request, env, corsHeaders);
-    }
-
-    if (url.pathname === '/api/helix-query') {
-      if (env.HELIX_ENABLED !== 'true') return new Response(JSON.stringify({error:'helix_disabled'}), {status:503, headers:{...corsHeaders,'Content-Type':'application/json'}});
-      return handleHelixQuery(request, env, corsHeaders);
-    }
-
-    if (url.pathname === '/api/helix-query-bulk' && request.method === 'POST') {
-      if (env.HELIX_ENABLED !== 'true') return new Response(JSON.stringify({error:'helix_disabled'}), {status:503, headers:{...corsHeaders,'Content-Type':'application/json'}});
-      return handleHelixQueryBulk(request, env, corsHeaders);
-    }
-
     if (url.pathname === '/api/send-test-sms' && request.method === 'POST') {
       return handleSendTestSms(request, env, corsHeaders);
     }
@@ -306,18 +292,6 @@ async function handleDashboardRequest(request, env, ctx, audit) {
 
     if (url.pathname === '/api/imei-pool/fix-slot' && request.method === 'POST') {
       return handleImeiPoolFixSlot(request, env, corsHeaders);
-    }
-
-    if (url.pathname === '/api/check-imei' && request.method === 'GET') {
-      return handleCheckImei(request, env, corsHeaders, url);
-    }
-
-    if (url.pathname === '/api/check-imeis' && request.method === 'POST') {
-      return handleCheckImeis(request, env, corsHeaders);
-    }
-
-    if (url.pathname === '/api/imei-pool/fix-incompatible' && request.method === 'POST') {
-      return handleFixIncompatibleImei(request, env, corsHeaders);
     }
 
     if (url.pathname === '/api/errors') {
@@ -433,15 +407,6 @@ async function handleDashboardRequest(request, env, ctx, audit) {
       return handleSimWebhooks(env, corsHeaders, url);
     }
 
-    if (url.pathname === '/api/imei-sweep' && request.method === 'POST') {
-      return handleImeiSweep(env, corsHeaders);
-    }
-
-    if (url.pathname === '/api/trigger-blimei-sweep' && request.method === 'POST') {
-      if (env.HELIX_ENABLED !== 'true') return new Response(JSON.stringify({error:'helix_disabled'}), {status:503, headers:{...corsHeaders,'Content-Type':'application/json'}});
-      return handleTriggerBlimeiSweep(env, corsHeaders);
-    }
-
     if (url.pathname === '/api/import-teltik' && request.method === 'POST') {
       // One chunk per request — the frontend loops until has_more=false so the
       // browser sees per-chunk progress and Cloudflare's response timeout never
@@ -468,14 +433,6 @@ async function handleDashboardRequest(request, env, ctx, audit) {
       );
       return new Response(await res.text(), { status: res.status,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-
-    if (url.pathname === '/api/sync-gateway-slots' && request.method === 'POST') {
-      return handleSyncGatewaySlots(request, env, corsHeaders);
-    }
-
-    if (url.pathname === '/api/imei-gateway-sync' && request.method === 'POST') {
-      return handleImeiGatewaySync(request, env, corsHeaders);
     }
 
     if (url.pathname === '/api/qbo-mappings' && request.method === 'GET') {
@@ -2293,215 +2250,6 @@ async function handleSimOnline(request, env, corsHeaders) {
   }
 }
 
-async function handleWingCheck(request, env, corsHeaders) {
-  if (request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405, headers: corsHeaders });
-  }
-  try {
-    const { iccid } = await request.json();
-    if (!iccid) {
-      return new Response(JSON.stringify({ error: 'iccid required' }), {
-        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
-    const url = baseUrl + '/v1/devices/' + encodeURIComponent(iccid);
-    const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
-    const runId = 'wing_check_' + iccid + '_' + Date.now();
-
-    const headers = { Authorization: auth };
-    if (env.RELAY_KEY) headers['x-relay-key'] = env.RELAY_KEY;
-    const fetchUrl = env.RELAY_URL ? env.RELAY_URL + '/' + url : url;
-    const res = await fetch(fetchUrl, {
-      method: 'GET',
-      headers
-    });
-
-    const text = await res.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
-
-    // Log to carrier_api_logs
-    await logCarrierApiCall(env, {
-      run_id: runId,
-      step: 'query',
-      iccid,
-      imei: null,
-      vendor: 'wing_iot',
-      request_url: url,
-      request_method: 'GET',
-      request_body: null,
-      response_status: res.status,
-      response_ok: res.ok,
-      response_body_text: text,
-      response_body_json: json,
-      error: res.ok ? null : 'Wing IoT query failed: ' + res.status,
-    });
-
-    let db_update_wing = null;
-    let db_skip_reason = null;
-    const wingStatus = json && json.status ? json.status.toLowerCase() : '';
-    const wingPlan = json && json.communicationPlan ? json.communicationPlan : '';
-    const DIALABLE_PLAN = 'Wing Tel Inc - NON ABIR SMS MO/MT US';
-    if (res.ok && json && (wingStatus === 'active' || wingStatus === 'activated')) {
-      if (wingPlan === DIALABLE_PLAN) {
-        db_update_wing = await syncActiveSim(env, iccid, {
-          mdn: json.mdn || json.msisdn || null,
-          activatedAt: json.dateActivated || null,
-        });
-      } else {
-        // SIM is on ABIR (non-dialable). Flag rotation_status='failed' so the
-        // mdn-rotator's remediation pass on the next /run will pick it up and
-        // run the dialable PUT (jumps straight to PUT-2 via the "already on
-        // ABIR" path in rotateWingIotSim).
-        try {
-          await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
-            rotation_status: 'failed',
-            status: 'rotation_failed',
-            last_rotation_error: 'Stuck on ABIR plan — flagged by Query at ' + new Date().toISOString(),
-          });
-          db_skip_reason = 'SIM is on plan "' + wingPlan + '" (not dialable). Marked rotation_status=failed — run mdn-rotator to retry the dialable PUT.';
-        } catch (e) {
-          db_skip_reason = 'SIM is on plan "' + wingPlan + '" (not dialable). Failed to flag for retry: ' + String(e);
-        }
-      }
-    } else {
-      const errMsg = !res.ok
-        ? 'Wing query HTTP ' + res.status
-        : (!json
-            ? 'Wing query: invalid JSON response'
-            : 'Wing query: unexpected carrier status "' + wingStatus + '"');
-      try {
-        await sbPatch(env, 'sims?iccid=eq.' + encodeURIComponent(iccid), {
-          status: 'error',
-          last_rotation_error: errMsg + ' at ' + new Date().toISOString(),
-        });
-        db_skip_reason = errMsg;
-      } catch (_) {}
-    }
-    return new Response(JSON.stringify({
-      ok: res.ok,
-      status: res.status,
-      iccid,
-      response: json || text,
-      db_update: db_update_wing,
-      db_skip_reason: db_skip_reason,
-    }, null, 2), {
-      status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  } catch (e) {
-    return new Response(JSON.stringify({ error: String(e) }), {
-      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-async function handleHelixQuery(request, env, corsHeaders) {
-  if (request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405 });
-  }
-
-  try {
-    const body = await request.json();
-    const subId = body.mobility_subscription_id;
-
-    if (!subId) {
-      return new Response(JSON.stringify({ error: 'mobility_subscription_id is required' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    const tokenRes = await relayFetch(env, env.HX_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'password',
-        client_id: env.HX_CLIENT_ID,
-        audience: env.HX_AUDIENCE,
-        username: env.HX_GRANT_USERNAME,
-        password: env.HX_GRANT_PASSWORD,
-      }),
-    });
-
-    const tokenData = await tokenRes.json();
-    if (!tokenRes.ok || !tokenData.access_token) {
-      return new Response(JSON.stringify({ error: 'Failed to get Helix token', details: tokenData }), {
-        status: 502,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    const token = tokenData.access_token;
-    const detailsUrl = env.HX_API_BASE + '/api/mobility-subscriber/details';
-    const detailsRes = await relayFetch(env, detailsUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-      body: JSON.stringify({ mobilitySubscriptionId: parseInt(subId) }),
-    });
-
-    const detailsText = await detailsRes.text();
-    let detailsData;
-    try {
-      detailsData = JSON.parse(detailsText);
-    } catch {
-      await sbPatch(env, 'sims?mobility_subscription_id=eq.' + encodeURIComponent(subId), {
-        status: 'error',
-        last_rotation_error: 'Helix query: invalid JSON response at ' + new Date().toISOString(),
-      }).catch(() => {});
-      return new Response(JSON.stringify({ error: 'Invalid JSON from Helix', raw: detailsText.slice(0, 500) }), {
-        status: 502,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    if (!detailsRes.ok) {
-      await sbPatch(env, 'sims?mobility_subscription_id=eq.' + encodeURIComponent(subId), {
-        status: 'error',
-        last_rotation_error: 'Helix query HTTP ' + detailsRes.status + ' at ' + new Date().toISOString(),
-      }).catch(() => {});
-      return new Response(JSON.stringify({ error: 'Helix API error', status: detailsRes.status, details: detailsData }), {
-        status: 502,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    const data = Array.isArray(detailsData) ? detailsData[0] : detailsData;
-    let db_update = null;
-    if (data && (data.status === 'CANCELLED' || data.status === 'CANCELED')) {
-      db_update = await syncCancelledSim(env, String(subId), data);
-    }
-
-    // Log to carrier_api_logs
-    await logCarrierApiCall(env, {
-      run_id: 'helix_query_' + subId + '_' + Date.now(),
-      step: 'query',
-      iccid: data?.iccid || null,
-      imei: data?.imei || null,
-      vendor: 'helix',
-      request_url: detailsUrl,
-      request_method: 'POST',
-      request_body: { mobilitySubscriptionId: parseInt(subId) },
-      response_status: detailsRes.status,
-      response_ok: detailsRes.ok,
-      response_body_text: detailsText,
-      response_body_json: detailsData,
-      error: null,
-    });
-
-    return new Response(JSON.stringify({ ok: true, mobility_subscription_id: subId, helix_response: detailsData, db_update }, null, 2), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-
-  } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  }
-}
-
 async function resolveTeltikKnownMdnForSim(env, sim, dbCurrentMdn) {
   return resolveSharedTeltikKnownMdn(env, {
     ...(sim || {}),
@@ -3058,100 +2806,6 @@ async function syncActiveSim(env, iccid, { mdn, activatedAt, zipCode }) {
     return result;
   } catch (e) {
     return { error: String(e) };
-  }
-}
-
-async function handleHelixQueryBulk(request, env, corsHeaders) {
-  if (request.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405 });
-  }
-  try {
-    const body = await request.json().catch(() => ({}));
-    const limit = Math.min(parseInt(body.limit) || 100, 200);
-    const offset = parseInt(body.offset) || 0;
-
-    const simsData = await sbGet(env, 'sims?mobility_subscription_id=not.is.null&status=not.eq.canceled&select=id,iccid,status,mobility_subscription_id&limit=5000');
-    const allSims = Array.isArray(simsData) ? simsData : [];
-    const batch = allSims.slice(offset, offset + limit);
-
-    if (batch.length === 0) {
-      return new Response(JSON.stringify({ ok: true, total_eligible: allSims.length, processed: 0, message: 'No SIMs in this batch' }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    const tokenRes = await relayFetch(env, env.HX_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'password',
-        client_id: env.HX_CLIENT_ID,
-        audience: env.HX_AUDIENCE,
-        username: env.HX_GRANT_USERNAME,
-        password: env.HX_GRANT_PASSWORD,
-      }),
-    });
-    const tokenData = await tokenRes.json();
-    if (!tokenRes.ok || !tokenData.access_token) {
-      return new Response(JSON.stringify({ error: 'Failed to get Helix token', details: tokenData }), {
-        status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-    const token = tokenData.access_token;
-
-    const results = {
-      ok: true,
-      total_eligible: allSims.length,
-      processed: batch.length,
-      offset,
-      has_more: offset + batch.length < allSims.length,
-      next_offset: offset + batch.length,
-      cancelled_found: 0,
-      db_updated: 0,
-      already_synced: 0,
-      errors: 0,
-      changed: [],
-    };
-
-    for (const sim of batch) {
-      try {
-        const detailsRes = await relayFetch(env, env.HX_API_BASE + '/api/mobility-subscriber/details', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-          body: JSON.stringify({ mobilitySubscriptionId: parseInt(sim.mobility_subscription_id) }),
-        });
-
-        if (!detailsRes.ok) {
-          results.errors++;
-          results.changed.push({ iccid: sim.iccid, error: 'Helix ' + detailsRes.status });
-          continue;
-        }
-
-        const d = await detailsRes.json();
-        const data = Array.isArray(d) ? d[0] : d;
-
-        if (data && (data.status === 'CANCELLED' || data.status === 'CANCELED')) {
-          results.cancelled_found++;
-          const upd = await syncCancelledSim(env, String(sim.mobility_subscription_id), data);
-          if (upd.status_updated) results.db_updated++;
-          else if (upd.status_already_canceled) results.already_synced++;
-          results.changed.push({ iccid: sim.iccid, sub_id: sim.mobility_subscription_id, helix_status: data.status, ...upd });
-        }
-      } catch (e) {
-        results.errors++;
-        results.changed.push({ iccid: sim.iccid, error: String(e) });
-      }
-    }
-
-    return new Response(JSON.stringify(results), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-
-  } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
   }
 }
 
@@ -7117,85 +6771,6 @@ async function logCarrierApiCall(env, logData) {
   }
 }
 
-async function handleImeiGatewaySync(request, env, corsHeaders) {
-  if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-
-  let body;
-  try { body = await request.json(); } catch {
-    return new Response(JSON.stringify({ error: 'Invalid JSON body' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  }
-
-  const workerUrl = `https://mdn-rotator/imei-gateway-sync?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
-  const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const responseText = await workerResponse.text();
-  let result;
-  try { result = JSON.parse(responseText); } catch {
-    result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
-  }
-  return new Response(JSON.stringify(result, null, 2), {
-    status: workerResponse.ok ? 200 : 500,
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-  });
-}
-
-async function handleImeiSweep(env, corsHeaders) {
-  if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-
-  const workerUrl = `https://mdn-rotator/imei-sweep?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
-  const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, { method: 'POST' });
-  const responseText = await workerResponse.text();
-  let result;
-  try { result = JSON.parse(responseText); } catch {
-    result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
-  }
-  return new Response(JSON.stringify(result, null, 2), {
-    status: workerResponse.ok ? 200 : 500,
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-  });
-}
-
-async function handleTriggerBlimeiSweep(env, corsHeaders) {
-  if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  const workerUrl = `https://mdn-rotator/trigger-blimei-sweep?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
-  const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, { method: 'POST' });
-  const responseText = await workerResponse.text();
-  let result;
-  try { result = JSON.parse(responseText); } catch {
-    result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
-  }
-  return new Response(JSON.stringify(result, null, 2), {
-    status: workerResponse.ok ? 200 : 500,
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-  });
-}
-
-async function handleSyncGatewaySlots(request, env, corsHeaders) {
-  if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  let body;
-  try { body = await request.json(); } catch { body = {}; }
-  const gateway_id = parsePositiveInt(body.gateway_id);
-  if (!gateway_id) return badRequest(corsHeaders, 'gateway_id must be a positive whole number');
-  const workerUrl = `https://mdn-rotator/sync-gateway-slots?gateway_id=${gateway_id}&secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
-  const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, { method: 'POST' });
-  const responseText = await workerResponse.text();
-  let result;
-  try { result = JSON.parse(responseText); } catch {
-    result = { ok: false, error: `Non-JSON response: ${responseText.slice(0, 200)}` };
-  }
-  return new Response(JSON.stringify(result, null, 2), {
-    status: workerResponse.ok ? 200 : 500,
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-  });
-}
-
 async function handleSimAction(request, env, corsHeaders) {
   try {
     const body = await request.json();
@@ -7324,63 +6899,6 @@ async function handleSimAction(request, env, corsHeaders) {
       error_message: String(error),
     });
     return errorResponse(error, corsHeaders);
-  }
-}
-
-async function handleCheckImei(request, env, corsHeaders, url) {
-  try {
-    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-
-    const imei = url.searchParams.get('imei') || '';
-    if (!/^\d{15}$/.test(imei)) {
-      return new Response(JSON.stringify({ error: 'imei must be 15 digits' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-
-    const checkUrl = 'https://mdn-rotator/check-imei?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET) + '&imei=' + encodeURIComponent(imei);
-    const workerRes = await env.MDN_ROTATOR.fetch(checkUrl, { method: 'GET' });
-    const responseText = await workerRes.text();
-    return new Response(responseText, { status: workerRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  }
-}
-
-async function handleCheckImeis(request, env, corsHeaders) {
-  try {
-    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-
-    const body = await request.json().catch(() => ({}));
-    const checkUrl = 'https://mdn-rotator/check-imeis?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET);
-    const workerRes = await env.MDN_ROTATOR.fetch(checkUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const responseText = await workerRes.text();
-    return new Response(responseText, { status: workerRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  }
-}
-
-async function handleFixIncompatibleImei(request, env, corsHeaders) {
-  try {
-    if (!env.MDN_ROTATOR) return new Response(JSON.stringify({ error: 'MDN_ROTATOR not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-
-    const body = await request.json().catch(() => ({}));
-    const fixUrl = 'https://mdn-rotator/fix-incompatible-imei?secret=' + encodeURIComponent(env.ADMIN_RUN_SECRET);
-    const workerRes = await env.MDN_ROTATOR.fetch(fixUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const responseText = await workerRes.text();
-    return new Response(responseText, { status: workerRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
 

@@ -326,21 +326,6 @@ wrong-key error that reads exactly like a dead line. The handler resolves the
 Teltik-known MDN for you from inbound SMS payloads and `/v1/all-lines`. Let it.
 Only pass `mdn` if you have a specific reason, and never pass our DB MDN.
 
-### POST /api/wing-check
-
-Wing IoT device status by ICCID. Body: `{ "iccid": "..." }`. Read-only;
-`carrier_api_logs`.
-
-Wing IoT is cancelled as a product line and all SIMs are Teltik-hosted, so this
-is a diagnostic for legacy rows, not part of normal work.
-
-### POST /api/helix-query
-
-Helix (T-Mobile) subscriber lookup. Body:
-`{ "mobility_subscription_id": "..." }`. Returns HTTP 503 with
-`{"error":"helix_disabled"}` unless `HELIX_ENABLED` is `true` on the worker.
-Read-only; `carrier_api_logs`.
-
 ## SIM actions
 
 ### POST /api/sim-action
@@ -353,9 +338,6 @@ The general per-SIM action route. One SIM per call.
 | `action` | enum | yes | See the table below. |
 | `force` | bool | no | `rotate` only. Bypasses the once-a-day dedup guard. |
 | `new_imei` | string | no | `change_imei`. 15 digits. |
-| `auto_imei` | bool | no | `change_imei`. Take the next IMEI from the pool. |
-| `imei_strategy` | string | no | `retry_activation`. `same` reuses the failed IMEI, `new` retires it and allocates another. |
-| `gateway_id`, `port` | | no | `fix`, when the SIM's slot is not already known. |
 
 | `action` | What happens at the carrier | What is written |
 |---|---|---|
@@ -363,9 +345,8 @@ The general per-SIM action route. One SIM per call.
 | `ota_refresh` | Teltik SIMs: a Teltik `/v1/reset-port` — an operator label, on the wire a gateway port reset, not a carrier OTA. Others: an OTA refresh via `mdn-rotator`. | `carrier_api_logs`; `system_errors` on failure. |
 | `cancel` | Deactivates the subscriber. | `sims.status = 'canceled'`, reseller assignment released. |
 | `resume` | Reconnects a suspended subscriber. | `sims.status = 'active'`. |
-| `fix` | The repair sequence: change IMEI, then OTA, cancel and resume. | `sims.imei`, `imei_pool`, `carrier_api_logs`. |
-| `retry_activation` | Re-runs a failed activation. | `sims.status`, `sims.last_activation_error`, `activation_jobs`. |
-| `change_imei` | Sets a new IMEI on the gateway and the carrier. | `sims.imei`, `imei_pool`. |
+| `fix` | ATOMIC SIMs: subscriber inquiry, then restore or reconnect if the line is suspended. | `sims.status`, `sims.msisdn`, `carrier_api_logs`. |
+| `change_imei` | ATOMIC `swapImei` at the carrier. No gateway write (all SIMs are Teltik-hosted). `new_imei` is required. | `sims.imei`, `carrier_api_logs`. |
 | `portin_status` | ATOMIC `portinStatus`. Read-only at the carrier. ATOMIC SIMs only. | `sims.atomic_portin_status_code`, `atomic_portin_description`, `atomic_portin_checked_at`. |
 
 ```json

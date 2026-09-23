@@ -2264,15 +2264,6 @@ async function gatherEvidence(env, report) {
       evidence.inboundProof = { ok: false, rows: [], error: String(err && err.message || err) };
     }
   }
-  // S5 gateway-offline probe (only if we have gateway+port).
-  if (evidence.sim && evidence.sim.gateway_id && evidence.sim.port && env.SKYLINE_GATEWAY) {
-    try {
-      const portStatus = await skylinePortStatus(env, evidence.sim.gateway_id, evidence.sim.port);
-      if (portStatus && portStatus.offline) evidence.gatewayOffline = true;
-    } catch (err) {
-      console.log('[Remediator] skyline probe failed for report ' + report.id + ': ' + err);
-    }
-  }
   return evidence;
 }
 
@@ -2311,20 +2302,6 @@ async function recordHostPortRead(env, sim, mdn, mdnSource, ps) {
     raw: ps.body || null,
     error: ps.error || (ps.status && (ps.status < 200 || ps.status >= 300) ? 'teltik_port_status_http_' + ps.status : null),
   }));
-}
-
-async function skylinePortStatus(env, gatewayId, port) {
-  const req = new Request('https://skyline-gateway/port-status?gateway_id='
-    + encodeURIComponent(gatewayId) + '&port=' + encodeURIComponent(port),
-    { method: 'GET' });
-  const resp = await env.SKYLINE_GATEWAY.fetch(req);
-  if (!resp.ok) return { offline: false };
-  const body = await resp.json().catch(() => ({}));
-  // Treat any explicit offline / not-registered signal as offline; conservative.
-  const state = String(body && (body.status || body.state) || '').toLowerCase();
-  const offline = state.includes('offline') || state.includes('not_registered')
-                || state === 'down' || body?.online === false;
-  return { offline, raw: state || null };
 }
 
 // ---------------------------------------------------------

@@ -26,9 +26,8 @@
 // carrier quota and are exactly what you want to see when an agent has been
 // hammering something, so they are audited despite the method.
 const AUDIT_GET_ROUTES = [
-  '/api/helix-query', '/api/helix-query-bulk', '/api/wing-check',
   '/api/teltik-query', '/api/teltik-host-check', '/api/atomic-query',
-  '/api/check-imei', '/api/keys',
+  '/api/keys',
 ];
 
 // Cap on the stored body. Bulk activations and CSV uploads can be megabytes;

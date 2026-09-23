@@ -14,7 +14,7 @@ import { generateApiKey, keyEnvLabel, readApiKeyHeader, hasApiKeyHeader } from '
 // --- the role fence -------------------------------------------------------
 
 const OPERATOR_ROUTES = [
-  ['POST', '/api/atomic-query'], ['POST', '/api/helix-query'], ['POST', '/api/wing-check'],
+  ['POST', '/api/atomic-query'],
   ['POST', '/api/teltik-query'], ['POST', '/api/teltik-host-check'], ['POST', '/api/sim-action'],
   ['POST', '/api/atomic-sub-action'], ['POST', '/api/atomic-swap-sim'], ['POST', '/api/atomic-swap-imei'],
   ['POST', '/api/suspend'], ['POST', '/api/restore'], ['POST', '/api/activate'],
@@ -160,7 +160,7 @@ test('acting requests are audited and polling GETs are not', () => {
   assert.ok(shouldAudit('POST', '/api/sim-action'));
   assert.ok(shouldAudit('DELETE', '/api/qbo-invoices/7'));
   // Carrier reads cost quota, so they are audited despite the method.
-  assert.ok(shouldAudit('GET', '/api/wing-check'));
+  assert.ok(shouldAudit('GET', '/api/atomic-query'));
   assert.ok(shouldAudit('GET', '/api/keys'));
 
   assert.ok(!shouldAudit('GET', '/api/sims'));

@@ -174,10 +174,6 @@ export default {
     if (!simId && gatewayIdFromPath && port) {
       const portLetter = dotPortToLetter(port);
       simId = await findSimIdByGatewayPort(env, gatewayIdFromPath, portLetter);
-      if (!simId) {
-        console.log(`[SMS] Port ${portLetter} on gateway ${gatewayIdFromPath} not found — triggering slot sync`);
-        ctx.waitUntil(triggerGatewaySlotSync(env, gatewayIdFromPath));
-      }
     }
     const toNumber = simId ? await findCurrentNumberBySimId(env, simId) : "";
 
@@ -442,18 +438,6 @@ async function findSimIdByGatewayPort(env, gatewayId, port) {
   const q = `sims?select=id&gateway_id=eq.${gatewayId}&port=eq.${encodeURIComponent(port)}&status=neq.canceled&limit=1`;
   const row = await lookupFirst(env, q);
   return row?.id ? row.id : null;
-}
-
-// Trigger a background slot sync on mdn-rotator so the next SMS routes correctly
-async function triggerGatewaySlotSync(env, gatewayId) {
-  if (!env.MDN_ROTATOR || !env.ADMIN_RUN_SECRET) return;
-  try {
-    const url = `https://mdn-rotator/sync-gateway-slots?gateway_id=${gatewayId}&secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
-    const res = await env.MDN_ROTATOR.fetch(url, { method: 'POST' });
-    console.log(`[SMS] Slot sync for gateway ${gatewayId}: ${res.status}`);
-  } catch (err) {
-    console.warn(`[SMS] Slot sync trigger failed: ${err}`);
-  }
 }
 
 // Find gateway ID by MAC address

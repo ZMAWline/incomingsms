@@ -48,8 +48,6 @@ queries() {
   api POST "/api/atomic-query"     "{\"identifier\":\"$ICCID\"}"
   api POST "/api/teltik-query"     "{\"iccid\":\"$ICCID\"}"
   api POST "/api/teltik-host-check" "{\"sim_id\":$SIM_ID}"
-  api POST "/api/wing-check"       "{\"iccid\":\"$ICCID\"}"
-  api POST "/api/helix-query"      '{"mobility_subscription_id":"REPLACE_ME"}'
   api POST "/api/sim-action"       "{\"sim_id\":$SIM_ID,\"action\":\"portin_status\"}"
 }
 
