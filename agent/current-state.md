@@ -21,6 +21,14 @@
 
 ---
 
+## Open items and notes 2026-09-23
+
+- **Brief C done** (`agent/briefs/2026-09-22-C-portin-outcomes-migration.md`): PR #127 (`cd50e29`) merged. It records and shows why each ATOMIC port-in failed (`atomic_portin_outcomes`). Its migration was already applied to TEST and PROD.
+- **Lost WIP on `feat/inc-2-rental-billing`:** any uncommitted or unpushed work from that branch is gone and cannot be recovered. The remote branch has only the commits that were pushed. Do not look for more.
+- **kasa-control now needs a secret on every route** (PR #131). Callers send `Authorization: Bearer <secret>` (or `X-Admin-Secret`). Unset secret means 503 on every route. Secret names: `ADMIN_RUN_SECRET` on kasa-control and kasa-control-test; `KASA_ADMIN_RUN_SECRET` on dashboard and dashboard-test (the dashboard `/api/kasa/*` proxy sends it). One value for all four, stored at `~/.config/incomingsms/KASA_ADMIN_RUN_SECRET` (mode 600). The `?secret=` query form is gone.
+- **Open: delete unused secrets after one week of clean logs.** `agent/secrets-inventory.md` lists 42 live secrets that no code reads and 105 secrets PROD has that TEST lacks. Earliest delete date for the 42: 2026-09-30, if the logs show no errors that name them. The 105 missing TEST secrets are a separate decision (TEST runs of those workers cannot work until they exist).
+- **Main was red 00:00–02:00 NY** because two bad-rental-remediator test files built fixtures from the real clock (fixed in PR #130 by pinning the clock). A test that builds `received_at` from `Date.now()` and runs through `runTick` must pin the clock too.
+
 ## Deployed 2026-09-23 (ship 7) — Offline SIM lifecycle enabled in PROD (#125)
 
 - **Brief B step 5 done.** PR #125 (`abefc87`) removed `OFFLINE_LIFECYCLE_DRY_RUN` from the PROD `[vars]` in `src/bad-rental-remediator/wrangler.toml`. `OFFLINE_LIFECYCLE_ENABLED = "true"` stays. `[env.test.vars]` is unchanged (still dry run; TEST has no crons).
@@ -76,7 +84,7 @@
 - **Live probes:** dashboard `/` 200; `/api/sims` unauthenticated 401 (not 502); bad-rental CSV with X-Api-Key 200 (18,581 bytes); live dashboard script contains `sims_dashboard` (3); live mdn-rotator contains `restoreRotationStamp` (8) and the new `pre-swap inquiry network error` branch calls it.
 - **Workers Builds also deploys on push:** details-finalizer got an automatic version `792b67a8` at 21:22:41 UTC (Source "Unknown", right after main was pushed), 90 s before `scripts/deploy.sh` put `938a566a` live. Ours is the current 100% version.
 - **UX changes from #121 (SIMs tab):** searching by ID is now an exact match (not substring); search no longer matches formatted dates or SMS counts (they are not columns in the view); auto-refresh polls only the current page; filter-menu counts come from `sims_dashboard_facets()` over the whole fleet.
-- **TODO(shared-supabase) leftovers from #120** (still on their own Supabase helpers): storefront (calls go through relayFetch), reseller-portal `sbGet` (returns raw Response, ~20 callers), teltik-worker write helpers (return raw Response; #122 checks the rotation writes only), bad-rental-remediator `index.js` / `actions.mjs` / `verify-runner.mjs` (inline requests), mdn-rotator (not moved).
+- **TODO(shared-supabase) leftovers from #120:** closed 2026-09-23 by PR #128 (every worker now uses `src/shared/supabase-rest.mjs`; no `TODO(shared-supabase)` markers remain in `src/`).
 - **project-map.md:** shared-module table now lists `supabase-rest.mjs` and `fetch-timeout.mjs`.
 - **TODO:** check mdn-rotator's first tick after 04:00 UTC (cron `*/5 4-14 * * *`) for `timeout after` errors and for any `pre-swap inquiry network error` lines.
 - **Marker:** `deployed/prod` moved `d2af4a32494f0d10bfca97991dd3dffce48980cb` → `ee9ae2b998c20c0cfddc99d6ebdad7d4b1591256`.
