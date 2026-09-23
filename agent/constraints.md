@@ -104,7 +104,7 @@ Process:
 
 ## 7. IMEI Pool Status Values
 
-`imei_pool.status` is constrained to exactly: `available`, `in_use`, `retired`, `blocked`.
+`imei_pool.status` is constrained to exactly: `available`, `in_use`, `retired` (PROD `imei_pool_status_check`, verified 2026-09-23). There is no `blocked` status; writing it fails the check constraint.
 
 - `retired` — permanently removed from a gateway slot. Never reuse.
 - `available` — can be allocated. `allocateImeiFromPool` filters on this.
