@@ -21,6 +21,7 @@ const SHARED_MODULES = [
   ['../shared/activation-bulk.mjs', 'src/shared/activation-bulk.mjs', false],
   ['../shared/sim-swap.mjs', 'src/shared/sim-swap.mjs', false],
   ['../shared/fetch-timeout.mjs', 'src/shared/fetch-timeout.mjs', false],
+  ['../shared/supabase-rest.mjs', 'src/shared/supabase-rest.mjs', false],
 ];
 
 async function toDataUrl(relPath) {

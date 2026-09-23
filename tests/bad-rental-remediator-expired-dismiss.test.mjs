@@ -117,7 +117,7 @@ test('open-counts use exact counts and exclude closed remediated rows', () => {
   const start = SRC.indexOf('async function fetchOpenCounts');
   assert.ok(start !== -1);
   const body = SRC.slice(start, SRC.indexOf('async function sweepExpiredOpenReports', start));
-  assert.ok(body.includes('supabaseExactCount'), 'counts must use exact PostgREST counts, not capped row materialization');
+  assert.ok(body.includes('countRows'), 'counts must use exact PostgREST counts, not capped row materialization');
   assert.ok(body.includes('status=in.(received,in_triage)'), 'open counts must include only open report statuses');
   assert.ok(!body.includes('remediated'), 'open counts must not count remediated/closed reports');
 });

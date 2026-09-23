@@ -20,7 +20,8 @@ import {
   durationFromHours,
   parseBearerToken,
 } from './logic.mjs';
-import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { carrierFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPost, sbPatch, sbDelete, sbRpc, SupabaseError } from '../shared/supabase-rest.mjs';
 
 const COOKIE_NAME = 'nb_session';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -51,86 +52,11 @@ function relayFetch(env, url, init, send = carrierFetch) {
 }
 
 // ---------------------------------------------------------------------------
-// Supabase (PostgREST) helpers — same shape as src/reseller-portal/index.js,
-// but routed through relayFetch per the constraint above.
+// Supabase goes through src/shared/supabase-rest.mjs. Supabase is exempt from
+// the relay (agent/constraints.md section 11); only NOWPayments uses relayFetch.
 // ---------------------------------------------------------------------------
-// TODO(shared-supabase): these helpers send Supabase calls through relayFetch
-// (the relay URL, not SUPABASE_URL directly), and sbRpc returns
-// { ok, status, text } for status-to-HTTP mapping. The shared
-// src/shared/supabase-rest.mjs calls Supabase directly; moving over would
-// change the network path, so it needs its own decision.
-function sbHeaders(env, extra) {
-  return {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    Accept: 'application/json',
-    ...(extra || {}),
-  };
-}
-
-async function sbSelect(env, path) {
-  const res = await relayFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    headers: sbHeaders(env),
-  }, supabaseFetch);
-  if (!res.ok) {
-    throw new Error('PostgREST GET ' + res.status + ': ' + (await res.text().catch(() => '')));
-  }
-  return res.json();
-}
-
-// Insert one row, return the created row (Prefer: representation).
-async function sbInsert(env, table, body) {
-  const res = await relayFetch(env, `${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: 'POST',
-    headers: sbHeaders(env, {
-      'Content-Type': 'application/json',
-      Prefer: 'return=representation',
-    }),
-    body: JSON.stringify(body),
-  }, supabaseFetch);
-  const text = await res.text().catch(() => '');
-  if (!res.ok) {
-    const err = new Error('PostgREST POST ' + table + ' ' + res.status + ': ' + text);
-    err.status = res.status;
-    err.body = text;
-    throw err;
-  }
-  const rows = JSON.parse(text);
-  return Array.isArray(rows) ? rows[0] : rows;
-}
-
-async function sbPatch(env, path, body) {
-  const res = await relayFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'PATCH',
-    headers: sbHeaders(env, { 'Content-Type': 'application/json', Prefer: 'return=minimal' }),
-    body: JSON.stringify(body),
-  }, supabaseFetch);
-  if (!res.ok) {
-    throw new Error('PostgREST PATCH ' + res.status + ': ' + (await res.text().catch(() => '')));
-  }
-}
-
-async function sbDelete(env, path) {
-  const res = await relayFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'DELETE',
-    headers: sbHeaders(env, { Prefer: 'return=minimal' }),
-  }, supabaseFetch);
-  if (!res.ok) {
-    throw new Error('PostgREST DELETE ' + res.status + ': ' + (await res.text().catch(() => '')));
-  }
-}
-
-// Call an RPC; returns { ok, status, text } so callers can map DB errors
-// (e.g. raised 'insufficient_balance', unique violations) to HTTP codes.
-async function sbRpc(env, fn, args) {
-  const res = await relayFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
-    method: 'POST',
-    headers: sbHeaders(env, { 'Content-Type': 'application/json' }),
-    body: JSON.stringify(args),
-  }, supabaseFetch);
-  const text = await res.text().catch(() => '');
-  return { ok: res.ok, status: res.status, text };
-}
+const MINIMAL = { prefer: 'return=minimal' };
+const REPRESENTATION = { prefer: 'return=representation' };
 
 // ---------------------------------------------------------------------------
 // Small response / request utilities
@@ -175,7 +101,7 @@ async function selectIn(env, table, column, ids, rest) {
   const out = [];
   for (const part of chunk(ids, 150)) {
     const list = part.map((v) => encodeURIComponent(v)).join(',');
-    out.push(...(await sbSelect(env, `${table}?${column}=in.(${list})&${rest}`)));
+    out.push(...(await sbGet(env, `${table}?${column}=in.(${list})&${rest}`)));
   }
   return out;
 }
@@ -186,11 +112,11 @@ async function selectIn(env, table, column, ids, rest) {
 async function createSession(env, customerId) {
   const token = randomHex(32); // 32 random bytes, hex-encoded
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  await sbInsert(env, 'shop_sessions', {
+  await sbPost(env, 'shop_sessions', {
     token,
     customer_id: customerId,
     expires_at: expiresAt,
-  });
+  }, MINIMAL);
   return { token, maxAge: Math.floor(SESSION_TTL_MS / 1000) };
 }
 
@@ -203,7 +129,7 @@ async function createSession(env, customerId) {
 async function requireCustomer(request, env) {
   const bearer = parseBearerToken(request.headers.get('Authorization'));
   if (bearer) {
-    const customers = await sbSelect(
+    const customers = await sbGet(
       env,
       `shop_customers?api_token=eq.${encodeURIComponent(bearer)}&select=id,email,status,api_token&limit=1`
     );
@@ -215,7 +141,7 @@ async function requireCustomer(request, env) {
 
   const token = getSessionToken(request);
   if (!token) return json({ error: 'unauthorized' }, 401);
-  const sessions = await sbSelect(
+  const sessions = await sbGet(
     env,
     `shop_sessions?token=eq.${encodeURIComponent(token)}&select=customer_id,expires_at&limit=1`
   );
@@ -223,7 +149,7 @@ async function requireCustomer(request, env) {
   if (!sess || Date.parse(sess.expires_at) <= Date.now()) {
     return json({ error: 'unauthorized' }, 401);
   }
-  const customers = await sbSelect(
+  const customers = await sbGet(
     env,
     `shop_customers?id=eq.${sess.customer_id}&select=id,email,status,api_token&limit=1`
   );
@@ -243,11 +169,11 @@ async function handleSignup(request, env) {
   const passwordHash = await hashPassword(password);
   let customer;
   try {
-    customer = await sbInsert(env, 'shop_customers', {
+    [customer] = await sbPost(env, 'shop_customers', {
       email,
       password_hash: passwordHash,
       api_token: randomHex(16), // 32-hex token for the future Telegram bot
-    });
+    }, REPRESENTATION);
   } catch (e) {
     if (e.status === 409 || /23505|duplicate key/.test(String(e.body || ''))) {
       return json({ error: 'email_taken' }, 409);
@@ -267,7 +193,7 @@ async function handleLogin(request, env) {
   const email = String(body?.email || '').trim().toLowerCase();
   const password = String(body?.password || '');
   const rows = email
-    ? await sbSelect(
+    ? await sbGet(
         env,
         `shop_customers?email=eq.${encodeURIComponent(email)}&select=id,email,status,password_hash&limit=1`
       )
@@ -290,7 +216,7 @@ async function handleLogout(request, env) {
   const token = getSessionToken(request);
   if (token) {
     try {
-      await sbDelete(env, `shop_sessions?token=eq.${encodeURIComponent(token)}`);
+      await sbDelete(env, `shop_sessions?token=eq.${encodeURIComponent(token)}`, MINIMAL);
     } catch (e) {
       console.log('[Logout] session delete failed: ' + e);
     }
@@ -315,7 +241,7 @@ async function handleConfig(env) {
 // Returns one entry per available sim with its vendor + current e164 — callers
 // decide how much (if anything) to expose.
 async function availableSims(env) {
-  const pool = await sbSelect(env, 'shop_pool?select=sim_id');
+  const pool = await sbGet(env, 'shop_pool?select=sim_id');
   const poolIds = pool.map((r) => r.sim_id);
   if (!poolIds.length) return [];
 
@@ -341,7 +267,7 @@ async function availableSims(env) {
 async function handleStock(env) {
   const [available, prices] = await Promise.all([
     availableSims(env),
-    sbSelect(env, PRICES_SELECT),
+    sbGet(env, PRICES_SELECT),
   ]);
 
   const stock = available.map((s) => {
@@ -379,7 +305,7 @@ async function handleStats(env) {
 // Authed: account, renting, inbox
 // ---------------------------------------------------------------------------
 async function handleMe(customer, env) {
-  const balances = await sbSelect(
+  const balances = await sbGet(
     env,
     `shop_balances?customer_id=eq.${customer.id}&select=balance_cents&limit=1`
   );
@@ -410,10 +336,10 @@ async function handleRent(customer, env, request) {
   // Re-verify sellability. These checks give clean errors for the common
   // cases; the RPC + partial unique index remain the actual race-safety.
   const [pool, sims, numbers, active] = await Promise.all([
-    sbSelect(env, `shop_pool?sim_id=eq.${simId}&select=sim_id&limit=1`),
-    sbSelect(env, `sims?id=eq.${simId}&status=eq.active&select=id,vendor&limit=1`),
-    sbSelect(env, `sim_numbers?sim_id=eq.${simId}&valid_to=is.null&select=e164&order=valid_from.desc&limit=1`),
-    sbSelect(env, `shop_rentals?sim_id=eq.${simId}&status=eq.active&select=id&limit=1`),
+    sbGet(env, `shop_pool?sim_id=eq.${simId}&select=sim_id&limit=1`),
+    sbGet(env, `sims?id=eq.${simId}&status=eq.active&select=id,vendor&limit=1`),
+    sbGet(env, `sim_numbers?sim_id=eq.${simId}&valid_to=is.null&select=e164&order=valid_from.desc&limit=1`),
+    sbGet(env, `shop_rentals?sim_id=eq.${simId}&status=eq.active&select=id&limit=1`),
   ]);
   if (!pool.length || !sims.length || !numbers.length) {
     return json({ error: 'not_available' }, 404);
@@ -421,29 +347,33 @@ async function handleRent(customer, env, request) {
   if (active.length) return json({ error: 'just_taken' }, 409);
 
   const vendor = sims[0].vendor;
-  const prices = await sbSelect(env, PRICES_SELECT);
+  const prices = await sbGet(env, PRICES_SELECT);
   const priceCents = priceFor(vendor, duration, prices);
   const e164 = normalizeToE164(numbers[0].e164);
 
-  const rpc = await sbRpc(env, 'shop_claim_rental', {
-    p_customer_id: customer.id,
-    p_sim_id: simId,
-    p_e164: e164,
-    p_carrier: vendorToCarrier(vendor),
-    p_price_cents: priceCents,
-    p_hours: hours,
-  });
-  if (!rpc.ok) {
-    if (rpc.text.includes('insufficient_balance')) {
+  let rentalId;
+  try {
+    rentalId = Number(await sbRpc(env, 'shop_claim_rental', {
+      p_customer_id: customer.id,
+      p_sim_id: simId,
+      p_e164: e164,
+      p_carrier: vendorToCarrier(vendor),
+      p_price_cents: priceCents,
+      p_hours: hours,
+    }));
+  } catch (e) {
+    // Map the DB's refusals to HTTP; a timeout or any other failure throws.
+    if (!(e instanceof SupabaseError)) throw e;
+    const text = String(e.body || '');
+    if (text.includes('insufficient_balance')) {
       return json({ error: 'insufficient_balance' }, 402);
     }
-    if (rpc.status === 409 || /23505|duplicate key/.test(rpc.text)) {
+    if (e.status === 409 || /23505|duplicate key/.test(text)) {
       return json({ error: 'just_taken' }, 409);
     }
-    throw new Error('shop_claim_rental failed ' + rpc.status + ': ' + rpc.text.slice(0, 300));
+    throw new Error('shop_claim_rental failed ' + e.status + ': ' + text.slice(0, 300));
   }
-  const rentalId = Number(JSON.parse(rpc.text));
-  const rentals = await sbSelect(env, `shop_rentals?id=eq.${rentalId}&select=*&limit=1`);
+  const rentals = await sbGet(env, `shop_rentals?id=eq.${rentalId}&select=*&limit=1`);
   return json({ rental: rentals[0] ? withDuration(rentals[0]) : { id: rentalId, duration } });
 }
 
@@ -461,7 +391,7 @@ function effectiveStatus(rental, currentE164BySim, nowMs) {
 }
 
 async function handleRentals(customer, env) {
-  const rentals = await sbSelect(
+  const rentals = await sbGet(
     env,
     `shop_rentals?customer_id=eq.${customer.id}&select=*&order=created_at.desc&limit=200`
   );
@@ -481,12 +411,12 @@ async function handleRentals(customer, env) {
 // the escape hatch for leaked agent credentials.
 async function handleRotateToken(customer, env) {
   const newToken = randomHex(16); // 32-hex, matches signup
-  await sbPatch(env, `shop_customers?id=eq.${customer.id}`, { api_token: newToken });
+  await sbPatch(env, `shop_customers?id=eq.${customer.id}`, { api_token: newToken }, MINIMAL);
   return json({ ok: true, api_token: newToken });
 }
 
 async function handleMessages(customer, env, rentalId) {
-  const rentals = await sbSelect(
+  const rentals = await sbGet(
     env,
     `shop_rentals?id=eq.${rentalId}&customer_id=eq.${customer.id}&select=*&limit=1`
   );
@@ -500,7 +430,7 @@ async function handleMessages(customer, env, rentalId) {
   // The inbox window closes at ends_at OR when the number was rotated off the
   // sim, whichever is earlier — messages after rotation belong to the next
   // tenant of that number.
-  const numberRows = await sbSelect(
+  const numberRows = await sbGet(
     env,
     `sim_numbers?sim_id=eq.${rental.sim_id}&select=e164,valid_from,valid_to&order=valid_from.desc&limit=50`
   );
@@ -513,7 +443,7 @@ async function handleMessages(customer, env, rentalId) {
   });
   if (span && span.valid_to) windowEndMs = Math.min(endsMs, Date.parse(span.valid_to));
 
-  const sms = await sbSelect(
+  const sms = await sbGet(
     env,
     `inbound_sms?sim_id=eq.${rental.sim_id}` +
       `&received_at=gte.${encodeURIComponent(new Date(startsMs).toISOString())}` +
@@ -538,12 +468,12 @@ async function handleCreateDeposit(customer, env, request) {
   }
 
   if (!env.NOWPAYMENTS_API_KEY) {
-    const dep = await sbInsert(env, 'shop_deposits', {
+    const [dep] = await sbPost(env, 'shop_deposits', {
       customer_id: customer.id,
       processor: 'manual',
       amount_cents: amountCents,
       status: 'pending',
-    });
+    }, REPRESENTATION);
     return json({
       mode: 'manual',
       deposit_id: dep.id,
@@ -554,12 +484,12 @@ async function handleCreateDeposit(customer, env, request) {
   }
 
   const origin = new URL(request.url).origin;
-  const dep = await sbInsert(env, 'shop_deposits', {
+  const [dep] = await sbPost(env, 'shop_deposits', {
     customer_id: customer.id,
     processor: 'nowpayments',
     amount_cents: amountCents,
     status: 'pending',
-  });
+  }, REPRESENTATION);
 
   const invRes = await relayFetch(env, 'https://api.nowpayments.io/v1/invoice', {
     method: 'POST',
@@ -580,7 +510,7 @@ async function handleCreateDeposit(customer, env, request) {
   const invText = await invRes.text().catch(() => '');
   if (!invRes.ok) {
     console.log('[Deposit] NOWPayments invoice failed ' + invRes.status + ': ' + invText.slice(0, 300));
-    await sbPatch(env, `shop_deposits?id=eq.${dep.id}`, { status: 'failed' });
+    await sbPatch(env, `shop_deposits?id=eq.${dep.id}`, { status: 'failed' }, MINIMAL);
     return json({ error: 'payment_provider_error' }, 502);
   }
   let inv;
@@ -588,12 +518,12 @@ async function handleCreateDeposit(customer, env, request) {
   await sbPatch(env, `shop_deposits?id=eq.${dep.id}`, {
     invoice_id: String(inv.id ?? ''),
     raw: { invoice: inv },
-  });
+  }, MINIMAL);
   return json({ mode: 'crypto', deposit_id: dep.id, invoice_url: inv.invoice_url });
 }
 
 async function handleListDeposits(customer, env) {
-  const deposits = await sbSelect(
+  const deposits = await sbGet(
     env,
     `shop_deposits?customer_id=eq.${customer.id}` +
       '&select=id,processor,amount_cents,status,created_at,confirmed_at' +
@@ -653,13 +583,13 @@ async function handleNowpaymentsIpn(request, env) {
   let dep = null;
   const orderId = Number(payload.order_id);
   if (Number.isInteger(orderId) && orderId > 0) {
-    const rows = await sbSelect(
+    const rows = await sbGet(
       env, `shop_deposits?id=eq.${orderId}&select=id,invoice_id,status&limit=1`
     );
     dep = rows[0] || null;
   }
   if (!dep && payload.invoice_id != null) {
-    const rows = await sbSelect(
+    const rows = await sbGet(
       env,
       `shop_deposits?invoice_id=eq.${encodeURIComponent(String(payload.invoice_id))}&select=id,invoice_id,status&limit=1`
     );
@@ -672,19 +602,17 @@ async function handleNowpaymentsIpn(request, env) {
     const amountCents = Number.isFinite(Number(payload.price_amount))
       ? Math.round(Number(payload.price_amount) * 100)
       : null;
-    const rpc = await sbRpc(env, 'shop_confirm_deposit', {
+    // A non-2xx throws SupabaseError, as before.
+    await sbRpc(env, 'shop_confirm_deposit', {
       p_invoice_id: dep.invoice_id,
       p_amount_cents: amountCents,
       p_raw: payload,
     });
-    if (!rpc.ok) {
-      throw new Error('shop_confirm_deposit failed ' + rpc.status + ': ' + rpc.text.slice(0, 300));
-    }
     // RPC returns false on retries (already confirmed) — still 200: idempotent.
     return json({ ok: true });
   }
   if ((status === 'failed' || status === 'expired') && dep.status === 'pending') {
-    await sbPatch(env, `shop_deposits?id=eq.${dep.id}`, { status, raw: payload });
+    await sbPatch(env, `shop_deposits?id=eq.${dep.id}`, { status, raw: payload }, MINIMAL);
   }
   return json({ ok: true });
 }

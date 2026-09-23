@@ -176,6 +176,32 @@ test('sbRpc posts args to /rest/v1/rpc/<fn> and returns scalars and rows', async
   assert.equal(calls[1].init.body, '{}');
 });
 
+test('raw: true returns the Response untouched and does not throw on a non-2xx', async (t) => {
+  const calls = fakeFetch(t, (url) => (url.includes('missing') ? { status: 404, body: 'nope' } : { status: 201, body: [{ id: 1 }] }));
+  const miss = await sbGet(ENV, 'missing?select=id', { raw: true });
+  assert.ok(miss instanceof Response);
+  assert.equal(miss.ok, false);
+  assert.equal(miss.status, 404);
+  assert.equal(await miss.text(), 'nope');
+  const res = await sbPost(ENV, 'sims', [{ iccid: '1' }], { prefer: 'return=minimal', raw: true });
+  assert.equal(res.status, 201);
+  assert.deepEqual(await res.json(), [{ id: 1 }]);
+  assert.equal(calls[1].init.headers.Prefer, 'return=minimal');
+  assert.equal((await sbPatch(ENV, 'missing?id=eq.1', {}, { raw: true })).status, 404);
+  assert.equal((await sbDelete(ENV, 'missing?id=eq.1', { raw: true })).status, 404);
+  assert.equal((await sbRpc(ENV, 'missing', {}, { raw: true })).status, 404);
+});
+
+test('logRows: true asks for the rows back and logs how many a write touched', async (t) => {
+  const calls = fakeFetch(t, () => ({ body: [{ id: 1 }, { id: 2 }] }));
+  const logged = [];
+  t.mock.method(console, 'log', (msg) => logged.push(msg));
+  assert.deepEqual(await sbPatch(ENV, 'sims?id=in.(1,2)', { status: 'active' }, { logRows: true }), [{ id: 1 }, { id: 2 }]);
+  await sbPost(ENV, 'sim_numbers', [{ sim_id: 1 }, { sim_id: 2 }], { logRows: true });
+  assert.equal(calls[0].init.headers.Prefer, 'return=representation');
+  assert.deepEqual(logged, ['[DB] PATCH result: 2 rows updated', '[DB] POST result: 2 rows inserted']);
+});
+
 // ---------------------------------------------------------------------------
 // Source scan: a migrated worker must not define its own Supabase REST helper.
 // ---------------------------------------------------------------------------
@@ -183,17 +209,10 @@ test('sbRpc posts args to /rest/v1/rpc/<fn> and returns scalars and rows', async
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HELPER_DEF = /^(?:export\s+)?(?:async\s+)?function\s+(sb(?:Headers|Get|GetAll|GetArray|Select|Post|Insert|Patch|Delete|Rpc|Upsert)|supabase(?:Headers|Get|GetArray|GetAllArray|GetOne|Select|SelectOne|Insert|Upsert|Patch|Delete|Rpc|ExactCount))\s*\(/gm;
 
-// Workers still on a local copy, by file and helper name. Each carries a
-// TODO(shared-supabase) comment saying why. Shrink this list; never grow it.
-const NOT_YET_MIGRATED = {
-  'src/storefront/index.js': ['sbHeaders', 'sbSelect', 'sbInsert', 'sbPatch', 'sbDelete', 'sbRpc'],
-  'src/reseller-portal/index.js': ['sbGet'],
-  'src/teltik-worker/index.js': ['supabaseInsert', 'supabaseUpsert', 'supabasePatch'],
-  'src/mdn-rotator/index.js': ['supabaseSelect', 'supabaseSelectOne', 'supabasePatch', 'supabaseInsert'],
-  'src/bad-rental-remediator/index.js': ['supabaseHeaders', 'supabaseGet', 'supabaseExactCount'],
-  'src/bad-rental-remediator/actions.mjs': ['supabaseHeaders'],
-  'src/bad-rental-remediator/verify-runner.mjs': ['supabaseGet', 'supabaseHeaders'],
-};
+// Workers still on a local copy, by file and helper name. Each would carry a
+// TODO(shared-supabase) comment saying why. Empty since every worker moved
+// over; keep it that way (use the raw / logRows options instead of a copy).
+const NOT_YET_MIGRATED = {};
 
 function workerSourceFiles() {
   const out = [];

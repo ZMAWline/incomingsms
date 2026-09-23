@@ -63,7 +63,7 @@ test('lookupAtomicPortinStatus builds the request via buildAtomicPortInStatusReq
   assert.match(fn, /step: 'portin_status'.*vendor: 'atomic'/s);
   assert.match(fn, /request_body: redactAtomicSession\(requestBody\)/, 'logged request body is redacted');
   // Only reads status — never patches sims/carrier state itself; callers own persistence.
-  assert.ok(!fn.includes('supabasePatch'), 'lookup helper itself does not mutate the sims row');
+  assert.ok(!fn.includes('sbPatch'), 'lookup helper itself does not mutate the sims row');
 });
 
 test('redactAtomicSession blanks userName/token/pin before logging', () => {
@@ -113,8 +113,8 @@ test('/sim-action accepts a "portin_status" action, ATOMIC-only, MSISDN-validate
   }
   // Only the read-only three status fields are patched — sims.status and
   // port_in_pending are left alone (no auto-completion from a manual check).
-  const patchMatch = branch.match(/supabasePatch\(env, `sims\?id=eq\.[^`]*`, \{([\s\S]*?)\}\);/);
-  assert.ok(patchMatch, 'supabasePatch call found in branch');
+  const patchMatch = branch.match(/sbPatch\(env, `sims\?id=eq\.[^`]*`, \{([\s\S]*?)\}\);/);
+  assert.ok(patchMatch, 'sbPatch call found in branch');
   const patchBody = patchMatch[1];
   assert.ok(!/\bstatus:/.test(patchBody), 'must not touch sims.status');
   assert.ok(!/\bport_in_pending:/.test(patchBody), 'must not clear/set port_in_pending itself');
