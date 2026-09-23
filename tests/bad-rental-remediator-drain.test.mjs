@@ -16,7 +16,7 @@
 // re-fires), duplicate close, Wing wrong-plan (SMS-disabled) → verify_pending,
 // and skipped_cooldown-only history NOT escalating prematurely.
 
-import { test } from 'node:test';
+import { test, mock, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -27,6 +27,11 @@ import worker from '../src/bad-rental-remediator/index.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const H = 60 * 60 * 1000;
+// Pin the clock to a fixed New York midday. The worker dismisses any report
+// received before today's NY day, so fixtures anchored to the real clock
+// (NOW - 1-2h) turned prior-day and got dismissed between 00:00 and 02:00 NY.
+mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-08-06T16:00:00.000Z') });
+after(() => mock.timers.reset());
 const NOW = Date.now();
 const iso = ms => new Date(ms).toISOString();
 
