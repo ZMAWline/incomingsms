@@ -125,6 +125,7 @@ Notes for Claude Code sessions live in `agent/`:
 - `agent/current-state.md` — what shipped, what is pending, open follow-ups.
 - `agent/project-map.md` — workers, bindings, tables, data flows.
 - `agent/constraints.md` — hard rules that prevent known failures.
+- `agent/secrets-inventory.md` — every secret and var name, where it lives, how to rotate it.
 
 ### Briefs
 
