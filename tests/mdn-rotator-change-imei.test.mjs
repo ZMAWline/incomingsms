@@ -149,44 +149,6 @@ test('change_imei: Teltik-hosted, non-ATOMIC vendor has no carrier-side update w
   assert.match(data.error, /no carrier-side IMEI update wired up/);
 });
 
-test('change_imei: Skyline-hosted SIM still writes IMEI to the Skyline gateway', async () => {
-  const sim = {
-    id: 45, iccid: 'ICC-SKYLINE', msisdn: '3322408357', vendor: 'atomic',
-    gateway_host: 'skyline', gateway_id: 7, port: '1A', status: 'active',
-    imei: '111111111111114', activation_zip: '98104', sim_numbers: [{ e164: '+13322408357' }],
-  };
-  let skylineSetImeiCalled = false;
-  const env = {
-    ...ENV,
-    SKYLINE_GATEWAY: {
-      fetch: async (url, init) => {
-        skylineSetImeiCalled = true;
-        const body = JSON.parse(init.body);
-        assert.equal(body.gateway_id, 7);
-        assert.equal(body.port, '1A');
-        assert.equal(body.imei, '351756051523999');
-        return { ok: true, text: async () => JSON.stringify({ ok: true }) };
-      },
-    },
-  };
-  globalThis.fetch = async (url, init = {}) => {
-    const u = String(url);
-    if (u.includes('/rest/v1/sims') && (!init.method || init.method === 'GET')) return jsonRes([sim]);
-    if (u.includes('/rest/v1/imei_pool') && init.method === 'PATCH') return jsonRes([]);
-    if (u.includes('/rest/v1/imei_pool') && init.method === 'POST') return jsonRes([{ id: 1 }], 201);
-    if (u.includes('/rest/v1/sims') && init.method === 'PATCH') return jsonRes([{ id: 45, imei: '351756051523999' }]);
-    throw new Error('Unexpected fetch: ' + u);
-  };
-
-  const res = await callSimAction({ sim_id: 45, action: 'change_imei', new_imei: '351756051523999' }, env);
-  const data = await res.json();
-
-  assert.equal(res.status, 200);
-  assert.equal(data.ok, true);
-  assert.equal(data.imei, '351756051523999');
-  assert.equal(skylineSetImeiCalled, true, 'Skyline gateway set-imei must still be called for Skyline-hosted SIMs');
-});
-
 test('change_imei: rejects a malformed IMEI (not exactly 15 digits) before touching any host', async () => {
   const sim = {
     id: 46, iccid: 'ICC-BAD-IMEI', msisdn: '3322408358', vendor: 'atomic',

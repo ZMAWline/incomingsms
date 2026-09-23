@@ -38,7 +38,7 @@ test('migration adds port_in_pending and atomic_portin_* columns, idempotently',
 test('mdn-rotator exposes GET /atomic-portin-status, secret-gated, MSISDN-only', () => {
   assert.match(MDN_ROTATOR, /url\.pathname === "\/atomic-portin-status" && request\.method === "GET"/);
   const routeStart = MDN_ROTATOR.indexOf('"/atomic-portin-status"');
-  const routeEnd = MDN_ROTATOR.indexOf('if (url.pathname === "/remediate-stuck-wing"');
+  const routeEnd = MDN_ROTATOR.indexOf('if (url.pathname === "/sim-action"');
   assert.ok(routeStart > 0 && routeEnd > routeStart, 'route markers found');
   const route = MDN_ROTATOR.slice(routeStart, routeEnd);
 
