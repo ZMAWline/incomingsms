@@ -5,8 +5,7 @@ import {
   REPORT_REASON_CODES,
 } from '../shared/report-bad-resolver.js';
 import { buildStatusFilter } from '../shared/rental-report-status.js';
-import { supabaseFetch } from '../shared/fetch-timeout.mjs';
-import { sbHeaders, sbGetAll, sbPost } from '../shared/supabase-rest.mjs';
+import { sbGet, sbGetAll, sbPost, SupabaseError } from '../shared/supabase-rest.mjs';
 
 const COOKIE_NAME = 'rp_session';
 const COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // 30 days
@@ -26,12 +25,11 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'Authorization, Content-Type',
 };
 
-// TODO(shared-supabase): this sbGet returns the raw Response, and about twenty
-// call sites (plus resolveRentalForReport in src/shared/report-bad-resolver.js)
-// branch on resp.ok with their own status mapping. Moving them to the shared
-// throwing sbGet is a per-call-site rewrite left for a follow-up.
-async function sbGet(env, path) {
-  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, { headers: sbHeaders(env) });
+// Reads here use sbGetRaw(env, path, { raw: true }): every call site branches on
+// resp.ok with its own fallback (0, null, an empty list or a 500), and
+// resolveRentalForReport takes a Response-returning reader.
+function sbGetRaw(env, path) {
+  return sbGet(env, path, { raw: true });
 }
 
 // --- Rate limits ---
@@ -50,7 +48,7 @@ async function countActionsSince(env, resellerId, action, sinceIsoSeconds, simId
     '&created_at=gte.' + encodeURIComponent(since);
   if (simId != null) path += '&sim_id=eq.' + encodeURIComponent(simId);
   path += '&limit=1000';
-  const resp = await sbGet(env, path);
+  const resp = await sbGetRaw(env, path);
   if (!resp.ok) return 0;
   const rows = await resp.json();
   return Array.isArray(rows) ? rows.length : 0;
@@ -221,7 +219,7 @@ async function authenticate(request, env) {
 
   // Path 1 — API key (rsk_*)
   if (cred.startsWith('rsk_')) {
-    const resp = await sbGet(env,
+    const resp = await sbGetRaw(env,
       'reseller_api_keys?select=id,reseller_id,enabled,resellers(name)' +
       '&api_key=eq.' + encodeURIComponent(cred) +
       '&limit=1'
@@ -238,7 +236,7 @@ async function authenticate(request, env) {
   if (cred.startsWith('rps_')) {
     const sess = await verifySession(env, cred);
     if (!sess) return null;
-    const resp = await sbGet(env,
+    const resp = await sbGetRaw(env,
       'resellers?select=id,name&id=eq.' + encodeURIComponent(sess.resellerId) + '&limit=1'
     );
     if (!resp.ok) return null;
@@ -285,7 +283,7 @@ async function handleLoginPost(request, env) {
   const password = body && body.password || '';
   if (!username || !password) return badRequest('Username and password required');
 
-  const resp = await sbGet(env,
+  const resp = await sbGetRaw(env,
     'resellers?select=id,name,password_hash&username=eq.' + encodeURIComponent(username) + '&limit=1'
   );
   if (!resp.ok) return jsonResp({ error: 'lookup failed' }, 500);
@@ -323,7 +321,7 @@ async function handleCredentials(auth, env) {
   // Returns the reseller's own API keys in plaintext so they can copy them
   // into their integration. Safe because the request is already authenticated
   // for this reseller.
-  const resp = await sbGet(env,
+  const resp = await sbGetRaw(env,
     'reseller_api_keys?select=id,api_key,enabled,created_at' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&order=enabled.desc,created_at.desc'
@@ -359,7 +357,7 @@ async function handleSims(auth, env, url) {
   // INC-3: pull open bad-rental reports for this reseller in one shot, then map
   // them onto SIM rows. Single query rather than per-row lookups so the SIMs
   // tab doesn't fan out N times when there's nothing to show.
-  const openReports = await sbGet(env,
+  const openReports = await sbGetRaw(env,
     'rental_reports?select=id,sim_id,rental_id,reason_code,status,remediation_action,received_at' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&status=in.(received,in_triage)&limit=1000'
@@ -414,7 +412,7 @@ function midnightNYAfterInterval(lastRotatedAt, intervalHours) {
 }
 
 async function handleInvoices(auth, env) {
-  const resp = await sbGet(env,
+  const resp = await sbGetRaw(env,
     'qbo_invoices?select=id,week_start,week_end,sim_count,total,status,paid_at,created_at,qbo_customer_map!inner(reseller_id)' +
     '&qbo_customer_map.reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&order=week_start.desc'
@@ -435,7 +433,7 @@ async function handleInvoices(auth, env) {
 }
 
 async function handleInvoiceDetail(invoiceId, auth, env) {
-  const resp = await sbGet(env,
+  const resp = await sbGetRaw(env,
     'qbo_invoices?select=id,week_start,week_end,sim_count,total,status,paid_at,created_at,qbo_customer_map!inner(reseller_id)' +
     '&id=eq.' + encodeURIComponent(invoiceId) +
     '&qbo_customer_map.reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
@@ -473,7 +471,7 @@ async function handleInvoiceDetail(invoiceId, auth, env) {
 }
 
 async function handleSimLifetime(simId, auth, env) {
-  const ownResp = await sbGet(env,
+  const ownResp = await sbGetRaw(env,
     'reseller_sims?select=sim_id,active,created_at,sims(iccid,vendor,msisdn,status,activated_at,rotation_interval_hours)' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&sim_id=eq.' + encodeURIComponent(simId) +
@@ -490,7 +488,7 @@ async function handleSimLifetime(simId, auth, env) {
   const vendor = sim.vendor;
   const intervalH = sim.rotation_interval_hours || 48;
 
-  const dailyResp = await sbGet(env,
+  const dailyResp = await sbGetRaw(env,
     'sim_sms_daily?select=est_date,sms_count&sim_id=eq.' + encodeURIComponent(simId) +
     (assignedDate ? '&est_date=gte.' + assignedDate : '') +
     '&order=est_date.asc&limit=10000'
@@ -551,7 +549,7 @@ async function handleSimLifetime(simId, auth, env) {
 
 async function handleResendOnline(simId, auth, env) {
   // 1. Ownership check — reseller must own this SIM and it must currently be active.
-  const ownResp = await sbGet(env,
+  const ownResp = await sbGetRaw(env,
     'reseller_sims?select=sim_id,active' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&sim_id=eq.' + encodeURIComponent(simId) +
@@ -641,7 +639,7 @@ async function handleOnlineHistory(simId, auth, env) {
   // Ownership check (historical: even if the SIM is no longer active, the reseller is allowed
   // to see deliveries that happened while they owned it). We still require an active or past
   // ownership row.
-  const ownResp = await sbGet(env,
+  const ownResp = await sbGetRaw(env,
     'reseller_sims?select=sim_id' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&sim_id=eq.' + encodeURIComponent(simId) +
@@ -655,7 +653,7 @@ async function handleOnlineHistory(simId, auth, env) {
 
   // Filter via the real sim_id column (added in Task 1 migration). Also filter reseller_id as
   // belt-and-suspenders so a backfill that misset sim_id can't leak cross-reseller rows.
-  const resp = await sbGet(env,
+  const resp = await sbGetRaw(env,
     'webhook_deliveries?select=created_at,sim_id,reseller_id,status,response_body,source,payload' +
     '&sim_id=eq.' + encodeURIComponent(simId) +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
@@ -727,7 +725,7 @@ async function insertOrReturnExistingReport(env, resellerId, resolved, body, sou
 
   // Dedup: if an open report exists for this (reseller_id, rental_id), return it.
   if (resolved.rental_id != null) {
-    const existing = await sbGet(env,
+    const existing = await sbGetRaw(env,
       'rental_reports?select=id,status,received_at,e164,sim_id,sim_number_id,rental_id' +
       '&reseller_id=eq.' + encodeURIComponent(resellerId) +
       '&rental_id=eq.' + encodeURIComponent(resolved.rental_id) +
@@ -777,27 +775,15 @@ async function insertOrReturnExistingReport(env, resellerId, resolved, body, sou
     auto_remediation_state: isUnresolved ? 'escalated' : null,
     escalation_reason: isUnresolved ? 'intake_unresolved_current_mdn_no_rental' : null,
   };
-  let insertResp;
+  let r;
   try {
-    insertResp = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rental_reports`, {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=representation',
-      },
-      body: JSON.stringify(row),
-    });
+    const inserted = await sbPost(env, 'rental_reports', row, { prefer: 'return=representation' });
+    r = Array.isArray(inserted) ? inserted[0] : inserted;
   } catch (e) {
-    return jsonResp({ error: 'insert failed: ' + String(e) }, 502);
+    // A non-2xx (SupabaseError) and a timeout both answer 502, as before.
+    const detail = e instanceof SupabaseError ? e.status + ' ' + e.body : String(e);
+    return jsonResp({ error: 'insert failed: ' + detail }, 502);
   }
-  if (!insertResp.ok) {
-    const t = await insertResp.text().catch(() => '');
-    return jsonResp({ error: 'insert failed: ' + insertResp.status + ' ' + t }, 502);
-  }
-  const inserted = await insertResp.json();
-  const r = Array.isArray(inserted) ? inserted[0] : inserted;
 
   // Append-only event row for the intake itself. When the resolver
   // self-healed (backfilled the missing rentals row from a delivered
@@ -858,7 +844,7 @@ async function handleReportBadByRental(auth, env, request) {
     return badRequest('JSON object body required');
   }
 
-  const resolved = await resolveRentalForReport(env, auth.resellerId, body, sbGet);
+  const resolved = await resolveRentalForReport(env, auth.resellerId, body, sbGetRaw);
   if (!resolved.ok) {
     const status = resolved.code === 'not_found' ? 404
                  : resolved.code === 'ambiguous' ? 409
@@ -881,7 +867,7 @@ async function handleReportBadByRental(auth, env, request) {
 // GET /api/sims/:simId/report-status — most recent report for the SIM's
 // current lifetime + last 5 historical (any status).
 async function handleReportStatus(simId, auth, env) {
-  const ownResp = await sbGet(env,
+  const ownResp = await sbGetRaw(env,
     'reseller_sims?select=sim_id' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&sim_id=eq.' + encodeURIComponent(simId) +
@@ -891,7 +877,7 @@ async function handleReportStatus(simId, auth, env) {
   const ownRows = await ownResp.json();
   if (!Array.isArray(ownRows) || ownRows.length === 0) return notFound();
 
-  const resp = await sbGet(env,
+  const resp = await sbGetRaw(env,
     'rental_reports?select=id,rental_id,sim_number_id,e164,reason_code,reason_note,status,remediation_action,received_at,triaged_at,closed_at' +
     '&reseller_id=eq.' + encodeURIComponent(auth.resellerId) +
     '&sim_id=eq.' + encodeURIComponent(simId) +
@@ -925,7 +911,7 @@ async function handleReportsList(auth, env, url) {
   if (norm.filter) path += norm.filter;
   if (since) path += '&received_at=gte.' + encodeURIComponent(since);
   path += '&order=received_at.desc&limit=500';
-  const resp = await sbGet(env, path);
+  const resp = await sbGetRaw(env, path);
   if (!resp.ok) return jsonResp({ error: 'lookup failed' }, 500);
   const rows = await resp.json();
   return jsonResp({ reports: Array.isArray(rows) ? rows : [] });

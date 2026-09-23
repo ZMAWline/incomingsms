@@ -20,6 +20,11 @@
 // opts.prefer sets the Prefer header (for example 'return=representation',
 // 'return=minimal', 'resolution=merge-duplicates,return=minimal').
 // opts.headers adds or overrides request headers.
+// opts.raw: true returns the fetch Response untouched and never throws on a
+//   non-2xx status. For callers that branch on res.ok / res.status themselves.
+// opts.logRows: true logs how many rows a write touched
+//   ("[DB] PATCH result: N rows updated"); implies Prefer: return=representation
+//   unless opts.prefer is set.
 // =========================================================
 
 import { supabaseFetch } from './fetch-timeout.mjs';
@@ -44,24 +49,37 @@ export function sbHeaders(env, extra) {
   };
 }
 
-// One PostgREST request. Returns { data, res }: data is the parsed JSON body,
-// null when the body is empty.
-async function request(env, method, path, body, opts = {}) {
+const ROWS_VERB = { POST: 'inserted', PATCH: 'updated', DELETE: 'deleted' };
+
+// Sends one PostgREST request and returns the fetch Response.
+function send(env, method, path, body, opts = {}) {
   const extra = {};
   if (body !== undefined) extra['Content-Type'] = 'application/json';
-  if (opts.prefer) extra.Prefer = opts.prefer;
+  const prefer = opts.prefer || (opts.logRows ? 'return=representation' : undefined);
+  if (prefer) extra.Prefer = prefer;
   const init = { method, headers: sbHeaders(env, { ...extra, ...(opts.headers || {}) }) };
   if (body !== undefined) init.body = JSON.stringify(body);
+  return supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, init);
+}
 
-  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${path}`, init);
+// One PostgREST request. Returns { data, res }: data is the parsed JSON body,
+// null when the body is empty. With opts.raw, returns the Response instead.
+async function request(env, method, path, body, opts = {}) {
+  const res = await send(env, method, path, body, opts);
+  if (opts.raw) return res;
   const text = await res.text();
   if (!res.ok) throw new SupabaseError(method, res.status, text);
   if (!text.trim()) return { data: null, res };
+  let data;
   try {
-    return { data: JSON.parse(text), res };
+    data = JSON.parse(text);
   } catch (e) {
     throw new Error(`Supabase ${method} JSON parse failed: ${String(e)}. Raw: ${text.slice(0, 300)}`);
   }
+  if (opts.logRows && Array.isArray(data)) {
+    console.log(`[DB] ${method} result: ${data.length} rows ${ROWS_VERB[method] || 'returned'}`);
+  }
+  return { data, res };
 }
 
 // Total row count from a `Content-Range: 0-9/123` header, null when absent.
@@ -72,6 +90,7 @@ function parseCount(res) {
 
 export async function sbGet(env, path, opts = {}) {
   const prefer = opts.count ? `count=${opts.count}` : opts.prefer;
+  if (opts.raw) return request(env, 'GET', path, undefined, { ...opts, prefer });
   const { data, res } = await request(env, 'GET', path, undefined, { ...opts, prefer });
   const rows = Array.isArray(data) ? data : data == null ? [] : data;
   if (opts.count) return { rows, count: parseCount(res) };
@@ -93,18 +112,24 @@ export async function sbGetAll(env, path, opts = {}) {
   }
 }
 
+// The write helpers return the parsed body (null when empty), or the Response
+// itself with opts.raw.
+function bodyOf(out, opts) {
+  return opts?.raw ? out : out.data;
+}
+
 export async function sbPost(env, path, body, opts) {
-  return (await request(env, 'POST', path, body, opts)).data;
+  return bodyOf(await request(env, 'POST', path, body, opts), opts);
 }
 
 export async function sbPatch(env, path, body, opts) {
-  return (await request(env, 'PATCH', path, body, opts)).data;
+  return bodyOf(await request(env, 'PATCH', path, body, opts), opts);
 }
 
 export async function sbDelete(env, path, opts) {
-  return (await request(env, 'DELETE', path, undefined, opts)).data;
+  return bodyOf(await request(env, 'DELETE', path, undefined, opts), opts);
 }
 
 export async function sbRpc(env, fn, args, opts) {
-  return (await request(env, 'POST', `rpc/${fn}`, args || {}, opts)).data;
+  return bodyOf(await request(env, 'POST', `rpc/${fn}`, args || {}, opts), opts);
 }

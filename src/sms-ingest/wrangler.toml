@@ -11,7 +11,7 @@ invocation_logs = true
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "sms-ingest-test"
-main = "index.ts"
+main = "index.js"
 
 [env.test.observability.logs]
 enabled = true

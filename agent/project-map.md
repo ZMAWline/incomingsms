@@ -156,10 +156,6 @@ Dashboard or CSV → POST to bulk-activator or sim-activation-queue
 
 | File | Exports |
 |------|---------|
-| `helix.ts` | `getCachedToken`, `hxMdnChange`, `hxSubscriberDetails`, `hxOtaRefresh`, `hxChangeSubscriberStatus`, `logHelixApiCall` |
 | `subscriber-sync.js` | `syncSimFromHelixDetails(env, simRow, detailsResponse, {isFinalization})` |
-| `supabase.ts` | `supabaseGet`, `supabaseSelect`, `supabaseInsert`, `supabasePatch` |
-| `utils.ts` | `sleep`, `normalizeToE164`, `generateMessageIdAsync`, `retryWithBackoff` |
-| `types.ts` | `Env` interface (all secrets + bindings) |
-| `supabase-rest.mjs` | `sbHeaders`, `sbGet`, `sbGetAll`, `sbPost`, `sbPatch`, `sbDelete`, `sbRpc`, `SupabaseError`, `PAGE_SIZE`. PostgREST calls with the service-role key through `supabaseFetch`; a non-2xx throws `SupabaseError`. Used by most workers since #120 (see TODO(shared-supabase) for the ones not moved yet). |
+| `supabase-rest.mjs` | `sbHeaders`, `sbGet`, `sbGetAll`, `sbPost`, `sbPatch`, `sbDelete`, `sbRpc`, `SupabaseError`, `PAGE_SIZE`. PostgREST calls with the service-role key through `supabaseFetch`; a non-2xx throws `SupabaseError`. `{ raw: true }` returns the fetch Response instead (no throw) for call sites that branch on `res.ok`; `{ logRows: true }` logs how many rows a write touched. No worker outside the dashboard keeps its own copy; `tests/shared-supabase-rest.test.mjs` fails if one comes back. The old TypeScript shared modules (`supabase.ts`, `helix.ts`, `atomic.ts`, `wing-iot.ts`, `utils.ts`, `types.ts`) were deleted with the stale TEST `index.ts` entrypoints. |
 | `fetch-timeout.mjs` | `supabaseFetch`, `carrierFetch`, `webhookFetch`, `fetchWithTimeout`, `timeoutFor`, `CARRIER_TIMEOUT_MS` (45 s), `SUPABASE_TIMEOUT_MS` (15 s), `WEBHOOK_TIMEOUT_MS` (10 s). Every carrier, database and webhook call outside the dashboard goes through one of these (#117); override per worker with `FETCH_TIMEOUT_*_MS`. |
