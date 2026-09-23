@@ -1845,8 +1845,8 @@ async function handleResellers(env, corsHeaders) {
 }
 
 async function handleKasaProxy(request, env, url, corsHeaders) {
-  if (!env.KASA_CONTROL) {
-    return new Response(JSON.stringify({error: 'KASA_CONTROL not configured'}), {
+  if (!env.KASA_CONTROL || !env.KASA_ADMIN_RUN_SECRET) {
+    return new Response(JSON.stringify({error: 'KASA_CONTROL or KASA_ADMIN_RUN_SECRET not configured'}), {
       status: 503,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -1854,7 +1854,7 @@ async function handleKasaProxy(request, env, url, corsHeaders) {
   const kasaPath = url.pathname.replace('/api/kasa', '');
   const kasaReq = new Request('https://kasa-control.workers.dev' + kasaPath, {
     method: request.method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + env.KASA_ADMIN_RUN_SECRET },
     body: (request.method !== 'GET' && request.method !== 'HEAD') ? request.body : undefined,
   });
   try {
