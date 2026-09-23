@@ -92,3 +92,69 @@ export async function recordPortinStatusOutcome({ patch, iccid, statusCode, desc
     return null;
   }
 }
+
+// ── atomic_portin_outcomes history rows ─────────────────────────────────────
+// One row per final port-in result (completed / failed / abandoned), so the
+// reason a port failed is still visible after the sims columns move on.
+
+const SECRET_KEY = /(pin|password|account_?number)$/i;
+const RAW_MAX_CHARS = 4000;
+
+// Deep copy with every key named like pin / password / accountNumber removed
+// (portPin, oldPassword, account_number, ...). Carrier responses can echo the
+// request back; the PIN and account number must never reach this table.
+export function scrubPortinResponse(value) {
+  if (Array.isArray(value)) return value.map(scrubPortinResponse);
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  for (const [key, v] of Object.entries(value)) {
+    if (SECRET_KEY.test(key)) continue;
+    out[key] = scrubPortinResponse(v);
+  }
+  return out;
+}
+
+function rawSnippet(raw) {
+  if (raw == null) return null;
+  const scrubbed = scrubPortinResponse(raw);
+  const text = JSON.stringify(scrubbed);
+  return text.length <= RAW_MAX_CHARS ? scrubbed : { truncated: text.slice(0, RAW_MAX_CHARS) };
+}
+
+// The human reason inside an ATOMIC description. A 951 buries it as
+// "... ~ statusReasonDescription - T-Mobile Number Transfer PIN is required
+// or incorrect"; others read "Error!!Port Request Does Not Exist".
+export function portinHumanReason(description) {
+  const text = String(description ?? '').trim();
+  if (!text) return null;
+  const m = text.match(/statusReasonDescription\s*-\s*([^~]+)/i);
+  const reason = (m ? m[1] : text.replace(/^Error!!/i, '')).trim();
+  return reason || null;
+}
+
+export function buildPortinOutcomeRow({ simId = null, iccid, msisdn = null, outcome, source, carrierCode = null, reasonCode = null, description = null, reason, raw = null, now = new Date().toISOString() }) {
+  return {
+    sim_id: simId ?? null,
+    iccid: String(iccid),
+    msisdn: msisdn ? String(msisdn) : null,
+    outcome,
+    source,
+    carrier_code: carrierCode == null ? null : String(carrierCode),
+    carrier_reason_code: reasonCode == null || reasonCode === '' ? null : String(reasonCode),
+    carrier_description: reason !== undefined ? reason : portinHumanReason(description),
+    raw_response: rawSnippet(raw),
+    recorded_at: now,
+  };
+}
+
+// Inserts one outcomes row. Never throws: the history row is for operators,
+// and a failed write must not undo or block the finalization it describes.
+export async function recordPortinOutcomeRow({ insert, row }) {
+  try {
+    await insert('atomic_portin_outcomes', [row]);
+    return true;
+  } catch (e) {
+    console.error(`[AtomicPortinOutcome] SIM ${row && row.iccid}: outcomes row write failed: ${e}`);
+    return false;
+  }
+}

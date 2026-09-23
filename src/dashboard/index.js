@@ -15,6 +15,7 @@ import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from './api-ke
 import { withAuditLog, handleAuditLogQuery } from './audit-log.mjs';
 import { handleSavedFilterRoutes } from './saved-filters.mjs';
 import { splitSearchTerms } from '../shared/search-terms.mjs';
+import { handlePortinOutcomes, loadLatestPortinOutcomes } from './portin-outcomes.mjs';
 import { parseSimsPageRequest, filterParam, orderParam, parseContentRangeTotal, matchesDerivedFilter, sortByDerived } from './sims-query.mjs';
 
 function normalizeImeiPoolPort(port) {
@@ -174,6 +175,11 @@ async function handleDashboardRequest(request, env, ctx, audit) {
 
     if (url.pathname === '/api/sims') {
       return handleSims(env, corsHeaders, url);
+    }
+
+    const portinOutcomesMatch = url.pathname.match(/^\/api\/sims\/(\d+)\/portin-outcomes$/);
+    if (portinOutcomesMatch && request.method === 'GET') {
+      return handlePortinOutcomes(env, corsHeaders, portinOutcomesMatch[1]);
     }
 
     if (url.pathname === '/api/sims/facets') {
@@ -1191,6 +1197,7 @@ async function handleSims(env, corsHeaders, url) {
     }
 
     if (!stats) stats = await loadSimStats(env, filteredSims);
+    const portinOutcomes = await loadLatestPortinOutcomes(env, filteredSims.filter(s => s.vendor === 'atomic').map(s => s.id));
 
     const formatted = filteredSims.map(sim => {
       return {
@@ -1221,6 +1228,7 @@ async function handleSims(env, corsHeaders, url) {
         atomic_portin_status_code: sim.atomic_portin_status_code || null,
         atomic_portin_description: sim.atomic_portin_description || null,
         atomic_portin_checked_at: sim.atomic_portin_checked_at || null,
+        portin_outcome: portinOutcomes.get(sim.id) || null,
         rotation_interval_hours: sim.rotation_interval_hours || 24,
         rotation_eligible: sim.rotation_eligible !== false,
         rotation_pause_reason: sim.rotation_pause_reason || null,

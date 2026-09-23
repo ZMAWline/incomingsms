@@ -7604,8 +7604,14 @@ function renderSims() {
                 // A failed port-in leaves the SIM at status=provisioning with no
                 // error field set, so without this badge it is indistinguishable
                 // from a SIM that is healthily mid-provisioning.
-                const portInBadge = simPortInFailed(sim)
-                    ? `<span class="ml-1 px-2 py-1 text-xs font-medium rounded-full bg-red-500/20 text-red-400 cursor-help whitespace-nowrap" title="Port-in failed (${escapeHtml(sim.atomic_portin_status_code)}) — ${escapeHtml(sim.atomic_portin_description || 'no detail recorded')}${sim.atomic_portin_checked_at ? ' (checked ' + escapeHtml(new Date(sim.atomic_portin_checked_at).toLocaleString()) + ')' : ''}">${escapeHtml(portInFailureLabel(sim))}</span>`
+                // The hover text prefers the latest atomic_portin_outcomes row
+                // (the carrier's human reason); the sims columns are the fallback.
+                const portOutcome = sim.portin_outcome && sim.portin_outcome.outcome !== 'completed' ? sim.portin_outcome : null;
+                const portInTitle = portOutcome
+                    ? `Port-in ${portOutcome.outcome === 'abandoned' ? 'gave up' : 'failed'}${portOutcome.carrier_code ? ' (' + portOutcome.carrier_code + ')' : ''} — ${portOutcome.carrier_description || 'no reason recorded'} (${new Date(portOutcome.recorded_at).toLocaleString()})`
+                    : `Port-in failed (${sim.atomic_portin_status_code}) — ${sim.atomic_portin_description || 'no detail recorded'}${sim.atomic_portin_checked_at ? ' (checked ' + new Date(sim.atomic_portin_checked_at).toLocaleString() + ')' : ''}`;
+                const portInBadge = (simPortInFailed(sim) || portOutcome)
+                    ? `<span class="ml-1 px-2 py-1 text-xs font-medium rounded-full bg-red-500/20 text-red-400 cursor-help whitespace-nowrap" title="${escapeHtml(portInTitle)}">${escapeHtml(portOutcome && !simPortInFailed(sim) ? (portOutcome.outcome === 'abandoned' ? 'Port-in Gave Up' : 'Port-in Failed') : portInFailureLabel(sim))}</span>`
                     : '';
                 const vendorBadge = { teltik: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-300">Teltik</span>', atomic: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-blue-500/20 text-blue-300">ATOMIC</span>', wing_iot: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-green-500/20 text-green-300">Wing IoT</span>', helix: '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">Helix</span>' }[sim.vendor] || '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-400">-</span>';
                 return `
@@ -14193,6 +14199,16 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
+        // QuickBooks import wants invoice CSV names with no underscores or
+        // dashes. The Worker already sends that name in Content-Disposition;
+        // a.download would override it, so use the server's name and only
+        // fall back to a separator-free name built the same way.
+        function invoiceDownloadName(resp, fallback) {
+            const cd = resp.headers.get("Content-Disposition") || "";
+            const m = cd.match(/filename="?([^";]+)"?/i);
+            return m ? m[1] : fallback;
+        }
+
         async function downloadInvoiceIIF() {
             if (!invoicePreviewData || !invoicePreviewData.days || invoicePreviewData.days.length === 0) return;
             const resellerId = document.getElementById("invoice-reseller").value;
@@ -14210,8 +14226,8 @@ async function sendSimOnline(simId, phoneNumber) {
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");
-                const filename = `invoice_${invoicePreviewData.mapping?.qbo_display_name?.replace(/[^a-z0-9]/gi, "_") || resellerId}_${start}_${end}.csv`;
-                a.href = url; a.download = filename; a.click();
+                const fallback = "invoice" + String(invoicePreviewData.mapping?.qbo_display_name || resellerId).replace(/[^a-z0-9]/gi, "") + start.replace(/[^0-9]/g, "") + end.replace(/[^0-9]/g, "") + ".csv";
+                a.href = url; a.download = invoiceDownloadName(resp, fallback); a.click();
                 URL.revokeObjectURL(url);
                 showToast("Downloaded CSV — import via QuickBooks > Invoices > Import", "success");
                 loadInvoiceHistory();
@@ -14231,7 +14247,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");
-                a.href = url; a.download = `invoice_${invoiceId}.csv`; a.click();
+                a.href = url; a.download = invoiceDownloadName(resp, "invoice" + String(invoiceId).replace(/[^a-z0-9]/gi, "") + ".csv"); a.click();
                 URL.revokeObjectURL(url);
             } catch (error) {
                 showToast("Error: " + error, "error");
@@ -14900,6 +14916,7 @@ async function sendSimOnline(simId, phoneNumber) {
             document.getElementById('sd-title').textContent = 'SIM #' + sim.id;
             document.getElementById('sd-subtitle').textContent = sim.iccid || '';
             renderSimDetailDetails(sim);
+            if (sim.vendor === 'atomic') loadSimDetailPortinResult(sim.id);
             renderSimDetailStatus(sim);
             renderSimDetailImei(sim);
             document.getElementById('sd-logs-container').innerHTML = '';
@@ -14961,6 +14978,30 @@ async function sendSimOnline(simId, phoneNumber) {
         function _sdRetry() { if (_sdCurrentSim) simAction(_sdCurrentSim.id, 'retry_activation'); }
         function _sdViewLogs() { switchSimDetailTab('logs'); }
 
+        // "Port-in result" line: the latest atomic_portin_outcomes row, in the
+        // carrier's own words, with the time it was recorded.
+        function portInResultHtml(o) {
+            if (!o) return '';
+            const label = { completed: 'Completed', failed: 'Failed', abandoned: 'Gave up' }[o.outcome] || o.outcome;
+            const color = o.outcome === 'completed' ? 'text-green-400' : 'text-red-400';
+            return '<span class="' + color + '">' + escapeHtml(label) + '</span>' +
+                (o.carrier_description ? ' — ' + escapeHtml(o.carrier_description) : '') +
+                (o.carrier_code ? ' <span class="text-gray-500">(' + escapeHtml(o.carrier_code) + ')</span>' : '') +
+                (o.recorded_at ? ' <span class="text-gray-500">' + escapeHtml(new Date(o.recorded_at).toLocaleString()) + '</span>' : '');
+        }
+        async function loadSimDetailPortinResult(simId) {
+            try {
+                const resp = await fetch(API_BASE + '/sims/' + encodeURIComponent(simId) + '/portin-outcomes');
+                if (!resp.ok) return;
+                const body = await resp.json();
+                const latest = body && Array.isArray(body.outcomes) ? body.outcomes[0] : null;
+                const el = document.getElementById('sd-portin-result');
+                if (!el || !_sdCurrentSim || String(_sdCurrentSim.id) !== String(simId)) return;
+                _sdCurrentSim.portin_outcome = latest || null;
+                el.innerHTML = _sdField('Port-in result', portInResultHtml(latest));
+            } catch (e) { console.error('port-in outcomes fetch failed', e); }
+        }
+
         function _sdField(label, value) {
             return '<div><p class="text-xs text-gray-500 mb-0.5">' + label + '</p><p class="text-sm text-gray-200">' + (value || '<span class="text-gray-600">-</span>') + '</p></div>';
         }
@@ -15013,6 +15054,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 _sdField('Last SMS', sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '') +
                 ((sim.port_in_pending || sim.atomic_portin_checked_at) ? _sdField('Port-In Status', (sim.atomic_portin_description || sim.atomic_portin_status_code || 'Not yet checked') +
                     (sim.atomic_portin_checked_at ? ' <span class="text-gray-500">(checked ' + new Date(sim.atomic_portin_checked_at).toLocaleString() + ')</span>' : '')) : '') +
+                (sim.vendor === 'atomic' ? '<div id="sd-portin-result">' + _sdField('Port-in result', portInResultHtml(sim.portin_outcome)) + '</div>' : '') +
                 '</div>' +
                 errHtml + actions;
         }

@@ -36,7 +36,7 @@
 
 import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
-import { recordPortinStatusOutcome } from '../shared/atomic-portin-outcomes.mjs';
+import { recordPortinStatusOutcome, recordPortinOutcomeRow, buildPortinOutcomeRow } from '../shared/atomic-portin-outcomes.mjs';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -220,6 +220,14 @@ export function createAtomicPortinPoller(deps) {
     }
   }
 
+  // One atomic_portin_outcomes history row. Never throws.
+  function recordOutcome(env, sim, fields) {
+    return recordPortinOutcomeRow({
+      insert: (table, rows) => supabaseInsert(env, table, rows),
+      row: buildPortinOutcomeRow({ simId: sim.id, iccid: sim.iccid, msisdn: sim.msisdn || null, ...fields }),
+    });
+  }
+
   // Past the max age with no terminal carrier status: stop polling and tell an
   // operator. The system_errors row is written first so a failed insert leaves
   // port_in_pending=true and the next tick retries the escalation.
@@ -252,6 +260,13 @@ export function createAtomicPortinPoller(deps) {
       port_in_pending: false,
       status_reason: 'atomic_portin_max_age',
       last_activation_error: message,
+    });
+    await recordOutcome(env, sim, {
+      outcome: 'abandoned',
+      source: 'max_age',
+      carrierCode: sim.atomic_portin_status_code || null,
+      reason: `No final carrier status after ${maxAgeDays} days; polling stopped`,
+      raw: { statusCode: sim.atomic_portin_status_code || null, description: sim.atomic_portin_description || null },
     });
     console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: MAX AGE - ${message}`);
     return message;
@@ -358,12 +373,20 @@ export function createAtomicPortinPoller(deps) {
           await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
             port_in_pending: false,
           });
+          await recordOutcome(env, sim, {
+            outcome: 'failed', source: 'portin_status',
+            carrierCode: statusCode, reasonCode, description, raw: data,
+          });
           terminal++;
           const reason = `Atomic portinStatus returned ${statusCode} — ${TERMINAL_REASONS[String(statusCode)]}`;
           results.push({ iccid: sim.iccid, ok: true, statusCode, description, reasonCode, terminal: true, reason });
           console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: TERMINAL - ${reason} (carrier said: ${description})`);
         } else if (isCompleted) {
           const finalized = await finalizeCompletedAtomicPortin(env, sim);
+          await recordOutcome(env, { ...sim, msisdn: finalized.msisdn || sim.msisdn }, {
+            outcome: 'completed', source: 'portin_status',
+            carrierCode: statusCode, reasonCode, description, raw: data,
+          });
           terminal++;
           results.push({
             iccid: sim.iccid,

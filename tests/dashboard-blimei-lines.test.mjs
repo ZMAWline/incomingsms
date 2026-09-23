@@ -51,6 +51,7 @@ test('/api/sims reads sims.imei and returns it as blimei', async () => {
   };
   vm.createContext(sandbox);
   Object.assign(sandbox, simsQuery);
+  sandbox.loadLatestPortinOutcomes = async () => new Map(); // imported from portin-outcomes.mjs
   vm.runInContext([
     'async function handleSims(env, corsHeaders, url) {',
     'async function loadSimStats(env, sims) {',

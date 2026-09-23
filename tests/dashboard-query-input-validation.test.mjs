@@ -71,6 +71,7 @@ function makeSandbox(respond = () => null) {
     URL,
     logSystemError: async () => {}, // handleSimAction logs failures; not under test
     ...simsQuery, // handleSims imports its query builder from sims-query.mjs
+    loadLatestPortinOutcomes: async () => new Map(), // imported from portin-outcomes.mjs
     async fetch(url) {
       const u = String(url);
       calls.push(u);

@@ -58,6 +58,7 @@ function makeSandbox(respond = () => null) {
     Response,
     URL,
     ...simsQuery,
+    loadLatestPortinOutcomes: async () => new Map(), // imported from portin-outcomes.mjs
     async fetch(u, init) {
       const s = String(u);
       calls.push({ url: s, init });
