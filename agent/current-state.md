@@ -8,7 +8,8 @@
 > 2026-09-22: PR #113 + #115 merged and DEPLOYED to PROD with #114 — dashboard `5d424a79`, details-finalizer `49029305`, bad-rental-remediator `ecb01e83`. `deployed/prod` moved 7b18ed4 → 320bd40. See "Deployed 2026-09-22 (ship 3)".
 > 2026-09-22 (latest): PR #119, #120, #121 and #122 merged and DEPLOYED to PROD — 18 workers (shared supabase-rest helper). Migration `sims_paging_indexes` applied TEST + PROD. `deployed/prod` moved d2af4a3 → ee9ae2b. Check mdn-rotator's first tick after 04:00 UTC for `timeout after` errors. See "Deployed 2026-09-22 (ship 5)".
 > 2026-09-22: PR #116, #117 and #118 merged and DEPLOYED to PROD — all 19 workers (shared fetch-timeout helper touched every worker). `deployed/prod` moved 320bd40 → d2af4a3. Open owner decision: reseller webhooks from sim-canceller / sim-status-changer. See "Deployed 2026-09-22 (ship 4)".
-> 2026-09-22 (latest): Offline-lifecycle dry-run flags were silently DROPPED by ships 3/4/5 (set with `--var`); now in `wrangler.toml` [vars] (PR #123) and redeployed as `505b4387` at 22:06 UTC — the 5h dry-run clock restarted then. `scripts/deploy.sh` now refuses to delete live vars. PR #124: sim-canceller/sim-status-changer reseller webhooks now actually send (`number.offline` on cancel/suspend, `number.online` on restore). `deployed/prod` ee9ae2b → 11899f6. See "Deployed 2026-09-22 (ship 6)".
+> 2026-09-23 (latest): Offline SIM lifecycle ENABLED for real in PROD — `bad-rental-remediator` `572f4242` at 03:07:33 UTC (PR #125). To pause: set `OFFLINE_LIFECYCLE_ENABLED = "false"` in its wrangler.toml, merge, `scripts/deploy.sh bad-rental-remediator`. `deployed/prod` 11899f6 → abefc87. See "Deployed 2026-09-23 (ship 7)".
+> 2026-09-22: Offline-lifecycle dry-run flags were silently DROPPED by ships 3/4/5 (set with `--var`); now in `wrangler.toml` [vars] (PR #123) and redeployed as `505b4387` at 22:06 UTC — the 5h dry-run clock restarted then. `scripts/deploy.sh` now refuses to delete live vars. PR #124: sim-canceller/sim-status-changer reseller webhooks now actually send (`number.offline` on cancel/suspend, `number.online` on restore). `deployed/prod` ee9ae2b → 11899f6. See "Deployed 2026-09-22 (ship 6)".
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
@@ -19,6 +20,17 @@
 > Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
 
 ---
+
+## Deployed 2026-09-23 (ship 7) — Offline SIM lifecycle enabled in PROD (#125)
+
+- **Brief B step 5 done.** PR #125 (`abefc87`) removed `OFFLINE_LIFECYCLE_DRY_RUN` from the PROD `[vars]` in `src/bad-rental-remediator/wrangler.toml`. `OFFLINE_LIFECYCLE_ENABLED = "true"` stays. `[env.test.vars]` is unchanged (still dry run; TEST has no crons).
+- **Why writes are now on:** `offlineLifecycleDryRun()` is true only for the exact string `"true"`, so a missing var means the tick writes. `OFFLINE_LIFECYCLE_MAX_ACTIONS` is not set, so the default of 25 transitions per hourly tick still applies.
+- **Dry-run sign-off:** the owner reviewed a dry run in another session and signed off on 2026-09-22. A Slack search found no digest, so the only record of the sign-off is the owner's word.
+- **Deploy:** `scripts/deploy.sh bad-rental-remediator` refused first, because the live-var guard saw `OFFLINE_LIFECYCLE_DRY_RUN` about to be deleted. That deletion was the point, so the deploy was re-run with `--allow-var-drop`, not `ALLOW_UNSAFE_DEPLOY`. 1156/1156 tests passed and the DB constraint check passed. Version `572f4242-94e4-4db3-832a-67c6d8dec6da`, live 2026-09-23 03:07:33 UTC. Root 404 → 404.
+- **Settings API after:** `OFFLINE_LIFECYCLE_ENABLED="true"`, `OFFLINE_LIFECYCLE_DRY_RUN` absent, `FINALIZER_RUN_SECRET` present (21 secrets, same as before). The first read returned the old version for a few seconds; a re-read 10 s later showed the new one.
+- **Tail** (03:08:23–03:15:03 UTC): 10 invocations, all ok, no exceptions. There were 3 probe runs, each `{"candidates":4285,"probe_limit":43,"probed":43,"coverage_short":false}`. The hourly decision tick did not fall inside the window. The first real tick is 04:00 UTC 2026-09-23. Check for the `[OfflineLifecycle] tick` line with `"dry_run":false`.
+- **To pause:** set `OFFLINE_LIFECYCLE_ENABLED = "false"` in `src/bad-rental-remediator/wrangler.toml`, merge to main, `scripts/deploy.sh bad-rental-remediator`. To dry-run again, add `OFFLINE_LIFECYCLE_DRY_RUN = "true"` back instead.
+- **Marker:** `deployed/prod` `11899f660b4b480df36f1c189c94c1ba93b12ba4` → `abefc87313c808c42cc86bb58ac750d87b1cbc8a`.
 
 ## Deployed 2026-09-22 (ship 6) — dry-run flags in toml (#123), reseller webhooks fixed (#124)
 

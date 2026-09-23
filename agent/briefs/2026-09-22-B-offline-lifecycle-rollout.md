@@ -1,6 +1,6 @@
 # Brief B — turn on the Offline SIM lifecycle (PR #109)
 
-Status: IN PROGRESS — dry-run restarted at 2026-09-22 22:06 UTC (version `505b4387`; the 19:24 `--var` flags were dropped by later deploys and now live in wrangler.toml). Step 3: earliest digest read 2026-09-23 03:06 UTC (+5h; first hourly tick after that is 04:00 UTC). Step 5 = remove the `OFFLINE_LIFECYCLE_DRY_RUN` line from `src/bad-rental-remediator/wrangler.toml` and deploy with `scripts/deploy.sh bad-rental-remediator`. Owner: Zalmen. Created 2026-09-22 after the main-deploy run.
+Status: DONE — enabled for real in PROD 2026-09-23 03:07:33 UTC, `bad-rental-remediator` version `572f4242-94e4-4db3-832a-67c6d8dec6da` (PR #125, `abefc87`). `OFFLINE_LIFECYCLE_DRY_RUN` removed from PROD `[vars]`; `OFFLINE_LIFECYCLE_ENABLED="true"`. To pause: set `OFFLINE_LIFECYCLE_ENABLED = "false"` in `src/bad-rental-remediator/wrangler.toml`, merge, and run `scripts/deploy.sh bad-rental-remediator`. The owner signed off the dry run on 2026-09-22 in another session; no Slack digest was found, so the sign-off is the owner's word.
 
 The code is live in PROD on `bad-rental-remediator` (version 89f93b91) and `dashboard` (77c607df). The PROD migration is applied. The feature is switched OFF.
 
