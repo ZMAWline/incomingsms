@@ -4,6 +4,34 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-09-23 — Every table the code touches has a CREATE TABLE in the repo; rotation_freshness reads the reply as JSON
+
+**Decision:** Thirteen tables that existed only in PROD are now captured as `CREATE TABLE IF NOT EXISTS` migrations (`supabase/migrations/20260923_*.sql`), along with the shared `touch_updated_at()` trigger function. `tests/tables-have-migrations.test.mjs` fails if `src/` references a table or view that no migration creates. `teltik_hold_morning_batch` now pins `search_path = public, pg_temp`. `rotation_freshness` now uses each SIM's `rotation_interval_hours` (old 48h/24h as the fallback) and, when the partner reply is a JSON object, requires a non-null top-level `rentalId` instead of a text match. A non-JSON reply still uses the old text match.
+
+**Why:** The 2026-09-18 review asked for three tables. Scanning every table reference in `src/` found thirteen: `bill_audit_lines`, `bill_audit_uploads`, `billing_ledger`, `cron_runs`, `gateway_defective_slots`, `imei_pool`, `pending_review_items`, `plan_rates`, `remediation_attempts`, `reseller_actions_log`, `rotation_audit`, `sim_sms_daily` and `teltik_lifecycle_events`. TEST had only one of them, so five RPCs could not be created there. The RPC test also missed the `sbRpc(...)` call shape, which hid six call sites; that is fixed too.
+
+**Verification:** A PROD schema fingerprint (columns, defaults, constraints, indexes, RLS, grants, trigger, function) was `a92a5fc4…` (417 items) before and after the capture files ran on PROD, so they are no-ops there. On TEST, 12 of the 13 tables match PROD exactly. `rotation_freshness` old vs new on PROD, side by side: atomic 305 total / 268 fresh / 37 stale on both; teltik 4000 / 3813 / 187 on both. That is a 0% difference, so the new version was applied. `teltik_hold_morning_batch` has the same `pg_get_functiondef` hash on TEST and PROD.
+
+**Consequence:** Capture files state PROD as-is, including two points that disagree with the docs. First, `imei_pool_status_check` allows only `available`, `in_use` and `retired`, although `agent/constraints.md` section 7 also lists `blocked`. Second, the `bill_audit_*` constraints still carry their old `wing_bill_*` names. On TEST, `rotation_audit` pre-dated the capture: its `id` has no default and it lacks `rotation_audit_trigger_check`, and `IF NOT EXISTS` does not repair that. TEST still lacks `otp_portal_claim`, `shop_claim_rental` and `shop_confirm_deposit`, whose storefront and OTP tables are not on TEST. The 2026-09-18 function files still carry PROD-era `GRANT ... TO anon`. On TEST they were applied with the 2026-09-22 lockdown grants (`service_role` only) instead.
+
+## 2026-09-22 — Break-glass is off unless explicitly turned on
+
+**Decision:** `breakGlassUser` now accepts the shared `DASHBOARD_AUTH` password only while `DASHBOARD_BREAK_GLASS` is exactly `on` (any case). Unset, empty, `off`, or any other value means off. The password compare uses `constantTimeEqual`, and each break-glass login logs one `[Auth] break-glass login used` line.
+
+**Why:** The old rule was "on unless the flag says `off`", so a missing or mistyped secret silently re-opened an admin login guarded by one shared password. Fail-closed is the safer default now that PROD has a real admin account.
+
+**Consequence:** Deleting the secret no longer re-enables break-glass; setting it to `on` does. PROD had the secret set (break-glass already off), so nothing changes there. `dashboard-test` had no secret, so break-glass stops working on TEST after this deploys unless the secret is set to `on` there.
+
+## 2026-09-22 — The anon and authenticated roles get nothing; RLS on everywhere with no policies
+
+**Decision:** `supabase/migrations/20260922_lock_down_anon.sql` drops every anon/authenticated/PUBLIC policy in `public`, revokes all their table, sequence and function grants plus the future-object defaults, and enables RLS on every table. Nothing is granted back. Applied to TEST 2026-09-22; PROD waits for owner approval.
+
+**Why:** The anon key is public by design, and no code in the repo uses it. On PROD, the 2026-09-08 migration `anon_readonly_all_except_credential_tables` (applied for a "Grok bot", also reachable through the `dan_bot` publishable key) let that key read 60+ tables. Those tables included `inbound_sms` bodies (customers' OTP codes), `carrier_api_logs` request headers and bodies, and `dashboard_sessions`. Its exclusion list missed `dashboard_sessions`. PROD API logs showed no anon traffic on 2026-09-09 or 2026-09-22. On TEST, anon had read-write policies on `sims`, `gateways`, `resellers` and 9 more tables. This restores the 2026-06-16 decision below.
+
+**Consequence:** Applying to PROD ends the Grok bot's read access. If a bot needs data again, give it a narrow, named path: a dedicated Postgres role with SELECT on specific tables/columns, or a Worker endpoint behind its own key. Do not reopen the anon role. `tests/migrations-no-anon-grants.test.mjs` fails any new migration that grants to anon/authenticated without an `-- anon-grant-approved: <reason>` comment. Rollback: `supabase/migrations/20260922_lock_down_anon_ROLLBACK.sql.txt`.
+
+---
+
 ## 2026-09-08 — ATOMIC portinStatus enum is now confirmed; the finalizer may interpret it. Workers Builds does not deploy on merge.
 
 **Decision:** (1) `runAtomicPortinStatusFinalizer` now interprets the carrier's `portinStatus` response instead of only recording it — `948`/`910` end the poll, `statusCode="00"` + `Result.reasonCode="CO"` auto-finalizes the SIM to `active` from a `subsriberInquiry`. This reverses the deliberate 2026-08 choice to stay read-only. (2) `port_in_pending` is cleared **only after** finalization succeeds, never alongside the status write. (3) Deploys of these two workers are manual `wrangler deploy`, `mdn-rotator` first.
@@ -244,7 +272,7 @@ The single-table approach is async by nature (operator's reply gets picked up on
 - **Node scripts (verifier, tests, seeder):** these run under raw Node, which respects `package.json` `"type"` and requires `.mjs` for ESM under a CommonJS package.
 
 Two alternatives were considered and rejected:
-1. **Flip `package.json` to `"type": "module"`** — would have let `.js` stay `.js` cleanly. Rejected because the project has one CommonJS file (`src/mdn-rotator/_patch_queue_token.js`, a dev helper) that would have needed renaming to `.cjs`, and the change affects how Node interprets *every* `.js` file in the repo — potential subtle effects on root-level dev scripts (`_check_frontend_js.js`, `_check_relay.js`, `fix_both.js`) that weren't going to be verified exhaustively in-session. The blast radius was too wide for what's effectively a one-file problem.
+1. **Flip `package.json` to `"type": "module"`** — would have let `.js` stay `.js` cleanly. Rejected because the project has one CommonJS file (`src/mdn-rotator/_patch_queue_token.js`, a dev helper) that would have needed renaming to `.cjs`, and the change affects how Node interprets *every* `.js` file in the repo — potential subtle effects on root-level dev scripts (`scripts/check-frontend-js.js`, `_check_relay.js`, `fix_both.js`) that weren't going to be verified exhaustively in-session. The blast radius was too wide for what's effectively a one-file problem.
 2. **Use `require()` / dynamic `import()` in the Node scripts** — would have let the workers keep `.js` but made the test/seeder code messier and forced async-IIFE wrapping. Rejected as ugly.
 
 The `.mjs` rename is one file (plus updating two worker import lines), zero runtime risk, and clearly localized.
@@ -910,13 +938,13 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 
 **Decision:** Every change to `src/dashboard/index.js` — without exception and regardless of size — must be performed by invoking the `patch-dashboard` skill (`Skill` tool, `skill: "patch-dashboard"`) before writing any patch script. Freehand patch scripts are prohibited even when they appear to follow the pattern. This rule is now hardcoded in `agent/BOOTSTRAP.md` Rule 1, `agent/constraints.md §1`, and the user's auto-memory.
 
-**Why:** On 2026-04-15 a freehand `_add_gateway_export.js` patch shipped invalid JS to prod: the CSV-escape helper contained `/[",\n\r]/` which became a multi-line regex literal after the template literal evaluated `\n` and `\r` as escape sequences. The outer-Worker syntax check (Check 1) read the frontend JS as a string and passed. Only Check 2 (`_check_frontend_js.js`, which executes `getHTML()` via `vm` and syntax-checks the extracted browser JS) would have caught it — and I had skipped it because I didn't invoke the skill. The skill enforces both checks and the `--env=""` deploy.
+**Why:** On 2026-04-15 a freehand `_add_gateway_export.js` patch shipped invalid JS to prod: the CSV-escape helper contained `/[",\n\r]/` which became a multi-line regex literal after the template literal evaluated `\n` and `\r` as escape sequences. The outer-Worker syntax check (Check 1) read the frontend JS as a string and passed. Only Check 2 (`scripts/check-frontend-js.js`, which executes `getHTML()` via `vm` and syntax-checks the extracted browser JS) would have caught it — and I had skipped it because I didn't invoke the skill. The skill enforces both checks and the `--env=""` deploy.
 
 **Consequence:**
 - Do NOT handcraft a patch script and run the outer-module check only. Always open the skill first so the frontend-JS check runs.
 - Do NOT deploy the dashboard with bare `npx wrangler deploy` — always `--env=""` (prod) or `--env test`.
 - If a future session discovers this rule is overbearing (e.g. a docs-only change), the skill itself must be amended — not bypassed.
-- `_check_frontend_js.js` is load-bearing. Do not delete.
+- `scripts/check-frontend-js.js` is load-bearing. Do not delete.
 
 ---
 
@@ -961,11 +989,11 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 
 ## 2026-03-24 — Frontend JS check must execute getHTML() via vm, not regex substitution
 
-**Decision:** `_check_frontend_js.js` uses Node `vm.runInContext` to actually execute the `getHTML()` function and extract the resulting HTML string, rather than regex-replacing `\`` → `` ` `` and `\${` → `${` on the raw file text.
+**Decision:** `scripts/check-frontend-js.js` uses Node `vm.runInContext` to actually execute the `getHTML()` function and extract the resulting HTML string, rather than regex-replacing `\`` → `` ` `` and `\${` → `${` on the raw file text.
 
 **Why:** The regex approach misses all other template literal escape evaluations: `\n` → newline, `\t` → tab, `\\` → `\`, etc. A file with `dbLines.join('\n')` (single backslash-n inside single-quoted string) passed the regex check because node's own `--check` sees `'\n'` as a valid newline escape — but the template literal evaluates `\n` to a literal newline char, so the browser actually receives an unclosed string literal → syntax error. This caused recurring "data not loading" bugs that appeared fixed but weren't.
 
-**Consequence:** Always use `node _check_frontend_js.js` (the vm-based version at the repo root) as Step 4b. Never revert to the regex version. The check must faithfully reproduce what the browser receives.
+**Consequence:** Always use `node scripts/check-frontend-js.js` (the vm-based version at the repo root) as Step 4b. Never revert to the regex version. The check must faithfully reproduce what the browser receives.
 
 ---
 
@@ -1245,7 +1273,7 @@ The `runWingIotCleanupSweep` and `processRotationBatch` stuck-wing pass are resp
 
 **Why:** The dashboard is the control surface for ~4,000 live billable lines. A bug in a brand-new login path with no fallback means nobody can reach production operations until a fix is written and deployed. Break-glass also solves bootstrapping: the first admin has to be created by someone, and no user exists yet.
 
-**Consequence:** Break-glass is now `off` in production and `dashboard123` is dead (verified 401). It remains available on `dashboard-test`. If a future auth change risks lockout, re-enable by deleting the `DASHBOARD_BREAK_GLASS` secret — `DASHBOARD_AUTH` is still set. Break-glass has no `dashboard_users` row, so it cannot use the Profile tab; `/auth/me` reports `has_profile: false`.
+**Consequence:** Break-glass is now `off` in production and `dashboard123` is dead (verified 401). If a future auth change risks lockout, re-enable by setting the `DASHBOARD_BREAK_GLASS` secret to `on` — `DASHBOARD_AUTH` is still set. Break-glass has no `dashboard_users` row, so it cannot use the Profile tab; `/auth/me` reports `has_profile: false`.
 
 ---
 

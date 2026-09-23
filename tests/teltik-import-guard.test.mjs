@@ -7,9 +7,11 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 // package.json is "type":"commonjs", so node would parse the worker's .js as
-// CJS and the named ESM exports fail to resolve. The worker file is
-// self-contained (zero imports), so load it as ESM via a data: URL instead.
-const src = await readFile(new URL('../src/teltik-worker/index.js', import.meta.url), 'utf8');
+// CJS and the named ESM exports fail to resolve. Load it as ESM via a data:
+// URL, rewriting its one shared import to an absolute file: URL.
+const src = (await readFile(new URL('../src/teltik-worker/index.js', import.meta.url), 'utf8'))
+  .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href))
+  .replace("'../shared/supabase-rest.mjs'", JSON.stringify(new URL('../src/shared/supabase-rest.mjs', import.meta.url).href));
 const { importTeltikLines, looksLikeAttIccid } =
   await import('data:text/javascript;base64,' + Buffer.from(src).toString('base64'));
 

@@ -1,3 +1,5 @@
+import { carrierFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPost, sbPatch } from '../shared/supabase-rest.mjs';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -25,7 +27,7 @@ export default {
       const token = await hxGetBearerToken(env);
 
       // Get all active SIMs with mobility_subscription_id
-      const sims = await supabaseSelect(
+      const sims = await sbGet(
         env,
         `sims?select=id,iccid,mobility_subscription_id&mobility_subscription_id=not.is.null&status=in.(active,provisioning)&order=id.asc`
       );
@@ -68,7 +70,7 @@ export default {
           const e164 = normalizeToE164(helixMdn);
 
           // Get current phone number from sim_numbers (valid_to IS NULL)
-          const currentNumbers = await supabaseSelect(
+          const currentNumbers = await sbGet(
             env,
             `sim_numbers?select=e164,valid_from&sim_id=eq.${simId}&valid_to=is.null&limit=1`
           );
@@ -94,7 +96,7 @@ export default {
 
           // If there's an existing current number, expire it
           if (currentE164) {
-            await supabasePatch(
+            await sbPatch(
               env,
               `sim_numbers?sim_id=eq.${simId}&valid_to=is.null`,
               { valid_to: now }
@@ -102,7 +104,7 @@ export default {
           }
 
           // Insert new current number
-          await supabaseInsert(env, "sim_numbers", [
+          await sbPost(env, "sim_numbers", [
             {
               sim_id: simId,
               e164: e164,
@@ -185,14 +187,14 @@ function normalizeToE164(phoneNumber) {
 
 /* ================= RELAY ================= */
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 /* ================= HELIX API ================= */
@@ -241,85 +243,6 @@ async function hxGetSubscription(env, token, subscriptionId) {
   }
 
   return json;
-}
-
-/* ================= SUPABASE ================= */
-
-async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      Accept: "application/json",
-    },
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Supabase select failed ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  if (!text.trim()) return [];
-
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw new Error(
-      `Supabase select JSON parse failed: ${String(e)}. Raw: ${text.slice(0, 300)}`
-    );
-  }
-}
-
-async function supabaseInsert(env, table, rows) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: "POST",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify(rows),
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Supabase insert failed ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  if (!text.trim()) return [];
-
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw new Error(
-      `Supabase insert JSON parse failed: ${String(e)}. Raw: ${text.slice(0, 300)}`
-    );
-  }
-}
-
-async function supabasePatch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "PATCH",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Supabase patch failed ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  return true;
 }
 
 /* ================= RESPONSE PARSING ================= */

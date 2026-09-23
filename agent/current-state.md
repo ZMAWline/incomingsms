@@ -1,6 +1,16 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
+> 2026-09-22: Brief A done. PRs #88 (`87cc4bf`) and #84 (`6584492`) are squash-merged, not deployed. 989 tests pass. #84 frontend filename gap is open. See "Brief A done".
+> Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
+> Also 2026-09-22: Brief B steps 1–2 done — `FINALIZER_RUN_SECRET` set on `bad-rental-remediator` (test + prod), and PROD redeployed with `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` as version `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`. See "Brief B steps 1–2 done" below. Next: wait 5h for one full probe cycle, read the Slack digest, get owner sign-off, then remove DRY_RUN (step 5).
+> 2026-09-22: PR #112 merged and DEPLOYED to PROD with #110, #88 and #84 — dashboard `3b69cf80`, details-finalizer `1f22a644`, reseller-portal `e6e18c80`. `deployed/prod` moved 6ec5620 → 7b18ed4. See "Deployed 2026-09-22 (ship 2)".
+> 2026-09-22: PR #113 + #115 merged and DEPLOYED to PROD with #114 — dashboard `5d424a79`, details-finalizer `49029305`, bad-rental-remediator `ecb01e83`. `deployed/prod` moved 7b18ed4 → 320bd40. See "Deployed 2026-09-22 (ship 3)".
+> 2026-09-22 (latest): PR #119, #120, #121 and #122 merged and DEPLOYED to PROD — 18 workers (shared supabase-rest helper). Migration `sims_paging_indexes` applied TEST + PROD. `deployed/prod` moved d2af4a3 → ee9ae2b. Check mdn-rotator's first tick after 04:00 UTC for `timeout after` errors. See "Deployed 2026-09-22 (ship 5)".
+> 2026-09-22: PR #116, #117 and #118 merged and DEPLOYED to PROD — all 19 workers (shared fetch-timeout helper touched every worker). `deployed/prod` moved 320bd40 → d2af4a3. Open owner decision: reseller webhooks from sim-canceller / sim-status-changer. See "Deployed 2026-09-22 (ship 4)".
+> 2026-09-23 (ship 8, latest): PRs #126–#133 merged and DEPLOYED to PROD — 18 workers. kasa-control now requires a secret (`~/.config/incomingsms/KASA_ADMIN_RUN_SECRET`). `deployed/prod` abefc87 → 77d4a90. See "Deployed 2026-09-23 (ship 8)".
+> 2026-09-23: Offline SIM lifecycle ENABLED for real in PROD — `bad-rental-remediator` `572f4242` at 03:07:33 UTC (PR #125). To pause: set `OFFLINE_LIFECYCLE_ENABLED = "false"` in its wrangler.toml, merge, `scripts/deploy.sh bad-rental-remediator`. `deployed/prod` 11899f6 → abefc87. See "Deployed 2026-09-23 (ship 7)".
+> 2026-09-22: Offline-lifecycle dry-run flags were silently DROPPED by ships 3/4/5 (set with `--var`); now in `wrangler.toml` [vars] (PR #123) and redeployed as `505b4387` at 22:06 UTC — the 5h dry-run clock restarted then. `scripts/deploy.sh` now refuses to delete live vars. PR #124: sim-canceller/sim-status-changer reseller webhooks now actually send (`number.offline` on cancel/suspend, `number.online` on restore). `deployed/prod` ee9ae2b → 11899f6. See "Deployed 2026-09-22 (ship 6)".
 > Last updated: 2026-09-18 (PR #108 merged: 8 live PROD functions captured into migrations; TEST Supabase now has 8 of 13 RPCs, 5 blocked on missing tables.)
 > Also 2026-09-18 (Bad Rental escalation CSV is keyed in PROD — secret `BAD_RENTAL_CSV_KEY` set on `dashboard` + `dashboard-test`, key file at `~/.config/incomingsms/BAD_RENTAL_CSV_KEY`, prod version `40642f28`.)
 > Also 2026-09-18: Per-account saved filters, migration 011, confirmed applied to PROD Supabase — `20260917213954` — and the dashboard Worker deployed to PROD as `17e0f0c4` (superseded by `40642f28`). The 2026-09-17 note below saying the migration was not applied is stale.
@@ -8,7 +18,315 @@
 > 2026-09-10: SIMs table filtering + saved filters, PR #104 — DEPLOYED TO PROD as `ae5e4756`, reconciled with the Agent API.
 > Also 2026-09-10: `dashboard_audit_log` 90-day retention via pg_cron (migration 010), applied to PROD and TEST.
 
+> Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
+
 ---
+
+## Deployed 2026-09-23 (ship 8) — PRs #126–#133, 18 workers
+
+- **Merged** (squash, no rebases needed): #130 test clock fix (`65af902`), #131 kasa-control auth (`177b950`), #126 secrets inventory (`b45ecce`), #129 db repo gaps (`715d4bc`), #128 shared helper finish + TEST entrypoints (`5530627`), #127 port-in outcomes (`cd50e29`), #132 docs (`c43970a`), #133 DB constraint check fix (`77d4a90`).
+- **Main was red 00:00–02:00 NY** (5 bad-rental-remediator tests). Cause: test fixtures built from the real clock went prior-NY-day and were dismissed by the expired-report sweep; latent since #48 (`a7f286d`) and #47 (`28c4895`). Fixed in the tests (#130), no worker code change.
+- **`check:db-constraints` failed after #128** on 4 false positives (result objects after an `sbPatch('sims?...')`), which blocked `scripts/deploy.sh`. Fixed in #133.
+- **Migrations:** none applied by this deploy. The 14 `supabase/migrations/20260923_*` files were already applied to TEST and PROD by the worker sessions. Spot check: PROD `atomic_portin_outcomes` = 164 rows.
+- **Pre-flight:** `npm test` 1187/1187, `check:db-constraints` pass, both dashboard syntax checks pass.
+- **Workers** (deploy list = changed dirs + every importer of `src/shared/supabase-rest.mjs` / `atomic-portin-outcomes.mjs`), via `scripts/deploy.sh`, one at a time, root probe before → after:
+  - dashboard (`--env=""`): `b375bdb6-eb44-432c-9aa3-f28b6c32052a` (200 → 200)
+  - bad-rental-remediator: `5d92613f-8eac-418e-9fdf-47733fc83f25` (404 → 404)
+  - bulk-activator: `55e45b70-9fa0-4854-9d2c-668fc120b18d` (200 → 200)
+  - details-finalizer: `94678117-959c-49a4-b6a7-d87b2147d9ee` (200 → 200)
+  - kasa-control: `f3606274-4ad4-440c-9784-2e602777b4a2` (404 → 401)
+  - mdn-rotator: `c3a3d5b8-0390-47b7-8544-844a106cb8d6` (200 → 200)
+  - ota-status-sync: `959c1e3f-736f-4ef4-9373-9208bcaf4790` (401 → 401)
+  - otp-portal: `64365b34-e457-4b86-babc-9df2ddf56b17` (200 → 200)
+  - phone-number-sync: `07f7b864-13b7-4a87-ba12-f4396499147a` (200 → 200)
+  - reseller-portal: `76492768-e804-47a2-92ca-1439ea296ccf` (200 → 200)
+  - reseller-sync: `b7ea1d2e-8dbf-4341-b69b-e132d2613652` (200 → 200)
+  - sim-canceller: `478b2c41-6f55-4ef7-9780-df0518a184c5` (200 → 200)
+  - sim-status-changer: `0dda11ff-9e5a-4e08-a634-405154af883c` (200 → 200)
+  - skyline-gateway: `eb7ad8db-a22d-482d-8833-ca36418031e5` (200 → 200)
+  - sms-ingest: `05462cc3-3254-4b12-ad9b-289ae3f08f78` (405 → 405)
+  - storefront: `cec56896-9532-41f3-9d9d-cc0ca883b095` (200 → 200)
+  - teltik-portal: `dc259b5f-37f8-4fec-9193-631540bd8494` (200 → 200)
+  - teltik-worker: `3ca87425-dfa6-42b4-b605-e1ec21bca5b2` (200 → 200)
+  - Not deployed: quickbooks (unchanged; no import of the changed shared modules).
+- **Live probes:** dashboard `/` 200; bad-rental CSV with X-Api-Key 200 (6,135 bytes); kasa-control `/` and `/outlets` without secret 401, with secret on an unknown path 404; dashboard has `KASA_ADMIN_RUN_SECRET` bound; live details-finalizer contains `atomic_portin_outcomes`; live mdn-rotator has no `supabaseSelect(`.
+- **Tail** details-finalizer 04:49–04:55 UTC: one `*/5` tick, outcome ok, 0 exceptions.
+- **Marker:** `deployed/prod` `abefc87313c808c42cc86bb58ac750d87b1cbc8a` → `77d4a901c5b7d3638742c223edd1ad0d7edbd0cd`.
+
+## Open items and notes 2026-09-23
+
+- **Brief C done** (`agent/briefs/2026-09-22-C-portin-outcomes-migration.md`): PR #127 (`cd50e29`) merged. It records and shows why each ATOMIC port-in failed (`atomic_portin_outcomes`). Its migration was already applied to TEST and PROD.
+- **Lost WIP on `feat/inc-2-rental-billing`:** any uncommitted or unpushed work from that branch is gone and cannot be recovered. The remote branch has only the commits that were pushed. Do not look for more.
+- **kasa-control now needs a secret on every route** (PR #131). Callers send `Authorization: Bearer <secret>` (or `X-Admin-Secret`). Unset secret means 503 on every route. Secret names: `ADMIN_RUN_SECRET` on kasa-control and kasa-control-test; `KASA_ADMIN_RUN_SECRET` on dashboard and dashboard-test (the dashboard `/api/kasa/*` proxy sends it). One value for all four, stored at `~/.config/incomingsms/KASA_ADMIN_RUN_SECRET` (mode 600). The `?secret=` query form is gone.
+- **Open: delete unused secrets after one week of clean logs.** `agent/secrets-inventory.md` lists 42 live secrets that no code reads and 105 secrets PROD has that TEST lacks. Earliest delete date for the 42: 2026-09-30, if the logs show no errors that name them. The 105 missing TEST secrets are a separate decision (TEST runs of those workers cannot work until they exist).
+- **Main was red 00:00–02:00 NY** because two bad-rental-remediator test files built fixtures from the real clock (fixed in PR #130 by pinning the clock). A test that builds `received_at` from `Date.now()` and runs through `runTick` must pin the clock too.
+
+## Deployed 2026-09-23 (ship 7) — Offline SIM lifecycle enabled in PROD (#125)
+
+- **Brief B step 5 done.** PR #125 (`abefc87`) removed `OFFLINE_LIFECYCLE_DRY_RUN` from the PROD `[vars]` in `src/bad-rental-remediator/wrangler.toml`. `OFFLINE_LIFECYCLE_ENABLED = "true"` stays. `[env.test.vars]` is unchanged (still dry run; TEST has no crons).
+- **Why writes are now on:** `offlineLifecycleDryRun()` is true only for the exact string `"true"`, so a missing var means the tick writes. `OFFLINE_LIFECYCLE_MAX_ACTIONS` is not set, so the default of 25 transitions per hourly tick still applies.
+- **Dry-run sign-off:** the owner reviewed a dry run in another session and signed off on 2026-09-22. A Slack search found no digest, so the only record of the sign-off is the owner's word.
+- **Deploy:** `scripts/deploy.sh bad-rental-remediator` refused first, because the live-var guard saw `OFFLINE_LIFECYCLE_DRY_RUN` about to be deleted. That deletion was the point, so the deploy was re-run with `--allow-var-drop`, not `ALLOW_UNSAFE_DEPLOY`. 1156/1156 tests passed and the DB constraint check passed. Version `572f4242-94e4-4db3-832a-67c6d8dec6da`, live 2026-09-23 03:07:33 UTC. Root 404 → 404.
+- **Settings API after:** `OFFLINE_LIFECYCLE_ENABLED="true"`, `OFFLINE_LIFECYCLE_DRY_RUN` absent, `FINALIZER_RUN_SECRET` present (21 secrets, same as before). The first read returned the old version for a few seconds; a re-read 10 s later showed the new one.
+- **Tail** (03:08:23–03:15:03 UTC): 10 invocations, all ok, no exceptions. There were 3 probe runs, each `{"candidates":4285,"probe_limit":43,"probed":43,"coverage_short":false}`. The hourly decision tick did not fall inside the window. The first real tick is 04:00 UTC 2026-09-23. Check for the `[OfflineLifecycle] tick` line with `"dry_run":false`.
+- **To pause:** set `OFFLINE_LIFECYCLE_ENABLED = "false"` in `src/bad-rental-remediator/wrangler.toml`, merge to main, `scripts/deploy.sh bad-rental-remediator`. To dry-run again, add `OFFLINE_LIFECYCLE_DRY_RUN = "true"` back instead.
+- **Marker:** `deployed/prod` `11899f660b4b480df36f1c189c94c1ba93b12ba4` → `abefc87313c808c42cc86bb58ac750d87b1cbc8a`.
+
+## Deployed 2026-09-22 (ship 6) — dry-run flags in toml (#123), reseller webhooks fixed (#124)
+
+- **Flags were clobbered.** Brief B step 2 set `OFFLINE_LIFECYCLE_ENABLED=true` / `OFFLINE_LIFECYCLE_DRY_RUN=true` with `--var` (version `6dcacae8`, 19:24 UTC). Ships 3, 4 and 5 redeployed `bad-rental-remediator` with plain `scripts/deploy.sh`, which dropped both. Confirmed via `GET /workers/scripts/bad-rental-remediator/settings`: no plain-text vars at all before this ship; `FINALIZER_RUN_SECRET` was still there. So no dry-run digest was ever produced after the first redeploy.
+- **PR #123** (`d263027`): both flags now in `src/bad-rental-remediator/wrangler.toml` `[vars]` and `[env.test.vars]`. The code arms only on the exact string `"true"`; to enable for real, delete the `OFFLINE_LIFECYCLE_DRY_RUN` line and deploy. TEST has no crons and no SUPABASE secrets, so the TEST block does nothing today.
+- **deploy.sh live-var guard** (same PR, `scripts/check_live_vars.py`): before each deploy it reads the live worker's plain-text vars and refuses if any is missing from that env's wrangler.toml `[vars]` (names passed with `--var` on the same command count as kept). Override: `--allow-var-drop`. If the API cannot be read it warns and continues. Checked against every worker (PROD + TEST): no false refusals today.
+- **bad-rental-remediator** `505b4387-b440-4ce3-bb5d-441e3d757ca8`, live 2026-09-22 22:06:16 UTC. Settings API after: `OFFLINE_LIFECYCLE_ENABLED="true"`, `OFFLINE_LIFECYCLE_DRY_RUN="true"`, `FINALIZER_RUN_SECRET` present. Root 404 → 404. Tail (400 s): probe runs logging `[OfflineLifecycle] probe run {"candidates":4285,"probe_limit":43,"probed":43,...}`; the hourly decision tick (the one that posts the dry-run digest) did not fall inside the window.
+- **Brief B step 3 clock restarted:** 22:06 UTC 2026-09-22. Earliest digest read: 2026-09-23 03:06 UTC (first hourly tick after that: 04:00 UTC).
+- **PR #124** (`11899f6`): `postResellerWebhook` in sim-canceller and sim-status-changer used `env` without receiving it, so every send died with `env is not defined` (caught and logged). sim-canceller also looked up the reseller after setting `reseller_sims.active=false`, so it found none. Now: cancel → `number.offline` (reason `canceled`), suspend → `number.offline` (`suspended`), restore → `number.online` (`restored`). Old names `sim.cancelled` / `sim.suspended` / `sim.restored` are gone. Payload matches mdn-rotator/reseller-sync (`src/shared/number-event.mjs`): `event_type`, `created_at`, `message_id` (per-day hash, reason in the `from` slot), `data.{sim_id, iccid, number, online, mobilitySubscriptionId, reason, carrier, verified}`. No `online_until`, no retry, no `webhook_deliveries` row, no rental capture — send once, log only; a webhook failure never fails the cancel/restore.
+- **Deployed** via `scripts/deploy.sh` (1156/1156 tests, DB constraint check passed): sim-canceller `376a4482-55f1-41a8-8e7c-3dc910938135` (root 200 → 200), sim-status-changer `2632f301-cb9d-4893-bff3-d293f31db545` (200 → 200).
+- **Marker:** `deployed/prod` `ee9ae2b998c20c0cfddc99d6ebdad7d4b1591256` → `11899f660b4b480df36f1c189c94c1ba93b12ba4`.
+
+## Deployed 2026-09-22 (ship 5) — PR #119, #120, #121 and #122, 18 workers
+
+- **PRs merged** (squash, branches deleted, no rebases needed): #119 "Behaviour tests for ATOMIC and Teltik rotation paths" (`888d811`); #120 "Share one Supabase REST helper across workers instead of twenty copies" (`47e066f`); #121 "SIMs table: page, filter and sort on the server" (`f5a2552`); #122 "Rotation: restore the claim stamp on inquiry timeout; stop ignoring failed DB writes after a Teltik number change" (`ee9ae2b`).
+- **Combination break caught after merging #119 + #120:** the teltik rotation test loads the worker from a `data:` URL and rewrote only the `fetch-timeout.mjs` import; #120 added `../shared/supabase-rest.mjs`, so the whole file failed to load. Fixed in #122 (the loader now rewrites every `../shared/` import). No worker code was affected.
+- **#122 — the two bugs #119 found:**
+  - mdn-rotator: a timeout or network error on the pre-swap `subsriberInquiry` now restores `last_mdn_rotated_at` and throws `ATOMIC pre-swap inquiry network error: ...`, which the batch counts as a transport failure (outage breaker) before moving on. Before, the SIM was locked out of rotation until the next NY day. Test 13 is now a real test (was todo) and fails on the old code.
+  - teltik-worker: after a Teltik number change, the `sim_numbers` close/insert and `sims` PATCH now check `res.ok`. On failure: `console.error` with SIM id, status and body; a `system_errors` row (`source=teltik-worker`, `action=teltik_rotation_db_write_failed`, `severity=error`, `error_details` has old/new msisdn and the failed writes); the SIM is counted as an error and listed in the tick result's new `failed_after_carrier` array. No carrier retry, and `increment_rotation_fail` is NOT called (a `failed` rotation_status would put the SIM in the retry pass and burn another number). New test covers a 500 on the sims PATCH and fails on the old code.
+- **Migration** `supabase/migrations/20260922_sims_paging_indexes.sql` (view `sims_dashboard`, function `sims_dashboard_facets()`, index `idx_reseller_sims_sim_id_active`), applied with `apply_migration` name `sims_paging_indexes`. Re-runnable (CREATE OR REPLACE / IF NOT EXISTS).
+  - TEST: `sims_dashboard` 5,348 rows = `sims` 5,348; facets return 11 columns; index present. Preview `0ce244b0-dashboard-test`: `/` 200, `/api/sims` 401.
+  - PROD: `sims_dashboard` 5,532 rows = `sims` 5,532; facets return 11 columns (status: active 4,287, canceled 1,201, error 20, rotation_failed 20, provisioning 4); index present.
+- **Workers deployed** via `scripts/deploy.sh`, one at a time (1151/1151 tests, 0 todo, DB constraint check, both dashboard syntax checks passed first). Root probe before → after, no changes:
+  - dashboard (`--env=""`): `2fcdac7d-399b-4f21-abd4-bd4bc8773f19` (200 → 200)
+  - details-finalizer: `938a566a-5017-414d-852a-b2510af3626e` (200 → 200)
+  - mdn-rotator: `e5a885a0-6173-4626-8296-b6359bad1c4e` (200 → 200)
+  - teltik-worker: `8290c4b0-8f4a-46d4-90c5-d83bb405ce8c` (200 → 200)
+  - bulk-activator: `55f47c3d-8382-4b34-b2f7-26c8176a5dd8` (200 → 200)
+  - bad-rental-remediator: `078e2550-5bb3-47be-8f3e-689c707d7301` (404 → 404)
+  - reseller-sync: `2772aca0-3c79-4a3c-bb16-c454429951e8` (200 → 200)
+  - kasa-control: `c8799fbc-e1ad-4364-8bed-da2e99a7c9f3` (404 → 404)
+  - ota-status-sync: `252a6ba3-5753-46cd-a4f9-93ac9a9e719f` (401 → 401)
+  - otp-portal: `10bd5c7c-a4de-4987-b9ee-8b52237ecbb7` (200 → 200)
+  - phone-number-sync: `d38d98ef-adca-474f-aa35-0e74bfca2738` (200 → 200)
+  - reseller-portal: `9c4c19bf-c6cd-4771-8697-8b33e2ffdd71` (200 → 200)
+  - sim-canceller: `23d608c7-ae4c-4eb7-936e-ee09f92906b3` (200 → 200)
+  - sim-status-changer: `785dbc29-a570-495b-89b8-deb9537065b6` (200 → 200)
+  - skyline-gateway: `af149a92-b872-492a-9eb8-ca64ac007a79` (200 → 200)
+  - sms-ingest: `8a6e32df-abe4-4589-98f5-bf71a131e46f` (405 → 405)
+  - storefront: `cd1502f0-7a66-444a-aae7-08bfb4d9b2d3` (200 → 200)
+  - teltik-portal: `26539d21-b72d-4457-84b4-3160c0a4099c` (200 → 200)
+  - Not deployed: quickbooks (unchanged; imports only `fetch-timeout.mjs`).
+- **Live probes:** dashboard `/` 200; `/api/sims` unauthenticated 401 (not 502); bad-rental CSV with X-Api-Key 200 (18,581 bytes); live dashboard script contains `sims_dashboard` (3); live mdn-rotator contains `restoreRotationStamp` (8) and the new `pre-swap inquiry network error` branch calls it.
+- **Workers Builds also deploys on push:** details-finalizer got an automatic version `792b67a8` at 21:22:41 UTC (Source "Unknown", right after main was pushed), 90 s before `scripts/deploy.sh` put `938a566a` live. Ours is the current 100% version.
+- **UX changes from #121 (SIMs tab):** searching by ID is now an exact match (not substring); search no longer matches formatted dates or SMS counts (they are not columns in the view); auto-refresh polls only the current page; filter-menu counts come from `sims_dashboard_facets()` over the whole fleet.
+- **TODO(shared-supabase) leftovers from #120:** closed 2026-09-23 by PR #128 (every worker now uses `src/shared/supabase-rest.mjs`; no `TODO(shared-supabase)` markers remain in `src/`).
+- **project-map.md:** shared-module table now lists `supabase-rest.mjs` and `fetch-timeout.mjs`.
+- **TODO:** check mdn-rotator's first tick after 04:00 UTC (cron `*/5 4-14 * * *`) for `timeout after` errors and for any `pre-swap inquiry network error` lines.
+- **Marker:** `deployed/prod` moved `d2af4a32494f0d10bfca97991dd3dffce48980cb` → `ee9ae2b998c20c0cfddc99d6ebdad7d4b1591256`.
+- **Rollback:** `npx wrangler rollback` in the worker's dir (`--env=""` for dashboard), or redeploy from `d2af4a3`. The migration only adds a view, a function and an index; the old dashboard does not use them.
+
+## Deployed 2026-09-22 (ship 4) — PR #116, #117 and #118, all 19 workers
+
+- **PRs merged** (squash, branches deleted): #116 "Tighten dashboard CORS, prefer header for SMS ingest secret, remove dead scripts, rewrite README" (`12bb6bc`); #117 "Add timeouts to every carrier, database and webhook call outside the dashboard" (`f8b3ea1`, merged clean, no rebase needed); #118 "sms-ingest: use the shared fetch timeouts" (`d2af4a3`, follow-up to #117: sms-ingest Supabase calls use `supabaseFetch`, reseller webhook delivery uses `webhookFetch`, and `PENDING_WORKERS` is removed from `tests/fetch-timeout.test.mjs`).
+- **Workers deployed** via `scripts/deploy.sh`, one at a time (1063/1063 tests, DB constraint check, both dashboard syntax checks passed first). Root probe before → after, no changes:
+  - dashboard (`--env=""`): `9511b400-ceae-4767-a73f-04dc7f077429` (200 → 200)
+  - details-finalizer: `b040f152-c8ab-4bdc-94e8-bf02184587fb` (200 → 200)
+  - mdn-rotator: `3d3101d4-081f-4751-a470-ec933a1e8f58` (200 → 200)
+  - bulk-activator: `2b5d1b6b-8e59-45fe-98a6-5939402e6942` (200 → 200)
+  - teltik-worker: `aa2743ae-be1b-4a91-8253-d200cc3872c6` (200 → 200)
+  - bad-rental-remediator: `84b281be-ae71-4207-8844-24042230a9cd` (404 → 404)
+  - reseller-sync: `16d8c3ad-6149-4c72-a4be-d12f6109b3b7` (200 → 200)
+  - sms-ingest: `9176677b-e669-4481-aea2-41a3188193a4` (405 → 405)
+  - kasa-control: `93f19cc7-ee7e-47ca-82c1-c1ebc330a250` (404 → 404)
+  - ota-status-sync: `39253636-eae5-4690-93aa-602a5d78771e` (401 → 401)
+  - otp-portal: `abb06fe5-5770-4814-8345-c3a59331575c` (200 → 200)
+  - phone-number-sync: `1e63f051-7045-483d-a2a7-4e837a8986cf` (200 → 200)
+  - quickbooks: `9be31522-d93e-459c-bc99-ca26d68f9ff8` (404 → 404)
+  - reseller-portal: `b5230acb-2ea0-44eb-8fa7-a1e2339f388a` (200 → 200)
+  - sim-canceller: `6a26c1b9-2dfa-4e69-8734-9d354f2be5ea` (200 → 200)
+  - sim-status-changer: `6e947c46-613d-4208-bacf-0269b49dba8b` (200 → 200)
+  - skyline-gateway: `03379dbc-5fe4-4c7b-889c-e82aaa20f84c` (200 → 200)
+  - storefront: `c44fee43-3381-4f0c-b884-8964356c5b95` (200 → 200)
+  - teltik-portal: `598cf066-b9ba-4706-a592-83a92562e2b2` (200 → 200)
+- **Migrations:** none in range.
+- **Live probes:** dashboard `/` 200; bad-rental CSV with X-Api-Key 200 (18,581 bytes); live mdn-rotator script contains `fetch-timeout` and `carrierFetch`.
+- **CORS probe:** unauthenticated `/api/sims` with `Origin: https://evil.example` returns 401 with no Access-Control header. The same request with the dashboard's own origin also has no header, because the auth gate returns 401 before the CORS headers are computed (`src/dashboard/index.js`), and that includes OPTIONS preflights. The echo for allowed origins is covered by `tests/dashboard-cors.test.mjs` only. It was not verified live because that needs an authenticated request.
+- **Cron tail:** details-finalizer ran one `*/5` tick at 20:55 UTC on `b040f152`, outcome ok, no exceptions, no timeout errors, 580 ms wall time. mdn-rotator had no events in the 400 s tail: its cron is `*/5 4-14 * * *` (04:00–14:59 UTC), and the tail ran at 20:51 UTC. Check the first tick after 04:00 UTC for `timeout after` errors.
+- **TEST note:** sms-ingest TEST (`sms-ingest-test`) deploys `index.ts`, not `index.js`, so the #116 auth change and the #118 timeouts are PROD-only.
+- **Open decision (owner):** `postResellerWebhook` in sim-canceller and sim-status-changer never sends, because `env` is not passed to it. Fixing that would START sending cancel/suspend/restore webhooks to resellers, which they have never received. Owner to decide before anyone fixes it.
+- **Marker:** `deployed/prod` moved `320bd403a6fe957e746505e0f3f23202224ef5d5` → `d2af4a32494f0d10bfca97991dd3dffce48980cb`.
+- **Rollback:** `npx wrangler rollback` in the worker's dir (`--env=""` for dashboard), or redeploy from `320bd40`.
+
+## Deployed 2026-09-22 (ship 3) — PR #113 and #115, plus #114
+
+- **PRs merged** (squash, branches deleted): #113 "Dashboard: break-glass admin login is off unless explicitly turned on" (`c5c84bc`); #115 "Port-in poller: back off and stop after 14 days instead of polling forever" (`320bd40`, merged clean, no rebase needed). #114 (bad-rental-remediator offline lifecycle paging past the 1000-row clamp, `e89dc66`) was already on main from another chat and shipped in the same range.
+- **Workers deployed** via `scripts/deploy.sh` (1036/1036 tests, DB constraint check, both dashboard syntax checks passed first):
+  - dashboard (`--env=""`): `5d424a79-f86f-457a-8be7-8fc84e737390`
+  - details-finalizer: `49029305-b1b4-46c3-b604-e2cb54fed29b`
+  - bad-rental-remediator: `ecb01e83-6dfa-4b72-adc3-bbc930bde186` (probe cron changed from `5,20,35,50 * * * *` to `2-59/3 * * * *`, per #114)
+- **Migrations:** none in range. No `src/shared` changes.
+- **Live probes:** dashboard `/` 200; bad-rental CSV with X-Api-Key 200 (18,579 bytes); live dashboard script contains "break-glass login used"; live details-finalizer script contains `ATOMIC_PORTIN_MAX_AGE_DAYS`.
+- **Cron tail:** one details-finalizer `*/5` tick at 20:25 UTC, outcome ok, zero log lines — no port-in SIM was polled, escalated, or finalized in that tick. The poller does not log skipped (backed-off) SIMs, so polled-vs-skipped counts are not observable from logs.
+- **Break-glass:** now off by default in both PROD and TEST. It works only when the break-glass secret is set to `on`.
+- **Marker:** `deployed/prod` moved `7b18ed4f1314c04582883b16959f610911e16ae2` → `320bd403a6fe957e746505e0f3f23202224ef5d5`.
+- **Rollback:** `npx wrangler rollback` in the worker's dir (`--env=""` for dashboard), or redeploy from `7b18ed4`.
+
+## Deployed 2026-09-22 (ship 2) — PR #112 plus everything queued since the last deploy
+
+- **PR #112 merged** (squash, `7b18ed4`, "Dashboard: validate and encode request values before they reach the database"). Branch deleted.
+- **Shipped range:** `6ec5620..7b18ed4` — #112, #110 (details-finalizer records ATOMIC port-in outcomes), #88 (Messages search accepts number lists), #84 (QBO CSV filename fix), #111 (anon lockdown migration, already applied to PROD earlier), plus agent notes.
+- **Workers deployed** via `scripts/deploy.sh` (1018/1018 tests, DB constraint check, both dashboard syntax checks passed first):
+  - dashboard (`--env=""`): `3b69cf80-01c6-45df-bc6b-d0d09e06727c`
+  - details-finalizer: `1f22a644-f178-4a45-806f-7c8a97752d02` (changed by #110; also imports `shared/atomic-portin-outcomes.mjs`)
+  - reseller-portal: `e6e18c80-5c28-44e0-ba50-116bfe311811` (imports changed `shared/billing.js`)
+- **Migrations:** none applied by this deploy. `supabase/migrations/20260922_lock_down_anon.sql` was already applied to PROD (see below). The `sims.atomic_portin_reason_code` / `_reason_description` / `_status_attempted_at` columns that #110 writes were confirmed present in PROD before deploying — so Brief C's migration is effectively applied in PROD; the worker now writes to it.
+- **Live probes:** dashboard `/` 200; `/public/bad-rental-escalations-today.csv` with X-Api-Key 200 (18,663 bytes); `/api/sims?status=active&select=*` unauthenticated 401 (route up, auth enforced); reseller-portal `/` 200.
+- **Marker:** `deployed/prod` moved `6ec5620dea013f2c26dc43634342d6582a6006cf` → `7b18ed4f1314c04582883b16959f610911e16ae2`.
+- **Rollback:** `npx wrangler rollback` in the worker's dir (`--env=""` for dashboard), or redeploy from `6ec5620`.
+
+## PROD anon lockdown applied 2026-09-22 — PR #111 merged
+
+- Migration `20260922_lock_down_anon.sql` applied to PROD (`lzjqegxazqlktttyybth`) via `apply_migration`, name `lock_down_anon`. TEST already had it.
+- Before → after on PROD: grants to anon/authenticated **614 → 0**; policies for anon/authenticated/PUBLIC **58 → 0**; public tables without RLS **0 → 0**.
+- Anon probes (`/rest/v1/{sims,inbound_sms,carrier_api_logs,dashboard_sessions}?select=id&limit=1`): all **401** (`42501 permission denied`) with each of the three live keys: legacy anon JWT, `default` publishable, and `dan_bot` publishable.
+- Backend: `SET ROLE service_role; select count(*) from sims` → 5532, same as before. Dashboard root → 200. Bad-rental CSV (`/public/bad-rental-escalations-today.csv`, `X-Api-Key`) → 200, 18,663 bytes before and after. The dashboard has no real health route: `/health` serves the sign-in page and `/api/health` returns 401.
+- No rollback needed. The rollback file is `supabase/migrations/20260922_lock_down_anon_ROLLBACK.sql.txt`, section A.
+- **dan_bot / "Grok bot" read access is ended by owner decision.** Its replacement, the "Dan" bot, is stalled and has not been started. The `dan_bot` publishable key still exists but can read nothing. Any future consumer needs a narrow grant plus a narrow policy.
+- **Closed 2026-09-22 by owner decision:** the carrier_api_logs rows that were anon-readable 2026-09-08 to 2026-09-22 will NOT be inspected, scrubbed, or acted on. Do not raise this again.
+
+## Brief A done 2026-09-22 — PRs #88 and #84 rebased and squash-merged (not deployed)
+
+- **#88** Messages search accepts space-separated number lists → squash `87cc4bf`. One conflict, `src/dashboard/index.js` import block: kept main's auth/audit/saved-filter imports and added `splitSearchTerms`. `handleMessages` uses `splitSearchTerms(search, 10)`.
+- **#84** QBO CSV invoice filenames without separators → squash `6584492`. Rebased with no conflicts.
+- Tests: 989/989 pass on each rebased branch. Both are on main but not deployed. Run `/main-deploy` to ship the dashboard Worker.
+- **Open gap in #84:** the dashboard frontend sets its own download name, so the server-side fix does not reach the UI buttons. `src/dashboard/public/index.html` still builds `invoice_<name>_<start>_<end>.csv` in the preview download and `invoice_<id>.csv` in the history download. `a.download` overrides the server filename, so QuickBooks still gets underscored names from the dashboard. This was already on the PR's base, so the rebase did not cause it. Needs a follow-up fix.
+
+## Brief B optional item done 2026-09-22 — offline lifecycle migrations applied to TEST
+
+Applied to TEST Supabase (`incomingsms-test`, ref `lwapudjjlwkskijefxdz`) only:
+`migrations/20260804_hosting_port_status_checks.sql` then
+`supabase/migrations/20260922_sim_offline_lifecycle.sql`. Verified via
+information_schema: `hosting_port_status_checks` table, 4 `sims` offline columns,
+2 `reseller_sims` columns, and `get_hosting_port_status_summary`,
+`get_recent_hosting_port_checks`, `claim_rotation_slot` all present. The
+migration header saying `claim_rotation_slot` is missing on TEST is stale.
+
+Brief B step 3 clock: dry-run version `6dcacae8` went live 2026-09-22 19:24 UTC.
+Earliest time to read the Slack digest (step 4): 2026-09-23 00:30 UTC. Step 5
+(remove `OFFLINE_LIFECYCLE_DRY_RUN`) waits for Zalmen's yes.
+
+## Brief B steps 1–2 done 2026-09-22 — `FINALIZER_RUN_SECRET` set, dry-run deploy live
+
+Working tree was found checked out on `feat/wire-portin-outcomes` (clean, 0 commits
+ahead — leftover from the Brief A session) at task start; switched to `main`
+(up to date with `origin/main`) before doing anything, per the brief's instruction
+to deploy from the main workspace.
+
+- **`FINALIZER_RUN_SECRET`** found at `/root/projects/incomingsms/.dev.vars` line 17
+  (top-level, single shared `.dev.vars` for local dev — this repo does not keep a
+  per-worker copy). Confirmed the name already exists as a secret on `reseller-sync`
+  (`wrangler secret list`) before copying it. Set on `bad-rental-remediator` for
+  both prod and test via `wrangler secret put -c src/bad-rental-remediator/wrangler.toml
+  [--env test]`, value piped through stdin, never echoed. Confirmed present by name
+  on both (`wrangler secret list` / `wrangler secret list --env test`).
+- **Redeployed to PROD** via `scripts/deploy.sh bad-rental-remediator --var
+  OFFLINE_LIFECYCLE_ENABLED:true --var OFFLINE_LIFECYCLE_DRY_RUN:true` — `deploy.sh`
+  already forwards extra args to `wrangler deploy` via `"$@"`, no script change
+  needed. 989/989 tests passed, DB constraint check passed, then deployed.
+  **New PROD version:** `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`, confirmed live at
+  100% (`wrangler deployments list`) with both vars set (`wrangler versions view`:
+  `OFFLINE_LIFECYCLE_ENABLED="true"`, `OFFLINE_LIFECYCLE_DRY_RUN="true"`) and
+  `FINALIZER_RUN_SECRET` present in its secret list.
+- **Remaining (brief steps 3–5):** wait ≥5h for one full probe cycle, read the
+  Slack digest of intended actions, get the owner's sign-off, then redeploy with
+  `OFFLINE_LIFECYCLE_ENABLED:true` and DRY_RUN removed.
+
+## Deployed 2026-09-22 — offline SIM lifecycle to PROD (feature ships OFF)
+
+- **main:** `6ec5620` (tag `deployed/prod` now points here; it did not exist before).
+- **Workers deployed to PROD:** `bad-rental-remediator` version `89f93b91-fee6-485e-8359-d84b83d20734`; `dashboard` version `77c607df-0051-4900-a2df-00259cef5335`. `bulk-activator`, `details-finalizer`, `reseller-sync` were already byte-identical to main and were not redeployed. No `OFFLINE_LIFECYCLE_*` vars set.
+- **Verified:** dashboard root returns 200 (sign-in page); live dashboard script contains `offline_state`; `wrangler deployments list` shows both versions at 100%.
+- **Migration:** `supabase/migrations/20260922_sim_offline_lifecycle.sql` applied to PROD `lzjqegxazqlktttyybth` as `sim_offline_lifecycle`; all 6 columns and `get_recent_hosting_port_checks` confirmed present. NOT applied to TEST: TEST lacks `hosting_port_status_checks`, which the migration indexes and reads.
+- **New migration on main, not applied:** `migrations/20260904_atomic_portin_outcomes.sql` (from PR #79). Its module `src/shared/atomic-portin-outcomes.mjs` is not imported by any worker yet.
+- **PRs merged:** #82 (ops scripts + data-export ignores), #79 (ATOMIC port-in outcomes module). **Left open:** #80 (TrustOTP weekly invoice) — its tests assert a Friday cron, dashboard wiring and QuickBooks-worker removal that do not exist, 4 failures; #81 (specs for unbuilt features) — 6 failures, as expected. Both skipped because a red suite blocks every future deploy. #88 and #84 were merged later the same day (see "Brief A done").
+- **Branches deleted:** chore/recover-ops-scripts-and-ignore-data, feat/atomic-portin-outcomes (merged), plus redesign/sims-table-v2, task/t_f479e342-brr-dashboard, fix/atomic-port-in-fields, fix/parked-teltik-recovery, claude/celtic-sims-rotation-timing-8oer9s, claude/gateway-host-awareness, claude/sim-1374-api-logs-gtamyj, feat/inc-23-dashboard-surfacing, inc-18-vendor-classifier, inc-13-imei-device-type, inc-10-teltik-import-paginate, fix/qbo-csv-filenames.
+- **Still missing:** `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod). Until set, `/send-offline` returns 401.
+- **Remaining rollout steps:** (1) set `FINALIZER_RUN_SECRET` (same value as reseller-sync's) with `printf`; (2) set `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` and let it run 5h (one full probe cycle); (3) review the Slack digest of intended actions; (4) remove `OFFLINE_LIFECYCLE_DRY_RUN` to enable for real.
+
+---
+
+## Session 2026-09-22 — Offline SIM lifecycle (branch `unassign-offline-sims-from-reseller`)
+
+A Teltik-hosted line that goes offline used to stay `reseller_sims.active=true`,
+so the reseller kept counting our dead line as a broken rental. The offline
+signal (`hosting_port_status_checks`) now drives three coupled effects.
+
+**On a confirmed outage** (2 consecutive `offline` checks, `offline_state='online'`):
+pause rotation, send `number.offline` (`reason=line_offline`, no `replaced_by`),
+set `reseller_sims.active=false`, latch `offline_state='offline'`.
+
+**On a confirmed recovery** (latest check `online`, `offline_state='offline'`):
+restore `reseller_sims.active=true` FIRST (every webhook sender resolves the
+reseller through the active assignment), un-pause rotation, then either re-send
+`number.online` for the SAME number (inside the current rotation window) or
+force-rotate to a fresh one (new window). Latch back to `online`.
+
+Rotation window: teltik = `last_mdn_rotated_at + rotation_interval_hours > now`;
+atomic/helix = same America/New_York calendar day as now. Inside the window we
+NEVER call change-number: for Teltik the carrier rejects it inside 48h
+(`status=FAILED`) and the rejection increments `rotation_fail_count`.
+
+**Where it runs.** `bad-rental-remediator`, two new crons with their own
+branches in `scheduled()` and KV summary keys (both surfaced in `/status`):
+hourly `0 * * * *` decides and acts
+(`bad_rental_remediator_last_offline_lifecycle_tick`); `5,20,35,50 * * * *`
+probes the stalest candidates (`bad_rental_remediator_last_offline_probe_run`).
+Each probe run probes `min(50, ceil(candidates / 20))` SIMs, so every candidate
+gets a fresh check within 5h, inside the 6h freshness rule; worst case is about
+456 subrequests per probe run and about 107 per decision tick. Candidates are
+SIMs with `reseller_sims.active=true` plus SIMs latched `offline_state='offline'`.
+Manual trigger: `POST /offline-lifecycle/run?secret=$ADMIN_RUN_SECRET`.
+Decisions are pure in `src/shared/offline-lifecycle.mjs`; IO is in
+`src/bad-rental-remediator/offline-lifecycle.mjs`.
+
+**Env vars** (plain vars on `bad-rental-remediator`, none are secrets):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `OFFLINE_LIFECYCLE_ENABLED` | unset (off) | `"true"` arms the tick. Anything else makes the hourly tick log one line and return. |
+| `OFFLINE_LIFECYCLE_DRY_RUN` | unset | `"true"` still probes (records check rows), but makes no webhook send, no rotation and no write to `sims` or `reseller_sims`. Posts the intended-action list to `SLACK_WEBHOOK_URL`. |
+| `OFFLINE_LIFECYCLE_MAX_ACTIONS` | 25 | real transitions per tick: the blast-radius cap. |
+
+**New secret on `bad-rental-remediator`:** `FINALIZER_RUN_SECRET` (same value
+as reseller-sync's). Set it before enabling, or `/send-offline` returns 401.
+
+**New bindings on `bad-rental-remediator`:** `TELTIK_WORKER`, `MDN_ROTATOR`
+(both `-test` in `[env.test]`). Both force-rotate through each worker's existing
+`/rotate-sim?iccid=...&force=true` route with the shared `ADMIN_RUN_SECRET`,
+the same pattern `details-finalizer#forceRotateSim` already uses. No new rotate
+endpoint was added. `reseller-sync` DID gain one new internal route,
+`POST /send-offline`, which requires `?secret=$FINALIZER_RUN_SECRET` (the
+`X-Internal-Caller` header alone is rejected), because it owns webhook sending
+and had no offline sender a service binding could reach. Its dedup id includes
+the outage start, so a second outage on the same day is still sent. A reseller
+with no enabled webhook (412) is logged and the unassign continues.
+
+**New DB state** (`supabase/migrations/20260922_sim_offline_lifecycle.sql`,
+NOT yet applied to TEST or PROD):
+`sims.offline_state` (`'online'|'offline'`, NOT NULL DEFAULT `'online'`),
+`sims.offline_since`, `sims.offline_notified_at`, `sims.rotation_pause_reason`
+(`'host_offline'` only when the lifecycle paused rotation; NULL means an
+operator did and recovery must not touch it), `reseller_sims.deactivated_reason`
+/ `deactivated_at`, and `get_recent_hosting_port_checks(sim_ids, per_sim,
+since)` (newest N checks per SIM, one row per SIM, so no SIM starves the
+1000-row PostgREST limit). `claim_rotation_slot` still does not exist in
+TEST; apply it there too or the force-rotate leg cannot be exercised.
+
+**Safety rails:** default-off flag, dry run, per-tick action cap, 2-check
+confirm plus the `offline_state` latch (one notification per outage, not one per
+tick), a 1h per-SIM recovery cooldown, `port_in_pending` SIMs skipped entirely,
+and the rule that a read failure is `error` and never `offline`, so a Teltik API
+outage cannot mass-unassign the fleet.
+
+**Rollout order:** deploy with the flag off, run one hourly cycle with
+`OFFLINE_LIFECYCLE_DRY_RUN=true` and read the Slack digest, then enable writes.
 
 ## Session 2026-09-18 — 8 live PROD functions captured into migrations (PR #108), TEST DB partially reconciled
 
@@ -290,8 +608,10 @@ updating. The TEST key is at `/root/.config/incomingsms/agent-api-key.test` (mod
    (5 fenced routes → 403 `api_key_denied`, `GET /api/sims` → 200,
    `POST /api/sim-action` → 400 from the handler). Pinned by
    `tests/agent-api.test.mjs` (841 tests pass).
-2. **`DASHBOARD_BREAK_GLASS` is not off on TEST**, which is how the TEST key was
-   created without a human password. PROD break-glass stays off.
+2. **`DASHBOARD_BREAK_GLASS` was unset on TEST**, which under the old default meant
+   break-glass was on; that is how the TEST key was created without a human password.
+   Since the break-glass default flip (2026-09-22), unset means off everywhere; set the
+   flag to `on` to use break-glass. PROD break-glass stays off.
 3. A throwaway TEST account `agent-api-verify` was created to exercise a real session
    and left **disabled**. Delete it whenever.
 4. ~~`dashboard_audit_log` has no retention policy. It grows without bound.~~
@@ -317,7 +637,10 @@ tab. Deployed as dashboard version `d0d68a5f`; `DASHBOARD_BREAK_GLASS=off` since
 shared password no longer works. `DASHBOARD_SESSION_SECRET` is set on both `dashboard`
 and `dashboard-test`; values are in the repo `.dev.vars` as `DASHBOARD_SESSION_SECRET_PROD`
 / `_TEST`. `DASHBOARD_AUTH` is still set on prod but inert while break-glass is off — that
-is the re-entry path if auth ever breaks (delete the `DASHBOARD_BREAK_GLASS` secret).
+is the re-entry path if auth ever breaks. Since 2026-09-22 break-glass is off unless
+`DASHBOARD_BREAK_GLASS` is exactly `on` (any case); unset or any other value is off. To
+re-enter: set the secret to `on`, sign in with the shared password, fix, then set it back
+to `off` or delete it. Every break-glass login logs `[Auth] break-glass login used`.
 
 **The finding that shaped the design:** many dashboard action routes have no HTTP method
 guard, so a bare GET performs the action (`/api/activate`, `/api/cancel`, `/api/suspend`,
@@ -1189,6 +1512,10 @@ The 13 pending will clear in the next two 5-min finalizer cron ticks.
 
 ## In Progress / Pending Work
 
+### Open items from deleted branches (2026-09-22)
+- Idea from deleted branch fix/parked-teltik-recovery: a recovery step for Teltik SIMs that get parked mid-rotation (first seen SIM 8549); main has no equivalent.
+- Check from deleted branch fix/atomic-port-in-fields: confirm main does not log the ATOMIC port-in PIN in plain text; that branch fixed it and was never merged.
+
 ### Apex PPU-then-MDN — Phase 2 closed; live canary on SIM 2619 (session 57, 2026-05-20)
 **Status: apex flow shipped, flag ON, canary live on SIM 2619 only. End-to-end validated across 3 consecutive force-rotations with the new OSM pool. Tomorrow's `*/5 4-11 UTC` cron will exercise apex on production code path for SIM 2619 (legacy for the other ~625 atomic SIMs since their `canary_apex_ppu` is still false).**
 
@@ -1426,7 +1753,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 | 2026-06-16 | **Supabase security advisors cleared on prod (`lzjqegxazqlktttyybth`).** DB-only, no worker changes. Migration `lock_down_public_rls_critical`: enabled RLS on 10 RLS-off tables + dropped two `TO public USING(true)` policies (`sim_sms_daily`, `system_errors`). Migration `security_hardening_funcs_views`: pinned `search_path` on 18 functions, revoked `anon`/`authenticated`/`public` EXECUTE on 5 SECURITY DEFINER RPCs (`claim_rotation_slot`, `rotation_freshness`, `shop_claim_rental`, `shop_confirm_deposit`, `sweep_stuck_rotations`) + re-granted to `service_role` only, switched `helix_api_logs`/`shop_balances` views to `security_invoker`. Safe because backend is service-role-only (no anon/`createClient` usage anywhere); advisor now shows only INFO `rls_enabled_no_policy`. **Test project `lwapudjjlwkskijefxdz` still pending** — same SQL needs to be run there manually. | DB (no workers) |
 | 2026-05-21 | **Session 58 — overnight rotation post-mortem + daily rotation-review automation.** Day broke open with the discovery that PR-B (shipped 01:38 UTC) had a malformed PostgREST URL in its retry-candidates query (`reseller_sims!inner(...)` as standalone param instead of inside `select=`), throwing PGRST108 on every cron tick. Result: tonight's entire Teltik cron window rotated **0 of 714 eligible SIMs**. Separately, 39 atomic SIMs hit PPU verify failures at the first cron tick (04:16 UTC) and got locked out for the night by the cron's `last_mdn_rotated_at >= NY-midnight` pre-filter — my retry-loop fix wasn't deployed until 06:19 UTC. **Drained manually** via `/tmp/force_rotate.sh` (atomic: 42/43 ok) + `/tmp/teltik_parallel.sh` (627 sent, 540 ok, 87 CF-killed → 96 came back "Only 1 per 48h" because Teltik HAD rotated but our worker died before capturing the response → SQL-flipped to `mdn_pending` so finalizer drained them via `get-phone-number`). **Final tally**: 1273/1289 = 98.8% notified. **Then built a daily safety net** so this never recurs silently: new `/rotation-review` endpoint on details-finalizer (lock via `cron_runs` table, per-SIM 3-attempts/NY-day budget via `remediation_attempts` table + `attempts_today` RPC, vendor 5xx circuit breaker, atomic second-read verification, multi-day failure detection, playbook-driven classification via `src/shared/rotation-playbook.mjs`, Resend email gated on RESEND_API_KEY secret). CCR routine `rotation-review` (`trig_017nq9h7VPDnfoSy6dLhRnCR`) cron `30 12 * * *` UTC runs it daily, commits report to `agent/rotation-reviews/YYYY-MM-DD.md`, appends agent assessment. Dashboard "Rotation Reviews" tab at `/rotation-reviews` exposes everything: Run Now button, last-10 reviews table, full-report modal, pending operator items widget with Reply/Ack/Snooze/Dismiss + ask-the-agent textarea. Sidebar badge polls open-pending count. Three new tables (`cron_runs`, `remediation_attempts`, `pending_review_items`), 6 new dashboard API routes. **Deployed**: teltik-worker `bd5ed97d` (PR-B URL fix), mdn-rotator `1646b5cd` (PPU retry loop), bulk-activator `27cf893c` (DB-driven pool), details-finalizer `19da0151` → `6190c135` → `7616358f` → progressively (rotation-review endpoint), dashboard `cc95ff48` (Rotation Reviews tab). Migrations applied: `address_pool_usage_add_address_fields`, `claim_address_pool_entry_returns_row`, `list_zips_needing_refill`, `rotation_review_lock_and_attempts`, `rotation_review_dashboard`. CCR routine created + updated. Lots committed across `327abaf`, `da7f55c`, `8e311e4`, `5846733`, `1e9f763`. **Operator action needed**: add `RESEND_API_KEY` + `REPORT_EMAIL_TO` secrets on details-finalizer to enable email delivery (otherwise reports just commit to repo). | details-finalizer, dashboard, mdn-rotator, bulk-activator, teltik-worker, DB, CCR |
 | 2026-05-20 | **Session 55 — Teltik rotation silent-failure fix + reseller online_until correctness + PR-B staged.** Investigated why 506 active Teltik SIMs failed last night's rotation (2026-05-19→20) and never retried within the same 12–6am NY window, despite the cron running every 30 min. Root causes: (1) **Silent body-FAILED**: Teltik returns HTTP 200 with body `{status:"FAILED"}` for application-level rejections; `rotateOneTeltikSim` only checked `changeRes.ok` (HTTP status), so it flipped the SIM to `mdn_pending`, details-finalizer polled `get-phone-number` 8× over 30 min for an MDN that would never change, then the stuck-state guard marked `rotation_status='failed'` with the misleading message "MDN did not change within 30m (Teltik returned <same MDN>)". 5-day audit of `carrier_api_logs` showed 70 body-FAILED responses (no other ambiguous statuses — just SUCCESS / FAILED / 4xx-without-status). (2) **`last_mdn_rotated_at` stamped on attempt, not success**: `claim_rotation_slot` stamps it at the START of every rotation attempt; on failure the stamp stays (intentional dedup), but combined with the cron's `(now - last_mdn_rotated_at) >= 48h` filter this locks a SIM out of all subsequent ticks the same night AND the next 48h. (3) **Cron query filters `status=eq.active` only** — SIMs stuck in `status=provisioning, rotation_status=mdn_pending` (32 last night) are invisible to the cron entirely. (4) **Workers page "Run mdn-rotator" button doesn't touch Teltik**: `mdn-rotator/index.js:1247-1251` filters `vendor=neq.teltik` (Teltik handled by separate worker), and there's no "Run teltik-worker" button. (5) **Reseller `online_until` was wrong on failed attempts**: `reseller-sync` + `reseller-portal` computed `online_until` from `last_mdn_rotated_at` (attempt time), so a failed rotation pushed the reseller's expected MDN-expiry forward by 48h even though the MDN never actually changed. `sims.last_rotation_at` (set only on real success by details-finalizer) already existed but was unused — readers were using the wrong column. **Shipped:** **Fix #1** (deployed) — `teltik-worker/index.js:618-639` now parses `changeData.status`, throws `change-number body status=FAILED: <teltik error/message>` on body-FAILED so it lands in the existing catch and writes the real Teltik error into `last_rotation_error`. Eliminates the 30-min false-pending stall. **PR-A** (deployed) — `reseller-sync/index.js:61,116` and `reseller-portal/index.js:276,284-287` now prefer `last_rotation_at` over `last_mdn_rotated_at` for `online_until`, falling back to `last_mdn_rotated_at` when null (first-activation case where the column was stamped at import time). **PR-B** (code on disk + migration file, NOT YET DEPLOYED, awaiting migration apply): new sibling RPC `claim_rotation_retry_slot(p_sim_id bigint)` at `supabase/migrations/20260520_claim_rotation_retry_slot.sql` — accepts SIMs where `vendor='teltik' AND status IN ('active','provisioning') AND rotation_status='failed' AND rotation_eligible=true AND last_mdn_rotated_at >= today NY midnight AND last_mdn_rotated_at < NOW() - INTERVAL '15 minutes'`. Worker side: `rotateTeltikSims` gets a second query for failed-today candidates (deduped against `due`); `rotateOneTeltikSim` branches on `opts.retry===true` to call the new RPC. Returns extended cron stats `retry_eligible/retried/retry_skipped`. Deliberately scope-limited to Teltik via the RPC predicate, so Helix/ATOMIC/Wing IoT paths and the main `claim_rotation_slot` are untouched — full revert is `DROP FUNCTION claim_rotation_retry_slot(bigint);` + `wrangler rollback teltik-worker`. **Considered alternatives:** column split (new `last_rotation_attempt_at` + repurpose `last_mdn_rotated_at`) was rejected for higher blast radius (every reader audited, real schema migration, harder rollback). The sibling-RPC approach keeps `claim_rotation_slot` semantics identical for non-teltik vendors. **Also set up Supabase MCP server** (`@supabase/mcp-server-supabase`) — user-scope, project-ref=lzjqegxazqlktttyybth, token in `.dev.vars` as `SUPABASE_ACCESS_TOKEN`. Active in new sessions after `/clear` or restart. **Deployed**: teltik-worker `47cf46ef-082d-4eb5-89bf-de27419960de` (Fix #1), reseller-sync `03b72cae-4ab8-4c23-87be-48fa70a51f5e`, reseller-portal `e10f2156-e895-4675-b294-defa034e9bdd`. **NOT deployed**: PR-B teltik-worker code (Fix #1 IS deployed though — they're in the same file, future deploys carry both). User was manually rotating SIMs during the session — instructed me to "continue all the way" but the migration step requires either Supabase MCP (loads next session) or manual Studio apply. | teltik-worker, reseller-sync, reseller-portal, DB |
-| 2026-05-19 | **Session 54 — SIM Utilization Audit panel (Invoicing tab, block-level for Teltik).** User came in with the recurring question: TrustOTP claims they're using all ~1500 Teltik SIMs but daily billed-block counts swing wildly (88→1131→73→524 per day) and never sum cleanly to 1500. Explored two framings: (a) restructure rotations into Cycle Groups A/B for predictable daily totals (designed in `/home/zalmen/.claude/plans/date-est-scope-units-twinkling-glacier.md`, schema + parity helper + dashboard toggle), (b) build a read-only utilization audit that directly answers "how much of what we deliver is actually being used." Decided on (b) — same data, no schema or rotation change. Cycle-group design **deferred** to memory `project_teltik_cycle_groups_deferred.md` for future revisit. **Built:** new `computeResellerUtilization(env, {resellerId, start, end, vendors})` in `src/shared/billing.js` (additive; reuses `sbGet`/`sbGetAll` helpers, mirrors the block-iteration logic from `computeBillingBreakdown` lines 223-265). First version returned SIM-level only ("did SIM have ≥1 SMS in window"); when user pointed out his real concern was block-level utilization (each 48h rental, the unit that drives the bill), extended the helper with a second pass that fetches `sim_numbers` rotations in a `±2-day` widened window, walks each rotation's block range `[valid_from, min(valid_from+interval, next_valid_from))`, and per-SIM computes `blocks_in_window` / `blocks_billed` / `blocks_idle` / `block_utilization_pct` + `idle_block_dates[]`. Vendor-level aggregates `total_blocks`/`billed_blocks`/`idle_blocks`/`block_utilization_pct` only emitted for Teltik (null for atomic/helix/wing_iot since those bill per-SIM-day, not per-block). **Dashboard:** new `GET /api/utilization?reseller_id=&days=&vendor=` route. Panel originally placed in Billing tab; user corrected — Billing tab is for auditing *vendor bills we pay*, not what we charge resellers; moved to **Invoicing** tab. Panel: reseller selector (auto-defaults to TrustOTP via case-insensitive name match), vendor selector, window selector (7/14/30d), Run Audit button, summary cards (block-level headline for Teltik, SIM-level for AT&T; color thresholds green≥99% / yellow≥90% / red<90% since the realistic numbers are near 100), table with 11 columns including idle block dates, "Show fully-utilized SIMs too" toggle, CSV export. Table default filter: SIMs with ≥1 idle block, sorted by `blocks_idle DESC` (worst first). **Verified end-to-end against the user's pasted bill report (2026-05-09 to 2026-05-15):** audit returned 4,997 billed of 5,030 total Teltik blocks = **99.3% block utilization, 33 idle blocks across 7 days, 1502/1502 SIMs active**. Matches bill total 4,996 (off by 1 — one SMS arrived between report and audit). My earlier napkin-math estimate of 95% / 5,257 theoretical blocks was wrong because not every SIM rotates *exactly* every 48h (cron timing + 0–6am NY window limits actual rotation events). **Conclusion: TrustOTP is using all SIMs; bill is correct; cycle groups not needed.** Two recurring escaping bugs caught in patch flow: (a) `'\n'` in a patch-script source string evaluates to a literal newline inside the outer `getHTML()` template literal — must write `'\\n'` (two backslashes) in patch-script source to land `\n` literal in file so getHTML evaluates to the escape sequence and runtime gets a newline; (b) relay-check false positives in `src/dashboard/index.js` for browser-side kasa fetches and `src/reseller-portal/index.js` for browser-side login fetch — the checker looks for `function getHTML()` (empty parens) but actual signature is `function getHTML(helixEnabled)`, so getHTML's body is never stripped. Pre-existing; not in this session's diff. Both syntax checks pass (`node --check`, `_check_frontend_js.js`); CRLF preserved. +454/-2 lines content delta (whitespace-ignoring; raw stat shows 32K lines due to CRLF normalization round-trip in patch script). **Deployed:** dashboard `a591ef79` (v1), then `a5a78f45` (v2 after panel move + block-level upgrade). **Committed at session close** (this session). | dashboard, shared/billing |
+| 2026-05-19 | **Session 54 — SIM Utilization Audit panel (Invoicing tab, block-level for Teltik).** User came in with the recurring question: TrustOTP claims they're using all ~1500 Teltik SIMs but daily billed-block counts swing wildly (88→1131→73→524 per day) and never sum cleanly to 1500. Explored two framings: (a) restructure rotations into Cycle Groups A/B for predictable daily totals (designed in `/home/zalmen/.claude/plans/date-est-scope-units-twinkling-glacier.md`, schema + parity helper + dashboard toggle), (b) build a read-only utilization audit that directly answers "how much of what we deliver is actually being used." Decided on (b) — same data, no schema or rotation change. Cycle-group design **deferred** to memory `project_teltik_cycle_groups_deferred.md` for future revisit. **Built:** new `computeResellerUtilization(env, {resellerId, start, end, vendors})` in `src/shared/billing.js` (additive; reuses `sbGet`/`sbGetAll` helpers, mirrors the block-iteration logic from `computeBillingBreakdown` lines 223-265). First version returned SIM-level only ("did SIM have ≥1 SMS in window"); when user pointed out his real concern was block-level utilization (each 48h rental, the unit that drives the bill), extended the helper with a second pass that fetches `sim_numbers` rotations in a `±2-day` widened window, walks each rotation's block range `[valid_from, min(valid_from+interval, next_valid_from))`, and per-SIM computes `blocks_in_window` / `blocks_billed` / `blocks_idle` / `block_utilization_pct` + `idle_block_dates[]`. Vendor-level aggregates `total_blocks`/`billed_blocks`/`idle_blocks`/`block_utilization_pct` only emitted for Teltik (null for atomic/helix/wing_iot since those bill per-SIM-day, not per-block). **Dashboard:** new `GET /api/utilization?reseller_id=&days=&vendor=` route. Panel originally placed in Billing tab; user corrected — Billing tab is for auditing *vendor bills we pay*, not what we charge resellers; moved to **Invoicing** tab. Panel: reseller selector (auto-defaults to TrustOTP via case-insensitive name match), vendor selector, window selector (7/14/30d), Run Audit button, summary cards (block-level headline for Teltik, SIM-level for AT&T; color thresholds green≥99% / yellow≥90% / red<90% since the realistic numbers are near 100), table with 11 columns including idle block dates, "Show fully-utilized SIMs too" toggle, CSV export. Table default filter: SIMs with ≥1 idle block, sorted by `blocks_idle DESC` (worst first). **Verified end-to-end against the user's pasted bill report (2026-05-09 to 2026-05-15):** audit returned 4,997 billed of 5,030 total Teltik blocks = **99.3% block utilization, 33 idle blocks across 7 days, 1502/1502 SIMs active**. Matches bill total 4,996 (off by 1 — one SMS arrived between report and audit). My earlier napkin-math estimate of 95% / 5,257 theoretical blocks was wrong because not every SIM rotates *exactly* every 48h (cron timing + 0–6am NY window limits actual rotation events). **Conclusion: TrustOTP is using all SIMs; bill is correct; cycle groups not needed.** Two recurring escaping bugs caught in patch flow: (a) `'\n'` in a patch-script source string evaluates to a literal newline inside the outer `getHTML()` template literal — must write `'\\n'` (two backslashes) in patch-script source to land `\n` literal in file so getHTML evaluates to the escape sequence and runtime gets a newline; (b) relay-check false positives in `src/dashboard/index.js` for browser-side kasa fetches and `src/reseller-portal/index.js` for browser-side login fetch — the checker looks for `function getHTML()` (empty parens) but actual signature is `function getHTML(helixEnabled)`, so getHTML's body is never stripped. Pre-existing; not in this session's diff. Both syntax checks pass (`node --check`, `scripts/check-frontend-js.js`); CRLF preserved. +454/-2 lines content delta (whitespace-ignoring; raw stat shows 32K lines due to CRLF normalization round-trip in patch script). **Deployed:** dashboard `a591ef79` (v1), then `a5a78f45` (v2 after panel move + block-level upgrade). **Committed at session close** (this session). | dashboard, shared/billing |
 | 2026-05-15 | **Session 53 — TrustOTP MDN report investigation + webhook_deliveries JSONB index.** Trustotp emailed a 1,084-row report (`damp-mountain-16002372_main_neondb_2026-05-14_10-05-29.csv`) listing MDNs that were active >48 hours, totaling $1,298.80 ($1.10/$1.60/$2.20/$0.00 tiers). Built `scratch/investigate.py` — a sequential investigator that, per MDN, joins `sim_numbers` + `sims` + `sim_status_history` + per-MDN `number.online` and `sms.received` rows from `webhook_deliveries`, then emits a plain-language prose note describing every activation period: which SIM(s) carried it, the `online_until` from the first number.online webhook, SMS counts (with day-by-day breakdown when split), billable-day computation, and post-shutdown false re-onlines for helix MDNs (helix→AT&T 2026-04-01 account-wide cancellation mapped from DB date 2026-04-15). Vendor names are stripped from the prose — only carrier (`att`/`tmobile`) is shown. **Performance pivot mid-session**: the per-MDN webhook queries (`payload->'data'->>'number' = '+1...'`) were doing sequential scans of `webhook_deliveries` (649K sms.received + 80K number.online rows); ran fine sequentially at ~15–20s/MDN but was projected to finish at hour 5+ and was burning Supabase Disk IO budget. Created `idx_webhook_deliveries_payload_number ON webhook_deliveries (event_type, ((payload->'data'->>'number')))` via `CREATE INDEX CONCURRENTLY`. Verified planner picks it up (Index Scan, not Seq Scan); per-query latency dropped from ~5s to ~0.5s. Final pipeline split: 112 stratified-sample rows (pre-index, ~30 min) + 315 head-of-list rows (pre-index, ~30 min before pause) + 657 tail rows (post-index, <10 min). Merged into `damp-mountain-16002372_annotated_full.csv` (1,084 rows, zero errors, zero pending) in the user's repo root. **Key finding for the user**: trustotp's $1.10 tier does NOT correlate with our internal billable-day count — e.g. some MDNs got 75 SMS across 4 days (3 billable days by our 48h-window rule) and were billed $1.10, others got 8 SMS in 1 day and were billed $2.20. Their pricing logic is independent of usage. **Repo state**: no tracked files changed. New untracked artifacts: `damp-mountain-16002372_*.csv` (input + annotated full + sample at repo root), `scratch/investigate.py` + intermediate CSVs. Worth keeping unless cleaning up. | DB index, scratch tooling |
 | 2026-05-12 | **Session 52 — Mastercard-inspired dashboard redesign (test env only, uncommitted).** Full visual reskin of `src/dashboard/index.js` per new `DESIGN.md` reference. `--dark-N` CSS variables remapped to Mastercard cream tones (so all existing Tailwind `bg-dark-*` / `text-dark-*` class usages auto-style without per-element edits), override layer translates `bg-blue-*`/`bg-green-*`/`bg-red-*`/`bg-yellow-*`/`bg-orange-*` to ink/forest/red/Signal Orange, Sofia Sans typography (weight 450 body / 500 -2%-tracked headings), 20px/24px/40px/999px radius scale, soft 48px-spread shadows. Page header rebuilt as eyebrow + dynamic title + subtitle via new `PAGE_HEADERS` map in `switchTab`; sidebar brand is now circular ink logo + "OPERATOR" eyebrow; top-right "Connected" pill replaces the pulse dot. **CSS pitfall**: `.hover\:bg-blue-X:hover` class selectors with the standard Tailwind `\:` escape were silently dropped by the browser CSS parser when read from the static `<style>` block (raw HTTP bytes verified correct, identical rules parse fine via `insertRule` — root cause unresolved, possibly Tailwind CDN's DOM observer interfering). Worked around with attribute-selector form `[class*='hover:bg-blue-']:hover` which avoids the escape entirely. Pattern recorded for future sessions. +432 / −70 lines, only `src/dashboard/index.js` touched. **Deployed to `dashboard-test` (version `e4c764b3-bea6-4dc7-97fe-1f335a0c93a2`). Prod NOT updated.** Awaiting user review before commit + prod deploy. | dashboard |
 | 2026-05-11 | **Session 51 — gateway slot capacity tracking + defective slot hiding.** Multi-SIM gateways (8 slots/port) crash when all 8 slots carry SIMs; safe cap is 5/port. Added two related features on the `/gateways` page. (1) New `gateway_defective_slots(gateway_id, port_slot, reason, created_at, UNIQUE(gateway_id,port_slot))` table — migration `20260511_gateway_defective_slots`, RLS enabled (service-role bypasses). (2) Three new API routes in `src/dashboard/index.js`: `GET /api/gateway-defective-slots?gateway_id=X` lists, `POST` upserts with `?on_conflict=gateway_id,port_slot` + `Prefer: resolution=merge-duplicates,return=representation` (normalizes `port_slot` through existing `normalizeImeiPoolPort` before insert), `DELETE` unmarks. (3) Frontend (via `patch-dashboard` skill, 4 patch scripts): new state `defectiveSlotsCache: Set<"port.slot">` + `showDefectiveSlots: bool`; `loadDefectiveSlots(gatewayId)` runs in parallel with the existing skyline `port-info` fetch; new helpers `markSlotDefective`/`unmarkSlotDefective` (POST/DELETE + reload, no native `prompt()` — uses `showConfirm`); new `renderUnderFilledPorts()` panel below the Port Status grid. Marking is per-slot from the slot-detail modal (new red "Mark Defective" / gray "Mark Working" button per row, alongside Lock/Unlock/Switch). **Under-Filled Ports panel** groups slots by physical port, computes `seated = count(inserted===1 AND !defective)`, `target = min(5, working_slots)`, lists ports where `seated < target` with "needs N more" hint; multi-slot ports only. **Port-grid layout**: detects multi-slot gateways (any physical port with >1 slot) and renders one row per port (label + horizontal slot cards in a flex-wrap) instead of the flat 16-column grid — keeps slots grouped when defectives are hidden. Single-slot gateways (64-1) keep the original grid. **Show defective** checkbox in the Port Status header toggles visibility globally; defective cards render with `bg-dark-900 opacity-60 border-red-700/60` styling and a red status label. **Bug caught mid-session**: regex literals `/^(\\d+)\\./` in source were eaten by the outer `getHTML()` template literal (unrecognized escapes drop the backslash), producing `/^(d+)./` in the browser — so `renderUnderFilledPorts` never matched any port string and the panel always reported "all at or above target". Same class of bug as the 2026-03-24 `\\n`→newline incident already documented in `agent/constraints.md §1`. Fixed by using `\\\\d` / `\\\\.` in patch-script source. The pre-existing `exportGatewayTable` at line 11199 has the same latent bug (`/^(\\d+)\\.(\\d+)$/`) — left alone since it's outside this feature; flag if CSV export starts misbehaving on multi-slot gateways. **Bulk-marked**: 144 slots across 18 fully-empty ports on gateway 512-2 (ports 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36 — clear dead-PCB-row pattern, even numbers only) via API loop. Reason: "Empty port - no SIM ever seated; marked via bulk import". **Deployed**: dashboard `a468c374-7e7e-46d0-aa8b-fd9f2de8be9b`. Migration applied via MCP. | dashboard, DB |
@@ -1483,7 +1810,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 | 2026-04-15 | **Helix Quarantine (session 16):** Full audit + quarantine of all Helix code behind `HELIX_ENABLED=false` flag on 7 workers. mdn-rotator daily cron fixed to rotate ATOMIC SIMs (50/50 success on first prod tick). 4 provider-leak bugs fixed (vendor defaults, billing aggregation). Dashboard: Helix UI elements hidden/disabled when flag off, 3 backend routes return 503, queryHelix functions gated. | mdn-rotator, bulk-activator, sim-canceller, sim-status-changer, ota-status-sync, details-finalizer, dashboard |
 | 2026-04-15 | Dashboard: shift-click range selection on SIM checkboxes (sims page) | dashboard |
 | 2026-04-15 | mdn-rotator: ATOMIC manual rotation path added — `rotateSpecificSim` now branches on vendor; new `rotateAtomicSim` calls swapMSISDN + fallback inquiry + DB/webhook writes. Daily queue (rotateSingleSim) still silently skips ATOMIC — not yet migrated. | mdn-rotator |
-| 2026-04-15 | Dashboard: gateway "Export Table" button — scans selected gateway via skyline-gateway `/port-info?all_slots=1` and downloads CSV (port/slot/iccid/imei/number/operator/signal/sim_status/state). Caught 522 escaping bug mid-session (regex char class `\n\r` became literal newlines) — fix: `\\n\\r` in source. Surfaced by `_check_frontend_js.js`. | dashboard |
+| 2026-04-15 | Dashboard: gateway "Export Table" button — scans selected gateway via skyline-gateway `/port-info?all_slots=1` and downloads CSV (port/slot/iccid/imei/number/operator/signal/sim_status/state). Caught 522 escaping bug mid-session (regex char class `\n\r` became literal newlines) — fix: `\\n\\r` in source. Surfaced by `scripts/check-frontend-js.js`. | dashboard |
 | 2026-04-15 | Dashboard: `/api/delete-sim` route + per-row Del button; child-row cleanup (sim_numbers, inbound_sms, reseller_sims, sim_status_history) + nullify system_errors.sim_id | dashboard |
 | 2026-04-15 | Dashboard: `/api/relay-test` route + new API Tester tab; presets for ATOMIC/Wing IoT/Teltik/Helix + custom | dashboard |
 | 2026-04-15 | Dashboard: `/api/atomic-query` route + separate ATOMIC option in bulk Query modal (was merged into Helix). Auto-routes by vendor in `querySimCarrier`. ATOMIC credentials (ATOMIC_USERNAME/TOKEN/PIN) pushed to dashboard worker + added to `.dev.vars`. | dashboard |
@@ -1495,7 +1822,7 @@ Lists 5 of 12 workers and has stale environment variable names. Not critical but
 | 2026-03-27 | Billing: vendor-split billing — Teltik SIMs billed per 48h block at 2× daily_rate; Helix SIMs billed per calendar day at daily_rate; both preview and CSV download updated; buildCSV uses per-row rate | dashboard |
 | 2026-03-25 | Teltik webhook: 48h guard stamped on change-number initiation (before polling); fallback to get-phone-number if polling fails; online_until = midnightNYAfterInterval(last_mdn_rotated_at, interval_hours) in all 3 code paths; carrier field (T-Mobile/att) added to all number.online payloads; webhook handler fixed for Teltik push format (destination/origin/message/timestamp) + array payload support | teltik-worker, reseller-sync, dashboard |
 | 2026-03-25 | Teltik vendor integration: new `teltik-worker` (import/webhook/rotate/setup-webhook), DB migration adds vendor/carrier/rotation_interval_hours to sims, mdn-rotator filters to helix-only + vendor guard in rotateSpecificSim, reseller-sync vendor-aware online_until + interval-based backstop skip, dashboard vendor column/filter/Import button | teltik-worker (new), mdn-rotator, reseller-sync, dashboard, DB migration |
-| 2026-03-24 | Dashboard: fixed two prod bugs from prior session — missing fetch URLs in queryHelix/queryHelixBulk (bare backtick issue) and \n→newline in dbLines.join (template literal escape bug); rewrote _check_frontend_js.js to use Node vm.runInContext to accurately simulate template evaluation | dashboard |
+| 2026-03-24 | Dashboard: fixed two prod bugs from prior session — missing fetch URLs in queryHelix/queryHelixBulk (bare backtick issue) and \n→newline in dbLines.join (template literal escape bug); rewrote scripts/check-frontend-js.js to use Node vm.runInContext to accurately simulate template evaluation | dashboard |
 | 2026-03-24 | patch-dashboard skill updated: added frontend JS check step (vm-based), documented correct BT='\\\\'+'\`' escaping pattern, added explicit --env flag warning | — |
 | 2026-03-24 | IP relay: VPS at 74.208.37.8, Node.js relay service on relay.zmawsolutions.com (HTTPS/TLS); helix.ts `relayFetch()` routes all 5 Helix API calls through relay; RELAY_URL + RELAY_KEY secrets pushed + deployed to 6 workers | bulk-activator, details-finalizer, mdn-rotator, ota-status-sync, sim-canceller, sim-status-changer |
 | 2026-03-23 | Dashboard: Gemini UI redesign (zinc/blue palette, expanded sidebar w/ labels, Inter font, mobile responsive); light/dark mode toggle (CSS vars + localStorage); all 26 confirm()→showConfirm() + 14 alert()→showToast() | dashboard |
@@ -1555,3 +1882,12 @@ These items were verified to be working correctly as of their last check:
 ## Open Questions
 
 _None currently tracked._
+
+---
+
+## 2026-09-23 — morning check and secrets inventory (branch `docs/secrets-inventory`)
+
+- **mdn-rotator on the timeout code (first window, 04:00–04:26 UTC):** clean. PROD `system_errors` has 0 rows since 2026-09-22 20:00 UTC. 891 SIMs rotated since 04:00 (266 of 291 active ATOMIC, 625 Teltik). Tail of the 04:20 and 04:25 ticks: outcome ok, 0 exceptions, no `timeout after`, no `pre-swap inquiry network error`. Each tick logged Helix `Token failed: 429 too_many_attempts` (account blocked); 0 active Helix SIMs, so harmless, but the per-tick token fetch keeps the account locked.
+- **Offline lifecycle 04:00 tick:** acted. 25 SIMs now `offline_state = offline` (5507 online); 25 `reseller_sims` rows got `deactivated_reason = host_offline`, all in the 04:00 hour. 0 `system_errors` from bad-rental-remediator since 03:00.
+- **`agent/secrets-inventory.md`** added: 83 names, where each lives, how to rotate. Refresh with `python3 scripts/list-live-vars.py` (read-only, names only). Open items it raised: kasa-control PROD has no auth on `/outlet` and `/reboot-gateways` (workers.dev); 42 live secrets no code reads; TEST lacks 105 secrets PROD has (bad-rental-remediator-test has no Supabase or carrier keys).
+- `npm test` on `origin/main` (28312d1): 1151 pass, 5 fail, all in `tests/bad-rental-remediator-drain.test.mjs` and `tests/bad-rental-remediator-lifecycle-fixes.test.mjs`. Not caused by this branch (docs and a script only).

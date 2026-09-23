@@ -27,6 +27,7 @@
 
 import { mintNonce, buildVerifyBody, cleanRecheckPredicate } from './verify.mjs';
 import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
+import { sbGet, sbPatch, sbPost } from '../shared/supabase-rest.mjs';
 
 const RECEIVE_WINDOW_MS = 5 * 60 * 1000; // §C.3 — 5 min, 30 × 10s polls.
 const SEND_MAX_ATTEMPTS = 3;             // §C.2
@@ -187,18 +188,15 @@ export async function resolvePendingVerify(env, report, opts) {
     });
     // Mirror the dashboard/applyClassificationState timeline row for a remediated close.
     try {
-      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
-        method: 'POST',
-        headers: supabaseHeaders(env, false),
-        body: JSON.stringify({
-          report_id: report.id,
-          from_status: report.status || null,
-          to_status: 'remediated',
-          actor: 'auto-remediator',
-          note: 'auto-remediator §C verified (inbound nonce received)',
-          evidence: { source: 'auto_remediator', verify: 'received', inbound_sms_id: match.id },
-        }),
-      });
+      // unchecked: audit-event insert; a non-2xx is ignored (unchanged behaviour).
+      await sbPost(env, 'rental_report_events', {
+        report_id: report.id,
+        from_status: report.status || null,
+        to_status: 'remediated',
+        actor: 'auto-remediator',
+        note: 'auto-remediator §C verified (inbound nonce received)',
+        evidence: { source: 'auto_remediator', verify: 'received', inbound_sms_id: match.id },
+      }, { prefer: 'return=minimal', raw: true });
     } catch (e) {
       console.log('[Verify] remediated event log insert failed report=' + report.id + ': ' + e);
     }
@@ -233,22 +231,19 @@ export async function resolvePendingVerify(env, report, opts) {
     // in_triage), so to_status carries the unchanged status and the real
     // transition rides in evidence, matching the dashboard's convention.
     try {
-      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
-        method: 'POST',
-        headers: supabaseHeaders(env, false),
-        body: JSON.stringify({
-          report_id: report.id,
-          from_status: report.status || null,
-          to_status: report.status || null,
-          actor: 'auto-remediator',
-          note: 'auto-remediator escalated: verify_receive_timeout',
-          evidence: {
-            source: 'auto_remediator', escalation_reason: 'verify_receive_timeout',
-            nonce: report.verify_pending_nonce, to_number: toNumber, window_ms: RECEIVE_WINDOW_MS,
-            auto_remediation_state_from: 'verify_pending', auto_remediation_state_to: 'escalated',
-          },
-        }),
-      });
+      // unchecked: audit-event insert; a non-2xx is ignored (unchanged behaviour).
+      await sbPost(env, 'rental_report_events', {
+        report_id: report.id,
+        from_status: report.status || null,
+        to_status: report.status || null,
+        actor: 'auto-remediator',
+        note: 'auto-remediator escalated: verify_receive_timeout',
+        evidence: {
+          source: 'auto_remediator', escalation_reason: 'verify_receive_timeout',
+          nonce: report.verify_pending_nonce, to_number: toNumber, window_ms: RECEIVE_WINDOW_MS,
+          auto_remediation_state_from: 'verify_pending', auto_remediation_state_to: 'escalated',
+        },
+      }, { prefer: 'return=minimal', raw: true });
     } catch (e) {
       console.log('[Verify] escalated event log insert failed report=' + report.id + ': ' + e);
     }
@@ -361,8 +356,8 @@ async function readSimE164(env, simId) {
   // returned HTTP 400 -> null -> the receive poll exited `still_pending`
   // forever and verify_pending reports never resolved (INC-25 column trap).
   // Read msisdn and synthesize E.164 to match inbound_sms.to_number (+1XXXXXXXXXX).
-  const r = await supabaseGet(env,
-    'sims?id=eq.' + encodeURIComponent(simId) + '&select=msisdn&limit=1');
+  const r = await sbGet(env,
+    'sims?id=eq.' + encodeURIComponent(simId) + '&select=msisdn&limit=1', { raw: true });
   if (!r.ok) return null;
   const rows = await r.json();
   const msisdn = rows && rows[0] && rows[0].msisdn;
@@ -390,7 +385,7 @@ async function findNonceInbound(env, { toNumber, nonce, afterIso }) {
     + '&body=like.' + encodeURIComponent(pattern)
     + '&select=id,to_number,from_number,body,received_at'
     + '&order=received_at.desc&limit=1';
-  const r = await supabaseGet(env, q);
+  const r = await sbGet(env, q, { raw: true });
   if (!r.ok) return null;
   const rows = await r.json();
   return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
@@ -400,18 +395,14 @@ async function fetchVerifyPendingReports(env, limit) {
   const q = 'rental_reports?auto_remediation_state=eq.verify_pending'
     + '&select=id,sim_id,e164,status,verify_pending_nonce,verify_pending_sent_at'
     + '&order=verify_pending_sent_at.asc&limit=' + limit;
-  const r = await supabaseGet(env, q);
+  const r = await sbGet(env, q, { raw: true });
   if (!r.ok) return [];
   const rows = await r.json();
   return Array.isArray(rows) ? rows : [];
 }
 
 async function insertAttempt(env, row) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_remediation_attempts', {
-    method: 'POST',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify(row),
-  });
+  const resp = await sbPost(env, 'rental_report_remediation_attempts', row, { prefer: 'return=minimal', raw: true });
   if (!resp.ok) {
     const txt = await resp.text();
     console.log('[Verify] attempt insert failed report=' + row.report_id + ' status=' + resp.status + ' body=' + txt);
@@ -419,33 +410,11 @@ async function insertAttempt(env, row) {
 }
 
 async function patchReport(env, reportId, patch) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(reportId), {
-    method: 'PATCH',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify(patch),
-  });
+  const resp = await sbPatch(env, 'rental_reports?id=eq.' + encodeURIComponent(reportId), patch, { prefer: 'return=minimal', raw: true });
   if (!resp.ok) {
     const txt = await resp.text();
     console.log('[Verify] report PATCH failed id=' + reportId + ' status=' + resp.status + ' body=' + txt);
   }
-}
-
-async function supabaseGet(env, path) {
-  return fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-    },
-  });
-}
-
-function supabaseHeaders(env, returnRep) {
-  return {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-    'Content-Type': 'application/json',
-    Prefer: returnRep ? 'return=representation' : 'return=minimal',
-  };
 }
 
 function realSleep(ms) {

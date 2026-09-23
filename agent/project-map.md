@@ -107,7 +107,9 @@ Port format stored in DB: dot-notation zero-padded — `"13.03"` (not `"13C"` or
 | `qbo_customer_map` | Reseller → QBO customer mapping | reseller_id, qbo_customer_id, daily_rate |
 | `qbo_invoices` | Generated invoices | qbo_customer_map_id, week_start, week_end, sim_count, total, status |
 
-**DB constraints:** RLS enabled on all public tables (service_role bypasses automatically). `imei_pool.status` enum: `available`, `in_use`, `retired`, `blocked`. Unique index `idx_sims_unique_gateway_port` on `sims(gateway_id, port)`.
+**DB access model:** Only `service_role` (every Worker) and `postgres` may touch `public`. Before 2026-09-22 this was not true: RLS was on for every PROD table, but a 2026-09-08 migration (`anon_readonly_all_except_credential_tables`) gave the public anon key a read-everything policy on 60+ tables, and on TEST the anon key could read and write `sims`, `gateways`, `resellers` and 9 more tables (one table had RLS off). `supabase/migrations/20260922_lock_down_anon.sql` drops every anon/authenticated policy, revokes all their table, sequence and function grants (and the future-object defaults), and enables RLS with no policies on every table. Applied to TEST 2026-09-22; PROD pending. `tests/migrations-no-anon-grants.test.mjs` fails any new migration that grants to anon/authenticated without an `-- anon-grant-approved:` comment.
+
+**DB constraints:** `imei_pool.status` enum: `available`, `in_use`, `retired`, `blocked`. Unique index `idx_sims_unique_gateway_port` on `sims(gateway_id, port)`.
 
 ## Main Data Flows
 
@@ -154,8 +156,6 @@ Dashboard or CSV → POST to bulk-activator or sim-activation-queue
 
 | File | Exports |
 |------|---------|
-| `helix.ts` | `getCachedToken`, `hxMdnChange`, `hxSubscriberDetails`, `hxOtaRefresh`, `hxChangeSubscriberStatus`, `logHelixApiCall` |
 | `subscriber-sync.js` | `syncSimFromHelixDetails(env, simRow, detailsResponse, {isFinalization})` |
-| `supabase.ts` | `supabaseGet`, `supabaseSelect`, `supabaseInsert`, `supabasePatch` |
-| `utils.ts` | `sleep`, `normalizeToE164`, `generateMessageIdAsync`, `retryWithBackoff` |
-| `types.ts` | `Env` interface (all secrets + bindings) |
+| `supabase-rest.mjs` | `sbHeaders`, `sbGet`, `sbGetAll`, `sbPost`, `sbPatch`, `sbDelete`, `sbRpc`, `SupabaseError`, `PAGE_SIZE`. PostgREST calls with the service-role key through `supabaseFetch`; a non-2xx throws `SupabaseError`. `{ raw: true }` returns the fetch Response instead (no throw) for call sites that branch on `res.ok`; `{ logRows: true }` logs how many rows a write touched. No worker outside the dashboard keeps its own copy; `tests/shared-supabase-rest.test.mjs` fails if one comes back. The old TypeScript shared modules (`supabase.ts`, `helix.ts`, `atomic.ts`, `wing-iot.ts`, `utils.ts`, `types.ts`) were deleted with the stale TEST `index.ts` entrypoints. |
+| `fetch-timeout.mjs` | `supabaseFetch`, `carrierFetch`, `webhookFetch`, `fetchWithTimeout`, `timeoutFor`, `CARRIER_TIMEOUT_MS` (45 s), `SUPABASE_TIMEOUT_MS` (15 s), `WEBHOOK_TIMEOUT_MS` (10 s). Every carrier, database and webhook call outside the dashboard goes through one of these (#117); override per worker with `FETCH_TIMEOUT_*_MS`. |

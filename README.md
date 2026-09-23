@@ -1,115 +1,148 @@
-# Incoming SMS - Cloudflare Workers
+# IncomingSMS — Cloudflare Workers
 
-A collection of Cloudflare Workers for handling incoming SMS messages with SIM card management and routing capabilities.
+IncomingSMS rents out phone lines that receive SMS. It activates SIM cards
+with the carrier, keeps each line's phone number and IMEI healthy, receives
+the text messages that arrive on those lines, and delivers them to resellers
+and customers. Operators run everything from one web dashboard.
+
+All SIMs are hosted by Teltik. The SkyLine gateway hardware and Wing IoT
+lines are retired; the code that still mentions them is legacy.
 
 ## Workers
 
-This project contains multiple Cloudflare Workers:
+Each directory under `src/` is one Cloudflare Worker with its own
+`wrangler.toml`. `src/shared/` holds code the workers import.
 
-- **sms-ingest** - Main worker for receiving and processing incoming SMS messages
-- **bulk-activator** - Handles bulk SIM activation operations
-- **details-finalizer** - Finalizes SIM card details
-- **mdn-rotator** - Manages phone number rotation for SIM cards
-- **reseller-sync** - Synchronizes data with reseller systems
+| Worker | What it does |
+|---|---|
+| `dashboard` | Operator web app and API for every manual operation; calls the other workers over service bindings |
+| `sms-ingest` | Receives pushed SMS, stores them, and triggers an IMEI change on AT&T "unsupported device" messages |
+| `teltik-worker` | Teltik line management: imports lines, receives SMS webhooks, rotates numbers |
+| `bulk-activator` | Activates SIM cards (queue consumer plus HTTP `/activate`) |
+| `details-finalizer` | Polls provisioning SIMs and promotes them to active once the carrier returns a number |
+| `mdn-rotator` | Daily phone-number rotation, the fix-SIM flow, and manual SIM actions |
+| `ota-status-sync` | Syncs over-the-air update status from the carrier |
+| `reseller-sync` | Re-sends `number.online` webhooks that failed during rotation |
+| `sim-canceller` | Cancels a SIM with the carrier |
+| `sim-status-changer` | Suspends or restores a SIM with the carrier |
+| `phone-number-sync` | Utility worker that syncs phone numbers |
+| `bad-rental-remediator` | Diagnoses and fixes rentals reported as not working |
+| `quickbooks` | QuickBooks Online sign-in, customer mapping, and invoices |
+| `reseller-portal` | Read-only portal and JSON API for resellers (own SIMs, invoices, usage) |
+| `storefront` | Customer-facing shop for day rentals of SMS numbers |
+| `otp-portal` | Small login-gated page that hands a trusted user one temporary number |
+| `teltik-portal` | Small login-gated page for Teltik support to check and reset lines |
+| `skyline-gateway` | Legacy: relay to the retired SkyLine gateway hardware |
+| `kasa-control` | Legacy: power control for the retired gateway hardware |
+
+`agent/project-map.md` has triggers, bindings, queues, and data flows.
+
+## Services used
+
+- **Supabase** — the database (PostgREST). Workers use the service-role key.
+- **Cloudflare Workers** — runs every worker, plus queues and KV.
+- **Teltik** — hosts every SIM; SMS forwarding, port resets, SIM swaps.
+- **ATOMIC** — AT&T wholesale API: activation, subscriber changes, port-ins.
+- **QuickBooks Online** — reseller invoicing.
+- **Resend** — outgoing email.
+
+Helix (the older AT&T SOLO API) code is still present behind the
+`HELIX_ENABLED` flag and is legacy.
 
 ## Prerequisites
 
-- Node.js (v18 or later)
-- npm or yarn
-- Cloudflare account with Workers enabled
-- Wrangler CLI (Cloudflare Workers CLI tool)
+- Node.js 20 or later
+- A Cloudflare account with access to the `zalmen-531` workers
+- Wrangler (`npx wrangler` works; no global install needed)
 
-## Setup for Development
+## Local setup
 
-1. **Install dependencies**
-   ```bash
-   npm install -g wrangler
-   ```
-
-2. **Configure environment variables**
-
-   Copy the example environment file:
+1. Copy the example variables and fill them in:
    ```bash
    cp .dev.vars.example .dev.vars
    ```
-
-   Edit `.dev.vars` and add your configuration:
-   - `SUPABASE_URL` - Your Supabase project URL
-   - `SUPABASE_SERVICE_ROLE_KEY` - Your Supabase service role key
-   - `GATEWAY_SECRET` - Secret key for SMS gateway authentication
-   - `RESELLER_WEBHOOK_URL` - (Optional) Webhook URL for reseller notifications
-
-3. **Authenticate with Cloudflare**
+2. Run one worker locally:
    ```bash
-   wrangler login
+   cd src/<worker-name>
+   npx wrangler dev
    ```
+   The worker is served at `http://localhost:8787`.
 
-## Development
+Never commit `.dev.vars` or paste secrets into chat. Set production secrets
+with `printf` (not `echo`), because `echo` adds a newline to the value:
+```bash
+printf '%s' "$VALUE" | npx wrangler secret put NAME
+```
 
-To develop a specific worker locally:
+## Tests
 
 ```bash
-# SMS Ingest Worker
-cd src/sms-ingest
-wrangler dev
-
-# Or for other workers
-cd src/bulk-activator
-wrangler dev
+npm test
 ```
 
-The worker will be available at `http://localhost:8787`
-
-## Deployment
-
-To deploy a worker to Cloudflare:
+Runs every `tests/*.test.mjs` file with Node's built-in test runner. After
+any dashboard change, also run both syntax checks:
 
 ```bash
-cd src/[worker-name]
-wrangler deploy
+node --input-type=module --check < src/dashboard/index.js   # Worker module
+node scripts/check-frontend-js.js                            # inline <script> blocks in public/index.html
 ```
 
-## Project Structure
+## Deploying
+
+Deploys run only from the main checkout, after the change is merged to
+`main`.
+
+- **Normal path:** run `/main-deploy` in Claude Code from the main checkout.
+  It pulls, finds which workers changed since the last deploy, runs the
+  tests, deploys each changed worker, and moves the deploy marker.
+- **One worker by hand:** `scripts/deploy.sh <worker-name>` (production) or
+  `scripts/deploy.sh <worker-name> --env test`. The script refuses to ship if
+  tests or the DB-constraint check fail, or if the checkout is stale.
+- **Never run `wrangler deploy` directly.** It replaces the whole worker with
+  your working copy and can silently revert other people's merged work.
+
+Dashboard pull requests get their own preview URL from
+`.github/workflows/dashboard-pr-preview.yml`.
+
+## SMS ingest authentication
+
+`sms-ingest` checks a shared secret (`GATEWAY_SECRET`). Send it in a header:
+
+1. `X-Ingest-Secret: <secret>` (preferred)
+2. `Authorization: Bearer <secret>`
+3. `x-gateway-secret: <secret>` (older header name)
+
+The URL forms `?secret=<secret>` and `/s/<secret>` still work for existing
+push configurations, but they log a deprecation warning because the secret
+ends up in access logs.
+
+## Agent notes
+
+Notes for Claude Code sessions live in `agent/`:
+
+- `agent/BOOTSTRAP.md` — read first; the working rules.
+- `agent/current-state.md` — what shipped, what is pending, open follow-ups.
+- `agent/project-map.md` — workers, bindings, tables, data flows.
+- `agent/constraints.md` — hard rules that prevent known failures.
+- `agent/secrets-inventory.md` — every secret and var name, where it lives, how to rotate it.
+
+### Briefs
+
+Parallel work runs one chat per open item. Each item starts from a committed
+brief in `agent/briefs/`, named `YYYY-MM-DD-<letter>-<slug>.md`. A brief
+states the task, the rules (work in a task worktree, do not deploy), and when
+it is done. The chat updates the brief's `Status:` line when it finishes.
+Only the main checkout deploys.
+
+## Project layout
 
 ```
-src/
-├── sms-ingest/          # Main SMS ingestion worker
-│   ├── index.js
-│   └── wrangler.toml
-├── bulk-activator/      # Bulk SIM activation
-│   ├── index.js
-│   └── wrangler.toml
-├── details-finalizer/   # SIM details finalization
-│   ├── index.js
-│   └── wrangler.toml
-├── mdn-rotator/         # Phone number rotation
-│   ├── index.js
-│   └── wrangler.toml
-└── reseller-sync/       # Reseller synchronization
-    ├── index.js
-    └── wrangler.toml
+src/<worker>/     one Cloudflare Worker per directory
+src/shared/       modules shared between workers
+tests/            node:test suites (npm test)
+scripts/          deploy.sh, checks, one-off maintenance scripts
+supabase/         SQL migrations
+agent/            notes and briefs for Claude Code sessions
+docs/             design specs and plans
 ```
-
-## SMS Ingest Authentication
-
-The SMS ingest worker supports three authentication methods:
-
-1. **Header**: `x-gateway-secret: <secret>`
-2. **Query parameter**: `?secret=<secret>`
-3. **Path**: `/s/<secret>` (recommended for gateways that append query params)
-
-## Environment Variables
-
-Each worker requires environment variables to be set either in `.dev.vars` for local development or in the Cloudflare dashboard for production.
-
-Required variables:
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `GATEWAY_SECRET`
-
-Optional variables:
-- `RESELLER_WEBHOOK_URL`
-
-## License
-
-[Add your license here]

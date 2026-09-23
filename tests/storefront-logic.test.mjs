@@ -17,7 +17,7 @@ import {
   highlightOtpHtml,
 } from '../src/storefront/logic.mjs';
 
-test('normalizeToE164 matches src/shared/utils.ts behavior', () => {
+test('normalizeToE164 turns US numbers into E.164', () => {
   assert.equal(normalizeToE164('3475551243'), '+13475551243');
   assert.equal(normalizeToE164('13475551243'), '+13475551243');
   assert.equal(normalizeToE164('+13475551243'), '+13475551243');

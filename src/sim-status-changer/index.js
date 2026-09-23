@@ -1,3 +1,6 @@
+import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
+import { buildNumberEvent } from '../shared/number-event.mjs';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -26,7 +29,6 @@ export default {
     const reasonCode = "CR";
     const reasonCodeId = action === "suspend" ? 22 : 35;
     const newDbStatus = action === "suspend" ? "suspended" : "active";
-    const webhookEvent = action === "suspend" ? "sim.suspended" : "sim.restored";
 
     try {
       const body = await request.json();
@@ -51,7 +53,7 @@ export default {
       for (const simId of simIds) {
         try {
           // Get SIM and current phone number from database
-          const sims = await supabaseSelect(
+          const sims = await sbGet(
             env,
             `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor&id=eq.${encodeURIComponent(simId)}&limit=1`
           );
@@ -116,7 +118,7 @@ export default {
           // Get current phone number for helix
           let phoneNumber = msisdn;
           if (vendor === 'helix') {
-            const numbers = await supabaseSelect(
+            const numbers = await sbGet(
               env,
               `sim_numbers?select=e164&sim_id=eq.${simId}&valid_to=is.null&limit=1`
             );
@@ -144,7 +146,7 @@ export default {
           }
 
           // Update SIM status in database
-          await supabasePatch(
+          await sbPatch(
             env,
             `sims?id=eq.${simId}`,
             {
@@ -153,23 +155,24 @@ export default {
             }
           );
 
-          // Send webhook notification (if configured)
+          // Tell the reseller: a suspended line is offline, a restored one is
+          // online. A webhook failure is logged only; the status change has
+          // already succeeded.
           try {
             const resellerId = await findResellerIdBySimId(env, simId);
             if (resellerId) {
               const webhookUrl = await findWebhookUrlByResellerId(env, resellerId);
               if (webhookUrl) {
-                await postResellerWebhook(webhookUrl, {
-                  event_type: webhookEvent,
-                  created_at: new Date().toISOString(),
-                  data: {
-                    sim_id: simId,
-                    iccid: iccid,
-                    phone_number: phoneNumber,
-                    mobility_subscription_id: subId,
-                    action: subscriberState
-                  }
-                });
+                const numbers = await sbGet(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(simId))}&valid_to=is.null&limit=1`);
+                await postResellerWebhook(env, webhookUrl, await buildNumberEvent({
+                  online: action === "restore",
+                  simId,
+                  iccid,
+                  number: numbers?.[0]?.e164 || phoneNumber,
+                  mobilitySubscriptionId: subId,
+                  vendor,
+                  reason: action === "restore" ? "restored" : "suspended",
+                }));
               }
             }
           } catch (webhookError) {
@@ -218,14 +221,14 @@ export default {
 
 /* ================= RELAY ================= */
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 /* ================= HELPERS ================= */
@@ -380,7 +383,7 @@ async function hxChangeStatus(env, token, mdn, subscriberState, reasonCode, reas
 async function logCarrierApi(env, data) {
   const vendor = data.vendor || 'helix';
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -412,70 +415,21 @@ async function logHelixApi(env, data) {
   return logCarrierApi(env, { ...data, vendor: 'helix' });
 }
 
-/* ================= SUPABASE ================= */
-
-async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      Accept: "application/json",
-    },
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Supabase select failed ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  if (!text.trim()) return [];
-
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw new Error(
-      `Supabase select JSON parse failed: ${String(e)}. Raw: ${text.slice(0, 300)}`
-    );
-  }
-}
-
-async function supabasePatch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "PATCH",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`Supabase patch failed ${res.status}: ${text.slice(0, 300)}`);
-  }
-
-  return true;
-}
-
 async function findResellerIdBySimId(env, simId) {
   if (!simId) return null;
   const q = `reseller_sims?select=reseller_id&sim_id=eq.${encodeURIComponent(String(simId))}&active=eq.true&limit=1`;
-  const res = await supabaseSelect(env, q);
+  const res = await sbGet(env, q);
   return Array.isArray(res) && res[0]?.reseller_id ? res[0].reseller_id : null;
 }
 
 async function findWebhookUrlByResellerId(env, resellerId) {
   if (!resellerId) return null;
   const q = `reseller_webhooks?select=url&reseller_id=eq.${encodeURIComponent(String(resellerId))}&enabled=eq.true&limit=1`;
-  const res = await supabaseSelect(env, q);
+  const res = await sbGet(env, q);
   return Array.isArray(res) && res[0]?.url ? res[0].url : null;
 }
 
-async function postResellerWebhook(webhookUrl, payload) {
+async function postResellerWebhook(env, webhookUrl, payload) {
   if (!webhookUrl) return;
 
   console.log(`[Status Webhook] Sending to ${webhookUrl}:`, JSON.stringify(payload));
@@ -485,7 +439,7 @@ async function postResellerWebhook(webhookUrl, payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    });
+    }, webhookFetch);
 
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
