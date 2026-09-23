@@ -1,6 +1,6 @@
 # Brief C — the unapplied port-in outcomes migration (PR #79)
 
-Status: DONE 2026-09-23 (branch `feat/portin-outcomes-wired`, not yet deployed). Owner: Zalmen. Created 2026-09-22 after the main-deploy run.
+Status: DONE 2026-09-23 (branch `feat/portin-outcomes-wired`, deployed to PROD 2026-09-23 in ship 8, PR #127). Owner: Zalmen. Created 2026-09-22 after the main-deploy run.
 
 PR #79 merged `migrations/20260904_atomic_portin_outcomes.sql` and a module that records each ATOMIC port-in result. The migration is NOT applied to PROD or TEST, and no worker calls the module yet.
 
