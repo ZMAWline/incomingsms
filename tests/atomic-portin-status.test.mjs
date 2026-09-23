@@ -237,7 +237,7 @@ test('details-finalizer auto-transitions completed ports to active/success', () 
 });
 
 test('details-finalizer records the port-in outcome for terminal and completed results before finalizing', () => {
-  assert.match(PORTIN_POLLER, /import \{ recordPortinStatusOutcome \} from '\.\.\/shared\/atomic-portin-outcomes\.mjs'/);
+  assert.match(PORTIN_POLLER, /import \{ recordPortinStatusOutcome\b[^}]*\} from '\.\.\/shared\/atomic-portin-outcomes\.mjs'/);
   const fnBody = PORTIN_POLLER.slice(
     PORTIN_POLLER.indexOf('async function runAtomicPortinStatusFinalizer'),
     PORTIN_POLLER.length

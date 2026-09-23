@@ -4,6 +4,7 @@ import { isTeltikHosted } from '../shared/gateway-host.mjs';
 import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
 import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPost, sbPatch, sbDelete } from '../shared/supabase-rest.mjs';
+import { buildPortinOutcomeRow, recordPortinOutcomeRow } from '../shared/atomic-portin-outcomes.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -939,6 +940,23 @@ async function activateViaAtomic(env, iccid, imei, runId, options = {}) {
   };
 }
 
+// History row for a portinRequest the carrier rejected. The sims row may not
+// exist yet (a fresh SIM is only written after an accepted submission), so
+// sim_id is looked up and left null when absent. Never throws.
+async function recordPortinRejection(env, { iccid, msisdn, carrierCode, reasonCode, description, raw }) {
+  let simId = null;
+  try {
+    const rows = await sbGet(env, `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+    simId = Array.isArray(rows) && rows[0] ? rows[0].id : null;
+  } catch (e) {
+    console.error(`[Activator] ${iccid}: sim lookup for port-in outcome failed: ${e}`);
+  }
+  await recordPortinOutcomeRow({
+    insert: (table, rows) => sbPost(env, table, rows),
+    row: buildPortinOutcomeRow({ simId, iccid, msisdn, outcome: 'failed', source: 'portin_request', carrierCode, reasonCode, description, raw }),
+  });
+}
+
 async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   const normalizedPortMdn = options.normalizedPortMdn || normalizePhone10(options.portMdn || options.port_mdn || '');
   const portAccountNumber = String(options.portAccountNumber || options.port_account_number || '').trim();
@@ -1061,6 +1079,14 @@ async function activateViaAtomicPortIn(env, iccid, imei, runId, options = {}) {
   const wholeSaleResponse = responseJson?.wholeSaleApi?.wholeSaleResponse;
   const carrierStatusCode = wholeSaleResponse?.statusCode ?? null;
   if (carrierStatusCode !== null && carrierStatusCode !== '00') {
+    await recordPortinRejection(env, {
+      iccid,
+      msisdn: normalizedPortMdn,
+      carrierCode: carrierStatusCode,
+      reasonCode: wholeSaleResponse?.Result?.reasonCode ?? null,
+      description: wholeSaleResponse?.description || null,
+      raw: responseJson,
+    });
     throw new CarrierActivationError(
       `ATOMIC port-in rejected (statusCode ${carrierStatusCode}): ${wholeSaleResponse?.description || responseText.slice(0, 300)}`,
       carrierLogId

@@ -122,9 +122,10 @@ test('a SIM at 15 days is marked and escalated, not polled', async () => {
   assert.equal(out.checked, 0);
   assert.deepEqual(h.calls.carrier, [], 'no carrier call');
 
-  assert.equal(h.calls.inserts.length, 1);
+  assert.deepEqual(h.calls.inserts.map(i => i.table), ['system_errors', 'atomic_portin_outcomes']);
   const { table, rows: [row] } = h.calls.inserts[0];
   assert.equal(table, 'system_errors');
+  assert.equal(h.calls.inserts[1].rows[0].outcome, 'abandoned');
   assert.equal(row.source, 'details-finalizer');
   assert.equal(row.action, 'atomic_portin_max_age');
   assert.equal(row.sim_id, 7);
