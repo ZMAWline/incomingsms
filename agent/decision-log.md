@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-09-23 — Every table the code touches has a CREATE TABLE in the repo; rotation_freshness reads the reply as JSON
+
+**Decision:** Thirteen tables that existed only in PROD are now captured as `CREATE TABLE IF NOT EXISTS` migrations (`supabase/migrations/20260923_*.sql`), along with the shared `touch_updated_at()` trigger function. `tests/tables-have-migrations.test.mjs` fails if `src/` references a table or view that no migration creates. `teltik_hold_morning_batch` now pins `search_path = public, pg_temp`. `rotation_freshness` now uses each SIM's `rotation_interval_hours` (old 48h/24h as the fallback) and, when the partner reply is a JSON object, requires a non-null top-level `rentalId` instead of a text match. A non-JSON reply still uses the old text match.
+
+**Why:** The 2026-09-18 review asked for three tables. Scanning every table reference in `src/` found thirteen: `bill_audit_lines`, `bill_audit_uploads`, `billing_ledger`, `cron_runs`, `gateway_defective_slots`, `imei_pool`, `pending_review_items`, `plan_rates`, `remediation_attempts`, `reseller_actions_log`, `rotation_audit`, `sim_sms_daily` and `teltik_lifecycle_events`. TEST had only one of them, so five RPCs could not be created there. The RPC test also missed the `sbRpc(...)` call shape, which hid six call sites; that is fixed too.
+
+**Verification:** A PROD schema fingerprint (columns, defaults, constraints, indexes, RLS, grants, trigger, function) was `a92a5fc4…` (417 items) before and after the capture files ran on PROD, so they are no-ops there. On TEST, 12 of the 13 tables match PROD exactly. `rotation_freshness` old vs new on PROD, side by side: atomic 305 total / 268 fresh / 37 stale on both; teltik 4000 / 3813 / 187 on both. That is a 0% difference, so the new version was applied. `teltik_hold_morning_batch` has the same `pg_get_functiondef` hash on TEST and PROD.
+
+**Consequence:** Capture files state PROD as-is, including two points that disagree with the docs. First, `imei_pool_status_check` allows only `available`, `in_use` and `retired`, although `agent/constraints.md` section 7 also lists `blocked`. Second, the `bill_audit_*` constraints still carry their old `wing_bill_*` names. On TEST, `rotation_audit` pre-dated the capture: its `id` has no default and it lacks `rotation_audit_trigger_check`, and `IF NOT EXISTS` does not repair that. TEST still lacks `otp_portal_claim`, `shop_claim_rental` and `shop_confirm_deposit`, whose storefront and OTP tables are not on TEST. The 2026-09-18 function files still carry PROD-era `GRANT ... TO anon`. On TEST they were applied with the 2026-09-22 lockdown grants (`service_role` only) instead.
+
 ## 2026-09-22 — Break-glass is off unless explicitly turned on
 
 **Decision:** `breakGlassUser` now accepts the shared `DASHBOARD_AUTH` password only while `DASHBOARD_BREAK_GLASS` is exactly `on` (any case). Unset, empty, `off`, or any other value means off. The password compare uses `constantTimeEqual`, and each break-glass login logs one `[Auth] break-glass login used` line.
