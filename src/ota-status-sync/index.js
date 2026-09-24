@@ -9,6 +9,7 @@
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
 import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
+import { legacyVendorEnabled, disabledLegacyVendorOfSim, legacyVendorDisabledResult, assertLegacyVendorEnabled } from '../shared/legacy-vendors.mjs';
 
 export default {
   async fetch(request, env) {
@@ -73,7 +74,7 @@ async function runOtaStatusSync(env) {
   console.log(`[OTA Sync] Starting sync for ${validSims.length} SIMs (${sims.length - validSims.length} skipped)`);
 
   // Get Helix token only if we have helix SIMs AND Helix is enabled
-  const hasHelix = env.HELIX_ENABLED === 'true' && validSims.some(s => (s.vendor || 'helix') === 'helix');
+  const hasHelix = env.HELIX_ENABLED === 'true' && legacyVendorEnabled(env, 'helix') && validSims.some(s => (s.vendor || 'helix') === 'helix');
   let token = null;
   if (hasHelix) {
     token = await getCachedToken(env);
@@ -103,6 +104,12 @@ async function syncSimStatus(env, token, sim) {
   const { id, iccid } = sim;
   const vendor = sim.vendor || 'helix';
   const runId = `ota_sync_${iccid}_${Date.now()}`;
+
+  const offVendor = disabledLegacyVendorOfSim(env, vendor);
+  if (offVendor) {
+    console.log(`[OTA Sync] SIM ${iccid}: legacy vendor ${offVendor} disabled — skipping`);
+    return legacyVendorDisabledResult(offVendor);
+  }
 
   if (vendor === 'atomic') {
     await syncSimStatusAtomic(env, sim, runId);
@@ -232,6 +239,7 @@ const TOKEN_CACHE_KEY = "helix_token";
 const TOKEN_TTL_SECONDS = 1800;
 
 async function getCachedToken(env) {
+  assertLegacyVendorEnabled(env, 'helix');
   if (env.TOKEN_CACHE) {
     const cached = await env.TOKEN_CACHE.get(TOKEN_CACHE_KEY);
     if (cached) return cached;
@@ -244,6 +252,7 @@ async function getCachedToken(env) {
 }
 
 async function hxGetBearerToken(env) {
+  assertLegacyVendorEnabled(env, 'helix');
   const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

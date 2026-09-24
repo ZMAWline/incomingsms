@@ -6,6 +6,7 @@ import { buildAtomicPortInStatusRequest } from '../shared/activation-bulk.mjs';
 import { resolveMsisdn, resolveZip, buildSwapImeiRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 import { carrierFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPatch, sbPost, sbRpc } from '../shared/supabase-rest.mjs';
+import { legacyVendorEnabled, disabledLegacyVendorOfSim, legacyVendorDisabledResult, legacyVendorDisabledResponse, assertLegacyVendorEnabled } from '../shared/legacy-vendors.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -14,10 +15,28 @@ import { sbGet, sbPatch, sbPost, sbRpc } from '../shared/supabase-rest.mjs';
 // Includes: webhook deduplication and retry
 // =========================================================
 
+// Routes that only reach a legacy vendor, with the switch each one needs.
+const LEGACY_ROUTES = {
+  '/imei-sweep': ['helix', 'skyline'],
+  '/remediate-stuck-wing': ['wing'],
+  '/trigger-blimei-sweep': ['skyline'],
+  '/imei-gateway-sync': ['skyline'],
+  '/check-imei': ['helix'],
+  '/check-imeis': ['helix'],
+  '/fix-incompatible-imei': ['helix', 'skyline'],
+  '/sync-gateway-slots': ['skyline'],
+};
+
 export default {
   // HTTP endpoint for manual triggering
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // Legacy vendor routes (Helix, Wing IoT, SkyLine) answer 409 while their
+    // vendor is switched off. The code below stays intact.
+    for (const vendor of LEGACY_ROUTES[url.pathname] || []) {
+      if (!legacyVendorEnabled(env, vendor)) return legacyVendorDisabledResponse(vendor, 'mdn-rotator');
+    }
 
     if (url.pathname === "/run") {
       const secret = url.searchParams.get("secret") || "";
@@ -75,8 +94,10 @@ export default {
         }
 
         let token = null;
-        try { token = await getCachedToken(env); } catch (e) {
-          console.log('[FixSim] Helix token unavailable (ok for ATOMIC SIMs):', e.message);
+        if (legacyVendorEnabled(env, 'helix')) {
+          try { token = await getCachedToken(env); } catch (e) {
+            console.log('[FixSim] Helix token unavailable (ok for ATOMIC SIMs):', e.message);
+          }
         }
         const results = [];
         for (const simId of simIds) {
@@ -473,6 +494,19 @@ export default {
         const iccid = sim.iccid;
         const subId = sim.mobility_subscription_id;
 
+        // Carrier actions on a switched-off legacy vendor (Helix / Wing IoT) never call out.
+        // A null vendor is treated as Helix, the same default as the Helix fallthrough below.
+        if (action !== "portin_status") {
+          const offVendor = disabledLegacyVendorOfSim(env, sim.vendor || 'helix');
+          if (offVendor) return legacyVendorDisabledResponse(offVendor, 'mdn-rotator');
+        }
+        // SkyLine-only flows: retry_activation, and change_imei / fix on a SkyLine-hosted SIM.
+        const needsSkyline = action === "retry_activation"
+          || ((action === "change_imei" || action === "fix") && gatewaySupports(sim, 'setImei'));
+        if (needsSkyline && !legacyVendorEnabled(env, 'skyline')) {
+          return legacyVendorDisabledResponse('skyline', 'mdn-rotator');
+        }
+
         // Manual, read-only ATOMIC portinStatus check — dashboard's "Check
         // Port-In Status" button. Same lookup the finalizer's periodic poll
         // uses; also records the result on the SIM row so a manual check
@@ -535,8 +569,8 @@ export default {
             gwPort = dotPortToLetter(String(body.port)); // "13.03" → "13C"
             await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { gateway_id: gwId, port: gwPort }, { logRows: true });
             console.log(`[SimAction/fix] SIM ${iccid}: persisted manual slot gateway_id=${gwId} port=${gwPort}`);
-          } else if (!gwId || !gwPort) {
-            // Auto-scan gateways for this ICCID
+          } else if ((!gwId || !gwPort) && legacyVendorEnabled(env, 'skyline')) {
+            // Auto-scan gateways for this ICCID (SkyLine only; skipped while it is switched off)
             console.log(`[SimAction/fix] SIM ${iccid}: no gateway/port — scanning gateways...`);
             const found = await scanGatewaysForIccid(env, iccid);
             if (found) {
@@ -1199,8 +1233,10 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
         const { sim_id, iccid } = msg.body;
         try {
           let token = null;
-          try { token = await getCachedToken(env); } catch (e) {
-            console.log('[FixSimQueue] Helix token unavailable (ok for ATOMIC SIMs):', e.message);
+          if (legacyVendorEnabled(env, 'helix')) {
+            try { token = await getCachedToken(env); } catch (e) {
+              console.log('[FixSimQueue] Helix token unavailable (ok for ATOMIC SIMs):', e.message);
+            }
           }
           await fixSim(env, token, sim_id, { autoRotate: false });
           msg.ack();
@@ -1226,7 +1262,9 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
 
     // Default: mdn-rotation-queue
     let token = null;
-    try {
+    if (!legacyVendorEnabled(env, 'helix')) {
+      console.log('[Queue] legacy vendor helix disabled: no Helix token');
+    } else try {
       token = await getCachedToken(env);
     } catch (err) {
       // Token fetch failure is non-fatal: ATOMIC/Wing SIMs don't need a Helix token.
@@ -1515,13 +1553,23 @@ async function processRotationBatch(env, options = {}) {
   const concurrency = options.concurrency || 3;
   const todayNy = getNYMidnightISO();
 
+  // Legacy vendors that are switched off are left out of the query, and the
+  // Helix token is never fetched. One log line per tick says so.
+  const helixOn = legacyVendorEnabled(env, 'helix');
+  const wingOn = legacyVendorEnabled(env, 'wing');
+  const offVendors = [!helixOn && 'helix', !wingOn && 'wing'].filter(Boolean);
+  if (offVendors.length) {
+    console.log(`[ProcessBatch] ${offVendors.map(v => `legacy vendor ${v} disabled`).join('; ')}: not rotating those SIMs`);
+  }
+  const rotationVendors = [helixOn && 'helix', 'atomic', wingOn && 'wing_iot'].filter(Boolean);
+
   // Pre-filter eligible SIMs. Over-fetch 2x since some may be filtered out in JS.
   const query =
     `sims?select=id,iccid,mobility_subscription_id,msisdn,vendor,status,last_mdn_rotated_at,activated_at,activation_zip,rotation_eligible,canary_apex_ppu,reseller_sims!inner(reseller_id)` +
     `&reseller_sims.active=eq.true` +
     `&status=eq.active` +
     `&rotation_eligible=eq.true` +
-    `&vendor=in.(helix,atomic,wing_iot)` +
+    `&vendor=in.(${rotationVendors.join(',')})` +
     `&order=last_mdn_rotated_at.asc.nullsfirst` +
     `&limit=${limit * 2}`;
   const raw = await sbGet(env, query);
@@ -1546,7 +1594,7 @@ async function processRotationBatch(env, options = {}) {
     `sims?select=id,iccid,vendor,status,msisdn,last_mdn_rotated_at,activated_at,activation_zip,rotation_eligible` +
     `&vendor=eq.wing_iot&rotation_status=eq.failed&status=neq.canceled` +
     `&or=(rotation_fail_count.is.null,rotation_fail_count.lt.5)&limit=${limit}`;
-  const stuckRaw = await sbGet(env, stuckWingQuery).catch(() => []);
+  const stuckRaw = wingOn ? await sbGet(env, stuckWingQuery).catch(() => []) : [];
   const stuckCandidates = Array.isArray(stuckRaw) ? stuckRaw : [];
 
   if (candidates.length === 0 && stuckCandidates.length === 0) {
@@ -1555,9 +1603,11 @@ async function processRotationBatch(env, options = {}) {
   }
 
   let token = null;
-  try { token = await getCachedToken(env); } catch (err) {
-    // Token fetch failure is non-fatal: ATOMIC / Wing IoT SIMs don't need it.
-    console.warn(`[ProcessBatch] Helix token fetch failed (ok for non-helix): ${err}`);
+  if (helixOn) {
+    try { token = await getCachedToken(env); } catch (err) {
+      // Token fetch failure is non-fatal: ATOMIC / Wing IoT SIMs don't need it.
+      console.warn(`[ProcessBatch] Helix token fetch failed (ok for non-helix): ${err}`);
+    }
   }
 
   // Process stuck-wing remediation first — these are broken SIMs (non-dialable).
@@ -1638,6 +1688,12 @@ async function rotateSpecificSim(env, iccid, options = {}) {
 
     if (vendor === 'teltik') {
       return { ok: false, error: 'Use teltik-worker for Teltik SIM rotation' };
+    }
+
+    const offVendor = disabledLegacyVendorOfSim(env, vendor);
+    if (offVendor) {
+      console.log(`SIM ${iccid}: legacy vendor ${offVendor} disabled — not rotating`);
+      return { ...legacyVendorDisabledResult(offVendor), iccid, error: `legacy vendor ${offVendor} disabled` };
     }
 
     // Daily dedup guard — applies to all vendors on manual rotate.
@@ -1737,6 +1793,7 @@ async function rotateWingIotSim(env, sim, opts = {}) {
 }
 
 async function rotateWingIotSimInner(env, sim, opts = {}) {
+  assertLegacyVendorEnabled(env, 'wing');
   const iccid = sim.iccid;
   const runId = `rotate_${iccid}_${Date.now()}`;
   const force = opts.force === true;
@@ -1882,6 +1939,7 @@ async function rotateWingIotSimInner(env, sim, opts = {}) {
 // details-finalizer picks up the new dialable MDN on its next cron tick.
 // ===========================
 async function remediateStuckWingSim(env, iccid) {
+  assertLegacyVendorEnabled(env, 'wing');
   if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
     throw new Error('Wing IoT credentials not configured');
   }
@@ -2345,6 +2403,12 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
   const vendor = sim.vendor || 'helix';
   const force = opts.force === true;
 
+  const offVendor = disabledLegacyVendorOfSim(env, vendor);
+  if (offVendor) {
+    console.log(`SIM ${iccid}: legacy vendor ${offVendor} disabled — skipping`);
+    return { skipped: true, ...legacyVendorDisabledResult(offVendor) };
+  }
+
   // Vendor dispatch. Each vendor function calls claim_rotation_slot internally;
   // no JS-side dedup is needed here (it was removed as part of the redesign —
   // the Postgres RPC is the single source of truth).
@@ -2638,6 +2702,7 @@ const TOKEN_CACHE_KEY = "helix_token";
 const TOKEN_TTL_SECONDS = 1800; // 30 minutes
 
 async function getCachedToken(env) {
+  assertLegacyVendorEnabled(env, 'helix');
   // Try to get cached token from KV
   if (env.TOKEN_CACHE) {
     const cached = await env.TOKEN_CACHE.get(TOKEN_CACHE_KEY);
@@ -2660,6 +2725,7 @@ async function getCachedToken(env) {
 }
 
 async function hxGetBearerToken(env) {
+  assertLegacyVendorEnabled(env, 'helix');
   const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2886,6 +2952,12 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
 
   if (sim.vendor === 'atomic') {
     return await fixAtomicSim(env, sim);
+  }
+
+  const offVendor = disabledLegacyVendorOfSim(env, sim.vendor || 'helix');
+  if (offVendor) {
+    console.log(`[FixSim] SIM ${iccid}: legacy vendor ${offVendor} disabled — skipping`);
+    return legacyVendorDisabledResult(offVendor);
   }
 
   if (sim.vendor === 'wing_iot') {
@@ -3639,6 +3711,7 @@ async function changeImeiTeltikHosted(env, sim, sim_id, iccid, autoImei, newImei
 // Skyline Gateway - Set IMEI via service binding
 // ===========================
 async function callSkylineSetImei(env, gatewayId, port, imei) {
+  assertLegacyVendorEnabled(env, 'skyline');
   if (!env.SKYLINE_GATEWAY) {
     throw new Error("SKYLINE_GATEWAY service binding not configured");
   }
@@ -3990,6 +4063,7 @@ async function retryActivateViaAtomic(env, iccid, imei, runId) {
 }
 
 async function retryActivateViaWingIot(env, iccid, runId) {
+  assertLegacyVendorEnabled(env, 'wing');
   const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
   const url = baseUrl + '/v1/devices/' + encodeURIComponent(iccid);
   const auth = 'Basic ' + btoa(env.WING_IOT_USERNAME + ':' + env.WING_IOT_API_KEY);
@@ -4147,6 +4221,7 @@ function dotPortToLetter(dotPort) {
 }
 
 async function scanGatewaysForIccid(env, iccid) {
+  assertLegacyVendorEnabled(env, 'skyline');
   if (!env.SKYLINE_GATEWAY) throw new Error("SKYLINE_GATEWAY service binding not configured");
   if (!env.SKYLINE_SECRET) throw new Error("SKYLINE_SECRET not configured");
   const gateways = await sbGet(env, 'gateways?select=id,code&order=id.asc');
@@ -4170,6 +4245,7 @@ async function scanGatewaysForIccid(env, iccid) {
 }
 
 async function getUnoccupiedCandidates(env) {
+  assertLegacyVendorEnabled(env, 'skyline');
   if (!env.SKYLINE_GATEWAY) throw new Error("SKYLINE_GATEWAY service binding not configured");
   if (!env.SKYLINE_SECRET) throw new Error("SKYLINE_SECRET not configured");
   const activeSims = await sbGet(env, 'sims?select=iccid&status=in.(active,provisioning)&limit=5000');

@@ -193,3 +193,9 @@ Always check both locations:
 2. `response.rejected[].message` (HTTP 200) → `data_mismatch` status
 
 Checking only one will silently miss failures.
+
+---
+
+## 13. Legacy Vendor Code Stays, Behind `LEGACY_VENDORS`
+
+Wing IoT, Helix, SkyLine and Kasa code stays in the repo behind the `LEGACY_VENDORS` switch (`src/shared/legacy-vendors.mjs`, off by default). Never delete it. Gate any new entry point that reaches one of these vendors with `legacyVendorEnabled(env, name)`. Owner decision 2026-09-24; see `agent/decision-log.md`.

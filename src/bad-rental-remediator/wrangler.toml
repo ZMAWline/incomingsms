@@ -102,6 +102,7 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 # Enabled for real in PROD on 2026-09-22 after the owner signed off the dry run.
 # A missing OFFLINE_LIFECYCLE_DRY_RUN line means dry run is off, so the tick writes.
 [vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
 # To pause the feature: set this to "false" and deploy. To dry-run again: add OFFLINE_LIFECYCLE_DRY_RUN = "true".
 OFFLINE_LIFECYCLE_ENABLED = "true"
 
@@ -142,6 +143,7 @@ crons = []
 # never runs here; the block keeps the two environments in step.
 # DRY_RUN: remove this line to enable for real; set via toml so scripts/deploy.sh keeps it.
 [env.test.vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
 OFFLINE_LIFECYCLE_ENABLED = "true"
 OFFLINE_LIFECYCLE_DRY_RUN = "true"
 

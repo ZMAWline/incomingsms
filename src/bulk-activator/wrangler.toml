@@ -19,6 +19,9 @@ max_batch_size = 5
 max_retries = 2
 max_concurrency = 1
 
+[vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "bulk-activator-test"
@@ -36,3 +39,6 @@ queue = "sim-activation-queue-test"
 max_batch_size = 5
 max_retries = 2
 max_concurrency = 1
+
+[env.test.vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy

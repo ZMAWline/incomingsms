@@ -28,6 +28,7 @@
 import { mintNonce, buildVerifyBody, cleanRecheckPredicate } from './verify.mjs';
 import { smsSendingEnabled, SMS_UNAVAILABLE_MESSAGE } from '../shared/sms-availability.mjs';
 import { sbGet, sbPatch, sbPost } from '../shared/supabase-rest.mjs';
+import { legacyVendorEnabled } from '../shared/legacy-vendors.mjs';
 
 const RECEIVE_WINDOW_MS = 5 * 60 * 1000; // §C.3 — 5 min, 30 × 10s polls.
 const SEND_MAX_ATTEMPTS = 3;             // §C.2
@@ -51,6 +52,11 @@ export async function startVerify(env, opts) {
   // src/shared/sms-availability.mjs.
   if (!smsSendingEnabled(env)) {
     return { ok: false, status: 'sms_unavailable', error: SMS_UNAVAILABLE_MESSAGE };
+  }
+  // The nonce is sent through a SkyLine gateway. While that legacy vendor is
+  // switched off, skip the same way as above: no send, nothing recorded.
+  if (!legacyVendorEnabled(env, 'skyline')) {
+    return { ok: false, status: 'sms_unavailable', reason: 'legacy_vendor_disabled', vendor: 'skyline', error: 'legacy vendor skyline disabled' };
   }
   if (!sim.gateway_id || !sim.port) {
     return await recordSendFailed(env, report.id, attemptNo, 'missing_gateway_or_port', null);

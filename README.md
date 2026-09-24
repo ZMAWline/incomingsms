@@ -117,6 +117,45 @@ The URL forms `?secret=<secret>` and `/s/<secret>` still work for existing
 push configurations, but they log a deprecation warning because the secret
 ends up in access logs.
 
+## Legacy vendors
+
+Wing IoT, Helix, the SkyLine gateways and the Kasa power strips are no longer
+in use. Their code is still in the repo and still tested, but it is switched
+off by default. Nothing calls those vendors unless you turn one back on.
+
+What is off while a vendor is switched off:
+
+| Vendor | Worker | What is skipped |
+|---|---|---|
+| Helix | mdn-rotator | Helix token fetch on every tick, Helix rotation, fix-sim, OTA/cancel/resume, `/check-imei(s)` |
+| Helix | details-finalizer | Helix finalizer |
+| Helix | sim-canceller, sim-status-changer, ota-status-sync, bulk-activator | Helix cancel, suspend/restore, OTA sync, activation |
+| Wing IoT | mdn-rotator | Wing rotation, stuck-Wing pass, `/remediate-stuck-wing` |
+| Wing IoT | details-finalizer | Wing finalizer, Wing cleanup sweep, reconcile bucket A |
+| Wing IoT | sim-canceller, sim-status-changer, bulk-activator | Wing cancel, status change, activation |
+| SkyLine | mdn-rotator | gateway scan, IMEI write, retry activation, blimei sweep, gateway slot sync |
+| SkyLine | bad-rental-remediator | S5 port probe, verify SMS send |
+| SkyLine | sms-ingest | gateway slot sync trigger |
+| Any | dashboard | 10 legacy routes and `/api/kasa/*` answer 409 |
+
+A blocked call returns `{ ok: false, reason: "legacy_vendor_disabled", vendor }`.
+A blocked HTTP route answers 409 with `how_to_enable`. The dashboard shows it
+in the error toast.
+
+To turn one back on:
+
+1. In each worker's `wrangler.toml` `[vars]` (and `[env.test.vars]` for TEST),
+   replace the commented line with, for example:
+   ```toml
+   LEGACY_VENDORS = "helix"
+   ```
+   Use a comma-separated list (`"helix,wing,skyline,kasa"`) or `"all"`.
+   Case and spaces do not matter.
+2. Merge, then deploy each changed worker with `scripts/deploy.sh <worker>`.
+
+The switch lives in `src/shared/legacy-vendors.mjs`. The skyline-gateway and
+kasa-control workers stay deployed behind their admin secrets.
+
 ## Agent notes
 
 Notes for Claude Code sessions live in `agent/`:

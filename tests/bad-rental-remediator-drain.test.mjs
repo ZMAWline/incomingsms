@@ -262,6 +262,7 @@ function buildHarness() {
     ATOMIC_USERNAME: 'u', ATOMIC_TOKEN: 't', ATOMIC_PIN: 'p',
     WING_IOT_USERNAME: 'wu', WING_IOT_API_KEY: 'wk',
     SKYLINE_SECRET: 'sk',
+    LEGACY_VENDORS: 'all', // keep the SkyLine probe path exercised
     SKYLINE_GATEWAY: {
       async fetch(req) {
         const u = String(req.url || req);

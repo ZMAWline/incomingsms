@@ -4800,6 +4800,21 @@ set verify_pending; schedule §C.3 poll
     <script>
         const API_BASE = '/api';
 
+        // Legacy vendor switch: routes for Wing IoT, Helix, SkyLine and Kasa answer
+        // 409 { reason: 'legacy_vendor_disabled', vendor, how_to_enable } while that
+        // vendor is off. Not every caller toasts its errors, so show it here for all.
+        const _nativeFetch = window.fetch.bind(window);
+        window.fetch = async (...args) => {
+            const res = await _nativeFetch(...args);
+            if (res.status === 409) {
+                const body = await res.clone().json().catch(() => null);
+                if (body && body.reason === 'legacy_vendor_disabled') {
+                    showToast(`Legacy vendor ${body.vendor} is switched off. To turn it back on: ${body.how_to_enable}`, 'error');
+                }
+            }
+            return res;
+        };
+
         
         const TAB_ROUTES = {
             'dashboard': '/',

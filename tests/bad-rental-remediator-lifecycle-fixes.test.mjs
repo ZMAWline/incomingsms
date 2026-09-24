@@ -201,6 +201,7 @@ test('R1: S5 gateway-port-offline exhausts after 2 classify_only looks -> gatewa
   };
 
   const env = baseEnv({
+    LEGACY_VENDORS: 'all', // the S5 probe is a legacy SkyLine path; prove it still works when on
     SKYLINE_GATEWAY: {
       async fetch() { return jsonResp({ status: 'offline', online: false }); },
     },

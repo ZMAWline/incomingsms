@@ -22,6 +22,7 @@ const SHARED_MODULES = [
   ['../shared/sim-swap.mjs', 'src/shared/sim-swap.mjs', false],
   ['../shared/fetch-timeout.mjs', 'src/shared/fetch-timeout.mjs', false],
   ['../shared/supabase-rest.mjs', 'src/shared/supabase-rest.mjs', false],
+  ['../shared/legacy-vendors.mjs', 'src/shared/legacy-vendors.mjs', false],
 ];
 
 async function toDataUrl(relPath) {
@@ -142,7 +143,8 @@ test('change_imei: Teltik-hosted, non-ATOMIC vendor has no carrier-side update w
     throw new Error('Unexpected fetch: ' + u);
   };
 
-  const res = await callSimAction({ sim_id: 44, action: 'change_imei', new_imei: '351756051523999' });
+  // A Helix SIM is a legacy vendor: switch it on to keep proving this path.
+  const res = await callSimAction({ sim_id: 44, action: 'change_imei', new_imei: '351756051523999' }, { ...ENV, LEGACY_VENDORS: 'all' });
   const data = await res.json();
   assert.equal(res.status, 400);
   assert.equal(data.ok, false);
@@ -158,6 +160,7 @@ test('change_imei: Skyline-hosted SIM still writes IMEI to the Skyline gateway',
   let skylineSetImeiCalled = false;
   const env = {
     ...ENV,
+    LEGACY_VENDORS: 'all', // SkyLine is a legacy vendor: switch it on to keep proving this path
     SKYLINE_GATEWAY: {
       fetch: async (url, init) => {
         skylineSetImeiCalled = true;

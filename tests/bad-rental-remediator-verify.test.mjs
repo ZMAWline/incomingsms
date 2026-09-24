@@ -139,6 +139,7 @@ function makeFakeEnv({ skylineResponses = [], inbound = [] } = {}) {
     // These fixtures exercise the real send path; bypass the temporary
     // outbound-SMS kill switch (see tests/sms-disable.test.mjs for the guard).
     SMS_SENDING_ENABLED: 'true',
+    LEGACY_VENDORS: 'all', // the nonce goes out through SkyLine, a legacy vendor
     SKYLINE_GATEWAY: {
       async fetch(req) {
         calls.skyline.push({ url: req.url, body: await req.text() });

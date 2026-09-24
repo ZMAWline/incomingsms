@@ -7,6 +7,7 @@
 import { constantTimeEqual } from "../shared/portal-auth.mjs";
 import { supabaseFetch, webhookFetch } from "../shared/fetch-timeout.mjs";
 import { sbGet, sbPost, SupabaseError } from "../shared/supabase-rest.mjs";
+import { legacyVendorEnabled } from "../shared/legacy-vendors.mjs";
 
 export default {
   async fetch(request, env, ctx) {
@@ -447,6 +448,10 @@ async function findSimIdByGatewayPort(env, gatewayId, port) {
 // Trigger a background slot sync on mdn-rotator so the next SMS routes correctly
 async function triggerGatewaySlotSync(env, gatewayId) {
   if (!env.MDN_ROTATOR || !env.ADMIN_RUN_SECRET) return;
+  if (!legacyVendorEnabled(env, 'skyline')) {
+    console.log(`[SMS] legacy vendor skyline disabled: no slot sync for gateway ${gatewayId}`);
+    return;
+  }
   try {
     const url = `https://mdn-rotator/sync-gateway-slots?gateway_id=${gatewayId}&secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
     const res = await env.MDN_ROTATOR.fetch(url, { method: 'POST' });

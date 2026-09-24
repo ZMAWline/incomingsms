@@ -4,6 +4,16 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-09-24 — Keep the legacy vendor code, switch it off with LEGACY_VENDORS
+
+**Decision:** The Wing IoT, Helix, SkyLine and Kasa code stays in the repo. Every entry point that reaches one of them checks `legacyVendorEnabled(env, name)` (`src/shared/legacy-vendors.mjs`) and skips when the vendor is off. `LEGACY_VENDORS` is a comma-separated var, case-insensitive, `all` for everything; unset means all off. No `wrangler.toml` sets it; each affected worker has a commented line to uncomment. PR #134, which deleted the code, is closed unmerged; its branch `chore/remove-legacy-vendors` is kept.
+
+**Why:** Owner decision 2026-09-24. The vendors are unused (0 live Helix or Wing SIMs, no live SkyLine-hosted SIM, 0 active gateways), but the owner wants to be able to turn them back on without a code change. The switch also stops the side effects #134 targeted: the Helix token fetch that failed with 429 on every mdn-rotator tick, and the SkyLine port probe sent for 142 Teltik SIMs with an old `gateway_id`.
+
+**Consequence:** Do not delete the legacy code (constraints §13). Existing tests for those paths set `LEGACY_VENDORS: 'all'`, so they keep proving the code works. `HELIX_ENABLED` is unchanged and still also has to be `true` where it applied before. No DB column, binding, cron or secret changed.
+
+---
+
 ## 2026-09-23 — Every table the code touches has a CREATE TABLE in the repo; rotation_freshness reads the reply as JSON
 
 **Decision:** Thirteen tables that existed only in PROD are now captured as `CREATE TABLE IF NOT EXISTS` migrations (`supabase/migrations/20260923_*.sql`), along with the shared `touch_updated_at()` trigger function. `tests/tables-have-migrations.test.mjs` fails if `src/` references a table or view that no migration creates. `teltik_hold_morning_batch` now pins `search_path = public, pg_temp`. `rotation_freshness` now uses each SIM's `rotation_interval_hours` (old 48h/24h as the fallback) and, when the partner reply is a JSON object, requires a non-null top-level `rentalId` instead of a text match. A non-JSON reply still uses the old text match.

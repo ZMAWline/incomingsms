@@ -17,6 +17,7 @@ import { handleSavedFilterRoutes } from './saved-filters.mjs';
 import { splitSearchTerms } from '../shared/search-terms.mjs';
 import { handlePortinOutcomes, loadLatestPortinOutcomes } from './portin-outcomes.mjs';
 import { parseSimsPageRequest, filterParam, orderParam, parseContentRangeTotal, matchesDerivedFilter, sortByDerived } from './sims-query.mjs';
+import { legacyRouteResponse } from './legacy-routes.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -163,6 +164,11 @@ async function handleDashboardRequest(request, env, ctx, audit) {
     // matched before any prefix route can claim them.
     const savedFilterResponse = await handleSavedFilterRoutes(request, env, url, user);
     if (savedFilterResponse) return savedFilterResponse;
+
+    // Legacy vendor routes (Wing IoT, Helix, SkyLine, Kasa) answer 409 while
+    // their vendor is switched off. The handlers below stay intact.
+    const legacyResponse = legacyRouteResponse(env, url.pathname, corsHeaders);
+    if (legacyResponse) return legacyResponse;
 
     // API Routes
     if (url.pathname === '/api/stats') {

@@ -16,3 +16,6 @@ id = "edaf2c8828b14badb3037600635f8a7f"
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+[vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy

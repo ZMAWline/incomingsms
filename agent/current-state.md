@@ -20,6 +20,18 @@
 
 > Also 2026-09-22: PROD anon lockdown APPLIED (`lock_down_anon`), PR #111 merged as `580bd98`. The anon, publishable, and dan_bot keys now get 401 on every table. The dashboard still reads data. See "PROD anon lockdown applied".
 
+> 2026-09-24: Legacy vendors (Wing IoT, Helix, SkyLine, Kasa) switched OFF behind `LEGACY_VENDORS` instead of deleted (owner decision; PR #134 closed). See "Legacy vendors behind a switch (2026-09-24)".
+
+---
+
+## Legacy vendors behind a switch (2026-09-24)
+
+- **Owner decision:** keep the Wing IoT, Helix, SkyLine and Kasa code, make it inert. PR #134 (delete) closed unmerged, branch `chore/remove-legacy-vendors` kept.
+- **Switch:** `src/shared/legacy-vendors.mjs` — `legacyVendorEnabled(env, 'helix'|'wing'|'skyline'|'kasa')` reads `LEGACY_VENDORS` (comma list, `all`, case-insensitive; unset = all off). No worker sets it; each affected `wrangler.toml` has a commented `# LEGACY_VENDORS = ...` line in `[vars]` and `[env.test.vars]`.
+- **Gated:** mdn-rotator (Helix token fetch per tick, Helix/Wing rotation, stuck-Wing pass, fix-sim, legacy routes → 409, SkyLine helpers), details-finalizer (Helix + Wing finalizers, Wing sweep, reconcile bucket A), bad-rental-remediator (S5 SkyLine probe, verify SMS send), sim-canceller / sim-status-changer / ota-status-sync / bulk-activator (Helix/Wing branches → `legacy_vendor_disabled`), sms-ingest (slot sync trigger), dashboard (10 legacy routes + `/api/kasa/*` → 409, toast shows `how_to_enable`).
+- **Expected in logs:** one `legacy vendor helix disabled` line per mdn-rotator tick; no more `Token failed: 429`.
+- **Re-enable:** see README "Legacy vendors".
+
 ---
 
 ## Deployed 2026-09-23 (ship 8) — PRs #126–#133, 18 workers
