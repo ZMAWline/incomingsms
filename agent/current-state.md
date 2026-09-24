@@ -31,6 +31,18 @@
 - **Gated:** mdn-rotator (Helix token fetch per tick, Helix/Wing rotation, stuck-Wing pass, fix-sim, legacy routes → 409, SkyLine helpers), details-finalizer (Helix + Wing finalizers, Wing sweep, reconcile bucket A), bad-rental-remediator (S5 SkyLine probe, verify SMS send), sim-canceller / sim-status-changer / ota-status-sync / bulk-activator (Helix/Wing branches → `legacy_vendor_disabled`), sms-ingest (slot sync trigger), dashboard (10 legacy routes + `/api/kasa/*` → 409, toast shows `how_to_enable`).
 - **Expected in logs:** one `legacy vendor helix disabled` line per mdn-rotator tick; no more `Token failed: 429`.
 - **Re-enable:** see README "Legacy vendors".
+- **Deployed to PROD 2026-09-24 (PR #135, `3e264a3`)** via `scripts/deploy.sh`, one at a time, root probe before → after:
+  - dashboard (`--env=""`): `de466857-b2b3-4023-b365-a3361b196cc6` (200 → 200); CSV probe 200
+  - bad-rental-remediator: `0d95a3e0-13ff-4916-8eef-fb5dd30d06b7` (404 → 404)
+  - bulk-activator: `cb3ebe2a-adfc-48dc-ad30-c6035b339509` (200 → 200)
+  - details-finalizer: `7fa8c271-6f75-4ffe-8a95-0694a43dff4f` (200 → 200)
+  - mdn-rotator: `f40da41b-31df-4031-8cd6-210b2b9a8001` (200 → 200); live script contains `legacy vendor helix disabled`
+  - ota-status-sync: `f5d2bd67-36c4-46f2-9bc6-ceda2a5033fa` (401 → 401)
+  - sim-canceller: `0ec4a047-487b-477c-935a-97cc27b76cff` (200 → 200)
+  - sim-status-changer: `0d0c9bb3-6f40-4d42-b16e-37b603a21d17` (200 → 200)
+  - sms-ingest: `df09128c-fde5-4f57-954a-f72a287cb675` (405 → 405)
+  - Deploy ran 16:06–16:10 UTC, outside the mdn-rotator window (04:00–14:59 UTC), so details-finalizer was tailed instead (16:09:58–16:16:38): 2 cron ticks, both `ok`, 0 exceptions, 0 `Token failed` lines. **Open check:** the first mdn-rotator tick after 04:00 UTC 2026-09-25 should show one `legacy vendor helix disabled` line and no `Token failed: 429`.
+  - `deployed/prod` 77d4a90 → 3e264a3. Migrations: none.
 
 ---
 
