@@ -1,4 +1,5 @@
 import { isAddressRejection } from './activation-bulk.mjs';
+import { supabaseFetch } from './fetch-timeout.mjs';
 // The address pool is DB-driven (table: address_pool_usage). The static
 // src/shared/address-pool.mjs file is kept only as the original seed source —
 // runtime never imports it. New entries (e.g., refill-cron replacements for
@@ -19,7 +20,7 @@ export async function pickNextPpuAddress(env, opts = {}) {
   const excludeZip   = opts.excludeZip ?? null;
 
   const url = `${env.SUPABASE_URL}/rest/v1/rpc/claim_address_pool_entry`;
-  const res = await fetch(url, {
+  const res = await supabaseFetch(env, url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -58,7 +59,7 @@ export async function markAddressVerifyFailure(env, addressId, errorMessage) {
   }
   const url = `${env.SUPABASE_URL}/rest/v1/address_pool_usage?address_id=eq.${encodeURIComponent(addressId)}`;
   try {
-    const res = await fetch(url, {
+    const res = await supabaseFetch(env, url, {
       method: 'PATCH',
       headers: {
         'Content-Type':  'application/json',

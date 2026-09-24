@@ -1,8 +1,8 @@
 // Pure storefront helpers, shared by the worker (index.js) and the tests
 // (tests/storefront-logic.test.mjs). No I/O here.
 
-// Keep in sync with normalizeToE164 in src/shared/utils.ts (that file is
-// TypeScript, which node:test can't import directly under this package).
+// E.164 normalisation for US numbers: 10 digits gain +1, 11 digits starting
+// with 1 gain +, anything else is returned unchanged.
 export function normalizeToE164(to) {
   const s = String(to || '');
   const digits = s.replace(/\D/g, '');

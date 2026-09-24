@@ -5,6 +5,8 @@
 // =========================================================
 
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
+import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
 
 export default {
   async fetch(request, env, ctx) {
@@ -48,6 +50,39 @@ export default {
         const result = await resendOneSim(env, Number(simId), source);
         // Pass through specific not-ok statuses so the caller can distinguish 404 (SIM not found),
         // 412 (reseller has no webhook configured) from 500 (genuine pipeline failure).
+        const httpStatus = result.ok ? 200
+                         : result.status === 404 ? 404
+                         : result.status === 412 ? 412
+                         : 500;
+        return json(result, httpStatus);
+      } catch (e) {
+        return json({ ok: false, error: String(e) }, 500);
+      }
+    }
+
+    // Offline SIM lifecycle (bad-rental-remediator hourly tick): the reseller's
+    // rental on this line is being closed because the host port is down, so the
+    // OLD number has to go offline before reseller_sims.active flips to false.
+    // This worker owns webhook sending, so the remediator reaches it here
+    // instead of growing a second sender. Sending number.offline makes the
+    // reseller close a rental, so this route requires FINALIZER_RUN_SECRET and
+    // does not accept the spoofable X-Internal-Caller header.
+    if (url.pathname === "/send-offline" && request.method === 'POST') {
+      if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      let body;
+      try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
+      const simId = body && body.simId;
+      const reason = body && body.reason;
+      const offlineSince = body && body.offlineSince;
+      if (!simId || !Number.isFinite(Number(simId))) return json({ ok: false, error: 'simId required' }, 400);
+      if (reason !== 'line_offline') return json({ ok: false, error: 'reason must be line_offline' }, 400);
+      if (!offlineSince || Number.isNaN(Date.parse(offlineSince))) {
+        return json({ ok: false, error: 'offlineSince (ISO timestamp) required' }, 400);
+      }
+      try {
+        const result = await sendOfflineForSim(env, Number(simId), reason, offlineSince);
         const httpStatus = result.ok ? 200
                          : result.status === 404 ? 404
                          : result.status === 412 ? 412
@@ -105,7 +140,7 @@ async function runResellerSync(env, limit, force = false) {
   // the reseller's view (incident: 2026-05-09 — 71 teltik SIMs invisible after Teltik 502 outage).
   // The is.null branch is required because PostgreSQL evaluates `NULL != 'failed'` as NULL
   // (not TRUE), so a bare `neq.failed` would silently drop fresh activations with NULL status.
-  const sims = await sbGetArray(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_notified_at,last_mdn_rotated_at,last_rotation_at,sim_numbers!inner(id,e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))&status=eq.active&or=(vendor.neq.wing_iot,rotation_status.is.null,rotation_status.neq.failed)&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=last_notified_at.asc.nullsfirst&limit=${limit}`
   );
@@ -183,7 +218,7 @@ async function runResellerSync(env, limit, force = false) {
       });
 
       if (result.ok && !result.skipped) {
-        await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
+        await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
           method: 'PATCH',
           headers: {
             apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -199,7 +234,7 @@ async function runResellerSync(env, limit, force = false) {
         // Reseller responds with a body like {"success":true,"rentalId":1401254}.
         const rentalId = parseRentalIdFromResponse(result.responseBody);
         if (rentalId != null) {
-          await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${simId}`, {
+          await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${simId}`, {
             method: 'PATCH',
             headers: {
               apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -292,7 +327,7 @@ async function resendOneSim(env, simId, source) {
 
   // Fetch the SIM + its current number + reseller webhook in one query, mirroring runResellerSync's
   // select shape (line 59-62) but constrained to a single sim_id.
-  const rows = await sbGetArray(
+  const rows = await sbGet(
     env,
     `sims?select=id,iccid,status,vendor,rotation_interval_hours,last_mdn_rotated_at,last_rotation_at,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))` +
     `&id=eq.${encodeURIComponent(simId)}` +
@@ -351,7 +386,7 @@ async function resendOneSim(env, simId, source) {
   if (result.ok && !result.skipped) {
     rentalId = parseRentalIdFromResponse(result.responseBody);
     if (rentalId != null) {
-      await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${sim.id}`, {
+      await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${sim.id}`, {
         method: 'PATCH',
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -377,6 +412,74 @@ async function resendOneSim(env, simId, source) {
   };
 }
 
+// Emit number.offline for a SIM's CURRENT number because the line itself went
+// down, not because the number is being replaced. Deliberately carries no
+// replaced_by: nothing is taking over this route.
+//
+// Must be called BEFORE reseller_sims.active flips to false, because the
+// reseller/webhook lookup below (like every other sender in this repo) resolves
+// through the active assignment.
+//
+// Dedup: generateMessageIdAsync hashes number.offline per calendar day over
+// (eventType, simId, iccid, number, from). `from` is the only free slot in that
+// tuple, so it carries the reason plus the start of the outage: the reason
+// keeps a host-offline event from colliding with the same day's rotation
+// offline, and offlineSince keeps a second outage on the same day from being
+// dropped as a duplicate of the first.
+async function sendOfflineForSim(env, simId, reason, offlineSince) {
+  const rows = await sbGet(
+    env,
+    `sims?select=id,iccid,status,vendor,sim_numbers!inner(e164),reseller_sims!inner(reseller_id,resellers!inner(reseller_webhooks(url,enabled)))` +
+    `&id=eq.${encodeURIComponent(simId)}` +
+    `&sim_numbers.valid_to=is.null` +
+    `&reseller_sims.active=eq.true` +
+    `&limit=1`
+  );
+
+  if (!rows.length) {
+    return { ok: false, status: 404, attempts: 0, error: 'SIM not found, not active, or has no current number' };
+  }
+
+  const sim = rows[0];
+  const currentNumber = sim.sim_numbers?.[0]?.e164;
+  const resellerId = sim.reseller_sims?.[0]?.reseller_id;
+  const webhook = sim.reseller_sims?.[0]?.resellers?.reseller_webhooks?.find(w => w.enabled);
+  const webhookUrl = webhook?.url;
+
+  if (!currentNumber) return { ok: false, status: 404, attempts: 0, error: 'No current number on this SIM' };
+  if (!resellerId)    return { ok: false, status: 404, attempts: 0, error: 'No reseller assigned to this SIM' };
+  if (!webhookUrl)    return { ok: false, status: 412, attempts: 0, error: 'Reseller has no enabled webhook configured' };
+
+  const result = await sendWebhookWithDeduplication(env, webhookUrl, {
+    event_type: "number.offline",
+    created_at: new Date().toISOString(),
+    data: {
+      sim_id: sim.id,
+      iccid: sim.iccid,
+      number: currentNumber,
+      online: false,
+      reason,
+      carrier: sim.vendor === 'teltik' ? 'T-Mobile' : 'att',
+      verified: true,
+    },
+  }, {
+    idComponents: { simId: sim.id, iccid: sim.iccid, number: currentNumber, from: reason + ':' + offlineSince },
+    resellerId,
+    simId: sim.id,
+    source: reason,
+  });
+
+  return {
+    ok: !!result.ok,
+    status: result.status || 0,
+    attempts: result.attempts || 0,
+    error: result.error || null,
+    sim_id: sim.id,
+    reseller_id: resellerId,
+    number: currentNumber,
+  };
+}
+
 /**
  * Re-emit number.online for every currently-active SIM owned by `resellerId`, in bounded-concurrency
  * batches. Calls resendOneSim for each. Returns aggregate counts + per-SIM results.
@@ -395,7 +498,7 @@ async function resyncReseller(env, resellerId) {
   const pageSize = 1000;
   const allRows = [];
   for (let offset = 0; ; offset += pageSize) {
-    const page = await sbGetArray(
+    const page = await sbGet(
       env,
       `reseller_sims?select=sim_id&reseller_id=eq.${encodeURIComponent(resellerId)}&active=eq.true&order=sim_id.asc&limit=${pageSize}&offset=${offset}`
     );
@@ -443,55 +546,14 @@ async function resyncReseller(env, resellerId) {
 
 /* ---------------- Relay ---------------- */
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
-}
-
-/* ---------------- Supabase ---------------- */
-
-async function sbGetArray(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "GET",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-
-  const text = await res.text();
-  let data;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { raw: text };
-  }
-
-  if (!res.ok) throw new Error(`Supabase ${res.status}: ${JSON.stringify(data)}`);
-  if (!Array.isArray(data)) throw new Error(`Supabase returned non-array: ${JSON.stringify(data)}`);
-  return data;
-}
-
-async function sbPatch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'PATCH',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Supabase PATCH ${res.status}: ${t}`);
-  }
+  return send(env, url, init);
 }
 
 /* ---------------- Offline retry sweep ---------------- */
@@ -501,7 +563,7 @@ async function sbPatch(env, path, body) {
 
 async function runOfflineRetrySweep(env) {
   const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
-  const failed = await sbGetArray(env,
+  const failed = await sbGet(env,
     `webhook_deliveries?select=id,webhook_url,payload,attempts,reseller_id,message_id` +
     `&event_type=eq.number.offline&status=eq.failed` +
     `&created_at=gte.${encodeURIComponent(since)}` +
@@ -565,7 +627,7 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await fetch(
+  const res = await supabaseFetch(env,
     `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
     {
       method: 'GET',
@@ -598,7 +660,7 @@ async function recordWebhookDelivery(env, delivery) {
     simId = Number.isFinite(n) ? n : null;
   }
 
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -637,7 +699,7 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
+      }, webhookFetch);
 
       lastStatus = res.status;
 

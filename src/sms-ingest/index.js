@@ -4,6 +4,10 @@
 // Includes: deduplication and retry
 // =========================================================
 
+import { constantTimeEqual } from "../shared/portal-auth.mjs";
+import { supabaseFetch, webhookFetch } from "../shared/fetch-timeout.mjs";
+import { sbGet, sbPost, SupabaseError } from "../shared/supabase-rest.mjs";
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
@@ -13,10 +17,14 @@ export default {
     const url = new URL(request.url);
 
     // =========================
-    // AUTH (3 supported ways)
-    // 1) Header: x-gateway-secret: <secret>
-    // 2) Query:  ?secret=<secret>
-    // 3) Path:   /s/<secret>   (BEST for gateways that always append ?params)
+    // AUTH
+    // Preferred (header):
+    //   X-Ingest-Secret: <secret>
+    //   Authorization: Bearer <secret>
+    //   x-gateway-secret: <secret>   (older header name, still accepted)
+    // Deprecated (secret in the URL, lands in access logs):
+    //   ?secret=<secret>
+    //   /s/<secret>   (for gateways that always append ?params)
     // =========================
     const pathParts = url.pathname.split("/").filter(Boolean);
     const secretFromPath =
@@ -26,14 +34,21 @@ export default {
     const gatewayIdFromPath = (pathParts[2] === "gw" && pathParts[3])
       ? parseInt(pathParts[3]) : null;
 
-    const gotSecret =
+    const auth = request.headers.get("authorization") || "";
+    const bearer = /^Bearer\s+/i.test(auth) ? auth.replace(/^Bearer\s+/i, "").trim() : "";
+    const headerSecret =
+      request.headers.get("x-ingest-secret") ||
+      bearer ||
       request.headers.get("x-gateway-secret") ||
-      url.searchParams.get("secret") ||
-      secretFromPath ||
       "";
+    const urlSecret = url.searchParams.get("secret") || secretFromPath || "";
+    const gotSecret = headerSecret || urlSecret;
 
-    if (!env.GATEWAY_SECRET || gotSecret !== env.GATEWAY_SECRET) {
+    if (!env.GATEWAY_SECRET || !gotSecret || !constantTimeEqual(gotSecret, env.GATEWAY_SECRET)) {
       return new Response("Unauthorized", { status: 401 });
+    }
+    if (!headerSecret) {
+      console.warn("[sms-ingest] deprecated: secret sent in the URL (" + (secretFromPath ? "/s/<secret>" : "?secret=") + "); send it as an X-Ingest-Secret header instead");
     }
 
     const ct = (request.headers.get("content-type") || "").toLowerCase();
@@ -123,8 +138,8 @@ export default {
 
       if (inserts.length === 0) return new Response("OK", { status: 200 });
 
-      const ins = await supabaseInsert(env, "inbound_sms", inserts);
-      if (!ins.ok) return new Response(await ins.text(), { status: 500 });
+      const failed = await insertInboundSms(env, inserts);
+      if (failed) return failed;
 
       // Auto IMEI change for AT&T unsupported device messages
       for (const row of inserts) {
@@ -192,7 +207,7 @@ export default {
     }
 
     // Insert the SMS
-    const ins = await supabaseInsert(env, "inbound_sms", [
+    const failed = await insertInboundSms(env, [
       {
         sim_id: simId,
         to_number: toNumber,
@@ -210,7 +225,7 @@ export default {
       },
     ]);
 
-    if (!ins.ok) return new Response(await ins.text(), { status: 500 });
+    if (failed) return failed;
 
     // Auto IMEI change for AT&T unsupported device messages
     if (simId && isAttUnsupportedDeviceMsg(body)) {
@@ -257,12 +272,12 @@ export default {
 
 function relayFetch(env, url, init) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return webhookFetch(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return webhookFetch(env, url, init);
 }
 
 // ====================
@@ -302,45 +317,42 @@ function extractSmsBody(text) {
 // ====================
 // Supabase helpers
 // ====================
-async function supabaseGet(env, path) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "GET",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
+
+// Inserts inbound_sms rows. Returns a 500 Response carrying the PostgREST
+// error body when the insert is rejected, null on success.
+async function insertInboundSms(env, rows) {
+  try {
+    await sbPost(env, "inbound_sms", rows, { prefer: "return=minimal" });
+    return null;
+  } catch (err) {
+    if (!(err instanceof SupabaseError)) throw err;
+    return new Response(err.body, { status: 500 });
+  }
 }
 
-async function supabaseInsert(env, table, rows) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: "POST",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=minimal",
-    },
-    body: JSON.stringify(rows),
-  });
+// First row for a lookup, or null. A PostgREST error also yields null so a
+// failed lookup degrades to "not found", as the finders below always did.
+async function lookupFirst(env, path) {
+  try {
+    return await sbGet(env, path, { single: true });
+  } catch (err) {
+    if (!(err instanceof SupabaseError)) throw err;
+    return null;
+  }
 }
 
 // Check if message already exists (deduplication)
 async function checkDuplicateMessage(env, messageId) {
   const q = `inbound_sms?select=id&message_id=eq.${encodeURIComponent(messageId)}&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return false;
-  const data = await res.json();
-  return Array.isArray(data) && data.length > 0;
+  const row = await lookupFirst(env, q);
+  return !!row;
 }
 
 // Find sim_id by ICCID
 async function findSimIdByIccid(env, iccid) {
   const q = `sims?select=id&iccid=eq.${encodeURIComponent(iccid)}&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+  const row = await lookupFirst(env, q);
+  return row?.id ? row.id : null;
 }
 
 function dotPortToLetter(dotPort) {
@@ -376,7 +388,7 @@ async function updateSimPortAndGateway(env, simId, port, mac, gatewayIdHint = nu
     // If we know both gateway and port, evict any other SIM currently claiming
     // this slot — the gateway's ICCID report is the physical source of truth.
     if (updates.gateway_id && updates.port) {
-      const evictRes = await fetch(
+      const evictRes = await supabaseFetch(env,
         `${env.SUPABASE_URL}/rest/v1/sims?gateway_id=eq.${updates.gateway_id}&port=eq.${encodeURIComponent(updates.port)}&id=neq.${simId}`,
         {
           method: "PATCH",
@@ -399,7 +411,7 @@ async function updateSimPortAndGateway(env, simId, port, mac, gatewayIdHint = nu
       }
     }
 
-    const res = await fetch(
+    const res = await supabaseFetch(env,
       `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${encodeURIComponent(String(simId))}`,
       {
         method: "PATCH",
@@ -428,10 +440,8 @@ async function updateSimPortAndGateway(env, simId, port, mac, gatewayIdHint = nu
 // Find sim_id by gateway_id + port (fallback when ICCID is absent)
 async function findSimIdByGatewayPort(env, gatewayId, port) {
   const q = `sims?select=id&gateway_id=eq.${gatewayId}&port=eq.${encodeURIComponent(port)}&status=neq.canceled&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+  const row = await lookupFirst(env, q);
+  return row?.id ? row.id : null;
 }
 
 // Trigger a background slot sync on mdn-rotator so the next SMS routes correctly
@@ -450,10 +460,8 @@ async function triggerGatewaySlotSync(env, gatewayId) {
 async function findGatewayIdByMac(env, mac) {
   if (!mac) return null;
   const q = `gateways?select=id&mac_address=eq.${encodeURIComponent(mac)}&active=eq.true&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+  const row = await lookupFirst(env, q);
+  return row?.id ? row.id : null;
 }
 
 // Find CURRENT number for sim_id (valid_to is null)
@@ -461,10 +469,8 @@ async function findCurrentNumberBySimId(env, simId) {
   const q = `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(
     String(simId)
   )}&valid_to=is.null&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return "";
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.e164 ? data[0].e164 : "";
+  const row = await lookupFirst(env, q);
+  return row?.e164 ? row.e164 : "";
 }
 
 // Optional helper if you ever route by number
@@ -472,28 +478,22 @@ async function findSimIdByCurrentNumber(env, e164) {
   const q = `sim_numbers?select=sim_id&e164=eq.${encodeURIComponent(
     e164
   )}&valid_to=is.null&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.sim_id ? data[0].sim_id : null;
+  const row = await lookupFirst(env, q);
+  return row?.sim_id ? row.sim_id : null;
 }
 
 async function findResellerIdBySimId(env, simId) {
   if (!simId) return null;
   const q = `reseller_sims?select=reseller_id&sim_id=eq.${encodeURIComponent(String(simId))}&active=eq.true&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.reseller_id ? data[0].reseller_id : null;
+  const row = await lookupFirst(env, q);
+  return row?.reseller_id ? row.reseller_id : null;
 }
 
 async function findWebhookUrlByResellerId(env, resellerId) {
   if (!resellerId) return null;
   const q = `reseller_webhooks?select=url&reseller_id=eq.${encodeURIComponent(String(resellerId))}&enabled=eq.true&limit=1`;
-  const res = await supabaseGet(env, q);
-  if (!res.ok) return null;
-  const data = await res.json();
-  return Array.isArray(data) && data[0]?.url ? data[0].url : null;
+  const row = await lookupFirst(env, q);
+  return row?.url ? row.url : null;
 }
 
 // ====================
@@ -519,26 +519,16 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
-    {
-      method: 'GET',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+  const row = await lookupFirst(env,
+    `webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`
   );
-
-  if (!res.ok) return false;
-  const data = await res.json();
-  return Array.isArray(data) && data.length > 0;
+  return !!row;
 }
 
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts } = delivery;
 
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,

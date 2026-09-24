@@ -8,11 +8,15 @@ import { recordHostingPortCheck, buildHostingPortCheckRow, normalizeHostPortStat
 import { ADDRESS_POOL } from '../shared/address-pool.mjs';
 import { NAME_POOL } from '../shared/name-pool.mjs';
 import { canAccess, requiredRole, apiKeyMayAccess, constantTimeEqual } from '../shared/portal-auth.mjs';
+import { corsHeadersFor } from './cors.mjs';
 import { resolveUser, breakGlassUser, handleAuthRoutes } from './auth-routes.mjs';
 import { renderLoginPage, renderAcceptInvitePage } from './auth-pages.mjs';
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from './api-keys.mjs';
 import { withAuditLog, handleAuditLogQuery } from './audit-log.mjs';
 import { handleSavedFilterRoutes } from './saved-filters.mjs';
+import { splitSearchTerms } from '../shared/search-terms.mjs';
+import { handlePortinOutcomes, loadLatestPortinOutcomes } from './portin-outcomes.mjs';
+import { parseSimsPageRequest, filterParam, orderParam, parseContentRangeTotal, matchesDerivedFilter, sortByDerived } from './sims-query.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -49,9 +53,8 @@ async function handleDashboardRequest(request, env, ctx, audit) {
 
     // --- Authentication ---------------------------------------------------
     // Named users with revocable sessions. The legacy shared Basic password
-    // still works as break-glass while DASHBOARD_BREAK_GLASS !== 'off', and
-    // counts as admin — that is also how the first admin bootstraps before any
-    // account exists.
+    // works as break-glass only while DASHBOARD_BREAK_GLASS is 'on', and
+    // counts as admin — the escape hatch if the session login ever breaks.
     //
     // API keys are the third way in, for the external agent. A key resolves to
     // the same principal shape and one of the same three roles, so everything
@@ -134,12 +137,9 @@ async function handleDashboardRequest(request, env, ctx, audit) {
       }), { status: 403, headers: { 'Content-Type': 'application/json' } });
     }
 
-    // CORS headers for API requests
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    };
+    // CORS headers for API requests: only the dashboard's own origins are
+    // echoed back (see cors.mjs).
+    const corsHeaders = corsHeadersFor(request);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders });
@@ -175,6 +175,15 @@ async function handleDashboardRequest(request, env, ctx, audit) {
 
     if (url.pathname === '/api/sims') {
       return handleSims(env, corsHeaders, url);
+    }
+
+    const portinOutcomesMatch = url.pathname.match(/^\/api\/sims\/(\d+)\/portin-outcomes$/);
+    if (portinOutcomesMatch && request.method === 'GET') {
+      return handlePortinOutcomes(env, corsHeaders, portinOutcomesMatch[1]);
+    }
+
+    if (url.pathname === '/api/sims/facets') {
+      return handleSimsFacets(env, corsHeaders);
     }
 
     if (url.pathname === '/api/sims/status-counts') {
@@ -752,7 +761,7 @@ export default {
 
 // checkAuth() lived here. Replaced by named-user sessions; the equivalent
 // shared-password check now survives only as breakGlassUser() in
-// auth-routes.mjs, which additionally honours DASHBOARD_BREAK_GLASS=off.
+// auth-routes.mjs, which only accepts it while DASHBOARD_BREAK_GLASS=on.
 // Note the old version returned TRUE when DASHBOARD_AUTH was unset — an unset
 // secret meant no authentication at all. The replacement fails closed.
 
@@ -867,13 +876,13 @@ async function handleApiTesterRun(request, env, corsHeaders) {
 
   let gateway = null;
   if ((preset.inputs || []).some((i) => i.source === 'gateways')) {
-    const gid = inputs.gateway_id;
-    if (!gid) return respond(400, { ok: false, error: 'gateway_id is required' });
+    const gid = parsePositiveInt(inputs.gateway_id);
+    if (!gid) return respond(400, { ok: false, error: 'gateway_id must be a positive whole number' });
     try {
-      const gres = await supabaseGet(env, 'gateways?select=id,code,name,host,api_port,username,password,active&id=eq.' + encodeURIComponent(gid) + '&active=eq.true&limit=1');
-      const rows = await gres.json();
+      const gres = await supabaseGet(env, 'gateways?select=id,code,name,host,api_port,username,password,active&id=eq.' + gid + '&active=eq.true&limit=1');
+      const rows = await supabaseJson(gres);
       gateway = rows && rows[0];
-    } catch (e) { return respond(500, { ok: false, error: 'gateway lookup failed: ' + String(e) }); }
+    } catch (e) { return respond(e instanceof SupabaseError ? 502 : 500, { ok: false, error: 'gateway lookup failed: ' + String(e) }); }
     if (!gateway) return respond(400, { ok: false, error: 'gateway not found or inactive' });
   }
 
@@ -1114,115 +1123,83 @@ async function handleSimsStatusCounts(env, corsHeaders) {
   }
 }
 
+// GET /api/sims.
+//
+// Default (the SIMs table): one page of SIMs, filtered and sorted in the
+// database — see sims-query.mjs for the parameters. Answers
+// { rows, total, page, page_size }.
+//
+// ?all=1, or an id / iccid lookup (the SIM detail deep link): the original
+// response, a bare array of every matching SIM, with the original status /
+// hide_cancelled / reseller_id parameters.
 async function handleSims(env, corsHeaders, url) {
   try {
-    // Parse filter params
-    const statusFilter = url.searchParams.get('status');
-    const resellerFilter = url.searchParams.get('reseller_id');
-    const hideCancelled = url.searchParams.get('hide_cancelled') !== 'false';
-    // id/iccid: single-record lookup for the SIM detail deep link — fetches a
-    // SIM not currently loaded in the operator's filtered/paged SIMs table.
-    const idFilter = url.searchParams.get('id');
-    const iccidFilter = url.searchParams.get('iccid');
+    const params = url.searchParams;
+    const select = `sims_dashboard?select=id,iccid,imei,msisdn,port,status,vendor,gateway_host,carrier,rotation_interval_hours,rotation_eligible,rotation_pause_reason,offline_state,offline_since,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_rotation_at,activated_at,created_at,last_activation_error,last_notified_at,port_in_pending,atomic_portin_status_code,atomic_portin_description,atomic_portin_checked_at,gateway_code,gateway_name,phone_number,verification_status,reseller_id,reseller_name`;
+    const legacy = params.get('all') === '1' || params.has('id') || params.has('iccid');
 
-    // Build query with reseller and gateway info
-    let query = `sims?select=id,iccid,imei,msisdn,port,status,vendor,gateway_host,carrier,rotation_interval_hours,rotation_eligible,mobility_subscription_id,gateway_id,last_mdn_rotated_at,last_rotation_at,activated_at,last_activation_error,last_notified_at,port_in_pending,atomic_portin_status_code,atomic_portin_description,atomic_portin_checked_at,gateways(code,name),sim_numbers(e164,verification_status),reseller_sims(reseller_id,resellers(name))&sim_numbers.valid_to=is.null&reseller_sims.active=eq.true&order=id.desc`;
+    let filteredSims;
+    let stats = null;
+    let pageInfo = null;
 
-    if (idFilter) {
-      query += `&id=eq.${encodeURIComponent(idFilter)}`;
-    } else if (iccidFilter) {
-      query += `&iccid=eq.${encodeURIComponent(iccidFilter)}`;
-    } else if (statusFilter) {
-      // Apply status filter
-      query += `&status=eq.${statusFilter}`;
-    } else if (hideCancelled) {
-      query += `&status=neq.canceled`;
-    }
+    if (legacy) {
+      const statusFilter = params.get('status');
+      const resellerFilter = params.get('reseller_id');
+      const hideCancelled = params.get('hide_cancelled') !== 'false';
+      const idFilter = params.get('id');
+      const iccidFilter = params.get('iccid');
+      if (idFilter && !parsePositiveInt(idFilter)) return badRequest(corsHeaders, 'id must be a positive whole number');
+      if (statusFilter && !SIM_STATUSES.includes(statusFilter)) {
+        return badRequest(corsHeaders, 'Invalid status. Valid: ' + SIM_STATUSES.join(', '));
+      }
+      if (resellerFilter && !parsePositiveInt(resellerFilter)) return badRequest(corsHeaders, 'reseller_id must be a positive whole number');
 
-    const sims = await supabaseGetAllArray(env, query);
+      let query = `${select}&order=id.desc`;
+      if (idFilter) {
+        query += `&id=eq.${parsePositiveInt(idFilter)}`;
+      } else if (iccidFilter) {
+        query += `&iccid=eq.${encodeURIComponent(iccidFilter)}`;
+      } else if (statusFilter) {
+        query += `&status=eq.${statusFilter}`;
+      } else if (hideCancelled) {
+        query += `&status=neq.canceled`;
+      }
+      if (resellerFilter) query += `&reseller_id=eq.${parsePositiveInt(resellerFilter)}`;
+      filteredSims = await supabaseGetAllArray(env, query);
+    } else {
+      const req = parseSimsPageRequest(params, { statuses: SIM_STATUSES, vendors: [...LEDGER_VENDORS, 'unknown'] });
+      if (req.error) return badRequest(corsHeaders, req.error);
+      const where = filterParam(req.conditions);
+      const offset = (req.page - 1) * req.pageSize;
 
-    // Filter by reseller if specified (done client-side since nested filter is complex)
-    let filteredSims = sims;
-    if (resellerFilter) {
-      const resellerId = parseInt(resellerFilter);
-      filteredSims = sims.filter(sim =>
-        sim.reseller_sims?.some(rs => rs.reseller_id === resellerId)
-      );
-    }
-
-    // SMS stats and Teltik hosting-port status both come from DB-side
-    // aggregation RPCs, chunked into batches of 500 sim_ids per call. PostgREST
-    // caps response rows at 1000, so a single call with every sim_id silently
-    // truncates once >1000 SIMs have rows.
-    //
-    // The two RPC groups depend only on the sim id list, never on each other,
-    // so they are launched together and awaited once. Previously the
-    // hosting-port calls did not start until every SMS call had come back,
-    // which spent a whole extra round-trip stage for no reason.
-    const CHUNK = 500;
-    const chunkIds = (ids) => {
-      const out = [];
-      for (let i = 0; i < ids.length; i += CHUNK) out.push(ids.slice(i, i + CHUNK));
-      return out;
-    };
-    const rpcHeaders = {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    };
-    const callRpc = (rpcPath, simIdChunk) => fetch(env.SUPABASE_URL + '/rest/v1/' + rpcPath, {
-      method: 'POST',
-      headers: rpcHeaders,
-      body: JSON.stringify({ sim_ids: simIdChunk }),
-    });
-
-    const simIds = filteredSims.map(s => s.id);
-    const teltikHostedIds = filteredSims
-      .filter(s => s.gateway_host === 'teltik' || (!s.gateway_host && s.vendor === 'teltik'))
-      .map(s => s.id);
-
-    const smsPromise = simIds.length === 0
-      ? Promise.resolve([])
-      : Promise.all(chunkIds(simIds).map(chunk =>
-          callRpc('rpc/get_sms_counts_24h', chunk).then(r => r.json())
-        ));
-
-    // Latest persisted Teltik hosting port status + uptime stats, derived from
-    // the canonical hosting_port_status_checks history across ALL check
-    // sources. A missing RPC/table (pre-migration) or a transient failure
-    // degrades to nulls rather than failing the whole SIMs request.
-    const hostPortPromise = teltikHostedIds.length === 0
-      ? Promise.resolve([])
-      : Promise.all(chunkIds(teltikHostedIds).map(chunk =>
-          callRpc('rpc/get_hosting_port_status_summary', chunk).then(r => r.ok ? r.json() : null)
-        )).catch(() => []);
-
-    const [smsResponses, hpResponses] = await Promise.all([smsPromise, hostPortPromise]);
-
-    const smsMap = {}; // sim_id -> { count, last_received }
-    for (const rows of smsResponses) {
-      if (!Array.isArray(rows)) continue;
-      for (const row of rows) {
-        smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
+      if (!req.derivedFilters.length && !req.sort.derived) {
+        // The database filters, sorts and pages; only this page hits the RPCs.
+        const resp = await supabaseGet(env, `${select}${where}&${orderParam(req)}&limit=${req.pageSize}&offset=${offset}`, { Prefer: 'count=exact' });
+        // PostgREST answers 416 for an offset past the end; that is an empty page.
+        filteredSims = resp.status === 416 ? [] : await supabaseJson(resp);
+        const total = parseContentRangeTotal(resp.headers.get('content-range'));
+        pageInfo = { total: total == null ? offset + filteredSims.length : total, page: req.page, page_size: req.pageSize };
+      } else {
+        // A filter or sort on SMS / hosting-port stats: those come from RPCs,
+        // so compute them for every SIM matching the other conditions, then
+        // filter, sort and page here.
+        const candidates = await supabaseGetAllArray(env, `sims_dashboard?select=id,gateway_host,vendor${where}&${orderParam(req)}`);
+        stats = await loadSimStats(env, candidates);
+        let rows = candidates.map(s => ({ id: s.id, ...simStatFields(s.id, stats.smsMap, stats.hostPortMap) }));
+        rows = rows.filter(r => req.derivedFilters.every(f => matchesDerivedFilter(r, f, req.now)));
+        if (req.sort.derived) rows = sortByDerived(rows, req.sort.key, req.dir, req.now);
+        const pageIds = rows.slice(offset, offset + req.pageSize).map(r => r.id);
+        const fetched = pageIds.length ? await supabaseGetAllArray(env, `${select}&id=in.(${pageIds.join(',')})`) : [];
+        const byId = new Map(fetched.map(s => [s.id, s]));
+        filteredSims = pageIds.map(id => byId.get(id)).filter(Boolean);
+        pageInfo = { total: rows.length, page: req.page, page_size: req.pageSize };
       }
     }
 
-    const hostPortMap = {}; // sim_id -> get_hosting_port_status_summary row
-    for (const rows of hpResponses) {
-      if (!Array.isArray(rows)) continue;
-      for (const row of rows) hostPortMap[row.sim_id] = row;
-    }
+    if (!stats) stats = await loadSimStats(env, filteredSims);
+    const portinOutcomes = await loadLatestPortinOutcomes(env, filteredSims.filter(s => s.vendor === 'atomic').map(s => s.id));
 
     const formatted = filteredSims.map(sim => {
-      const smsStat = smsMap[sim.id] || { count: 0, last_received: null };
-      const hp = hostPortMap[sim.id] || null;
-
-      // Extract reseller info
-      const resellerSim = sim.reseller_sims?.[0];
-      const resellerId = resellerSim?.reseller_id || null;
-      const resellerName = resellerSim?.resellers?.name || null;
-
       return {
         id: sim.id,
         iccid: sim.iccid,
@@ -1230,18 +1207,17 @@ async function handleSims(env, corsHeaders, url) {
         port: sim.port,
         status: sim.status,
         mobility_subscription_id: sim.mobility_subscription_id,
-        phone_number: sim.sim_numbers?.[0]?.e164 || null,
-        verification_status: sim.sim_numbers?.[0]?.verification_status || null,
-        sms_count: smsStat.count,
-        last_sms_received: smsStat.last_received,
-        reseller_id: resellerId,
-        reseller_name: resellerName,
+        phone_number: sim.phone_number || null,
+        verification_status: sim.verification_status || null,
+        reseller_id: sim.reseller_id || null,
+        reseller_name: sim.reseller_name || null,
         gateway_id: sim.gateway_id,
-        gateway_code: sim.gateways?.code || null,
-        gateway_name: sim.gateways?.name || null,
+        gateway_code: sim.gateway_code || null,
+        gateway_name: sim.gateway_name || null,
         last_mdn_rotated_at: sim.last_mdn_rotated_at || null,
         last_rotation_at: sim.last_rotation_at || null,
         activated_at: sim.activated_at || null,
+        created_at: sim.created_at || null,
         last_activation_error: sim.last_activation_error || null,
         last_notified_at: sim.last_notified_at || null,
         vendor: sim.vendor || 'unknown',
@@ -1252,29 +1228,131 @@ async function handleSims(env, corsHeaders, url) {
         atomic_portin_status_code: sim.atomic_portin_status_code || null,
         atomic_portin_description: sim.atomic_portin_description || null,
         atomic_portin_checked_at: sim.atomic_portin_checked_at || null,
+        portin_outcome: portinOutcomes.get(sim.id) || null,
         rotation_interval_hours: sim.rotation_interval_hours || 24,
         rotation_eligible: sim.rotation_eligible !== false,
-        hosting_port_state: hp ? hp.last_state : null,
-        hosting_port_checked_at: hp ? hp.last_checked_at : null,
-        hosting_port_source: hp ? hp.last_source : null,
-        hosting_port_mdn: hp ? hp.last_mdn : null,
-        hosting_port_mdn_source: hp ? hp.last_mdn_source : null,
-        hosting_port_error: hp ? hp.last_error : null,
-        hosting_port_checks_24h: hp ? hp.checks_24h : 0,
-        hosting_port_online_24h: hp ? hp.online_24h : 0,
-        hosting_port_checks_7d: hp ? hp.checks_7d : 0,
-        hosting_port_online_7d: hp ? hp.online_7d : 0,
+        rotation_pause_reason: sim.rotation_pause_reason || null,
+        offline_state: sim.offline_state || 'online',
+        offline_since: sim.offline_since || null,
+        ...simStatFields(sim.id, stats.smsMap, stats.hostPortMap),
       };
     });
 
-    return new Response(JSON.stringify(formatted), {
+    const body = pageInfo ? { rows: formatted, ...pageInfo } : formatted;
+    return new Response(JSON.stringify(body), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
+    return errorResponse(error, corsHeaders);
+  }
+}
+
+// SMS-in-24h and Teltik hosting-port status for a list of SIMs, from two
+// DB-side aggregation RPCs, chunked into batches of 500 sim_ids per call.
+// PostgREST caps response rows at 1000, so a single call with every sim_id
+// silently truncates once >1000 SIMs have rows.
+//
+// The two RPC groups depend only on the sim id list, never on each other,
+// so they are launched together and awaited once.
+async function loadSimStats(env, sims) {
+  const CHUNK = 500;
+  const chunkIds = (ids) => {
+    const out = [];
+    for (let i = 0; i < ids.length; i += CHUNK) out.push(ids.slice(i, i + CHUNK));
+    return out;
+  };
+  const rpcHeaders = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+  const callRpc = (rpcPath, simIdChunk) => fetch(env.SUPABASE_URL + '/rest/v1/' + rpcPath, {
+    method: 'POST',
+    headers: rpcHeaders,
+    body: JSON.stringify({ sim_ids: simIdChunk }),
+  });
+
+  const simIds = sims.map(s => s.id);
+  const teltikHostedIds = sims
+    .filter(s => s.gateway_host === 'teltik' || (!s.gateway_host && s.vendor === 'teltik'))
+    .map(s => s.id);
+
+  const smsPromise = simIds.length === 0
+    ? Promise.resolve([])
+    : Promise.all(chunkIds(simIds).map(chunk =>
+        callRpc('rpc/get_sms_counts_24h', chunk).then(r => r.json())
+      ));
+
+  // Latest persisted Teltik hosting port status + uptime stats, derived from
+  // the canonical hosting_port_status_checks history across ALL check
+  // sources. A missing RPC/table (pre-migration) or a transient failure
+  // degrades to nulls rather than failing the whole SIMs request.
+  const hostPortPromise = teltikHostedIds.length === 0
+    ? Promise.resolve([])
+    : Promise.all(chunkIds(teltikHostedIds).map(chunk =>
+        callRpc('rpc/get_hosting_port_status_summary', chunk).then(r => r.ok ? r.json() : null)
+      )).catch(() => []);
+
+  const [smsResponses, hpResponses] = await Promise.all([smsPromise, hostPortPromise]);
+
+  const smsMap = {}; // sim_id -> { count, last_received }
+  for (const rows of smsResponses) {
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows) {
+      smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
+    }
+  }
+
+  const hostPortMap = {}; // sim_id -> get_hosting_port_status_summary row
+  for (const rows of hpResponses) {
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows) hostPortMap[row.sim_id] = row;
+  }
+  return { smsMap, hostPortMap };
+}
+
+// The stats fields /api/sims returns for a SIM, from the two RPC maps.
+function simStatFields(simId, smsMap, hostPortMap) {
+  const sms = smsMap[simId] || { count: 0, last_received: null };
+  const hp = hostPortMap[simId] || null;
+  return {
+    sms_count: sms.count,
+    last_sms_received: sms.last_received,
+    hosting_port_state: hp ? hp.last_state : null,
+    hosting_port_checked_at: hp ? hp.last_checked_at : null,
+    hosting_port_source: hp ? hp.last_source : null,
+    hosting_port_mdn: hp ? hp.last_mdn : null,
+    hosting_port_mdn_source: hp ? hp.last_mdn_source : null,
+    hosting_port_error: hp ? hp.last_error : null,
+    hosting_port_checks_24h: hp ? hp.checks_24h : 0,
+    hosting_port_online_24h: hp ? hp.online_24h : 0,
+    hosting_port_checks_7d: hp ? hp.checks_7d : 0,
+    hosting_port_online_7d: hp ? hp.online_7d : 0,
+  };
+}
+
+// GET /api/sims/facets — { column: { value: count } } over the whole fleet for
+// the SIMs filter menus, from one GROUP BY in the database. The table only
+// holds one page, so counting loaded rows would count that page.
+async function handleSimsFacets(env, corsHeaders) {
+  try {
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/sims_dashboard_facets', {
+      method: 'POST',
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: '{}',
+    });
+    const facets = await supabaseJson(resp);
+    return new Response(JSON.stringify({ ok: true, facets: facets || {} }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
+  } catch (error) {
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -1287,10 +1365,10 @@ async function handleMessages(env, corsHeaders, url) {
     if (!search) {
       queryPath = `inbound_sms?${baseSelect}&order=received_at.desc&limit=500`;
     } else {
-      const terms = search.split(/[,;\r\n]+/)
-        .map(t => t.replace(/[^a-zA-Z0-9\s+\-]/g, '').trim())
-        .filter(Boolean)
-        .slice(0, 10);
+      // Also splits on spaces when every token looks like an identifier, so a
+      // typed or mobile-pasted number list is several terms rather than one
+      // long non-matching string. Free text with spaces stays one substring.
+      const terms = splitSearchTerms(search, 10);
       if (!terms.length) {
         return new Response(JSON.stringify([]), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -1329,7 +1407,7 @@ async function handleMessages(env, corsHeaders, url) {
     const messages = await response.json();
     if (!response.ok || !Array.isArray(messages)) {
       return new Response(JSON.stringify({ error: 'messages_query_failed', detail: messages }), {
-        status: 500,
+        status: 502,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
@@ -1765,21 +1843,18 @@ async function handleActivateSims(request, env, corsHeaders) {
 async function handleResellers(env, corsHeaders) {
   try {
     const response = await supabaseGet(env, 'resellers?select=id,name&order=name.asc');
-    const resellers = await response.json();
+    const resellers = await supabaseJson(response);
     return new Response(JSON.stringify(resellers), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
 async function handleKasaProxy(request, env, url, corsHeaders) {
-  if (!env.KASA_CONTROL) {
-    return new Response(JSON.stringify({error: 'KASA_CONTROL not configured'}), {
+  if (!env.KASA_CONTROL || !env.KASA_ADMIN_RUN_SECRET) {
+    return new Response(JSON.stringify({error: 'KASA_CONTROL or KASA_ADMIN_RUN_SECRET not configured'}), {
       status: 503,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -1787,7 +1862,7 @@ async function handleKasaProxy(request, env, url, corsHeaders) {
   const kasaPath = url.pathname.replace('/api/kasa', '');
   const kasaReq = new Request('https://kasa-control.workers.dev' + kasaPath, {
     method: request.method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + env.KASA_ADMIN_RUN_SECRET },
     body: (request.method !== 'GET' && request.method !== 'HEAD') ? request.body : undefined,
   });
   try {
@@ -1807,20 +1882,17 @@ async function handleKasaProxy(request, env, url, corsHeaders) {
 
 async function handleGateways(request, env, corsHeaders) {
   const url = new URL(request.url);
-  const idParam = url.searchParams.get('id');
+  const gatewayId = parsePositiveInt(url.searchParams.get('id'));
 
   if (request.method === 'GET') {
     try {
       const response = await supabaseGet(env, 'gateways?select=id,mac_address,code,name,location,host,api_port,username,password,total_ports,slots_per_port,active&order=code.asc');
-      const gateways = await response.json();
+      const gateways = await supabaseJson(response);
       return new Response(JSON.stringify(gateways), {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     } catch (error) {
-      return new Response(JSON.stringify({ error: String(error) }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
+      return errorResponse(error, corsHeaders);
     }
   }
 
@@ -1880,12 +1952,7 @@ async function handleGateways(request, env, corsHeaders) {
   }
 
   if (request.method === 'PATCH') {
-    if (!idParam) {
-      return new Response(JSON.stringify({ error: 'id query param is required' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
+    if (!gatewayId) return badRequest(corsHeaders, 'id must be a positive whole number');
     try {
       const body = await request.json();
       const allowed = ['mac_address','code','name','location','host','api_port','username','password','total_ports','slots_per_port','active'];
@@ -1900,7 +1967,7 @@ async function handleGateways(request, env, corsHeaders) {
         });
       }
       patch.updated_at = new Date().toISOString();
-      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways?id=eq.${encodeURIComponent(idParam)}`, {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways?id=eq.${gatewayId}`, {
         method: 'PATCH',
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1930,14 +1997,9 @@ async function handleGateways(request, env, corsHeaders) {
   }
 
   if (request.method === 'DELETE') {
-    if (!idParam) {
-      return new Response(JSON.stringify({ error: 'id query param is required' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
+    if (!gatewayId) return badRequest(corsHeaders, 'id must be a positive whole number');
     try {
-      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways?id=eq.${encodeURIComponent(idParam)}`, {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways?id=eq.${gatewayId}`, {
         method: 'DELETE',
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1970,27 +2032,27 @@ async function handleGatewayDefectiveSlots(request, env, corsHeaders) {
   const jsonHeaders = { ...corsHeaders, 'Content-Type': 'application/json' };
 
   if (request.method === 'GET') {
-    const gatewayId = url.searchParams.get('gateway_id');
+    const gatewayId = parsePositiveInt(url.searchParams.get('gateway_id'));
     if (!gatewayId) {
-      return new Response(JSON.stringify({ error: 'gateway_id query param is required' }), { status: 400, headers: jsonHeaders });
+      return new Response(JSON.stringify({ error: 'gateway_id must be a positive whole number' }), { status: 400, headers: jsonHeaders });
     }
     try {
-      const res = await supabaseGet(env, `gateway_defective_slots?select=id,port_slot,reason,created_at&gateway_id=eq.${encodeURIComponent(gatewayId)}&order=port_slot.asc`);
-      const slots = await res.json();
+      const res = await supabaseGet(env, `gateway_defective_slots?select=id,port_slot,reason,created_at&gateway_id=eq.${gatewayId}&order=port_slot.asc`);
+      const slots = await supabaseJson(res);
       return new Response(JSON.stringify({ ok: true, slots }), { headers: jsonHeaders });
     } catch (error) {
-      return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: jsonHeaders });
+      return errorResponse(error, corsHeaders);
     }
   }
 
   if (request.method === 'POST') {
     try {
       const body = await request.json();
-      const gatewayId = body.gateway_id;
+      const gatewayId = parsePositiveInt(body.gateway_id);
       const portSlot = normalizeImeiPoolPort(body.port_slot);
       const reason = body.reason || null;
       if (!gatewayId || !portSlot) {
-        return new Response(JSON.stringify({ error: 'gateway_id and port_slot are required' }), { status: 400, headers: jsonHeaders });
+        return new Response(JSON.stringify({ error: 'gateway_id (positive whole number) and port_slot are required' }), { status: 400, headers: jsonHeaders });
       }
       const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/gateway_defective_slots?on_conflict=gateway_id,port_slot`, {
         method: 'POST',
@@ -2014,13 +2076,13 @@ async function handleGatewayDefectiveSlots(request, env, corsHeaders) {
   }
 
   if (request.method === 'DELETE') {
-    const gatewayId = url.searchParams.get('gateway_id');
+    const gatewayId = parsePositiveInt(url.searchParams.get('gateway_id'));
     const portSlot = normalizeImeiPoolPort(url.searchParams.get('port_slot'));
     if (!gatewayId || !portSlot) {
-      return new Response(JSON.stringify({ error: 'gateway_id and port_slot are required' }), { status: 400, headers: jsonHeaders });
+      return new Response(JSON.stringify({ error: 'gateway_id (positive whole number) and port_slot are required' }), { status: 400, headers: jsonHeaders });
     }
     try {
-      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateway_defective_slots?gateway_id=eq.${encodeURIComponent(gatewayId)}&port_slot=eq.${encodeURIComponent(portSlot)}`, {
+      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateway_defective_slots?gateway_id=eq.${gatewayId}&port_slot=eq.${encodeURIComponent(portSlot)}`, {
         method: 'DELETE',
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2047,18 +2109,13 @@ async function handleSimOnline(request, env, corsHeaders) {
 
   try {
     const body = await request.json();
-    const simId = body.sim_id;
+    const simId = parsePositiveInt(body.sim_id);
 
-    if (!simId) {
-      return new Response(JSON.stringify({ error: 'sim_id is required' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
+    if (!simId) return badRequest(corsHeaders, 'sim_id must be a positive whole number');
 
     // Step 1: Get the SIM basic info
     const simResponse = await supabaseGet(env, `sims?select=id,iccid,status,vendor,rotation_status,rotation_interval_hours,last_mdn_rotated_at,last_rotation_at&id=eq.${simId}`);
-    const sims = await simResponse.json();
+    const sims = await supabaseJson(simResponse);
 
     if (!sims || sims.length === 0) {
       return new Response(JSON.stringify({ error: 'SIM not found' }), {
@@ -2086,13 +2143,13 @@ async function handleSimOnline(request, env, corsHeaders) {
 
     // Step 2: Get current phone number
     const numberResponse = await supabaseGet(env, `sim_numbers?select=e164,verification_status&sim_id=eq.${simId}&valid_to=is.null&limit=1`);
-    const numbers = await numberResponse.json();
+    const numbers = await supabaseJson(numberResponse);
     const currentNumber = numbers?.[0]?.e164;
     const verificationStatus = numbers?.[0]?.verification_status;
 
     // Step 3: Get reseller info
     const resellerSimResponse = await supabaseGet(env, `reseller_sims?select=reseller_id,resellers(name)&sim_id=eq.${simId}&active=eq.true&limit=1`);
-    const resellerSims = await resellerSimResponse.json();
+    const resellerSims = await supabaseJson(resellerSimResponse);
     const resellerId = resellerSims?.[0]?.reseller_id;
     const resellerName = resellerSims?.[0]?.resellers?.name;
 
@@ -2100,7 +2157,7 @@ async function handleSimOnline(request, env, corsHeaders) {
     let webhookUrl = null;
     if (resellerId) {
       const webhookResponse = await supabaseGet(env, `reseller_webhooks?select=url&reseller_id=eq.${resellerId}&enabled=eq.true&limit=1`);
-      const webhooks = await webhookResponse.json();
+      const webhooks = await supabaseJson(webhookResponse);
       webhookUrl = webhooks?.[0]?.url;
     }
 
@@ -2232,10 +2289,7 @@ async function handleSimOnline(request, env, corsHeaders) {
       });
     }
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -2692,13 +2746,17 @@ async function handleTeltikHostCheck(request, env, corsHeaders) {
       });
     }
 
-    let simId = body.sim_id || null;
+    let simId = null;
+    if (body.sim_id) {
+      simId = parsePositiveInt(body.sim_id);
+      if (!simId) return badRequest(corsHeaders, 'sim_id must be a positive whole number');
+    }
     const iccid = body.iccid || null;
     let dbCurrentMdn = body.mdn || null;
     let simVendor = body.vendor || null;
     let simGatewayHost = body.gateway_host || null;
     if ((!simId && iccid) || (simId && !simVendor)) {
-      const filter = simId ? 'id=eq.' + encodeURIComponent(String(simId)) : 'iccid=eq.' + encodeURIComponent(String(iccid));
+      const filter = simId ? 'id=eq.' + simId : 'iccid=eq.' + encodeURIComponent(String(iccid));
       const rows = await sbGet(env, 'sims?select=id,iccid,vendor,gateway_host,sim_numbers(e164)&sim_numbers.valid_to=is.null&' + filter + '&limit=1').catch(() => null);
       const sim = Array.isArray(rows) && rows[0] ? rows[0] : null;
       if (sim) {
@@ -3333,7 +3391,7 @@ async function handleSkylineProxy(request, env, url, corsHeaders) {
         const normPort = normalizeImeiPoolPort(port);
         if (gateway_id && port && newImei) {
           // 1. Retire old IMEI on this gateway/port (if any)
-          await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?gateway_id=eq.${gateway_id}&port=eq.${encodeURIComponent(normPort)}&status=eq.in_use&imei=neq.${newImei}`, {
+          await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?gateway_id=eq.${encodeURIComponent(gateway_id)}&port=eq.${encodeURIComponent(normPort)}&status=eq.in_use&imei=neq.${encodeURIComponent(newImei)}`, {
             method: 'PATCH',
             headers: {
               apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3392,6 +3450,66 @@ async function handleSkylineProxy(request, env, url, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   }
+}
+
+// ── Request values bound for a PostgREST URL ────────────────────────────────
+// A PostgREST filter is plain query-string text, so a raw request value such
+// as "active&select=*" or "1)or(id.gt.0" would add filters, widen the columns
+// returned, or pull in embedded tables. Ids must be plain positive whole
+// numbers, values from a known set are allow-listed, and any other free text
+// goes through encodeURIComponent.
+
+// Returns the id as a number, or null unless the value is a positive whole
+// number (a JSON number or a string of digits). "1;drop", "-1", "1.5", "abc",
+// "" and "01" are all null.
+function parsePositiveInt(value) {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? value : null;
+  if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+// Allowed values, copied from the table CHECK constraints.
+const SIM_STATUSES = ['pending', 'provisioning', 'active', 'suspended', 'canceled', 'error', 'data_mismatch', 'helix_timeout', 'rotation_failed'];
+const SYSTEM_ERROR_STATUSES = ['open', 'acknowledged', 'resolved'];
+const ACTIVATION_RUN_STATUSES = ['queued', 'processing', 'done', 'failed', 'cancelled'];
+const ACTIVATION_RUN_SOURCES = ['csv', 'json', 'dashboard'];
+const ACTIVATION_ITEM_STATUSES = ['pending', 'queued', 'processing', 'done', 'failed', 'retry_needed', 'skipped'];
+const LEDGER_VENDORS = ['wing_iot', 'atomic', 'helix', 'teltik'];
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function badRequest(corsHeaders, error) {
+  return new Response(JSON.stringify({ error }), {
+    status: 400,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
+}
+
+// Thrown when Supabase answers non-2xx, so its error object is never passed
+// on as if it were data. errorResponse turns it into a 502.
+class SupabaseError extends Error {
+  constructor(status, detail) {
+    super(`Supabase query failed (${status})`);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+async function supabaseJson(res) {
+  if (!res.ok) throw new SupabaseError(res.status, await res.text().catch(() => ''));
+  return res.json();
+}
+
+// Catch-block response: 502 with the Supabase error for a failed query,
+// 500 for anything else.
+function errorResponse(error, corsHeaders) {
+  const upstream = error instanceof SupabaseError;
+  const body = upstream ? { error: error.message, detail: error.detail } : { error: String(error) };
+  return new Response(JSON.stringify(body), {
+    status: upstream ? 502 : 500,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  });
 }
 
 async function supabaseGet(env, path, extraHeaders) {
@@ -3459,11 +3577,7 @@ async function supabaseGetAllArraySerial(env, pathWithoutLimit) {
     const sep = pathWithoutLimit.includes('?') ? '&' : '?';
     const url = pathWithoutLimit + sep + 'limit=' + pageSize + '&offset=' + offset;
     const resp = await supabaseGet(env, url);
-    if (!resp.ok) {
-      const txt = await resp.text();
-      throw new Error('PostgREST fetch failed: ' + resp.status + ' ' + txt);
-    }
-    const batch = await resp.json();
+    const batch = await supabaseJson(resp);
     if (!Array.isArray(batch)) return batch;
     out.push(...batch);
     if (batch.length < pageSize) break;
@@ -3486,12 +3600,7 @@ async function supabaseGetAllArray(env, pathWithoutLimit) {
   const pageSize = 1000;
   const sep = pathWithoutLimit.includes('?') ? '&' : '?';
   const pageUrl = (offset) => pathWithoutLimit + sep + 'limit=' + pageSize + '&offset=' + offset;
-  const readPage = async (resp) => {
-    if (!resp.ok) {
-      throw new Error('PostgREST fetch failed: ' + resp.status + ' ' + (await resp.text()));
-    }
-    return resp.json();
-  };
+  const readPage = supabaseJson;
 
   const firstResp = await supabaseGet(env, pageUrl(0), { Prefer: 'count=exact' });
   const firstPage = await readPage(firstResp);
@@ -3874,7 +3983,9 @@ async function handleFixSim(request, env, corsHeaders) {
     // is delegated to teltik-worker). The dominant Teltik "broken" case is a
     // physical SIM-card swap → stale ICCID, which we heal in-dashboard via
     // get-info-by-MDN. Partition: heal teltik here, forward the rest to mdn-rotator.
-    const idList = simIds.map(s => encodeURIComponent(String(s))).join(',');
+    const idNums = simIds.map(parsePositiveInt);
+    if (idNums.includes(null)) return badRequest(corsHeaders, 'every sim_id must be a positive whole number');
+    const idList = idNums.join(',');
     const simRows = await sbGet(env, 'sims?id=in.(' + idList + ')&select=id,iccid,msisdn,vendor').catch(() => null);
     const rows = Array.isArray(simRows) ? simRows : [];
     const teltikRows = rows.filter(r => r.vendor === 'teltik');
@@ -3923,10 +4034,7 @@ async function handleFixSim(request, env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -3947,7 +4055,7 @@ async function handleImeiPoolGet(env, corsHeaders) {
           Range: `${offset}-${offset + batchSize - 1}`,
         },
       });
-      const batch = await response.json();
+      const batch = await supabaseJson(response);
       if (!Array.isArray(batch) || batch.length === 0) break;
       allRows = allRows.concat(batch);
       if (batch.length < batchSize) break; // Last page
@@ -3956,7 +4064,7 @@ async function handleImeiPoolGet(env, corsHeaders) {
 
     // Get total gateway slots for context
     const gwRes = await supabaseGet(env, 'gateways?select=total_ports,slots_per_port&active=eq.true');
-    const gateways = await gwRes.json();
+    const gateways = await supabaseJson(gwRes);
     const totalSlots = Array.isArray(gateways) ? gateways.reduce((sum, gw) => sum + (gw.total_ports || 0) * (gw.slots_per_port || 1), 0) : 0;
 
     const stats = {
@@ -3979,10 +4087,7 @@ async function handleImeiPoolGet(env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -3998,7 +4103,7 @@ async function handleImeiPoolPick(env, corsHeaders) {
         },
       }
     );
-    const rows = await response.json();
+    const rows = await supabaseJson(response);
     if (!Array.isArray(rows) || rows.length === 0) {
       return new Response(JSON.stringify({ ok: false, error: 'No available IMEIs in pool' }), {
         status: 404,
@@ -4009,10 +4114,7 @@ async function handleImeiPoolPick(env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
-    return new Response(JSON.stringify({ ok: false, error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -4168,13 +4270,8 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
     }
 
     if (action === 'retire') {
-      const id = body.id;
-      if (!id) {
-        return new Response(JSON.stringify({ error: 'id is required' }), {
-          status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        });
-      }
+      const id = parsePositiveInt(body.id);
+      if (!id) return badRequest(corsHeaders, 'id must be a positive whole number');
 
       // Retire available or in_use IMEIs (carrier rejected)
       const patchRes = await fetch(
@@ -4208,8 +4305,8 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
     }
 
     if (action === 'unretire') {
-      const id = body.id;
-      if (!id) return new Response(JSON.stringify({ error: 'id is required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      const id = parsePositiveInt(body.id);
+      if (!id) return badRequest(corsHeaders, 'id must be a positive whole number');
       const patchRes = await fetch(
         `${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${id}&status=eq.retired`,
         {
@@ -4223,7 +4320,7 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
           body: JSON.stringify({ status: 'available' }),
         }
       );
-      const patched = await patchRes.json().catch(() => []);
+      const patched = await supabaseJson(patchRes);
       if (!patched.length) return new Response(JSON.stringify({ error: 'IMEI not found or not retired' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       return new Response(JSON.stringify({ ok: true, unretired: patched[0] }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
@@ -4233,24 +4330,16 @@ async function handleImeiPoolPost(request, env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
 async function handleImportGatewayImeis(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const gatewayId = body.gateway_id;
+    const gatewayId = parsePositiveInt(body.gateway_id);
 
-    if (!gatewayId) {
-      return new Response(JSON.stringify({ error: 'gateway_id is required' }), {
-        status: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
+    if (!gatewayId) return badRequest(corsHeaders, 'gateway_id must be a positive whole number');
 
     if (!env.SKYLINE_GATEWAY) {
       return new Response(JSON.stringify({ error: 'SKYLINE_GATEWAY service binding not configured' }), {
@@ -4297,7 +4386,7 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
 
     // Query DB for all in_use IMEIs for this gateway (DB is the source of truth)
     const dbRes = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/imei_pool?gateway_id=eq.${encodeURIComponent(gatewayId)}&status=eq.in_use&select=imei,port`,
+      `${env.SUPABASE_URL}/rest/v1/imei_pool?gateway_id=eq.${gatewayId}&status=eq.in_use&select=imei,port`,
       {
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4472,10 +4561,7 @@ async function handleImportGatewayImeis(request, env, corsHeaders) {
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -4577,24 +4663,24 @@ async function handleImeiPoolFixSlot(request, env, corsHeaders) {
 async function handleErrors(env, corsHeaders, url) {
   try {
     const statusFilter = url.searchParams.get('status') || 'open';
+    if (statusFilter !== 'all' && !SYSTEM_ERROR_STATUSES.includes(statusFilter)) {
+      return badRequest(corsHeaders, 'Invalid status. Valid: all, ' + SYSTEM_ERROR_STATUSES.join(', '));
+    }
 
     // Query system_errors table
     let errQuery = `system_errors?select=id,source,action,sim_id,iccid,error_message,error_details,severity,status,resolved_at,resolved_by,resolution_notes,created_at&order=created_at.desc&limit=500`;
     if (statusFilter !== 'all') {
       errQuery += `&status=eq.${statusFilter}`;
     }
-    const errResponse = await supabaseGet(env, errQuery);
-    const systemErrors = await errResponse.json();
+    const systemErrors = await supabaseJson(await supabaseGet(env, errQuery));
 
     // Also get SIMs with last_activation_error (legacy errors)
     const simQuery = `sims?select=id,iccid,port,status,last_activation_error,gateways(code),sim_numbers(e164)&last_activation_error=not.is.null&sim_numbers.valid_to=is.null&order=id.desc&limit=200`;
-    const simResponse = await supabaseGet(env, simQuery);
-    const simErrors = await simResponse.json();
+    const simErrors = await supabaseJson(await supabaseGet(env, simQuery));
 
     // Also get SIMs with last_rotation_error
     const rotQuery = `sims?select=id,iccid,port,status,last_rotation_error,last_rotation_at,gateways(code),sim_numbers(e164)&last_rotation_error=not.is.null&sim_numbers.valid_to=is.null&order=last_rotation_at.desc.nullslast&limit=200`;
-    const rotResponse = await supabaseGet(env, rotQuery);
-    const rotErrors = await rotResponse.json();
+    const rotErrors = await supabaseJson(await supabaseGet(env, rotQuery));
 
     // Convert SIM errors to unified format
     const legacyErrors = (Array.isArray(simErrors) ? simErrors : []).map(sim => ({
@@ -4675,17 +4761,16 @@ async function handleErrors(env, corsHeaders, url) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
 async function handleErrorLogs(env, corsHeaders, url) {
   try {
-    const simId = url.searchParams.get('sim_id');
+    const simIdParam = url.searchParams.get('sim_id');
+    const simId = parsePositiveInt(simIdParam);
     const iccid = url.searchParams.get('iccid');
+    if (simIdParam && !simId) return badRequest(corsHeaders, 'sim_id must be a positive whole number');
 
     if (!simId && !iccid) return new Response(JSON.stringify({ error: 'sim_id or iccid required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
@@ -4694,7 +4779,7 @@ async function handleErrorLogs(env, corsHeaders, url) {
     // If we have sim_id but no iccid, look up the iccid from the sims table
     if (simId && !lookupIccid) {
       const simRes = await supabaseGet(env, `sims?select=iccid&id=eq.${simId}&limit=1`);
-      const sims = await simRes.json();
+      const sims = await supabaseJson(simRes);
       lookupIccid = sims?.[0]?.iccid;
       if (!lookupIccid) {
         return new Response(JSON.stringify([]), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -4704,7 +4789,7 @@ async function handleErrorLogs(env, corsHeaders, url) {
     // Query helix_api_logs by iccid with correct column names
     const query = `carrier_api_logs?select=id,step,iccid,imei,vendor,request_url,request_method,request_body,response_status,response_ok,response_body_json,response_body_text,error,created_at&iccid=eq.${encodeURIComponent(lookupIccid)}&order=created_at.desc&limit=20`;
     const response = await supabaseGet(env, query);
-    const logs = await response.json();
+    const logs = await supabaseJson(response);
     return new Response(JSON.stringify(logs), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
@@ -6662,9 +6747,9 @@ async function handleResolveError(request, env, corsHeaders) {
     }
 
     // Filter out legacy sim_ IDs and rotation rot_ IDs and handle them separately
-    const systemIds = error_ids.filter(id => typeof id === 'number');
-    const legacySimIds = error_ids.filter(id => typeof id === 'string' && id.startsWith('sim_')).map(id => parseInt(id.replace('sim_', '')));
-    const rotationSimIds = error_ids.filter(id => typeof id === 'string' && id.startsWith('rot_')).map(id => parseInt(id.replace('rot_', '')));
+    const systemIds = error_ids.filter(id => typeof id === 'number').map(parsePositiveInt).filter(Boolean);
+    const legacySimIds = error_ids.filter(id => typeof id === 'string' && id.startsWith('sim_')).map(id => parsePositiveInt(id.slice(4))).filter(Boolean);
+    const rotationSimIds = error_ids.filter(id => typeof id === 'string' && id.startsWith('rot_')).map(id => parsePositiveInt(id.slice(4))).filter(Boolean);
 
     // Resolve system errors
     if (systemIds.length > 0) {
@@ -6722,23 +6807,22 @@ async function handleResolveError(request, env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 
 // Reset SIMs back to provisioning so details-finalizer re-processes them
 async function handleSetSimStatus(request, env, corsHeaders) {
   const body = await request.json();
-  const { sim_id, status } = body;
+  const { status } = body;
+  const sim_id = parsePositiveInt(body.sim_id);
   const validStatuses = ['provisioning', 'active', 'suspended', 'canceled', 'error', 'pending', 'helix_timeout', 'data_mismatch'];
-  if (!sim_id || !status) {
-    return new Response(JSON.stringify({ error: 'sim_id and status required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-  }
+  if (!sim_id || !status) return badRequest(corsHeaders, 'sim_id (positive whole number) and status required');
   if (!validStatuses.includes(status)) {
     return new Response(JSON.stringify({ error: 'Invalid status. Valid: ' + validStatuses.join(', ') }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
   const res = await fetch(
-    env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(String(sim_id)),
+    env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + sim_id,
     {
       method: 'PATCH',
       headers: {
@@ -6768,7 +6852,8 @@ async function handleResetToProvisioning(request, env, corsHeaders) {
     if (!Array.isArray(sim_ids) || sim_ids.length === 0) {
       return new Response(JSON.stringify({ error: 'sim_ids array required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    const idList = sim_ids.map(Number).filter(n => Number.isFinite(n) && n > 0);
+    const idList = sim_ids.map(parsePositiveInt);
+    if (idList.includes(null)) return badRequest(corsHeaders, 'every sim_id must be a positive whole number');
     if (idList.length === 0) {
       return new Response(JSON.stringify({ error: 'No valid sim_ids' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
@@ -6791,7 +6876,7 @@ async function handleResetToProvisioning(request, env, corsHeaders) {
     const count = Array.isArray(updated) ? updated.length : idList.length;
     return new Response(JSON.stringify({ ok: true, reset: count }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -6799,10 +6884,9 @@ async function handleResetToProvisioning(request, env, corsHeaders) {
 async function handleAssignReseller(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const { sim_id, reseller_id } = body;
-    if (!sim_id || !reseller_id) {
-      return new Response(JSON.stringify({ error: 'sim_id and reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
+    const sim_id = parsePositiveInt(body.sim_id);
+    const reseller_id = parsePositiveInt(body.reseller_id);
+    if (!sim_id || !reseller_id) return badRequest(corsHeaders, 'sim_id and reseller_id (positive whole numbers) required');
     // Deactivate any existing active assignment
     await fetch(`${env.SUPABASE_URL}/rest/v1/reseller_sims?sim_id=eq.${sim_id}&active=eq.true`, {
       method: 'PATCH',
@@ -6831,7 +6915,7 @@ async function handleAssignReseller(request, env, corsHeaders) {
     }
     return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -6839,8 +6923,9 @@ async function handleAssignReseller(request, env, corsHeaders) {
 async function handleSetRotationEligible(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const simIds = Array.isArray(body.sim_ids) ? body.sim_ids.map(Number).filter(Boolean) : [];
+    const simIds = Array.isArray(body.sim_ids) ? body.sim_ids.map(parsePositiveInt) : [];
     const eligible = body.eligible === true;
+    if (simIds.includes(null)) return badRequest(corsHeaders, 'every sim_id must be a positive whole number');
     if (simIds.length === 0) {
       return new Response(JSON.stringify({ error: 'sim_ids array required' }), {
         status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
@@ -6879,10 +6964,11 @@ async function handleSetRotationEligible(request, env, corsHeaders) {
 async function handleUnassignReseller(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const simIds = body.sim_ids || [];
-    if (!Array.isArray(simIds) || simIds.length === 0) {
+    const simIds = Array.isArray(body.sim_ids) ? body.sim_ids.map(parsePositiveInt) : [];
+    if (simIds.length === 0) {
       return new Response(JSON.stringify({ error: 'sim_ids array required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
+    if (simIds.includes(null)) return badRequest(corsHeaders, 'every sim_id must be a positive whole number');
 
     let unassigned = 0;
     for (const simId of simIds) {
@@ -6906,17 +6992,15 @@ async function handleUnassignReseller(request, env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 
 async function handleDeleteSim(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const simId = parseInt(body.sim_id);
-    if (!simId) {
-      return new Response(JSON.stringify({ error: 'sim_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
+    const simId = parsePositiveInt(body.sim_id);
+    if (!simId) return badRequest(corsHeaders, 'sim_id must be a positive whole number');
     const base = env.SUPABASE_URL + '/rest/v1';
     const h = {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -6943,7 +7027,7 @@ async function handleDeleteSim(request, env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -7097,8 +7181,8 @@ async function handleSyncGatewaySlots(request, env, corsHeaders) {
   if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   let body;
   try { body = await request.json(); } catch { body = {}; }
-  const gateway_id = body.gateway_id ? parseInt(body.gateway_id) : null;
-  if (!gateway_id) return new Response(JSON.stringify({ error: 'gateway_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  const gateway_id = parsePositiveInt(body.gateway_id);
+  if (!gateway_id) return badRequest(corsHeaders, 'gateway_id must be a positive whole number');
   const workerUrl = `https://mdn-rotator/sync-gateway-slots?gateway_id=${gateway_id}&secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}`;
   const workerResponse = await env.MDN_ROTATOR.fetch(workerUrl, { method: 'POST' });
   const responseText = await workerResponse.text();
@@ -7115,15 +7199,16 @@ async function handleSyncGatewaySlots(request, env, corsHeaders) {
 async function handleSimAction(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const { sim_id, action } = body;
-    if (!sim_id || !action) return new Response(JSON.stringify({ error: 'sim_id and action required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const { action } = body;
+    const sim_id = parsePositiveInt(body.sim_id);
+    if (!sim_id || !action) return badRequest(corsHeaders, 'sim_id (positive whole number) and action required');
 
     if (!env.ADMIN_RUN_SECRET) return new Response(JSON.stringify({ error: 'ADMIN_RUN_SECRET not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
     // Teltik rotate is handled by teltik-worker, not mdn-rotator. Look up vendor first.
     if (action === 'rotate') {
-      const vendorRes = await supabaseGet(env, `sims?select=iccid,vendor&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`);
-      const vendorRows = await vendorRes.json().catch(() => []);
+      const vendorRes = await supabaseGet(env, `sims?select=iccid,vendor&id=eq.${sim_id}&limit=1`);
+      const vendorRows = await supabaseJson(vendorRes);
       const row = Array.isArray(vendorRows) && vendorRows[0] ? vendorRows[0] : null;
       if (row && row.vendor === 'teltik') {
         if (!env.TELTIK_WORKER) return new Response(JSON.stringify({ ok: false, error: 'TELTIK_WORKER not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -7142,8 +7227,8 @@ async function handleSimAction(request, env, corsHeaders) {
     // wire it is a gateway port reset, not a carrier OTA). Non-Teltik SIMs fall through
     // to the existing mdn-rotator ota_refresh path.
     if (action === 'ota_refresh') {
-      const vendorRes = await supabaseGet(env, `sims?select=iccid,vendor,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.${encodeURIComponent(String(sim_id))}&limit=1`);
-      const vendorRows = await vendorRes.json().catch(() => []);
+      const vendorRes = await supabaseGet(env, `sims?select=iccid,vendor,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.${sim_id}&limit=1`);
+      const vendorRows = await supabaseJson(vendorRes);
       const row = Array.isArray(vendorRows) && vendorRows[0] ? vendorRows[0] : null;
       if (row && row.vendor === 'teltik') {
         const apiKey = env.TELTIK_API_KEY;
@@ -7238,10 +7323,7 @@ async function handleSimAction(request, env, corsHeaders) {
       action: 'sim_action',
       error_message: String(error),
     });
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -7330,35 +7412,31 @@ async function handleQboRoute(request, env, corsHeaders, url) {
 
 async function handleSimWebhooks(env, corsHeaders, url) {
   try {
-    const simId = parseInt(url.searchParams.get('sim_id') || '0', 10);
-    if (!simId) {
-      return new Response(JSON.stringify({ error: 'sim_id required' }), {
-        status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
+    const simId = parsePositiveInt(url.searchParams.get('sim_id'));
+    if (!simId) return badRequest(corsHeaders, 'sim_id must be a positive whole number');
     // webhook_deliveries.payload is jsonb shaped like { data: { sim_id, iccid, number, ... } }
     // Use PostgREST nested JSON path filter. The `cs.{json}` containment form
     // (previously tried) silently returned 0 rows here, even though the
     // equivalent SQL `payload @> jsonb` matches — see /api/sim-webhooks 2026-05-21.
     const q = `webhook_deliveries?select=id,event_type,reseller_id,webhook_url,payload,status,attempts,last_attempt_at,delivered_at,created_at,response_body&event_type=eq.number.online&payload->data->>sim_id=eq.${simId}&order=created_at.desc&limit=50`;
     const res = await supabaseGet(env, q);
-    const rows = await res.json().catch(() => []);
+    const rows = await supabaseJson(res);
     const deliveries = Array.isArray(rows) ? rows : [];
     return new Response(JSON.stringify({ ok: true, sim_id: simId, count: deliveries.length, deliveries }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (e) {
-    return new Response(JSON.stringify({ error: String(e) }), {
-      status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(e, corsHeaders);
   }
 }
 
 async function handleResellerKeysList(url, env, corsHeaders) {
   try {
-    const resellerId = url.searchParams.get('reseller_id');
+    const resellerParam = url.searchParams.get('reseller_id');
+    const resellerId = parsePositiveInt(resellerParam);
+    if (resellerParam && !resellerId) return badRequest(corsHeaders, 'reseller_id must be a positive whole number');
     let q = 'reseller_api_keys?select=id,reseller_id,api_key,enabled,created_at,resellers(name)&order=created_at.desc';
-    if (resellerId) q += '&reseller_id=eq.' + encodeURIComponent(resellerId);
+    if (resellerId) q += '&reseller_id=eq.' + resellerId;
     const resp = await supabaseGet(env, q);
     if (!resp.ok) {
       return new Response(JSON.stringify({ error: 'lookup failed' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -7393,12 +7471,10 @@ function generateApiKey() {
 async function handleResellerKeysCreate(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const resellerId = body.reseller_id;
-    if (!resellerId) {
-      return new Response(JSON.stringify({ error: 'reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-    const checkResp = await supabaseGet(env, 'resellers?select=id&id=eq.' + encodeURIComponent(resellerId) + '&limit=1');
-    const checkRows = await checkResp.json();
+    const resellerId = parsePositiveInt(body.reseller_id);
+    if (!resellerId) return badRequest(corsHeaders, 'reseller_id must be a positive whole number');
+    const checkResp = await supabaseGet(env, 'resellers?select=id&id=eq.' + resellerId + '&limit=1');
+    const checkRows = await supabaseJson(checkResp);
     if (!Array.isArray(checkRows) || checkRows.length === 0) {
       return new Response(JSON.stringify({ error: 'reseller not found' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
@@ -7428,18 +7504,16 @@ async function handleResellerKeysCreate(request, env, corsHeaders) {
       note: 'This key is shown once. Copy it now and deliver to the reseller securely.',
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (e) {
-    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(e, corsHeaders);
   }
 }
 
 async function handleResellerKeysRevoke(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const id = body.id;
-    if (!id) {
-      return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/reseller_api_keys?id=eq.' + encodeURIComponent(id), {
+    const id = parsePositiveInt(body.id);
+    if (!id) return badRequest(corsHeaders, 'id must be a positive whole number');
+    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/reseller_api_keys?id=eq.' + id, {
       method: 'PATCH',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -7455,7 +7529,7 @@ async function handleResellerKeysRevoke(request, env, corsHeaders) {
     }
     return new Response(JSON.stringify({ ok: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (e) {
-    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(e, corsHeaders);
   }
 }
 
@@ -7477,10 +7551,10 @@ async function hashResellerPassword(password) {
 async function handleResellerCredentials(request, env, corsHeaders) {
   try {
     const body = await request.json();
-    const resellerId = body.reseller_id;
+    const resellerId = parsePositiveInt(body.reseller_id);
     const username = (body.username || '').trim().toLowerCase();
     const password = body.password || '';
-    if (!resellerId) return new Response(JSON.stringify({ error: 'reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!resellerId) return badRequest(corsHeaders, 'reseller_id must be a positive whole number');
     if (!username || !/^[a-z0-9._-]{3,40}$/.test(username)) return new Response(JSON.stringify({ error: 'username must be 3-40 chars: a-z, 0-9, . _ -' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     const hasPassword = !!password;
     if (hasPassword && password.length < 8) return new Response(JSON.stringify({ error: 'password must be at least 8 characters' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -7513,7 +7587,7 @@ async function handleResellerCredentials(request, env, corsHeaders) {
     }
     return new Response(JSON.stringify({ ok: true, reseller_id: Number(resellerId), username, password_changed: hasPassword }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (e) {
-    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(e, corsHeaders);
   }
 }
 
@@ -7541,7 +7615,7 @@ async function handleQboMappingsGet(env, corsHeaders) {
   try {
     const query = `qbo_customer_map?select=id,reseller_id,customer_name,qbo_customer_id,qbo_display_name,daily_rate,resellers(name)&order=id.desc`;
     const response = await supabaseGet(env, query);
-    const data = await response.json();
+    const data = await supabaseJson(response);
     const mapped = (Array.isArray(data) ? data : []).map(m => ({
       ...m,
       reseller_name: m.resellers?.name || null,
@@ -7550,10 +7624,7 @@ async function handleQboMappingsGet(env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -7572,22 +7643,19 @@ async function handleQboMappingsPost(request, env, corsHeaders) {
       },
       body: JSON.stringify({ reseller_id: reseller_id || null, qbo_customer_id, qbo_display_name, daily_rate: daily_rate || 0.50 }),
     });
-    const inserted = await insertResp.json();
+    const inserted = await supabaseJson(insertResp);
     return new Response(JSON.stringify(inserted), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
 async function handleQboMappingsDelete(url, env, corsHeaders) {
   try {
-    const id = url.searchParams.get('id');
-    if (!id) return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const id = parsePositiveInt(url.searchParams.get('id'));
+    if (!id) return badRequest(corsHeaders, 'id must be a positive whole number');
     await fetch(`${env.SUPABASE_URL}/rest/v1/qbo_customer_map?id=eq.${id}`, {
       method: 'DELETE',
       headers: {
@@ -7599,10 +7667,7 @@ async function handleQboMappingsDelete(url, env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -7610,7 +7675,7 @@ async function handleQboInvoicesGet(env, corsHeaders) {
   try {
     const query = `qbo_invoices?select=id,week_start,week_end,sim_count,total,status,paid_at,error_message,qbo_customer_map(qbo_display_name)&order=created_at.desc&limit=50`;
     const response = await supabaseGet(env, query);
-    const data = await response.json();
+    const data = await supabaseJson(response);
     const mapped = (Array.isArray(data) ? data : []).map(inv => ({
       ...inv,
       customer_name: inv.qbo_customer_map?.qbo_display_name || null,
@@ -7619,10 +7684,7 @@ async function handleQboInvoicesGet(env, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -7690,11 +7752,11 @@ async function handleQboInvoicePreview(url, env, corsHeaders) {
 
 async function handleBillingPreview(url, env, corsHeaders) {
   try {
-    const resellerId = url.searchParams.get('reseller_id');
+    const resellerId = parsePositiveInt(url.searchParams.get('reseller_id'));
     const start = url.searchParams.get('start');
     const end = url.searchParams.get('end');
-    if (!resellerId || !start || !end) {
-      return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!resellerId || !ISO_DATE_RE.test(start || '') || !ISO_DATE_RE.test(end || '')) {
+      return badRequest(corsHeaders, 'reseller_id (positive whole number), start and end (YYYY-MM-DD) required');
     }
     // INC-2: optional billing_mode override for the preview (rental testing).
     // Absent => undefined => legacy_simday. Only the exact string 'rental' diverts.
@@ -7702,19 +7764,20 @@ async function handleBillingPreview(url, env, corsHeaders) {
     // Optional forward-only cutover override (rental mode only). Absent => default
     // RENTAL_CUTOVER_DATE. Used by dashboard-test to diff against an earlier audit window.
     const cutover = url.searchParams.get('cutover') || undefined;
+    if (cutover && !ISO_DATE_RE.test(cutover)) return badRequest(corsHeaders, 'cutover must be YYYY-MM-DD');
     const result = await computeBillingBreakdown(env, { resellerId, start, end, billing_mode, cutover });
     return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 async function handleRentalExport(url, env, corsHeaders) {
   try {
-    const resellerId = url.searchParams.get('reseller_id');
+    const resellerId = parsePositiveInt(url.searchParams.get('reseller_id'));
     const start = url.searchParams.get('start');
     const end = url.searchParams.get('end');
-    if (!resellerId || !start || !end) {
-      return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!resellerId || !ISO_DATE_RE.test(start || '') || !ISO_DATE_RE.test(end || '')) {
+      return badRequest(corsHeaders, 'reseller_id (positive whole number), start and end (YYYY-MM-DD) required');
     }
     const q = env.SUPABASE_URL + '/rest/v1/rentals?select=id,rental_date,carrier,sim_id,e164,reseller_rental_id'
       + '&reseller_id=eq.' + encodeURIComponent(resellerId)
@@ -7726,7 +7789,7 @@ async function handleRentalExport(url, env, corsHeaders) {
     const PAGE = 1000;
     for (let offset = 0; ; offset += PAGE) {
       const res = await fetch(q + '&limit=' + PAGE + '&offset=' + offset, { headers: hdrs });
-      const rows = await res.json();
+      const rows = await supabaseJson(res);
       if (!Array.isArray(rows) || rows.length === 0) break;
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
@@ -7736,18 +7799,16 @@ async function handleRentalExport(url, env, corsHeaders) {
     }
     return new Response(lines.join('\n') + '\n', { headers: { ...corsHeaders, 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="rental_rows.csv"' } });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 
 async function handleUtilization(url, env, corsHeaders) {
   try {
-    const resellerId = url.searchParams.get('reseller_id');
+    const resellerId = parsePositiveInt(url.searchParams.get('reseller_id'));
     const days = Math.max(1, Math.min(90, parseInt(url.searchParams.get('days') || '7', 10) || 7));
     const vendorParam = url.searchParams.get('vendor');
-    if (!resellerId) {
-      return new Response(JSON.stringify({ error: 'reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
+    if (!resellerId) return badRequest(corsHeaders, 'reseller_id must be a positive whole number');
     // Window: last `days` calendar days in EST, inclusive of today.
     const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' });
     const now = new Date();
@@ -7756,10 +7817,13 @@ async function handleUtilization(url, env, corsHeaders) {
     startD.setUTCDate(startD.getUTCDate() - (days - 1));
     const start = fmt.format(startD);
     const vendors = vendorParam ? vendorParam.split(',').map(s => s.trim()).filter(Boolean) : null;
+    if (vendors && vendors.some(v => !LEDGER_VENDORS.includes(v))) {
+      return badRequest(corsHeaders, 'Invalid vendor. Valid: ' + LEDGER_VENDORS.join(', '));
+    }
     const result = await computeResellerUtilization(env, { resellerId, start, end, vendors });
     return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -7805,14 +7869,16 @@ function buildCSV(customerName, start, end, days, dailyRate) {
 
 async function handleBillingDownloadInvoice(url, env, corsHeaders) {
   try {
-    const invoiceId = url.searchParams.get('invoice_id');
+    const invoiceParam = url.searchParams.get('invoice_id');
+    const invoiceId = parsePositiveInt(invoiceParam);
+    if (invoiceParam && !invoiceId) return badRequest(corsHeaders, 'invoice_id must be a positive whole number');
 
     if (invoiceId) {
       // Re-download an existing invoice from history
       const invResp = await supabaseGet(env,
-        'qbo_invoices?select=id,week_start,week_end,sim_count,total,daily_breakdown,qbo_customer_map(qbo_display_name,daily_rate)&id=eq.' + encodeURIComponent(invoiceId) + '&limit=1'
+        'qbo_invoices?select=id,week_start,week_end,sim_count,total,daily_breakdown,qbo_customer_map(qbo_display_name,daily_rate)&id=eq.' + invoiceId + '&limit=1'
       );
-      const invData = await invResp.json();
+      const invData = await supabaseJson(invResp);
       const inv = Array.isArray(invData) && invData[0] ? invData[0] : null;
       if (!inv) {
         return new Response(JSON.stringify({ error: 'Invoice not found' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -7827,7 +7893,7 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
         ? inv.daily_breakdown
         : [{ sim_count: inv.sim_count, amount: totalAmount }];
       const csv = buildCSV(customerName, inv.week_start, inv.week_end, days, dailyRate);
-      const filename = 'invoice_' + customerName.replace(/[^a-z0-9]/gi, '_') + '_' + inv.week_start + '_' + inv.week_end + '.csv';
+      const filename = 'invoice' + customerName.replace(/[^a-z0-9]/gi, '') + String(inv.week_start).replace(/[^0-9]/g, '') + String(inv.week_end).replace(/[^0-9]/g, '') + '.csv';
       return new Response(csv, {
         headers: {
           ...corsHeaders,
@@ -7838,11 +7904,11 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
     }
 
     // New invoice: reseller_id + start + end
-    const resellerId = url.searchParams.get('reseller_id');
+    const resellerId = parsePositiveInt(url.searchParams.get('reseller_id'));
     const start = url.searchParams.get('start');
     const end = url.searchParams.get('end');
-    if (!resellerId || !start || !end) {
-      return new Response(JSON.stringify({ error: 'reseller_id, start, end required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!resellerId || !ISO_DATE_RE.test(start || '') || !ISO_DATE_RE.test(end || '')) {
+      return badRequest(corsHeaders, 'reseller_id (positive whole number), start and end (YYYY-MM-DD) required');
     }
 
     const billing_mode = url.searchParams.get('billing_mode') || undefined;
@@ -7882,7 +7948,7 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
     });
 
     const csv = buildCSV(mapping.qbo_display_name, start, end, days, dailyRate);
-    const filename = 'invoice_' + mapping.qbo_display_name.replace(/[^a-z0-9]/gi, '_') + '_' + start + '_' + end + '.csv';
+    const filename = 'invoice' + mapping.qbo_display_name.replace(/[^a-z0-9]/gi, '') + String(start).replace(/[^0-9]/g, '') + String(end).replace(/[^0-9]/g, '') + '.csv';
     return new Response(csv, {
       headers: {
         ...corsHeaders,
@@ -7891,7 +7957,7 @@ async function handleBillingDownloadInvoice(url, env, corsHeaders) {
       },
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return errorResponse(error, corsHeaders);
   }
 }
 
@@ -7925,8 +7991,12 @@ async function loadActivePlanMap(env, atDate) {
 const WING_AGGREGATOR_VENDORS = ['wing_iot', 'atomic', 'helix'];
 
 async function handlePlanRatesList(env, corsHeaders) {
-    const rows = await sbGet(env, 'plan_rates?order=vendor.asc,plan_name.asc,effective_from.desc');
-    return new Response(JSON.stringify(rows || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    try {
+        const rows = await sbGet(env, 'plan_rates?order=vendor.asc,plan_name.asc,effective_from.desc');
+        return new Response(JSON.stringify(rows || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return errorResponse(e, corsHeaders);
+    }
 }
 
 async function handlePlanRatesCreate(request, env, corsHeaders) {
@@ -8023,24 +8093,24 @@ function validateVendor(v) {
 
 async function handleResellerRatesList(env, corsHeaders, url) {
     try {
-        const resellerId = url.searchParams.get('reseller_id');
+        const resellerParam = url.searchParams.get('reseller_id');
+        const resellerId = parsePositiveInt(resellerParam);
+        if (resellerParam && !resellerId) return badRequest(corsHeaders, 'reseller_id must be a positive whole number');
         let q = 'reseller_rates?select=id,reseller_id,vendor,effective_from,effective_to,tiers,notes,created_at,updated_at,resellers(name)&order=reseller_id.asc,vendor.asc.nullsfirst,effective_from.desc';
-        if (resellerId) q = q.replace('?', '?reseller_id=eq.' + encodeURIComponent(resellerId) + '&');
+        if (resellerId) q = q.replace('?', '?reseller_id=eq.' + resellerId + '&');
         const rows = await sbGet(env, q);
         const mapped = (rows || []).map(r => Object.assign({}, r, { reseller_name: r.resellers?.name || null }));
         return new Response(JSON.stringify(mapped), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     } catch (e) {
-        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return errorResponse(e, corsHeaders);
     }
 }
 
 async function handleResellerRatesCreate(request, env, corsHeaders) {
     try {
         const body = await request.json();
-        const reseller_id = body.reseller_id != null ? parseInt(body.reseller_id) : NaN;
-        if (!Number.isInteger(reseller_id)) {
-            return new Response(JSON.stringify({ error: 'reseller_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        }
+        const reseller_id = parsePositiveInt(body.reseller_id);
+        if (!reseller_id) return badRequest(corsHeaders, 'reseller_id must be a positive whole number');
         const vendor = validateVendor(body.vendor);
         const effective_from = body.effective_from || new Date().toISOString().split('T')[0];
         const effective_to = body.effective_to || null;
@@ -8221,7 +8291,7 @@ async function sbGet(env, path) {
             'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
         }
     });
-    return resp.json();
+    return supabaseJson(resp);
 }
 
 async function sbPost(env, table, data) {
@@ -8401,14 +8471,17 @@ async function regenerateLedgerForVendor(env, vendor, options) {
 async function handleBillingLedgerRegenerate(request, env, corsHeaders, url) {
     try {
         const vendorParam = url.searchParams.get('vendor');
-        const vendors = vendorParam ? [vendorParam] : ['wing_iot', 'atomic', 'helix', 'teltik'];
+        if (vendorParam && !LEDGER_VENDORS.includes(normalizeVendorName(vendorParam))) {
+            return badRequest(corsHeaders, 'Invalid vendor. Valid: ' + LEDGER_VENDORS.join(', '));
+        }
+        const vendors = vendorParam ? [vendorParam] : LEDGER_VENDORS;
         const results = [];
         for (const v of vendors) {
             results.push(await regenerateLedgerForVendor(env, v));
         }
         return new Response(JSON.stringify({ ok: true, results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     } catch (e) {
-        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return errorResponse(e, corsHeaders);
     }
 }
 
@@ -8428,7 +8501,7 @@ async function reconcileLedgerForUpload(env, uploadId) {
         ? `vendor=in.(${WING_AGGREGATOR_VENDORS.join(',')})`
         : `vendor=eq.${vendor}`;
 
-    const lines = await supabaseGetAllArray(env, `bill_audit_lines?upload_id=eq.${uploadId}&order=id.asc`) || [];
+    const lines = await supabaseGetAllArray(env, `bill_audit_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc`) || [];
     if (!lines.length) return { upload_id: uploadId, matched: 0, missing: 0, phantom: 0 };
 
     const iccids = [...new Set(lines.map(l => l.subscription_iccid).filter(Boolean))];
@@ -8531,7 +8604,7 @@ async function handleBillingLedgerReconcile(request, env, corsHeaders, url) {
         const result = await reconcileLedgerForUpload(env, uploadId);
         return new Response(JSON.stringify({ ok: true, ...result }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     } catch (e) {
-        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return errorResponse(e, corsHeaders);
     }
 }
 
@@ -8543,7 +8616,10 @@ async function handleBillingLedgerList(env, corsHeaders, url) {
         const vendor = url.searchParams.get('vendor');
         const status = url.searchParams.get('status');
         const periodMonth = url.searchParams.get('period_month'); // YYYY-MM
-        if (sim_id) filters.push(`sim_id=eq.${encodeURIComponent(sim_id)}`);
+        if (sim_id) {
+            if (!parsePositiveInt(sim_id)) return badRequest(corsHeaders, 'sim_id must be a positive whole number');
+            filters.push(`sim_id=eq.${sim_id}`);
+        }
         if (iccid) filters.push(`iccid=ilike.*${encodeURIComponent(iccid)}*`);
         if (vendor) filters.push(`vendor=eq.${encodeURIComponent(vendor)}`);
         if (status) filters.push(`status=eq.${encodeURIComponent(status)}`);
@@ -8567,12 +8643,12 @@ async function handleBillingLedgerList(env, corsHeaders, url) {
                 'Prefer': 'count=exact',
             },
         });
-        const rows = await resp.json();
+        const rows = await supabaseJson(resp);
         const cr = resp.headers.get('content-range') || '*/0';
         const total = parseInt(cr.split('/')[1] || '0');
         return new Response(JSON.stringify({ rows: rows || [], total, limit, offset }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     } catch (e) {
-        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return errorResponse(e, corsHeaders);
     }
 }
 
@@ -8587,11 +8663,11 @@ async function handleBillingLedgerMonths(env, corsHeaders) {
             },
             body: '{}',
         });
-        const rows = await resp.json();
+        const rows = await supabaseJson(resp);
         const months = (rows || []).map(r => r.month).filter(Boolean);
         return new Response(JSON.stringify({ months }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     } catch (e) {
-        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return errorResponse(e, corsHeaders);
     }
 }
 
@@ -8887,27 +8963,35 @@ async function handleBillAuditUpload(request, env, corsHeaders) {
 }
 
 async function handleBillAuditResults(env, corsHeaders, url) {
-    const uploadId = url.searchParams.get('upload_id');
-    if (!uploadId) return new Response(JSON.stringify({ error: 'upload_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    try {
+        const uploadId = url.searchParams.get('upload_id');
+        if (!uploadId) return new Response(JSON.stringify({ error: 'upload_id required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
-    const [uploads, lines] = await Promise.all([
-        sbGet(env, `bill_audit_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
-        sbGet(env, `bill_audit_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
-    ]);
+        const [uploads, lines] = await Promise.all([
+            sbGet(env, `bill_audit_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
+            sbGet(env, `bill_audit_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
+        ]);
 
-    const upload = Array.isArray(uploads) ? uploads[0] : null;
-    if (!upload) return new Response(JSON.stringify({ error: 'Upload not found' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        const upload = Array.isArray(uploads) ? uploads[0] : null;
+        if (!upload) return new Response(JSON.stringify({ error: 'Upload not found' }), { status: 404, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
-    return new Response(JSON.stringify({
-        upload,
-        lines: lines || [],
-        discrepancies: (lines || []).filter(l => l.discrepancy_type),
-    }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({
+            upload,
+            lines: lines || [],
+            discrepancies: (lines || []).filter(l => l.discrepancy_type),
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return errorResponse(e, corsHeaders);
+    }
 }
 
 async function handleBillAuditUploads(env, corsHeaders) {
-    const data = await sbGet(env, 'bill_audit_uploads?select=id,vendor,filename,invoice_no,billing_period_start,billing_period_end,total_rows,total_amount,total_expected,overcharge_amount,discrepancy_count,status,created_at&order=created_at.desc&limit=50');
-    return new Response(JSON.stringify(data || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    try {
+        const data = await sbGet(env, 'bill_audit_uploads?select=id,vendor,filename,invoice_no,billing_period_start,billing_period_end,total_rows,total_amount,total_expected,overcharge_amount,discrepancy_count,status,created_at&order=created_at.desc&limit=50');
+        return new Response(JSON.stringify(data || []), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    } catch (e) {
+        return errorResponse(e, corsHeaders);
+    }
 }
 
 // Delete an audit upload + its lines + reset any ledger rows that were tied to it.
@@ -8951,67 +9035,71 @@ async function handleBillAuditDelete(env, corsHeaders, url) {
 
         return new Response(JSON.stringify({ ok: true, lines_deleted: lines.length, ledger_reset: lines.length }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     } catch (e) {
-        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return errorResponse(e, corsHeaders);
     }
 }
 
 async function handleBillAuditExport(env, corsHeaders, url) {
-    const uploadId = url.searchParams.get('upload_id');
-    if (!uploadId) return new Response('upload_id required', { status: 400 });
+    try {
+        const uploadId = url.searchParams.get('upload_id');
+        if (!uploadId) return new Response('upload_id required', { status: 400 });
 
-    const [uploads, lines] = await Promise.all([
-        sbGet(env, `bill_audit_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
-        sbGet(env, `bill_audit_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
-    ]);
+        const [uploads, lines] = await Promise.all([
+            sbGet(env, `bill_audit_uploads?id=eq.${encodeURIComponent(uploadId)}&limit=1`),
+            sbGet(env, `bill_audit_lines?upload_id=eq.${encodeURIComponent(uploadId)}&order=id.asc&limit=10000`),
+        ]);
 
-    const upload = Array.isArray(uploads) ? uploads[0] : null;
-    if (!upload) return new Response('Upload not found', { status: 404 });
+        const upload = Array.isArray(uploads) ? uploads[0] : null;
+        if (!upload) return new Response('Upload not found', { status: 404 });
 
-    const auditLabels = {
-        'unknown_iccid': 'UNKNOWN ICCID',
-        'canceled_before_period': 'CANCELED BEFORE PERIOD',
-        'rate_mismatch': 'RATE MISMATCH',
-        'duplicate_charge': 'DUPLICATE',
-    };
+        const auditLabels = {
+            'unknown_iccid': 'UNKNOWN ICCID',
+            'canceled_before_period': 'CANCELED BEFORE PERIOD',
+            'rate_mismatch': 'RATE MISMATCH',
+            'duplicate_charge': 'DUPLICATE',
+        };
 
-    const csvHeaders = 'Bill Line ID,ICCID,Description,Plan ID,Carrier,From Date,To Date,Billed Amount,Expected Amount,Overcharge,SIM Status,Audit Result,Detail';
-    const csvRows = (lines || []).map(l => {
-        const overcharge = Math.max(0, (l.price || 0) - (l.expected_price || 0));
-        const auditResult = l.discrepancy_type ? auditLabels[l.discrepancy_type] || l.discrepancy_type : 'OK';
-        return [
-            l.wing_id || '',
-            l.subscription_iccid || '',
-            `"${(l.description || '').replace(/"/g, '""')}"`,
-            l.bypassed_plan_id || '',
-            l.carrier || '',
-            l.from_date ? new Date(l.from_date).toLocaleDateString('en-US') : '',
-            l.to_date ? new Date(l.to_date).toLocaleDateString('en-US') : '',
-            (l.price || 0).toFixed(2),
-            (l.expected_price || 0).toFixed(2),
-            overcharge.toFixed(2),
-            l.sim_status || 'N/A',
-            auditResult,
-            `"${(l.discrepancy_detail || '').replace(/"/g, '""')}"`,
-        ].join(',');
-    });
+        const csvHeaders = 'Bill Line ID,ICCID,Description,Plan ID,Carrier,From Date,To Date,Billed Amount,Expected Amount,Overcharge,SIM Status,Audit Result,Detail';
+        const csvRows = (lines || []).map(l => {
+            const overcharge = Math.max(0, (l.price || 0) - (l.expected_price || 0));
+            const auditResult = l.discrepancy_type ? auditLabels[l.discrepancy_type] || l.discrepancy_type : 'OK';
+            return [
+                l.wing_id || '',
+                l.subscription_iccid || '',
+                `"${(l.description || '').replace(/"/g, '""')}"`,
+                l.bypassed_plan_id || '',
+                l.carrier || '',
+                l.from_date ? new Date(l.from_date).toLocaleDateString('en-US') : '',
+                l.to_date ? new Date(l.to_date).toLocaleDateString('en-US') : '',
+                (l.price || 0).toFixed(2),
+                (l.expected_price || 0).toFixed(2),
+                overcharge.toFixed(2),
+                l.sim_status || 'N/A',
+                auditResult,
+                `"${(l.discrepancy_detail || '').replace(/"/g, '""')}"`,
+            ].join(',');
+        });
 
-    const totalBilled = (lines || []).reduce((s, l) => s + (l.price || 0), 0);
-    const totalExpected = (lines || []).reduce((s, l) => s + (l.expected_price || 0), 0);
-    const totalOvercharge = Math.max(0, totalBilled - totalExpected);
-    csvRows.push('');
-    csvRows.push(`,,,,,,,${totalBilled.toFixed(2)},${totalExpected.toFixed(2)},${totalOvercharge.toFixed(2)},,"TOTALS",`);
+        const totalBilled = (lines || []).reduce((s, l) => s + (l.price || 0), 0);
+        const totalExpected = (lines || []).reduce((s, l) => s + (l.expected_price || 0), 0);
+        const totalOvercharge = Math.max(0, totalBilled - totalExpected);
+        csvRows.push('');
+        csvRows.push(`,,,,,,,${totalBilled.toFixed(2)},${totalExpected.toFixed(2)},${totalOvercharge.toFixed(2)},,"TOTALS",`);
 
-    const csv = csvHeaders + '\n' + csvRows.join('\n');
-    const invoiceName = (upload.filename || '').replace(/\.[^.]+$/, '') || `upload-${uploadId}`;
-    const exportFilename = `${invoiceName} - Audit.csv`;
+        const csv = csvHeaders + '\n' + csvRows.join('\n');
+        const invoiceName = (upload.filename || '').replace(/\.[^.]+$/, '') || `upload-${uploadId}`;
+        const exportFilename = `${invoiceName} - Audit.csv`;
 
-    return new Response(csv, {
-        headers: {
-            ...corsHeaders,
-            'Content-Type': 'text/csv',
-            'Content-Disposition': `attachment; filename="${exportFilename}"`,
-        },
-    });
+        return new Response(csv, {
+            headers: {
+                ...corsHeaders,
+                'Content-Type': 'text/csv',
+                'Content-Disposition': `attachment; filename="${exportFilename}"`,
+            },
+        });
+    } catch (e) {
+        return errorResponse(e, corsHeaders);
+    }
 }
 
 // One-time: re-evaluate discrepancies for existing bill_audit_lines using current logic.
@@ -9158,7 +9246,7 @@ async function handleBillAuditRecompute(env, corsHeaders, url) {
 
         return new Response(JSON.stringify({ ok: true, uploads_processed: summary.length, summary }, null, 2), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     } catch (e) {
-        return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return errorResponse(e, corsHeaders);
     }
 }
 
@@ -9279,15 +9367,15 @@ async function handleAtomicSwapSim(request, env, corsHeaders) {
   const json = (obj, status) => new Response(JSON.stringify(obj), { status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   try {
     const body = await request.json();
-    const simId = body.sim_id;
+    const simId = parsePositiveInt(body.sim_id);
     const newIccid = (body.new_iccid == null ? '' : String(body.new_iccid)).trim();
-    if (!simId) return json({ ok: false, error: 'sim_id required' }, 400);
+    if (!simId) return json({ ok: false, error: 'sim_id must be a positive whole number' }, 400);
 
     if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
       return json({ ok: false, error: 'ATOMIC credentials not configured on dashboard worker (push ATOMIC_USERNAME, ATOMIC_TOKEN, ATOMIC_PIN secrets)' }, 500);
     }
 
-    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,activation_zip,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1');
+    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,activation_zip,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + simId + '&limit=1');
     const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
     if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
     if (sim.vendor !== 'atomic') return json({ ok: false, error: 'SIM swap is only supported for ATOMIC (AT&T) SIMs; this SIM is ' + sim.vendor }, 400);
@@ -9369,7 +9457,7 @@ async function handleAtomicSwapSim(request, env, corsHeaders) {
 
     return json({ ok: true, sim_id: sim.id, old_iccid: sim.iccid, new_iccid: newIccid, msisdn, response: data });
   } catch (error) {
-    return json({ ok: false, error: String(error) }, 500);
+    return json({ ok: false, error: String(error) }, error instanceof SupabaseError ? 502 : 500);
   }
 }
 
@@ -9380,16 +9468,16 @@ async function handleAtomicSwapImei(request, env, corsHeaders) {
   const json = (obj, status) => new Response(JSON.stringify(obj), { status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   try {
     const body = await request.json();
-    const simId = body.sim_id;
+    const simId = parsePositiveInt(body.sim_id);
     const newImei = (body.imei == null ? '' : String(body.imei)).trim();
-    if (!simId) return json({ ok: false, error: 'sim_id required' }, 400);
+    if (!simId) return json({ ok: false, error: 'sim_id must be a positive whole number' }, 400);
     if (!/^\d{15}$/.test(newImei)) return json({ ok: false, error: 'imei must be 15 digits' }, 400);
 
     if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
       return json({ ok: false, error: 'ATOMIC credentials not configured on dashboard worker' }, 500);
     }
 
-    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,activation_zip,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1');
+    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,activation_zip,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + simId + '&limit=1');
     const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
     if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
     if (sim.vendor !== 'atomic') return json({ ok: false, error: 'swapImei is only supported for ATOMIC (AT&T) SIMs; this SIM is ' + sim.vendor }, 400);
@@ -9445,7 +9533,7 @@ async function handleAtomicSwapImei(request, env, corsHeaders) {
 
     return json({ ok: true, sim_id: sim.id, iccid: sim.iccid, msisdn, zipCode, imei: newImei, response: data });
   } catch (error) {
-    return json({ ok: false, error: String(error) }, 500);
+    return json({ ok: false, error: String(error) }, error instanceof SupabaseError ? 502 : 500);
   }
 }
 
@@ -9462,15 +9550,15 @@ async function handleAtomicSubAction(request, env, corsHeaders) {
   };
   try {
     const body = await request.json();
-    const simId = body.sim_id;
+    const simId = parsePositiveInt(body.sim_id);
     const op = String(body.op || '').trim();
-    if (!simId) return json({ ok: false, error: 'sim_id required' }, 400);
+    if (!simId) return json({ ok: false, error: 'sim_id must be a positive whole number' }, 400);
     if (!OPS[op]) return json({ ok: false, error: 'op must be one of: ' + Object.keys(OPS).join(', ') }, 400);
     if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
       return json({ ok: false, error: 'ATOMIC credentials not configured on dashboard worker' }, 500);
     }
 
-    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1');
+    const sims = await sbGet(env, 'sims?select=id,iccid,msisdn,vendor,status,sim_numbers(e164)&sim_numbers.valid_to=is.null&id=eq.' + simId + '&limit=1');
     const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
     if (!sim) return json({ ok: false, error: 'SIM #' + simId + ' not found' }, 404);
     if (sim.vendor !== 'atomic') return json({ ok: false, error: 'ATOMIC only; this SIM is ' + sim.vendor }, 400);
@@ -9521,7 +9609,7 @@ async function handleAtomicSubAction(request, env, corsHeaders) {
     if (spec.status === 'canceled') await deactivateSimAssignments(env, sim.id);
     return json({ ok: true, sim_id: sim.id, iccid: sim.iccid, msisdn, op, requestType: spec.requestType, new_status: spec.status, response: data });
   } catch (error) {
-    return json({ ok: false, error: String(error) }, 500);
+    return json({ ok: false, error: String(error) }, error instanceof SupabaseError ? 502 : 500);
   }
 }
 
@@ -9709,6 +9797,12 @@ async function handleActivationRunsList(env, corsHeaders, url) {
     const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10), 0);
     const status = url.searchParams.get('status');
     const source = url.searchParams.get('source');
+    if (status && !ACTIVATION_RUN_STATUSES.includes(status)) {
+      return badRequest(corsHeaders, 'Invalid status. Valid: ' + ACTIVATION_RUN_STATUSES.join(', '));
+    }
+    if (source && !ACTIVATION_RUN_SOURCES.includes(source)) {
+      return badRequest(corsHeaders, 'Invalid source. Valid: ' + ACTIVATION_RUN_SOURCES.join(', '));
+    }
 
     let query = 'activation_runs?select=*&order=created_at.desc&limit=' + limit + '&offset=' + offset;
     const filters = [];
@@ -9766,6 +9860,9 @@ async function handleActivationRunDetail(env, corsHeaders, runId, url) {
     const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '200', 10), 1), 1000);
     const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10), 0);
     const status = url.searchParams.get('status');
+    if (status && !ACTIVATION_ITEM_STATUSES.includes(status)) {
+      return badRequest(corsHeaders, 'Invalid status. Valid: ' + ACTIVATION_ITEM_STATUSES.join(', '));
+    }
 
     let itemsQuery = 'activation_job_items?select=*&run_id=eq.' + encodeURIComponent(runId) + '&order=created_at.asc&limit=' + limit + '&offset=' + offset;
     if (status) itemsQuery += '&status=eq.' + status;
@@ -9816,6 +9913,10 @@ async function handleActivationRunRetry(request, env, corsHeaders) {
   try {
     const body = await request.json();
     const { run_id, item_ids, retry_all_failed } = body;
+    if (run_id && !UUID_RE.test(String(run_id))) return badRequest(corsHeaders, 'run_id must be a UUID');
+    if (Array.isArray(item_ids) && item_ids.some(id => !UUID_RE.test(String(id)))) {
+      return badRequest(corsHeaders, 'every item_id must be a UUID');
+    }
 
     if (!run_id) {
       return new Response(JSON.stringify({ error: 'run_id required' }), {

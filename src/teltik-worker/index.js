@@ -1,3 +1,5 @@
+import { carrierFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbGetAll, sbPatch, sbPost, sbRpc, SupabaseError } from '../shared/supabase-rest.mjs';
 // =========================================================
 // TELTIK WORKER
 // Manages T-Mobile SIMs via Teltik REST API (api.smsgateway.xyz)
@@ -63,7 +65,7 @@ export default {
       const force = url.searchParams.get('force') === 'true';
       if (!iccid) return jsonResponse({ ok: false, error: 'iccid required' }, 400);
       try {
-        const rows = await supabaseGetArray(
+        const rows = await sbGet(
           env,
           `sims?iccid=eq.${encodeURIComponent(iccid)}&vendor=eq.teltik&select=id,iccid,reseller_sims(reseller_id,active)&limit=1`
         );
@@ -83,7 +85,7 @@ export default {
       }
       const batch = parseInt(url.searchParams.get('batch') || '100', 10) || 100;
       try {
-        const held = await supabaseRpc(env, 'teltik_hold_morning_batch', { p_batch: batch });
+        const held = await sbRpc(env, 'teltik_hold_morning_batch', { p_batch: batch });
         return jsonResponse({ ok: true, held }, 200);
       } catch (err) {
         return jsonResponse({ ok: false, error: String(err) }, 500);
@@ -141,7 +143,7 @@ export default {
       }
       const batch = parseInt(env.TELTIK_MIGRATION_BATCH || '100', 10) || 100;
       try {
-        const held = await supabaseRpc(env, 'teltik_hold_morning_batch', { p_batch: batch });
+        const held = await sbRpc(env, 'teltik_hold_morning_batch', { p_batch: batch });
         console.log(`[Migrate] held ${held} morning-anchored teltik lines for next-midnight rotation`);
       } catch (err) {
         console.error(`[Migrate] failed: ${err}`);
@@ -237,7 +239,7 @@ export async function importTeltikLines(env, opts = {}) {
   // Precompute existing ICCID → {id, vendor} once per chunk. Covers ALL
   // vendors, not just teltik: a Teltik-hosted foreign-vendor SIM must be
   // recognized as existing so we never insert/overwrite it (see note above).
-  const existingDbRows = await supabaseGetAllArray(env, `sims?select=id,iccid,vendor`);
+  const existingDbRows = await sbGetAll(env, `sims?select=id,iccid,vendor`);
   const iccidToSim = new Map();
   for (const r of existingDbRows) iccidToSim.set(String(r.iccid), r);
 
@@ -307,7 +309,7 @@ export async function importTeltikLines(env, opts = {}) {
       // baseline. Plain insert, not upsert — this path must never be able to
       // touch an existing row.
       const nowIso = new Date().toISOString();
-      const insRes = await supabaseInsert(env, 'sims', [{
+      const insRes = await sbPost(env, 'sims', [{
         iccid,
         vendor: 'teltik',
         carrier: 'tmobile',
@@ -315,14 +317,14 @@ export async function importTeltikLines(env, opts = {}) {
         status: 'active',
         activated_at: nowIso,
         last_mdn_rotated_at: nowIso,
-      }]);
+      }], RAW_MINIMAL);
       if (!insRes.ok) {
         const errText = await insRes.text();
         console.log(`[Import] Insert failed for ICCID ${iccid}: ${insRes.status} ${errText}`);
         continue;
       }
 
-      const simRows = await supabaseGetArray(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`);
+      const simRows = await sbGet(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`);
       if (!Array.isArray(simRows) || simRows.length === 0) {
         console.log(`[Import] Could not find SIM after insert for ICCID ${iccid}`);
         skipped++;
@@ -332,7 +334,7 @@ export async function importTeltikLines(env, opts = {}) {
     }
 
     // 6. Sync sim_numbers — close old if different, insert new
-    const currentNumbers = await supabaseGetArray(
+    const currentNumbers = await sbGet(
       env,
       `sim_numbers?sim_id=eq.${simId}&valid_to=is.null&select=e164&limit=1`
     );
@@ -343,17 +345,18 @@ export async function importTeltikLines(env, opts = {}) {
     } else {
       // Close old number row if exists
       if (currentE164) {
-        await supabasePatch(env, `sim_numbers?sim_id=eq.${simId}&valid_to=is.null`, {
+        // unchecked: a failed close is not detected (unchanged behaviour).
+        await sbPatch(env, `sim_numbers?sim_id=eq.${simId}&valid_to=is.null`, {
           valid_to: new Date().toISOString(),
-        });
+        }, RAW_MINIMAL);
       }
       // Insert new number
-      const insRes = await supabaseInsert(env, 'sim_numbers', [{
+      const insRes = await sbPost(env, 'sim_numbers', [{
         sim_id: simId,
         e164: mdn,
         valid_from: new Date().toISOString(),
         verification_status: 'verified',
-      }]);
+      }], RAW_MINIMAL);
       if (!insRes.ok) {
         console.log(`[Import] sim_numbers insert failed for ${mdn}: ${insRes.status}`);
       }
@@ -362,7 +365,8 @@ export async function importTeltikLines(env, opts = {}) {
       // and other consumers don't drift if they fall back to sims.msisdn.
       const bare10 = String(mdn).replace(/^\+?1?/, '');
       if (/^\d{10}$/.test(bare10)) {
-        await supabasePatch(env, `sims?id=eq.${simId}`, { msisdn: bare10 }).catch(() => {});
+        // Best effort: any failure is swallowed.
+        await sbPatch(env, `sims?id=eq.${simId}`, { msisdn: bare10 }, MINIMAL).catch(() => {});
       }
 
       if (existing) {
@@ -405,7 +409,7 @@ async function reconcileWithTeltik(env) {
   if (!Array.isArray(lines)) throw new Error('Teltik returned non-array');
 
   // Pull every Teltik ICCID we know about from our DB (paginated to bypass PostgREST 1000-row cap).
-  const dbRows = await supabaseGetAllArray(env, `sims?vendor=eq.teltik&select=id,iccid,status`);
+  const dbRows = await sbGetAll(env, `sims?vendor=eq.teltik&select=id,iccid,status`);
   const dbByIccid = new Map();
   const simIdToIccid = new Map();
   for (const r of dbRows) {
@@ -414,7 +418,7 @@ async function reconcileWithTeltik(env) {
   }
 
   // Active sim_numbers for the MDN-→ICCID fast path (paginated).
-  const activeNums = await supabaseGetAllArray(env, `sim_numbers?valid_to=is.null&select=sim_id,e164`);
+  const activeNums = await sbGetAll(env, `sim_numbers?valid_to=is.null&select=sim_id,e164`);
   const e164ToSimId = new Map();
   for (const n of activeNums) e164ToSimId.set(String(n.e164), n.sim_id);
 
@@ -442,9 +446,16 @@ async function reconcileWithTeltik(env) {
     if (!u.mdn) { unresolved.push(u); continue; }
     await sleep(120);
     const mdnDigits = u.mdn.replace('+', '');
-    const r = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${apiKey}&mdn=${encodeURIComponent(mdnDigits)}`);
+    let r, info;
+    try {
+      r = await relayFetch(env, `${TELTIK_BASE}/v1/get-info?apikey=${apiKey}&mdn=${encodeURIComponent(mdnDigits)}`);
+      if (r.ok) info = await r.json();
+    } catch (err) {
+      // One MDN's lookup failing (timeout, network) must not abort the reconcile.
+      unresolved.push({ ...u, error: `get-info ${err}` });
+      continue;
+    }
     if (!r.ok) { unresolved.push({ ...u, error: `get-info ${r.status}` }); continue; }
-    const info = await r.json();
     if (info.iccid) teltikIccids.add(String(info.iccid));
     else unresolved.push({ ...u, info });
   }
@@ -477,7 +488,7 @@ async function reconcileWithTeltik(env) {
 async function syncTeltikMdns(env) {
   const apiKey = env.TELTIK_API_KEY;
 
-  const sims = await supabaseGetArray(
+  const sims = await sbGet(
     env,
     `sims?vendor=eq.teltik&status=eq.active&select=id,iccid&order=id.asc&limit=5000`
   );
@@ -510,7 +521,7 @@ async function syncTeltikMdns(env) {
         continue;
       }
 
-      const currentNumbers = await supabaseGetArray(
+      const currentNumbers = await sbGet(
         env,
         `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null&select=e164&limit=1`
       );
@@ -527,16 +538,17 @@ async function syncTeltikMdns(env) {
       mismatches.push({ iccid: sim.iccid, db: dbMdn, teltik: teltikMdn });
 
       if (dbMdn) {
-        await supabasePatch(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`, {
+        // unchecked: a failed close is not detected; the insert below is checked.
+        await sbPatch(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`, {
           valid_to: new Date().toISOString(),
-        });
+        }, RAW_MINIMAL);
       }
-      const insRes = await supabaseInsert(env, 'sim_numbers', [{
+      const insRes = await sbPost(env, 'sim_numbers', [{
         sim_id: sim.id,
         e164: teltikMdn,
         valid_from: new Date().toISOString(),
         verification_status: 'verified',
-      }]);
+      }], RAW_MINIMAL);
       if (!insRes.ok) {
         console.log(`[SyncMDN] SIM ${sim.iccid}: insert failed ${insRes.status}`);
         errors++;
@@ -544,7 +556,8 @@ async function syncTeltikMdns(env) {
         // INC-5: keep sims.msisdn in lockstep with sim_numbers.
         const bare10 = String(teltikMdn).replace(/^\+?1?/, '');
         if (/^\d{10}$/.test(bare10)) {
-          await supabasePatch(env, `sims?id=eq.${sim.id}`, { msisdn: bare10 }).catch(() => {});
+          // Best effort: any failure is swallowed.
+          await sbPatch(env, `sims?id=eq.${sim.id}`, { msisdn: bare10 }, MINIMAL).catch(() => {});
         }
         updated++;
       }
@@ -616,7 +629,7 @@ export async function processTeltikSmsItem(body, env) {
   let iccid = null;
   let matchedByIccid = false;
   if (aliasIccid) {
-    const simRows = await supabaseGetArray(
+    const simRows = await sbGet(
       env,
       `sims?iccid=eq.${encodeURIComponent(aliasIccid)}&select=id,iccid&limit=1`
     );
@@ -632,7 +645,7 @@ export async function processTeltikSmsItem(body, env) {
 
   if (!simId && mdn) {
     // Look up sim_id by current E.164 number
-    const simNumbers = await supabaseGetArray(
+    const simNumbers = await sbGet(
       env,
       `sim_numbers?e164=eq.${encodeURIComponent(mdn)}&valid_to=is.null&select=sim_id&limit=1`
     );
@@ -645,7 +658,7 @@ export async function processTeltikSmsItem(body, env) {
     // payload. Once ICCID resolves the SIM, customer-facing paths must use the
     // active DB sim_number, not the Teltik host MDN. Keep the payload MDN in raw
     // (and reseller evidence below), but do not treat it as canonical.
-    const activeNumbers = await supabaseGetArray(
+    const activeNumbers = await sbGet(
       env,
       `sim_numbers?sim_id=eq.${simId}&valid_to=is.null&select=e164&limit=1`
     );
@@ -666,7 +679,7 @@ export async function processTeltikSmsItem(body, env) {
   });
 
   // Dedup check
-  const existingMsg = await supabaseGetArray(
+  const existingMsg = await sbGet(
     env,
     `inbound_sms?message_id=eq.${encodeURIComponent(messageId)}&select=id&limit=1`
   );
@@ -676,7 +689,7 @@ export async function processTeltikSmsItem(body, env) {
   }
 
   // Insert into inbound_sms
-  const insRes = await supabaseInsert(env, 'inbound_sms', [{
+  const insRes = await sbPost(env, 'inbound_sms', [{
     sim_id: simId,
     to_number: canonicalNumber,
     from_number: fromNumber,
@@ -685,7 +698,7 @@ export async function processTeltikSmsItem(body, env) {
     port: null,        // no physical port for Teltik
     message_id: messageId,
     raw: body,
-  }]);
+  }], RAW_MINIMAL);
 
   if (!insRes.ok) {
     console.log(`[Webhook] inbound_sms insert failed: ${insRes.status}`);
@@ -693,7 +706,7 @@ export async function processTeltikSmsItem(body, env) {
 
   // Send reseller sms.received webhook if SIM is assigned
   if (simId) {
-    const resellerRows = await supabaseGetArray(
+    const resellerRows = await sbGet(
       env,
       `reseller_sims?sim_id=eq.${simId}&active=eq.true&select=reseller_id,resellers!inner(reseller_webhooks(url,enabled))&limit=1`
     );
@@ -732,7 +745,7 @@ async function rotateTeltikSims(env) {
   const now = Date.now();
 
   // 1. Query active Teltik SIMs assigned to active resellers
-  const sims = await supabaseGetArray(
+  const sims = await sbGet(
     env,
     `sims?vendor=eq.teltik&status=eq.active&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours,rotation_hold_until,reseller_sims!inner(reseller_id,active)&reseller_sims.active=eq.true&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
   );
@@ -761,7 +774,7 @@ async function rotateTeltikSims(env) {
   // and silently killed tonight's entire cron window — see session 58).
   let retryCandidates = [];
   try {
-    retryCandidates = await supabaseGetArray(
+    retryCandidates = await sbGet(
       env,
       `sims?vendor=eq.teltik&status=in.(active,provisioning)&rotation_status=eq.failed&rotation_eligible=eq.true&reseller_sims.active=eq.true&select=id,iccid,last_mdn_rotated_at,rotation_interval_hours,rotation_hold_until,reseller_sims!inner(reseller_id,active)&order=last_mdn_rotated_at.asc.nullsfirst&limit=5000`
     );
@@ -778,6 +791,7 @@ async function rotateTeltikSims(env) {
   console.log(`[Rotate] ${sims.length} active Teltik SIMs, ${due.length} due, ${retryList.length} eligible for in-window retry`);
 
   let rotated = 0, errors = 0, skipped = 0, retried = 0, retrySkipped = 0;
+  const failedAfterCarrier = [];
 
   // Bounded-concurrency pool + graceful time budget (speed-up approved
   // 2026-06-12). The old serial loop did ~6/min and was KILLED at the 15-min
@@ -820,6 +834,7 @@ async function rotateTeltikSims(env) {
           if (result.skipped) { if (isRetry) retrySkipped++; else skipped++; }
           else if (result.ok) { if (isRetry) retried++; else rotated++; }
           else errors++;
+          if (result.failed_after_carrier) failedAfterCarrier.push({ sim_id: result.sim_id, iccid: result.iccid });
           if (result.ok || result.skipped || !isTransportError(result.error)) {
             consecutiveTransportFails = 0;
           } else if (++consecutiveTransportFails >= BREAKER_THRESHOLD) {
@@ -863,6 +878,7 @@ async function rotateTeltikSims(env) {
     retry_skipped: retrySkipped,
     time_budget_hit: timedOut,
     breaker_tripped: breakerTripped,
+    failed_after_carrier: failedAfterCarrier,
     concurrency: lanes,
   };
 }
@@ -884,8 +900,8 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
     // If the RPC returns false, the SIM isn't eligible and we MUST NOT call the
     // carrier — would burn an extra MDN.
     const claimed = retry
-      ? await supabaseRpc(env, 'claim_rotation_retry_slot', { p_sim_id: sim.id })
-      : await supabaseRpc(env, 'claim_rotation_slot', { p_sim_id: sim.id, p_force: force });
+      ? await sbRpc(env, 'claim_rotation_retry_slot', { p_sim_id: sim.id })
+      : await sbRpc(env, 'claim_rotation_slot', { p_sim_id: sim.id, p_force: force });
     if (!claimed) {
       const rpcName = retry ? 'claim_rotation_retry_slot' : 'claim_rotation_slot';
       console.log(`[Rotate] SIM ${sim.iccid}: ${rpcName} returned false — skipping`);
@@ -943,13 +959,30 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
       const rawOld = changeData.old_msisdn || '';
       const oldBare = rawOld ? String(rawOld).replace(/\D/g, '').replace(/^1(\d{10})$/, '$1') : null;
 
-      // Close the prior number window, open the new one.
-      await supabasePatch(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`, { valid_to: nowIso }).catch(() => {});
-      await supabaseInsert(env, 'sim_numbers', [{
-        sim_id: sim.id, e164: newE164, valid_from: nowIso, verification_status: 'verified',
-      }]).catch((e) => console.error(`[Rotate] SIM ${sim.iccid}: sim_numbers insert failed: ${e}`));
+      // Teltik has already changed the number, so every write below must land.
+      // A failed write is collected, not thrown: the carrier call is never
+      // retried, and increment_rotation_fail is skipped because a 'failed'
+      // rotation_status would put the SIM in the retry pass and burn another MDN.
+      const dbWriteFailures = [];
+      const checkWrite = async (label, write) => {
+        try {
+          await write;
+        } catch (e) {
+          // SupabaseError carries the HTTP status and body; a timeout or
+          // network error has neither and is recorded as status 0.
+          const status = e instanceof SupabaseError ? e.status : 0;
+          const body = e instanceof SupabaseError ? String(e.body) : String(e);
+          dbWriteFailures.push({ write: label, status, body: body.slice(0, 300) });
+        }
+      };
 
-      await supabasePatch(env, `sims?id=eq.${sim.id}`, {
+      // Close the prior number window, open the new one.
+      await checkWrite('sim_numbers close', sbPatch(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null`, { valid_to: nowIso }, MINIMAL));
+      await checkWrite('sim_numbers insert', sbPost(env, 'sim_numbers', [{
+        sim_id: sim.id, e164: newE164, valid_from: nowIso, verification_status: 'verified',
+      }], MINIMAL));
+
+      await checkWrite('sims patch', sbPatch(env, `sims?id=eq.${sim.id}`, {
         msisdn: newMdnBare,
         status: 'active',
         rotation_status: 'success',
@@ -957,7 +990,7 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
         last_rotation_error: null,
         rotation_fail_count: 0,
         rotation_hold_until: null, // night-migration hold satisfied once it rotates
-      });
+      }, MINIMAL));
 
       // Reseller webhooks: old number offline, new number online.
       try {
@@ -966,19 +999,27 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
         console.error(`[Rotate] SIM ${sim.iccid}: reseller webhook err: ${err}`);
       }
 
+      if (dbWriteFailures.length) {
+        const summary = dbWriteFailures.map(f => `${f.write} HTTP ${f.status}: ${f.body}`).join('; ');
+        console.error(`[Rotate] SIM ${sim.id} (${sim.iccid}): Teltik changed ${oldBare || '?'} → ${newMdnBare} but DB writes failed — ${summary}`);
+        await logRotationDbWriteFailure(env, sim, { oldBare, newMdnBare, requestId, failures: dbWriteFailures });
+        return { ok: false, iccid: sim.iccid, sim_id: sim.id, new_mdn: newE164, failed_after_carrier: true, error: `DB write failed after Teltik number change: ${summary}` };
+      }
+
       console.log(`[Rotate] SIM ${sim.iccid}: rotated inline ${oldBare || '?'} → ${newMdnBare} (synchronous change-number response, requestId=${requestId})`);
       return { ok: true, iccid: sim.iccid, sim_id: sim.id, new_mdn: newE164, rotated: true };
     }
 
     // Fallback: response lacked a usable new_msisdn — flip to provisioning and let
     // details-finalizer pick up the new MDN via get-phone-number (the old behavior).
-    await supabasePatch(env, `sims?id=eq.${sim.id}`, {
+    // unchecked: a failed write is not detected (unchanged behaviour).
+    await sbPatch(env, `sims?id=eq.${sim.id}`, {
       rotation_status: 'mdn_pending',
       status: 'provisioning',
       last_rotation_error: null,
       rotation_fail_count: 0,
       rotation_hold_until: null, // night-migration hold satisfied once it rotates
-    });
+    }, RAW_MINIMAL);
 
     console.log(`[Rotate] SIM ${sim.iccid}: change-number issued (requestId=${requestId}) — no new_msisdn in response, status=provisioning, details-finalizer will pick up MDN`);
     return { ok: true, iccid: sim.iccid, sim_id: sim.id, pending: true, requestId };
@@ -991,7 +1032,7 @@ async function rotateOneTeltikSim(env, sim, opts = {}) {
     // (status in active/provisioning), so no further auto attempts occur.
     // last_mdn_rotated_at is left untouched (claim_rotation_retry_slot's 15-min
     // backoff keys off it) so we don't re-burn an MDN this cycle.
-    await supabaseRpc(env, 'increment_rotation_fail', {
+    await sbRpc(env, 'increment_rotation_fail', {
       p_sim_id: sim.id,
       p_error: String(err).slice(0, 500),
       p_today_start: getNYMidnightISO(),
@@ -1026,14 +1067,14 @@ async function setupTeltikForwardUrl(env) {
 // Relay
 // =========================================================
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 // =========================================================
@@ -1078,92 +1119,31 @@ function jsonResponse(obj, status = 200) {
 // Supabase Helpers
 // =========================================================
 
-async function supabaseGetArray(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'GET',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  const text = await res.text();
-  let data;
-  try { data = text ? JSON.parse(text) : []; } catch { data = []; }
-  if (!res.ok) throw new Error(`Supabase ${res.status}: ${JSON.stringify(data)}`);
-  return Array.isArray(data) ? data : [];
-}
+// Write options for call sites that keep the fetch Response: the caller
+// either checks res.ok itself, or is marked "unchecked" where a non-2xx write
+// has always been ignored. A timeout or network error still throws.
+const RAW_MINIMAL = { prefer: 'return=minimal', raw: true };
+// Throwing variant: a non-2xx rejects with SupabaseError.
+const MINIMAL = { prefer: 'return=minimal' };
 
-// Paginated fetch that bypasses the PostgREST 1000-row cap by chunking via
-// Range headers. `path` MUST NOT include &limit= or &offset=.
-async function supabaseGetAllArray(env, path) {
-  const all = [];
-  const pageSize = 1000;
-  let offset = 0;
-  while (true) {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-      method: 'GET',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        Range: `${offset}-${offset + pageSize - 1}`,
-        'Range-Unit': 'items',
-      },
-    });
-    const text = await res.text();
-    let data;
-    try { data = text ? JSON.parse(text) : []; } catch { data = []; }
-    if (!res.ok) throw new Error(`Supabase ${res.status}: ${JSON.stringify(data)}`);
-    if (!Array.isArray(data) || data.length === 0) break;
-    all.push(...data);
-    if (data.length < pageSize) break;
-    offset += pageSize;
-    if (offset > 50000) break; // safety stop
+// Teltik changed the number but the DB did not record it: the dashboard and
+// resellers still see the old number, so surface it to an operator.
+async function logRotationDbWriteFailure(env, sim, { oldBare, newMdnBare, requestId, failures }) {
+  try {
+    const res = await sbPost(env, 'system_errors', [{
+      source: 'teltik-worker',
+      action: 'teltik_rotation_db_write_failed',
+      sim_id: sim.id,
+      iccid: sim.iccid,
+      error_message: `Teltik changed the number to ${newMdnBare} but ${failures.map(f => f.write).join(', ')} failed; the DB may still show ${oldBare || 'the old number'}`,
+      error_details: { old_msisdn: oldBare, new_msisdn: newMdnBare, request_id: requestId, failures },
+      severity: 'error',
+      status: 'open',
+    }], RAW_MINIMAL);
+    if (!res.ok) console.error(`[Rotate] SIM ${sim.id}: system_errors insert failed HTTP ${res.status}`);
+  } catch (e) {
+    console.error(`[Rotate] SIM ${sim.id}: system_errors insert failed: ${e}`);
   }
-  return all;
-}
-
-async function supabaseGetOne(env, path) {
-  const rows = await supabaseGetArray(env, path);
-  return rows[0] || null;
-}
-
-async function supabaseInsert(env, table, rows) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(rows),
-  });
-}
-
-async function supabaseUpsert(env, table, data, onConflict) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${table}?on_conflict=${onConflict}`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'resolution=merge-duplicates,return=minimal',
-    },
-    body: JSON.stringify(data),
-  });
-}
-
-async function supabasePatch(env, path, data) {
-  return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'PATCH',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(data),
-  });
 }
 
 async function logCarrierApiCall(env, logData) {
@@ -1185,36 +1165,11 @@ async function logCarrierApiCall(env, logData) {
     created_at: new Date().toISOString(),
   };
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
-      },
-      body: JSON.stringify(payload),
-    });
+    // Best effort: a failure (non-2xx or timeout) is logged and swallowed.
+    await sbPost(env, 'carrier_api_logs', payload, MINIMAL);
   } catch (e) {
     console.warn(`[Teltik API log] insert failed: ${e}`);
   }
-}
-
-// Calls a Supabase RPC and returns the parsed body (for scalar returns this is
-// the raw value, e.g. boolean for claim_rotation_slot).
-async function supabaseRpc(env, fnName, args) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(args || {}),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`RPC ${fnName} failed ${res.status}: ${text}`);
-  try { return JSON.parse(text); } catch { return text; }
 }
 
 // =========================================================
@@ -1244,16 +1199,8 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
-    {
-      method: 'GET',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
-  );
+  // raw: a non-2xx counts as "not delivered" below; a timeout still throws.
+  const res = await sbGet(env, `webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`, { raw: true });
   if (!res.ok) return false;
   const data = await res.json();
   return Array.isArray(data) && data.length > 0;
@@ -1261,27 +1208,19 @@ async function wasWebhookDelivered(env, messageId) {
 
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts } = delivery;
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'resolution=merge-duplicates',
-    },
-    body: JSON.stringify({
-      message_id: messageId,
-      event_type: eventType,
-      reseller_id: resellerId,
-      webhook_url: webhookUrl,
-      payload,
-      status,
-      attempts,
-      last_attempt_at: new Date().toISOString(),
-      delivered_at: status === 'delivered' ? new Date().toISOString() : null,
-      response_body: delivery.responseBody ? String(delivery.responseBody).slice(0, 2000) : null,
-    }),
-  });
+  // unchecked: a non-2xx is ignored (unchanged behaviour); a timeout still throws.
+  await sbPost(env, 'webhook_deliveries', {
+    message_id: messageId,
+    event_type: eventType,
+    reseller_id: resellerId,
+    webhook_url: webhookUrl,
+    payload,
+    status,
+    attempts,
+    last_attempt_at: new Date().toISOString(),
+    delivered_at: status === 'delivered' ? new Date().toISOString() : null,
+    response_body: delivery.responseBody ? String(delivery.responseBody).slice(0, 2000) : null,
+  }, { prefer: 'resolution=merge-duplicates', raw: true });
 }
 
 async function postWebhookWithRetry(env, url, payload, options = {}) {
@@ -1295,7 +1234,7 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
+      }, webhookFetch);
       lastStatus = res.status;
       const responseBody = await res.text().catch(() => '');
       if (res.ok) return { ok: true, status: res.status, attempts: attempt, responseBody };
@@ -1390,15 +1329,10 @@ async function handleTeltikLifecycleWebhook(request, env) {
 
   // Insert dedup row. If event_id already exists, the upsert is a no-op and
   // we return early so re-deliveries don't re-apply the side effects.
-  const insRes = await fetch(`${env.SUPABASE_URL}/rest/v1/teltik_lifecycle_events?on_conflict=event_id`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'resolution=ignore-duplicates,return=minimal',
-    },
-    body: JSON.stringify([{ event_id: eventId, event_type: eventType, occurred_at: occurredAt, data }]),
+  // raw: a 409 is tolerated and any other non-2xx returns 500 below.
+  const insRes = await sbPost(env, 'teltik_lifecycle_events?on_conflict=event_id', [{ event_id: eventId, event_type: eventType, occurred_at: occurredAt, data }], {
+    prefer: 'resolution=ignore-duplicates,return=minimal',
+    raw: true,
   });
   if (!insRes.ok && insRes.status !== 409) {
     const t = await insRes.text();
@@ -1406,9 +1340,9 @@ async function handleTeltikLifecycleWebhook(request, env) {
     return jsonResponse({ ok: false, error: 'dedup insert failed' }, 500);
   }
 
-  const existing = await supabaseGetOne(
+  const existing = await sbGet(
     env,
-    `teltik_lifecycle_events?event_id=eq.${encodeURIComponent(eventId)}&select=event_id,processed_at&limit=1`
+    `teltik_lifecycle_events?event_id=eq.${encodeURIComponent(eventId)}&select=event_id,processed_at&limit=1`, { single: true }
   );
   if (existing && existing.processed_at) {
     return jsonResponse({ ok: true, dedup: true, event_id: eventId }, 200);
@@ -1434,12 +1368,13 @@ async function handleTeltikLifecycleWebhook(request, env) {
     console.error(`[Lifecycle] ${eventType} handler error:`, err);
   }
 
-  await supabasePatch(env, `teltik_lifecycle_events?event_id=eq.${encodeURIComponent(eventId)}`, {
+  // Best effort: any failure is swallowed.
+  await sbPatch(env, `teltik_lifecycle_events?event_id=eq.${encodeURIComponent(eventId)}`, {
     processed_at: new Date().toISOString(),
     outcome,
     error: errMsg,
     sim_id: simId,
-  }).catch(() => {});
+  }, MINIMAL).catch(() => {});
 
   return jsonResponse({ ok: outcome !== 'error', event_id: eventId, outcome, sim_id: simId }, outcome === 'error' ? 500 : 200);
 }
@@ -1455,7 +1390,7 @@ async function applyTeltikActivation(env, data) {
   // Same hosting ≠ service-provider guard as importTeltikLines: Teltik can
   // fire lifecycle events for SIMs it merely hosts. Never overwrite a row
   // owned by another vendor, and never auto-create AT&T-looking ICCIDs.
-  const preexisting = await supabaseGetOne(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id,vendor&limit=1`);
+  const preexisting = await sbGet(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id,vendor&limit=1`, { single: true });
   if (preexisting && preexisting.vendor !== 'teltik') {
     console.log(`[Lifecycle/activated] ICCID ${iccid} exists with vendor=${preexisting.vendor} — not overwriting`);
     return { outcome: 'skipped_foreign_vendor', simId: preexisting.id };
@@ -1466,7 +1401,7 @@ async function applyTeltikActivation(env, data) {
   }
 
   const nowIso = new Date().toISOString();
-  const upsertRes = await supabaseUpsert(env, 'sims', {
+  const upsertRes = await sbPost(env, 'sims?on_conflict=iccid', {
     iccid,
     vendor: 'teltik',
     carrier: 'tmobile',
@@ -1478,24 +1413,25 @@ async function applyTeltikActivation(env, data) {
     last_rotation_at: nowIso,
     rotation_status: 'success',
     last_rotation_error: null,
-  }, 'iccid');
+  }, { prefer: 'resolution=merge-duplicates,return=minimal', raw: true });
   if (!upsertRes.ok) throw new Error(`sims upsert failed: ${upsertRes.status}`);
 
-  const simRow = await supabaseGetOne(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`);
+  const simRow = await sbGet(env, `sims?iccid=eq.${encodeURIComponent(iccid)}&select=id&limit=1`, { single: true });
   if (!simRow) return { outcome: 'error', simId: null };
 
-  const cur = await supabaseGetArray(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null&select=e164&limit=1`);
+  const cur = await sbGet(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null&select=e164&limit=1`);
   const curE164 = cur[0]?.e164;
   if (curE164 !== mdnE164) {
     if (curE164) {
-      await supabasePatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, { valid_to: nowIso });
+      // unchecked: sim_numbers writes here ignore a non-2xx (unchanged behaviour).
+      await sbPatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, { valid_to: nowIso }, RAW_MINIMAL);
     }
-    await supabaseInsert(env, 'sim_numbers', [{
+    await sbPost(env, 'sim_numbers', [{
       sim_id: simRow.id,
       e164: mdnE164,
       valid_from: nowIso,
       verification_status: 'verified',
-    }]);
+    }], RAW_MINIMAL);
   }
   return { outcome: 'applied', simId: simRow.id };
 }
@@ -1505,22 +1441,23 @@ async function applyTeltikCancellation(env, data) {
   const iccid = (data.iccid || '').trim();
   if (!iccid) return { outcome: 'noop', simId: null };
 
-  const simRow = await supabaseGetOne(
+  const simRow = await sbGet(
     env,
-    `sims?iccid=eq.${encodeURIComponent(iccid)}&vendor=eq.teltik&select=id&limit=1`
+    `sims?iccid=eq.${encodeURIComponent(iccid)}&vendor=eq.teltik&select=id&limit=1`, { single: true }
   );
   if (!simRow) return { outcome: 'noop', simId: null };
 
-  await supabasePatch(env, `sims?id=eq.${simRow.id}`, {
+  // unchecked: these three writes ignore a non-2xx (unchanged behaviour).
+  await sbPatch(env, `sims?id=eq.${simRow.id}`, {
     status: 'canceled',
     status_reason: data.reason ? `teltik:${data.reason}` : 'teltik_lifecycle_webhook',
-  });
-  await supabasePatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, {
+  }, RAW_MINIMAL);
+  await sbPatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, {
     valid_to: new Date().toISOString(),
-  });
-  await supabasePatch(env, `reseller_sims?sim_id=eq.${simRow.id}&active=eq.true`, {
+  }, RAW_MINIMAL);
+  await sbPatch(env, `reseller_sims?sim_id=eq.${simRow.id}&active=eq.true`, {
     active: false,
-  });
+  }, RAW_MINIMAL);
   return { outcome: 'applied', simId: simRow.id };
 }
 
@@ -1530,9 +1467,9 @@ async function applyTeltikSwap(env, data) {
   const newIccid = (data.new_iccid || '').trim();
   if (!oldIccid || !newIccid) return { outcome: 'noop', simId: null };
 
-  const simRow = await supabaseGetOne(
+  const simRow = await sbGet(
     env,
-    `sims?iccid=eq.${encodeURIComponent(oldIccid)}&vendor=eq.teltik&select=id,iccid,msisdn,rotation_interval_hours&limit=1`
+    `sims?iccid=eq.${encodeURIComponent(oldIccid)}&vendor=eq.teltik&select=id,iccid,msisdn,rotation_interval_hours&limit=1`, { single: true }
   );
   if (!simRow) {
     console.log(`[Lifecycle/swap] no sim for old_iccid=${oldIccid}`);
@@ -1558,16 +1495,17 @@ async function applyTeltikSwap(env, data) {
     patch.last_rotation_at = nowIso;
     patch.last_mdn_rotated_at = nowIso;
   }
-  await supabasePatch(env, `sims?id=eq.${simRow.id}`, patch);
+  // unchecked: this write and the sim_numbers writes below ignore a non-2xx (unchanged behaviour).
+  await sbPatch(env, `sims?id=eq.${simRow.id}`, patch, RAW_MINIMAL);
 
   if (mdnChanged && newMdnE164) {
-    await supabasePatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, { valid_to: nowIso });
-    await supabaseInsert(env, 'sim_numbers', [{
+    await sbPatch(env, `sim_numbers?sim_id=eq.${simRow.id}&valid_to=is.null`, { valid_to: nowIso }, RAW_MINIMAL);
+    await sbPost(env, 'sim_numbers', [{
       sim_id: simRow.id,
       e164: newMdnE164,
       valid_from: nowIso,
       verification_status: 'verified',
-    }]);
+    }], RAW_MINIMAL);
     try {
       await sendTeltikSwapWebhooks(env, simRow, newIccid, newMdnE164, newMdnBare, nowIso);
     } catch (err) {
@@ -1601,7 +1539,7 @@ function parseRentalIdFromResponse(body) {
 }
 
 async function sendTeltikSwapWebhooks(env, sim, newIccid, newE164, newMsisdnBare, rotatedAtIso) {
-  const rows = await supabaseGetArray(
+  const rows = await sbGet(
     env,
     `reseller_sims?sim_id=eq.${sim.id}&active=eq.true&select=reseller_id,resellers!inner(reseller_webhooks(url,enabled))&limit=1`
   );
@@ -1636,7 +1574,8 @@ async function sendTeltikSwapWebhooks(env, sim, newIccid, newE164, newMsisdnBare
   }, { idComponents: { simId: sim.id, iccid: newIccid, number: newE164, kind: 'swap_online' }, resellerId });
 
   if (onlineRes.ok) {
-    await supabasePatch(env, `sims?id=eq.${sim.id}`, { last_notified_at: new Date().toISOString() }).catch(() => {});
+    // Best effort: any failure is swallowed.
+    await sbPatch(env, `sims?id=eq.${sim.id}`, { last_notified_at: new Date().toISOString() }, MINIMAL).catch(() => {});
 
     // INC-2 rental capture. This inline rotate path (used by the night-migration)
     // fires number.online directly instead of going through reseller-sync, so it
@@ -1646,7 +1585,7 @@ async function sendTeltikSwapWebhooks(env, sim, newIccid, newE164, newMsisdnBare
     if (env.RENTAL_CAPTURE_ENABLED === 'true') {
       try {
         const resellerRentalId = parseRentalIdFromResponse(onlineRes.responseBody);
-        const snRows = await supabaseGetArray(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null&select=id&limit=1`);
+        const snRows = await sbGet(env, `sim_numbers?sim_id=eq.${sim.id}&valid_to=is.null&select=id&limit=1`);
         const simNumberId = snRows[0]?.id;
         if (simNumberId != null) {
           const { upsertRental } = await import('../shared/rentals.js');
@@ -1656,8 +1595,9 @@ async function sendTeltikSwapWebhooks(env, sim, newIccid, newE164, newMsisdnBare
           if (!r.ok) console.log(`[Rotate] SIM ${sim.id}: rental capture failed: status=${r.status} ${r.error || ''}`);
         }
         if (resellerRentalId != null) {
-          await supabasePatch(env, `reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${sim.id}`,
-            { last_rental_id: resellerRentalId }).catch(() => {});
+          // Best effort: any failure is swallowed.
+          await sbPatch(env, `reseller_sims?reseller_id=eq.${resellerId}&sim_id=eq.${sim.id}`,
+            { last_rental_id: resellerRentalId }, MINIMAL).catch(() => {});
         }
       } catch (err) {
         console.error(`[Rotate] SIM ${sim.id}: rental capture threw: ${err}`);

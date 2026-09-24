@@ -33,9 +33,11 @@ function walk(dir, exts, out = []) {
 //   supabaseRpc(env, 'name', {...})          workers
 //   fetch(`${env.SUPABASE_URL}/rest/v1/rpc/name`, ...)
 //   callRpc('rpc/name', ...)                 dashboard
+//   sbRpc(env, 'name', {...})                shared/supabase-rest.mjs, storefront
+//                                            (missed until 2026-09-23: it hid six call sites)
 const CALL_PATTERNS = [
   /\/rest\/v1\/rpc\/([a-z][a-z0-9_]*)/g,
-  /supabaseRpc\(\s*[A-Za-z0-9_.]+\s*,\s*['"`]([a-z][a-z0-9_]*)['"`]/g,
+  /(?:supabaseRpc|sbRpc)\(\s*[A-Za-z0-9_.]+\s*,\s*['"`]([a-z][a-z0-9_]*)['"`]/g,
   /callRpc\(\s*['"`]rpc\/([a-z][a-z0-9_]*)['"`]/g,
 ];
 

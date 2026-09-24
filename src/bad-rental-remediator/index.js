@@ -23,6 +23,9 @@ import { cleanRecheckPredicate } from './verify.mjs';
 import { executeAction } from './actions.mjs';
 import { canAttempt, gateRejection, summarizeAttempts } from './cooldown.mjs';
 import { notifyPortOffline, notifyOfflineFleetSummary } from './notify.mjs';
+import {
+  runOfflineLifecycleTick, runOfflineProbeRun, offlineLifecycleEnabled, offlineLifecycleDryRun,
+} from './offline-lifecycle.mjs';
 import { teltikPortStatus, readVendorView, teltikGetInfo } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import {
@@ -39,6 +42,7 @@ import {
   evaluateHealthyEvidence, proofWindow,
   HEALTHY_EVIDENCE_MODE, HEALTHY_EVIDENCE_ACTION, HEALTHY_EVIDENCE_OUTCOME, HEALTHY_EVIDENCE_REASON,
 } from './healthy-evidence.mjs';
+import { sbGet, sbPatch, sbPost, SupabaseError } from '../shared/supabase-rest.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const LAST_MAIN_TICK_KEY = 'bad_rental_remediator_last_main_tick';
@@ -74,6 +78,16 @@ const STALE_CLAIM_MS = 10 * 60 * 1000;
 // on the loser). TTL > TICK_BUDGET_MS so a crashed tick releases naturally.
 const TICK_LOCK_KEY = 'bad_rental_remediator_main_tick_lock';
 const TICK_LOCK_TTL_S = 120;
+// Offline SIM lifecycle (branch `unassign-offline-sims-from-reseller`): its own
+// hourly cron, its own KV summary key, and its own flag. It shares this worker
+// only because this is where the cron host, the kill switch and the Slack sink
+// already live; report processing and the lifecycle never touch each other.
+const LAST_OFFLINE_LIFECYCLE_TICK_KEY = 'bad_rental_remediator_last_offline_lifecycle_tick';
+const OFFLINE_LIFECYCLE_CRON = '0 * * * *';
+// Probe runs for the lifecycle, every 3 minutes and off the quarter-hour so they
+// never share a minute with the intake or decision ticks.
+const LAST_OFFLINE_PROBE_RUN_KEY = 'bad_rental_remediator_last_offline_probe_run';
+const OFFLINE_PROBE_CRON = '2-59/3 * * * *';
 // R5: KV flag written whenever a tick has to fall back to the pre-migration
 // next_review_at-free query/patch shape (schema drift — the 20260729 column
 // missing). Not sticky across ticks: each tick overwrites it with its own
@@ -173,6 +187,21 @@ export default {
       const result = await drainQueuedEscalations(env, { limit, dryRun: !confirm });
       return json({ ok: result.ok !== false, result }, result.ok === false ? 503 : 200);
     }
+    // Manual trigger for the hourly offline SIM lifecycle tick. Same behaviour
+    // and same gates as the cron branch: with OFFLINE_LIFECYCLE_ENABLED unset
+    // this returns a `disabled` summary without touching anything.
+    if (url.pathname === '/offline-lifecycle/run' && request.method === 'POST') {
+      const secret = url.searchParams.get('secret') || '';
+      if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
+        return json({ ok: false, error: 'unauthorized' }, 401);
+      }
+      const startedAt = Date.now();
+      const result = await runOfflineLifecycleTick(env);
+      await recordLastTick(env, LAST_OFFLINE_LIFECYCLE_TICK_KEY, {
+        ...result, completed_at: new Date().toISOString(), ms: Date.now() - startedAt,
+      });
+      return json({ ok: true, result }, 200);
+    }
     if (url.pathname === '/kill-switch' && request.method === 'POST') {
       const secret = url.searchParams.get('secret') || '';
       if (!env.ADMIN_RUN_SECRET || secret !== env.ADMIN_RUN_SECRET) {
@@ -201,8 +230,44 @@ export default {
     //                      (2h → */5 on 2026-06-12, → */15 on 2026-08-06.
     //                      Tick lock + claim CAS make any frequency safe;
     //                      idle ticks are one indexed query.)
-    // event.cron is the literal expression the trigger fired on.
+    //   - '0 * * * *'    → offline SIM lifecycle decisions: pause/unassign on
+    //                      a confirmed outage and restore on recovery.
+    //   - '2-59/3 * * * *' → offline SIM lifecycle probes: record fresh
+    //                      port-status checks for the stalest candidates.
+    //   Both lifecycle crons are gated by OFFLINE_LIFECYCLE_ENABLED, which
+    //   defaults to off.
+    // event.cron is the literal expression the trigger fired on. Minute 0 of
+    // every hour fires all three expressions; each gets its own branch and its
+    // own KV summary, so they never share state.
     const cron = (event && event.cron) || '';
+    if (cron === OFFLINE_PROBE_CRON) {
+      const startedAt = Date.now();
+      ctx.waitUntil(runOfflineProbeRun(env).then(summary => (
+        recordLastTick(env, LAST_OFFLINE_PROBE_RUN_KEY, {
+          ...summary, completed_at: new Date().toISOString(), ms: Date.now() - startedAt,
+        })
+      )).catch(err => {
+        console.log('[Remediator] offline-probe error: ' + err);
+        return recordLastTick(env, LAST_OFFLINE_PROBE_RUN_KEY, {
+          completed_at: new Date().toISOString(), error: String(err), ms: Date.now() - startedAt,
+        });
+      }));
+      return;
+    }
+    if (cron === OFFLINE_LIFECYCLE_CRON) {
+      const startedAt = Date.now();
+      ctx.waitUntil(runOfflineLifecycleTick(env).then(summary => (
+        recordLastTick(env, LAST_OFFLINE_LIFECYCLE_TICK_KEY, {
+          ...summary, completed_at: new Date().toISOString(), ms: Date.now() - startedAt,
+        })
+      )).catch(err => {
+        console.log('[Remediator] offline-lifecycle error: ' + err);
+        return recordLastTick(env, LAST_OFFLINE_LIFECYCLE_TICK_KEY, {
+          completed_at: new Date().toISOString(), error: String(err), ms: Date.now() - startedAt,
+        });
+      }));
+      return;
+    }
     if (cron === '*/1 * * * *') {
       const startedAt = Date.now();
       ctx.waitUntil((async () => {
@@ -517,9 +582,11 @@ async function recordLastTick(env, key, summary) {
 
 async function buildStatus(env) {
   const enabled = await killSwitchEnabled(env);
-  const [lastMain, lastVerify, openCounts, actionDisables, escalationBacklog] = await Promise.all([
+  const [lastMain, lastVerify, lastOfflineLifecycle, lastOfflineProbe, openCounts, actionDisables, escalationBacklog] = await Promise.all([
     readJsonKv(env, LAST_MAIN_TICK_KEY),
     readJsonKv(env, LAST_VERIFY_POLL_KEY),
+    readJsonKv(env, LAST_OFFLINE_LIFECYCLE_TICK_KEY),
+    readJsonKv(env, LAST_OFFLINE_PROBE_RUN_KEY),
     fetchOpenCounts(env),
     listDisabledActions(env),
     fetchEscalationBacklog(env).catch(err => ({ error: String(err).slice(0, 200) })),
@@ -528,12 +595,20 @@ async function buildStatus(env) {
     kill_switch: enabled ? 'enabled' : 'disabled',
     last_main_tick: lastMain,
     last_verify_poll: lastVerify,
+    last_offline_lifecycle_tick: lastOfflineLifecycle,
+    last_offline_probe_run: lastOfflineProbe,
+    offline_lifecycle: {
+      enabled: offlineLifecycleEnabled(env),
+      dry_run: offlineLifecycleDryRun(env),
+    },
     open_counts: openCounts,
     action_disables: actionDisables,
     escalation_backlog: escalationBacklog,
     schedule: {
       main_cron: '*/15 * * * *',
       verify_poll_cron: '*/1 * * * *',
+      offline_lifecycle_cron: OFFLINE_LIFECYCLE_CRON,
+      offline_probe_cron: OFFLINE_PROBE_CRON,
       intake_limit: INTAKE_LIMIT,
       scan_cap: SCAN_CAP,
       concurrency: CONCURRENCY,
@@ -584,10 +659,10 @@ async function fetchOpenCounts(env) {
   // "at least 1000". Open counts should only include open report statuses.
   const out = { queued: 0, in_progress: 0, verify_pending: 0, operator_locked: 0, escalated: 0 };
   try {
-    out.queued = await supabaseExactCount(env,
+    out.queued = await countRows(env,
       'rental_reports?select=id&status=in.(received,in_triage)&or=(auto_remediation_state.is.null,auto_remediation_state.eq.queued)');
     for (const state of ['in_progress', 'verify_pending', 'operator_locked', 'escalated']) {
-      out[state] = await supabaseExactCount(env,
+      out[state] = await countRows(env,
         'rental_reports?select=id&status=in.(received,in_triage)&auto_remediation_state=eq.' + state);
     }
   } catch (err) {
@@ -601,7 +676,7 @@ async function sweepExpiredOpenReports(env, limit) {
     + '&or=(auto_remediation_state.is.null,auto_remediation_state.in.(queued,in_progress,verify_pending,escalated))'
     + '&select=' + encodeURIComponent('id,reseller_id,sim_id,sim_number_id,rental_id,e164,status,received_at,auto_remediation_state')
     + '&order=received_at.asc&limit=' + Math.max(1, Math.min(limit || EXPIRED_OPEN_SWEEP_CAP, EXPIRED_OPEN_SWEEP_CAP));
-  const r = await supabaseGet(env, q);
+  const r = await sbGet(env, q, { raw: true });
   if (!r.ok) {
     const txt = await r.text().catch(() => '');
     console.log('[Remediator] sweepExpiredOpenReports fetch failed: ' + r.status + ' ' + txt);
@@ -641,7 +716,7 @@ async function sweepAgedOutEscalationInboxItems(env, limit) {
     + Math.max(1, Math.min(limit || ESCALATION_INBOX_AGE_OUT_CAP, ESCALATION_INBOX_AGE_OUT_CAP));
   let r;
   try {
-    r = await supabaseGet(env, q);
+    r = await sbGet(env, q, { raw: true });
   } catch (err) {
     console.log('[Remediator] sweepAgedOutEscalationInboxItems fetch error: ' + err);
     return { scanned: 0, aged_out: 0, failed: 0 };
@@ -657,15 +732,11 @@ async function sweepAgedOutEscalationInboxItems(env, limit) {
   let agedOut = 0, failed = 0;
   for (const row of rows) {
     try {
-      const resp = await fetch(env.SUPABASE_URL + '/rest/v1/pending_review_items?id=eq.' + encodeURIComponent(row.id), {
-        method: 'PATCH',
-        headers: supabaseHeaders(env, false),
-        body: JSON.stringify({
-          status: 'dismissed',
-          resolved_at: nowIso,
-          operator_response: ESCALATION_INBOX_AGE_OUT_NOTE,
-        }),
-      });
+      const resp = await sbPatch(env, 'pending_review_items?id=eq.' + encodeURIComponent(row.id), {
+        status: 'dismissed',
+        resolved_at: nowIso,
+        operator_response: ESCALATION_INBOX_AGE_OUT_NOTE,
+      }, { prefer: 'return=minimal', raw: true });
       if (resp.ok) agedOut++;
       else {
         failed++;
@@ -815,9 +886,9 @@ const EXPIRED_DISMISS_NOTE = 'dismissed expired/stale bad-rental report because 
 async function dismissExpiredReport(env, report, classification) {
   // Light DB-only attempt count — gatherEvidence is skipped on this path.
   let attemptNo = 1;
-  const ar = await supabaseGet(env,
+  const ar = await sbGet(env,
     'rental_report_remediation_attempts?report_id=eq.' + encodeURIComponent(report.id)
-    + '&select=id&limit=200');
+    + '&select=id&limit=200', { raw: true });
   if (ar.ok) {
     const rows = await ar.json().catch(() => []);
     if (Array.isArray(rows)) attemptNo = rows.length + 1;
@@ -1855,7 +1926,7 @@ async function cancelGuardCheck(env, report, evidence) {
   if (report.sim_id) {
     const q = 'rentals?sim_id=eq.' + encodeURIComponent(report.sim_id)
       + '&select=id,reseller_rental_id,rental_date,minted_at&limit=5';
-    const r = await supabaseGet(env, q);
+    const r = await sbGet(env, q, { raw: true });
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) {
@@ -1872,7 +1943,7 @@ async function cancelGuardCheck(env, report, evidence) {
     const q = 'rentals?reseller_id=eq.' + encodeURIComponent(report.reseller_id)
       + '&reseller_rental_id=eq.' + encodeURIComponent(rid)
       + '&select=id,sim_id,reseller_rental_id,rental_date,minted_at&limit=5';
-    const r = await supabaseGet(env, q);
+    const r = await sbGet(env, q, { raw: true });
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) {
@@ -1920,9 +1991,9 @@ async function gatherEvidence(env, report) {
     // `current_mdn_e164` from `msisdn` (US national → +1XXXXXXXXXX) so
     // downstream code that reads `sim.current_mdn_e164` continues to work
     // without a coordinated cross-worker rewrite.
-    const r = await supabaseGet(env,
+    const r = await sbGet(env,
       'sims?id=eq.' + encodeURIComponent(report.sim_id)
-      + '&select=id,iccid,vendor,gateway_host,status,msisdn,activated_at,gateway_id,port,imei,att_ban,mobility_subscription_id&limit=1');
+      + '&select=id,iccid,vendor,gateway_host,status,msisdn,activated_at,gateway_id,port,imei,att_ban,mobility_subscription_id&limit=1', { raw: true });
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) {
@@ -1947,9 +2018,9 @@ async function gatherEvidence(env, report) {
     // swallowed error was being mis-classified as `no_rental_row` (false S4
     // duplicate). Capture lookup failures explicitly so classifyShared can
     // escalate instead of closing as duplicate.
-    const r = await supabaseGet(env,
+    const r = await sbGet(env,
       'rentals?id=eq.' + encodeURIComponent(report.rental_id)
-      + '&select=id,sim_id,reseller_id,reseller_rental_id,rental_date,minted_at&limit=1');
+      + '&select=id,sim_id,reseller_id,reseller_rental_id,rental_date,minted_at&limit=1', { raw: true });
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) {
@@ -1970,9 +2041,9 @@ async function gatherEvidence(env, report) {
   // historical attachment (sim_number.valid_to set) from a current one, and
   // know what the SIM's current MDN is so we can compare against report.e164.
   if (report.sim_number_id) {
-    const r = await supabaseGet(env,
+    const r = await sbGet(env,
       'sim_numbers?id=eq.' + encodeURIComponent(report.sim_number_id)
-      + '&select=id,sim_id,e164,valid_from,valid_to&limit=1');
+      + '&select=id,sim_id,e164,valid_from,valid_to&limit=1', { raw: true });
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) {
@@ -1988,9 +2059,9 @@ async function gatherEvidence(env, report) {
     }
   }
   if (report.sim_id) {
-    const r = await supabaseGet(env,
+    const r = await sbGet(env,
       'sim_numbers?sim_id=eq.' + encodeURIComponent(report.sim_id)
-      + '&valid_to=is.null&select=e164&order=valid_from.desc&limit=1');
+      + '&valid_to=is.null&select=e164&order=valid_from.desc&limit=1', { raw: true });
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) evidence.currentSimNumberE164 = rows[0].e164;
@@ -1998,11 +2069,11 @@ async function gatherEvidence(env, report) {
   }
   // Newer open report for same sim_id?
   if (report.sim_id) {
-    const r = await supabaseGet(env,
+    const r = await sbGet(env,
       'rental_reports?sim_id=eq.' + encodeURIComponent(report.sim_id)
       + '&id=gt.' + encodeURIComponent(report.id)
       + '&status=in.(received,in_triage)'
-      + '&select=id&order=id.desc&limit=1');
+      + '&select=id&order=id.desc&limit=1', { raw: true });
     if (r.ok) {
       const rows = await r.json();
       if (Array.isArray(rows) && rows.length > 0) evidence.newerOpenReportId = rows[0].id;
@@ -2018,9 +2089,9 @@ async function gatherEvidence(env, report) {
   // per-action maps — those rows are gate bookkeeping, and counting them
   // refreshed the cooldown window every tick (never expiring) and burned the
   // max-attempts budget without any vendor call.
-  const ar = await supabaseGet(env,
+  const ar = await sbGet(env,
     'rental_report_remediation_attempts?report_id=eq.' + encodeURIComponent(report.id)
-    + '&select=id,action,outcome,attempted_at&order=id.desc&limit=200');
+    + '&select=id,action,outcome,attempted_at&order=id.desc&limit=200', { raw: true });
   if (ar.ok) {
     const rows = await ar.json();
     if (Array.isArray(rows)) {
@@ -2042,12 +2113,12 @@ async function gatherEvidence(env, report) {
   // (webhook missing → resend_online) and as a §C pre-resolve predicate.
   if (report.sim_id) {
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-    const wr = await supabaseGet(env,
+    const wr = await sbGet(env,
       'webhook_deliveries?select=delivered_at'
       + '&sim_id=eq.' + encodeURIComponent(report.sim_id)
       + '&event_type=eq.number.online&status=eq.delivered'
       + '&delivered_at=gte.' + encodeURIComponent(since)
-      + '&order=delivered_at.desc&limit=1');
+      + '&order=delivered_at.desc&limit=1', { raw: true });
     if (wr.ok) {
       const rows = await wr.json();
       if (Array.isArray(rows) && rows.length > 0) {
@@ -2175,12 +2246,12 @@ async function gatherEvidence(env, report) {
     // sure in-window rows are always in the candidate set.
     const until = new Date(anchorMs).toISOString();
     try {
-      const r = await supabaseGet(env,
+      const r = await sbGet(env,
         'inbound_sms?sim_id=eq.' + encodeURIComponent(report.sim_id)
         + '&received_at=gte.' + encodeURIComponent(since)
         + '&received_at=lte.' + encodeURIComponent(until)
         + '&select=id,sim_id,to_number,from_number,received_at,port'
-        + '&order=received_at.desc&limit=' + INBOUND_PROOF_LIMIT);
+        + '&order=received_at.desc&limit=' + INBOUND_PROOF_LIMIT, { raw: true });
       if (r.ok) {
         const rows = await r.json().catch(() => []);
         evidence.inboundProof = { ok: true, rows: Array.isArray(rows) ? rows : [], error: null };
@@ -2298,11 +2369,7 @@ async function claimReport(env, report) {
   const filter = '?id=eq.' + encodeURIComponent(report.id)
     + '&or=(auto_remediation_state.is.null,auto_remediation_state.eq.queued)';
   const patch = { auto_remediation_state: 'in_progress', last_auto_attempt_at: new Date().toISOString() };
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
-    method: 'PATCH',
-    headers: { ...supabaseHeaders(env, false), Prefer: 'return=minimal, count=exact' },
-    body: JSON.stringify(patch),
-  });
+  const resp = await sbPatch(env, 'rental_reports' + filter, patch, { prefer: 'return=minimal, count=exact', raw: true });
   if (!resp.ok) {
     console.log('[Remediator] claim PATCH failed for report ' + report.id + ': ' + resp.status);
     return false;
@@ -2386,11 +2453,7 @@ async function applyClassificationState(env, report, classification, exec) {
         new Date(Date.now() - INTAKE_DEFER_MS + exec.intakeEligibleInMs).toISOString();
     }
   }
-  let resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
-    method: 'PATCH',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify(patch),
-  });
+  let resp = await sbPatch(env, 'rental_reports?id=eq.' + encodeURIComponent(report.id), patch, { prefer: 'return=minimal', raw: true });
   if (!resp.ok && resp.status === 400 && 'next_review_at' in patch) {
     // Migration 20260729 not applied yet — retry without the column rather
     // than leaving the row stuck in in_progress. R5: count it — silently
@@ -2398,11 +2461,7 @@ async function applyClassificationState(env, report, classification, exec) {
     // so make every occurrence loud instead of invisible.
     nextReviewAtFallbackCount++;
     const { next_review_at: _nr, ...legacy } = patch;
-    resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.' + encodeURIComponent(report.id), {
-      method: 'PATCH',
-      headers: supabaseHeaders(env, false),
-      body: JSON.stringify(legacy),
-    });
+    resp = await sbPatch(env, 'rental_reports?id=eq.' + encodeURIComponent(report.id), legacy, { prefer: 'return=minimal', raw: true });
   }
   if (!resp.ok) {
     console.log('[Remediator] state PATCH failed for report ' + report.id + ': ' + resp.status);
@@ -2412,24 +2471,21 @@ async function applyClassificationState(env, report, classification, exec) {
   // terminal close so the timeline matches a manual close.
   if (patch.status === 'remediated') {
     try {
-      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
-        method: 'POST',
-        headers: supabaseHeaders(env, false),
-        body: JSON.stringify({
-          report_id: report.id,
-          from_status: report.status || null,
-          to_status: 'remediated',
-          actor: 'auto-remediator',
-          note: 'auto-remediator §C verified',
-          evidence: {
-            source: 'auto_remediator',
-            mode: classification.mode,
-            action: classification.action,
-            exec_status: exec && exec.execStatus,
-            gate_status: exec && exec.gateStatus,
-          },
-        }),
-      });
+      // unchecked: audit-event insert; a non-2xx is ignored (unchanged behaviour).
+      await sbPost(env, 'rental_report_events', {
+        report_id: report.id,
+        from_status: report.status || null,
+        to_status: 'remediated',
+        actor: 'auto-remediator',
+        note: 'auto-remediator §C verified',
+        evidence: {
+          source: 'auto_remediator',
+          mode: classification.mode,
+          action: classification.action,
+          exec_status: exec && exec.execStatus,
+          gate_status: exec && exec.gateStatus,
+        },
+      }, { prefer: 'return=minimal', raw: true });
     } catch (e) {
       console.log('[Remediator] remediated event log insert failed: ' + e);
     }
@@ -2443,28 +2499,25 @@ async function applyClassificationState(env, report, classification, exec) {
   if (patch.auto_remediation_state === 'escalated') {
     try {
       const unchangedStatus = patch.status || report.status || null;
-      await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
-        method: 'POST',
-        headers: supabaseHeaders(env, false),
-        body: JSON.stringify({
-          report_id: report.id,
-          from_status: report.status || null,
-          to_status: unchangedStatus,
-          actor: 'auto-remediator',
-          note: 'auto-remediator escalated: ' + (patch.escalation_reason || 'operator_review_required'),
-          evidence: {
-            source: 'auto_remediator',
-            mode: classification.mode,
-            action: classification.action,
-            escalation_reason: patch.escalation_reason || null,
-            issue_type: patch.issue_type || null,
-            exec_status: exec && exec.execStatus,
-            gate_status: exec && exec.gateStatus,
-            auto_remediation_state_from: report.auto_remediation_state || null,
-            auto_remediation_state_to: 'escalated',
-          },
-        }),
-      });
+      // unchecked: audit-event insert; a non-2xx is ignored (unchanged behaviour).
+      await sbPost(env, 'rental_report_events', {
+        report_id: report.id,
+        from_status: report.status || null,
+        to_status: unchangedStatus,
+        actor: 'auto-remediator',
+        note: 'auto-remediator escalated: ' + (patch.escalation_reason || 'operator_review_required'),
+        evidence: {
+          source: 'auto_remediator',
+          mode: classification.mode,
+          action: classification.action,
+          escalation_reason: patch.escalation_reason || null,
+          issue_type: patch.issue_type || null,
+          exec_status: exec && exec.execStatus,
+          gate_status: exec && exec.gateStatus,
+          auto_remediation_state_from: report.auto_remediation_state || null,
+          auto_remediation_state_to: 'escalated',
+        },
+      }, { prefer: 'return=minimal', raw: true });
     } catch (e) {
       console.log('[Remediator] escalated event log insert failed: ' + e);
     }
@@ -2494,11 +2547,7 @@ function computeNextReviewAt(classification, exec, nowIsoStr) {
 }
 
 async function insertAttempt(env, row) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_remediation_attempts', {
-    method: 'POST',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify(row),
-  });
+  const resp = await sbPost(env, 'rental_report_remediation_attempts', row, { prefer: 'return=minimal', raw: true });
   if (!resp.ok) {
     const txt = await resp.text();
     console.log('[Remediator] attempt insert failed for report ' + row.report_id + ': ' + resp.status + ' ' + txt);
@@ -2517,11 +2566,7 @@ async function recoverStaleClaims(env, thresholdMs) {
     + '&or=(last_auto_attempt_at.lt.' + encodeURIComponent(cutoff) + ',last_auto_attempt_at.is.null)'
     + '&status=in.(received,in_triage)';
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
-      method: 'PATCH',
-      headers: { ...supabaseHeaders(env, true), Prefer: 'return=representation,count=exact' },
-      body: JSON.stringify({ auto_remediation_state: 'queued' }),
-    });
+    const resp = await sbPatch(env, 'rental_reports' + filter, { auto_remediation_state: 'queued' }, { prefer: 'return=representation,count=exact', raw: true });
     if (!resp.ok) {
       const txt = await resp.text();
       console.log('[Remediator] recoverStaleClaims failed: ' + resp.status + ' ' + txt);
@@ -2535,21 +2580,18 @@ async function recoverStaleClaims(env, thresholdMs) {
     // raced tick, not just infer it from attempt-row gaps.
     for (const row of recovered) {
       try {
-        await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
-          method: 'POST',
-          headers: supabaseHeaders(env, false),
-          body: JSON.stringify({
-            report_id: row.id,
-            from_status: row.status || null,
-            to_status: row.status || null,
-            actor: 'system',
-            note: 'auto-remediator recovered a stale in_progress claim (crashed/raced tick)',
-            evidence: {
-              source: 'auto_remediator', reason: 'claim_recovered',
-              auto_remediation_state_from: 'in_progress', auto_remediation_state_to: 'queued',
-            },
-          }),
-        });
+        // unchecked: audit-event insert; a non-2xx is ignored (unchanged behaviour).
+        await sbPost(env, 'rental_report_events', {
+          report_id: row.id,
+          from_status: row.status || null,
+          to_status: row.status || null,
+          actor: 'system',
+          note: 'auto-remediator recovered a stale in_progress claim (crashed/raced tick)',
+          evidence: {
+            source: 'auto_remediator', reason: 'claim_recovered',
+            auto_remediation_state_from: 'in_progress', auto_remediation_state_to: 'queued',
+          },
+        }, { prefer: 'return=minimal', raw: true });
       } catch (e) {
         console.log('[Remediator] claim_recovered event log insert failed for ' + row.id + ': ' + e);
       }
@@ -2567,11 +2609,7 @@ async function recoverStaleClaims(env, thresholdMs) {
 async function releaseClaimedToQueued(env, reportId, reportStatus) {
   const filter = '?id=eq.' + encodeURIComponent(reportId)
     + '&auto_remediation_state=eq.in_progress';
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports' + filter, {
-    method: 'PATCH',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify({ auto_remediation_state: 'queued' }),
-  });
+  const resp = await sbPatch(env, 'rental_reports' + filter, { auto_remediation_state: 'queued' }, { prefer: 'return=minimal', raw: true });
   if (!resp.ok) {
     console.log('[Remediator] releaseClaimedToQueued failed for ' + reportId + ': ' + resp.status);
     return;
@@ -2579,21 +2617,18 @@ async function releaseClaimedToQueued(env, reportId, reportStatus) {
   // R4: same claim_recovered audit trail as recoverStaleClaims, for the
   // single-row crash-recovery path.
   try {
-    await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
-      method: 'POST',
-      headers: supabaseHeaders(env, false),
-      body: JSON.stringify({
-        report_id: reportId,
-        from_status: reportStatus || null,
-        to_status: reportStatus || null,
-        actor: 'system',
-        note: 'auto-remediator recovered a claim after processReport threw',
-        evidence: {
-          source: 'auto_remediator', reason: 'claim_recovered',
-          auto_remediation_state_from: 'in_progress', auto_remediation_state_to: 'queued',
-        },
-      }),
-    });
+    // unchecked: audit-event insert; a non-2xx is ignored (unchanged behaviour).
+    await sbPost(env, 'rental_report_events', {
+      report_id: reportId,
+      from_status: reportStatus || null,
+      to_status: reportStatus || null,
+      actor: 'system',
+      note: 'auto-remediator recovered a claim after processReport threw',
+      evidence: {
+        source: 'auto_remediator', reason: 'claim_recovered',
+        auto_remediation_state_from: 'in_progress', auto_remediation_state_to: 'queued',
+      },
+    }, { prefer: 'return=minimal', raw: true });
   } catch (e) {
     console.log('[Remediator] claim_recovered event log insert failed for ' + reportId + ': ' + e);
   }
@@ -2643,7 +2678,7 @@ async function fetchOpenReports(env, limit) {
     +   ',or(last_auto_attempt_at.is.null,last_auto_attempt_at.lt.' + encodeURIComponent(cutoff) + '))'
     + '&select=' + encodeURIComponent(select)
     + '&order=last_auto_attempt_at.asc.nullsfirst,received_at.asc&limit=' + limit;
-  let r = await supabaseGet(env, q);
+  let r = await sbGet(env, q, { raw: true });
   if (!r.ok && r.status === 400) {
     // Migration 20260729 (next_review_at) not applied yet — fall back to the
     // legacy query instead of going dormant on a column trap (INC-25 class).
@@ -2655,7 +2690,7 @@ async function fetchOpenReports(env, limit) {
       +   ',or(last_auto_attempt_at.is.null,last_auto_attempt_at.lt.' + encodeURIComponent(cutoff) + '))'
       + '&select=' + encodeURIComponent(select)
       + '&order=last_auto_attempt_at.asc.nullsfirst,received_at.asc&limit=' + limit;
-    r = await supabaseGet(env, legacy);
+    r = await sbGet(env, legacy, { raw: true });
   }
   if (!r.ok) {
     const txt = await r.text();
@@ -2691,36 +2726,16 @@ async function killSwitchEnabled(env) {
   }
 }
 
-function supabaseHeaders(env, returnRep) {
-  const h = {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-    'Content-Type': 'application/json',
-  };
-  h.Prefer = returnRep ? 'return=representation' : 'return=minimal';
-  return h;
-}
-
-async function supabaseGet(env, path) {
-  return fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
-    headers: { apikey: env['SUPABASE_SERVICE_ROLE_KEY'], Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY },
-  });
-}
-
-async function supabaseExactCount(env, path) {
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
-    headers: {
-      apikey: env['SUPABASE_SERVICE_ROLE_KEY'],
-      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-      Prefer: 'count=exact',
-      Range: '0-0',
-    },
-  });
-  if (!resp.ok) return 0;
-  const cr = resp.headers.get('content-range') || '';
-  const m = cr.match(/\/(\d+|\*)$/);
-  if (!m || m[1] === '*') return 0;
-  return parseInt(m[1], 10) || 0;
+// Exact row count for `path` (Content-Range total). A non-2xx counts as 0,
+// so one failed count does not blank the whole stats response.
+async function countRows(env, path) {
+  try {
+    const { count } = await sbGet(env, path, { count: 'exact', headers: { Range: '0-0' } });
+    return count || 0;
+  } catch (err) {
+    if (err instanceof SupabaseError) return 0;
+    throw err;
+  }
 }
 
 function json(obj, status) {

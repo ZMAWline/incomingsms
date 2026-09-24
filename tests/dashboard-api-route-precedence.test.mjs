@@ -21,13 +21,14 @@ import { fileURLToPath } from 'node:url';
 // The dispatcher now imports its auth from modules rather than defining
 // checkAuth() inline, so the sandbox is given the real implementations instead
 // of a lifted copy. Requests here carry Basic admin:test-pass, which
-// breakGlassUser accepts as admin (DASHBOARD_BREAK_GLASS is unset in env).
+// breakGlassUser accepts as admin (DASHBOARD_BREAK_GLASS is 'on' in env).
 import { canAccess, requiredRole } from '../src/shared/portal-auth.mjs';
 import { resolveUser, breakGlassUser, handleAuthRoutes } from '../src/dashboard/auth-routes.mjs';
 import { renderLoginPage, renderAcceptInvitePage } from '../src/dashboard/auth-pages.mjs';
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from '../src/dashboard/api-keys.mjs';
 import { handleAuditLogQuery } from '../src/dashboard/audit-log.mjs';
 import { handleSavedFilterRoutes } from '../src/dashboard/saved-filters.mjs';
+import { corsHeadersFor } from '../src/dashboard/cors.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -52,7 +53,7 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
     canAccess, requiredRole, resolveUser, breakGlassUser, handleAuthRoutes,
     renderLoginPage, renderAcceptInvitePage,
     resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes, handleAuditLogQuery,
-    handleSavedFilterRoutes,
+    handleSavedFilterRoutes, corsHeadersFor,
     async fetch(url, init) {
       const u = String(url);
       supabaseCalls.push({ url: u, headers: (init && init.headers) || {} });
@@ -63,6 +64,7 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
     },
     env: {
       DASHBOARD_AUTH: 'admin:test-pass',
+      DASHBOARD_BREAK_GLASS: 'on',
       SUPABASE_URL: 'https://sb.test',
       SUPABASE_SERVICE_ROLE_KEY: 'srv',
       ASSETS: {

@@ -1,3 +1,4 @@
+import { carrierFetch } from '../shared/fetch-timeout.mjs';
 // QuickBooks Online OAuth + API proxy worker
 // Called via service binding from dashboard worker
 
@@ -52,14 +53,14 @@ export default {
 
 // ===== Relay =====
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 // ===== OAuth Handlers =====

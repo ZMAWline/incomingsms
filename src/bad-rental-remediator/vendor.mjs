@@ -18,10 +18,11 @@
 //
 // Relay support — if RELAY_URL+RELAY_KEY are set every outbound vendor call
 // is proxied through the relay so the worker doesn't need an IP allowlist on
-// the carrier side. Identical pattern to src/shared/atomic.ts etc.
+// the carrier side. Standard relayFetch pattern (agent/constraints.md §11).
 // =========================================================
 
 import { mdn10 } from './teltik.mjs';
+import { carrierFetch } from '../shared/fetch-timeout.mjs';
 
 const HELIX_TOKEN_CACHE_KEY = 'bad_rental_remediator_helix_token';
 const HELIX_TOKEN_TTL_SECONDS = 25 * 60;
@@ -308,7 +309,7 @@ export async function teltikPortStatus(env, { mdn } = {}) {
 // (pending_vendor_read) rather than acting on a bad read.
 // =========================================================
 
-// Atomic — subsriberInquiry (read). Mirrors src/shared/atomic.ts.
+// Atomic — subsriberInquiry (read). Same call as src/mdn-rotator/index.js.
 export async function atomicSubscriberInquiry(env, { msisdn, iccid }) {
   if (!env.ATOMIC_USERNAME || !env.ATOMIC_TOKEN || !env.ATOMIC_PIN) {
     return { ok: false, error: 'atomic_credentials_missing' };
@@ -347,7 +348,7 @@ export async function atomicSubscriberInquiry(env, { msisdn, iccid }) {
   return { ok: false, error: 'atomic_sc_' + sc + ':' + desc.slice(0, 80) };
 }
 
-// Wing IoT — GET /v1/devices/{iccid} (read). Mirrors src/shared/wing-iot.ts.
+// Wing IoT — GET /v1/devices/{iccid} (read). Same call as src/mdn-rotator/index.js.
 export async function wingGetDevice(env, { iccid }) {
   if (!iccid) return { ok: false, error: 'missing_iccid' };
   if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) return { ok: false, error: 'wing_credentials_missing' };
@@ -370,7 +371,7 @@ export async function wingGetDevice(env, { iccid }) {
   };
 }
 
-// Helix — POST /api/mobility-subscriber/details (read). Mirrors src/shared/helix.ts.
+// Helix — POST /api/mobility-subscriber/details (read). Same call as src/mdn-rotator/index.js.
 // mobilitySubscriptionId comes from sims.mobility_subscription_id (DB), since the
 // details endpoint is keyed by it.
 export async function helixSubscriberDetails(env, { mobilitySubscriptionId }) {
@@ -559,12 +560,12 @@ export async function teltikGetInfo(env, { mdn } = {}) {
 // ---------------------------------------------------------
 // Plumbing
 // ---------------------------------------------------------
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(env.RELAY_URL + '/' + url, {
+    return send(env, env.RELAY_URL + '/' + url, {
       ...init,
       headers: { ...(init && init.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }

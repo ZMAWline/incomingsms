@@ -85,9 +85,9 @@ node --input-type=module --check < src/dashboard/index.js
 
 **Check 2: frontend JS inside `<script>` tags**
 ```bash
-node _check_frontend_js.js
+node scripts/check-frontend-js.js
 ```
-`_check_frontend_js.js` is committed at the repo root. It pulls every inline `<script>` block out of `public/index.html` and runs `node --check` over each one.
+`scripts/check-frontend-js.js` is committed in the repo. It pulls every inline `<script>` block out of `public/index.html` and runs `node --check` over each one.
 
 **Why two checks?** Check 1 only validates the Worker module, which no longer contains any frontend code. A syntax error in `public/index.html` is invisible to it — the Worker deploys fine and the browser gets broken JS, so `loadData()` never runs and the page renders empty. That is the recurring "data not loading" bug.
 
@@ -104,7 +104,7 @@ cd src/dashboard && npx wrangler versions upload --env test
 That uploads your build and prints a unique preview URL
 (`https://<version-id>-dashboard-test.zalmen-531.workers.dev`) **without changing
 what `dashboard-test` serves**. The version inherits every secret and binding, so
-Supabase, sessions and break-glass all work. Give that URL to the user.
+Supabase and sessions work, and break-glass works if `DASHBOARD_BREAK_GLASS=on` is set on `dashboard-test`. Give that URL to the user.
 
 **Why this is the default.** `dashboard-test` is one shared Worker with no
 locking: the last deploy wins, silently, whatever branch it came from. Several

@@ -7,6 +7,8 @@
 //   - Teltik: Skip (handled by teltik-worker)
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
+import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
 
 export default {
   async fetch(request, env) {
@@ -35,14 +37,14 @@ export default {
 // ===========================
 // Relay fetch helper
 // ===========================
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 // ===========================
@@ -50,7 +52,7 @@ function relayFetch(env, url, init) {
 // ===========================
 async function runOtaStatusSync(env) {
   // Get all active/suspended SIMs, excluding wing_iot and teltik (no OTA support)
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     "sims?select=id,iccid,mobility_subscription_id,msisdn,status,imei,activated_at,vendor&status=in.(active,suspended)&vendor=not.in.(wing_iot,teltik)&order=id.asc&limit=10000"
   );
@@ -189,12 +191,12 @@ async function syncSimStatusHelix(env, token, sim, runId) {
     otaResult = await hxOtaRefresh(env, token, { ban: attBan, subscriberNumber: mdn, iccid }, runId, iccid);
   } catch (otaErr) {
     if (otaErr.isHelixTimeout) {
-      await supabasePatch(env, `sims?id=eq.${id}`, { status: 'helix_timeout' });
+      await sbPatch(env, `sims?id=eq.${id}`, { status: 'helix_timeout' });
       console.log(`[OTA Sync] SIM ${iccid}: sub not found → helix_timeout`);
       return;
     }
     if (otaErr.isSimMismatch) {
-      await supabasePatch(env, `sims?id=eq.${id}`, { status: 'data_mismatch' });
+      await sbPatch(env, `sims?id=eq.${id}`, { status: 'data_mismatch' });
       console.log(`[OTA Sync] SIM ${iccid}: sim mismatch → data_mismatch`);
       return;
     }
@@ -209,7 +211,7 @@ async function syncSimStatusHelix(env, token, sim, runId) {
   const dbStatus = mapHelixStatus(helixStatus);
   if (!dbStatus) return;
 
-  await supabasePatch(env, `sims?id=eq.${id}`, { status: dbStatus });
+  await sbPatch(env, `sims?id=eq.${id}`, { status: dbStatus });
   console.log(`[OTA Sync] SIM ${iccid}: ${helixStatus} -> ${dbStatus}`);
 }
 
@@ -367,37 +369,6 @@ async function hxOtaRefresh(env, token, data, runId, iccid) {
 }
 
 // ===========================
-// Supabase helpers
-// ===========================
-async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "GET",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Supabase SELECT failed: ${res.status} ${JSON.stringify(json)}`);
-  return json;
-}
-
-async function supabasePatch(env, path, bodyObj) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "PATCH",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify(bodyObj),
-  });
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`Supabase PATCH failed: ${res.status} ${txt}`);
-}
-
-// ===========================
 // Carrier API Logging
 // ===========================
 async function logCarrierApiCall(env, logData) {
@@ -405,7 +376,7 @@ async function logCarrierApiCall(env, logData) {
   console.log(`[${vendor.toUpperCase()} API] ${logData.request_method} ${logData.request_url} -> ${logData.response_status} ${logData.response_ok ? "OK" : "FAIL"}`);
 
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,

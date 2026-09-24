@@ -68,9 +68,12 @@ function makeRx(column) {
 function isSimsStatusContext(src, matchIndex) {
   const before = src.slice(Math.max(0, matchIndex - 400), matchIndex);
   const after  = src.slice(matchIndex, matchIndex + 200);
-  // Strong positive signal: nearest enclosing supabasePatch/sbPatch call
-  // points at the sims table.
-  if (/(supabasePatch|sbPatch|supabaseInsert|sbPost|supabaseUpsert|sbUpsert)\s*\([^)]{0,200}['"`]sims[?']/.test(before)) return true;
+  // Strong positive signal: the literal sits inside a supabasePatch/sbPatch
+  // call that points at the sims table. A `);` between the call and the
+  // literal means the call already ended — e.g. `return { status: 'ok' }`
+  // right after the write is a result object, not a sims column.
+  const calls = [...before.matchAll(/(supabasePatch|sbPatch|supabaseInsert|sbPost|supabaseUpsert|sbUpsert)\s*\([^)]{0,200}['"`]sims[?']/g)];
+  if (calls.length && !before.slice(calls[calls.length - 1].index).includes(');')) return true;
   // SQL context: UPDATE sims ... SET ... status = 'x'
   if (/UPDATE\s+(public\.)?sims[\s\S]{0,300}$/i.test(before)) return true;
   // Otherwise: ignore

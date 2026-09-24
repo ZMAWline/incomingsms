@@ -9,8 +9,10 @@
 //      (calls mdn-rotator's /atomic-inquiry via service binding since it holds ATOMIC creds)
 //   5) ATOMIC port-in status finalizer — read-only portinStatus poll for SIMs
 //      awaiting a port-in submitted via portinRequest (sims.port_in_pending=true),
-//      via mdn-rotator's /atomic-portin-status. Terminal carrier responses stop
-//      polling; completed ports auto-finalize from ATOMIC subscriber inquiry.
+//      via mdn-rotator's /atomic-portin-status. Backs off as the port ages and
+//      escalates after the max age (atomic-portin-poller.mjs). Terminal carrier
+//      responses stop polling; completed ports auto-finalize from ATOMIC
+//      subscriber inquiry.
 // =========================================================
 
 import { syncSimFromHelixDetails } from '../shared/subscriber-sync.js';
@@ -18,9 +20,10 @@ import { PLAYBOOK, classifyFailure, UNCLASSIFIED_BUCKET } from '../shared/rotati
 import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { iccidSwapPatch } from '../shared/teltik-iccid.mjs';
 import { pickTeltikKnownMdn, latestTeltikSmsQuery } from '../shared/teltik-known-mdn.mjs';
-import { isTeltikHosted } from '../shared/gateway-host.mjs';
-import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.mjs';
+import { createAtomicPortinPoller } from './atomic-portin-poller.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
+import { carrierFetch, fetchWithTimeout, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPost, sbPatch, sbRpc } from '../shared/supabase-rest.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
@@ -184,7 +187,7 @@ async function runHelixFinalizer(env, limit) {
   }
   const token = await hxGetBearerToken(env);
 
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,mobility_subscription_id,status,imei,activated_at,vendor&status=eq.provisioning&vendor=eq.helix&limit=${limit}`
   );
@@ -233,7 +236,7 @@ async function runHelixFinalizer(env, limit) {
     }
 
     const activatedAt = synced.activatedAt || sim.activated_at || new Date().toISOString();
-    await supabasePatch(
+    await sbPatch(
       env,
       `sims?id=eq.${encodeURIComponent(String(sim.id))}`,
       { status: 'active', status_reason: null, activated_at: activatedAt }
@@ -254,7 +257,7 @@ async function runWingIotFinalizer(env, limit) {
 
   // Catches both post-activation (msisdn IS NULL) and post-rotation (rotation_status='mdn_pending').
   // Both states use status='provisioning' — the unified signal that details-finalizer owns MDN sync.
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,msisdn,rotation_status,status,activated_at&vendor=eq.wing_iot&status=eq.provisioning&limit=${limit}`
   );
@@ -332,7 +335,7 @@ async function runWingIotFinalizer(env, limit) {
       // Backfill activated_at when it's null (first time the SIM becomes usable).
       // Never override an existing date — that's the real activation timestamp.
       if (!sim.activated_at) patch.activated_at = new Date().toISOString();
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
 
       await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare);
 
@@ -364,7 +367,7 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
     return { ok: false, error: 'wing_iot_credentials_missing' };
   }
 
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,msisdn,status,rotation_status,activated_at` +
     `&vendor=eq.wing_iot` +
@@ -430,7 +433,7 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
             // First-activation reconcile (no prior MDN) → leave last_rotation_at null.
             if (sim.msisdn && sim.msisdn !== msisdnBare) patch.last_rotation_at = new Date().toISOString();
             if (!sim.activated_at) patch.activated_at = new Date().toISOString();
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
             try {
               await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare);
               webhooks_sent++;
@@ -440,7 +443,7 @@ async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
             synced++;
             if (sample.length < 10) sample.push({ id: sim.id, iccid: sim.iccid, action: 'synced', mdn: msisdnBare });
           } else {
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
               rotation_status: 'failed',
               last_rotation_error: 'Sweep cleanup: plan="' + plan + '" mdn=' + mdnRaw + '. Flagged for mdn-rotator retry at ' + new Date().toISOString(),
             });
@@ -510,7 +513,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
   });
 
   // ── Bucket A — wing_iot stuck mdn_pending ─────────────────────────────────
-  const bucketA = (await supabaseSelect(
+  const bucketA = (await sbGet(
     env,
     `sims?select=id,iccid,msisdn,status,rotation_status,activated_at` +
       `&vendor=eq.wing_iot` +
@@ -524,7 +527,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
   // ── Bucket B — any vendor: rotated <24h ago, last_notified_at stale ───────
   // PostgREST doesn't allow column-to-column comparison in or=(), so fetch
   // candidates (rotated in last 24h) and filter in JS for stale notify.
-  const bucketBCandidates = (await supabaseSelect(
+  const bucketBCandidates = (await sbGet(
     env,
     `sims?select=id,iccid,msisdn,vendor,last_mdn_rotated_at,last_notified_at` +
       `&status=eq.active` +
@@ -539,7 +542,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
   log(`Bucket B (rotated, not notified): ${bucketB.length} SIMs`);
 
   // ── Bucket C — wing_iot eligible but not rotated in 24h (log only) ────────
-  const bucketC = (await supabaseSelect(
+  const bucketC = (await sbGet(
     env,
     `sims?select=id,iccid,vendor,last_mdn_rotated_at` +
       `&status=eq.active` +
@@ -619,7 +622,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
           // First-activation reconcile (no prior MDN) → leave last_rotation_at null.
           if (sim.msisdn && sim.msisdn !== msisdnBare) patch.last_rotation_at = new Date().toISOString();
           if (!sim.activated_at) patch.activated_at = new Date().toISOString();
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
           if (webhookFires < MAX_WEBHOOK_FIRES) {
             try {
               await sendNumberOnlineWebhook(env, sim.id, e164, sim.iccid, msisdnBare, { force: true });
@@ -631,7 +634,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
           }
           aActions.synced++;
         } else {
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
             rotation_status: 'failed',
             last_rotation_error: `Reconcile: plan="${plan}" mdn=${mdnRaw} att_status=${wingStatus} at ${new Date().toISOString()}`,
           });
@@ -684,7 +687,7 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
     },
   };
   try {
-    const insertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/rotation_audit`, {
+    const insertRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rotation_audit`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -722,7 +725,7 @@ async function runOfflineTestBatch(env, { resellerId, limit, dryRun, force }) {
   // We over-fetch (limit*4) to allow filtering down to ones that have both an
   // open and a closed sim_numbers row.
   const overFetch = Math.min(limit * 4, 100);
-  const sims = await supabaseSelect(env,
+  const sims = await sbGet(env,
     `sims?select=id,iccid,vendor,msisdn,mobility_subscription_id,last_mdn_rotated_at,reseller_sims!inner(reseller_id,active)` +
     `&reseller_sims.reseller_id=eq.${resellerId}` +
     `&reseller_sims.active=eq.true` +
@@ -739,7 +742,7 @@ async function runOfflineTestBatch(env, { resellerId, limit, dryRun, force }) {
   const eligible = [];
   for (const sim of sims) {
     if (eligible.length >= limit) break;
-    const rows = await supabaseSelect(env,
+    const rows = await sbGet(env,
       `sim_numbers?select=e164,valid_from,valid_to&sim_id=eq.${sim.id}&order=valid_from.desc&limit=10`
     ).catch(() => []);
     const open = rows.find(r => r.valid_to === null);
@@ -822,7 +825,7 @@ async function runTeltikFinalizer(env, limit) {
   // Post-rotation: rotateOneTeltikSim flipped status=provisioning + rotation_status=mdn_pending.
   // sim.msisdn still holds the OLD MDN — we call get-phone-number; when the returned MDN
   // differs, the change-number actually took effect and we finalize.
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,rotation_interval_hours&vendor=eq.teltik&status=eq.provisioning&rotation_status=eq.mdn_pending&limit=${limit}`
   );
@@ -871,7 +874,7 @@ async function runTeltikFinalizer(env, limit) {
       if (!msisdnBare || msisdnBare === sim.msisdn) {
         if (ageMin >= STUCK_MINUTES) {
           failed++;
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
             rotation_status: 'failed',
             status: 'active',
             last_rotation_error: `MDN did not change within ${STUCK_MINUTES}m (Teltik returned ${msisdnBare || 'null'})`,
@@ -898,7 +901,7 @@ async function runTeltikFinalizer(env, limit) {
 
       await closeCurrentNumber(env, sim.id);
       await insertNewNumber(env, sim.id, e164);
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
         msisdn: msisdnBare,
         status: 'active',
         rotation_status: 'success',
@@ -946,7 +949,7 @@ async function sendTeltikNumberOnlineWebhook(env, sim, e164, msisdnBare) {
   }, { idComponents: { simId: sim.id, iccid: sim.iccid, number: e164 }, resellerId });
 
   if (result.ok) {
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       last_notified_at: new Date().toISOString(),
     }).catch(() => {});
   }
@@ -971,7 +974,7 @@ async function logTeltikApiCall(env, logData) {
     created_at: new Date().toISOString(),
   };
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
+    await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/carrier_api_logs`, {
       method: 'POST',
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1012,7 +1015,7 @@ async function runAtomicFinalizer(env, limit) {
 
   // Bucket 1 (pending): post-rotation stuck ATOMIC SIMs — swapMSISDN returned 5xx or threw
   // a network error and we don't know the final state. mdn_pending is the signal.
-  const pendingSims = (await supabaseSelect(
+  const pendingSims = (await sbGet(
     env,
     `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error&vendor=eq.atomic&status=eq.provisioning&rotation_status=eq.mdn_pending&limit=${limit}`
   )) || [];
@@ -1021,7 +1024,7 @@ async function runAtomicFinalizer(env, limit) {
   // Inactive" because our stored MDN is stale while AT&T has the subscriber Active under a
   // DIFFERENT number. rotation_eligible=true excludes ones already escalated as non-healable.
   const desyncCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-  const parkedSims = (await supabaseSelect(
+  const parkedSims = (await sbGet(
     env,
     `sims?select=id,iccid,msisdn,rotation_status,status,last_mdn_rotated_at,last_rotation_error` +
       `&vendor=eq.atomic&rotation_eligible=eq.true` +
@@ -1082,7 +1085,7 @@ async function runAtomicFinalizer(env, limit) {
             status: 'open',
           });
         }
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
           rotation_eligible: false,
           status: 'rotation_failed',
           last_rotation_error: `ATOMIC attStatus=${data.attStatus} (not healable, escalated)`,
@@ -1095,8 +1098,8 @@ async function runAtomicFinalizer(env, limit) {
       // (b) Active + DIFFERENT MDN → reconcile to AT&T's live number (the self-heal).
       if (attStatus === 'active' && attMsisdn && attMsisdn !== sim.msisdn) {
         // Collision guard: never adopt a number another SIM already holds.
-        const takenSim = await supabaseSelect(env, `sims?select=id&msisdn=eq.${encodeURIComponent(attMsisdn)}&id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
-        const takenNum = await supabaseSelect(env, `sim_numbers?select=sim_id&e164=eq.${encodeURIComponent(e164)}&valid_to=is.null&sim_id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
+        const takenSim = await sbGet(env, `sims?select=id&msisdn=eq.${encodeURIComponent(attMsisdn)}&id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
+        const takenNum = await sbGet(env, `sim_numbers?select=sim_id&e164=eq.${encodeURIComponent(e164)}&valid_to=is.null&sim_id=neq.${encodeURIComponent(String(sim.id))}&limit=1`);
         if ((Array.isArray(takenSim) && takenSim.length) || (Array.isArray(takenNum) && takenNum.length)) {
           const ex = await findOpenPendingForSim(env, sim.id, 'atomic_mdn_collision');
           if (!ex) {
@@ -1121,13 +1124,13 @@ async function runAtomicFinalizer(env, limit) {
           }
         }
         // Reconcile sim_numbers independently: only rewrite if the open row isn't already AT&T's number.
-        const openRows = await supabaseSelect(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&limit=1`);
+        const openRows = await sbGet(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&limit=1`);
         const openE164 = Array.isArray(openRows) && openRows[0] ? openRows[0].e164 : null;
         if (openE164 !== e164) {
           await closeCurrentNumber(env, sim.id);
           await insertNewNumber(env, sim.id, e164);
         }
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
           msisdn: attMsisdn,
           status: 'active',
           rotation_status: 'success',
@@ -1147,7 +1150,7 @@ async function runAtomicFinalizer(env, limit) {
       // (c) Active + SAME MDN → for a parked SIM, our DB already agrees with AT&T; un-park it
       //     so the normal rotation batch picks it up (it was only stuck on the stale swap-from).
       if (attStatus === 'active' && attMsisdn && attMsisdn === sim.msisdn && sim._parked) {
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+        await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
           status: 'active', rotation_status: 'success', rotation_fail_count: 0, last_rotation_error: null,
         });
         results.push({ iccid: sim.iccid, ok: true, note: 'unparked (active, in sync)' });
@@ -1158,7 +1161,7 @@ async function runAtomicFinalizer(env, limit) {
       if (!sim._parked) {
         if (ageMin >= STUCK_MINUTES) {
           failed++;
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
             rotation_status: 'failed',
             status: 'active',
             last_rotation_error: `ATOMIC inquiry: MDN unchanged within ${STUCK_MINUTES}m (got ${attMsisdn || 'null'})`,
@@ -1183,249 +1186,14 @@ async function runAtomicFinalizer(env, limit) {
 }
 
 /* ── ATOMIC port-in status finalizer ──────────────────────────────────────── */
-// Read-only poll of ATOMIC's portinStatus for SIMs awaiting port-in
-// completion (sims.port_in_pending = true, set by bulk-activator when a
-// portinRequest is submitted — a distinct signal from rotation_status=
-// 'mdn_pending', which runAtomicFinalizer's bucket already owns for stuck
-// swapMSISDN recovery). Talks to ATOMIC only via mdn-rotator's
-// /atomic-portin-status route (mdn-rotator holds the ATOMIC credentials, same
-// as the /atomic-inquiry call above).
-//
-// Terminal status codes that stop polling:
-// - 948 "Port Request Does Not Exist" — the port was never created or was
-//   cancelled on the carrier side. No point continuing to poll.
-// - 910 "sim does not belong to this MVNO" — the SIM/ICCID is not under our
-//   ATOMIC account. This is a configuration error, not a transient state.
-// - 951 "Portin status fail.Conflict" (Result.reasonCode=CT) — the losing
-//   carrier rejected the port. The real reason is embedded in the description
-//   as "statusReasonCode - <XX> ~ statusReasonDescription - <text>" (seen: 8A
-//   account number incorrect, 6B T-Mobile transfer PIN incorrect). Polling
-//   cannot clear a rejection — the details must be corrected and the port
-//   resubmitted — so stop and leave it for an operator.
-// - 00 with Result.reasonCode=CO (Completed) — port completed successfully.
-//   Immediately run regular ATOMIC subsriberInquiry by ICCID and auto-finalize
-//   the SIM from that response. Only clear port_in_pending after that
-//   finalization succeeds, so transient inquiry failures keep the 5-minute poll
-//   alive for retry.
-//
-// For non-terminal codes (e.g., 01 Pending, 02 In Progress, etc.), we record
-// the carrier's raw statusCode/description on the sims row every tick and
-// continue polling. The dashboard's manual Check Port-In Status button remains
-// read-only and available for operator review.
-function pickAtomicInquiryField(data, keys) {
-  const result = data?.result || {};
-  for (const key of keys) {
-    if (data && data[key] !== undefined && data[key] !== null && data[key] !== '') return data[key];
-    if (result && result[key] !== undefined && result[key] !== null && result[key] !== '') return result[key];
-  }
-  return null;
-}
-
-function normalizeAtomicMdn(value) {
-  const digits = String(value || '').replace(/\D/g, '');
-  if (digits.length === 10) return digits;
-  if (digits.length === 11 && digits.startsWith('1')) return digits.slice(1);
-  return null;
-}
-
-async function finalizeCompletedAtomicPortin(env, sim) {
-  const inqUrl = `https://mdn-rotator/atomic-inquiry?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&iccid=${encodeURIComponent(sim.iccid)}`;
-  const inqRes = await env.MDN_ROTATOR.fetch(inqUrl, { method: 'GET' });
-  if (!inqRes.ok) {
-    throw new Error(`subscriber inquiry ${inqRes.status}`);
-  }
-  const data = await inqRes.json().catch(() => ({}));
-  if (!data.ok || data.statusCode !== '00') {
-    throw new Error(`subscriber inquiry failed: ${data.description || data.statusCode || 'unknown'}`);
-  }
-
-  const attStatus = String(pickAtomicInquiryField(data, ['attStatus', 'status']) || '').trim();
-  if (attStatus && attStatus.toLowerCase() !== 'active') {
-    throw new Error(`subscriber inquiry not Active (got ${attStatus})`);
-  }
-
-  const msisdn = normalizeAtomicMdn(pickAtomicInquiryField(data, ['msisdn', 'MSISDN']));
-  const e164 = msisdn ? `+1${msisdn}` : null;
-  const patch = {
-    status: 'active',
-    status_reason: null,
-    port_in_pending: false,
-    rotation_status: 'success',
-    rotation_fail_count: 0,
-    rotation_eligible: true,
-    last_activation_error: null,
-    last_rotation_error: null,
-  };
-
-  if (msisdn) patch.msisdn = msisdn;
-  const ban = pickAtomicInquiryField(data, ['ban', 'BAN', 'attBan', 'billingAccountNumber']);
-  if (ban) patch.att_ban = String(ban);
-  const imei = pickAtomicInquiryField(data, ['imei', 'IMEI', 'BLIMEI', 'blimei', 'billingImei']);
-  if (imei) patch.imei = String(imei);
-  const activationDate = pickAtomicInquiryField(data, ['activationDate', 'activatedAt', 'activation_date']);
-  if (activationDate) {
-    const parsed = new Date(activationDate);
-    if (!isNaN(parsed.getTime())) patch.activated_at = parsed.toISOString();
-  }
-  const zipCode = pickAtomicInquiryField(data, ['zipCode', 'zip']);
-  if (zipCode) patch.activation_zip = String(zipCode);
-
-  if (e164) {
-    const openRows = await supabaseSelect(env, `sim_numbers?select=e164&sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&limit=1`);
-    const openE164 = Array.isArray(openRows) && openRows[0] ? openRows[0].e164 : null;
-    if (openE164 !== e164) {
-      await closeCurrentNumber(env, sim.id);
-      await insertNewNumber(env, sim.id, e164);
-    }
-  }
-
-  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, patch);
-
-  // Port completed: the Atomic line is live. If it is seated in a Teltik
-  // gateway, make sure Teltik's nickname is the ICCID (idempotent read → POST
-  // /v1/update-nickname → read back). Logged, never throws, never touches
-  // vendor/gateway_host/msisdn.
-  const teltikAlias = await ensureTeltikAliasAfterPortin(env, { ...sim, msisdn: msisdn || sim.msisdn });
-
-  return {
-    ok: true,
-    msisdn,
-    e164,
-    attStatus,
-    ban: ban || null,
-    imei: imei || null,
-    activated_at: patch.activated_at || null,
-    teltik_alias: teltikAlias,
-  };
-}
-
-async function ensureTeltikAliasAfterPortin(env, sim) {
-  try {
-    if (!sim || !isTeltikHosted(sim)) return null;
-    const alias = await ensureTeltikAlias(env, {
-      id: sim.id,
-      iccid: sim.iccid,
-      vendor: 'atomic',
-      current_mdn_e164: sim.msisdn || null,
-    });
-    const summary = summarizeAliasResult(alias);
-    console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: teltik alias ${alias.ok ? 'OK' : 'FAILED'} action=${alias.action} reason=${alias.reason || 'none'} host_mdn=${alias.mdn10 || 'unresolved'}`);
-    await logTeltikApiCall(env, {
-      run_id: null,
-      step: 'teltik_alias',
-      iccid: sim.iccid,
-      request_url: (alias.update && alias.update.url) || 'https://api.smsgateway.xyz/v1/update-nickname',
-      request_method: alias.update ? 'POST' : 'GET',
-      request_body: { nickname: sim.iccid, mdn: alias.mdn10 || null, action: alias.action },
-      response_status: alias.update ? alias.update.http_status : (alias.ok ? 200 : 0),
-      response_ok: !!alias.ok,
-      response_body_text: JSON.stringify({ summary, trail: alias.trail }),
-      response_body_json: summary,
-      error: alias.ok ? null : `Teltik alias not verified: ${alias.reason}`,
-    });
-    return summary;
-  } catch (e) {
-    console.error(`[Finalizer/AtomicPortinStatus] SIM ${sim && sim.iccid}: teltik alias check crashed: ${e}`);
-    return null;
-  }
-}
-
-async function runAtomicPortinStatusFinalizer(env, limit) {
-  if (!env.MDN_ROTATOR) {
-    return { processed: 0, checked: 0, message: 'mdn_rotator_binding_missing' };
-  }
-  if (!env.ADMIN_RUN_SECRET) {
-    return { processed: 0, checked: 0, message: 'admin_run_secret_missing' };
-  }
-
-  const sims = (await supabaseSelect(
-    env,
-    `sims?select=id,iccid,msisdn,gateway_host,atomic_portin_status_code,atomic_portin_checked_at&vendor=eq.atomic&status=eq.provisioning&port_in_pending=eq.true&limit=${limit}`
-  )) || [];
-  if (sims.length === 0) return { ok: true, processed: 0, checked: 0 };
-
-  let processed = 0;
-  let checked = 0;
-  let errors = 0;
-  let terminal = 0;
-  const results = [];
-
-  // Carrier statusCode -> what it means for us. The carrier's own text is kept
-  // verbatim in atomic_portin_description; these say why we stop polling.
-  const TERMINAL_REASONS = {
-    '948': 'port was never created or was cancelled on carrier side',
-    '910': 'SIM/ICCID not under our ATOMIC account',
-    '951': 'port rejected by the losing carrier — correct the details and resubmit; polling cannot clear a rejection',
-  };
-  const TERMINAL_CODES = new Set(Object.keys(TERMINAL_REASONS));
-  const COMPLETED_REASON_CODES = new Set(['CO']);
-
-  for (const sim of sims) {
-    processed++;
-    const msisdn = String(sim.msisdn || '').replace(/\D/g, '');
-    if (!/^\d{10}$/.test(msisdn)) {
-      errors++;
-      results.push({ iccid: sim.iccid, ok: false, error: 'no valid 10-digit MSISDN on file' });
-      continue;
-    }
-    try {
-      const url = `https://mdn-rotator/atomic-portin-status?secret=${encodeURIComponent(env.ADMIN_RUN_SECRET)}&msisdn=${encodeURIComponent(msisdn)}&iccid=${encodeURIComponent(sim.iccid)}`;
-      const res = await env.MDN_ROTATOR.fetch(url, { method: 'GET' });
-      if (!res.ok) {
-        errors++;
-        results.push({ iccid: sim.iccid, ok: false, error: `portin-status ${res.status}` });
-        continue;
-      }
-      const data = await res.json().catch(() => ({}));
-      const statusCode = data.statusCode ?? null;
-      const description = data.description ?? null;
-      const result = data.result ?? null;
-      const reasonCode = result?.reasonCode ?? null;
-      const isTerminalCode = statusCode && TERMINAL_CODES.has(String(statusCode));
-      const isCompleted = statusCode === '00' && reasonCode && COMPLETED_REASON_CODES.has(reasonCode);
-
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-        atomic_portin_status_code: statusCode,
-        atomic_portin_description: description,
-        atomic_portin_checked_at: new Date().toISOString(),
-      });
-      checked++;
-
-      if (isTerminalCode) {
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
-          port_in_pending: false,
-        });
-        terminal++;
-        const reason = `Atomic portinStatus returned ${statusCode} — ${TERMINAL_REASONS[String(statusCode)]}`;
-        results.push({ iccid: sim.iccid, ok: true, statusCode, description, reasonCode, terminal: true, reason });
-        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: TERMINAL - ${reason} (carrier said: ${description})`);
-      } else if (isCompleted) {
-        const finalized = await finalizeCompletedAtomicPortin(env, sim);
-        terminal++;
-        results.push({
-          iccid: sim.iccid,
-          ok: true,
-          statusCode,
-          description,
-          reasonCode,
-          terminal: true,
-          finalized: true,
-          ...finalized,
-          reason: 'Port completed (reasonCode=CO). Auto-finalized from ATOMIC subsriberInquiry.',
-        });
-        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: COMPLETED - auto-finalized from subscriber inquiry`);
-      } else {
-        results.push({ iccid: sim.iccid, ok: true, statusCode, description, reasonCode, terminal: false });
-        console.log(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: statusCode=${statusCode} reasonCode=${reasonCode} — continuing poll`);
-      }
-    } catch (e) {
-      errors++;
-      results.push({ iccid: sim.iccid, ok: false, error: String(e) });
-      console.error(`[Finalizer/AtomicPortinStatus] SIM ${sim.iccid}: ${e}`);
-    }
-  }
-
-  return { ok: true, processed, checked, errors, terminal, results };
+// Implementation, poll schedule, and max-age escalation live in
+// atomic-portin-poller.mjs.
+function runAtomicPortinStatusFinalizer(env, limit) {
+  const poller = createAtomicPortinPoller({
+    supabaseSelect: sbGet, supabasePatch: sbPatch, supabaseInsert: sbPost,
+    closeCurrentNumber, insertNewNumber, logTeltikApiCall,
+  });
+  return poller.runAtomicPortinStatusFinalizer(env, limit);
 }
 
 /* ── Rotation Review (daily 12:30 UTC) ────────────────────────────────────── */
@@ -1464,7 +1232,7 @@ async function rotationReviewQuery(env, fragment) {
 
   // Small intentional limits (≤1000) — simple fetch, no pagination needed
   if (limitVal <= 1000) {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${fragment}`, {
+    const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${fragment}`, {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -1480,7 +1248,7 @@ async function rotationReviewQuery(env, fragment) {
   const all = [];
   let offset = 0;
   while (true) {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${base}`, {
+    const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/${base}`, {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -1505,7 +1273,7 @@ async function rotationReviewQuery(env, fragment) {
 // (covers crashed/killed prior runs).
 async function acquireReviewLock(env, kind = 'rotation_review') {
   // Mark stale runs first
-  await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs?kind=eq.${kind}&status=eq.running&started_at=lt.${encodeURIComponent(new Date(Date.now() - 30 * 60 * 1000).toISOString())}`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/cron_runs?kind=eq.${kind}&status=eq.running&started_at=lt.${encodeURIComponent(new Date(Date.now() - 30 * 60 * 1000).toISOString())}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1516,7 +1284,7 @@ async function acquireReviewLock(env, kind = 'rotation_review') {
     body: JSON.stringify({ status: 'stale', ended_at: new Date().toISOString() }),
   }).catch(() => {});
 
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/cron_runs`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1539,7 +1307,7 @@ async function acquireReviewLock(env, kind = 'rotation_review') {
 async function releaseReviewLock(env, runDbId, status, summary, reportMd) {
   const body = { status, ended_at: new Date().toISOString(), summary };
   if (reportMd) body.report_md = reportMd;
-  await fetch(`${env.SUPABASE_URL}/rest/v1/cron_runs?id=eq.${runDbId}`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/cron_runs?id=eq.${runDbId}`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1565,7 +1333,7 @@ async function findOpenPendingForSim(env, simId, kind) {
 }
 
 async function insertPendingItem(env, item) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/pending_review_items`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1580,7 +1348,7 @@ async function insertPendingItem(env, item) {
 
 async function markPendingItemSeen(env, ids) {
   if (!ids || ids.length === 0) return;
-  await fetch(`${env.SUPABASE_URL}/rest/v1/pending_review_items?id=in.(${ids.join(',')})`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/pending_review_items?id=in.(${ids.join(',')})`, {
     method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1593,7 +1361,7 @@ async function markPendingItemSeen(env, ids) {
 }
 
 async function recordAttempt(env, simId, runId, action, result, error) {
-  await fetch(`${env.SUPABASE_URL}/rest/v1/remediation_attempts`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/remediation_attempts`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1606,7 +1374,7 @@ async function recordAttempt(env, simId, runId, action, result, error) {
 }
 
 async function attemptsToday(env, simId, action) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/attempts_today`, {
+  const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/rpc/attempts_today`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1697,7 +1465,7 @@ async function sendReportEmail(env, subject, markdown) {
   }
   // Minimal markdown → HTML conversion (the report uses a tiny subset)
   const html = markdownToHtml(markdown);
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = await webhookFetch(env, 'https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${env.RESEND_API_KEY}`,
@@ -1891,7 +1659,7 @@ async function runCatchupSweep(env, opts = {}) {
       if (dryRun) continue;
       if (entry.action === 'flip_to_mdn_pending' && sims.length > 0) {
         const ids = sims.map(s => s.id).join(',');
-        const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
+        const flipRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
           method: 'PATCH',
           headers: {
             apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2086,7 +1854,7 @@ async function runRotationReview(env, opts = {}) {
       if (entry.action === 'flip_to_mdn_pending') {
         if (!dryRun && sims.length > 0) {
           const ids = sims.map(s => s.id).join(',');
-          const flipRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
+          const flipRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=in.(${ids})`, {
             method: 'PATCH',
             headers: {
               apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2129,7 +1897,7 @@ async function runRotationReview(env, opts = {}) {
               await recordAttempt(env, sim.id, runId, 'sync_iccid', 'fail', 'get-info returned same iccid — SIM may be deprovisioned on Teltik');
               continue;
             }
-            const patchRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${sim.id}`, {
+            const patchRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/sims?id=eq.${sim.id}`, {
               method: 'PATCH',
               headers: {
                 apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2202,7 +1970,7 @@ async function runRotationReview(env, opts = {}) {
 
     // ── 5. Pool health ───────────────────────────────────────────────────────
     async function poolCount(filter) {
-      const res = await fetch(`${env.SUPABASE_URL}/rest/v1/address_pool_usage?${filter}&select=address_id&limit=1`, {
+      const res = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/address_pool_usage?${filter}&select=address_id&limit=1`, {
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
           Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -2466,7 +2234,7 @@ async function runRotationReview(env, opts = {}) {
     // Single non-blocking query; failure just omits the line rather than
     // breaking the rotation review.
     try {
-      const badResp = await fetch(
+      const badResp = await supabaseFetch(env,
         `${env.SUPABASE_URL}/rest/v1/rental_reports?select=id&status=in.(received,in_triage)&limit=1000`,
         {
           headers: {
@@ -2539,6 +2307,8 @@ async function runRotationReview(env, opts = {}) {
 // pick on next rotation since last_used_at is NULL.
 
 const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+// Query carries [timeout:60] server-side; the client bound sits just above it.
+const OVERPASS_TIMEOUT_MS = 75_000;
 const REFILL_DEFAULT_MAX_ZIPS = 5;
 const REFILL_QUERY_DELAY_MS   = 5000; // polite delay between Overpass queries
 
@@ -2576,14 +2346,14 @@ async function overpassFetchByZip(env, state, zip) {
       // mirror — relay routing adds latency without value and the relay appears
       // to time out on long-running Overpass queries. Relay exists for AT&T /
       // Helix IP allowlist needs, not for public APIs like OSM.
-      const res = await fetch(OVERPASS_URL, {
+      const res = await fetchWithTimeout(OVERPASS_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'User-Agent':   'incomingsms address-pool refill (https://github.com/ZMAWline/incomingsms)',
         },
         body: `data=${encodeURIComponent(query)}`,
-      });
+      }, { timeoutMs: OVERPASS_TIMEOUT_MS, label: 'Overpass POST' });
       if (!res.ok) {
         const text = (await res.text().catch(() => '')).slice(0, 200);
         if ((res.status === 429 || res.status === 504) && attempt === 1) {
@@ -2611,25 +2381,11 @@ async function overpassFetchByZip(env, state, zip) {
   throw lastErr;
 }
 
-async function supabaseRpc(env, fn, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, {
-    method: 'POST',
-    headers: {
-      apikey:        env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body || {}),
-  });
-  if (!res.ok) throw new Error(`Supabase RPC ${fn} ${res.status}: ${await res.text().catch(() => '')}`);
-  return res.json();
-}
-
 async function runAddressPoolRefill(env, opts = {}) {
   const maxZips = Math.min(Math.max(parseInt(opts.maxZips, 10) || REFILL_DEFAULT_MAX_ZIPS, 1), 20);
   const dryRun  = opts.dryRun === true;
 
-  const targets = await supabaseRpc(env, 'list_zips_needing_refill', { p_limit: maxZips });
+  const targets = await sbRpc(env, 'list_zips_needing_refill', { p_limit: maxZips });
   if (!Array.isArray(targets) || targets.length === 0) {
     console.log('[Refill] no zips needing refill');
     return { ok: true, attempted: 0, results: [] };
@@ -2655,7 +2411,7 @@ async function runAddressPoolRefill(env, opts = {}) {
         const newId = `${target.state.toLowerCase()}-${target.zip_code}-${fresh.housenumber}-${refillSlug(fresh.street)}`;
         if (!dryRun) {
           // Use ON CONFLICT DO NOTHING via Prefer header to swallow rare slug collisions.
-          const insRes = await fetch(`${env.SUPABASE_URL}/rest/v1/address_pool_usage?on_conflict=address_id`, {
+          const insRes = await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/address_pool_usage?on_conflict=address_id`, {
             method: 'POST',
             headers: {
               apikey:          env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2694,14 +2450,14 @@ async function runAddressPoolRefill(env, opts = {}) {
 
 /* ── Relay ────────────────────────────────────────────────────────────────── */
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: { ...(init?.headers || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 /* ── Helix ────────────────────────────────────────────────────────────────── */
@@ -2740,7 +2496,7 @@ async function resolveTeltikKnownMdnForFinalizer(env, sim) {
   let latestTeltikSms = null;
   if (sim && sim.id) {
     try {
-      const rows = await supabaseSelect(env, latestTeltikSmsQuery(sim.id));
+      const rows = await sbGet(env, latestTeltikSmsQuery(sim.id));
       latestTeltikSms = Array.isArray(rows) && rows[0] ? rows[0] : null;
     } catch (_) {
       latestTeltikSms = null;
@@ -2749,50 +2505,10 @@ async function resolveTeltikKnownMdnForFinalizer(env, sim) {
   return pickTeltikKnownMdn(latestTeltikSms, dbCurrentMdn);
 }
 
-/* ── Supabase ─────────────────────────────────────────────────────────────── */
-
-async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  if (!res.ok) throw new Error(`Supabase SELECT ${res.status}: ${await res.text().catch(() => '')}`);
-  return res.json();
-}
-
-async function supabasePatch(env, path, body) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: 'PATCH',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Supabase PATCH ${res.status}: ${await res.text().catch(() => '')}`);
-}
-
-async function supabaseInsert(env, table, rows) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(rows),
-  });
-  if (!res.ok) throw new Error(`Supabase INSERT ${res.status}: ${await res.text().catch(() => '')}`);
-}
-
 /* ── sim_numbers helpers ──────────────────────────────────────────────────── */
 
 async function closeCurrentNumber(env, simId) {
-  await supabasePatch(
+  await sbPatch(
     env,
     `sim_numbers?sim_id=eq.${encodeURIComponent(String(simId))}&valid_to=is.null`,
     { valid_to: new Date().toISOString() }
@@ -2800,7 +2516,7 @@ async function closeCurrentNumber(env, simId) {
 }
 
 async function insertNewNumber(env, simId, e164) {
-  await supabaseInsert(env, 'sim_numbers', [
+  await sbPost(env, 'sim_numbers', [
     {
       sim_id: simId,
       e164,
@@ -2828,7 +2544,7 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
   // Bypassed when opts.force=true — caller (reconciliation) already filtered
   // to rotation_status='success' so the guard read would be redundant.
   if (!opts.force) {
-    const guard = await supabaseSelect(env,
+    const guard = await sbGet(env,
       `sims?select=vendor,rotation_status&id=eq.${encodeURIComponent(String(simId))}&limit=1`
     ).catch(() => []);
     const guardRow = Array.isArray(guard) && guard[0];
@@ -2869,7 +2585,7 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
 
   if (result.ok) {
     try {
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
         last_notified_at: new Date().toISOString(),
       });
     } catch (err) {
@@ -2917,7 +2633,7 @@ async function sendNumberOfflineWebhook(env, simId, oldNumber, iccid, oldMobilit
 
 async function findResellerIdBySimId(env, simId) {
   if (!simId) return null;
-  const data = await supabaseSelect(
+  const data = await sbGet(
     env,
     `reseller_sims?select=reseller_id&sim_id=eq.${encodeURIComponent(String(simId))}&active=eq.true&limit=1`
   ).catch(() => null);
@@ -2926,7 +2642,7 @@ async function findResellerIdBySimId(env, simId) {
 
 async function findWebhookUrlByResellerId(env, resellerId) {
   if (!resellerId) return null;
-  const data = await supabaseSelect(
+  const data = await sbGet(
     env,
     `reseller_webhooks?select=url&reseller_id=eq.${encodeURIComponent(String(resellerId))}&enabled=eq.true&limit=1`
   ).catch(() => null);
@@ -3016,7 +2732,7 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const data = await supabaseSelect(
+  const data = await sbGet(
     env,
     `webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`
   ).catch(() => null);
@@ -3025,7 +2741,7 @@ async function wasWebhookDelivered(env, messageId) {
 
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts, responseBody } = delivery;
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
+  await supabaseFetch(env, `${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3059,7 +2775,7 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
+      }, webhookFetch);
       lastStatus = res.status;
       const responseBody = await res.text().catch(() => '');
       if (res.ok) {

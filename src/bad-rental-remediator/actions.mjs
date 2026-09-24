@@ -46,6 +46,7 @@ import {
 } from './vendor.mjs';
 import { mdn10 } from './teltik.mjs';
 import { HEALTHY_EVIDENCE_OUTCOME, HEALTHY_EVIDENCE_REASON } from './healthy-evidence.mjs';
+import { sbPatch, sbPost, sbGet } from '../shared/supabase-rest.mjs';
 
 export const SAFE_ACTIONS = Object.freeze([
   'db_sync_upsert',
@@ -218,11 +219,7 @@ async function execDbSyncUpsert(env, ctx) {
     return { ok: true, status: 'noop', evidence: { reason: 'db_already_matches_vendor', sim_id: sim.id } };
   }
 
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(sim.id), {
-    method: 'PATCH',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify(patch),
-  });
+  const resp = await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(sim.id), patch, { prefer: 'return=minimal', raw: true });
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '');
     return { ok: false, status: 'db_error', errorMessage: 'sims_patch_' + resp.status + ':' + txt };
@@ -305,10 +302,8 @@ async function execCloseDuplicate(env, ctx) {
 
   // Fetch current row so we preserve triaged_at / closed_at semantics like the
   // dashboard handler does — keeps audit timestamps coherent.
-  const curResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
-    + encodeURIComponent(report.id) + '&select=id,status,triaged_at,closed_at', {
-    headers: supabaseHeaders(env, false),
-  });
+  const curResp = await sbGet(env, 'rental_reports?id=eq.'
+    + encodeURIComponent(report.id) + '&select=id,status,triaged_at,closed_at', { raw: true });
   if (!curResp.ok) {
     return { ok: false, status: 'db_error', errorMessage: 'cur_get_' + curResp.status };
   }
@@ -325,12 +320,8 @@ async function execCloseDuplicate(env, ctx) {
   };
   if (fromStatus === 'received' && !cur.triaged_at) patch.triaged_at = nowIso;
 
-  const patchResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
-    + encodeURIComponent(report.id), {
-    method: 'PATCH',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify(patch),
-  });
+  const patchResp = await sbPatch(env, 'rental_reports?id=eq.'
+    + encodeURIComponent(report.id), patch, { prefer: 'return=minimal', raw: true });
   if (!patchResp.ok) {
     const txt = await patchResp.text().catch(() => '');
     return { ok: false, status: 'db_error', errorMessage: 'rental_reports_patch_' + patchResp.status + ':' + txt };
@@ -341,18 +332,15 @@ async function execCloseDuplicate(env, ctx) {
   if (ctx.evidenceBundle) evidence.classifier = ctx.evidenceBundle;
   if (duplicateOf) evidence.duplicate_of = duplicateOf;
   try {
-    await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
-      method: 'POST',
-      headers: supabaseHeaders(env, false),
-      body: JSON.stringify({
-        report_id: report.id,
-        from_status: fromStatus,
-        to_status: 'duplicate',
-        actor: 'auto-remediator',
-        note: note.slice(0, 500),
-        evidence,
-      }),
-    });
+    // unchecked: audit-event insert; a non-2xx is ignored (unchanged behaviour).
+    await sbPost(env, 'rental_report_events', {
+      report_id: report.id,
+      from_status: fromStatus,
+      to_status: 'duplicate',
+      actor: 'auto-remediator',
+      note: note.slice(0, 500),
+      evidence,
+    }, { prefer: 'return=minimal', raw: true });
   } catch (e) {
     console.log('[Actions] close_duplicate event log insert failed: ' + e);
   }
@@ -390,10 +378,8 @@ async function execHealthyEvidenceAutoResolve(env, ctx) {
   }
   const nowIso = new Date().toISOString();
 
-  const curResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
-    + encodeURIComponent(report.id) + '&select=id,status,triaged_at,closed_at', {
-    headers: supabaseHeaders(env, false),
-  });
+  const curResp = await sbGet(env, 'rental_reports?id=eq.'
+    + encodeURIComponent(report.id) + '&select=id,status,triaged_at,closed_at', { raw: true });
   if (!curResp.ok) {
     return { ok: false, status: 'db_error', errorMessage: 'cur_get_' + curResp.status };
   }
@@ -409,12 +395,8 @@ async function execHealthyEvidenceAutoResolve(env, ctx) {
   };
   if (fromStatus === 'received' && !cur.triaged_at) patch.triaged_at = nowIso;
 
-  const patchResp = await fetch(env.SUPABASE_URL + '/rest/v1/rental_reports?id=eq.'
-    + encodeURIComponent(report.id), {
-    method: 'PATCH',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify(patch),
-  });
+  const patchResp = await sbPatch(env, 'rental_reports?id=eq.'
+    + encodeURIComponent(report.id), patch, { prefer: 'return=minimal', raw: true });
   if (!patchResp.ok) {
     const txt = await patchResp.text().catch(() => '');
     return { ok: false, status: 'db_error', errorMessage: 'rental_reports_patch_' + patchResp.status + ':' + txt };
@@ -442,19 +424,16 @@ async function execHealthyEvidenceAutoResolve(env, ctx) {
   };
   if (ctx.evidenceBundle) evidence.classifier = ctx.evidenceBundle;
   try {
-    await fetch(env.SUPABASE_URL + '/rest/v1/rental_report_events', {
-      method: 'POST',
-      headers: supabaseHeaders(env, false),
-      body: JSON.stringify({
-        report_id: report.id,
-        from_status: fromStatus,
-        to_status: 'remediated',
-        actor: 'auto-remediator',
-        note: ('auto-remediator ' + HEALTHY_EVIDENCE_OUTCOME + ': ' + HEALTHY_EVIDENCE_REASON
-          + ' (provider + host + inbound-SMS proof)').slice(0, 500),
-        evidence,
-      }),
-    });
+    // unchecked: audit-event insert; a non-2xx is ignored (unchanged behaviour).
+    await sbPost(env, 'rental_report_events', {
+      report_id: report.id,
+      from_status: fromStatus,
+      to_status: 'remediated',
+      actor: 'auto-remediator',
+      note: ('auto-remediator ' + HEALTHY_EVIDENCE_OUTCOME + ': ' + HEALTHY_EVIDENCE_REASON
+        + ' (provider + host + inbound-SMS proof)').slice(0, 500),
+      evidence,
+    }, { prefer: 'return=minimal', raw: true });
   } catch (e) {
     console.log('[Actions] healthy_evidence_auto_resolve event log insert failed: ' + e);
   }
@@ -638,11 +617,7 @@ async function execTeltikSyncIccid(env, ctx) {
     last_rotation_error: null,
     status_reason: 'ICCID swapped from ' + sim.iccid + ' to ' + newIccid + ' on ' + nowIso(),
   };
-  const resp = await fetch(env.SUPABASE_URL + '/rest/v1/sims?id=eq.' + encodeURIComponent(sim.id), {
-    method: 'PATCH',
-    headers: supabaseHeaders(env, false),
-    body: JSON.stringify(patch),
-  });
+  const resp = await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(sim.id), patch, { prefer: 'return=minimal', raw: true });
   if (!resp.ok) {
     const txt = await resp.text().catch(() => '');
     return { ok: false, status: 'db_error', errorMessage: 'sims_patch_' + resp.status + ':' + txt };
@@ -697,15 +672,6 @@ function nowIso() { return new Date().toISOString(); }
 // ---------------------------------------------------------
 // Plumbing
 // ---------------------------------------------------------
-
-function supabaseHeaders(env, returnRep) {
-  return {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-    'Content-Type': 'application/json',
-    Prefer: returnRep ? 'return=representation' : 'return=minimal',
-  };
-}
 
 function pick(obj, keys) {
   const out = {};

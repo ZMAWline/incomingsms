@@ -1,3 +1,6 @@
+import { carrierFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet } from '../shared/supabase-rest.mjs';
+import { constantTimeEqual } from '../shared/portal-auth.mjs';
 const TPLINK_BASE = 'https://wap.tplinkcloud.com/';
 
 export default {
@@ -5,7 +8,7 @@ export default {
     const cors = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Secret',
     };
 
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
@@ -16,6 +19,12 @@ export default {
       status: status || 200,
       headers: { ...cors, 'Content-Type': 'application/json' },
     });
+
+    // Every route switches real power outlets, so every route needs the admin
+    // secret (Authorization: Bearer <secret> or X-Admin-Secret). Fail closed
+    // when the secret is not configured.
+    if (!env.ADMIN_RUN_SECRET) return json({ error: 'ADMIN_RUN_SECRET not configured' }, 503);
+    if (!isAuthorized(request, env.ADMIN_RUN_SECRET)) return json({ error: 'Unauthorized' }, 401);
 
     try {
       if (path === '/outlets' && request.method === 'GET') {
@@ -28,13 +37,8 @@ export default {
         }
         return json(await controlOutlet(env, alias, action));
       }
-      // Manual trigger of the scheduled reboot. Same auth as other workers (ADMIN_RUN_SECRET)
-      // optional — if not configured, the endpoint is open. Useful for one-off ops.
+      // Manual trigger of the scheduled reboot. Useful for one-off ops.
       if (path === '/reboot-gateways' && request.method === 'POST') {
-        const secret = url.searchParams.get('secret') || '';
-        if (env.ADMIN_RUN_SECRET && secret !== env.ADMIN_RUN_SECRET) {
-          return json({ error: 'Unauthorized' }, 401);
-        }
         return json(await rebootAllGateways(env));
       }
       return json({ error: 'Not found' }, 404);
@@ -49,6 +53,13 @@ export default {
     }));
   },
 };
+
+function isAuthorized(request, secret) {
+  const auth = request.headers.get('Authorization') || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const given = bearer || request.headers.get('X-Admin-Secret') || '';
+  return given !== '' && constantTimeEqual(given, secret);
+}
 
 // Reboot every KASA outlet whose alias matches a known gateway code (gateways.code in DB).
 // Sequential — at most one gateway is powered down at any moment (~20s downtime each:
@@ -99,25 +110,18 @@ async function fetchActiveGatewayCodes(env) {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Supabase credentials not configured on kasa-control');
   }
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/gateways?select=code&active=eq.true`, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  if (!res.ok) throw new Error(`Supabase gateways fetch failed ${res.status}`);
-  const rows = await res.json();
+  const rows = await sbGet(env, 'gateways?select=code&active=eq.true');
   return Array.isArray(rows) ? rows.map(r => r.code).filter(Boolean) : [];
 }
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(env.RELAY_URL + '/' + url, {
+    return send(env, env.RELAY_URL + '/' + url, {
       ...init,
       headers: { ...((init && init.headers) || {}), 'x-relay-key': env.RELAY_KEY },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 async function kasaPost(env, token, appServerUrl, body) {

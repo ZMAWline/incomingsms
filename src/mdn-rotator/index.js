@@ -4,6 +4,8 @@ import { persistRentalFromWebhookResponse } from '../shared/persist-rental.mjs';
 import { gatewaySupports } from '../shared/gateway-host.mjs';
 import { buildAtomicPortInStatusRequest } from '../shared/activation-bulk.mjs';
 import { resolveMsisdn, resolveZip, buildSwapImeiRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
+import { carrierFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
+import { sbGet, sbPatch, sbPost, sbRpc } from '../shared/supabase-rest.mjs';
 
 // =========================================================
 // MDN ROTATOR WORKER
@@ -109,7 +111,7 @@ export default {
             status: 500, headers: { "Content-Type": "application/json" }
           });
         }
-        const suspended = await supabaseSelect(
+        const suspended = await sbGet(
           env,
           `sims?select=id,iccid&status=eq.suspended&gateway_id=not.is.null&port=not.is.null&mobility_subscription_id=not.is.null&limit=200`
         );
@@ -343,7 +345,7 @@ export default {
         for (const item of simList) {
           const { id: simId, needs_ota, target_imei } = item;
           try {
-            const rows = await supabaseSelect(
+            const rows = await sbGet(
               env,
               `sims?select=id,iccid,gateway_id,port,att_ban,imei,mobility_subscription_id,sim_numbers(e164)&id=eq.${encodeURIComponent(String(simId))}&limit=1&sim_numbers.valid_to=is.null`
             );
@@ -378,7 +380,7 @@ export default {
                   blimei = d.billingImei;
                   const newBan = d.attBan || d.billingAccountNumber || null;
                   if (newBan) {
-                    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { att_ban: newBan });
+                    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { att_ban: newBan }, { logRows: true });
                     console.log(`[ImeiGatewaySync] SIM ${iccid}: backfilled att_ban=${newBan}`);
                   }
                 } else {
@@ -408,7 +410,7 @@ export default {
             const dbImei = sim.imei;
             // Always update sims.imei to live BLIMEI first — heartbeat uses this for retries
             if (blimei !== dbImei) {
-              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { imei: blimei });
+              await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { imei: blimei }, { logRows: true });
             }
             await callSkylineSetImei(env, gateway_id, port, blimei);
             await markGatewayImeiSynced(env, simId);
@@ -457,7 +459,7 @@ export default {
         }
 
         // Load SIM from DB
-        const sims = await supabaseSelect(
+        const sims = await sbGet(
           env,
           `sims?select=id,iccid,msisdn,mobility_subscription_id,vendor,gateway_host,gateway_id,port,status,imei,activated_at,att_ban,activation_zip,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim_id))}&limit=1&sim_numbers.valid_to=is.null`
         );
@@ -493,11 +495,11 @@ export default {
             });
           }
           const lookup = await lookupAtomicPortinStatus(env, { msisdn, iccid });
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, {
             atomic_portin_status_code: lookup.statusCode ?? null,
             atomic_portin_description: lookup.description ?? null,
             atomic_portin_checked_at: new Date().toISOString(),
-          });
+          }, { logRows: true });
           return new Response(JSON.stringify({
             ok: lookup.ok, action, sim_id, iccid, status_updated: true, detail: lookup,
           }, null, 2), {
@@ -531,7 +533,7 @@ export default {
           if (body.gateway_id && body.port) {
             gwId = parseInt(body.gateway_id, 10) || body.gateway_id;
             gwPort = dotPortToLetter(String(body.port)); // "13.03" → "13C"
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { gateway_id: gwId, port: gwPort });
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { gateway_id: gwId, port: gwPort }, { logRows: true });
             console.log(`[SimAction/fix] SIM ${iccid}: persisted manual slot gateway_id=${gwId} port=${gwPort}`);
           } else if (!gwId || !gwPort) {
             // Auto-scan gateways for this ICCID
@@ -540,7 +542,7 @@ export default {
             if (found) {
               gwId = found.gateway_id;
               gwPort = found.port;
-              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { gateway_id: gwId, port: gwPort });
+              await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { gateway_id: gwId, port: gwPort }, { logRows: true });
               console.log(`[SimAction/fix] SIM ${iccid}: discovered gateway_id=${gwId} port=${gwPort}`);
             } else {
               return new Response(JSON.stringify({
@@ -603,17 +605,17 @@ export default {
           // Retire all in_use IMEI pool entries for this SIM (by sim_id).
           // Must happen before allocating a new one — the DB unique constraint
           // (one in_use per sim_id) would otherwise block the allocation.
-          await supabasePatch(
+          await sbPatch(
             env,
             `imei_pool?sim_id=eq.${encodeURIComponent(String(sim_id))}&status=eq.in_use`,
-            { status: 'retired', sim_id: null, assigned_at: null, updated_at: new Date().toISOString() }
+            { status: 'retired', sim_id: null, assigned_at: null, updated_at: new Date().toISOString() }, { logRows: true }
           );
           // Also retire any stale in_use entry occupying the same gateway/port slot.
           // This handles cases where the slot was previously assigned to a different sim_id.
-          await supabasePatch(
+          await sbPatch(
             env,
             `imei_pool?gateway_id=eq.${encodeURIComponent(String(sim.gateway_id))}&port=eq.${encodeURIComponent(sim.port)}&status=eq.in_use`,
-            { status: 'retired', sim_id: null, assigned_at: null, updated_at: new Date().toISOString() }
+            { status: 'retired', sim_id: null, assigned_at: null, updated_at: new Date().toISOString() }, { logRows: true }
           );
 
           try {
@@ -651,24 +653,19 @@ export default {
             // Upsert new IMEI in pool as in_use for this slot
             if (!allocatedEntry) {
               // Manual IMEI: add to pool as in_use
-              const upsertRes = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?on_conflict=imei`, {
-                method: 'POST',
-                headers: {
-                  apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-                  Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-                  'Content-Type': 'application/json',
-                  Prefer: 'resolution=merge-duplicates,return=representation',
-                },
-                body: JSON.stringify([{
-                  imei: targetImei,
-                  status: 'in_use',
-                  device_type: sim.vendor === 'wing_iot' ? 'router' : 'phone',
-                  gateway_id: sim.gateway_id,
-                  port: sim.port,
-                  sim_id,
-                  assigned_at: new Date().toISOString(),
-                  updated_at: new Date().toISOString(),
-                }]),
+              // raw: a failed upsert is logged below and the IMEI change carries on.
+              const upsertRes = await sbPost(env, 'imei_pool?on_conflict=imei', [{
+                imei: targetImei,
+                status: 'in_use',
+                device_type: sim.vendor === 'wing_iot' ? 'router' : 'phone',
+                gateway_id: sim.gateway_id,
+                port: sim.port,
+                sim_id,
+                assigned_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              }], {
+                prefer: 'resolution=merge-duplicates,return=representation',
+                raw: true,
               });
               if (!upsertRes.ok) {
                 const errTxt = await upsertRes.text();
@@ -676,10 +673,10 @@ export default {
               }
             } else {
               // Auto IMEI: update the allocated entry with gateway_id/port
-              await supabasePatch(
+              await sbPatch(
                 env,
                 `imei_pool?id=eq.${encodeURIComponent(String(allocatedEntry.id))}`,
-                { gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString() }
+                { gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString() }, { logRows: true }
               );
             }
 
@@ -690,10 +687,10 @@ export default {
             }
 
             // Update SIM record
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, {
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, {
               imei: targetImei,
               current_imei_pool_id: allocatedEntry ? allocatedEntry.id : null,
-            });
+            }, { logRows: true });
 
             return new Response(JSON.stringify({
               ok: true, action, sim_id, iccid, imei: targetImei, eligibility, detail: helixResult
@@ -809,7 +806,7 @@ export default {
             error: actOk ? null : `ATOMIC ${requestType} failed: ${actR?.description || actRes.status}`,
           });
           if (actOk) {
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: newDbStatus });
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: newDbStatus }, { logRows: true });
           }
           return new Response(JSON.stringify({
             ok: actOk, action, sim_id, iccid,
@@ -882,7 +879,7 @@ export default {
           let statusUpdated = null;
           if (helixStatus && helixStatus !== sim.status) {
             console.log(`[OTA] SIM ${iccid}: status mismatch DB=${sim.status} Helix=${helixStatus} — updating`);
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: helixStatus });
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: helixStatus }, { logRows: true });
             statusUpdated = { from: sim.status, to: helixStatus };
           }
           let otaResult, otaError = null;
@@ -891,7 +888,7 @@ export default {
           } catch (otaErr) {
             if (otaErr.isSimMismatch) {
               console.log(`[OTA] SIM ${iccid}: sim number mismatch — setting status to data_mismatch`);
-              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: "data_mismatch" });
+              await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: "data_mismatch" }, { logRows: true });
               return new Response(JSON.stringify({ ok: false, action, sim_id, iccid, status_updated: { from: sim.status, to: "data_mismatch" }, error: otaErr.message }, null, 2), {
                 status: 200,
                 headers: { "Content-Type": "application/json" }
@@ -899,7 +896,7 @@ export default {
             }
             if (otaErr.isHelixTimeout) {
               console.log(`[OTA] SIM ${iccid}: subscription not found — setting status to helix_timeout`);
-              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: "helix_timeout" });
+              await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: "helix_timeout" }, { logRows: true });
               return new Response(JSON.stringify({ ok: false, action, sim_id, iccid, status_updated: { from: sim.status, to: "helix_timeout" }, error: otaErr.message }, null, 2), {
                 status: 200,
                 headers: { "Content-Type": "application/json" }
@@ -915,7 +912,7 @@ export default {
             const currentDbStatus = statusUpdated ? statusUpdated.to : sim.status;
             if (otaDbStatus && otaDbStatus !== currentDbStatus) {
               console.log(`[OTA] SIM ${iccid}: fulfilled=${fulfilledStatus} → updating DB ${currentDbStatus} → ${otaDbStatus}`);
-              await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: otaDbStatus });
+              await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: otaDbStatus }, { logRows: true });
               statusUpdated = { from: currentDbStatus, to: otaDbStatus };
             }
           }
@@ -934,9 +931,9 @@ export default {
             reasonCodeId: 1,
             subscriberState: "Cancel",
           }, runId, iccid, "manual_cancel");
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: 'canceled' });
-          await supabasePatch(env, `sim_numbers?sim_id=eq.${encodeURIComponent(String(sim_id))}&valid_to=is.null`, { valid_to: new Date().toISOString() });
-          await supabasePatch(env, `reseller_sims?sim_id=eq.${encodeURIComponent(String(sim_id))}&active=eq.true`, { active: false });
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: 'canceled' }, { logRows: true });
+          await sbPatch(env, `sim_numbers?sim_id=eq.${encodeURIComponent(String(sim_id))}&valid_to=is.null`, { valid_to: new Date().toISOString() }, { logRows: true });
+          await sbPatch(env, `reseller_sims?sim_id=eq.${encodeURIComponent(String(sim_id))}&active=eq.true`, { active: false }, { logRows: true });
           return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
@@ -951,7 +948,7 @@ export default {
             reasonCodeId: 20,
             subscriberState: "Resume On Cancel",
           }, runId, iccid, "manual_resume");
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: 'active' });
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { status: 'active' }, { logRows: true });
           return new Response(JSON.stringify({ ok: true, action, sim_id, iccid, detail: result }, null, 2), {
             status: 200,
             headers: { "Content-Type": "application/json" }
@@ -1061,12 +1058,12 @@ export default {
           });
         }
         // Retire bad IMEI in pool
-        await supabasePatch(env, 'imei_pool?imei=eq.' + encodeURIComponent(imei) + '&status=eq.in_use', {
+        await sbPatch(env, 'imei_pool?imei=eq.' + encodeURIComponent(imei) + '&status=eq.in_use', {
           status: 'retired',
           sim_id: null,
           assigned_at: null,
           updated_at: new Date().toISOString(),
-        });
+        }, { logRows: true });
         const token = await getCachedToken(env);
         // Try up to 3 pool IMEIs until we find an eligible one
         let newImei = null;
@@ -1074,7 +1071,7 @@ export default {
         let poolEntry = null;
         for (let attempt = 0; attempt < 3; attempt++) {
           // Allocate available IMEI (no sim_id — this is a gateway slot fix, not tied to a SIM)
-          const available = await supabaseSelect(env, 'imei_pool?select=id,imei&status=eq.available&order=id.asc&limit=1');
+          const available = await sbGet(env, 'imei_pool?select=id,imei&status=eq.available&order=id.asc&limit=1');
           if (!Array.isArray(available) || available.length === 0) {
             throw new Error("No available IMEIs in pool");
           }
@@ -1083,21 +1080,21 @@ export default {
           const result = await hxCheckImeiEligibility(env, token, candidate.imei);
           if (result.isImeiValid !== true) {
             // Retire ineligible IMEI and try next
-            await supabasePatch(env, 'imei_pool?id=eq.' + encodeURIComponent(String(candidate.id)), {
+            await sbPatch(env, 'imei_pool?id=eq.' + encodeURIComponent(String(candidate.id)), {
               status: 'retired', updated_at: new Date().toISOString(),
-            });
+            }, { logRows: true });
             continue;
           }
           // Set on gateway
           await callSkylineSetImei(env, gateway_id, port, candidate.imei);
           // Mark as in_use for this slot (no sim_id)
-          await supabasePatch(env, 'imei_pool?id=eq.' + encodeURIComponent(String(candidate.id)), {
+          await sbPatch(env, 'imei_pool?id=eq.' + encodeURIComponent(String(candidate.id)), {
             status: 'in_use',
             gateway_id,
             port,
             assigned_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
-          });
+          }, { logRows: true });
           newImei = candidate.imei;
           eligibility = result;
           poolEntry = candidate;
@@ -1147,9 +1144,9 @@ export default {
         let synced = 0, not_found = 0;
         for (const p of (data.ports || [])) {
           if (!p.iccid) continue;
-          const sims = await supabaseSelect(env, `sims?select=id&iccid=eq.${encodeURIComponent(p.iccid)}&limit=1`);
+          const sims = await sbGet(env, `sims?select=id&iccid=eq.${encodeURIComponent(p.iccid)}&limit=1`);
           if (!Array.isArray(sims) || sims.length === 0) { not_found++; continue; }
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sims[0].id))}`, { gateway_id, port: p.port });
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sims[0].id))}`, { gateway_id, port: p.port }, { logRows: true });
           synced++;
         }
 
@@ -1252,17 +1249,17 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
           await callSkylineSetImei(env, sim.gateway_id, sim.port, sim.imei);
           // Increment consecutive success count (capped at 3 = graduated)
           const newCount = Math.min((sim.sync_count || 0) + 1, 3);
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.sim_id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.sim_id))}`, {
             gateway_imei_synced_at: new Date().toISOString(),
             gateway_imei_sync_count: newCount,
-          });
+          }, { logRows: true });
           const status = newCount >= 3 ? "graduated — skipping future heartbeats" : `${newCount}/3`;
           console.log(`[ImeiHeartbeat] SIM ${sim.iccid}: IMEI synced (${status})`);
         } catch (err) {
           // Reset consecutive count — streak broken. Cron will re-enqueue next cycle.
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.sim_id))}`, {
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.sim_id))}`, {
             gateway_imei_sync_count: 0,
-          }).catch(() => {});
+          }, { logRows: true }).catch(() => {});
           console.warn(`[ImeiHeartbeat] SIM ${sim.iccid}: failed, streak reset (will retry next cron): ${err.message}`);
         }
         message.ack();
@@ -1277,7 +1274,7 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
       // blimei_update (dead code while disabled):
       if (sim.type === "blimei_update_disabled") {
         try {
-          const rows = await supabaseSelect(
+          const rows = await sbGet(
             env,
             `sims?select=id,iccid,gateway_id,port,att_ban,imei,mobility_subscription_id,sim_numbers(e164)&id=eq.${encodeURIComponent(String(sim.sim_id))}&limit=1&sim_numbers.valid_to=is.null`
           );
@@ -1297,7 +1294,7 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
             if (d?.billingImei) {
               blimei = d.billingImei;
               const newBan = d.attBan || d.billingAccountNumber || null;
-              if (newBan) await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(s.id))}`, { att_ban: newBan }).catch(() => {});
+              if (newBan) await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(s.id))}`, { att_ban: newBan }, { logRows: true }).catch(() => {});
             }
           } else if (s.att_ban) {
             const mdnRaw = Array.isArray(s.sim_numbers) && s.sim_numbers.length > 0 ? s.sim_numbers[0].e164 : null;
@@ -1313,7 +1310,7 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
           }
           // Always update DB first so heartbeat uses correct BLIMEI even if gateway is down
           if (blimei !== s.imei) {
-            await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(s.id))}`, { imei: blimei });
+            await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(s.id))}`, { imei: blimei }, { logRows: true });
             console.log(`[BlimeiUpdate] SIM ${s.iccid}: DB imei updated ${s.imei} → ${blimei}`);
           }
           await callSkylineSetImei(env, s.gateway_id, s.port, blimei);
@@ -1366,7 +1363,7 @@ async function queueSimsForRotation(env, options = {}) {
     console.log(`[Scheduled Run] Fetching all active SIMs for EST-today filter`);
   }
 
-  const rawSims = await supabaseSelect(env, query);
+  const rawSims = await sbGet(env, query);
 
   // Per-vendor identifier filter (PostgREST OR is awkward, so filter in JS).
   // Helix needs mobility_subscription_id. Atomic needs msisdn.
@@ -1431,7 +1428,7 @@ async function queueImeiHeartbeats(env) {
   // Only queue SIMs that haven't graduated (< 3 consecutive successes).
   // Graduated SIMs (count >= 3) are skipped until suspended/canceled resets their count.
   const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
-  const stale = await supabaseSelect(
+  const stale = await sbGet(
     env,
     `sims?select=id,iccid,gateway_id,port,imei,gateway_imei_sync_count&status=eq.active&gateway_id=not.is.null&port=not.is.null&imei=not.is.null&gateway_imei_sync_count=lt.3&or=(gateway_imei_synced_at.is.null,gateway_imei_synced_at.lt.${threeHoursAgo})&limit=100`
   ).catch(err => {
@@ -1464,7 +1461,7 @@ async function queueImeiHeartbeats(env) {
 // ===========================
 async function queueBlimeiUpdates(env) {
   if (!env.MDN_QUEUE) return { queued: 0, error: "MDN_QUEUE not configured" };
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid&status=eq.active&gateway_id=not.is.null&limit=5000`
   ).catch(err => { console.warn(`[BlimeiSweep] Query failed: ${err}`); return []; });
@@ -1527,7 +1524,7 @@ async function processRotationBatch(env, options = {}) {
     `&vendor=in.(helix,atomic,wing_iot)` +
     `&order=last_mdn_rotated_at.asc.nullsfirst` +
     `&limit=${limit * 2}`;
-  const raw = await supabaseSelect(env, query);
+  const raw = await sbGet(env, query);
   const candidates = (Array.isArray(raw) ? raw : []).filter(s => {
     if (s.last_mdn_rotated_at && s.last_mdn_rotated_at >= todayNy) return false;
     if (s.activated_at && s.activated_at >= todayNy) return false;
@@ -1549,7 +1546,7 @@ async function processRotationBatch(env, options = {}) {
     `sims?select=id,iccid,vendor,status,msisdn,last_mdn_rotated_at,activated_at,activation_zip,rotation_eligible` +
     `&vendor=eq.wing_iot&rotation_status=eq.failed&status=neq.canceled` +
     `&or=(rotation_fail_count.is.null,rotation_fail_count.lt.5)&limit=${limit}`;
-  const stuckRaw = await supabaseSelect(env, stuckWingQuery).catch(() => []);
+  const stuckRaw = await sbGet(env, stuckWingQuery).catch(() => []);
   const stuckCandidates = Array.isArray(stuckRaw) ? stuckRaw : [];
 
   if (candidates.length === 0 && stuckCandidates.length === 0) {
@@ -1627,7 +1624,7 @@ async function rotateSpecificSim(env, iccid, options = {}) {
   const force = options.force === true;
   try {
     // Look up the SIM by ICCID
-    const sims = await supabaseSelect(
+    const sims = await sbGet(
       env,
       `sims?select=id,iccid,mobility_subscription_id,msisdn,status,vendor,activation_zip,last_mdn_rotated_at,canary_apex_ppu&iccid=eq.${encodeURIComponent(iccid)}&limit=1`
     );
@@ -1732,9 +1729,9 @@ async function rotateWingIotSim(env, sim, opts = {}) {
   try {
     return await rotateWingIotSimInner(env, sim, opts);
   } catch (err) {
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       last_mdn_rotated_at: priorRotatedAt,
-    }).catch(() => {});
+    }, { logRows: true }).catch(() => {});
     throw err;
   }
 }
@@ -1824,11 +1821,11 @@ async function rotateWingIotSimInner(env, sim, opts = {}) {
   if (oldPlan === ABIR_PLAN) {
     console.log(`SIM ${iccid}: already on ABIR (msisdn=${oldMdn}) — skipping PUT-1, jumping to dialable PUT`);
     midMdn = oldMdn;
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       rotation_status: 'failed',
       status: 'rotation_failed',
       last_rotation_error: 'Stuck on ABIR plan — detected by rotator at ' + new Date().toISOString(),
-    }).catch(() => {});
+    }, { logRows: true }).catch(() => {});
   } else {
     const nonDialableBody = { communicationPlan: ABIR_PLAN };
     const ndRes = await relayFetch(env, url, { method: 'PUT', headers: putHeaders, body: JSON.stringify(nonDialableBody) });
@@ -1867,12 +1864,12 @@ async function rotateWingIotSimInner(env, sim, opts = {}) {
   // assigns the new dialable MDN asynchronously (observed 30–60s lag). Hand off to
   // details-finalizer (every 5 min cron), which polls GET, waits for plan=NON ABIR
   // AND MDN ≠ sim.msisdn, then writes sim_numbers + fires the webhook.
-  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+  await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
     rotation_status: 'mdn_pending',
     status: 'provisioning',
     last_rotation_error: null,
     rotation_fail_count: 0,
-  });
+  }, { logRows: true });
 
   console.log(`SIM ${iccid}: Wing IoT plan swap complete (old MDN: ${oldMdn || 'unknown'}) — status=provisioning, details-finalizer will pick up new MDN`);
 }
@@ -1888,7 +1885,7 @@ async function remediateStuckWingSim(env, iccid) {
   if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
     throw new Error('Wing IoT credentials not configured');
   }
-  const sims = await supabaseSelect(env, `sims?select=id,iccid,msisdn,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
+  const sims = await sbGet(env, `sims?select=id,iccid,msisdn,vendor&iccid=eq.${encodeURIComponent(iccid)}&limit=1`);
   const sim = Array.isArray(sims) && sims[0] ? sims[0] : null;
   if (!sim) return { iccid, ok: false, error: 'SIM not found in DB' };
   if (sim.vendor !== 'wing_iot') return { iccid, ok: false, error: `vendor=${sim.vendor} (not wing_iot)` };
@@ -1937,11 +1934,11 @@ async function remediateStuckWingSim(env, iccid) {
 
   // 3) Trust the 202 Accepted. AT&T finalizes the plan switch + assigns the new
   // dialable MDN asynchronously (30–60s lag). Hand off to details-finalizer.
-  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+  await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
     rotation_status: 'mdn_pending',
     status: 'provisioning',
     last_rotation_error: null,
-  });
+  }, { logRows: true });
 
   return { iccid, ok: true, old_mdn: currentMdn, new_mdn: null, pending: true };
 }
@@ -2003,7 +2000,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   // reads from there. sims.msisdn is a denormalized mirror that can drift on
   // partial-failure paths, so prefer sim_numbers.e164 (valid_to IS NULL) and
   // fall back to sim.msisdn only if no current row exists.
-  const curNumRows = await supabaseSelect(
+  const curNumRows = await sbGet(
     env,
     `sim_numbers?sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null&select=e164&limit=1`,
   ).catch(() => []);
@@ -2012,7 +2009,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   let currentMsisdn = curBare || sim.msisdn;
   if (curBare && sim.msisdn && curBare !== sim.msisdn) {
     console.log(`SIM ${iccid}: sims.msisdn=${sim.msisdn} drift vs sim_numbers.e164=${curE164}; using sim_numbers and healing sims.msisdn`);
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: curBare }).catch(() => {});
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: curBare }, { logRows: true }).catch(() => {});
   }
 
   if (!currentMsisdn) throw new Error(`SIM ${iccid}: no msisdn for ATOMIC rotation`);
@@ -2037,9 +2034,9 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   // After swapMSISDN returns statusCode '00' the MDN IS changed; we must NOT restore.
   const priorRotatedAt = sim.last_mdn_rotated_at ?? null;
   const restoreRotationStamp = () =>
-    supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       last_mdn_rotated_at: priorRotatedAt,
-    }).catch(() => {});
+    }, { logRows: true }).catch(() => {});
 
   const url = env.ATOMIC_API_URL || 'https://solutionsatt-atomic.telgoo5.com:22712';
   const session = {
@@ -2055,23 +2052,36 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       wholeSaleRequest: { requestType: 'subsriberInquiry', MSISDN: '', sim: iccid },
     },
   };
-  const preInqRes = await relayFetch(env, url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(preInqBody),
-  });
-  const preInqText = await preInqRes.text();
-  let preInqJson = {};
-  try { preInqJson = JSON.parse(preInqText); } catch {}
+  // A timeout or network error here happens before any swap, so no MDN was used:
+  // restore the claim stamp and throw a transport error so processBatch counts it
+  // toward the outage breaker and moves on to the next SIM.
+  let preInqRes, preInqText, preInqJson = {}, preInqNetworkError = null;
+  try {
+    preInqRes = await relayFetch(env, url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(preInqBody),
+    });
+    preInqText = await preInqRes.text();
+    try { preInqJson = JSON.parse(preInqText); } catch {}
+  } catch (err) {
+    preInqNetworkError = err;
+    preInqText = String(err);
+  }
   const preInqR = preInqJson?.wholeSaleApi?.wholeSaleResponse;
   await logCarrierApiCall(env, {
     run_id: runId, step: 'pre_swap_inquiry', iccid, imei: null, vendor: 'atomic',
     request_url: url, request_method: 'POST', request_body: preInqBody,
-    response_status: preInqRes.status, response_ok: preInqRes.ok,
-    response_body_text: preInqText, response_body_json: preInqJson,
-    error: (preInqRes.ok && preInqR?.statusCode === '00') ? null :
-      `ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`,
+    response_status: preInqRes?.status ?? 0, response_ok: preInqRes?.ok ?? false,
+    response_body_text: preInqText || '', response_body_json: preInqJson,
+    error: preInqNetworkError ? `ATOMIC pre-swap inquiry network error: ${preInqNetworkError}`
+      : (preInqRes.ok && preInqR?.statusCode === '00') ? null
+      : `ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`,
   });
+  if (preInqNetworkError) {
+    await restoreRotationStamp();
+    throw new Error(`ATOMIC pre-swap inquiry network error: ${String(preInqNetworkError).slice(0, 300)}`);
+  }
   if (!preInqRes.ok || preInqR?.statusCode !== '00') {
     await restoreRotationStamp();
     throw new Error(`ATOMIC pre-swap inquiry failed: ${preInqR?.description || preInqRes.status}`);
@@ -2082,9 +2092,9 @@ async function rotateAtomicSim(env, sim, opts = {}) {
 
   // Sync zip to DB if AT&T has a different value
   if (preInqR.Result?.address?.zipCode && preInqR.Result.address.zipCode !== sim.activation_zip) {
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       activation_zip: preInqR.Result.address.zipCode,
-    }).catch(() => {});
+    }, { logRows: true }).catch(() => {});
     console.log(`SIM ${iccid}: updated activation_zip ${sim.activation_zip} → ${preInqR.Result.address.zipCode}`);
   }
 
@@ -2104,7 +2114,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
     // self-heal silently skipped, leaving the stale DB number in the request.
     console.log(`SIM ${iccid}: DESYNC detected — DB msisdn=${currentMsisdn} but AT&T MDN=${attMdnBare} (attStatus=${preInqR.Result?.attStatus || 'n/a'}); adopting AT&T number as swap-from`);
     currentMsisdn = attMdnBare;
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: attMdnBare }).catch(() => {});
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: attMdnBare }, { logRows: true }).catch(() => {});
   }
 
   // Apex flow: pick a new PPU address (different state + zip) and update
@@ -2160,9 +2170,9 @@ async function rotateAtomicSim(env, sim, opts = {}) {
     }
     zipCode = ppuSuccessAddr.zipCode;
     ppuAddr = ppuSuccessAddr;
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       activation_zip: ppuSuccessAddr.zipCode,
-    }).catch(() => {});
+    }, { logRows: true }).catch(() => {});
   } else {
     zipCode = currentZip || env.HX_ZIP || '11238';
   }
@@ -2211,12 +2221,12 @@ async function rotateAtomicSim(env, sim, opts = {}) {
     // had actually assigned the new MDN, leaving DB stuck with stale msisdn.
     if (swapNetworkError || (swapRes && swapRes.status >= 500)) {
       console.log(`SIM ${iccid}: ATOMIC swap uncertain (${swapNetworkError ? 'network' : swapRes.status}) — flipping to provisioning for finalizer reconciliation`);
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
         rotation_status: 'mdn_pending',
         status: 'provisioning',
         last_rotation_error: swapNetworkError ? `swap uncertain: ${String(swapNetworkError).slice(0, 300)}` : `swap uncertain: HTTP ${swapRes.status}`,
         rotation_fail_count: 0,
-      });
+      }, { logRows: true });
       return;
     }
     if (!swapRes.ok) {
@@ -2245,9 +2255,9 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       }
       ppuAddr = nextAddr;
       zipCode = nextAddr.zipCode;
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
         activation_zip: nextAddr.zipCode,
-      }).catch(() => {});
+      }, { logRows: true }).catch(() => {});
       continue;  // retry swapMSISDN with the replacement zip
     }
 
@@ -2255,9 +2265,9 @@ async function rotateAtomicSim(env, sim, opts = {}) {
       console.log(`SIM ${iccid}: ATOMIC subscriber not active (statusCode ${swapR?.statusCode}) — marking suspended + queuing fix-sim`);
       // Reflect reality: AT&T says the subscriber is not active, so DB should show suspended.
       // fix-sim will run restoreSubscriber to bring it back to active.
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
         status: 'suspended',
-      }).catch(e => console.error(`SIM ${iccid}: failed to patch status=suspended: ${e}`));
+      }, { logRows: true }).catch(e => console.error(`SIM ${iccid}: failed to patch status=suspended: ${e}`));
       if (env.FIX_SIM_QUEUE) {
         await env.FIX_SIM_QUEUE.send({ sim_id: sim.id, iccid }).catch(e =>
           console.error(`SIM ${iccid}: failed to enqueue fix-sim: ${e}`)
@@ -2315,7 +2325,7 @@ async function rotateAtomicSim(env, sim, opts = {}) {
   await closeCurrentNumber(env, sim.id);
   await insertNewNumber(env, sim.id, e164);
   await updateSimRotationTimestamp(env, sim.id);
-  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: msisdnBare });
+  await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { msisdn: msisdnBare }, { logRows: true });
 
   // 4) Webhook (use MSISDN as the external identifier, same slot as mobility_subscription_id
   //    occupies for Helix SIMs — downstream reseller systems just need *an* ID)
@@ -2427,14 +2437,14 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
       }
     }
     if (!ppuSuccessAddr) {
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
         last_mdn_rotated_at: priorRotatedAt,
-      }).catch(() => {});
+      }, { logRows: true }).catch(() => {});
       throw lastPpuErr || new Error(`SIM ${iccid}: helix PPU exhausted ${MAX_PPU_ATTEMPTS} attempts`);
     }
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, {
       activation_zip: ppuSuccessAddr.zipCode,
-    }).catch(() => {});
+    }, { logRows: true }).catch(() => {});
   }
 
   // 1) MDN change - request new number from carrier
@@ -2473,9 +2483,9 @@ async function rotateSingleSim(env, token, sim, opts = {}) {
   const rotateHelixStatus = d?.status ? String(d.status).toLowerCase() : null;
   if (rotateHelixStatus === 'canceled' || rotateHelixStatus === 'cancelled') {
     console.log(`SIM ${iccid}: subscriber is CANCELED in Helix — updating DB and skipping rotation`);
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { status: 'canceled' });
-    await supabasePatch(env, `sim_numbers?sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null`, { valid_to: new Date().toISOString() });
-    await supabasePatch(env, `reseller_sims?sim_id=eq.${encodeURIComponent(String(sim.id))}&active=eq.true`, { active: false });
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim.id))}`, { status: 'canceled' }, { logRows: true });
+    await sbPatch(env, `sim_numbers?sim_id=eq.${encodeURIComponent(String(sim.id))}&valid_to=is.null`, { valid_to: new Date().toISOString() }, { logRows: true });
+    await sbPatch(env, `reseller_sims?sim_id=eq.${encodeURIComponent(String(sim.id))}&active=eq.true`, { active: false }, { logRows: true });
     return;
   }
 
@@ -2525,7 +2535,7 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
   // rotation_status='failed' — that signals it's on the non-dialable ABIR plan
   // and the MDN we're about to broadcast is a 5xxx interim number that can't
   // receive normal SMS. The cleanup sweep + processRotationBatch flag these.
-  const guard = await supabaseSelect(env,
+  const guard = await sbGet(env,
     `sims?select=vendor,rotation_status&id=eq.${encodeURIComponent(String(simId))}&limit=1`
   ).catch(() => []);
   const guardRow = Array.isArray(guard) && guard[0];
@@ -2573,16 +2583,8 @@ async function sendNumberOnlineWebhook(env, simId, number, iccid, mobilitySubscr
 
   if (result.ok) {
     try {
-      await fetch(`${env.SUPABASE_URL}/rest/v1/sims?id=eq.${simId}`, {
-        method: 'PATCH',
-        headers: {
-          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-          'Content-Type': 'application/json',
-          Prefer: 'return=minimal',
-        },
-        body: JSON.stringify({ last_notified_at: new Date().toISOString() }),
-      });
+      // Non-critical: a failure (non-2xx or timeout) is logged and swallowed.
+      await sbPatch(env, `sims?id=eq.${simId}`, { last_notified_at: new Date().toISOString() }, { prefer: 'return=minimal' });
     } catch (err) {
       console.error(`[Webhook] SIM ${simId}: last_notified_at PATCH failed (non-critical): ${err}`);
     }
@@ -2871,7 +2873,7 @@ async function retryUntilFulfilled(fn, { attempts = 3, delayMs = 5000, label = '
 // ===========================
 async function fixSim(env, token, simId, { autoRotate = false } = {}) {
   // Load SIM details from DB
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     `sims?select=id,iccid,vendor,gateway_host,msisdn,mobility_subscription_id,gateway_id,port,slot,current_imei_pool_id,status,imei,activated_at&id=eq.${encodeURIComponent(String(simId))}&limit=1`
   );
@@ -2902,10 +2904,10 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
     sim.port = found.port;
     console.log(`[FixSim] SIM ${iccid}: discovered gateway_id=${sim.gateway_id} port=${sim.port}`);
     // Persist so future operations have it
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
       gateway_id: sim.gateway_id,
       port: sim.port,
-    });
+    }, { logRows: true });
   }
 
   console.log(`[FixSim] Starting for SIM ${simId} (${iccid})`);
@@ -3024,15 +3026,15 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
 
     if (poolEntry) {
       // New pool entry: update with gateway/port and update SIM record
-      await supabasePatch(
+      await sbPatch(
         env,
         `imei_pool?id=eq.${encodeURIComponent(String(poolEntry.id))}`,
-        { gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString() }
+        { gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString() }, { logRows: true }
       );
-      await supabasePatch(
+      await sbPatch(
         env,
         `sims?id=eq.${encodeURIComponent(String(simId))}`,
-        { imei: newImei, current_imei_pool_id: poolEntry.id }
+        { imei: newImei, current_imei_pool_id: poolEntry.id }, { logRows: true }
       );
     }
     // If reusing existing IMEI, sims.imei is already correct — no DB update needed.
@@ -3065,7 +3067,7 @@ async function fixSim(env, token, simId, { autoRotate = false } = {}) {
         otaStatusPatch.imei = otaBlimei;
       }
       if (Object.keys(otaStatusPatch).length > 0) {
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, otaStatusPatch);
+        await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, otaStatusPatch, { logRows: true });
       }
       await sleep(3000);
     } else {
@@ -3131,10 +3133,10 @@ async function fixAtomicSim(env, sim) {
     if (!found) throw new Error(`SIM ${iccid}: no gateway_id/port and ICCID not found on any gateway`);
     sim.gateway_id = found.gateway_id;
     sim.port = found.port;
-    await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+    await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
       gateway_id: sim.gateway_id,
       port: sim.port,
-    });
+    }, { logRows: true });
   }
 
   console.log(`[FixAtomicSim] Starting for SIM ${simId} (${iccid})`);
@@ -3163,12 +3165,12 @@ async function fixAtomicSim(env, sim) {
       markGatewayImeiSynced(env, simId).catch(() => {});
 
       // Update pool entry with slot info and SIM record with new IMEI
-      await supabasePatch(env, `imei_pool?id=eq.${encodeURIComponent(String(poolEntry.id))}`, {
+      await sbPatch(env, `imei_pool?id=eq.${encodeURIComponent(String(poolEntry.id))}`, {
         gateway_id: sim.gateway_id, port: sim.port, updated_at: new Date().toISOString(),
-      });
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
+      }, { logRows: true });
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, {
         imei: newImei, current_imei_pool_id: poolEntry.id,
-      });
+      }, { logRows: true });
     } else {
       console.log(`[FixAtomicSim] SIM ${iccid}: Teltik-hosted, skipping IMEI allocate + gateway push`);
     }
@@ -3208,7 +3210,7 @@ async function fixAtomicSim(env, sim) {
     if (msisdnRaw) {
       const msisdn10 = String(msisdnRaw).replace(/^\+?1?/, '').replace(/\D/g, '').slice(0, 10);
       if (msisdn10 !== sim.msisdn) {
-        await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { msisdn: msisdn10 }).catch(() => {});
+        await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { msisdn: msisdn10 }, { logRows: true }).catch(() => {});
         console.log(`[FixAtomicSim] SIM ${iccid}: synced msisdn ${sim.msisdn} → ${msisdn10}`);
       }
     }
@@ -3264,7 +3266,7 @@ async function fixAtomicSim(env, sim) {
         if (match) {
           const newMdn = match[1];
           console.log(`[FixAtomicSim] SIM ${iccid}: ATOMIC reports current MSISDN=${newMdn} — syncing DB and retrying`);
-          await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { msisdn: newMdn }).catch(() => {});
+          await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { msisdn: newMdn }, { logRows: true }).catch(() => {});
           result = await callReactivate(newMdn, ' (after-msisdn-sync)');
         }
       }
@@ -3273,7 +3275,7 @@ async function fixAtomicSim(env, sim) {
         throw new Error(`ATOMIC ${requestType} failed: ${result.desc || result.httpStatus}`);
       }
       console.log(`[FixAtomicSim] SIM ${iccid}: subscriber ${requestType === 'reconnectSubscriber' ? 'reconnected' : 'restored'} successfully`);
-      await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { status: 'active' }).catch(() => {});
+      await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(simId))}`, { status: 'active' }, { logRows: true }).catch(() => {});
     } else {
       console.log(`[FixAtomicSim] SIM ${iccid}: attStatus=${attStatus} — no reactivation needed`);
     }
@@ -3320,23 +3322,15 @@ function parseImeiPoolConflict(status, bodyText) {
 async function logImeiPoolConflict(env, message, details) {
   console.error('[IMEI Pool Conflict]', message, details);
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/system_errors`, {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
-      },
-      body: JSON.stringify({
-        source: 'imei-pool',
-        action: 'duplicate_imei_assignment',
-        error_message: message,
-        error_details: details || null,
-        severity: 'error',
-        status: 'open',
-      }),
-    });
+    // Best effort: a failure (non-2xx or timeout) is logged and swallowed.
+    await sbPost(env, 'system_errors', {
+      source: 'imei-pool',
+      action: 'duplicate_imei_assignment',
+      error_message: message,
+      error_details: details || null,
+      severity: 'error',
+      status: 'open',
+    }, { prefer: 'return=minimal' });
   } catch (e) {
     console.error('[IMEI Pool] Failed to log conflict to system_errors:', e);
   }
@@ -3349,7 +3343,7 @@ async function allocateImeiFromPool(env, simId, deviceType = 'phone') {
     throw new Error(`allocateImeiFromPool: invalid deviceType ${deviceType}`);
   }
   // Find first available IMEI of the requested device type
-  const available = await supabaseSelect(
+  const available = await sbGet(
     env,
     `imei_pool?select=id,imei&status=eq.available&device_type=eq.${deviceType}&order=id.asc&limit=1`
   );
@@ -3360,20 +3354,15 @@ async function allocateImeiFromPool(env, simId, deviceType = 'phone') {
   const entry = available[0];
 
   // Claim it with status filter for safety (prevents double-allocation)
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry.id}&status=eq.available&device_type=eq.${deviceType}`, {
-    method: "PATCH",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify({
-      status: "in_use",
-      sim_id: simId,
-      assigned_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }),
+  // raw: the status and body feed the conflict parsing below.
+  const res = await sbPatch(env, `imei_pool?id=eq.${entry.id}&status=eq.available&device_type=eq.${deviceType}`, {
+    status: "in_use",
+    sim_id: simId,
+    assigned_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }, {
+    prefer: 'return=representation',
+    raw: true,
   });
 
   const txt = await res.text();
@@ -3390,7 +3379,7 @@ async function allocateImeiFromPool(env, simId, deviceType = 'phone') {
   if (!Array.isArray(updated) || updated.length === 0) {
     // Race condition — retry once with the next available IMEI
     console.warn(`[IMEI Pool] Race condition on entry ${entry.id}, retrying with next available`);
-    const available2 = await supabaseSelect(
+    const available2 = await sbGet(
       env,
       `imei_pool?select=id,imei&status=eq.available&device_type=eq.${deviceType}&order=id.asc&limit=1`
     );
@@ -3398,20 +3387,15 @@ async function allocateImeiFromPool(env, simId, deviceType = 'phone') {
       throw new Error(`No available ${deviceType} IMEIs in pool (retry after race condition)`);
     }
     const entry2 = available2[0];
-    const res2 = await fetch(`${env.SUPABASE_URL}/rest/v1/imei_pool?id=eq.${entry2.id}&status=eq.available&device_type=eq.${deviceType}`, {
-      method: "PATCH",
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        "Content-Type": "application/json",
-        Prefer: "return=representation",
-      },
-      body: JSON.stringify({
-        status: "in_use",
-        sim_id: simId,
-        assigned_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      }),
+    // raw: the status and body feed the conflict parsing below.
+    const res2 = await sbPatch(env, `imei_pool?id=eq.${entry2.id}&status=eq.available&device_type=eq.${deviceType}`, {
+      status: "in_use",
+      sim_id: simId,
+      assigned_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }, {
+      prefer: 'return=representation',
+      raw: true,
     });
     const txt2 = await res2.text();
     if (!res2.ok) {
@@ -3434,7 +3418,7 @@ async function allocateImeiFromPool(env, simId, deviceType = 'phone') {
 
 async function releaseImeiPoolEntry(env, poolEntryId, simId) {
   console.log(`[IMEI Pool] Releasing entry ${poolEntryId} from SIM ${simId}`);
-  await supabasePatch(
+  await sbPatch(
     env,
     `imei_pool?id=eq.${encodeURIComponent(String(poolEntryId))}`,
     {
@@ -3443,7 +3427,7 @@ async function releaseImeiPoolEntry(env, poolEntryId, simId) {
       assigned_at: null,
       previous_sim_id: simId,
       updated_at: new Date().toISOString(),
-    }
+    }, { logRows: true }
   );
 }
 
@@ -3457,7 +3441,7 @@ async function retireAllPoolEntriesForSim(env, simId, knownPoolId) {
   const query = 'imei_pool?select=id&status=eq.in_use&sim_id=eq.' +
     encodeURIComponent(String(simId)) +
     (knownPoolId ? '&id=neq.' + encodeURIComponent(String(knownPoolId)) : '');
-  const orphans = await supabaseSelect(env, query);
+  const orphans = await sbGet(env, query);
   for (const entry of (orphans || [])) {
     console.log('[IMEI Pool] Retiring orphaned pool entry ' + entry.id + ' for SIM ' + simId);
     await retireImeiPoolEntry(env, entry.id, simId);
@@ -3573,7 +3557,7 @@ async function hxChangeImei(env, token, mobilitySubscriptionId, newImei, runId, 
 
 async function retireImeiPoolEntry(env, poolEntryId, simId) {
   console.log(`[IMEI Pool] Retiring entry ${poolEntryId} from SIM ${simId} (will not be reused)`);
-  await supabasePatch(
+  await sbPatch(
     env,
     `imei_pool?id=eq.${encodeURIComponent(String(poolEntryId))}`,
     {
@@ -3582,7 +3566,7 @@ async function retireImeiPoolEntry(env, poolEntryId, simId) {
       assigned_at: null,
       previous_sim_id: simId,
       updated_at: new Date().toISOString(),
-    }
+    }, { logRows: true }
   );
 }
 
@@ -3641,7 +3625,7 @@ async function changeImeiTeltikHosted(env, sim, sim_id, iccid, autoImei, newImei
     return fail(`Skyline hardware update skipped (SIM ${iccid} is Teltik-hosted). ATOMIC carrier-side IMEI update failed: ${errMsg}`, res.status >= 400 ? res.status : 502);
   }
 
-  await supabasePatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { imei: newImeiRaw });
+  await sbPatch(env, `sims?id=eq.${encodeURIComponent(String(sim_id))}`, { imei: newImeiRaw }, { logRows: true });
 
   return new Response(JSON.stringify({
     ok: true, action: 'change_imei', sim_id, iccid, imei: newImeiRaw,
@@ -3706,10 +3690,10 @@ async function callSkylineSetImei(env, gatewayId, port, imei) {
 
 // Mark IMEI as confirmed on gateway hardware for a given SIM
 async function markGatewayImeiSynced(env, simId) {
-  await supabasePatch(
+  await sbPatch(
     env,
     `sims?id=eq.${encodeURIComponent(String(simId))}`,
-    { gateway_imei_synced_at: new Date().toISOString() }
+    { gateway_imei_synced_at: new Date().toISOString() }, { logRows: true }
   ).catch(err => console.warn(`[markGatewayImeiSynced] sim_id=${simId}: ${err}`));
 }
 
@@ -3905,9 +3889,9 @@ async function hxActivate(env, token, iccid, imei) {
   throw new Error('Activate returned ' + res.status + ' but no mobilitySubscriptionId. Raw: ' + responseText.slice(0, 200));
 }
 
-function relayFetch(env, url, init) {
+function relayFetch(env, url, init, send = carrierFetch) {
   if (env.RELAY_URL && env.RELAY_KEY) {
-    return fetch(`${env.RELAY_URL}/${url}`, {
+    return send(env, `${env.RELAY_URL}/${url}`, {
       ...init,
       headers: {
         ...(init?.headers || {}),
@@ -3915,7 +3899,7 @@ function relayFetch(env, url, init) {
       },
     });
   }
-  return fetch(url, init);
+  return send(env, url, init);
 }
 
 async function retryActivateViaAtomic(env, iccid, imei, runId) {
@@ -4147,16 +4131,8 @@ async function logCarrierApiCall(env, logData) {
     created_at: new Date().toISOString(),
   };
   console.log('[' + vendor.toUpperCase() + ' API] ' + logData.request_method + ' ' + logData.request_url + ' -> ' + logData.response_status + ' ' + (logData.response_ok ? 'OK' : 'FAIL'));
-  const res = await fetch(env.SUPABASE_URL + '/rest/v1/carrier_api_logs', {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-      'Content-Type': 'application/json',
-      Prefer: 'return=minimal',
-    },
-    body: JSON.stringify(payload),
-  });
+  // raw: a non-2xx is logged and ignored; a timeout still throws.
+  const res = await sbPost(env, 'carrier_api_logs', payload, { prefer: 'return=minimal', raw: true });
   if (!res.ok) console.error('[Carrier Log] Supabase failed: ' + res.status);
 }
 
@@ -4173,7 +4149,7 @@ function dotPortToLetter(dotPort) {
 async function scanGatewaysForIccid(env, iccid) {
   if (!env.SKYLINE_GATEWAY) throw new Error("SKYLINE_GATEWAY service binding not configured");
   if (!env.SKYLINE_SECRET) throw new Error("SKYLINE_SECRET not configured");
-  const gateways = await supabaseSelect(env, 'gateways?select=id,code&order=id.asc');
+  const gateways = await sbGet(env, 'gateways?select=id,code&order=id.asc');
   if (!Array.isArray(gateways) || gateways.length === 0) return null;
   for (const gw of gateways) {
     try {
@@ -4196,9 +4172,9 @@ async function scanGatewaysForIccid(env, iccid) {
 async function getUnoccupiedCandidates(env) {
   if (!env.SKYLINE_GATEWAY) throw new Error("SKYLINE_GATEWAY service binding not configured");
   if (!env.SKYLINE_SECRET) throw new Error("SKYLINE_SECRET not configured");
-  const activeSims = await supabaseSelect(env, 'sims?select=iccid&status=in.(active,provisioning)&limit=5000');
+  const activeSims = await sbGet(env, 'sims?select=iccid&status=in.(active,provisioning)&limit=5000');
   const occupied = new Set(Array.isArray(activeSims) ? activeSims.map(s => s.iccid).filter(Boolean) : []);
-  const gateways = await supabaseSelect(env, 'gateways?select=id,code&order=id.asc');
+  const gateways = await sbGet(env, 'gateways?select=id,code&order=id.asc');
   if (!Array.isArray(gateways) || gateways.length === 0) return [];
   const candidates = [];
   for (const gw of gateways) {
@@ -4223,7 +4199,7 @@ async function getUnoccupiedCandidates(env) {
 }
 
 async function retryActivation(env, simId, manualGatewayId = null, manualPort = null, imeiStrategy = 'new') {
-  const sims = await supabaseSelect(
+  const sims = await sbGet(
     env,
     'sims?select=id,iccid,status,current_imei_pool_id,imei,vendor,gateway_host,gateway_id,port&id=eq.' + encodeURIComponent(String(simId)) + '&limit=1'
   );
@@ -4250,8 +4226,8 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
       console.log('[RetryActivation] SIM ' + sim.iccid + ': Wing IoT activation submitted, msisdn=' + (activateResult.msisdn || 'pending'));
     } catch (err) {
       console.error('[RetryActivation] SIM ' + sim.iccid + ': Wing IoT activation failed: ' + err);
-      await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
-        { last_activation_error: String(err) });
+      await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
+        { last_activation_error: String(err) }, { logRows: true });
       throw err;
     }
 
@@ -4260,7 +4236,7 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
       last_activation_error: null,
     };
     if (activateResult.msisdn) updateData.msisdn = activateResult.msisdn;
-    await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), updateData);
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), updateData, { logRows: true });
     console.log('[RetryActivation] SIM ' + sim.iccid + ': set to active');
 
     return {
@@ -4297,7 +4273,7 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
     }
   }
 
-  await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), { gateway_id: gatewayId, port });
+  await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), { gateway_id: gatewayId, port }, { logRows: true });
 
   // IMEI strategy: reuse existing or allocate new from pool
   let poolEntry;
@@ -4320,8 +4296,8 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
   } catch (err) {
     console.error('[RetryActivation] SIM ' + sim.iccid + ': gateway set-IMEI failed: ' + err);
     await releaseImeiPoolEntry(env, poolEntry.id, simId).catch(() => {});
-    await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
-      { last_activation_error: 'Gateway error: ' + err.message });
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
+      { last_activation_error: 'Gateway error: ' + err.message }, { logRows: true });
     throw err;
   }
 
@@ -4338,8 +4314,8 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
   } catch (err) {
     console.error('[RetryActivation] SIM ' + sim.iccid + ': ' + vendor + ' activation failed: ' + err);
     await retireImeiPoolEntry(env, poolEntry.id, simId).catch(() => {});
-    await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
-      { last_activation_error: String(err), imei: poolEntry.imei, current_imei_pool_id: poolEntry.id });
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)),
+      { last_activation_error: String(err), imei: poolEntry.imei, current_imei_pool_id: poolEntry.id }, { logRows: true });
     throw err;
   }
 
@@ -4355,15 +4331,12 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
       const parsed = new Date(activateResult.activationDate);
       if (!isNaN(parsed.getTime())) patch914.activated_at = parsed.toISOString();
     }
-    await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), patch914);
+    await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), patch914, { logRows: true });
     if (activateResult.msisdn) {
       const e164 = '+1' + activateResult.msisdn.replace(/\D/g, '');
-      await supabasePatch(env, 'sim_numbers?sim_id=eq.' + encodeURIComponent(String(simId)) + '&valid_to=is.null', { valid_to: now914 });
-      await fetch(`${env.SUPABASE_URL}/rest/v1/sim_numbers`, {
-        method: 'POST',
-        headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, 'Content-Type': 'application/json', Prefer: 'resolution=ignore-duplicates' },
-        body: JSON.stringify([{ sim_id: simId, e164, valid_from: now914, verification_status: 'verified', verified_at: now914 }]),
-      });
+      await sbPatch(env, 'sim_numbers?sim_id=eq.' + encodeURIComponent(String(simId)) + '&valid_to=is.null', { valid_to: now914 }, { logRows: true });
+      // raw: a non-2xx is deliberately ignored here (as before); a timeout still throws.
+      await sbPost(env, 'sim_numbers', [{ sim_id: simId, e164, valid_from: now914, verification_status: 'verified', verified_at: now914 }], { prefer: 'resolution=ignore-duplicates', raw: true });
       console.log('[RetryActivation] SIM ' + sim.iccid + ': 914 sync — recorded MDN ' + e164);
     }
     return { ok: true, vendor, already_active: true, msisdn: activateResult.msisdn || null, message: 'SIM was already active — DB synced from carrier query' };
@@ -4383,22 +4356,14 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
   if (activateResult.msisdn) updateData.msisdn = activateResult.msisdn;
   if (activateResult.ban) updateData.att_ban = activateResult.ban;
 
-  await supabasePatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), updateData);
+  await sbPatch(env, 'sims?id=eq.' + encodeURIComponent(String(simId)), updateData, { logRows: true });
   console.log('[RetryActivation] SIM ' + sim.iccid + ': set to ' + newStatus);
 
   // Insert MDN into sim_numbers
   if (activateResult.msisdn) {
     const e164 = '+1' + activateResult.msisdn;
-    const simNumRes = await fetch(`${env.SUPABASE_URL}/rest/v1/sim_numbers`, {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'resolution=ignore-duplicates',
-      },
-      body: JSON.stringify([{ sim_id: simId, e164, valid_from: now, verification_status: 'verified', verified_at: now }]),
-    });
+    // raw: a failed insert is logged below and the activation still succeeds.
+    const simNumRes = await sbPost(env, 'sim_numbers', [{ sim_id: simId, e164, valid_from: now, verification_status: 'verified', verified_at: now }], { prefer: 'resolution=ignore-duplicates', raw: true });
     if (!simNumRes.ok) {
       console.error('[RetryActivation] SIM ' + sim.iccid + ': sim_numbers insert failed: ' + await simNumRes.text());
     } else {
@@ -4424,18 +4389,8 @@ async function retryActivation(env, simId, manualGatewayId = null, manualPort = 
 // should proceed with the external rotation. p_force=true bypasses the
 // per-vendor interval guard AND the activation-day skip — reserved for manual.
 async function claimRotationSlot(env, simId, force) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/claim_rotation_slot`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ p_sim_id: simId, p_force: !!force }),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`claim_rotation_slot failed ${res.status}: ${text}`);
-  return text.trim() === 'true';
+  // A non-2xx throws (SupabaseError), as before.
+  return (await sbRpc(env, 'claim_rotation_slot', { p_sim_id: simId, p_force: !!force })) === true;
 }
 
 // Returns the current hour (0-23) in America/New_York, DST-aware.
@@ -4463,68 +4418,6 @@ function getNYMidnightISO() {
   }).formatToParts(now).find(p => p.type === 'timeZoneName')?.value ?? 'GMT-5';
   const offsetHours = -parseInt(tzPart.replace('GMT', '') || '-5');
   return new Date(`${nyDate}T${String(offsetHours).padStart(2, '0')}:00:00.000Z`).toISOString();
-}
-
-async function supabaseSelect(env, path) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "GET",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Supabase SELECT failed: ${res.status} ${JSON.stringify(json)}`);
-  return json;
-}
-
-async function supabaseSelectOne(env, path) {
-  const rows = await supabaseSelect(env, path + '&limit=1');
-  return Array.isArray(rows) ? rows[0] || null : null;
-}
-
-async function supabasePatch(env, path, bodyObj) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: "PATCH",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify(bodyObj),
-  });
-
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`Supabase PATCH failed: ${res.status} ${txt}`);
-
-  // Log what was actually updated
-  try {
-    const data = JSON.parse(txt);
-    console.log(`[DB] PATCH result: ${data.length} rows updated`);
-  } catch {}
-}
-
-async function supabaseInsert(env, table, rows) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
-    method: "POST",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify(rows),
-  });
-
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`Supabase INSERT failed: ${res.status} ${txt}`);
-
-  // Log what was actually inserted
-  try {
-    const data = JSON.parse(txt);
-    console.log(`[DB] INSERT result: ${data.length} rows inserted`);
-  } catch {}
 }
 
 // ===========================
@@ -4556,23 +4449,9 @@ async function logHelixApiCall(env, logData) {
   console.log(`[Helix API] Response: ${JSON.stringify(logData.response_body_json)}`);
 
   try {
-    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/helix_api_logs`, {
-      method: "POST",
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-        "Content-Type": "application/json",
-        Prefer: "return=minimal",
-      },
-      body: JSON.stringify(logPayload),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      console.error(`[Helix API Log] Failed to save to Supabase: ${res.status} ${errText}`);
-    } else {
-      console.log(`[Helix API Log] Saved to helix_api_logs table`);
-    }
+    // Best effort: a failure (non-2xx or timeout) is logged and swallowed below.
+    await sbPost(env, 'helix_api_logs', logPayload, { prefer: 'return=minimal' });
+    console.log(`[Helix API Log] Saved to helix_api_logs table`);
   } catch (err) {
     console.error(`[Helix API Log] Exception saving to Supabase: ${err}`);
   }
@@ -4580,31 +4459,31 @@ async function logHelixApiCall(env, logData) {
 
 async function closeCurrentNumber(env, simId) {
   console.log(`[DB] Closing current number for sim_id=${simId}`);
-  await supabasePatch(
+  await sbPatch(
     env,
     `sim_numbers?sim_id=eq.${encodeURIComponent(String(simId))}&valid_to=is.null`,
-    { valid_to: new Date().toISOString() }
+    { valid_to: new Date().toISOString() }, { logRows: true }
   );
   console.log(`[DB] Closed current number for sim_id=${simId}`);
 }
 
 async function insertNewNumber(env, simId, e164) {
   console.log(`[DB] Inserting new number ${e164} for sim_id=${simId}`);
-  await supabaseInsert(env, "sim_numbers", [
+  await sbPost(env, "sim_numbers", [
     {
       sim_id: simId,
       e164,
       valid_from: new Date().toISOString(),
       verification_status: 'verified',
     },
-  ]);
+  ], { logRows: true });
   console.log(`[DB] Inserted new number ${e164} for sim_id=${simId}`);
 }
 
 async function updateSimRotationTimestamp(env, simId) {
   const now = new Date().toISOString();
   console.log(`[DB] Updating rotation timestamp for sim_id=${simId}`);
-  await supabasePatch(
+  await sbPatch(
     env,
     `sims?id=eq.${encodeURIComponent(String(simId))}`,
     {
@@ -4614,7 +4493,7 @@ async function updateSimRotationTimestamp(env, simId) {
       last_rotation_error: null,
       rotation_fail_count: 0,
       status: 'active',
-    }
+    }, { logRows: true }
   );
   console.log(`[DB] Updated rotation timestamp for sim_id=${simId}`);
 }
@@ -4622,15 +4501,8 @@ async function updateSimRotationTimestamp(env, simId) {
 async function updateSimRotationError(env, simId, errorMessage) {
   console.log(`[DB] Recording rotation error for sim_id=${simId}`);
   const todayNY = getNYMidnightISO();
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/increment_rotation_fail`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ p_sim_id: simId, p_error: errorMessage, p_today_start: todayNY }),
-  });
+  // raw: a non-2xx only shows up as an odd count in the log below (as before).
+  const res = await sbRpc(env, 'increment_rotation_fail', { p_sim_id: simId, p_error: errorMessage, p_today_start: todayNY }, { raw: true });
   const newCount = await res.json().catch(() => null);
   if (newCount >= 5) {
     console.log(`[DB] SIM ${simId}: rotation_fail_count=${newCount} → status=rotation_failed (cap reached, no further auto attempts)`);
@@ -4642,13 +4514,8 @@ async function updateSimRotationError(env, simId, errorMessage) {
 async function findResellerIdBySimId(env, simId) {
   if (!simId) return null;
   const q = `reseller_sims?select=reseller_id&sim_id=eq.${encodeURIComponent(String(simId))}&active=eq.true&limit=1`;
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${q}`, {
-    method: "GET",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
+  // raw: a non-2xx means "not found" (null) below; a timeout still throws.
+  const res = await sbGet(env, q, { raw: true });
   if (!res.ok) return null;
   const data = await res.json();
   return Array.isArray(data) && data[0]?.reseller_id ? data[0].reseller_id : null;
@@ -4657,13 +4524,8 @@ async function findResellerIdBySimId(env, simId) {
 async function findWebhookUrlByResellerId(env, resellerId) {
   if (!resellerId) return null;
   const q = `reseller_webhooks?select=url&reseller_id=eq.${encodeURIComponent(String(resellerId))}&enabled=eq.true&limit=1`;
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${q}`, {
-    method: "GET",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
+  // raw: a non-2xx means "not found" (null) below; a timeout still throws.
+  const res = await sbGet(env, q, { raw: true });
   if (!res.ok) return null;
   const data = await res.json();
   return Array.isArray(data) && data[0]?.url ? data[0].url : null;
@@ -4700,16 +4562,8 @@ async function generateMessageIdAsync(components) {
 }
 
 async function wasWebhookDelivered(env, messageId) {
-  const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`,
-    {
-      method: 'GET',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
-  );
+  // raw: a non-2xx counts as "not delivered" below; a timeout still throws.
+  const res = await sbGet(env, `webhook_deliveries?message_id=eq.${encodeURIComponent(messageId)}&status=eq.delivered&limit=1`, { raw: true });
 
   if (!res.ok) return false;
   const data = await res.json();
@@ -4719,27 +4573,19 @@ async function wasWebhookDelivered(env, messageId) {
 async function recordWebhookDelivery(env, delivery) {
   const { messageId, eventType, resellerId, webhookUrl, payload, status, attempts, responseBody } = delivery;
 
-  await fetch(`${env.SUPABASE_URL}/rest/v1/webhook_deliveries`, {
-    method: 'POST',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: 'resolution=merge-duplicates',
-    },
-    body: JSON.stringify({
-      message_id: messageId,
-      event_type: eventType,
-      reseller_id: resellerId,
-      webhook_url: webhookUrl,
-      payload,
-      status,
-      attempts,
-      last_attempt_at: new Date().toISOString(),
-      delivered_at: status === 'delivered' ? new Date().toISOString() : null,
-      response_body: responseBody ? String(responseBody).slice(0, 2000) : null,
-    }),
-  });
+  // raw: a non-2xx is deliberately ignored (as before); a timeout still throws.
+  await sbPost(env, 'webhook_deliveries', {
+    message_id: messageId,
+    event_type: eventType,
+    reseller_id: resellerId,
+    webhook_url: webhookUrl,
+    payload,
+    status,
+    attempts,
+    last_attempt_at: new Date().toISOString(),
+    delivered_at: status === 'delivered' ? new Date().toISOString() : null,
+    response_body: responseBody ? String(responseBody).slice(0, 2000) : null,
+  }, { prefer: 'resolution=merge-duplicates', raw: true });
 }
 
 async function postWebhookWithRetry(env, url, payload, options = {}) {
@@ -4756,7 +4602,7 @@ async function postWebhookWithRetry(env, url, payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-      });
+      }, webhookFetch);
 
       lastStatus = res.status;
 
@@ -4938,7 +4784,7 @@ async function sendErrorSummaryToSlack(env) {
 
   let errors = [];
   try {
-    errors = await supabaseSelect(env, query);
+    errors = await sbGet(env, query);
   } catch (err) {
     console.error(`[Slack] Failed to fetch errors: ${err}`);
     return { ok: false, error: `Failed to fetch errors: ${err}` };
@@ -5033,7 +4879,7 @@ async function postToSlack(env, webhookUrl, payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
-    });
+    }, webhookFetch);
 
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
