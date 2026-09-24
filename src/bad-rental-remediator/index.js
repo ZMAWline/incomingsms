@@ -43,6 +43,7 @@ import {
   HEALTHY_EVIDENCE_MODE, HEALTHY_EVIDENCE_ACTION, HEALTHY_EVIDENCE_OUTCOME, HEALTHY_EVIDENCE_REASON,
 } from './healthy-evidence.mjs';
 import { sbGet, sbPatch, sbPost, SupabaseError } from '../shared/supabase-rest.mjs';
+import { legacyVendorEnabled } from '../shared/legacy-vendors.mjs';
 
 const KILL_SWITCH_KEY = 'bad_rental_remediator_enabled';
 const LAST_MAIN_TICK_KEY = 'bad_rental_remediator_last_main_tick';
@@ -2264,8 +2265,10 @@ async function gatherEvidence(env, report) {
       evidence.inboundProof = { ok: false, rows: [], error: String(err && err.message || err) };
     }
   }
-  // S5 gateway-offline probe (only if we have gateway+port).
-  if (evidence.sim && evidence.sim.gateway_id && evidence.sim.port && env.SKYLINE_GATEWAY) {
+  // S5 gateway-offline probe (only if we have gateway+port). Skipped while the
+  // SkyLine legacy vendor is switched off: treated as "no SkyLine data".
+  if (evidence.sim && evidence.sim.gateway_id && evidence.sim.port && env.SKYLINE_GATEWAY
+      && legacyVendorEnabled(env, 'skyline')) {
     try {
       const portStatus = await skylinePortStatus(env, evidence.sim.gateway_id, evidence.sim.port);
       if (portStatus && portStatus.offline) evidence.gatewayOffline = true;

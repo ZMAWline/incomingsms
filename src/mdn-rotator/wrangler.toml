@@ -52,6 +52,9 @@ service = "skyline-gateway"
 enabled = true
 invocation_logs = true
 
+[vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "mdn-rotator-test"
@@ -85,3 +88,6 @@ service = "skyline-gateway-test"
 [env.test.observability.logs]
 enabled = true
 invocation_logs = true
+
+[env.test.vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy

@@ -13,6 +13,7 @@ crons = ["0 */12 * * *", "* * * * *"]
 # (zmaw_live_… vs zmaw_test_…), so a key is self-identifying and a TEST key
 # pasted at PROD is a format mismatch rather than a puzzling 401.
 [vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
 WING_EXPECTED_RATE = "5.00"
 DASHBOARD_ENV = "live"
 
@@ -86,6 +87,7 @@ name = "dashboard-test"
 crons = []
 
 [env.test.vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
 WING_EXPECTED_RATE = "5.00"
 DASHBOARD_ENV = "test"
 

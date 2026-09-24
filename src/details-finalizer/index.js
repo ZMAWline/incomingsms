@@ -24,6 +24,7 @@ import { createAtomicPortinPoller } from './atomic-portin-poller.mjs';
 import { isMissedDueNightly, isTeltikDue, isDeliveryGap, inNightlyRotationWindow } from '../shared/rotation-baseline.mjs';
 import { carrierFetch, fetchWithTimeout, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPost, sbPatch, sbRpc } from '../shared/supabase-rest.mjs';
+import { legacyVendorEnabled, legacyVendorDisabledResponse, assertLegacyVendorEnabled } from '../shared/legacy-vendors.mjs';
 
 const TELTIK_BASE = 'https://api.smsgateway.xyz';
 
@@ -35,6 +36,7 @@ export default {
       if (!env.FINALIZER_RUN_SECRET || secret !== env.FINALIZER_RUN_SECRET) {
         return new Response('Unauthorized', { status: 401 });
       }
+      if (!legacyVendorEnabled(env, 'wing')) return legacyVendorDisabledResponse('wing', 'details-finalizer');
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 200);
       const offset = parseInt(url.searchParams.get('offset') || '0', 10) || 0;
       const result = await runWingIotCleanupSweep(env, { limit, offset });
@@ -182,6 +184,9 @@ export default {
 /* ── Helix finalizer ──────────────────────────────────────────────────────── */
 
 async function runHelixFinalizer(env, limit) {
+  if (!legacyVendorEnabled(env, 'helix')) {
+    return { processed: 0, activated: 0, message: 'legacy vendor helix disabled' };
+  }
   if (env.HELIX_ENABLED !== 'true') {
     return { processed: 0, activated: 0, message: 'helix_disabled' };
   }
@@ -251,6 +256,9 @@ async function runHelixFinalizer(env, limit) {
 /* ── Wing IoT finalizer ───────────────────────────────────────────────────── */
 
 async function runWingIotFinalizer(env, limit) {
+  if (!legacyVendorEnabled(env, 'wing')) {
+    return { processed: 0, synced: 0, message: 'legacy vendor wing disabled' };
+  }
   if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
     return { processed: 0, synced: 0, message: 'wing_iot_credentials_missing' };
   }
@@ -363,6 +371,9 @@ async function runWingIotFinalizer(env, limit) {
 // CF Worker wall-clock budget.
 
 async function runWingIotCleanupSweep(env, { limit = 50, offset = 0 }) {
+  if (!legacyVendorEnabled(env, 'wing')) {
+    return { ok: false, reason: 'legacy_vendor_disabled', vendor: 'wing' };
+  }
   if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
     return { ok: false, error: 'wing_iot_credentials_missing' };
   }
@@ -575,7 +586,10 @@ async function runReconciliationSweep(env, { trigger, dryRun }) {
   const DIALABLE_PLAN = 'Wing Tel Inc - NON ABIR SMS MO/MT US';
   const aActions = { synced: 0, marked_failed: 0, errors: 0, webhooks: 0, skipped_no_creds: 0 };
 
-  if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
+  if (!legacyVendorEnabled(env, 'wing')) {
+    aActions.skipped_legacy_disabled = bucketA.length;
+    log('Bucket A skipped — legacy vendor wing disabled');
+  } else if (!env.WING_IOT_USERNAME || !env.WING_IOT_API_KEY) {
     aActions.skipped_no_creds = bucketA.length;
     log('Bucket A skipped — wing_iot credentials missing');
   } else {
@@ -2463,6 +2477,7 @@ function relayFetch(env, url, init, send = carrierFetch) {
 /* ── Helix ────────────────────────────────────────────────────────────────── */
 
 async function hxGetBearerToken(env) {
+  assertLegacyVendorEnabled(env, 'helix');
   const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

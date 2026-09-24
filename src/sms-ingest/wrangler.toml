@@ -8,6 +8,9 @@ workers_dev = true
 enabled = true
 invocation_logs = true
 
+[vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "sms-ingest-test"
@@ -25,3 +28,6 @@ service = "mdn-rotator"
 [[env.test.services]]
 binding = "MDN_ROTATOR"
 service = "mdn-rotator"
+
+[env.test.vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy

@@ -17,6 +17,7 @@ import { renderLoginPage, renderAcceptInvitePage } from '../src/dashboard/auth-p
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from '../src/dashboard/api-keys.mjs';
 import { handleAuditLogQuery } from '../src/dashboard/audit-log.mjs';
 import { handleSavedFilterRoutes } from '../src/dashboard/saved-filters.mjs';
+import { legacyRouteResponse } from '../src/dashboard/legacy-routes.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -43,7 +44,7 @@ function makeDispatcher() {
     canAccess, requiredRole, apiKeyMayAccess, resolveUser, breakGlassUser, handleAuthRoutes,
     renderLoginPage, renderAcceptInvitePage,
     resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes, handleAuditLogQuery,
-    handleSavedFilterRoutes, corsHeadersFor,
+    handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse,
     async fetch() {
       return new Response('[]', { status: 200, headers: { 'content-range': '0-0/0' } });
     },

@@ -5,6 +5,7 @@ import { ensureTeltikAlias, summarizeAliasResult } from '../shared/teltik-alias.
 import { carrierFetch, supabaseFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPost, sbPatch, sbDelete } from '../shared/supabase-rest.mjs';
 import { buildPortinOutcomeRow, recordPortinOutcomeRow } from '../shared/atomic-portin-outcomes.mjs';
+import { disabledLegacyVendorOfSim, legacyVendorDisabledResult, assertLegacyVendorEnabled } from '../shared/legacy-vendors.mjs';
 
 // =========================================================
 // SIM ACTIVATOR WORKER
@@ -101,6 +102,7 @@ export default {
         port_old_first_name: iPortOldFirstName >= 0 ? String(r[iPortOldFirstName] || '').trim() : '',
         port_old_last_name: iPortOldLastName >= 0 ? String(r[iPortOldLastName] || '').trim() : '',
       }, { defaultVendor: 'atomic' });
+      rejectDisabledLegacyVendor(env, checked);
       if (!checked.ok) {
         validationErrors++;
         rowErrors.push(...checked.errors);
@@ -153,7 +155,8 @@ export default {
   async queue(batch, env) {
     // Pre-fetch Helix token only if we have helix SIMs in batch
     let helixToken = null;
-    const hasHelix = env.HELIX_ENABLED === 'true' && batch.messages.some(m => m.body.vendor === 'helix');
+    const hasHelix = env.HELIX_ENABLED === 'true' && !disabledLegacyVendorOfSim(env, 'helix')
+      && batch.messages.some(m => m.body.vendor === 'helix');
     if (hasHelix) {
       try {
         helixToken = await hxGetBearerToken(env);
@@ -223,6 +226,21 @@ export default {
           console.log(`[Activator] ${iccid}: already activated (status=${existingSim.status}) — skipping`);
           if (jobRunId) {
             await updateJobItemStatus(env, jobRunId, iccid, 'skipped', { finished_at: new Date().toISOString(), error_message: 'Already activated' });
+          }
+          msg.ack();
+          continue;
+        }
+
+        // Helix / Wing IoT are legacy vendors: while switched off, never call out.
+        const offVendor = disabledLegacyVendorOfSim(env, vendor);
+        if (offVendor) {
+          const disabled = { iccid, ...legacyVendorDisabledResult(offVendor) };
+          console.log(`[Activator] ${iccid}: legacy vendor ${offVendor} disabled — not activated ${JSON.stringify(disabled)}`);
+          if (jobRunId) {
+            await updateJobItemStatus(env, jobRunId, iccid, 'failed', {
+              finished_at: new Date().toISOString(),
+              error_message: `legacy vendor ${offVendor} disabled`,
+            }).catch(err => console.error(`[Activator] ${iccid}: failed status write failed: ${err}`));
           }
           msg.ack();
           continue;
@@ -332,6 +350,7 @@ async function handleActivateJson(request, env) {
 
   for (let i = 0; i < sims.length; i++) {
     const checked = validateActivationSim(sims[i], { rowNumber: i + 1, defaultVendor, resellerId, addresses });
+    rejectDisabledLegacyVendor(env, checked, `Row ${i + 1}: `);
     if (!checked.ok) {
       validationErrors++;
       rowErrors.push(...checked.errors);
@@ -1122,7 +1141,17 @@ function mapPortFields(options) {
   };
 }
 
+// Validation for a row whose vendor is a switched-off legacy vendor (Helix / Wing IoT):
+// marks it invalid so it is never queued.
+function rejectDisabledLegacyVendor(env, checked, prefix = '') {
+  const offVendor = checked.ok ? disabledLegacyVendorOfSim(env, checked.sim.vendor) : null;
+  if (!offVendor) return;
+  checked.ok = false;
+  checked.errors = [...(checked.errors || []), `${prefix}legacy vendor ${offVendor} disabled (set LEGACY_VENDORS in bulk-activator wrangler.toml [vars])`];
+}
+
 async function activateViaWingIot(env, iccid, runId) {
+  assertLegacyVendorEnabled(env, 'wing');
   // Wing IoT activation - PUT with dialable plan
   const baseUrl = env.WING_IOT_BASE_URL || 'https://restapi19.att.com/rws/api';
   const url = `${baseUrl}/v1/devices/${iccid}`;
@@ -1182,6 +1211,7 @@ async function activateViaHelix(env, token, iccid, imei, runId) {
 /* ── Helix ─────────────────────────────────────────────────────────────────── */
 
 async function hxGetBearerToken(env) {
+  assertLegacyVendorEnabled(env, 'helix');
   const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

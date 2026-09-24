@@ -1,6 +1,7 @@
 import { carrierFetch, supabaseFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPatch } from '../shared/supabase-rest.mjs';
 import { buildNumberEvent } from '../shared/number-event.mjs';
+import { legacyVendorEnabled, disabledLegacyVendorOfSim, legacyVendorDisabledResult, assertLegacyVendorEnabled } from '../shared/legacy-vendors.mjs';
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -33,7 +34,7 @@ export default {
 
       // Get Helix bearer token (only if Helix is enabled)
       let token = null;
-      if (env.HELIX_ENABLED === 'true') {
+      if (env.HELIX_ENABLED === 'true' && legacyVendorEnabled(env, 'helix')) {
         token = await hxGetBearerToken(env);
       }
 
@@ -73,6 +74,15 @@ export default {
               skipped: true,
               reason: "Already cancelled"
             });
+            continue;
+          }
+
+          // Helix / Wing IoT are legacy vendors: while switched off, never call out.
+          const offVendor = disabledLegacyVendorOfSim(env, vendor);
+          if (offVendor) {
+            console.log(`[Cancel] ${iccid}: legacy vendor ${offVendor} disabled — not cancelled`);
+            errors++;
+            results.push({ iccid, ...legacyVendorDisabledResult(offVendor) });
             continue;
           }
 
@@ -287,6 +297,7 @@ async function atomicCancelSubscription(env, msisdn, iccid) {
 /* ================= HELIX API ================= */
 
 async function hxGetBearerToken(env) {
+  assertLegacyVendorEnabled(env, 'helix');
   const res = await relayFetch(env, env.HX_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -39,6 +39,9 @@ service = "mdn-rotator"
 binding = "TELTIK_WORKER"
 service = "teltik-worker"
 
+[vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
+
 # ============ TEST ENVIRONMENT ============
 [env.test]
 name = "details-finalizer-test"
@@ -62,3 +65,6 @@ service = "teltik-worker-test"
 [env.test.observability.logs]
 enabled = true
 invocation_logs = true
+
+[env.test.vars]
+# LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy

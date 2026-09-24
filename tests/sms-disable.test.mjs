@@ -112,6 +112,7 @@ test('verify send path stays intact behind the switch (env override sends nonce)
     },
     SKYLINE_SECRET: 's3cret',
     SMS_SENDING_ENABLED: 'true',
+    LEGACY_VENDORS: 'all', // the nonce goes out through SkyLine, a legacy vendor
     SUPABASE_URL: 'https://example.supabase.co',
     SUPABASE_SERVICE_ROLE_KEY: 'fake',
   };
