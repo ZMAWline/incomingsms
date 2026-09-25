@@ -42,6 +42,8 @@
   - sim-status-changer: `0d0c9bb3-6f40-4d42-b16e-37b603a21d17` (200 → 200)
   - sms-ingest: `df09128c-fde5-4f57-954a-f72a287cb675` (405 → 405)
   - Deploy ran 16:06–16:10 UTC, outside the mdn-rotator window (04:00–14:59 UTC), so details-finalizer was tailed instead (16:09:58–16:16:38): 2 cron ticks, both `ok`, 0 exceptions, 0 `Token failed` lines. **Open check:** the first mdn-rotator tick after 04:00 UTC 2026-09-25 should show one `legacy vendor helix disabled` line and no `Token failed: 429`.
+  - **Check closed 2026-09-25 (Workers observability query, mdn-rotator, 04:00–13:57 UTC):** 107 `legacy vendor helix disabled` lines (one per 5-min tick in the NY 00:00–08:59 rotation window) and **0 `Token failed` lines**. The Helix 429 noise is gone. Note: the rotation window is NY 00:00–08:59 (04:00–12:59 UTC in EDT); ticks after that log `outside NY rotation window` and never reach the helix check.
+  - **Unexplained redeploys (not from main, not from this session):** mdn-rotator was deployed again at 2026-09-24 16:15 and 16:29 UTC and 2026-09-25 12:33 UTC (live `359e8068`); details-finalizer (`8b365a67`) and bulk-activator (`8486822d`) at 2026-09-25 12:33–12:34 UTC. All by wrangler under the owner's account; no src commit on any branch since `3e264a3`. The live code of all three still contains the LEGACY_VENDORS gate, so nothing was reverted. Worth finding which session or job deploys at ~12:33 UTC (the daily rotation review runs around then).
   - `deployed/prod` 77d4a90 → 3e264a3. Migrations: none.
 
 ---
