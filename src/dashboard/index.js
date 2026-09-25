@@ -20,6 +20,7 @@ import { handlePortinOutcomes, loadLatestPortinOutcomes } from './portin-outcome
 import { parseSimsPageRequest, filterParam, orderParam, parseContentRangeTotal, matchesDerivedFilter, sortByDerived } from './sims-query.mjs';
 import { legacyRouteResponse } from './legacy-routes.mjs';
 import { handleBulkJobRoutes, consumeBulkJobBatch } from './bulk-jobs.mjs';
+import { handleRunsList } from './runs.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -165,6 +166,11 @@ async function handleDashboardRequest(request, env, ctx, audit, asUser) {
     const bulkJobResponse = await handleBulkJobRoutes(request, env, url, user, corsHeaders);
     if (bulkJobResponse) return bulkJobResponse;
 
+    // Runs page: activation runs and bulk jobs in one list. See runs.mjs.
+    if (url.pathname === '/api/runs' && request.method === 'GET') {
+      return handleRunsList(url, env, corsHeaders);
+    }
+
     // Who did what. Operator+ by the path-first matrix (not a READ_ROUTE).
     if (url.pathname === '/api/audit-log' && request.method === 'GET') {
       return handleAuditLogQuery(env, url, corsHeaders);
@@ -258,11 +264,8 @@ async function handleDashboardRequest(request, env, ctx, audit, asUser) {
       return handleActivateSims(request, env, corsHeaders);
     }
 
-    // Activation Runs / Jobs tracking
-    if (url.pathname === '/api/activation-runs' && request.method === 'GET') {
-      return handleActivationRunsList(env, corsHeaders, url);
-    }
-
+    // Activation run detail + retry. The list lives at /api/runs (runs.mjs),
+    // together with bulk jobs.
     if (url.pathname === '/api/activation-runs' && request.method === 'POST') {
       return handleActivationRunRetry(request, env, corsHeaders);
     }
@@ -3516,8 +3519,6 @@ function parsePositiveInt(value) {
 // Allowed values, copied from the table CHECK constraints.
 const SIM_STATUSES = ['pending', 'provisioning', 'active', 'suspended', 'canceled', 'error', 'data_mismatch', 'helix_timeout', 'rotation_failed'];
 const SYSTEM_ERROR_STATUSES = ['open', 'acknowledged', 'resolved'];
-const ACTIVATION_RUN_STATUSES = ['queued', 'processing', 'done', 'failed', 'cancelled'];
-const ACTIVATION_RUN_SOURCES = ['csv', 'json', 'dashboard'];
 const ACTIVATION_ITEM_STATUSES = ['pending', 'queued', 'processing', 'done', 'failed', 'retry_needed', 'skipped'];
 const LEDGER_VENDORS = ['wing_iot', 'atomic', 'helix', 'teltik'];
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -10105,50 +10106,6 @@ async function handleGatewayStatus(request, env) {
 }
 
 /* ── Activation Runs / Jobs API ───────────────────────────────────────────── */
-
-async function handleActivationRunsList(env, corsHeaders, url) {
-  try {
-    const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50', 10), 1), 200);
-    const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10), 0);
-    const status = url.searchParams.get('status');
-    const source = url.searchParams.get('source');
-    if (status && !ACTIVATION_RUN_STATUSES.includes(status)) {
-      return badRequest(corsHeaders, 'Invalid status. Valid: ' + ACTIVATION_RUN_STATUSES.join(', '));
-    }
-    if (source && !ACTIVATION_RUN_SOURCES.includes(source)) {
-      return badRequest(corsHeaders, 'Invalid source. Valid: ' + ACTIVATION_RUN_SOURCES.join(', '));
-    }
-
-    let query = 'activation_runs?select=*&order=created_at.desc&limit=' + limit + '&offset=' + offset;
-    const filters = [];
-    if (status) filters.push('status=eq.' + status);
-    if (source) filters.push('source=eq.' + source);
-    if (filters.length) query += '&' + filters.join('&');
-
-    // Prefer: count=exact returns the full filtered row count on the same
-    // response (via Content-Range) instead of a second round-trip query.
-    const resp = await supabaseGet(env, query, { Prefer: 'count=exact' });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => '');
-      console.error('activation-runs list: Supabase query failed', resp.status, body);
-      return new Response(JSON.stringify({ error: `Supabase query failed (${resp.status})`, detail: body }), {
-        status: 502,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-    const runs = await resp.json();
-    const totalCount = resp.headers?.get?.('content-range')?.split('/').pop() || runs.length;
-
-    return new Response(JSON.stringify({ runs, total: parseInt(totalCount, 10), limit, offset }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  }
-}
 
 async function handleActivationRunDetail(env, corsHeaders, runId, url) {
   try {

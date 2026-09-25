@@ -18,6 +18,7 @@ import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from '../src/d
 import { handleAuditLogQuery } from '../src/dashboard/audit-log.mjs';
 import { handleSavedFilterRoutes } from '../src/dashboard/saved-filters.mjs';
 import { handleBulkJobRoutes } from '../src/dashboard/bulk-jobs.mjs';
+import { handleRunsList } from '../src/dashboard/runs.mjs';
 import { legacyRouteResponse } from '../src/dashboard/legacy-routes.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -45,7 +46,7 @@ function makeDispatcher() {
     canAccess, requiredRole, apiKeyMayAccess, resolveUser, breakGlassUser, handleAuthRoutes,
     renderLoginPage, renderAcceptInvitePage,
     resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes, handleAuditLogQuery,
-    handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse, handleBulkJobRoutes,
+    handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse, handleBulkJobRoutes, handleRunsList,
     async fetch() {
       return new Response('[]', { status: 200, headers: { 'content-range': '0-0/0' } });
     },
@@ -57,9 +58,10 @@ function makeDispatcher() {
     },
   };
   vm.createContext(sandbox);
+  // runs.mjs is a real module, so it reaches Supabase through the global fetch.
+  globalThis.fetch = sandbox.fetch;
   const code = [
     extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
-    extractFn(SRC, 'async function handleActivationRunsList(env, corsHeaders, url) {'),
     extractFn(SRC, 'async function handleDashboardRequest(request, env, ctx, audit, asUser) {')
       .replace(/^async function handleDashboardRequest\(/, 'async function dispatch('),
   ].join('\n\n');
@@ -102,27 +104,27 @@ test('rejected origins: foreign, look-alikes, http, other workers, missing', () 
 
 test('real handler: allowed origin is echoed on an API response', async () => {
   const dispatch = makeDispatcher();
-  const res = await dispatch(authed('/api/activation-runs?limit=5', { origin: TEST }));
+  const res = await dispatch(authed('/api/runs?limit=5', { origin: TEST }));
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), TEST);
 });
 
 test('real handler: preview origin is echoed', async () => {
   const dispatch = makeDispatcher();
-  const res = await dispatch(authed('/api/activation-runs', { origin: PREVIEW }));
+  const res = await dispatch(authed('/api/runs', { origin: PREVIEW }));
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), PREVIEW);
 });
 
 test('real handler: foreign origin gets no Allow-Origin header', async () => {
   const dispatch = makeDispatcher();
-  const res = await dispatch(authed('/api/activation-runs', { origin: 'https://evil.example' }));
+  const res = await dispatch(authed('/api/runs', { origin: 'https://evil.example' }));
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), null);
 });
 
 test('real handler: same-origin / non-browser call (no Origin) still works, no header', async () => {
   const dispatch = makeDispatcher();
-  const res = await dispatch(authed('/api/activation-runs'));
+  const res = await dispatch(authed('/api/runs'));
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), null);
 });

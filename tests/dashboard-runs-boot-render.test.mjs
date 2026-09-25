@@ -1,3 +1,7 @@
+// 2026-09-25: the Activation Runs page became the Runs page (/runs, loadRuns,
+// runsPage), listing activation runs and bulk jobs together. The history below
+// predates the rename; the same boot-order rules apply to the new names.
+//
 // Regression tests for a real live bug found on dashboard-test.zalmen-531.workers.dev:
 // direct/deep-link navigation to /activation-runs rendered the table header
 // with zero rows even though GET /api/activation-runs?limit=5 returned a
@@ -58,18 +62,18 @@ const HTML = fs.readFileSync(HTML_PATH, 'utf8');
 //    boot, or a deep-link load re-triggers the temporal-dead-zone crash.
 // ---------------------------------------------------------------------
 
-test('activation-runs tab state is declared before switchTab and before the boot dispatch that can call it', () => {
-  const declIdx = HTML.indexOf('let activationRunsPage = 0;');
+test('runs tab state is declared before switchTab and before the boot dispatch that can call it', () => {
+  const declIdx = HTML.indexOf('let runsPage = 0;');
   const switchTabIdx = HTML.indexOf('function switchTab(tabName');
   const bootCallIdx = HTML.lastIndexOf('initTabFromUrl();');
 
-  assert.notEqual(declIdx, -1, 'activationRunsPage declaration not found');
+  assert.notEqual(declIdx, -1, 'runsPage declaration not found');
   assert.notEqual(switchTabIdx, -1, 'switchTab definition not found');
   assert.notEqual(bootCallIdx, -1, 'initTabFromUrl() boot call not found');
 
   assert.ok(
     declIdx < switchTabIdx,
-    'activationRunsPage must be declared before switchTab is defined — switchTab assigns it on its activation-runs branch'
+    'runsPage must be declared before switchTab is defined — switchTab assigns it on its runs branch'
   );
   assert.ok(
     switchTabIdx < bootCallIdx,
@@ -77,13 +81,13 @@ test('activation-runs tab state is declared before switchTab and before the boot
   );
 });
 
-test('no bare fmt(...) date-formatter call remains in the activation-runs renderers (fmt is only ever locally scoped elsewhere in this file)', () => {
-  const s = HTML.indexOf('async function loadActivationRuns(');
+test('no bare fmt(...) date-formatter call remains in the runs renderers (fmt is only ever locally scoped elsewhere in this file)', () => {
+  const s = HTML.indexOf('async function loadRuns(');
   const e = HTML.indexOf('async function loadActivationRunItems(');
   assert.notEqual(s, -1);
   assert.notEqual(e, -1);
   const listSrc = HTML.slice(s, e);
-  assert.ok(!/[^.\w]fmt\(/.test(listSrc), 'loadActivationRuns must not call an undeclared global fmt()');
+  assert.ok(!/[^.\w]fmt\(/.test(listSrc), 'loadRuns must not call an undeclared global fmt()');
 });
 
 // ---------------------------------------------------------------------
@@ -211,36 +215,36 @@ async function bootDashboard(pathname, fetchRoutes) {
   }
 
   // Flush the fire-and-forget async chains kicked off during boot
-  // (loadData(), and switchTab's autoLoad dispatch to loadActivationRuns()).
+  // (loadData(), and switchTab's autoLoad dispatch to loadRuns()).
   for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
 
   return { sandbox, elementCache, syncThrow };
 }
 
 const LIVE_RUNS = [
-  { id: '406036eb-4df0-4a1f-9f88-68a74c174919', status: 'failed', source: 'json', created_at: '2026-08-24T12:00:00Z', total_items: 1, failed_items: 1 },
-  { id: 'b11b2839-69aa-4b94-8d81-07c1b99fb113', status: 'failed', source: 'json', created_at: '2026-08-24T12:01:00Z', total_items: 1, failed_items: 1 },
-  { id: 'a48b19eb-3989-4aee-b7db-5a53d7730b08', status: 'failed', source: 'json', created_at: '2026-08-24T12:02:00Z', total_items: 1, failed_items: 1 },
+  { id: '406036eb-4df0-4a1f-9f88-68a74c174919', run_type: 'activation', title: 'Activation', status: 'failed', source: 'json', created_at: '2026-08-24T12:00:00Z', total_items: 1, failed_items: 1 },
+  { id: 'b11b2839-69aa-4b94-8d81-07c1b99fb113', run_type: 'activation', title: 'Activation', status: 'failed', source: 'json', created_at: '2026-08-24T12:01:00Z', total_items: 1, failed_items: 1 },
+  { id: 'a48b19eb-3989-4aee-b7db-5a53d7730b08', run_type: 'bulk', title: 'Bulk rotate — 1 SIMs', status: 'failed', source: 'dashboard', created_at: '2026-08-24T12:02:00Z', total_items: 1, failed_items: 1 },
 ];
 
 function standardRoutes({ simsFail } = {}) {
   return [
-    ['/api/activation-runs', () => new Response(JSON.stringify({ runs: LIVE_RUNS, total: LIVE_RUNS.length, limit: 5, offset: 0 }), { status: 200 })],
+    ['/api/runs', () => new Response(JSON.stringify({ ok: true, runs: LIVE_RUNS, total: LIVE_RUNS.length }), { status: 200 })],
     ['/api/sims', () => (simsFail ? new Response('Internal Server Error', { status: 500 }) : new Response('[]', { status: 200 }))],
     ['/api/stats', () => new Response(JSON.stringify({ total_sims: 10, active_sims: 8, provisioning_sims: 1, messages_24h: 5 }), { status: 200 })],
     ['/api/messages', () => new Response('[]', { status: 200 })],
   ];
 }
 
-test('a direct load of /activation-runs boots without a synchronous throw', async () => {
-  const { syncThrow } = await bootDashboard('/activation-runs', standardRoutes());
+test('a direct load of /runs boots without a synchronous throw', async () => {
+  const { syncThrow } = await bootDashboard('/runs', standardRoutes());
   assert.equal(syncThrow, null, 'boot script must not throw synchronously: ' + (syncThrow && syncThrow.stack));
 });
 
-test('a direct load of /activation-runs renders all 3 rows returned by the live API shape', async () => {
-  const { elementCache } = await bootDashboard('/activation-runs', standardRoutes());
-  const tbody = elementCache.get('activation-runs-tbody');
-  assert.notEqual(tbody, undefined, 'loadActivationRuns must have touched #activation-runs-tbody');
+test('a direct load of /runs renders all 3 rows returned by the live API shape', async () => {
+  const { elementCache } = await bootDashboard('/runs', standardRoutes());
+  const tbody = elementCache.get('runs-tbody');
+  assert.notEqual(tbody, undefined, 'loadRuns must have touched #runs-tbody');
 
   for (const run of LIVE_RUNS) {
     assert.ok(tbody.innerHTML.includes(run.id), `row for run ${run.id} must be rendered`);
@@ -248,21 +252,21 @@ test('a direct load of /activation-runs renders all 3 rows returned by the live 
   assert.equal((tbody.innerHTML.match(/<tr/g) || []).length, 3, 'exactly 3 rows rendered, matching total:3 from the API');
   assert.ok(!tbody.innerHTML.includes('ReferenceError'), 'no ReferenceError (e.g. from an undeclared fmt()) leaked into the rendered rows');
 
-  const countEl = elementCache.get('activation-runs-count');
+  const countEl = elementCache.get('runs-count');
   assert.equal(countEl.textContent, 'Showing 3 of 3 (page 1)');
 });
 
-test('a failing /api/sims does not block Activation Runs from rendering its rows', async () => {
-  const { elementCache } = await bootDashboard('/activation-runs', standardRoutes({ simsFail: true }));
-  const tbody = elementCache.get('activation-runs-tbody');
+test('a failing /api/sims does not block Runs from rendering its rows', async () => {
+  const { elementCache } = await bootDashboard('/runs', standardRoutes({ simsFail: true }));
+  const tbody = elementCache.get('runs-tbody');
 
   for (const run of LIVE_RUNS) {
-    assert.ok(tbody.innerHTML.includes(run.id), `Activation Runs must still render run ${run.id} even though /api/sims failed`);
+    assert.ok(tbody.innerHTML.includes(run.id), `Runs must still render run ${run.id} even though /api/sims failed`);
   }
   assert.equal((tbody.innerHTML.match(/<tr/g) || []).length, 3);
 });
 
-test('landing on the dashboard tab (not activation-runs) never touches the activation-runs tbody', async () => {
+test('landing on the dashboard tab (not runs) never touches the runs tbody', async () => {
   const { elementCache } = await bootDashboard('/', standardRoutes());
-  assert.equal(elementCache.has('activation-runs-tbody'), false, 'loadActivationRuns must only run for the activation-runs tab');
+  assert.equal(elementCache.has('runs-tbody'), false, 'loadRuns must only run for the runs tab');
 });

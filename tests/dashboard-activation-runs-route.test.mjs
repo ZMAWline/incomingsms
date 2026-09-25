@@ -12,7 +12,7 @@
 //    `job_run_id` (the actual activation_runs.id) — only job_run_id can be
 //    used to open the run detail view.
 //
-// Section 4 below covers a follow-up round: handleActivationRunsList and
+// Section 4 below covers a follow-up round: the old activation-runs list and
 // handleActivationRunDetail each issued a redundant second Supabase query
 // just to get a row count, doubling the latency of every list/detail load
 // (part of the "portal is super slow" report); they now use the
@@ -72,10 +72,10 @@ function loadRouteTables() {
   };
 }
 
-test('Activation Runs has a dedicated route registered both ways', () => {
+test('Runs has a dedicated route registered both ways', () => {
   const { TAB_ROUTES, ROUTE_TO_TAB } = loadRouteTables();
-  assert.equal(TAB_ROUTES['activation-runs'], '/activation-runs');
-  assert.equal(ROUTE_TO_TAB['/activation-runs'], 'activation-runs');
+  assert.equal(TAB_ROUTES.runs, '/runs');
+  assert.equal(ROUTE_TO_TAB['/runs'], 'runs');
 });
 
 test('every tab in TAB_ROUTES has a matching tab-content element in the page', () => {
@@ -114,75 +114,12 @@ test('activateSims opens the created run via job_run_id (not run_id) on success'
   );
 });
 
-test('the activation-runs source filter has no dead "dashboard" option', () => {
-  // Backend only ever inserts source 'csv' or 'json' (see createActivationRun
-  // callers in src/bulk-activator/index.js); a source="dashboard" <option>
-  // can never match a row and silently hides every run while selected.
-  const start = HTML.indexOf('id="ar-filter-source"');
-  assert.notEqual(start, -1, 'source filter select not found');
-  const end = HTML.indexOf('</select>', start);
-  const block = HTML.slice(start, end);
-  assert.ok(!/value="dashboard"/.test(block), 'source filter should not offer a value that never matches stored data');
-});
-
 // ---------------------------------------------------------------------
-// 3. Default list filters don't hide newly created runs
+// 3. The list moved to GET /api/runs (activation runs + bulk jobs); its
+//    filter, ordering and error tests live in tests/dashboard-runs-api.test.mjs.
 // ---------------------------------------------------------------------
-
-function makeSandbox(routes) {
-  const calls = [];
-  const sandbox = {
-    console, Response, URL, URLSearchParams,
-    async fetch(url, init) {
-      const u = String(url);
-      calls.push({ url: u, headers: (init && init.headers) || {} });
-      for (const [pattern, handler] of routes) {
-        if (u.includes(pattern)) return handler(u);
-      }
-      return new Response('[]', { status: 200 });
-    },
-  };
-  vm.createContext(sandbox);
-  const code = [
-    extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
-    extractFn(SRC, 'async function handleActivationRunsList(env, corsHeaders, url) {'),
-  ].join('\n\n');
-  vm.runInContext(code, sandbox);
-  return { sandbox, calls };
-}
 
 const ENV = { SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'srv' };
-
-test('activation-runs list applies no status/source filter when none is requested', async () => {
-  const freshRun = { id: 'new-run-uuid', source: 'json', status: 'queued', created_at: '2026-08-24T12:00:00Z' };
-  const { sandbox, calls } = makeSandbox([
-    ['/activation_runs', () => new Response(JSON.stringify([freshRun]), {
-      status: 200,
-      headers: { 'content-range': '0-0/1' },
-    })],
-  ]);
-
-  const url = new sandbox.URL('https://dashboard.test/api/activation-runs');
-  const res = await sandbox.handleActivationRunsList(ENV, {}, url);
-  const body = await res.json();
-
-  assert.deepEqual(body.runs, [freshRun], 'a run with no explicit filter selection is returned');
-  assert.equal(body.total, 1, 'total count is read from the single request\'s Content-Range header');
-  assert.equal(calls.length, 1, 'the list and its count come from one round-trip, not two');
-  assert.ok(calls[0].url.includes('/activation_runs?select=*'), 'base query issued');
-  assert.equal(calls[0].headers.Prefer, 'count=exact', 'count is requested via the Prefer header, not a second query');
-  assert.ok(!calls[0].url.includes('status=eq.'), 'no status filter applied when status is unset');
-  assert.ok(!calls[0].url.includes('source=eq.'), 'no source filter applied when source is unset');
-});
-
-test('activation-runs list orders newest-first so a just-submitted run is on page one', async () => {
-  const { sandbox, calls } = makeSandbox([
-    ['/activation_runs', () => new Response('[]', { status: 200, headers: { 'content-range': '0-0/0' } })],
-  ]);
-  const url = new sandbox.URL('https://dashboard.test/api/activation-runs');
-  await sandbox.handleActivationRunsList(ENV, {}, url);
-  assert.ok(calls.some(c => c.url.includes('order=created_at.desc')), 'newest runs sort first');
-});
 
 // ---------------------------------------------------------------------
 // 4. Run detail can be opened by id right after submit (the other half of
@@ -257,20 +194,6 @@ test('an unknown run id returns 404 instead of a silent empty page', async () =>
 //    there were zero runs, with no indication anything had gone wrong.
 // ---------------------------------------------------------------------
 
-test('activation-runs list returns a visible error, not an empty runs array, when Supabase query fails', async () => {
-  const { sandbox, calls } = makeSandbox([
-    ['/activation_runs', () => new Response('{"message":"relation \\"public.activation_runs\\" does not exist"}', { status: 404 })],
-  ]);
-  const url = new sandbox.URL('https://dashboard.test/api/activation-runs');
-  const res = await sandbox.handleActivationRunsList(ENV, {}, url);
-  const body = await res.json();
-
-  assert.equal(res.status, 502, 'a failed upstream query is reported as an error, not 200 with an empty list');
-  assert.ok(body.error, 'error field is present so the frontend can distinguish this from a genuine empty result');
-  assert.equal(body.runs, undefined, 'no runs array is fabricated on failure');
-  assert.equal(calls.length, 1);
-});
-
 test('activation-run detail returns a visible error when the run query fails', async () => {
   const { sandbox } = makeDetailSandbox([
     ['/activation_runs?select=*&id=eq.run-1', () => new Response('{"message":"upstream error"}', { status: 500 })],
@@ -304,34 +227,33 @@ test('activation-run detail returns a visible error when the items query fails',
 //    when the API reports a failure.
 // ---------------------------------------------------------------------
 
-test('loadActivationRuns shows a visible error banner, not the empty-state message, on API failure', async () => {
+test('loadRuns shows a visible error banner, not the empty-state message, on API failure', async () => {
   const elements = new Map();
   function makeEl(id) {
     const el = { id, innerHTML: '', textContent: '', value: '', disabled: false, classList: { add() {}, remove() {}, contains: () => false } };
     elements.set(id, el);
     return el;
   }
-  ['activation-runs-tbody', 'activation-runs-count', 'ar-prev-btn', 'ar-next-btn', 'ar-filter-status', 'ar-filter-source']
+  ['runs-tbody', 'runs-count', 'runs-prev-btn', 'runs-next-btn', 'runs-filter-type', 'runs-filter-status', 'runs-updated']
     .forEach(makeEl);
 
   const sandbox = {
     console,
     document: { getElementById: (id) => elements.get(id) || null },
-    fetch: async () => new Response(JSON.stringify({ error: 'Supabase query failed (404)' }), { status: 502 }),
+    fetch: async () => new Response(JSON.stringify({ ok: false, error: 'Supabase GET failed 404' }), { status: 502 }),
     Response, URL, URLSearchParams,
     API_BASE: '/api',
-    activationRunsPage: 0,
-    ACTIVATION_RUNS_PAGE_SIZE: 50,
+    runsPage: 0,
+    RUNS_PAGE_SIZE: 50,
     escapeHtml: (s) => String(s == null ? '' : s),
-    fmt: (s) => s,
   };
   vm.createContext(sandbox);
-  vm.runInContext('async ' + grabHtmlFn('loadActivationRuns'), sandbox);
+  vm.runInContext('async ' + grabHtmlFn('loadRuns'), sandbox);
 
-  await sandbox.loadActivationRuns();
+  await sandbox.loadRuns();
 
-  const tbody = elements.get('activation-runs-tbody');
-  assert.ok(/Error loading activation runs/.test(tbody.innerHTML), 'a failed request renders a visible error, not silence');
-  assert.ok(!/No activation runs found/.test(tbody.innerHTML), 'an API error must not be presented as an empty result');
-  assert.ok(tbody.innerHTML.includes('Supabase query failed'), 'the actual upstream error is shown, not a generic message');
+  const tbody = elements.get('runs-tbody');
+  assert.ok(/Error loading runs/.test(tbody.innerHTML), 'a failed request renders a visible error, not silence');
+  assert.ok(!/No runs found/.test(tbody.innerHTML), 'an API error must not be presented as an empty result');
+  assert.ok(tbody.innerHTML.includes('Supabase GET failed'), 'the actual upstream error is shown, not a generic message');
 });

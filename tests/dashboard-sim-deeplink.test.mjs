@@ -212,7 +212,7 @@ test('openSimDetailModal opens the SIM detail modal from tableState without push
   assert.ok(!modal.classList.contains('hidden'), 'the modal is visible');
 });
 
-test('clicking an Activation Run item\'s ICCID opens the SIM detail modal without switching away from the Activation Runs tab', async () => {
+test('clicking an Activation Run item\'s ICCID opens the SIM detail modal without switching away from the Runs tab', async () => {
   const runId = 'run-3';
   const sim = { id: 5345, iccid: '89012804332468992577', msisdn: '9072162205', status: 'active' };
   const item = { id: 'item-3', iccid: sim.iccid, imei: '359729444337382', vendor: 'atomic', status: 'done', sim_id: sim.id };
@@ -223,13 +223,13 @@ test('clicking an Activation Run item\'s ICCID opens the SIM detail modal withou
   ]);
   seedTableStateSims(sandbox, [sim]);
 
-  // Land on the Activation Runs tab and drill into a run's detail, exactly
+  // Land on the Runs tab and drill into a run's detail, exactly
   // as an operator would before clicking an item's ICCID.
-  sandbox.switchTab('activation-runs', false, false);
+  sandbox.switchTab('runs', false, false);
   await sandbox.showActivationRunDetail(runId);
   for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
-  const activationRunsTab = elementCache.get('tab-activation-runs');
-  assert.ok(!activationRunsTab.classList.contains('hidden'), 'sanity check: the Activation Runs tab is visible before the click');
+  const activationRunsTab = elementCache.get('tab-runs');
+  assert.ok(!activationRunsTab.classList.contains('hidden'), 'sanity check: the Runs tab is visible before the click');
 
   // Spy on switchTab (a bare global reference other top-level functions call
   // unqualified, so reassigning it on the sandbox intercepts those calls too)

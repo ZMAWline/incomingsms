@@ -29,6 +29,7 @@ import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from '../src/d
 import { handleAuditLogQuery } from '../src/dashboard/audit-log.mjs';
 import { handleSavedFilterRoutes } from '../src/dashboard/saved-filters.mjs';
 import { handleBulkJobRoutes } from '../src/dashboard/bulk-jobs.mjs';
+import { handleRunsList } from '../src/dashboard/runs.mjs';
 import { legacyRouteResponse } from '../src/dashboard/legacy-routes.mjs';
 import { corsHeadersFor } from '../src/dashboard/cors.mjs';
 
@@ -55,7 +56,7 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
     canAccess, requiredRole, resolveUser, breakGlassUser, handleAuthRoutes,
     renderLoginPage, renderAcceptInvitePage,
     resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes, handleAuditLogQuery,
-    handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse, handleBulkJobRoutes,
+    handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse, handleBulkJobRoutes, handleRunsList,
     async fetch(url, init) {
       const u = String(url);
       supabaseCalls.push({ url: u, headers: (init && init.headers) || {} });
@@ -85,10 +86,11 @@ function makeSandbox(supabaseRoutes, assetRoutes) {
     },
   };
   vm.createContext(sandbox);
+  // runs.mjs is a real module, so it reaches Supabase through the global fetch.
+  globalThis.fetch = sandbox.fetch;
 
   const code = [
     extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
-    extractFn(SRC, 'async function handleActivationRunsList(env, corsHeaders, url) {'),
     extractFn(SRC, 'async function handleActivationRunDetail(env, corsHeaders, runId, url) {'),
     extractFn(SRC, 'async function serveApp(env) {'),
     // Renamed to `dispatch` so it doesn't collide with the sandbox's mocked
@@ -108,16 +110,16 @@ function authedRequest(path) {
   });
 }
 
-test('GET /api/activation-runs returns JSON through the real dispatcher, never the asset/SPA shell', async () => {
-  const freshRun = { id: 'run-1', source: 'json', status: 'queued', created_at: '2026-08-24T12:00:00Z' };
+test('GET /api/runs returns JSON through the real dispatcher, never the asset/SPA shell', async () => {
+  const freshRun = { id: 'run-1', run_type: 'activation', source: 'json', status: 'queued', created_at: '2026-08-24T12:00:00Z' };
   const { sandbox, assetCalls } = makeSandbox([
-    ['/activation_runs', () => new Response(JSON.stringify([freshRun]), {
+    ['/dashboard_runs', () => new Response(JSON.stringify([freshRun]), {
       status: 200,
       headers: { 'content-range': '0-0/1' },
     })],
   ]);
 
-  const res = await sandbox.dispatch(authedRequest('/api/activation-runs?limit=5'), sandbox.env);
+  const res = await sandbox.dispatch(authedRequest('/api/runs?limit=5'), sandbox.env);
   assert.equal(res.headers.get('Content-Type'), 'application/json', 'API route must answer JSON, not HTML');
 
   const body = await res.json();
@@ -137,10 +139,10 @@ test('GET /api/activation-runs/<id> returns JSON, never the asset/SPA shell', as
   assert.equal(assetCalls.length, 0, 'the asset/SPA fallback must never be invoked for an /api/* path');
 });
 
-test('GET /activation-runs (no /api prefix) serves the dashboard app shell, not asset-only content', async () => {
+test('GET /runs (no /api prefix) serves the dashboard app shell, not asset-only content', async () => {
   const { sandbox, assetCalls } = makeSandbox();
 
-  const res = await sandbox.dispatch(authedRequest('/activation-runs'), sandbox.env);
+  const res = await sandbox.dispatch(authedRequest('/runs'), sandbox.env);
   assert.equal(res.headers.get('Content-Type'), 'text/html; charset=utf-8');
   assert.equal(res.headers.get('Cache-Control'), 'no-store', 'app shell must never be edge-cached, or a stale asset response can outlive a route fix');
 
@@ -149,9 +151,9 @@ test('GET /activation-runs (no /api prefix) serves the dashboard app shell, not 
   assert.ok(assetCalls.some(u => u.includes('/index.html')), 'the deep link is served by fetching the SPA shell asset, not by a 404/static passthrough');
 });
 
-test('an unauthenticated request to /api/activation-runs is rejected before any routing occurs', async () => {
+test('an unauthenticated request to /api/runs is rejected before any routing occurs', async () => {
   const { sandbox, assetCalls, supabaseCalls } = makeSandbox();
-  const res = await sandbox.dispatch(new Request('https://dashboard.test/api/activation-runs'), sandbox.env);
+  const res = await sandbox.dispatch(new Request('https://dashboard.test/api/runs'), sandbox.env);
   assert.equal(res.status, 401);
   assert.equal(assetCalls.length, 0);
   assert.equal(supabaseCalls.length, 0);
