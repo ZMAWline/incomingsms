@@ -1,6 +1,7 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
+> 2026-09-25 (latest): PR #138 (TrustOTP weekly invoice: dashboard + quickbooks, deployed 15:33 UTC by Hermes) and PR #139 (server-side bulk SIM jobs) are LIVE in PROD. dashboard `1429619d` now produces and consumes queue `dashboard-bulk-jobs`. Migrations `20260925_qbo_invoices_send_tracking` + `20260925_bulk_jobs` verified in PROD. `deployed/prod` 02a74d1 → 8d377c0. First Friday invoice run: 17:00 UTC today.
 > 2026-09-22: Brief A done. PRs #88 (`87cc4bf`) and #84 (`6584492`) are squash-merged, not deployed. 989 tests pass. #84 frontend filename gap is open. See "Brief A done".
 > Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
 > Also 2026-09-22: Brief B steps 1–2 done — `FINALIZER_RUN_SECRET` set on `bad-rental-remediator` (test + prod), and PROD redeployed with `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` as version `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`. See "Brief B steps 1–2 done" below. Next: wait 5h for one full probe cycle, read the Slack digest, get owner sign-off, then remove DRY_RUN (step 5).
