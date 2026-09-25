@@ -34,7 +34,7 @@ Read-only; prints names only. Run it after adding or deleting any secret, then u
 ## Headline findings (2026-09-23)
 
 1. **kasa-control PROD has no auth.** It is on workers.dev (`workers_dev = true`), `GET /outlets` and `POST /outlet` (power on/off/reboot) have no check at all, and `/reboot-gateways` is open because `ADMIN_RUN_SECRET` is not set on it. Anyone with the URL can switch the power strips. Fix: add an auth check to every route and set `ADMIN_RUN_SECRET` on kasa-control.
-2. **42 live secrets no code reads** (delete candidates, list below). Most are Wing IoT, SkyLine (`SK_*`) and Helix address leftovers.
+2. **41 live secrets no code reads** (delete candidates, list below). Most are Wing IoT, SkyLine (`SK_*`) and Helix address leftovers.
 3. **Helix login is blocked.** mdn-rotator's 04:20 and 04:25 ticks logged `Token failed: 429 too_many_attempts ... account has been blocked after multiple consecutive login attempts`. PROD has 0 active Helix SIMs, so nothing breaks, but the rotator still fetches a token on every tick, which keeps the account locked. Stop the token fetch and delete the `HX_*` secrets, or get the Helix account unblocked if Helix is coming back.
 4. **TEST is far behind PROD:** 105 secrets PROD has are missing on TEST. `bad-rental-remediator-test` has only `ADMIN_RUN_SECRET` and `FINALIZER_RUN_SECRET` (no Supabase, no carrier keys), `sim-status-changer-test` and `teltik-worker-test` have no Supabase keys. TEST runs of those workers cannot work.
 5. **Three flags are stored as secrets** (`HELIX_ENABLED`, `APEX_PPU_THEN_MDN_ENABLED`, `RECONCILIATION_ENABLED`). They work, but belong in `[vars]` so the toml shows the real setting.
@@ -66,7 +66,7 @@ One row per name. "Code that reads it" is the `src/` dirs that read `env.NAME` (
 | `FINALIZER_RUN_SECRET` | bad-rental-remediator, dashboard, details-finalizer, reseller-sync | secret: bad-rental-remediator,bad-rental-remediator(test),dashboard,dashboard(test),details-finalizer,details-finalizer(test),reseller-sync,reseller-sync(test) | Shared secret one worker sends to another (or an admin sends) to call a protected endpoint. | `openssl rand -hex 32`, put the SAME value in every dir listed, in the same minute, both envs as needed. | 2026-09-22 |
 | `GATEWAY_SECRET` | sms-ingest | secret: dashboard(test),sms-ingest,sms-ingest(test) | Shared secret one worker sends to another (or an admin sends) to call a protected endpoint. | `openssl rand -hex 32`, put the SAME value in every dir listed, in the same minute, both envs as needed. | unknown |
 | `GATEWAY_STATUS_API_KEY` | dashboard | secret: dashboard | Lets the Wing gateway-status API caller read dashboard status. | New random value, put in src/dashboard, give it to the caller. | unknown |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | **none** | secret: dashboard(test) | Google service account for the Sheets export (TEST only; no code reads it now). | Delete candidate, or rotate in Google Cloud IAM > service account > keys. | unknown |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | dashboard | secret: dashboard(test) | Google service account key for the SIMs Export → Google Sheets route (`POST /api/sims/export/google-sheet`). PROD has no value yet, so PROD answers 501. Needs `GOOGLE_SHEETS_PARENT_FOLDER_ID` in `[vars]` too. | Delete candidate, or rotate in Google Cloud IAM > service account > keys. | unknown |
 | `HELIX_ENABLED` | bulk-activator, dashboard, details-finalizer, ota-status-sync, sim-canceller, sim-status-changer | secret: bulk-activator,dashboard,details-finalizer,mdn-rotator,ota-status-sync,sim-canceller,sim-status-changer | Flag, not a secret: turns Helix code paths on/off. | Move to `[vars]` in wrangler.toml; `wrangler secret delete` after. | 2026-04-15 |
 | `HX_ACTIVATION_CLIENT_ID` | bulk-activator, dashboard, mdn-rotator | secret: bulk-activator,bulk-activator(test),dashboard(test),mdn-rotator | Helix (AT&T SOLO) OAuth client/login and activation defaults. Helix is quarantined (`HELIX_ENABLED`), token login is currently blocked (429). | Vendor: get new Helix OAuth client/password from the Helix account owner, then `wrangler secret put` in each dir listed. | unknown |
 | `HX_ADDRESS1` | **none** | secret: bulk-activator,bulk-activator(test),dashboard(test),mdn-rotator | Helix (AT&T SOLO) OAuth client/login and activation defaults. Helix is quarantined (`HELIX_ENABLED`), token login is currently blocked (429). | Vendor: get new Helix OAuth client/password from the Helix account owner, then `wrangler secret put` in each dir listed. | 2026-04-16 |
@@ -129,7 +129,7 @@ One row per name. "Code that reads it" is the `src/` dirs that read `env.NAME` (
 | `WING_IOT_USERNAME` | bad-rental-remediator, bulk-activator, dashboard, details-finalizer, mdn-rotator, shared | secret: bad-rental-remediator,bulk-activator,dashboard,details-finalizer,mdn-rotator | Wing IoT (AT&T IoT) REST login. All Wing SIMs are cancelled; dead in PROD. | Do not rotate: delete (`npx wrangler secret delete <NAME>`) once the Wing code paths are removed. | unknown |
 | `WORKER_SECRET` | ota-status-sync | secret: ota-status-sync | Shared secret one worker sends to another (or an admin sends) to call a protected endpoint. | `openssl rand -hex 32`, put the SAME value in every dir listed, in the same minute, both envs as needed. | unknown |
 
-### Live secrets no code reads (delete candidates) (42)
+### Live secrets no code reads (delete candidates) (41)
 - bulk-activator: HX_ADDRESS1
 - bulk-activator: HX_CITY
 - bulk-activator: HX_STATE
@@ -142,7 +142,6 @@ One row per name. "Code that reads it" is the `src/` dirs that read `env.NAME` (
 - dashboard-test: CRON_BATCH
 - dashboard-test: CRON_WAIT_MS
 - dashboard-test: GATEWAY_SECRET
-- dashboard-test: GOOGLE_SERVICE_ACCOUNT_JSON
 - dashboard-test: HX_ADDRESS1
 - dashboard-test: HX_BAN
 - dashboard-test: HX_CITY

@@ -196,6 +196,14 @@ async function handleDashboardRequest(request, env, ctx, audit) {
       return handleSimsStatusCounts(env, corsHeaders);
     }
 
+    // Creates a real Google Sheet from the rows the browser already has on
+    // screen. POST (it creates a document at Google), so the path-first role
+    // matrix puts it at operator+ — a viewer still has CSV/TXT export, which
+    // never leaves the browser.
+    if (url.pathname === '/api/sims/export/google-sheet' && request.method === 'POST') {
+      return handleSimsExportGoogleSheet(request, env, corsHeaders);
+    }
+
     if (url.pathname === '/api/messages') {
       return handleMessages(env, corsHeaders, url);
     }
@@ -3966,6 +3974,277 @@ async function handleOperatorQuestion(request, env, corsHeaders) {
     return new Response(JSON.stringify({ error: String(e) }), {
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
+  }
+}
+
+// =========================================================
+// SIMs export → a real Google Sheet, created server-side.
+//
+// The browser POSTs exactly the {headers, rows} it would otherwise have
+// serialized to CSV; this creates the spreadsheet at Google and returns its
+// URL, so Export → Google Sheets is one click instead of a clipboard paste.
+//
+// Auth is a service account — no user OAuth, nothing to consent to per
+// operator. GOOGLE_SERVICE_ACCOUNT_JSON holds the whole key JSON
+// (`wrangler secret put`); the fields used are client_email, private_key and
+// the optional token_uri. A missing secret is a clean 501, never a 500.
+//
+// The file is created through Drive (not spreadsheets.create) inside the
+// Shared Drive folder named by GOOGLE_SHEETS_PARENT_FOLDER_ID, because a
+// standalone service account has zero Drive storage quota of its own: it
+// cannot own a file, so spreadsheets.create 403s and drive files.create
+// answers storageQuotaExceeded. A Shared Drive is owned by the Workspace, so
+// the bytes are charged there and the create succeeds. The var is required —
+// unset is a 501 like the missing secret, not a confusing Google error.
+//
+// Members of the Shared Drive can already see the file. The extra sharing is
+// for everyone else: every address in GOOGLE_SHEETS_SHARE_WITH (optional,
+// comma-separated) gets writer, and type=anyone/role=writer makes the link
+// itself work for an operator who is not a drive member. Sharing failures are
+// warnings, not errors — a Workspace policy may forbid anyone-links, and the
+// sheet exists either way with its URL still worth returning.
+// =========================================================
+
+// Full .../auth/drive rather than the narrower .../auth/drive.file: drive.file
+// only reaches files the app itself created or a human picked for it, so
+// files.create with a pre-existing folder in `parents` is rejected — and a
+// service account has no picker to grant that per-file access with.
+const GOOGLE_SHEETS_SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive';
+// Google's own ceiling is 10M cells per spreadsheet; this is the far lower
+// "one HTTP request from a browser" ceiling. Over it, CSV is the right tool.
+const GOOGLE_SHEET_MAX_ROWS = 50000;
+// One values.update per this many rows. A single 50k-row PUT is large enough
+// to be refused; the writes are sequential so the sheet fills top-down.
+const GOOGLE_SHEET_WRITE_CHUNK = 5000;
+
+function googleB64url(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function googleB64urlText(text) {
+  return googleB64url(new TextEncoder().encode(text));
+}
+
+// Service account keys carry a PKCS#8 PEM ("-----BEGIN PRIVATE KEY-----").
+async function importGooglePrivateKey(pem) {
+  const b64 = String(pem || '').replace(/-----[^-]*-----/g, '').replace(/\s+/g, '');
+  const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey(
+    'pkcs8', der.buffer,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false, ['sign']
+  );
+}
+
+// Self-signed JWT → OAuth2 access token. Not cached: an export is a
+// once-in-a-while operator action, and a cached token in a Worker isolate is
+// a credential lifetime problem for no measurable win.
+async function googleAccessToken(keyJson) {
+  const tokenUri = keyJson.token_uri || 'https://oauth2.googleapis.com/token';
+  const now = Math.floor(Date.now() / 1000);
+  const signingInput = googleB64urlText(JSON.stringify({ alg: 'RS256', typ: 'JWT' }))
+    + '.'
+    + googleB64urlText(JSON.stringify({
+      iss: keyJson.client_email,
+      scope: GOOGLE_SHEETS_SCOPES,
+      aud: tokenUri,
+      iat: now,
+      exp: now + 3600,
+    }));
+  const key = await importGooglePrivateKey(keyJson.private_key);
+  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(signingInput));
+  const res = await fetch(tokenUri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: signingInput + '.' + googleB64url(new Uint8Array(sig)),
+    }).toString(),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error('Google token exchange failed: ' + res.status + ' ' + text.slice(0, 300));
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { parsed = null; }
+  if (!parsed || !parsed.access_token) throw new Error('Google token exchange returned no access_token');
+  return parsed.access_token;
+}
+
+// Thin fetch wrapper: bearer token in, parsed JSON out, non-2xx throws with
+// enough of Google's error body to diagnose (missing API, quota, permissions).
+async function googleApi(token, url, init) {
+  const opts = init || {};
+  const res = await fetch(url, {
+    ...opts,
+    headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + token },
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(url.split('?')[0] + ' failed: ' + res.status + ' ' + text.slice(0, 300));
+  }
+  if (!text) return {};
+  try { return JSON.parse(text); } catch { return {}; }
+}
+
+// RAW input means nothing is re-interpreted, so an ICCID keeps its leading
+// zeros and a value starting with '=' stays text rather than becoming a formula.
+function googleSheetCell(v) {
+  if (v == null) return '';
+  if (typeof v === 'number' || typeof v === 'boolean') return v;
+  return String(v);
+}
+
+async function handleSimsExportGoogleSheet(request, env, corsHeaders) {
+  const json = (obj, status) => new Response(JSON.stringify(obj), {
+    status: status || 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+
+  if (!env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    return json({
+      error: 'not_configured',
+      message: 'Google Sheets export is not configured on this Worker. Set the GOOGLE_SERVICE_ACCOUNT_JSON secret (wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON).',
+    }, 501);
+  }
+  let keyJson = null;
+  try { keyJson = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT_JSON); } catch { keyJson = null; }
+  if (!keyJson || !keyJson.client_email || !keyJson.private_key) {
+    return json({
+      error: 'not_configured',
+      message: 'GOOGLE_SERVICE_ACCOUNT_JSON is not a usable service account key (client_email and private_key are required).',
+    }, 501);
+  }
+  const parentFolderId = String(env.GOOGLE_SHEETS_PARENT_FOLDER_ID || '').trim();
+  if (!parentFolderId) {
+    return json({
+      error: 'not_configured',
+      message: 'Google Sheets export has no destination folder. Set the GOOGLE_SHEETS_PARENT_FOLDER_ID var to a Shared Drive ID (or a folder inside one) that the service account is a member of — a service account has no Drive storage of its own and cannot create the file anywhere else.',
+    }, 501);
+  }
+
+  const body = await request.json().catch(() => null);
+  if (!body || !Array.isArray(body.headers) || !Array.isArray(body.rows)) {
+    return json({ error: 'headers[] and rows[] are required' }, 400);
+  }
+  if (!body.rows.length) {
+    return json({ error: 'No rows to export' }, 400);
+  }
+  if (body.rows.length > GOOGLE_SHEET_MAX_ROWS) {
+    return json({
+      error: 'too_many_rows',
+      message: body.rows.length + ' rows exceeds the ' + GOOGLE_SHEET_MAX_ROWS + '-row limit for Google Sheets export — narrow the filters or use CSV.',
+    }, 413);
+  }
+
+  const title = (String(body.title || '').trim() || 'SIMs export').slice(0, 250);
+  const values = [body.headers.map(googleSheetCell)];
+  for (const row of body.rows) values.push((Array.isArray(row) ? row : [row]).map(googleSheetCell));
+  let columnCount = 1;
+  for (const row of values) if (row.length > columnCount) columnCount = row.length;
+
+  try {
+    const token = await googleAccessToken(keyJson);
+
+    // Create through Drive so the Shared Drive owns the file and pays for the
+    // storage. supportsAllDrives=true is required for any Drive call whose
+    // file lives outside My Drive.
+    const created = await googleApi(token, 'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true&fields=id', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: title,
+        mimeType: 'application/vnd.google-apps.spreadsheet',
+        parents: [parentFolderId],
+      }),
+    });
+    const spreadsheetId = created.id;
+    if (!spreadsheetId) throw new Error('Drive API returned no file id for the new spreadsheet');
+
+    // Read the sheet back rather than assuming 'Sheet1'/0 — Google localises
+    // the default sheet name, and the A1 range has to match whatever it is.
+    const meta = await googleApi(
+      token,
+      'https://sheets.googleapis.com/v4/spreadsheets/' + spreadsheetId + '?fields=' + encodeURIComponent('sheets.properties(sheetId,title)')
+    );
+    const firstSheet = (meta.sheets && meta.sheets[0] && meta.sheets[0].properties) || {};
+    const sheetId = firstSheet.sheetId != null ? firstSheet.sheetId : 0;
+    const quotedTitle = "'" + String(firstSheet.title || 'Sheet1').replace(/'/g, "''") + "'";
+
+    // Size the grid before writing: a new sheet is 1000x26 and values.update
+    // refuses any range past the grid, which a 5k-row export would be. The
+    // header freeze and bold ride along in the same batchUpdate — formatting
+    // applies to the cells whether or not they hold values yet.
+    await googleApi(token, 'https://sheets.googleapis.com/v4/spreadsheets/' + spreadsheetId + ':batchUpdate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requests: [
+          {
+            updateSheetProperties: {
+              properties: {
+                sheetId,
+                gridProperties: { rowCount: values.length + 1, columnCount, frozenRowCount: 1 },
+              },
+              fields: 'gridProperties.rowCount,gridProperties.columnCount,gridProperties.frozenRowCount',
+            },
+          },
+          {
+            repeatCell: {
+              range: { sheetId, startRowIndex: 0, endRowIndex: 1 },
+              cell: { userEnteredFormat: { textFormat: { bold: true } } },
+              fields: 'userEnteredFormat.textFormat.bold',
+            },
+          },
+        ],
+      }),
+    });
+
+    for (let i = 0; i < values.length; i += GOOGLE_SHEET_WRITE_CHUNK) {
+      const range = quotedTitle + '!A' + (i + 1);
+      await googleApi(
+        token,
+        'https://sheets.googleapis.com/v4/spreadsheets/' + spreadsheetId + '/values/' + encodeURIComponent(range) + '?valueInputOption=RAW',
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: values.slice(i, i + GOOGLE_SHEET_WRITE_CHUNK) }),
+        }
+      );
+    }
+
+    // Sharing on top of the Shared Drive's own membership. Best-effort per
+    // grantee: a Workspace policy can refuse link-sharing, and that should
+    // downgrade the result, not discard the sheet.
+    const warnings = [];
+    const permissionsUrl = 'https://www.googleapis.com/drive/v3/files/' + spreadsheetId + '/permissions?sendNotificationEmail=false&supportsAllDrives=true';
+    const grant = (permission) => googleApi(token, permissionsUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(permission),
+    });
+    for (const email of String(env.GOOGLE_SHEETS_SHARE_WITH || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+      try {
+        await grant({ type: 'user', role: 'writer', emailAddress: email });
+      } catch (e) {
+        warnings.push('Could not share with ' + email + ': ' + (e && e.message || e));
+      }
+    }
+    try {
+      await grant({ type: 'anyone', role: 'writer' });
+    } catch (e) {
+      warnings.push('Link sharing could not be enabled: ' + (e && e.message || e));
+    }
+
+    return json({
+      ok: true,
+      url: 'https://docs.google.com/spreadsheets/d/' + spreadsheetId + '/edit',
+      spreadsheet_id: spreadsheetId,
+      rows: body.rows.length,
+      warnings,
+    });
+  } catch (e) {
+    console.log('[SheetsExport] ' + (e && e.message || e));
+    return json({ error: 'google_api_failed', message: String(e && e.message || e) }, 502);
   }
 }
 

@@ -12,10 +12,53 @@ crons = ["0 */12 * * *", "* * * * *"]
 # DASHBOARD_ENV names the environment inside generated agent API keys
 # (zmaw_live_… vs zmaw_test_…), so a key is self-identifying and a TEST key
 # pasted at PROD is a format mismatch rather than a puzzling 401.
+
+# ---------------------------------------------------------------------------
+# Google Sheets export (POST /api/sims/export/google-sheet)
+#
+# GOOGLE_SERVICE_ACCOUNT_JSON — SECRET, not a var. The complete service-account
+# key JSON (the file Google Cloud downloads when you add a key). The Worker
+# reads client_email, private_key and the optional token_uri from it, mints an
+# RS256 JWT and exchanges it for a token scoped to
+# .../auth/spreadsheets + .../auth/drive. Enable the Google Sheets API and
+# the Google Drive API on that service account's project first. Set it with:
+#
+#   cd src/dashboard
+#   printf '%s' "$(cat ~/sa-key.json)" | npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON --env test
+#   printf '%s' "$(cat ~/sa-key.json)" | npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_JSON --env=""
+#
+# `--env test` targets dashboard-test, `--env=""` targets PROD dashboard. Never
+# add `--name`: wrangler appends the env suffix to it and writes to a phantom
+# script (see agent/current-state.md, PR #73). Never pipe with `echo` either —
+# the trailing newline lands inside the secret and breaks the PEM parse.
+#
+# Never commit the key, and never paste it into a [vars] block — vars are
+# plaintext in the deployed bundle. Until the secret exists the route answers
+# 501 and the dashboard says "not configured yet".
+#
+# GOOGLE_SHEETS_PARENT_FOLDER_ID — REQUIRED var below. A Shared Drive ID, or
+# the ID of a folder inside one, that the service account has been added to as
+# Content manager. Every exported sheet is created in it. Required because a
+# standalone service account gets zero Drive storage quota, so it cannot own a
+# file anywhere else (spreadsheets.create 403s, Drive says
+# storageQuotaExceeded); a Shared Drive is owned by the Workspace instead. Take
+# the ID from the drive/folder URL: drive.google.com/drive/folders/<ID>. Unset
+# → the route answers 501 naming this var.
+#
+# GOOGLE_SHEETS_SHARE_WITH — OPTIONAL var below, comma-separated email
+# addresses that each get writer on every exported sheet (a shared ops inbox,
+# for instance). Shared Drive members can already open the file; this and the
+# type=anyone/role=writer grant are for operators who are not members. Both are
+# best-effort — a Workspace policy that blocks anyone-links turns into a
+# warning in the response, not a failed export. Leave unset to skip named
+# sharing.
+# ---------------------------------------------------------------------------
 [vars]
 # LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
 WING_EXPECTED_RATE = "5.00"
 DASHBOARD_ENV = "live"
+# GOOGLE_SHEETS_PARENT_FOLDER_ID = "0AJ1exampleSharedDriveId"
+# GOOGLE_SHEETS_SHARE_WITH = "ops@example.com,billing@example.com"
 
 # Frontend (public/index.html + public/static/*) is deployed as static assets.
 # run_worker_first keeps the worker's Basic-auth gate in front of EVERYTHING —
@@ -90,6 +133,12 @@ crons = []
 # LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
 WING_EXPECTED_RATE = "5.00"
 DASHBOARD_ENV = "test"
+# Required for Google Sheets export, same meaning as the PROD
+# GOOGLE_SHEETS_PARENT_FOLDER_ID above — a Shared Drive the service account
+# belongs to, since the account itself has no Drive storage quota.
+# GOOGLE_SHEETS_PARENT_FOLDER_ID = "0AJ1exampleSharedDriveId"
+# Optional, same meaning as the PROD GOOGLE_SHEETS_SHARE_WITH above.
+# GOOGLE_SHEETS_SHARE_WITH = "ops@example.com"
 
 [env.test.assets]
 directory = "./public"

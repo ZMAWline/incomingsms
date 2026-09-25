@@ -38,7 +38,7 @@ const MAX_BODY_BYTES = 8192;
 
 // Bodies here are large by design and hold nothing worth auditing beyond the
 // fact of the call, which the row itself records.
-const SKIP_BODY_ROUTES = ['/api/bill-audit/upload', '/api/import-teltik'];
+const SKIP_BODY_ROUTES = ['/api/bill-audit/upload', '/api/import-teltik', '/api/sims/export/google-sheet'];
 
 // Anything whose field name reads like a credential. Over-redaction is the
 // right failure mode: a redacted `monkey` field costs nothing, a logged
