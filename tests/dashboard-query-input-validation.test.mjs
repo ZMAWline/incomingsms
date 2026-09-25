@@ -55,7 +55,6 @@ const HANDLERS = [
   'async function loadSimStats(env, sims) {',
   'function simStatFields(simId, smsMap, hostPortMap) {',
   'async function handleErrors(env, corsHeaders, url) {',
-  'async function handleActivationRunsList(env, corsHeaders, url) {',
   'async function handleSimOnline(request, env, corsHeaders) {',
   'async function handleAtomicSwapSim(request, env, corsHeaders) {',
   'async function handleDeleteSim(request, env, corsHeaders) {',
@@ -174,23 +173,7 @@ test('/api/errors answers 502 instead of treating a Supabase error as rows', asy
   assert.match(body.error, /Supabase query failed \(503\)/);
 });
 
-// --- /api/activation-runs ---------------------------------------------------
-
-test('/api/activation-runs rejects a bad status or source with 400', async () => {
-  for (const qs of ['status=nope', 'source=csv%26select%3D*', 'source=json)or(id.gt.0']) {
-    const { sandbox, calls } = makeSandbox();
-    const resp = await sandbox.handleActivationRunsList(ENV, CORS, url('/api/activation-runs?' + qs));
-    assert.equal(resp.status, 400, qs);
-    assert.equal(calls.length, 0);
-  }
-});
-
-test('/api/activation-runs passes valid status and source through', async () => {
-  const { sandbox, calls } = makeSandbox();
-  const resp = await sandbox.handleActivationRunsList(ENV, CORS, url('/api/activation-runs?status=failed&source=csv'));
-  assert.equal(resp.status, 200);
-  assert.ok(calls[0].endsWith('&status=eq.failed&source=eq.csv'), calls[0]);
-});
+// /api/runs input validation lives in tests/dashboard-runs-api.test.mjs.
 
 // --- sim_id in request bodies ----------------------------------------------
 

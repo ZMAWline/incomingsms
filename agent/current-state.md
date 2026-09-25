@@ -26,6 +26,8 @@
 
 > 2026-09-25: Server-side bulk jobs (branch `logperch`). Every per-SIM bulk button now runs on the server from a Cloudflare Queue, so locking the phone no longer fails the rest of the batch. Migration `20260925_bulk_jobs.sql` applied to TEST and PROD, queues `dashboard-bulk-jobs(-test)` created, `dashboard-test` deployed (`f5b01ded`). PROD dashboard NOT deployed yet. See "Server-side bulk jobs (2026-09-25)".
 
+> 2026-09-25: Runs page (branch `runs-page`) replaces Activation Runs: `/runs` lists activation runs and bulk SIM-action jobs together (view `dashboard_runs`, applied TEST + PROD); a bulk run opens a per-SIM line view with the request/response for each step. `GET /api/activation-runs` (list) removed; detail + retry stay. `dashboard-test` deployed (`366c853c`); PROD dashboard NOT deployed yet.
+
 ---
 
 ## Server-side bulk jobs (2026-09-25)

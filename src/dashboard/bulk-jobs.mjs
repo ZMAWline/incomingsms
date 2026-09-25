@@ -11,7 +11,8 @@
 //   GET  /api/bulk-jobs            the caller's jobs (?status=running to find
 //                                  one still in flight after a page reload)
 //   GET  /api/bulk-jobs/:id        job + finished items (?since=<cursor> for
-//                                  only the ones finished since the last poll)
+//                                  only the ones finished since the last poll;
+//                                  ?all=1 for every item, for the Runs page)
 //   POST /api/bulk-jobs/:id/cancel cancel every item not yet started
 //
 // The dashboard's own queue consumer (consumeBulkJobBatch) runs each item by
@@ -191,6 +192,13 @@ async function handleGet(jobId, url, env, corsHeaders) {
   // no later queue message would ever do it.
   if (job.status === 'running') {
     job.status = await sbRpc(env, 'settle_bulk_job', { p_job_id: jobId }) || job.status;
+  }
+  // ?all=1 is the Runs page's detail view: every item, finished or not, with
+  // the steps it was asked to run, in selection order.
+  if (url.searchParams.get('all') === '1') {
+    const items = await sbGet(env, 'bulk_job_items?job_id=eq.' + jobId
+      + '&select=seq,sim_id,label,steps,status,result,started_at,finished_at&order=seq.asc&limit=' + MAX_ITEMS);
+    return json({ ok: true, job, items }, 200, corsHeaders);
   }
   let path = 'bulk_job_items?job_id=eq.' + jobId
     + '&status=in.(done,failed,cancelled)&select=seq,sim_id,label,status,result,finished_at'

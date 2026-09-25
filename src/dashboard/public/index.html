@@ -1001,9 +1001,9 @@
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"></path></svg>
                     <span class="text-sm">SIMs</span>
                 </a>
-                <a href="/activation-runs" onclick="event.preventDefault();switchTab('activation-runs')" data-tab="activation-runs" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Activation Runs">
+                <a href="/runs" onclick="event.preventDefault();switchTab('runs')" data-tab="runs" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Runs">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                    <span class="text-sm">Activation Runs</span>
+                    <span class="text-sm">Runs</span>
                 </a>
                 <a href="/bad-rentals" onclick="event.preventDefault();switchTab('bad-rentals')" data-tab="bad-rentals" class="sidebar-btn w-full flex items-center gap-3 px-6 py-3 border-l-2 border-transparent text-dark-400 hover:text-dark-100 hover:bg-dark-800/50 transition-all duration-200" title="Bad Rentals">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path></svg>
@@ -4000,62 +4000,57 @@ set verify_pending; schedule §C.3 poll
             </div>
 
             <!-- Activation Runs Tab -->
-            <div id="tab-activation-runs" class="tab-content hidden">
-                <div class="flex items-center justify-between mb-6">
-                    <h2 class="text-xl font-bold text-white">Activation Runs</h2>
-                    <span class="text-sm text-gray-500">Track bulk activation jobs — per-SIM status, errors, and retry controls</span>
-                </div>
-
-                <!-- Runs List View -->
-                <div id="activation-runs-list" class="bg-dark-800 rounded-xl border border-dark-600 p-5">
-                    <div class="flex items-center justify-between mb-4">
-                        <h3 class="text-lg font-semibold text-white">Recent Activation Runs</h3>
+            <div id="tab-runs" class="tab-content hidden">
+                <!-- Runs List View: activation runs and bulk SIM actions, newest first -->
+                <div id="runs-list" class="bg-dark-800 rounded-xl border border-dark-600 p-5">
+                    <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+                        <div>
+                            <h3 class="text-lg font-semibold text-white">All Runs</h3>
+                            <p class="text-xs text-gray-500" id="runs-updated"></p>
+                        </div>
                         <div class="flex items-center gap-2">
-                            <select id="ar-filter-status" onchange="loadActivationRuns()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                            <select id="runs-filter-type" onchange="runsPage = 0; loadRuns()" aria-label="Filter by type" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                                <option value="">All Types</option>
+                                <option value="activation">Activations</option>
+                                <option value="bulk">Bulk SIM actions</option>
+                            </select>
+                            <select id="runs-filter-status" onchange="runsPage = 0; loadRuns()" aria-label="Filter by status" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
                                 <option value="">All Statuses</option>
-                                <option value="queued">Queued</option>
-                                <option value="processing">Processing</option>
+                                <option value="running">Running</option>
                                 <option value="done">Done</option>
                                 <option value="failed">Failed</option>
                                 <option value="cancelled">Cancelled</option>
                             </select>
-                            <select id="ar-filter-source" onchange="loadActivationRuns()" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
-                                <option value="">All Sources</option>
-                                <option value="csv">CSV Import</option>
-                                <option value="json">Dashboard / JSON API</option>
-                            </select>
+                            <button onclick="loadRuns()" class="px-3 py-2 text-sm bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded-lg transition">Refresh</button>
                         </div>
                     </div>
 
                     <div class="overflow-x-auto">
-                        <table class="w-full text-sm" id="activation-runs-table">
+                        <table class="w-full text-sm" id="runs-table">
                             <thead>
                                 <tr class="border-b border-dark-600 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
                                     <th class="pb-3 px-4">Run ID</th>
+                                    <th class="pb-3 px-4">Type</th>
                                     <th class="pb-3 px-4">Source</th>
+                                    <th class="pb-3 px-4">Started By</th>
                                     <th class="pb-3 px-4">Status</th>
-                                    <th class="pb-3 px-4">Total</th>
-                                    <th class="pb-3 px-4">Queued</th>
-                                    <th class="pb-3 px-4">Processing</th>
-                                    <th class="pb-3 px-4">Done</th>
-                                    <th class="pb-3 px-4">Failed</th>
-                                    <th class="pb-3 px-4">Retry Needed</th>
-                                    <th class="pb-3 px-4">Skipped</th>
+                                    <th class="pb-3 px-4 text-right">Total</th>
+                                    <th class="pb-3 px-4 text-right">Done</th>
+                                    <th class="pb-3 px-4 text-right">Failed</th>
                                     <th class="pb-3 px-4">Created</th>
-                                    <th class="pb-3 px-4">Started</th>
                                     <th class="pb-3 px-4">Finished</th>
                                     <th class="pb-3 px-4">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody id="activation-runs-tbody"></tbody>
+                            <tbody id="runs-tbody"></tbody>
                         </table>
                     </div>
 
-                    <div id="activation-runs-pagination" class="flex items-center justify-between mt-4 pt-4 border-t border-dark-600">
-                        <p id="activation-runs-count" class="text-sm text-gray-500"></p>
+                    <div id="runs-pagination" class="flex items-center justify-between mt-4 pt-4 border-t border-dark-600">
+                        <p id="runs-count" class="text-sm text-gray-500"></p>
                         <div class="flex items-center gap-2">
-                            <button onclick="activationRunsPrevPage()" disabled class="px-3 py-1.5 text-sm bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-400 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed" id="ar-prev-btn">&larr; Prev</button>
-                            <button onclick="activationRunsNextPage()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition" id="ar-next-btn">Next &rarr;</button>
+                            <button onclick="runsPrevPage()" disabled class="px-3 py-1.5 text-sm bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-400 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed" id="runs-prev-btn">&larr; Prev</button>
+                            <button onclick="runsNextPage()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed" id="runs-next-btn">Next &rarr;</button>
                         </div>
                     </div>
                 </div>
@@ -4064,7 +4059,7 @@ set verify_pending; schedule §C.3 poll
                 <div id="activation-run-detail" class="hidden bg-dark-800 rounded-xl border border-dark-600 p-5">
                     <div class="flex items-center justify-between mb-4">
                         <div>
-                            <button onclick="showActivationRunsList()" class="text-sm text-gray-400 hover:text-white transition mr-4">&larr; Back to Runs</button>
+                            <button onclick="showRunsList()" class="text-sm text-gray-400 hover:text-white transition mr-4">&larr; Back to Runs</button>
                             <h3 class="text-lg font-semibold text-white" id="ar-detail-run-id"></h3>
                         </div>
                         <div class="flex items-center gap-2">
@@ -4152,6 +4147,66 @@ set verify_pending; schedule §C.3 poll
                             <button onclick="activationItemsNextPage()" class="px-3 py-1.5 text-sm bg-accent hover:bg-green-600 text-white rounded-lg transition" id="ai-next-btn">Next &rarr;</button>
                         </div>
                     </div>
+                </div>
+
+                <!-- Bulk Run Detail View (server-side bulk SIM actions) -->
+                <div id="bulk-run-detail" class="hidden bg-dark-800 rounded-xl border border-dark-600 p-5">
+                    <div class="flex items-start justify-between mb-4 gap-3 flex-wrap">
+                        <div>
+                            <button onclick="showRunsList()" class="text-sm text-gray-400 hover:text-white transition">&larr; Back to Runs</button>
+                            <h3 class="text-lg font-semibold text-white mt-1" id="br-title"></h3>
+                            <p class="text-xs text-gray-400 font-mono" id="br-run-id"></p>
+                            <p class="text-xs text-gray-500 mt-1" id="br-meta"></p>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <span id="br-status-badge" class="px-2 py-1 text-xs rounded-full"></span>
+                            <span class="px-2 py-1 text-xs bg-dark-700 text-gray-300 rounded-full">dashboard</span>
+                            <button id="br-cancel-btn" onclick="cancelBulkRun()" class="hidden px-3 py-1.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg transition disabled:opacity-50">Cancel remaining</button>
+                        </div>
+                    </div>
+
+                    <div id="br-error-banner" class="hidden mb-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+                        <p class="text-sm text-red-300 whitespace-pre-wrap break-words font-mono" id="br-error-text"></p>
+                    </div>
+
+                    <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+                        <div class="bg-dark-700 rounded-lg p-4"><p class="text-xs text-gray-400">Total</p><p class="text-2xl font-bold text-white" id="br-total">0</p></div>
+                        <div class="bg-dark-700 rounded-lg p-4"><p class="text-xs text-gray-400">Done</p><p class="text-2xl font-bold text-emerald-400" id="br-done">0</p></div>
+                        <div class="bg-dark-700 rounded-lg p-4"><p class="text-xs text-gray-400">Failed</p><p class="text-2xl font-bold text-red-400" id="br-failed">0</p></div>
+                        <div class="bg-dark-700 rounded-lg p-4"><p class="text-xs text-gray-400">Cancelled</p><p class="text-2xl font-bold text-gray-300" id="br-cancelled">0</p></div>
+                        <div class="bg-dark-700 rounded-lg p-4"><p class="text-xs text-gray-400">Remaining</p><p class="text-2xl font-bold text-blue-300" id="br-remaining">0</p></div>
+                    </div>
+
+                    <div class="flex items-center gap-4 mb-4 flex-wrap">
+                        <select id="br-filter-status" onchange="renderBulkRunItems()" aria-label="Filter lines by status" class="text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent">
+                            <option value="">All Statuses</option>
+                            <option value="pending">Pending</option>
+                            <option value="running">Running</option>
+                            <option value="done">Done</option>
+                            <option value="failed">Failed</option>
+                            <option value="cancelled">Cancelled</option>
+                        </select>
+                        <input type="text" id="br-search" placeholder="Search SIM ID, ICCID or result..." oninput="renderBulkRunItems()" class="flex-1 min-w-[200px] text-sm bg-dark-700 border border-dark-500 rounded-lg px-3 py-2 text-gray-300 focus:outline-none focus:border-accent" />
+                    </div>
+
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm" id="bulk-run-items-table">
+                            <thead>
+                                <tr class="border-b border-dark-600 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">
+                                    <th class="pb-3 px-4">#</th>
+                                    <th class="pb-3 px-4">SIM</th>
+                                    <th class="pb-3 px-4">Action</th>
+                                    <th class="pb-3 px-4">Status</th>
+                                    <th class="pb-3 px-4">Result</th>
+                                    <th class="pb-3 px-4">Started</th>
+                                    <th class="pb-3 px-4">Finished</th>
+                                    <th class="pb-3 px-4">Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="bulk-run-items-tbody"></tbody>
+                        </table>
+                    </div>
+                    <p id="bulk-run-items-count" class="text-sm text-gray-500 mt-4 pt-4 border-t border-dark-600"></p>
                 </div>
             </div>
 
@@ -4486,6 +4541,7 @@ set verify_pending; schedule §C.3 poll
                 </div>
             </div>
             <div class="px-5 py-4 border-t border-dark-600 flex justify-end gap-2">
+                <button id="sim-action-open-run" onclick="openWatchedBulkRun()" class="hidden px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Open in Runs</button>
                 <button id="sim-action-cancel" onclick="onBulkCancelClick()" class="hidden px-4 py-2 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed">Cancel remaining</button>
                 <button onclick="hideSimActionModal()" class="px-4 py-2 text-sm bg-dark-600 hover:bg-dark-500 text-white rounded-lg transition">Close</button>
             </div>
@@ -4858,7 +4914,7 @@ set verify_pending; schedule §C.3 poll
             'sms-usage': '/sms-usage',
             'guide': '/guide',
             'api-tester': '/api-tester',
-            'activation-runs': '/activation-runs',
+            'runs': '/runs',
             'users': '/users',
             'audit': '/audit',
             'profile': '/profile',
@@ -4866,18 +4922,20 @@ set verify_pending; schedule §C.3 poll
         const ROUTE_TO_TAB = Object.fromEntries(Object.entries(TAB_ROUTES).map(([k,v]) => [v, k]));
         ROUTE_TO_TAB['/gateway'] = 'gateways'; // legacy alias for old bookmarks
 
-        // Activation Runs tab state — must be initialized before switchTab can run,
+        // Runs tab state — must be initialized before switchTab can run,
         // because a deep-link/direct page load resolves straight into
-        // switchTab('activation-runs') via initTabFromUrl() before the rest of the
+        // switchTab('runs') via initTabFromUrl() before the rest of the
         // script has executed. Declaring these later (as `let`) left them in the
         // temporal dead zone at that call site, throwing a ReferenceError that
-        // aborted the whole boot script before loadActivationRuns() ever ran —
+        // aborted the whole boot script before loadRuns() ever ran —
         // the tab rendered its static empty table with zero rows.
-        let activationRunsPage = 0;
+        let runsPage = 0;
         let activationItemsPage = 0;
-        const ACTIVATION_RUNS_PAGE_SIZE = 50;
+        const RUNS_PAGE_SIZE = 50;
         const ACTIVATION_ITEMS_PAGE_SIZE = 200;
         let currentRunId = null;
+        let currentBulkRun = null;   // bulk run detail view: { job, items }
+        let bulkRunRefreshTimer = null;
 
         function switchTab(tabName, push = true, autoLoad = true) {
             toggleSidebar(false);
@@ -4899,7 +4957,7 @@ set verify_pending; schedule §C.3 poll
             if (push && TAB_ROUTES[tabName]) {
                 history.pushState({ tab: tabName }, '', TAB_ROUTES[tabName]);
             }
-            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'bad-rentals': 'Bad Rentals', 'rotation-reviews': 'Rotation Health', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester', 'activation-runs': 'Activation Runs' };
+            const PAGE_TITLES = { dashboard: 'Dashboard', sims: 'SIMs', messages: 'Messages', workers: 'Workers', gateways: 'Gateways', 'imei-pool': 'IMEI Pool', errors: 'Errors', 'bad-rentals': 'Bad Rentals', 'rotation-reviews': 'Rotation Health', invoicing: 'Invoicing', billing: 'Billing', 'sms-usage': 'SMS Usage', guide: 'Guide', 'api-tester': 'API Tester', runs: 'Runs' };
             const PAGE_HEADERS = {
                 dashboard:   ['Overview',       'Dashboard',          'Monitor SIMs, messages, and system status.'],
                 sims:        ['Inventory',      'SIMs',               'Browse, filter, and manage every SIM card in the fleet.'],
@@ -4915,7 +4973,7 @@ set verify_pending; schedule §C.3 poll
                 'sms-usage': ['Analytics',      'SMS Usage',          'Inbound SMS volume per SIM over time.'],
                 guide:       ['Reference',      'Operations Guide',   'Cheat sheet for everyday dashboard operations.'],
                 'api-tester':['Tools',          'API Tester',         'Make raw requests against internal APIs for debugging.'],
-                'activation-runs': ['Operations',  'Activation Runs',    'Track bulk activation jobs — per-SIM status, errors, and retry controls.']
+                runs:        ['Operations',     'Runs',               'Every bulk run — activations and bulk SIM actions — with per-SIM results.']
             };
             const _hdr = PAGE_HEADERS[tabName];
             const _eb = document.getElementById('page-eyebrow');
@@ -4932,7 +4990,7 @@ set verify_pending; schedule §C.3 poll
                 // one tab's loader must not prevent the others from running, and — since
                 // this can run synchronously during page boot via initTabFromUrl() before
                 // the rest of the script has executed — must not abort the remaining
-                // top-level script (see the activation-runs state comment above).
+                // top-level script (see the runs tab state comment above).
                 try { if (tabName === 'imei-pool') loadImeiPool(); } catch(e) { console.error('switchTab autoLoad failed for imei-pool', e); }
                 try { if (tabName === 'gateways') { loadGatewaysList(); loadPortStatus(); } } catch(e) { console.error('switchTab autoLoad failed for gateways', e); }
                 try { if (tabName === 'errors') loadErrors(); } catch(e) { console.error('switchTab autoLoad failed for errors', e); }
@@ -4943,7 +5001,7 @@ set verify_pending; schedule §C.3 poll
                 try { if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} } } catch(e) { console.error('switchTab autoLoad failed for sims', e); }
                 try { if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); } } catch(e) { console.error('switchTab autoLoad failed for rotation-reviews', e); }
                 try { if (tabName === 'workers') loadHostingPortJobs(); } catch(e) { console.error('switchTab autoLoad failed for workers', e); }
-                try { if (tabName === 'activation-runs') { activationRunsPage = 0; loadActivationRuns(); } } catch(e) { console.error('switchTab autoLoad failed for activation-runs', e); }
+                try { if (tabName === 'runs') { runsPage = 0; showRunsList(); } } catch(e) { console.error('switchTab autoLoad failed for runs', e); }
                 try { if (tabName === 'users') loadUsers(); } catch(e) { console.error('switchTab autoLoad failed for users', e); }
                 try { if (tabName === 'audit') loadAuditLog(); } catch(e) { console.error('switchTab autoLoad failed for audit', e); }
                 try { if (tabName === 'profile') loadProfile(); } catch(e) { console.error('switchTab autoLoad failed for profile', e); }
@@ -8037,8 +8095,12 @@ async function sendSimOnline(simId, phoneNumber) {
         function copyToClipboard(text) {
             navigator.clipboard.writeText(text || '').then(() => showToast('Copied to clipboard', 'success'));
         }
-        function showErrorDetailModal(text) {
-            document.getElementById('error-detail-modal-text').textContent = text || 'No error text';
+        function showErrorDetailModal(text, title) {
+            document.getElementById('error-detail-modal-title').textContent = title || 'Full Error';
+            const pre = document.getElementById('error-detail-modal-text');
+            pre.classList.toggle('text-red-300', !title);
+            pre.classList.toggle('text-gray-300', !!title);
+            pre.textContent = text || 'No error text';
             document.getElementById('error-detail-modal').classList.remove('hidden');
         }
         function hideErrorDetailModal() {
@@ -8629,7 +8691,7 @@ async function sendSimOnline(simId, phoneNumber) {
                     // autoLoad=false skips the tab's default list fetch since
                     // showActivationRunDetail immediately replaces it anyway.
                     if (result.job_run_id) {
-                        switchTab('activation-runs', true, false);
+                        switchTab('runs', true, false);
                         showActivationRunDetail(result.job_run_id);
                     }
                 } else {
@@ -12723,6 +12785,17 @@ async function sendSimOnline(simId, phoneNumber) {
             if (bulkJobWatch && bulkJobWatch.timer) clearTimeout(bulkJobWatch.timer);
             bulkJobWatch = null;
             hideBulkCancelButton();
+            const openBtn = document.getElementById('sim-action-open-run');
+            if (openBtn) openBtn.classList.add('hidden');
+        }
+
+        function openWatchedBulkRun() {
+            const w = bulkJobWatch;
+            if (!w) return;
+            const jobId = w.jobId;
+            hideSimActionModal();
+            switchTab('runs', true, false);
+            showBulkRunDetail(jobId);
         }
 
         async function pollBulkJob() {
@@ -12763,6 +12836,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 items: new Map(), cursor: null, timer: null, error: null, cancelRequested: false
             };
             openBulkJobModal(job.title, 'Loading...');
+            document.getElementById('sim-action-open-run').classList.remove('hidden');
             if (bulkJobWatch.status === 'running') showBulkCancelButton();
             pollBulkJob();
         }
@@ -15999,111 +16073,276 @@ async function sendSimOnline(simId, phoneNumber) {
         }
 
 
-        // ===== Activation Runs Tab =====
-        async function loadActivationRuns() {
-            const tbody = document.getElementById('activation-runs-tbody');
-            const countEl = document.getElementById('activation-runs-count');
-            const prevBtn = document.getElementById('ar-prev-btn');
-            const nextBtn = document.getElementById('ar-next-btn');
-            const statusFilter = document.getElementById('ar-filter-status');
-            const sourceFilter = document.getElementById('ar-filter-source');
+        // ===== Runs Tab =====
+        // One list for activation runs (bulk-activator) and bulk SIM actions
+        // (bulk_jobs), from GET /api/runs. A row opens the detail view for its
+        // run_type.
+        const RUN_STATUS_CLS = {
+            queued: 'bg-blue-500/20 text-blue-300',
+            pending: 'bg-gray-500/20 text-gray-300',
+            processing: 'bg-yellow-500/20 text-yellow-300',
+            running: 'bg-yellow-500/20 text-yellow-300',
+            done: 'bg-emerald-500/20 text-emerald-300',
+            failed: 'bg-red-500/20 text-red-300',
+            cancelled: 'bg-gray-500/20 text-gray-300',
+            retry_needed: 'bg-amber-500/20 text-amber-300',
+            skipped: 'bg-gray-500/20 text-gray-400',
+        };
+        const RUN_SOURCE_CLS = {
+            csv: 'bg-purple-500/20 text-purple-300',
+            json: 'bg-cyan-500/20 text-cyan-300',
+            dashboard: 'bg-accent/20 text-accent',
+        };
 
+        function runDate(v) {
+            return v ? new Date(v).toLocaleString() : '—';
+        }
+
+        async function loadRuns() {
+            const tbody = document.getElementById('runs-tbody');
+            const countEl = document.getElementById('runs-count');
+            const prevBtn = document.getElementById('runs-prev-btn');
+            const nextBtn = document.getElementById('runs-next-btn');
             if (!tbody) return;
-
-            const status = statusFilter ? statusFilter.value : '';
-            const source = sourceFilter ? sourceFilter.value : '';
-
-            const params = new URLSearchParams({
-                limit: ACTIVATION_RUNS_PAGE_SIZE,
-                offset: activationRunsPage * ACTIVATION_RUNS_PAGE_SIZE,
-            });
+            const type = document.getElementById('runs-filter-type').value;
+            const status = document.getElementById('runs-filter-status').value;
+            const params = new URLSearchParams({ limit: RUNS_PAGE_SIZE, offset: runsPage * RUNS_PAGE_SIZE });
+            if (type) params.append('type', type);
             if (status) params.append('status', status);
-            if (source) params.append('source', source);
 
-            tbody.innerHTML = '<tr><td colspan="14" class="px-4 py-8 text-center text-dark-400">Loading…</td></tr>';
-
+            tbody.innerHTML = '<tr><td colspan="11" class="px-4 py-8 text-center text-dark-400">Loading…</td></tr>';
             try {
-                const resp = await fetch(`${API_BASE}/activation-runs?${params.toString()}`);
+                const resp = await fetch(API_BASE + '/runs?' + params.toString());
                 const data = await resp.json();
-
-                if (!resp.ok || data.error) {
-                    tbody.innerHTML = `<tr><td colspan="14" class="px-4 py-8 text-center text-red-400">Error loading activation runs: ${escapeHtml(data.error || resp.statusText || String(resp.status))}</td></tr>`;
+                if (!resp.ok || !data.ok) {
+                    tbody.innerHTML = '<tr><td colspan="11" class="px-4 py-8 text-center text-red-400">Error loading runs: ' + escapeHtml(data.error || resp.statusText || String(resp.status)) + '</td></tr>';
                     countEl.textContent = '';
                     prevBtn.disabled = true;
                     nextBtn.disabled = true;
                     return;
                 }
-
                 const runs = data.runs || [];
                 const total = data.total || 0;
-
+                document.getElementById('runs-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
                 if (runs.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="14" class="px-4 py-8 text-center text-dark-400">No activation runs found</td></tr>';
-                    countEl.textContent = `Total: 0`;
+                    tbody.innerHTML = '<tr><td colspan="11" class="px-4 py-8 text-center text-dark-400">No runs found</td></tr>';
+                    countEl.textContent = 'Total: 0';
                     prevBtn.disabled = true;
                     nextBtn.disabled = true;
                     return;
                 }
-
                 tbody.innerHTML = runs.map(r => {
-                    const statusCls = {
-                        queued: 'bg-blue-500/20 text-blue-300',
-                        processing: 'bg-yellow-500/20 text-yellow-300',
-                        done: 'bg-emerald-500/20 text-emerald-300',
-                        failed: 'bg-red-500/20 text-red-300',
-                        cancelled: 'bg-gray-500/20 text-gray-300',
-                    }[r.status] || 'bg-dark-600 text-gray-300';
-
-                    const sourceCls = {
-                        csv: 'bg-purple-500/20 text-purple-300',
-                        json: 'bg-cyan-500/20 text-cyan-300',
-                        dashboard: 'bg-accent/20 text-accent',
-                    }[r.source] || 'bg-dark-600 text-gray-300';
-
-                    return `<tr class="border-b border-dark-700 hover:bg-dark-700/50 cursor-pointer" onclick="showActivationRunDetail('${r.id}')">
-                        <td class="px-4 py-3 font-mono text-xs">${escapeHtml(r.id)}</td>
-                        <td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ${sourceCls}">${escapeHtml(r.source)}</span></td>
-                        <td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ${statusCls}">${escapeHtml(r.status)}</span></td>
-                        <td class="px-4 py-3 text-right">${r.total_items || 0}</td>
-                        <td class="px-4 py-3 text-right">${r.queued_items || 0}</td>
-                        <td class="px-4 py-3 text-right">${r.processing_items || 0}</td>
-                        <td class="px-4 py-3 text-right">${r.done_items || 0}</td>
-                        <td class="px-4 py-3 text-right text-red-400">${r.failed_items || 0}</td>
-                        <td class="px-4 py-3 text-right text-amber-400">${r.retry_needed_items || 0}</td>
-                        <td class="px-4 py-3 text-right">${r.skipped_items || 0}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(r.created_at ? new Date(r.created_at).toLocaleString() : '—')}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(r.started_at ? new Date(r.started_at).toLocaleString() : '—')}</td>
-                        <td class="px-4 py-3 text-xs">${escapeHtml(r.finished_at ? new Date(r.finished_at).toLocaleString() : '—')}</td>
-                        <td class="px-4 py-3">
-                            <button onclick="event.stopPropagation(); showActivationRunDetail('${r.id}')" class="px-2 py-1 text-xs bg-accent hover:bg-green-600 text-white rounded transition">View</button>
-                        </td>
-                    </tr>`;
+                    const open = r.run_type === 'bulk'
+                        ? 'showBulkRunDetail(' + escapeHtml(JSON.stringify(r.id)) + ')'
+                        : 'showActivationRunDetail(' + escapeHtml(JSON.stringify(r.id)) + ')';
+                    return '<tr class="border-b border-dark-700 hover:bg-dark-700/50 cursor-pointer" onclick="' + open + '">'
+                        + '<td class="px-4 py-3 font-mono text-xs">' + escapeHtml(r.id) + '</td>'
+                        + '<td class="px-4 py-3">' + escapeHtml(r.title) + '</td>'
+                        + '<td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ' + (RUN_SOURCE_CLS[r.source] || 'bg-dark-600 text-gray-300') + '">' + escapeHtml(r.source) + '</span></td>'
+                        + '<td class="px-4 py-3 text-xs">' + escapeHtml(r.created_by || '—') + '</td>'
+                        + '<td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ' + (RUN_STATUS_CLS[r.status] || 'bg-dark-600 text-gray-300') + '">' + escapeHtml(r.status) + '</span></td>'
+                        + '<td class="px-4 py-3 text-right">' + (r.total_items || 0) + '</td>'
+                        + '<td class="px-4 py-3 text-right">' + (r.done_items || 0) + '</td>'
+                        + '<td class="px-4 py-3 text-right text-red-400">' + (r.failed_items || 0) + '</td>'
+                        + '<td class="px-4 py-3 text-xs">' + escapeHtml(runDate(r.created_at)) + '</td>'
+                        + '<td class="px-4 py-3 text-xs">' + escapeHtml(runDate(r.finished_at)) + '</td>'
+                        + '<td class="px-4 py-3"><button onclick="event.stopPropagation(); ' + open + '" class="px-2 py-1 text-xs bg-accent hover:bg-green-600 text-white rounded transition">View</button></td>'
+                        + '</tr>';
                 }).join('');
-
-                countEl.textContent = `Showing ${runs.length} of ${total} (page ${activationRunsPage + 1})`;
-                prevBtn.disabled = activationRunsPage === 0;
-                nextBtn.disabled = (activationRunsPage + 1) * ACTIVATION_RUNS_PAGE_SIZE >= total;
+                countEl.textContent = 'Showing ' + runs.length + ' of ' + total + ' (page ' + (runsPage + 1) + ')';
+                prevBtn.disabled = runsPage === 0;
+                nextBtn.disabled = (runsPage + 1) * RUNS_PAGE_SIZE >= total;
             } catch (e) {
-                tbody.innerHTML = `<tr><td colspan="14" class="px-4 py-8 text-center text-red-400">Error: ${escapeHtml(String(e))}</td></tr>`;
+                tbody.innerHTML = '<tr><td colspan="11" class="px-4 py-8 text-center text-red-400">Error: ' + escapeHtml(String(e)) + '</td></tr>';
                 countEl.textContent = '';
             }
         }
 
-        function activationRunsPrevPage() {
-            if (activationRunsPage > 0) {
-                activationRunsPage--;
-                loadActivationRuns();
+        function runsPrevPage() {
+            if (runsPage > 0) {
+                runsPage--;
+                loadRuns();
             }
         }
 
-        function activationRunsNextPage() {
-            activationRunsPage++;
-            loadActivationRuns();
+        function runsNextPage() {
+            runsPage++;
+            loadRuns();
+        }
+
+        // Shows the list and hides both detail views. Always reloads, so a
+        // direct open (e.g. right after submitting) never shows stale rows.
+        function showRunsList() {
+            stopBulkRunRefresh();
+            currentRunId = null;
+            currentBulkRun = null;
+            document.getElementById('activation-run-detail').classList.add('hidden');
+            document.getElementById('bulk-run-detail').classList.add('hidden');
+            document.getElementById('runs-list').classList.remove('hidden');
+            loadRuns();
+        }
+
+        // --- Bulk run detail: one line per SIM, what ran and what happened ---
+        // (currentBulkRun / bulkRunRefreshTimer live with the other Runs tab
+        // state near switchTab, for the same boot-order reason.)
+
+        function stopBulkRunRefresh() {
+            if (bulkRunRefreshTimer) clearTimeout(bulkRunRefreshTimer);
+            bulkRunRefreshTimer = null;
+        }
+
+        // "rotate", "assign-reseller → sim-online", "atomic-query → teltik-host-check"
+        function bulkStepsLabel(steps) {
+            return (steps || []).map(st => st.path === '/api/sim-action'
+                ? String((st.body && st.body.action) || 'sim-action')
+                : String(st.path || '').replace(/^\/api\//, '')).join(' → ');
+        }
+
+        function bulkRunResultText(kindName, item) {
+            if (item.status === 'pending' || item.status === 'running') return '—';
+            if (item.status === 'cancelled') return 'Cancelled before it started';
+            const kind = BULK_JOB_KINDS[kindName] || BULK_JOB_KINDS['sim-action'];
+            const f = formatBulkJobItem(kind, item);
+            const who = item.label || ('SIM #' + item.sim_id);
+            return String(f.line || '').replace(who + ': ', '').replace(who + ' ', '');
+        }
+
+        async function showBulkRunDetail(jobId) {
+            stopBulkRunRefresh();
+            currentRunId = null;
+            document.getElementById('runs-list').classList.add('hidden');
+            document.getElementById('activation-run-detail').classList.add('hidden');
+            document.getElementById('bulk-run-detail').classList.remove('hidden');
+            document.getElementById('br-filter-status').value = '';
+            document.getElementById('br-search').value = '';
+            document.getElementById('br-title').textContent = 'Loading…';
+            document.getElementById('br-run-id').textContent = jobId;
+            currentBulkRun = { job: { id: jobId }, items: [] };
+            await loadBulkRunDetail();
+        }
+
+        async function loadBulkRunDetail() {
+            const run = currentBulkRun;
+            if (!run) return;
+            try {
+                const resp = await fetch(API_BASE + '/bulk-jobs/' + encodeURIComponent(run.job.id) + '?all=1');
+                const data = await resp.json();
+                if (currentBulkRun !== run) return;
+                if (!resp.ok || !data.ok) {
+                    document.getElementById('br-title').textContent = 'Error: ' + (data.error || resp.statusText || String(resp.status));
+                    return;
+                }
+                run.job = data.job;
+                run.items = data.items || [];
+            } catch (e) {
+                if (currentBulkRun !== run) return;
+                document.getElementById('br-title').textContent = 'Error: ' + (e && e.message ? e.message : e);
+                return;
+            }
+            const job = run.job;
+            document.getElementById('br-title').textContent = job.title;
+            document.getElementById('br-run-id').textContent = 'Run ID ' + job.id;
+            document.getElementById('br-meta').textContent = 'Started by ' + (job.created_by || '—')
+                + ' · created ' + runDate(job.created_at) + ' · finished ' + runDate(job.finished_at)
+                + ' · updated ' + new Date().toLocaleTimeString();
+            const badge = document.getElementById('br-status-badge');
+            badge.textContent = job.status;
+            badge.className = 'px-2 py-1 text-xs rounded-full ' + (RUN_STATUS_CLS[job.status] || 'bg-dark-600 text-gray-300');
+            const banner = document.getElementById('br-error-banner');
+            document.getElementById('br-error-text').textContent = job.error || '';
+            banner.classList.toggle('hidden', !job.error);
+
+            const counts = { done: 0, failed: 0, cancelled: 0, pending: 0, running: 0 };
+            run.items.forEach(it => { counts[it.status] = (counts[it.status] || 0) + 1; });
+            document.getElementById('br-total').textContent = job.total_items;
+            document.getElementById('br-done').textContent = counts.done;
+            document.getElementById('br-failed').textContent = counts.failed;
+            document.getElementById('br-cancelled').textContent = counts.cancelled;
+            document.getElementById('br-remaining').textContent = counts.pending + counts.running;
+
+            const cancelBtn = document.getElementById('br-cancel-btn');
+            const canCancel = job.status === 'running' && counts.pending > 0 && CURRENT_USER && CURRENT_USER.role !== 'viewer';
+            cancelBtn.classList.toggle('hidden', !canCancel);
+            cancelBtn.disabled = !!job.cancel_requested;
+            cancelBtn.textContent = job.cancel_requested ? 'Cancelling…' : 'Cancel remaining';
+
+            renderBulkRunItems();
+            // Keep a running job live while its detail view is open.
+            if (job.status === 'running') bulkRunRefreshTimer = setTimeout(loadBulkRunDetail, 3000);
+        }
+
+        function renderBulkRunItems() {
+            const run = currentBulkRun;
+            const tbody = document.getElementById('bulk-run-items-tbody');
+            if (!run || !tbody) return;
+            const status = document.getElementById('br-filter-status').value;
+            const q = document.getElementById('br-search').value.trim().toLowerCase();
+            const rows = run.items.map(it => ({ it, result: bulkRunResultText(run.job.kind, it) }))
+                .filter(({ it, result }) => (!status || it.status === status)
+                    && (!q || String(it.sim_id).includes(q) || String(it.label || '').toLowerCase().includes(q) || result.toLowerCase().includes(q)));
+            if (rows.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="px-4 py-8 text-center text-dark-400">No lines match</td></tr>';
+            } else {
+                tbody.innerHTML = rows.map(({ it, result }) => {
+                    const simCell = it.sim_id
+                        ? '<a href="javascript:void(0)" onclick="openSimDetailModal(' + it.sim_id + ', ' + escapeHtml(JSON.stringify(it.label || '')) + ', \'details\')" class="text-cyan-400 hover:text-cyan-300 hover:underline" title="Open SIM detail">' + escapeHtml(it.label || ('SIM #' + it.sim_id)) + '</a>'
+                        : escapeHtml(it.label || '—');
+                    const resultCls = it.status === 'failed' ? 'text-red-300' : 'text-gray-300';
+                    const hasDetail = it.result || it.steps;
+                    return '<tr class="border-b border-dark-700 hover:bg-dark-700/50 align-top">'
+                        + '<td class="px-4 py-3 text-xs text-gray-500">' + (it.seq + 1) + '</td>'
+                        + '<td class="px-4 py-3 font-mono text-xs">' + simCell + '</td>'
+                        + '<td class="px-4 py-3 text-xs">' + escapeHtml(bulkStepsLabel(it.steps)) + '</td>'
+                        + '<td class="px-4 py-3"><span class="px-2 py-0.5 text-xs rounded-full ' + (RUN_STATUS_CLS[it.status] || 'bg-dark-600 text-gray-300') + '">' + escapeHtml(it.status) + '</span></td>'
+                        + '<td class="px-4 py-3 text-xs ' + resultCls + ' max-w-[420px] break-words">' + escapeHtml(result) + '</td>'
+                        + '<td class="px-4 py-3 text-xs">' + escapeHtml(runDate(it.started_at)) + '</td>'
+                        + '<td class="px-4 py-3 text-xs">' + escapeHtml(runDate(it.finished_at)) + '</td>'
+                        + '<td class="px-4 py-3">' + (hasDetail ? '<button onclick="showBulkItemDetail(' + it.seq + ')" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded transition">View</button>' : '—') + '</td>'
+                        + '</tr>';
+                }).join('');
+            }
+            document.getElementById('bulk-run-items-count').textContent = 'Showing ' + rows.length + ' of ' + run.items.length + ' lines';
+        }
+
+        // Exactly what was sent and what came back, step by step.
+        function showBulkItemDetail(seq) {
+            const run = currentBulkRun;
+            const it = run && run.items.find(x => x.seq === seq);
+            if (!it) return;
+            const results = (it.result && Array.isArray(it.result.steps)) ? it.result.steps : [];
+            const parts = [(it.label || ('SIM #' + it.sim_id)) + ' — ' + it.status];
+            (it.steps || []).forEach((st, i) => {
+                const r = results[i];
+                parts.push('', '── Step ' + (i + 1) + ': POST ' + st.path + (st.optional ? ' (optional)' : ''),
+                    'Request: ' + JSON.stringify(st.body, null, 2),
+                    r ? 'Response (HTTP ' + r.status + (r.ok ? ', ok' : ', failed') + '): ' + JSON.stringify(r.body, null, 2)
+                      : 'Not run');
+            });
+            if (it.result && it.result.error) parts.push('', 'Error: ' + it.result.error);
+            showErrorDetailModal(parts.join('\n'), 'Run line ' + (it.seq + 1));
+        }
+
+        async function cancelBulkRun() {
+            const run = currentBulkRun;
+            if (!run) return;
+            if (!(await showConfirm('Cancel run', 'Cancel every SIM in this run that has not started yet?'))) return;
+            try {
+                const resp = await fetch(API_BASE + '/bulk-jobs/' + encodeURIComponent(run.job.id) + '/cancel', { method: 'POST' });
+                const data = await resp.json();
+                if (!data.ok) showToast('Cancel failed: ' + (data.error || resp.status), 'error');
+            } catch (e) {
+                showToast('Cancel failed: ' + (e && e.message ? e.message : e), 'error');
+            }
+            stopBulkRunRefresh();
+            loadBulkRunDetail();
         }
 
         async function showActivationRunDetail(runId) {
+            stopBulkRunRefresh();
+            currentBulkRun = null;
             currentRunId = runId;
-            document.getElementById('activation-runs-list').classList.add('hidden');
+            document.getElementById('runs-list').classList.add('hidden');
+            document.getElementById('bulk-run-detail').classList.add('hidden');
             document.getElementById('activation-run-detail').classList.remove('hidden');
 
             // Load run details
@@ -16160,16 +16399,6 @@ async function sendSimOnline(simId, phoneNumber) {
             // Load items
             activationItemsPage = 0;
             await loadActivationRunItems();
-        }
-
-        function showActivationRunsList() {
-            document.getElementById('activation-run-detail').classList.add('hidden');
-            document.getElementById('activation-runs-list').classList.remove('hidden');
-            currentRunId = null;
-            // Refresh rather than rely on stale data — a direct-open (e.g. right
-            // after submitting) may never have loaded the list in the background.
-            activationRunsPage = 0;
-            loadActivationRuns();
         }
 
         async function loadActivationRunItems() {
@@ -16295,8 +16524,6 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (data.ok) {
                     showToast(`Retried 1 item`, 'success');
                     loadActivationRunItems();
-                    // Also refresh the run list to update counts
-                    loadActivationRuns();
                 } else {
                     showToast('Retry failed: ' + (data.error || 'Unknown error'), 'error');
                 }
@@ -16321,7 +16548,6 @@ async function sendSimOnline(simId, phoneNumber) {
                 if (data.ok) {
                     showToast(`Retried ${data.retried} items`, 'success');
                     loadActivationRunItems();
-                    loadActivationRuns();
                 } else {
                     showToast('Bulk retry failed: ' + (data.error || 'Unknown error'), 'error');
                 }
@@ -16427,7 +16653,7 @@ async function sendSimOnline(simId, phoneNumber) {
     <div id="error-detail-modal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onclick="hideErrorDetailModal()">
         <div class="bg-dark-800 rounded-xl border border-dark-600 w-full max-w-2xl" onclick="event.stopPropagation()">
             <div class="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
-                <h3 class="text-base font-semibold text-white">Full Error</h3>
+                <h3 id="error-detail-modal-title" class="text-base font-semibold text-white">Full Error</h3>
                 <div class="flex items-center gap-2">
                     <button onclick="copyToClipboard(document.getElementById('error-detail-modal-text').textContent)" class="px-2 py-1 text-xs bg-dark-700 hover:bg-dark-600 border border-dark-500 text-gray-300 rounded transition">Copy</button>
                     <button onclick="hideErrorDetailModal()" class="text-gray-500 hover:text-white text-xl leading-none">&times;</button>

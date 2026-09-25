@@ -193,7 +193,7 @@ const READ_ROUTES = [
   '/api/stats', '/api/sims', '/api/sims/status-counts', '/api/messages', '/api/sms-usage', '/api/resellers',
   '/api/gateways', '/api/gateway-defective-slots', '/api/imei-pool', '/api/errors',
   '/api/error-logs', '/api/utilization', '/api/rotation-health', '/api/rotation-reviews',
-  '/api/rotation-audit', '/api/bad-rentals', '/api/activation-runs', '/api/sim-webhooks',
+  '/api/rotation-audit', '/api/bad-rentals', '/api/activation-runs', '/api/runs', '/api/bulk-jobs', '/api/sim-webhooks',
   '/api/pending-items', '/api/hosting-port-status/jobs', '/api/remediator/status',
   '/api/billing/preview', '/api/billing/download-invoice', '/api/billing/rental-export',
   '/api/billing-ledger', '/api/bill-audit/results', '/api/bill-audit/uploads',
