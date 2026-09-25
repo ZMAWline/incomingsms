@@ -57,7 +57,9 @@ crons = ["0 */12 * * *", "* * * * *"]
 # LEGACY_VENDORS = "helix,wing,skyline,kasa"  # off by default; set to re-enable, then deploy
 WING_EXPECTED_RATE = "5.00"
 DASHBOARD_ENV = "live"
-# GOOGLE_SHEETS_PARENT_FOLDER_ID = "0AJ1exampleSharedDriveId"
+# "Dashboard SIM exports" folder in the "Server Backups" Shared Drive; the
+# dashboard-sheets-export service account is a member of that drive.
+GOOGLE_SHEETS_PARENT_FOLDER_ID = "1OR3MQjiiEXPch37BPsEmDHHWKS1pFzF2"
 # GOOGLE_SHEETS_SHARE_WITH = "ops@example.com,billing@example.com"
 
 # Frontend (public/index.html + public/static/*) is deployed as static assets.
@@ -136,7 +138,7 @@ DASHBOARD_ENV = "test"
 # Required for Google Sheets export, same meaning as the PROD
 # GOOGLE_SHEETS_PARENT_FOLDER_ID above — a Shared Drive the service account
 # belongs to, since the account itself has no Drive storage quota.
-# GOOGLE_SHEETS_PARENT_FOLDER_ID = "0AJ1exampleSharedDriveId"
+GOOGLE_SHEETS_PARENT_FOLDER_ID = "1OR3MQjiiEXPch37BPsEmDHHWKS1pFzF2"
 # Optional, same meaning as the PROD GOOGLE_SHEETS_SHARE_WITH above.
 # GOOGLE_SHEETS_SHARE_WITH = "ops@example.com"
 
