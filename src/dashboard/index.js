@@ -1,4 +1,5 @@
 import { computeBillingBreakdown, computeResellerUtilization } from '../shared/billing.js';
+import { runScheduledTrustotpInvoice } from '../shared/trustotp-weekly-invoice.mjs';
 import { resolveMsisdn, resolveZip, validateNewIccid, buildSwapSimRequest, buildSwapImeiRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 import { PRESETS as API_TESTER_PRESETS_REGISTRY, listPresetsForClient, isStateChanging } from './api-tester-presets.js';
 import { formatGatewayState, parseIccidList } from '../shared/skyline-state.mjs';
@@ -759,6 +760,16 @@ export default {
   // progress/logs; awaiting keeps the scheduled event alive until the batch
   // commits.
   async scheduled(event, env, ctx) {
+    if (event.cron === '0 17 * * 5') {
+      // Friday weekly TrustOTP invoice: generate (or find), send, and record
+      // the result. Awaited — the same reasoning as the HostPort drain below
+      // applies: a fire-and-forget run was observed to be dropped before it
+      // could finish writing state.
+      await runScheduledTrustotpInvoice(env)
+        .then(r => console.log('[TrustotpInvoice] run: ' + JSON.stringify(r)))
+        .catch(e => console.log('[TrustotpInvoice] run failed: ' + (e && e.message || e)));
+      return;
+    }
     if (event.cron === '0 */12 * * *') {
       // enqueueHostingPortJob dedupes against an already queued/running job,
       // so this is a no-op (not a stacked duplicate) when the previous

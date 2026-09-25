@@ -559,7 +559,7 @@ test('Workers tab shows recent jobs on open and resumes watching active jobs', (
 });
 
 test('scheduled handler drains jobs every tick but full-sweeps only on the 12h cron', () => {
-  assert.match(DASHBOARD_TOML, /crons = \["0 \*\/12 \* \* \*", "\* \* \* \* \*"\]/);
+  assert.match(DASHBOARD_TOML, /crons = \["0 \*\/12 \* \* \*", "\* \* \* \* \*", "0 17 \* \* 5"\]/);
   assert.match(DASHBOARD_SRC, /if \(event\.cron === '0 \*\/12 \* \* \*'\) \{/);
   assert.match(DASHBOARD_SRC, /processHostingPortJobs\(env, \{ maxJobs: 1 \}\)/);
   // The drain is NOT gated on the 12h cron: it appears after the closing brace

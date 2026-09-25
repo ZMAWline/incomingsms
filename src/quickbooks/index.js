@@ -43,6 +43,29 @@ export default {
         return handleCreateInvoice(request, env);
       }
 
+      // Search QBO items (used to resolve ItemRef.value by name)
+      if (url.pathname === '/items/search') {
+        return handleItemSearch(url, env);
+      }
+
+      // Query invoices by DocNumber (duplicate guard / reconciliation)
+      if (url.pathname === '/invoice/query') {
+        return handleInvoiceQuery(url, env);
+      }
+
+      // Send an existing invoice by email (defaults to the customer's
+      // on-file email; ?sendTo= overrides it)
+      const sendMatch = url.pathname.match(/^\/invoice\/([^/]+)\/send$/);
+      if (sendMatch && request.method === 'POST') {
+        return handleSendInvoice(sendMatch[1], url, env);
+      }
+
+      // Read back a single invoice by QBO Id
+      const readMatch = url.pathname.match(/^\/invoice\/([^/]+)$/);
+      if (readMatch && request.method === 'GET') {
+        return handleReadInvoice(readMatch[1], env);
+      }
+
       return json({ error: 'Not found' }, 404);
     } catch (e) {
       console.error('QuickBooks worker error:', e);
@@ -160,9 +183,12 @@ async function handleCustomerSearch(url, env) {
 
 async function handleCreateInvoice(request, env) {
   const body = await request.json();
-  // body: { customerId, lineItems: [{ description, quantity, rate, amount }], dueDate }
+  // body: { customerId, lineItems: [{ itemId, description, quantity, rate, amount }],
+  //         dueDate, txnDate, docNumber, customerMemo, requestId }
+  // requestId is QBO's create-time idempotency key: a retry with the same
+  // requestId returns the original invoice instead of creating a duplicate.
 
-  const { customerId, lineItems, dueDate } = body;
+  const { customerId, lineItems, dueDate, txnDate, docNumber, customerMemo, requestId } = body;
   if (!customerId || !lineItems?.length) {
     return json({ error: 'Missing customerId or lineItems' }, 400);
   }
@@ -170,27 +196,84 @@ async function handleCreateInvoice(request, env) {
   const invoiceData = {
     CustomerRef: { value: customerId },
     DueDate: dueDate || undefined,
-    Line: lineItems.map((item, i) => ({
+    TxnDate: txnDate || undefined,
+    DocNumber: docNumber || undefined,
+    // Manual/pay-by-invoice customers only — no online payment buttons on
+    // the emailed invoice.
+    AllowIPNPayment: false,
+    AllowOnlineACHPayment: false,
+    AllowOnlineCreditCardPayment: false,
+    Line: lineItems.map((item) => ({
       DetailType: 'SalesItemLineDetail',
       Amount: item.amount,
       Description: item.description,
       SalesItemLineDetail: {
+        ItemRef: item.itemId ? { value: item.itemId } : undefined,
         UnitPrice: item.rate,
         Qty: item.quantity,
       },
     })),
   };
+  if (customerMemo) invoiceData.CustomerMemo = { value: customerMemo };
 
-  const result = await qboRequest(env, '/invoice', {
+  const qs = requestId ? `?requestid=${encodeURIComponent(requestId)}` : '';
+  const result = await qboRequest(env, `/invoice${qs}`, {
     method: 'POST',
     body: JSON.stringify(invoiceData),
   });
 
-  return json({
-    id: result?.Invoice?.Id,
-    docNumber: result?.Invoice?.DocNumber,
-    totalAmt: result?.Invoice?.TotalAmt,
-  });
+  return json(mapInvoice(result?.Invoice || {}));
+}
+
+async function handleItemSearch(url, env) {
+  const q = url.searchParams.get('q') || '';
+  const query = q
+    ? `SELECT * FROM Item WHERE Name = '${q.replace(/'/g, "\\'")}' MAXRESULTS 20`
+    : 'SELECT * FROM Item MAXRESULTS 50';
+
+  const data = await qboRequest(env, `/query?query=${encodeURIComponent(query)}`);
+  const items = data?.QueryResponse?.Item || [];
+
+  return json(items.map(i => ({ id: i.Id, name: i.Name, active: i.Active, type: i.Type })));
+}
+
+async function handleInvoiceQuery(url, env) {
+  const docNumber = url.searchParams.get('doc_number');
+  if (!docNumber) return json({ error: 'doc_number required' }, 400);
+
+  const query = `SELECT * FROM Invoice WHERE DocNumber = '${docNumber.replace(/'/g, "\\'")}'`;
+  const data = await qboRequest(env, `/query?query=${encodeURIComponent(query)}`);
+  const invoices = data?.QueryResponse?.Invoice || [];
+
+  return json(invoices.map(mapInvoice));
+}
+
+async function handleReadInvoice(id, env) {
+  const data = await qboRequest(env, `/invoice/${encodeURIComponent(id)}`);
+  if (!data?.Invoice) return json({ error: 'Invoice not found' }, 404);
+  return json(mapInvoice(data.Invoice));
+}
+
+async function handleSendInvoice(id, url, env) {
+  const sendTo = url.searchParams.get('sendTo');
+  const qs = sendTo ? `?sendTo=${encodeURIComponent(sendTo)}` : '';
+  const data = await qboRequest(env, `/invoice/${encodeURIComponent(id)}/send${qs}`, { method: 'POST' });
+  if (!data?.Invoice) return json({ error: 'Send did not return an invoice' }, 502);
+  return json(mapInvoice(data.Invoice));
+}
+
+function mapInvoice(inv) {
+  return {
+    id: inv.Id,
+    docNumber: inv.DocNumber,
+    customerId: inv.CustomerRef?.value,
+    customerName: inv.CustomerRef?.name,
+    txnDate: inv.TxnDate,
+    totalAmt: inv.TotalAmt,
+    balance: inv.Balance,
+    emailStatus: inv.EmailStatus,
+    lineCount: Array.isArray(inv.Line) ? inv.Line.length : 0,
+  };
 }
 
 // ===== Token Management =====

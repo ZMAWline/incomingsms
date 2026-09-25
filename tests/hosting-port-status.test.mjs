@@ -352,7 +352,7 @@ test('all Teltik port-status call sites route through the shared recorder', () =
 });
 
 test('12h cron + manual run endpoint exist and share the sweep implementation', () => {
-  assert.match(DASHBOARD_TOML, /\[triggers\]\ncrons = \["0 \*\/12 \* \* \*", "\* \* \* \* \*"\]/);
+  assert.match(DASHBOARD_TOML, /\[triggers\]\ncrons = \["0 \*\/12 \* \* \*", "\* \* \* \* \*", "0 17 \* \* 5"\]/);
   assert.match(DASHBOARD_TOML, /\[env\.test\.triggers\]\ncrons = \[\]/);
   assert.match(DASHBOARD_SRC, /async scheduled\(event, env, ctx\)/);
   // Full automatic sweep stays bounded to the 12h schedule — never every minute.
