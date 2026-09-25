@@ -1373,3 +1373,13 @@ persist inside a saved view.
 also used by the port-in badge in `renderSims`. Filtering, sorting and the distinct
 option lists all read through `simColValue()`, so a new computed column works
 everywhere by adding one registry entry.
+
+## 2026-09-25 - Cloudflare Workers Builds disconnected; scripts/deploy.sh is the only PROD deploy path
+**Decision:** Deleted the Workers Builds triggers (created 2026-01-19) on mdn-rotator, details-finalizer, bulk-activator, reseller-sync and sms-ingest. imei-generator (a different repo) keeps its triggers.
+**Why:** Those builds redeployed the five workers on every push to `main`, even doc-only commits, under the owner's user identity, and skipped the test suite, the DB constraint check and the live-var guard that `scripts/deploy.sh` runs. They were the source of the "unexplained redeploys" that cost two sessions to trace.
+**Consequence:** Nothing deploys to PROD except `scripts/deploy.sh` from an up-to-date `main`. Do not reconnect a repo in the Cloudflare dashboard. The Builds API needs the user-scoped token at `~/.config/cloudflare/builds-token`; the account token is refused by design.
+
+## 2026-09-25 - Unused live secrets are kept, not deleted
+**Decision:** The 41 live Cloudflare secrets no code reads stay in place indefinitely (owner decision).
+**Why:** The legacy vendors are switched off, not removed, and the owner wants their credentials ready for a possible re-enable.
+**Consequence:** The "Live secrets no code reads" list in `agent/secrets-inventory.md` is inventory only. Do not schedule or propose deleting them.
