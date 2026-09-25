@@ -34,7 +34,7 @@ Read-only; prints names only. Run it after adding or deleting any secret, then u
 ## Headline findings (2026-09-23)
 
 1. **kasa-control PROD has no auth.** It is on workers.dev (`workers_dev = true`), `GET /outlets` and `POST /outlet` (power on/off/reboot) have no check at all, and `/reboot-gateways` is open because `ADMIN_RUN_SECRET` is not set on it. Anyone with the URL can switch the power strips. Fix: add an auth check to every route and set `ADMIN_RUN_SECRET` on kasa-control.
-2. **41 live secrets no code reads** (delete candidates, list below). Most are Wing IoT, SkyLine (`SK_*`) and Helix address leftovers.
+2. **41 live secrets no code reads** (kept on purpose, owner decision 2026-09-25; list below). Most are Wing IoT, SkyLine (`SK_*`) and Helix address leftovers.
 3. **Helix login is blocked.** mdn-rotator's 04:20 and 04:25 ticks logged `Token failed: 429 too_many_attempts ... account has been blocked after multiple consecutive login attempts`. PROD has 0 active Helix SIMs, so nothing breaks, but the rotator still fetches a token on every tick, which keeps the account locked. Stop the token fetch and delete the `HX_*` secrets, or get the Helix account unblocked if Helix is coming back.
 4. **TEST is far behind PROD:** 105 secrets PROD has are missing on TEST. `bad-rental-remediator-test` has only `ADMIN_RUN_SECRET` and `FINALIZER_RUN_SECRET` (no Supabase, no carrier keys), `sim-status-changer-test` and `teltik-worker-test` have no Supabase keys. TEST runs of those workers cannot work.
 5. **Three flags are stored as secrets** (`HELIX_ENABLED`, `APEX_PPU_THEN_MDN_ENABLED`, `RECONCILIATION_ENABLED`). They work, but belong in `[vars]` so the toml shows the real setting.
@@ -129,7 +129,9 @@ One row per name. "Code that reads it" is the `src/` dirs that read `env.NAME` (
 | `WING_IOT_USERNAME` | bad-rental-remediator, bulk-activator, dashboard, details-finalizer, mdn-rotator, shared | secret: bad-rental-remediator,bulk-activator,dashboard,details-finalizer,mdn-rotator | Wing IoT (AT&T IoT) REST login. All Wing SIMs are cancelled; dead in PROD. | Do not rotate: delete (`npx wrangler secret delete <NAME>`) once the Wing code paths are removed. | unknown |
 | `WORKER_SECRET` | ota-status-sync | secret: ota-status-sync | Shared secret one worker sends to another (or an admin sends) to call a protected endpoint. | `openssl rand -hex 32`, put the SAME value in every dir listed, in the same minute, both envs as needed. | unknown |
 
-### Live secrets no code reads (delete candidates) (41)
+### Live secrets no code reads (41) — KEEP, owner decision 2026-09-25
+
+Do not delete these. The owner wants them kept for a possible future re-enable of the legacy vendors. Listed for inventory only.
 - bulk-activator: HX_ADDRESS1
 - bulk-activator: HX_CITY
 - bulk-activator: HX_STATE
