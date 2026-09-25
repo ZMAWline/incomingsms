@@ -942,6 +942,26 @@
         }
         #sim-more-menu button:hover { background-color: #F7F8FA !important; }
 
+        /* ---- SIMs table: Export format menu (same popover look as "More") ---- */
+        #sims-export-menu {
+            background-color: #FFFFFF !important;
+            border: 1px solid var(--mc-hair) !important;
+            box-shadow: var(--ops-pop-shadow) !important;
+        }
+        #sims-export-menu button {
+            display: block;
+            width: 100%;
+            text-align: left;
+            padding: 8px 12px;
+            font-size: 13px !important;
+            color: var(--mc-ink) !important;
+            background-color: transparent !important;
+            border: 0 !important;
+            border-radius: 6px;
+        }
+        #sims-export-menu button:hover,
+        #sims-export-menu button:focus { background-color: #F7F8FA !important; outline: none; }
+
         /* ---- Port grid: muted status palette ---- */
         .pg-registered  { background-color: #15803D !important; }
         .pg-registering { background-color: #B45309 !important; }
@@ -1491,10 +1511,17 @@
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h7"/></svg>
                                     Columns
                                 </button>
-                                <button onclick="exportSimsCsv()" title="Export selected SIMs, or all SIMs matching the current filter, to CSV" class="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-gray-400 hover:text-white bg-dark-700 hover:bg-dark-600 border border-dark-500 rounded-lg transition">
-                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>
-                                    Export
-                                </button>
+                                <div class="relative">
+                                    <button id="sims-export-btn" onclick="toggleSimsExportMenu()" onkeydown="onSimsExportBtnKeydown(event)" aria-haspopup="true" aria-expanded="false" aria-controls="sims-export-menu" title="Export selected SIMs, or all SIMs matching the current filter" class="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-gray-400 hover:text-white bg-dark-700 hover:bg-dark-600 border border-dark-500 rounded-lg transition">
+                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>
+                                        Export &#9662;
+                                    </button>
+                                    <div id="sims-export-menu" role="menu" aria-labelledby="sims-export-btn" onkeydown="onSimsExportMenuKeydown(event)" class="hidden absolute left-0 top-full mt-1 w-48 rounded-lg z-50 py-1">
+                                        <button role="menuitem" onclick="exportSimsCsv()">CSV</button>
+                                        <button role="menuitem" onclick="exportSimsTxt()">TXT</button>
+                                        <button role="menuitem" onclick="exportSimsGoogleSheets()">Google Sheets</button>
+                                    </div>
+                                </div>
                             </div>
                             <div class="flex flex-col gap-3 w-full">
                                 <div id="sims-saved-filters" class="flex flex-wrap items-center gap-2"></div>
@@ -7662,8 +7689,12 @@ function renderSims() {
             applySimsColumnVisibility();
         }
 
-        // Export SIMs to CSV. If any rows are selected (checkboxes), export only those;
-        // otherwise export every SIM matching the current filters. Columns mirror the table.
+        // ---- SIMs export ----------------------------------------------------
+        // One row builder, two local serializers (CSV, TXT) and one server
+        // round-trip (Google Sheets). If any rows are selected (checkboxes)
+        // only those are exported; otherwise every SIM matching the current
+        // filters. Columns mirror the table.
+
         // Every SIM matching the current filters and sort, fetched from
         // /api/sims 500 at a time (the largest page it serves).
         async function fetchAllFilteredSims() {
@@ -7684,61 +7715,214 @@ function renderSims() {
             }
         }
 
-        async function exportSimsCsv() {
+        const SIMS_EXPORT_HEADERS = ['ID','Gateway','Port','ICCID','Phone','BLIMEI','Verification','Status','Vendor','Host Port','Host Port Checked','Reseller','SMS','Last SMS','Last Rotated','Activated','Last Notified'];
+
+        // Returns { headers, rows, scope, count } — rows are arrays of raw
+        // (unquoted, unescaped) cell values in SIMS_EXPORT_HEADERS order.
+        // Returns null and toasts when there is nothing to export.
+        async function buildSimsExportData() {
             const selectedIds = new Set([...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value)));
-            let rows;
+            let sims;
             if (selectedIds.size > 0) {
-                rows = tableState.sims.data.filter(s => selectedIds.has(s.id));
+                sims = tableState.sims.data.filter(s => selectedIds.has(s.id));
             } else {
                 showToast('Exporting ' + tableState.sims.total + ' SIM(s)…', 'info');
-                try { rows = await fetchAllFilteredSims(); }
-                catch (e) { showToast('Export failed: ' + e.message, 'error'); return; }
+                try { sims = await fetchAllFilteredSims(); }
+                catch (e) { showToast('Export failed: ' + e.message, 'error'); return null; }
             }
-            if (!rows.length) {
+            if (!sims.length) {
                 showToast('No SIMs to export', 'error');
-                return;
+                return null;
             }
+            const rows = sims.map(s => [
+                s.id,
+                s.gateway_code || '',
+                normalizePortDisplay(s.port) || '',
+                s.iccid || '',
+                s.phone_number || '',
+                s.blimei || '',
+                s.verification_status || '',
+                s.status || '',
+                s.vendor || '',
+                s.hosting_port_state || '',
+                s.hosting_port_checked_at || '',
+                s.reseller_name || '',
+                s.sms_count != null ? s.sms_count : 0,
+                s.last_sms_received || '',
+                s.last_rotation_at || '',
+                s.activated_at || '',
+                s.last_notified_at || '',
+            ]);
+            return {
+                headers: SIMS_EXPORT_HEADERS,
+                rows,
+                scope: selectedIds.size > 0 ? 'selected' : 'filtered',
+                count: rows.length,
+            };
+        }
+
+        // Serializer: RFC-4180-ish CSV.
+        function simsExportToCsv(data) {
             const NL = String.fromCharCode(10);
             const esc = (v) => {
                 if (v == null) return '';
                 const s = String(v);
                 return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
             };
-            const header = ['ID','Gateway','Port','ICCID','Phone','BLIMEI','Verification','Status','Vendor','Host Port','Host Port Checked','Reseller','SMS','Last SMS','Last Rotated','Activated','Last Notified'];
-            const lines = [header.join(',')];
-            for (const s of rows) {
-                lines.push([
-                    esc(s.id),
-                    esc(s.gateway_code || ''),
-                    esc(normalizePortDisplay(s.port) || ''),
-                    esc(s.iccid || ''),
-                    esc(s.phone_number || ''),
-                    esc(s.blimei || ''),
-                    esc(s.verification_status || ''),
-                    esc(s.status || ''),
-                    esc(s.vendor || ''),
-                    esc(s.hosting_port_state || ''),
-                    esc(s.hosting_port_checked_at || ''),
-                    esc(s.reseller_name || ''),
-                    esc(s.sms_count != null ? s.sms_count : 0),
-                    esc(s.last_sms_received || ''),
-                    esc(s.last_rotation_at || ''),
-                    esc(s.activated_at || ''),
-                    esc(s.last_notified_at || ''),
-                ].join(','));
-            }
-            const csv = lines.join(NL) + NL;
-            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const lines = [data.headers.map(esc).join(',')];
+            for (const row of data.rows) lines.push(row.map(esc).join(','));
+            return lines.join(NL) + NL;
+        }
+
+        // Serializer: tab-separated. Tabs/newlines inside a value would break
+        // the row, so they collapse to a space — spreadsheets paste TSV as-is.
+        function simsExportToTsv(data) {
+            const NL = String.fromCharCode(10);
+            const esc = (v) => (v == null ? '' : String(v).replace(/[\t\r\n]+/g, ' '));
+            const lines = [data.headers.map(esc).join(String.fromCharCode(9))];
+            for (const row of data.rows) lines.push(row.map(esc).join(String.fromCharCode(9)));
+            return lines.join(NL) + NL;
+        }
+
+        function downloadSimsExport(text, mime, ext) {
+            const blob = new Blob([text], { type: mime });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
             a.href = url;
-            a.download = 'sims_export_' + ts + '.csv';
+            a.download = 'sims_export_' + ts + '.' + ext;
             a.click();
             URL.revokeObjectURL(url);
-            const scope = selectedIds.size > 0 ? 'selected' : 'filtered';
-            showToast('Exported ' + rows.length + ' ' + scope + ' SIM(s)', 'success');
         }
+
+        async function exportSimsCsv() {
+            closeSimsExportMenu();
+            const data = await buildSimsExportData();
+            if (!data) return;
+            downloadSimsExport(simsExportToCsv(data), 'text/csv;charset=utf-8;', 'csv');
+            showToast('Exported ' + data.count + ' ' + data.scope + ' SIM(s)', 'success');
+        }
+
+        async function exportSimsTxt() {
+            closeSimsExportMenu();
+            const data = await buildSimsExportData();
+            if (!data) return;
+            downloadSimsExport(simsExportToTsv(data), 'text/plain;charset=utf-8;', 'txt');
+            showToast('Exported ' + data.count + ' ' + data.scope + ' SIM(s)', 'success');
+        }
+
+        // Creates a real Google Sheet: the Worker holds a service-account key
+        // (GOOGLE_SERVICE_ACCOUNT_JSON), makes the spreadsheet, fills it and
+        // shares it, so nobody signs into Google here and nothing is pasted.
+        async function exportSimsGoogleSheets() {
+            closeSimsExportMenu();
+            const data = await buildSimsExportData();
+            if (!data) return;
+            const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            showToast('Creating Google Sheet with ' + data.count + ' ' + data.scope + ' SIM(s)...', 'info');
+            let result = null;
+            let response = null;
+            try {
+                response = await fetch(`${API_BASE}/sims/export/google-sheet`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        title: 'SIMs export (' + data.scope + ') ' + ts,
+                        headers: data.headers,
+                        rows: data.rows,
+                    }),
+                });
+                result = await response.json().catch(() => null);
+            } catch (err) {
+                console.error(err);
+                showToast('Could not reach the server to create the sheet — use CSV export instead', 'error');
+                return;
+            }
+            if (response.status === 501) {
+                showToast('Google Sheets export is not configured yet — use CSV or TXT export', 'error');
+                return;
+            }
+            if (!response.ok || !result || !result.url) {
+                const detail = (result && (result.message || result.error)) || ('HTTP ' + response.status);
+                showToast('Google Sheets export failed: ' + detail, 'error');
+                return;
+            }
+            // The await above ends the user gesture, so a popup blocker can
+            // stop this window.open; when it does, the URL still has to reach
+            // the user, so it goes in the toast.
+            const win = window.open(result.url, '_blank', 'noopener');
+            const warning = (result.warnings && result.warnings.length) ? ' Sharing warning: ' + result.warnings[0] : '';
+            if (win) {
+                showToast('Created a Google Sheet with ' + data.count + ' ' + data.scope + ' SIM(s).' + warning, 'success');
+            } else {
+                showToast('Created a Google Sheet with ' + data.count + ' ' + data.scope + ' SIM(s). Popup blocked — open ' + result.url + warning, 'info');
+            }
+        }
+
+        function closeSimsExportMenu(refocusBtn) {
+            const menu = document.getElementById('sims-export-menu');
+            const btn = document.getElementById('sims-export-btn');
+            if (menu) menu.classList.add('hidden');
+            if (btn) btn.setAttribute('aria-expanded', 'false');
+            if (refocusBtn && btn) btn.focus();
+        }
+
+        function toggleSimsExportMenu() {
+            const menu = document.getElementById('sims-export-menu');
+            const btn = document.getElementById('sims-export-btn');
+            if (!menu) return;
+            const willOpen = menu.classList.contains('hidden');
+            menu.classList.toggle('hidden', !willOpen);
+            if (btn) btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+            if (willOpen) {
+                const first = menu.querySelector('button');
+                if (first) first.focus();
+            }
+        }
+
+        function simsExportMenuItems() {
+            const menu = document.getElementById('sims-export-menu');
+            return menu ? [...menu.querySelectorAll('button')] : [];
+        }
+
+        function onSimsExportBtnKeydown(ev) {
+            if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+                ev.preventDefault();
+                const menu = document.getElementById('sims-export-menu');
+                if (menu && menu.classList.contains('hidden')) toggleSimsExportMenu();
+                const items = simsExportMenuItems();
+                if (items.length) items[ev.key === 'ArrowUp' ? items.length - 1 : 0].focus();
+            } else if (ev.key === 'Escape') {
+                closeSimsExportMenu();
+            }
+        }
+
+        function onSimsExportMenuKeydown(ev) {
+            const items = simsExportMenuItems();
+            if (!items.length) return;
+            const idx = items.indexOf(document.activeElement);
+            if (ev.key === 'Escape') {
+                ev.preventDefault();
+                closeSimsExportMenu(true);
+            } else if (ev.key === 'ArrowDown') {
+                ev.preventDefault();
+                items[(idx + 1 + items.length) % items.length].focus();
+            } else if (ev.key === 'ArrowUp') {
+                ev.preventDefault();
+                items[(idx - 1 + items.length) % items.length].focus();
+            } else if (ev.key === 'Tab') {
+                closeSimsExportMenu();
+            }
+        }
+
+        document.addEventListener('click', function(ev) {
+            const menu = document.getElementById('sims-export-menu');
+            if (!menu || menu.classList.contains('hidden')) return;
+            const btn = document.getElementById('sims-export-btn');
+            if (btn && btn.contains(ev.target)) return; // toggle handles its own clicks
+            menu.classList.add('hidden'); // outside click (or a menu item click) closes the menu
+            if (btn) btn.setAttribute('aria-expanded', 'false');
+        });
 
 
 async function sendSimOnline(simId, phoneNumber) {

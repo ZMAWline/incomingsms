@@ -95,8 +95,8 @@ test('SIMs export and detail surfaces include BLIMEI', () => {
   );
   assert.match(
     dashboardHtml,
-    /esc\(s\.blimei \|\| ''\)/,
-    'the SIMs CSV export rows must include BLIMEI values'
+    /s\.blimei \|\| '',/,
+    'the SIMs export row builder must include BLIMEI values'
   );
   assert.match(
     dashboardHtml,
