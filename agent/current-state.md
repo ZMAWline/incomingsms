@@ -1,7 +1,8 @@
 # Current State
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
-> 2026-09-25 (latest): PR #138 (TrustOTP weekly invoice: dashboard + quickbooks, deployed 15:33 UTC by Hermes) and PR #139 (server-side bulk SIM jobs) are LIVE in PROD. dashboard `1429619d` now produces and consumes queue `dashboard-bulk-jobs`. Migrations `20260925_qbo_invoices_send_tracking` + `20260925_bulk_jobs` verified in PROD. `deployed/prod` 02a74d1 → 8d377c0. First Friday invoice run: 17:00 UTC today.
+> 2026-09-25 (latest): TrustOTP QBO reconciliation requested (kanban `t_81e68aff`) after the owner reported completing the Intuit consent — STILL BLOCKED. Live `GET .../status` returns `connected:false` and `QBO_TOKENS` KV is empty in both prod and test; the reported consent did not persist tokens. Nothing was reconciled/created/sent, no code changed. See "TrustOTP QBO still disconnected after reported reconnect (2026-09-25)".
+> 2026-09-25: PR #138 (TrustOTP weekly invoice: dashboard + quickbooks, deployed 15:33 UTC by Hermes) and PR #139 (server-side bulk SIM jobs) are LIVE in PROD. dashboard `1429619d` now produces and consumes queue `dashboard-bulk-jobs`. Migrations `20260925_qbo_invoices_send_tracking` + `20260925_bulk_jobs` verified in PROD. `deployed/prod` 02a74d1 → 8d377c0. First Friday invoice run: 17:00 UTC today.
 > 2026-09-22: Brief A done. PRs #88 (`87cc4bf`) and #84 (`6584492`) are squash-merged, not deployed. 989 tests pass. #84 frontend filename gap is open. See "Brief A done".
 > Also 2026-09-22: Offline SIM lifecycle DEPLOYED to PROD (feature OFF) — see "Deployed 2026-09-22" below. Migration `20260922_sim_offline_lifecycle.sql` applied to PROD only. `claim_rotation_slot` is already in TEST (the old note saying to apply it there was stale). Remaining before enabling: set `FINALIZER_RUN_SECRET` on `bad-rental-remediator` (test + prod), 5h dry run, review Slack digest, enable.
 > Also 2026-09-22: Brief B steps 1–2 done — `FINALIZER_RUN_SECRET` set on `bad-rental-remediator` (test + prod), and PROD redeployed with `OFFLINE_LIFECYCLE_ENABLED=true` + `OFFLINE_LIFECYCLE_DRY_RUN=true` as version `6dcacae8-d21b-4f51-8341-4d1dee2fd7c3`. See "Brief B steps 1–2 done" below. Next: wait 5h for one full probe cycle, read the Slack digest, get owner sign-off, then remove DRY_RUN (step 5).
@@ -29,6 +30,14 @@
 > 2026-09-25: Runs page (branch `runs-page`) replaces Activation Runs: `/runs` lists activation runs and bulk SIM-action jobs together (view `dashboard_runs`, applied TEST + PROD); a bulk run opens a per-SIM line view with the request/response for each step. `GET /api/activation-runs` (list) removed; detail + retry stay. `dashboard-test` deployed (`366c853c`); PROD dashboard NOT deployed yet.
 
 ---
+
+## TrustOTP QBO still disconnected after reported reconnect (2026-09-25)
+
+- **Task:** owner reported completing the Intuit consent and asked for the full TrustOTP/HYPPE weekly-invoice reconciliation against live QuickBooks for 2026-05-16..2026-09-24 (kanban `t_81e68aff`, reconciliation/send pre-approved).
+- **Verification step (required before touching QBO) failed.** `GET https://quickbooks.zalmen-531.workers.dev/status` → `{"connected":false}`. `wrangler kv key list --binding=QBO_TOKENS --remote` from `src/quickbooks/` returns `[]` for both the prod and `test` KV bindings — no tokens stored anywhere. A live read (`/items/search`) throws, consistent with `getValidAccessToken` still seeing no tokens.
+- **The consent flow itself looks correctly wired**, so this isn't an obvious code bug: `GET .../auth-url` returns a valid Intuit URL with `redirect_uri=https://dashboard.zalmen-531.workers.dev/api/qbo/callback`; the dashboard's `/api/qbo/*` route proxies straight through to the `quickbooks` worker via service binding, which is the same binding `/status` reads. Most likely explanation: the reported consent either wasn't completed against this exact URL/app, Intuit surfaced an error the owner didn't see, or the popup closed before the callback finished — but this session did not dig further into Intuit-side logs.
+- **Net effect:** 0 invoices created or sent, 0 `qbo_invoices` rows touched, no code changed, nothing deployed. Full detail and the exact evidence trail is in the `t_81e68aff` comment thread (2026-09-25, this session).
+- **Next step (needs the account owner, Intuit login):** open the URL returned by `GET https://quickbooks.zalmen-531.workers.dev/auth-url`, complete consent all the way to the "Connected!" popup-close page, then confirm with `GET .../status` → `connected:true` before requesting reconciliation again. This is the second consecutive session blocked at this exact step — see also "QuickBooks OAuth disconnected, reconciliation blocked (2026-09-25)" above.
 
 ## Server-side bulk jobs (2026-09-25)
 
