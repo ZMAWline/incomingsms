@@ -17,6 +17,7 @@ import { renderLoginPage, renderAcceptInvitePage } from '../src/dashboard/auth-p
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from '../src/dashboard/api-keys.mjs';
 import { handleAuditLogQuery } from '../src/dashboard/audit-log.mjs';
 import { handleSavedFilterRoutes } from '../src/dashboard/saved-filters.mjs';
+import { handleBulkJobRoutes } from '../src/dashboard/bulk-jobs.mjs';
 import { legacyRouteResponse } from '../src/dashboard/legacy-routes.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -44,7 +45,7 @@ function makeDispatcher() {
     canAccess, requiredRole, apiKeyMayAccess, resolveUser, breakGlassUser, handleAuthRoutes,
     renderLoginPage, renderAcceptInvitePage,
     resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes, handleAuditLogQuery,
-    handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse,
+    handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse, handleBulkJobRoutes,
     async fetch() {
       return new Response('[]', { status: 200, headers: { 'content-range': '0-0/0' } });
     },
@@ -59,7 +60,7 @@ function makeDispatcher() {
   const code = [
     extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
     extractFn(SRC, 'async function handleActivationRunsList(env, corsHeaders, url) {'),
-    extractFn(SRC, 'async function handleDashboardRequest(request, env, ctx, audit) {')
+    extractFn(SRC, 'async function handleDashboardRequest(request, env, ctx, audit, asUser) {')
       .replace(/^async function handleDashboardRequest\(/, 'async function dispatch('),
   ].join('\n\n');
   vm.runInContext(code, sandbox);
@@ -74,7 +75,7 @@ function authed(pathname, { method = 'GET', origin } = {}) {
 
 test('the dispatcher builds its CORS headers from cors.mjs, not a wildcard', () => {
   assert.match(SRC, /const corsHeaders = corsHeadersFor\(request\);/);
-  assert.doesNotMatch(extractFn(SRC, 'async function handleDashboardRequest(request, env, ctx, audit) {'),
+  assert.doesNotMatch(extractFn(SRC, 'async function handleDashboardRequest(request, env, ctx, audit, asUser) {'),
     /'Access-Control-Allow-Origin': '\*'/);
 });
 

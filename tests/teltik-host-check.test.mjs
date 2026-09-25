@@ -59,10 +59,11 @@ test('latest-SMS lookup targets Teltik-delivered rows for the SIM, newest first'
 });
 
 test('SIM Query picks the provider API by sims.vendor', () => {
-  // Bulk dispatch map: vendor decides the main carrier endpoint.
-  assert.match(DASHBOARD_HTML, /v === 'wing_iot' \? '\/wing-check'/);
-  assert.match(DASHBOARD_HTML, /v === 'teltik' \? '\/teltik-query'/);
-  assert.match(DASHBOARD_HTML, /v === 'atomic' \? '\/atomic-query' : '\/helix-query'/);
+  // Bulk job steps: vendor decides the main carrier endpoint.
+  assert.match(DASHBOARD_HTML, /vendor === 'wing_iot' \? \{ path: '\/api\/wing-check'/);
+  assert.match(DASHBOARD_HTML, /vendor === 'teltik' \? \{ path: '\/api\/teltik-query'/);
+  assert.match(DASHBOARD_HTML, /vendor === 'atomic' \? \{ path: '\/api\/atomic-query'/);
+  assert.match(DASHBOARD_HTML, /: \{ path: '\/api\/helix-query'/);
 });
 
 test('single-SIM query keeps the full-detail modal, not a collapsed status line', () => {
@@ -81,7 +82,8 @@ test('Teltik-hosted non-Teltik SIM query appends Teltik host checks', () => {
   assert.match(DASHBOARD_HTML, /isTeltikHostedNonTeltik/);
   // Single-SIM modal appends the detailed block; bulk lines get the tag.
   assert.match(DASHBOARD_HTML, /teltikHostDetailsBlock\(currentCarrierQuerySim\)/);
-  assert.match(DASHBOARD_HTML, /_teltikHostTag\(sim\)/);
+  assert.match(DASHBOARD_HTML, /path: '\/api\/teltik-host-check', optional: true/);
+  assert.match(DASHBOARD_HTML, /\[Teltik host: port=/);
 });
 test('Teltik /v1/port-status carries MDN and never ICCID; get-info carries MDN too', () => {
   assert.match(DASHBOARD_SRC, /v1\/port-status\?apikey=' \+ encodeURIComponent\(apiKey\)\n\s*\+ '&mdn=' \+ encodeURIComponent\(portStatusMdn\)/);

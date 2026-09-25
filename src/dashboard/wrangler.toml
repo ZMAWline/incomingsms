@@ -76,6 +76,24 @@ run_worker_first = true
 enabled = true
 invocation_logs = true
 
+# Server-side bulk jobs (src/dashboard/bulk-jobs.mjs). POST /api/bulk-jobs
+# sends one message per SIM; this same Worker consumes them one at a time
+# (max_concurrency = 1 keeps carrier calls sequential, as the browser loop
+# was) and replays each SIM's API call as the user who started the job.
+# Retries are safe: an item runs only if it is still 'pending'.
+# Create the queue once per environment before the first deploy:
+#   npx wrangler queues create dashboard-bulk-jobs
+#   npx wrangler queues create dashboard-bulk-jobs-test
+[[queues.producers]]
+queue = "dashboard-bulk-jobs"
+binding = "BULK_JOBS_QUEUE"
+
+[[queues.consumers]]
+queue = "dashboard-bulk-jobs"
+max_batch_size = 1
+max_retries = 3
+max_concurrency = 1
+
 # Service bindings for worker-to-worker communication
 [[services]]
 binding = "SIM_CANCELLER"
@@ -152,6 +170,16 @@ run_worker_first = true
 [env.test.observability.logs]
 enabled = true
 invocation_logs = true
+
+[[env.test.queues.producers]]
+queue = "dashboard-bulk-jobs-test"
+binding = "BULK_JOBS_QUEUE"
+
+[[env.test.queues.consumers]]
+queue = "dashboard-bulk-jobs-test"
+max_batch_size = 1
+max_retries = 3
+max_concurrency = 1
 
 # Service bindings for TEST workers
 [[env.test.services]]

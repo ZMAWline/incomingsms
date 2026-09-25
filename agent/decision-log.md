@@ -1383,3 +1383,8 @@ everywhere by adding one registry entry.
 **Decision:** The 41 live Cloudflare secrets no code reads stay in place indefinitely (owner decision).
 **Why:** The legacy vendors are switched off, not removed, and the owner wants their credentials ready for a possible re-enable.
 **Consequence:** The "Live secrets no code reads" list in `agent/secrets-inventory.md` is inventory only. Do not schedule or propose deleting them.
+
+## 2026-09-25 - Bulk SIM actions run from a Cloudflare Queue, replaying the existing routes
+**Decision:** The dashboard's per-SIM bulk buttons post one job to `/api/bulk-jobs`; the dashboard Worker consumes its own `dashboard-bulk-jobs` queue (one message per SIM, `max_concurrency = 1`) and runs each SIM by calling `handleDashboardRequest` in-process as the job's creator. Items are claimed with the `claim_bulk_job_item` RPC (pending -> running) and never retried once claimed.
+**Why:** Browser loops died when the phone locked. `ctx.waitUntil` stops 30 s after the response, too short for rotations; the 1-minute drain tick used by hosting-port jobs adds up to 60 s before anything starts; a queue consumer starts at once and has 15 min per item. Replaying the real dispatcher keeps one copy of every SIM action, and the role matrix, legacy-vendor switch and audit log apply unchanged.
+**Consequence:** A new bulk action needs no server code if its per-SIM route is in `BULK_JOB_PATHS`; add a formatter to `BULK_JOB_KINDS` in `public/index.html`. A route added to `BULK_JOB_PATHS` must be safe to run unattended as the creator. Never make an item re-runnable after its claim: a rotation or cancel with unknown outcome must not fire twice.
