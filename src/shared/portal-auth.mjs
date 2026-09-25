@@ -259,12 +259,15 @@ export function canAccess(role, method, pathname) {
 // the activation machinery. /api/set-sim-status is here because its valid-status
 // list includes `canceled`, which also releases the reseller assignment
 // (see handleSetSimStatus in src/dashboard/index.js) — it is not a
-// suspend/restore toggle.
+// suspend/restore toggle. /api/bulk-jobs is here because a job replays its
+// items later as the stored creator, and a stored API-key principal could not
+// be revoked mid-job the way a disabled user is (see bulk-jobs.mjs).
 //
 // Human sessions are untouched: an operator human keeps exactly the access the
 // role matrix grants. Deliberately a separate list from the role lists so that
 // widening a role never silently widens what a key can reach.
 const API_KEY_DENIED_ROUTES = [
+  '/api/bulk-jobs',
   '/api/cancel',
   '/api/debug-cancel',
   '/api/delete-sim',

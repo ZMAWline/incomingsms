@@ -11963,6 +11963,7 @@ async function sendSimOnline(simId, phoneNumber) {
         let currentSimActionIccid = null;
 
         function hideSimActionModal() {
+            stopBulkJobWatch();
             document.getElementById('sim-action-modal').classList.add('hidden');
             document.getElementById('sim-action-output').classList.remove('hidden');
         }
@@ -12075,175 +12076,28 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
 
-            // Multiple SIMs: query each sequentially and show results in sim-action-modal
+            // Multiple SIMs: one server-side job. 500 ms between SIMs keeps the
+            // relay + AT&T layers from saturating mid-batch, as the old loop did.
             const sims = selected.map(cb => tableState.sims?.data?.find(s => s.id === parseInt(cb.value))).filter(Boolean);
-
-            const output = document.getElementById('sim-action-output');
-            document.getElementById('sim-action-title').textContent = 'Bulk Query — ' + sims.length + ' SIMs';
-            output.textContent = 'Starting...';
-            output.classList.remove('hidden');
-            document.getElementById('sim-action-logs-section').classList.add('hidden');
-            document.getElementById('sim-action-modal').classList.remove('hidden');
-
-            const lines = [];
-            let okCount = 0, failCount = 0;
-
-            // Per-vendor endpoint + body shape — used by the catch block to retry.
-            const _epFor = (v) => v === 'wing_iot' ? '/wing-check'
-                : v === 'teltik' ? '/teltik-query'
-                : v === 'atomic' ? '/atomic-query' : '/helix-query';
-            const _bodyFor = (v, s) => v === 'helix'
-                ? { mobility_subscription_id: s.mobility_subscription_id || s.iccid || '' }
-                : v === 'atomic' ? { identifier: s.iccid || '' }
-                : { iccid: s.iccid || '' };
-            // Compact Teltik host tag for hosted non-Teltik SIMs (full details
-            // live in the single-SIM modal).
-            const _teltikHostTag = async (s) => {
-                if (!isTeltikHostedNonTeltik(s)) return '';
-                try {
-                    const hc = await fetchTeltikHostCheck(s);
-                    return ' [Teltik host: port=' + teltikHostPortString(hc)
-                        + ', mdn=' + (hc.mdn || '?') + ' via ' + (hc.mdn_source || '?') + ']';
-                } catch (e) {
-                    return ' [Teltik host: check failed]';
-                }
-            };
-
-            for (let _i = 0; _i < sims.length; _i++) {
-                const sim = sims[_i];
-                const vendor = sim.vendor || 'unknown';
-                const label = (sim.iccid || ('#' + sim.id));
-                // Spacing between calls keeps the relay + AT&T layers from
-                // saturating mid-batch. Adds ~2 min per 240 SIMs.
-                if (_i > 0) await new Promise(r => setTimeout(r, 500));
-                try {
-                    if (vendor === 'wing_iot') {
-                        const res = await fetch(API_BASE + '/wing-check', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ iccid: sim.iccid || '' })
-                        });
-                        const r = await res.json();
-                        if (r.ok) {
-                            okCount++;
-                            const wStatus = r.response && r.response.status ? r.response.status : 'OK';
-                            const wPlan = r.response && r.response.communicationPlan ? r.response.communicationPlan : '';
-                            let wNote = '';
-                            if (r.db_update && r.db_update.found) {
-                                if (r.db_update.status_updated) wNote += ' [status→active]';
-                                if (r.db_update.mdn_updated) wNote += ' [MDN→' + r.db_update.mdn_new + ']';
-                            }
-                            if (r.db_skip_reason) {
-                                const planTag = wPlan && wPlan.indexOf('ABIR') !== -1 && wPlan.indexOf('NON ABIR') === -1
-                                    ? 'ABIR (non-dialable)'
-                                    : (wPlan || 'wrong plan');
-                                wNote += ' [rotation_status→failed: stuck on ' + planTag + ']';
-                            }
-                            wNote += await _teltikHostTag(sim);
-                            lines.push(label + ' [wing_iot]: ' + wStatus + wNote);
-                        } else {
-                            failCount++;
-                            lines.push(label + ' [wing_iot]: ERROR — ' + JSON.stringify(r.response || r.error));
-                        }
-                    } else if (vendor === 'teltik') {
-                        const res = await fetch(API_BASE + '/teltik-query', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ iccid: sim.iccid || '' })
-                        });
-                        const r = await res.json();
-                        if (r.ok) {
-                            okCount++;
-                            const tMdn = r.response && (r.response.msisdn || r.response.mdn) ? (r.response.msisdn || r.response.mdn) : 'OK';
-                            const tNote = r.db_update && r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '';
-                            let psTag = '';
-                            if (r.port_status) {
-                                const psb = (r.port_status.response && typeof r.port_status.response === 'object') ? r.port_status.response : {};
-                                const psRaw = psb.online ?? psb.is_online ?? psb.registered ?? psb.status;
-                                const psStr = typeof psRaw === 'boolean' ? (psRaw ? 'online' : 'offline')
-                                    : (psRaw == null ? 'unknown' : String(psRaw));
-                                psTag = ' [port=' + psStr + (r.port_status.ok ? '' : ':lookup_failed') + ']';
-                            }
-                            lines.push(label + ' [teltik]: ' + tMdn + tNote + psTag);
-                        } else {
-                            failCount++;
-                            lines.push(label + ' [teltik]: ERROR — ' + (r.error || 'unknown'));
-                        }
-                    } else if (vendor === 'atomic') {
-                        const res = await fetch(API_BASE + '/atomic-query', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ identifier: sim.iccid || '' })
-                        });
-                        const r = await res.json();
-                        if (r.ok) {
-                            const wr = r.response && r.response.wholeSaleApi && r.response.wholeSaleApi.wholeSaleResponse;
-                            const attStatus = (wr && wr.Result && wr.Result.attStatus) ? wr.Result.attStatus : (wr && wr.statusCode ? wr.statusCode : 'OK');
-                            okCount++;
-                            let aNote = r.db_update && r.db_update.found ? (r.db_update.status_updated ? ' [status→active]' : '') + (r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '') : '';
-                            aNote += await _teltikHostTag(sim);
-                            lines.push(label + ' [atomic]: ' + attStatus + aNote);
-                        } else {
-                            failCount++;
-                            lines.push(label + ' [atomic]: ERROR — ' + (r.error || 'unknown'));
-                        }
-                    } else {
-                        // helix
-                        const subId = sim.mobility_subscription_id || sim.iccid || '';
-                        const res = await fetch(API_BASE + '/helix-query', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ mobility_subscription_id: subId })
-                        });
-                        const r = await res.json();
-                        if (r.ok) {
-                            const data = Array.isArray(r.helix_response) ? r.helix_response[0] : r.helix_response;
-                            const hStatus = (data && data.status) ? data.status : 'OK';
-                            const hNote = await _teltikHostTag(sim);
-                            okCount++;
-                            lines.push(label + ' [helix]: ' + hStatus + hNote);
-                        } else {
-                            failCount++;
-                            lines.push(label + ' [helix]: ERROR — ' + (r.error || 'unknown'));
-                        }
+            startBulkJob({
+                kind: 'query',
+                title: 'Bulk Query — ' + sims.length + ' SIMs',
+                spacingMs: 500,
+                items: sims.map(sim => {
+                    const vendor = sim.vendor || 'unknown';
+                    const steps = [vendor === 'wing_iot' ? { path: '/api/wing-check', body: { iccid: sim.iccid || '' } }
+                        : vendor === 'teltik' ? { path: '/api/teltik-query', body: { iccid: sim.iccid || '' } }
+                        : vendor === 'atomic' ? { path: '/api/atomic-query', body: { identifier: sim.iccid || '' } }
+                        : { path: '/api/helix-query', body: { mobility_subscription_id: sim.mobility_subscription_id || sim.iccid || '' } }];
+                    // Compact Teltik host tag for hosted non-Teltik SIMs (full
+                    // details live in the single-SIM modal). Optional: a failed
+                    // host check never fails the query.
+                    if (isTeltikHostedNonTeltik(sim)) {
+                        steps.push({ path: '/api/teltik-host-check', optional: true, body: { sim_id: sim.id, iccid: sim.iccid || '', mdn: sim.phone_number || '', vendor: sim.vendor || '', gateway_host: sim.gateway_host || '' } });
                     }
-                } catch (e) {
-                    // Up to 2 retries with 1s and 3s backoff. "failed to fetch"
-                    // can persist past a single short retry under sustained load.
-                    let _settled = false;
-                    let _lastErr = e;
-                    const _backoffs = [1000, 3000];
-                    for (let _r = 0; _r < _backoffs.length && !_settled; _r++) {
-                        await new Promise(r => setTimeout(r, _backoffs[_r]));
-                        try {
-                            const _res2 = await fetch(API_BASE + _epFor(vendor), {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify(_bodyFor(vendor, sim))
-                            });
-                            const _r2 = await _res2.json();
-                            if (_r2.ok) {
-                                okCount++;
-                                lines.push(label + ' [' + vendor + ']: OK (after retry ' + (_r + 1) + ')');
-                            } else {
-                                failCount++;
-                                lines.push(label + ' [' + vendor + ']: ERROR after retry — ' + (_r2.error || 'unknown'));
-                            }
-                            _settled = true;
-                        } catch (e2) {
-                            _lastErr = e2;
-                        }
-                    }
-                    if (!_settled) {
-                        failCount++;
-                        lines.push(label + ' [' + vendor + ']: EXCEPTION — ' + e.message + ' (final: ' + _lastErr.message + ')');
-                    }
-                }
-                output.textContent = lines.join('\n');
-            }
-
-            lines.unshift('Done: ' + okCount + ' OK, ' + failCount + ' failed\n');
-            output.textContent = lines.join('\n');
+                    return { sim_id: sim.id, label: sim.iccid || ('#' + sim.id), steps };
+                })
+            });
         }
 
         async function bulkRetryActivation() {
@@ -12251,41 +12105,14 @@ async function sendSimOnline(simId, phoneNumber) {
             if (simIds.length === 0) { showToast('Select at least one SIM', 'error'); return; }
             var _bulkStrategy = await showImeiStrategyChoice(simIds.length);
             if (_bulkStrategy === null) return;
-
-            // Show results in sim-action-modal (same modal per-row Retry uses)
-            const output = document.getElementById('sim-action-output');
-            document.getElementById('sim-action-title').textContent = 'Bulk Retry — ' + simIds.length + ' SIMs';
-            output.textContent = 'Starting...';
-            output.classList.remove('hidden');
-            document.getElementById('sim-action-logs-section').classList.add('hidden');
-            document.getElementById('sim-action-modal').classList.remove('hidden');
-
-            let success = 0, failed = 0;
-            const lines = [];
-            for (const simId of simIds) {
-                try {
-                    const res = await fetch(API_BASE + '/sim-action', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ sim_id: simId, action: 'retry_activation', imei_strategy: _bulkStrategy })
-                    });
-                    const result = await res.json();
-                    if (result.ok) {
-                        success++;
-                        lines.push('SIM #' + simId + ': OK');
-                    } else {
-                        failed++;
-                        lines.push('SIM #' + simId + ': FAILED — ' + (result.error || 'unknown'));
-                    }
-                } catch (e) {
-                    failed++;
-                    lines.push('SIM #' + simId + ': ERROR — ' + e.message);
-                }
-                output.textContent = lines.join('\n') + '\n\nProcessing... (' + (success + failed) + '/' + simIds.length + ')';
-            }
-            output.textContent = lines.join('\n') + '\n\nDone: ' + success + ' success, ' + failed + ' failed';
-            showToast(success + ' success, ' + failed + ' failed', failed > 0 ? 'warning' : 'success');
-            loadSims(true);
+            startBulkJob({
+                kind: 'sim-action',
+                title: 'Bulk Retry — ' + simIds.length + ' SIMs',
+                items: simIds.map(simId => ({
+                    sim_id: simId,
+                    steps: [{ path: '/api/sim-action', body: { sim_id: simId, action: 'retry_activation', imei_strategy: _bulkStrategy } }]
+                }))
+            });
         }
 
         function showSimLogs(simId) {
@@ -12672,57 +12499,304 @@ async function sendSimOnline(simId, phoneNumber) {
             if (simIds.length === 0) return;
             let confirmMsg;
             if (action === 'rotate') {
-                confirmMsg = `Rotate ${simIds.length} SIMs?\n\n⚠️ This will force-rotate every selected SIM — including any already rotated today. Duplicate rotations risk your AT&T account and require resellers to update the MDN each time.`;
+                confirmMsg = 'Rotate ' + simIds.length + ' SIMs?\n\n⚠️ This will force-rotate every selected SIM — including any already rotated today. Duplicate rotations risk your AT&T account and require resellers to update the MDN each time.';
             } else {
-                confirmMsg = `Run ${action} on ${simIds.length} SIM(s)?`;
+                confirmMsg = 'Run ' + action + ' on ' + simIds.length + ' SIM(s)?';
             }
             if (!(await showConfirm('Run Action', confirmMsg))) return;
-
             const extraBody = action === 'rotate' ? { force: true } : {};
+            startBulkJob({
+                kind: 'sim-action',
+                title: 'Bulk ' + action + ' — ' + simIds.length + ' SIMs',
+                items: simIds.map(simId => ({
+                    sim_id: simId,
+                    steps: [{ path: '/api/sim-action', body: Object.assign({ sim_id: simId, action }, extraBody) }]
+                }))
+            });
+        }
 
-            // Open the shared bulk result modal once; append a line per SIM as we go.
+        // ===== Server-side bulk jobs =====
+        // Every per-SIM bulk button posts its whole selection to /api/bulk-jobs
+        // once. The dashboard Worker queues one item per SIM and runs them
+        // itself, as the user who clicked, so locking the phone or closing the
+        // tab no longer fails the remaining SIMs. This modal only watches: it
+        // polls for finished items and prints the same per-SIM lines the old
+        // browser loops printed. See src/dashboard/bulk-jobs.mjs.
+        const BULK_JOB_POLL_MS = 2000;
+        let bulkJobWatch = null;
+
+        function bulkJobError(body, status) {
+            if (body && typeof body === 'object') {
+                if (body.error) return String(body.error);
+                if (body.detail && body.detail.error) return String(body.detail.error);
+                if (body.message) return String(body.message);
+            }
+            return 'HTTP ' + status;
+        }
+
+        // A step counts as success only when the route said ok: true, which is
+        // what every old browser loop checked.
+        function bulkStepGood(step) {
+            return !!(step && step.ok && step.body && step.body.ok);
+        }
+
+        // Tally keys double as summary words ("3 OK, 1 failed").
+        function simActionLine(who, step) {
+            const b = (step && step.body) || {};
+            if (bulkStepGood(step)) {
+                const msg = (b.detail && b.detail.message) || b.message
+                    || ((b.new_imei || b.imei) ? 'IMEI ' + (b.new_imei || b.imei) : '');
+                return { line: who + ': OK' + (msg ? ' — ' + msg : ''), tally: ['OK'] };
+            }
+            return { line: who + ': FAILED — ' + bulkJobError(b, step ? step.status : 0), tally: ['failed'] };
+        }
+
+        function bulkQueryLine(who, steps) {
+            const step = steps[0];
+            const r = step.body || {};
+            const vendor = step.path === '/api/wing-check' ? 'wing_iot'
+                : step.path === '/api/teltik-query' ? 'teltik'
+                : step.path === '/api/atomic-query' ? 'atomic' : 'helix';
+            let hostTag = '';
+            const host = steps.find(s => s.path === '/api/teltik-host-check');
+            if (host) {
+                hostTag = host.ok && host.body
+                    ? ' [Teltik host: port=' + teltikHostPortString(host.body) + ', mdn=' + (host.body.mdn || '?') + ' via ' + (host.body.mdn_source || '?') + ']'
+                    : ' [Teltik host: check failed]';
+            }
+            if (!bulkStepGood(step)) {
+                const err = vendor === 'wing_iot' && (r.response || r.error) ? JSON.stringify(r.response || r.error) : bulkJobError(r, step.status);
+                return { line: who + ' [' + vendor + ']: ERROR — ' + err, tally: ['failed'] };
+            }
+            let text;
+            if (vendor === 'wing_iot') {
+                const wStatus = r.response && r.response.status ? r.response.status : 'OK';
+                const wPlan = r.response && r.response.communicationPlan ? r.response.communicationPlan : '';
+                let note = '';
+                if (r.db_update && r.db_update.found) {
+                    if (r.db_update.status_updated) note += ' [status→active]';
+                    if (r.db_update.mdn_updated) note += ' [MDN→' + r.db_update.mdn_new + ']';
+                }
+                if (r.db_skip_reason) {
+                    const planTag = wPlan && wPlan.indexOf('ABIR') !== -1 && wPlan.indexOf('NON ABIR') === -1
+                        ? 'ABIR (non-dialable)' : (wPlan || 'wrong plan');
+                    note += ' [rotation_status→failed: stuck on ' + planTag + ']';
+                }
+                text = wStatus + note + hostTag;
+            } else if (vendor === 'teltik') {
+                const tMdn = r.response && (r.response.msisdn || r.response.mdn) ? (r.response.msisdn || r.response.mdn) : 'OK';
+                const tNote = r.db_update && r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '';
+                let psTag = '';
+                if (r.port_status) {
+                    const psb = (r.port_status.response && typeof r.port_status.response === 'object') ? r.port_status.response : {};
+                    const psRaw = psb.online ?? psb.is_online ?? psb.registered ?? psb.status;
+                    const psStr = typeof psRaw === 'boolean' ? (psRaw ? 'online' : 'offline') : (psRaw == null ? 'unknown' : String(psRaw));
+                    psTag = ' [port=' + psStr + (r.port_status.ok ? '' : ':lookup_failed') + ']';
+                }
+                text = tMdn + tNote + psTag;
+            } else if (vendor === 'atomic') {
+                const wr = r.response && r.response.wholeSaleApi && r.response.wholeSaleApi.wholeSaleResponse;
+                const attStatus = (wr && wr.Result && wr.Result.attStatus) ? wr.Result.attStatus : (wr && wr.statusCode ? wr.statusCode : 'OK');
+                const aNote = r.db_update && r.db_update.found
+                    ? (r.db_update.status_updated ? ' [status→active]' : '') + (r.db_update.mdn_updated ? ' [MDN→' + r.db_update.mdn_new + ']' : '') : '';
+                text = attStatus + aNote + hostTag;
+            } else {
+                const data = Array.isArray(r.helix_response) ? r.helix_response[0] : r.helix_response;
+                text = ((data && data.status) ? data.status : 'OK') + hostTag;
+            }
+            return { line: who + ' [' + vendor + ']: ' + text, tally: ['OK'] };
+        }
+
+        // kind -> how to print one finished item, the summary order, and what
+        // to reload when the job ends. Unknown kinds fall back to sim-action.
+        const BULK_JOB_KINDS = {
+            'sim-action': {
+                order: ['OK', 'failed', 'cancelled'],
+                format: (who, steps) => simActionLine(who, steps[0]),
+                refresh: () => loadSims(true)
+            },
+            'change-imei': {
+                order: ['OK', 'failed', 'cancelled'],
+                format: (who, steps) => simActionLine(who, steps[0]),
+                refresh: () => { loadSims(true); loadImeiPool(); }
+            },
+            'error-action': {
+                order: ['OK', 'failed', 'cancelled'],
+                format: (who, steps) => simActionLine(who, steps[0]),
+                refresh: () => loadErrors()
+            },
+            'status-change': {
+                order: ['OK', 'skipped', 'failed', 'cancelled'],
+                format: (who, steps) => {
+                    const b = steps[0].body || {};
+                    const r = Array.isArray(b.results) && b.results.length ? b.results[0] : null;
+                    if (r && r.ok && r.skipped) return { line: who + ': skipped — ' + (r.reason || 'no change needed'), tally: ['skipped'] };
+                    if (r && r.ok) return { line: who + ': OK', tally: ['OK'] };
+                    return { line: who + ': FAILED — ' + ((r && r.error) || bulkJobError(b, steps[0].status)), tally: ['failed'] };
+                },
+                refresh: () => loadSims(true)
+            },
+            'assign-reseller': {
+                order: ['assigned', 'failed', 'cancelled'],
+                format: (who, steps) => bulkStepGood(steps[0])
+                    ? { line: who + ': assigned', tally: ['assigned'] }
+                    : { line: who + ': FAILED — ' + bulkJobError(steps[0].body, steps[0].status), tally: ['failed'] },
+                refresh: () => loadSims(true)
+            },
+            'assign-notify': {
+                order: ['assigned', 'notified', 'failed', 'cancelled'],
+                format: (who, steps) => {
+                    if (!bulkStepGood(steps[0])) return { line: who + ': FAILED — ' + bulkJobError(steps[0].body, steps[0].status), tally: ['failed'] };
+                    if (!steps[1]) return { line: who + ': assigned (skipped notify — not active or no number)', tally: ['assigned'] };
+                    if (bulkStepGood(steps[1])) return { line: who + ': assigned + notified', tally: ['assigned', 'notified'] };
+                    return { line: who + ': assigned, notify FAILED — ' + bulkJobError(steps[1].body, steps[1].status), tally: ['assigned'] };
+                },
+                refresh: () => loadSims(true)
+            },
+            'send-online': {
+                order: ['sent', 'skipped (stuck on ABIR — force-rotate first)', 'failed', 'cancelled'],
+                format: (who, steps) => {
+                    const b = steps[0].body || {};
+                    if (bulkStepGood(steps[0])) return { line: who + ': sent', tally: ['sent'] };
+                    if (b.abir_skipped) return { line: who + ': skipped — stuck on ABIR, force-rotate first', tally: ['skipped (stuck on ABIR — force-rotate first)'] };
+                    return { line: who + ': FAILED — ' + bulkJobError(b, steps[0].status), tally: ['failed'] };
+                },
+                refresh: () => loadSims(true)
+            },
+            'delete-sim': {
+                order: ['deleted', 'failed', 'cancelled'],
+                format: (who, steps) => bulkStepGood(steps[0])
+                    ? { line: who + ': deleted', tally: ['deleted'] }
+                    : { line: who + ': FAILED — ' + bulkJobError(steps[0].body, steps[0].status), tally: ['failed'] },
+                refresh: () => loadSims(true)
+            },
+            'query': {
+                order: ['OK', 'failed', 'cancelled'],
+                format: (who, steps) => bulkQueryLine(who, steps),
+                refresh: () => {}
+            }
+        };
+
+        function formatBulkJobItem(kind, item) {
+            const who = item.label || ('SIM #' + item.sim_id);
+            if (item.status === 'cancelled') return { line: null, tally: ['cancelled'] };
+            const result = item.result || {};
+            const steps = Array.isArray(result.steps) ? result.steps : [];
+            if (steps.length === 0) return { line: who + ': FAILED — ' + (result.error || 'not run'), tally: ['failed'] };
+            return kind.format(who, steps);
+        }
+
+        function renderBulkJob() {
+            const w = bulkJobWatch;
+            if (!w) return;
+            const kind = BULK_JOB_KINDS[w.kind] || BULK_JOB_KINDS['sim-action'];
+            const tallies = {};
+            const lines = [];
+            [...w.items.values()].sort((a, b) => a.seq - b.seq).forEach(item => {
+                const f = formatBulkJobItem(kind, item);
+                f.tally.forEach(t => { tallies[t] = (tallies[t] || 0) + 1; });
+                if (f.line) lines.push(f.line);
+            });
             const output = document.getElementById('sim-action-output');
-            document.getElementById('sim-action-title').textContent = 'Bulk ' + action + ' — ' + simIds.length + ' SIMs';
-            output.textContent = 'Starting...';
+            if (w.status === 'running') {
+                const cancelling = w.cancelRequested ? ' Cancelling the rest…' : '';
+                output.textContent = (lines.length ? lines.join('\n') + '\n\n' : '')
+                    + 'Processing... (' + w.items.size + '/' + w.total + ')' + cancelling
+                    + '\nThis runs on the server. You can close this window or lock your phone; it keeps going.';
+                return;
+            }
+            const parts = kind.order.filter(k => tallies[k]).map(k => tallies[k] + ' ' + k);
+            output.textContent = 'Done: ' + (parts.join(', ') || 'nothing ran')
+                + (w.error ? '\n' + w.error : '') + (lines.length ? '\n\n' + lines.join('\n') : '');
+        }
+
+        function openBulkJobModal(title, text) {
+            const output = document.getElementById('sim-action-output');
+            document.getElementById('sim-action-title').textContent = title;
+            output.textContent = text;
             output.classList.remove('hidden');
             document.getElementById('sim-action-logs-section').classList.add('hidden');
             document.getElementById('sim-action-modal').classList.remove('hidden');
+        }
 
-            window.__bulkCancel = false;
-            showBulkCancelButton();
-            let ok = 0, fail = 0, cancelled = 0;
-            const lines = [];
-            for (const simId of simIds) {
-                if (window.__bulkCancel) {
-                    cancelled = simIds.length - ok - fail;
-                    break;
-                }
-                try {
-                    const res = await fetch(API_BASE + '/sim-action', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(Object.assign({ sim_id: simId, action }, extraBody))
-                    });
-                    const result = await res.json();
-                    if (result.ok) {
-                        ok++;
-                        const msg = result.detail && result.detail.message ? result.detail.message : (result.message || '');
-                        lines.push('SIM #' + simId + ': OK' + (msg ? ' — ' + msg : ''));
-                    } else {
-                        fail++;
-                        const err = result.error || (result.detail && result.detail.error) || 'unknown';
-                        lines.push('SIM #' + simId + ': FAILED — ' + err);
-                    }
-                } catch (e) {
-                    fail++;
-                    lines.push('SIM #' + simId + ': EXCEPTION — ' + (e && e.message ? e.message : e));
-                }
-                output.textContent = lines.join('\n') + '\n\nProcessing... (' + (ok + fail) + '/' + simIds.length + ')';
-            }
+        function stopBulkJobWatch() {
+            if (bulkJobWatch && bulkJobWatch.timer) clearTimeout(bulkJobWatch.timer);
+            bulkJobWatch = null;
             hideBulkCancelButton();
-            const summary = 'Done: ' + ok + ' OK' + (fail ? ', ' + fail + ' failed' : '') + (cancelled ? ', ' + cancelled + ' cancelled' : '');
-            output.textContent = summary + '\n\n' + lines.join('\n');
-            loadSims(true);
+        }
+
+        async function pollBulkJob() {
+            const w = bulkJobWatch;
+            if (!w) return;
+            try {
+                const res = await fetch(API_BASE + '/bulk-jobs/' + encodeURIComponent(w.jobId)
+                    + (w.cursor ? '?since=' + encodeURIComponent(w.cursor) : ''));
+                const data = await res.json();
+                if (bulkJobWatch !== w) return;
+                if (data.ok) {
+                    data.items.forEach(item => w.items.set(item.seq, item));
+                    w.cursor = data.cursor || w.cursor;
+                    w.status = data.job.status;
+                    w.total = data.job.total_items;
+                    w.error = data.job.error || null;
+                    w.cancelRequested = !!data.job.cancel_requested;
+                }
+            } catch (e) {
+                // A dropped poll (phone locked, network blip) changes nothing:
+                // the job runs server-side, so just try again next tick.
+            }
+            if (bulkJobWatch !== w) return;
+            renderBulkJob();
+            if (w.status === 'running') {
+                w.timer = setTimeout(pollBulkJob, BULK_JOB_POLL_MS);
+            } else {
+                hideBulkCancelButton();
+                const kind = BULK_JOB_KINDS[w.kind] || BULK_JOB_KINDS['sim-action'];
+                kind.refresh();
+            }
+        }
+
+        function watchBulkJob(job) {
+            stopBulkJobWatch();
+            bulkJobWatch = {
+                jobId: job.id, kind: job.kind, total: job.total_items, status: job.status || 'running',
+                items: new Map(), cursor: null, timer: null, error: null, cancelRequested: false
+            };
+            openBulkJobModal(job.title, 'Loading...');
+            if (bulkJobWatch.status === 'running') showBulkCancelButton();
+            pollBulkJob();
+        }
+
+        // items: [{ sim_id, label?, steps: [{ path, body, optional? }] }]
+        async function startBulkJob({ kind, title, items, spacingMs }) {
+            stopBulkJobWatch();
+            openBulkJobModal(title, 'Starting...');
+            try {
+                const res = await fetch(API_BASE + '/bulk-jobs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ kind, title, items, spacing_ms: spacingMs || 0 })
+                });
+                const data = await res.json();
+                if (!data.ok) {
+                    document.getElementById('sim-action-output').textContent = 'Could not start: ' + (data.message || data.error || ('HTTP ' + res.status));
+                    return;
+                }
+                watchBulkJob({ id: data.job_id, kind, title, total_items: data.total_items, status: 'running' });
+            } catch (e) {
+                document.getElementById('sim-action-output').textContent = 'Could not start: ' + (e && e.message ? e.message : e);
+            }
+        }
+
+        // After a reload, reopen the newest job this user still has running.
+        async function resumeRunningBulkJob() {
+            try {
+                const res = await fetch(API_BASE + '/bulk-jobs?status=running&limit=1');
+                if (!res.ok) return;
+                const data = await res.json();
+                const job = data && data.ok && data.jobs && data.jobs[0];
+                if (job && !bulkJobWatch) watchBulkJob(job);
+            } catch (e) { /* nothing to resume */ }
         }
 
         function showBulkCancelButton() {
@@ -12733,10 +12807,17 @@ async function sendSimOnline(simId, phoneNumber) {
             const btn = document.getElementById('sim-action-cancel');
             if (btn) { btn.classList.add('hidden'); btn.disabled = false; btn.textContent = 'Cancel remaining'; }
         }
-        function onBulkCancelClick() {
-            window.__bulkCancel = true;
+        async function onBulkCancelClick() {
+            const w = bulkJobWatch;
+            if (!w) return;
             const btn = document.getElementById('sim-action-cancel');
             if (btn) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+            try {
+                await fetch(API_BASE + '/bulk-jobs/' + encodeURIComponent(w.jobId) + '/cancel', { method: 'POST' });
+            } catch (e) {
+                showToast('Cancel failed: ' + (e && e.message ? e.message : e), 'error');
+                if (btn) { btn.disabled = false; btn.textContent = 'Cancel remaining'; }
+            }
         }
 
         async function bulkResetToProvisioning() {
@@ -12844,29 +12925,11 @@ async function sendSimOnline(simId, phoneNumber) {
                 return;
             }
             if (!(await showConfirm('Send Webhooks', 'Send number.online webhook for ' + eligible.length + ' SIM(s)?'))) return;
-            let ok = 0, fail = 0, abirSkipped = 0;
-            for (const sim of eligible) {
-                try {
-                    const resp = await fetch(API_BASE + '/sim-online', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ sim_id: sim.id })
-                    });
-                    const result = await resp.json();
-                    if (resp.ok && result.ok) {
-                        ok++;
-                    } else if (result && result.abir_skipped) {
-                        abirSkipped++;
-                    } else {
-                        fail++;
-                    }
-                } catch { fail++; }
-            }
-            const parts = [ok + ' sent'];
-            if (abirSkipped) parts.push(abirSkipped + ' skipped (stuck on ABIR — force-rotate first)');
-            if (fail) parts.push(fail + ' failed');
-            const tone = fail ? 'error' : (abirSkipped ? 'warning' : 'success');
-            showToast(parts.join(', '), tone);
+            startBulkJob({
+                kind: 'send-online',
+                title: 'Send number.online — ' + eligible.length + ' SIMs',
+                items: eligible.map(sim => ({ sim_id: sim.id, steps: [{ path: '/api/sim-online', body: { sim_id: sim.id } }] }))
+            });
         }
 
         async function unassignReseller(simId) {
@@ -13011,26 +13074,17 @@ async function sendSimOnline(simId, phoneNumber) {
             const assignBtn = document.createElement('button');
             assignBtn.className = 'px-3 py-1.5 text-sm bg-green-700 hover:bg-green-800 text-white rounded transition';
             assignBtn.textContent = 'Assign';
-            assignBtn.onclick = async function() {
+            assignBtn.onclick = function() {
                 const resellerId = parseInt(select.value);
                 modal.remove();
-                let assigned = 0, failed = 0;
-                for (const simId of simIds) {
-                    try {
-                        const resp = await fetch(API_BASE + '/assign-reseller', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ sim_id: simId, reseller_id: resellerId })
-                        });
-                        const result = await resp.json();
-                        if (result.ok) assigned++; else failed++;
-                    } catch (err) {
-                        failed++;
-                    }
-                }
-                if (failed) showToast(assigned + ' assigned, ' + failed + ' failed', 'error');
-                else showToast(assigned + ' SIM(s) assigned to reseller', 'success');
-                loadSims(true);
+                startBulkJob({
+                    kind: 'assign-reseller',
+                    title: 'Bulk Assign Reseller — ' + simIds.length + ' SIMs',
+                    items: simIds.map(simId => ({
+                        sim_id: simId,
+                        steps: [{ path: '/api/assign-reseller', body: { sim_id: simId, reseller_id: resellerId } }]
+                    }))
+                });
             };
             btnRow.appendChild(cancelBtn);
             btnRow.appendChild(assignBtn);
@@ -13077,66 +13131,23 @@ async function sendSimOnline(simId, phoneNumber) {
             const assignBtn = document.createElement('button');
             assignBtn.className = 'px-3 py-1.5 text-sm bg-green-600 hover:bg-green-700 text-white rounded transition';
             assignBtn.textContent = 'Assign & Notify';
-            assignBtn.onclick = async function() {
+            assignBtn.onclick = function() {
                 const resellerId = parseInt(select.value);
                 modal.remove();
-                // Open shared bulk progress modal so user can track per-SIM result
-                const output = document.getElementById('sim-action-output');
-                document.getElementById('sim-action-title').textContent = 'Bulk Assign + Notify — ' + simIds.length + ' SIMs';
-                output.textContent = 'Starting...';
-                output.classList.remove('hidden');
-                document.getElementById('sim-action-logs-section').classList.add('hidden');
-                document.getElementById('sim-action-modal').classList.remove('hidden');
-                window.__bulkCancel = false;
-                showBulkCancelButton();
-                let assigned = 0, notified = 0, failed = 0, cancelled = 0;
-                const lines = [];
-                for (const simId of simIds) {
-                    if (window.__bulkCancel) { cancelled = simIds.length - assigned - failed; break; }
-                    try {
-                        const resp = await fetch(API_BASE + '/assign-reseller', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ sim_id: simId, reseller_id: resellerId })
-                        });
-                        const result = await resp.json();
-                        if (result.ok) {
-                            assigned++;
-                            const simData = tableState.sims.data.find(s => s.id === simId);
-                            if (simData && simData.status === 'active' && simData.phone_number) {
-                                try {
-                                    const onlineResp = await fetch(API_BASE + '/sim-online', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ sim_id: simId })
-                                    });
-                                    const onlineResult = await onlineResp.json();
-                                    if (onlineResp.ok && onlineResult.ok) {
-                                        notified++;
-                                        lines.push('SIM #' + simId + ': assigned + notified');
-                                    } else {
-                                        lines.push('SIM #' + simId + ': assigned, notify FAILED — ' + (onlineResult.error || onlineResp.status));
-                                    }
-                                } catch (e) {
-                                    lines.push('SIM #' + simId + ': assigned, notify EXCEPTION — ' + (e && e.message ? e.message : e));
-                                }
-                            } else {
-                                lines.push('SIM #' + simId + ': assigned (skipped notify — not active or no number)');
-                            }
-                        } else {
-                            failed++;
-                            lines.push('SIM #' + simId + ': FAILED — ' + (result.error || 'unknown'));
+                // Notify only SIMs that are active with a number, as before;
+                // the server runs sim-online only if the assign succeeded.
+                startBulkJob({
+                    kind: 'assign-notify',
+                    title: 'Bulk Assign + Notify — ' + simIds.length + ' SIMs',
+                    items: simIds.map(simId => {
+                        const simData = tableState.sims.data.find(s => s.id === simId);
+                        const steps = [{ path: '/api/assign-reseller', body: { sim_id: simId, reseller_id: resellerId } }];
+                        if (simData && simData.status === 'active' && simData.phone_number) {
+                            steps.push({ path: '/api/sim-online', body: { sim_id: simId } });
                         }
-                    } catch (e) {
-                        failed++;
-                        lines.push('SIM #' + simId + ': EXCEPTION — ' + (e && e.message ? e.message : e));
-                    }
-                    output.textContent = lines.join('\n') + '\n\nProcessing... (' + (assigned + failed) + '/' + simIds.length + ')';
-                }
-                hideBulkCancelButton();
-                const summary = 'Done: ' + assigned + ' assigned, ' + notified + ' notified' + (failed ? ', ' + failed + ' failed' : '') + (cancelled ? ', ' + cancelled + ' cancelled' : '');
-                output.textContent = summary + '\n\n' + lines.join('\n');
-                loadSims(true);
+                        return { sim_id: simId, steps };
+                    })
+                });
             };
             btnRow.appendChild(cancelBtn);
             btnRow.appendChild(assignBtn);
@@ -13214,42 +13225,15 @@ async function sendSimOnline(simId, phoneNumber) {
                 }
                 if (!(await showConfirm('Change IMEI', (isAuto ? 'Auto-assign new IMEI from pool' : 'Change IMEI to ' + manualImei) + ' for ' + simIds.length + ' SIM(s)?'))) return;
                 modal.remove();
-                const output = document.getElementById('sim-action-output');
-                document.getElementById('sim-action-title').textContent = 'Modify IMEI — ' + simIds.length + ' SIM(s)';
-                output.textContent = 'Starting...';
-                output.classList.remove('hidden');
-                document.getElementById('sim-action-logs-section').classList.add('hidden');
-                document.getElementById('sim-action-modal').classList.remove('hidden');
-                let ok = 0, fail = 0;
-                const lines = [];
-                for (const simId of simIds) {
-                    try {
-                        const bodyObj = { sim_id: simId, action: 'change_imei', auto_imei: isAuto };
-                        if (!isAuto) bodyObj.new_imei = manualImei;
-                        const resp = await fetch(API_BASE + '/sim-action', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(bodyObj)
-                        });
-                        const result = await resp.json();
-                        if (result.ok) {
-                            ok++;
-                            const newImei = result.new_imei || result.imei || '';
-                            lines.push('SIM #' + simId + ': OK' + (newImei ? ' — IMEI ' + newImei : ''));
-                        } else {
-                            fail++;
-                            lines.push('SIM #' + simId + ': FAILED — ' + (result.error || 'unknown'));
-                        }
-                    } catch (e) {
-                        fail++;
-                        lines.push('SIM #' + simId + ': ERROR — ' + e.message);
-                    }
-                    output.textContent = lines.join('\n') + '\n\nProcessing... (' + (ok + fail) + '/' + simIds.length + ')';
-                }
-                output.textContent = lines.join('\n') + '\n\nDone: ' + ok + ' success, ' + fail + ' failed';
-                showToast(ok + ' IMEI(s) changed' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'warning' : 'success');
-                loadSims(true);
-                loadImeiPool();
+                startBulkJob({
+                    kind: 'change-imei',
+                    title: 'Modify IMEI — ' + simIds.length + ' SIM(s)',
+                    items: simIds.map(simId => {
+                        const body = { sim_id: simId, action: 'change_imei', auto_imei: isAuto };
+                        if (!isAuto) body.new_imei = manualImei;
+                        return { sim_id: simId, steps: [{ path: '/api/sim-action', body }] };
+                    })
+                });
             };
             btnRow.appendChild(cancelBtn);
             btnRow.appendChild(confirmBtn);
@@ -13398,47 +13382,11 @@ async function sendSimOnline(simId, phoneNumber) {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
             if (!(await showConfirm('Run Action', 'Run ' + label + ' on ' + simIds.length + ' SIM(s)?'))) return;
-            const output = document.getElementById('sim-action-output');
-            document.getElementById('sim-action-title').textContent = 'Bulk ' + label + ' — ' + simIds.length + ' SIMs';
-            output.textContent = 'Starting...';
-            output.classList.remove('hidden');
-            document.getElementById('sim-action-logs-section').classList.add('hidden');
-            document.getElementById('sim-action-modal').classList.remove('hidden');
-            window.__bulkCancel = false;
-            showBulkCancelButton();
-            let ok = 0, fail = 0, cancelled = 0, skipped = 0;
-            const lines = [];
-            for (const simId of simIds) {
-                if (window.__bulkCancel) { cancelled = simIds.length - ok - fail - skipped; break; }
-                try {
-                    const res = await fetch(API_BASE + '/' + endpoint, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ sim_ids: [simId] })
-                    });
-                    const result = await res.json();
-                    const r = Array.isArray(result.results) && result.results.length ? result.results[0] : null;
-                    if (r && r.ok) {
-                        if (r.skipped) { skipped++; lines.push('SIM #' + simId + ': skipped — ' + (r.reason || 'no change needed')); }
-                        else { ok++; lines.push('SIM #' + simId + ': OK'); }
-                    } else {
-                        fail++;
-                        const err = (r && r.error) || result.error || 'unknown';
-                        lines.push('SIM #' + simId + ': FAILED — ' + err);
-                    }
-                } catch (e) {
-                    fail++;
-                    lines.push('SIM #' + simId + ': EXCEPTION — ' + (e && e.message ? e.message : e));
-                }
-                output.textContent = lines.join('\n') + '\n\nProcessing... (' + (ok + fail + skipped) + '/' + simIds.length + ')';
-            }
-            hideBulkCancelButton();
-            const parts = [ok + ' OK'];
-            if (skipped) parts.push(skipped + ' skipped');
-            if (fail) parts.push(fail + ' failed');
-            if (cancelled) parts.push(cancelled + ' cancelled');
-            output.textContent = 'Done: ' + parts.join(', ') + '\n\n' + lines.join('\n');
-            loadSims(true);
+            startBulkJob({
+                kind: 'status-change',
+                title: 'Bulk ' + label + ' — ' + simIds.length + ' SIMs',
+                items: simIds.map(simId => ({ sim_id: simId, steps: [{ path: '/api/' + endpoint, body: { sim_ids: [simId] } }] }))
+            });
         }
 
         function showBulkResellerActionModal() {
@@ -13496,52 +13444,22 @@ async function sendSimOnline(simId, phoneNumber) {
             const simIds = [...document.querySelectorAll('.sim-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
             if (!(await showConfirm('Delete SIMs', 'Permanently delete ' + simIds.length + ' SIM(s)? This deletes all SMS history and CANNOT be undone.'))) return;
-            const output = document.getElementById('sim-action-output');
-            document.getElementById('sim-action-title').textContent = 'Bulk Delete — ' + simIds.length + ' SIMs';
-            output.textContent = 'Starting...';
-            output.classList.remove('hidden');
-            document.getElementById('sim-action-logs-section').classList.add('hidden');
-            document.getElementById('sim-action-modal').classList.remove('hidden');
-            window.__bulkCancel = false;
-            showBulkCancelButton();
-            let deleted = 0, failed = 0, cancelled = 0;
-            const lines = [];
-            for (const simId of simIds) {
-                if (window.__bulkCancel) { cancelled = simIds.length - deleted - failed; break; }
-                try {
-                    const resp = await fetch(API_BASE + '/delete-sim', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ sim_id: simId })
-                    });
-                    const result = await resp.json();
-                    if (result.ok) {
-                        deleted++;
-                        lines.push('SIM #' + simId + ': deleted');
-                    } else {
-                        failed++;
-                        lines.push('SIM #' + simId + ': FAILED — ' + (result.error || 'unknown'));
-                    }
-                } catch (e) {
-                    failed++;
-                    lines.push('SIM #' + simId + ': EXCEPTION — ' + (e && e.message ? e.message : e));
-                }
-                output.textContent = lines.join('\n') + '\n\nProcessing... (' + (deleted + failed) + '/' + simIds.length + ')';
-            }
-            hideBulkCancelButton();
-            const summary = 'Done: ' + deleted + ' deleted' + (failed ? ', ' + failed + ' failed' : '') + (cancelled ? ', ' + cancelled + ' cancelled' : '');
-            output.textContent = summary + '\n\n' + lines.join('\n');
-            loadSims(true);
+            startBulkJob({
+                kind: 'delete-sim',
+                title: 'Bulk Delete — ' + simIds.length + ' SIMs',
+                items: simIds.map(simId => ({ sim_id: simId, steps: [{ path: '/api/delete-sim', body: { sim_id: simId } }] }))
+            });
         }
 
         async function bulkErrorAction(action) {
             const simIds = [...document.querySelectorAll('.error-cb:checked')].map(cb => parseInt(cb.value));
             if (simIds.length === 0) return;
-            if (!(await showConfirm('Run Action', `Run ${action} on ${simIds.length} SIM(s)?`))) return;
-            for (const id of simIds) {
-                await simAction(id, action, true);
-            }
-            loadErrors();
+            if (!(await showConfirm('Run Action', 'Run ' + action + ' on ' + simIds.length + ' SIM(s)?'))) return;
+            startBulkJob({
+                kind: 'error-action',
+                title: 'Bulk ' + action + ' — ' + simIds.length + ' SIMs',
+                items: simIds.map(simId => ({ sim_id: simId, steps: [{ path: '/api/sim-action', body: { sim_id: simId, action } }] }))
+            });
         }
 
         // ===== IMEI Sync/Block =====
@@ -16463,7 +16381,8 @@ async function sendSimOnline(simId, phoneNumber) {
         // and any write-only controls settle before the first interaction.
         // Reaching this file at all means the session was already accepted by
         // the Worker, so a failure here is cosmetic, never a security gap.
-        loadCurrentUser();
+        // Then reopen a bulk job this user left running (viewers cannot start one).
+        loadCurrentUser().then(u => { if (u && u.role !== 'viewer') resumeRunningBulkJob(); });
 
     </script>
         <!-- Add Mapping Modal -->

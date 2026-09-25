@@ -23,6 +23,7 @@ import { renderLoginPage, renderAcceptInvitePage } from '../src/dashboard/auth-p
 import { resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes } from '../src/dashboard/api-keys.mjs';
 import { handleAuditLogQuery } from '../src/dashboard/audit-log.mjs';
 import { handleSavedFilterRoutes } from '../src/dashboard/saved-filters.mjs';
+import { handleBulkJobRoutes } from '../src/dashboard/bulk-jobs.mjs';
 
 const realFetch = globalThis.fetch;
 const realConsole = { log: console.log, error: console.error, warn: console.warn };
@@ -362,12 +363,12 @@ function makeDispatcher(envOverrides = {}) {
     console, Response, URL, URLSearchParams, Request, atob,
     canAccess, requiredRole, apiKeyMayAccess, resolveUser, breakGlassUser, handleAuthRoutes,
     renderLoginPage, renderAcceptInvitePage, resolveApiKeyUser, hasApiKeyHeader, handleApiKeyRoutes,
-    handleAuditLogQuery, handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse,
+    handleAuditLogQuery, handleSavedFilterRoutes, corsHeadersFor, legacyRouteResponse, handleBulkJobRoutes,
     async fetch(u) { throw new Error('legacy route must not reach any fetch: ' + u); },
     env: { DASHBOARD_AUTH: 'admin:test-pass', DASHBOARD_BREAK_GLASS: 'on', SUPABASE_URL: 'https://sb.test', SUPABASE_SERVICE_ROLE_KEY: 'srv', ...envOverrides },
   };
   vm.createContext(sandbox);
-  vm.runInContext(extractFn(DASH_SRC, 'async function handleDashboardRequest(request, env, ctx, audit) {')
+  vm.runInContext(extractFn(DASH_SRC, 'async function handleDashboardRequest(request, env, ctx, audit, asUser) {')
     .replace(/^async function handleDashboardRequest\(/, 'async function dispatch('), sandbox);
   return (req) => sandbox.dispatch(req, sandbox.env);
 }

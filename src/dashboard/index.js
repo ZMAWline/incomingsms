@@ -19,6 +19,7 @@ import { splitSearchTerms } from '../shared/search-terms.mjs';
 import { handlePortinOutcomes, loadLatestPortinOutcomes } from './portin-outcomes.mjs';
 import { parseSimsPageRequest, filterParam, orderParam, parseContentRangeTotal, matchesDerivedFilter, sortByDerived } from './sims-query.mjs';
 import { legacyRouteResponse } from './legacy-routes.mjs';
+import { handleBulkJobRoutes, consumeBulkJobBatch } from './bulk-jobs.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -35,7 +36,12 @@ function normalizeImeiPoolPort(port) {
 //
 // `audit` is a mutable box: the auth block below drops the resolved principal
 // into it, which is the one thing the wrapper cannot work out for itself.
-async function handleDashboardRequest(request, env, ctx, audit) {
+//
+// `asUser` is for in-process callers only: the bulk-job queue consumer
+// (bulk-jobs.mjs) replays a SIM action as the user who started the job. It
+// replaces credential lookup and nothing else; the role matrix, the API-key
+// fence and every route below still apply. No HTTP request can set it.
+async function handleDashboardRequest(request, env, ctx, audit, asUser) {
     const url = new URL(request.url);
 
     // WING gateway-status: external partner endpoint with its own API-key auth.
@@ -64,7 +70,8 @@ async function handleDashboardRequest(request, env, ctx, audit) {
     // ordinary caller. Sessions win when both are presented; a person debugging
     // the agent's key in their own browser should not silently escalate to
     // their own role.
-    const user = (await resolveUser(env, request))
+    const user = asUser
+      || (await resolveUser(env, request))
       || breakGlassUser(env, request)
       || (await resolveApiKeyUser(env, request, ctx));
     const isApiPath = url.pathname.startsWith('/api/');
@@ -152,6 +159,11 @@ async function handleDashboardRequest(request, env, ctx, audit) {
     // callers of any role so a leaked key cannot mint its own replacement.
     const apiKeyResponse = await handleApiKeyRoutes(request, env, url, user);
     if (apiKeyResponse) return apiKeyResponse;
+
+    // Server-side bulk jobs: the SIMs/Errors bulk buttons post their whole
+    // selection here once instead of looping in the browser. See bulk-jobs.mjs.
+    const bulkJobResponse = await handleBulkJobRoutes(request, env, url, user, corsHeaders);
+    if (bulkJobResponse) return bulkJobResponse;
 
     // Who did what. Operator+ by the path-first matrix (not a READ_ROUTE).
     if (url.pathname === '/api/audit-log' && request.method === 'GET') {
@@ -781,6 +793,13 @@ export default {
     await processHostingPortJobs(env, { maxJobs: 1 })
       .then(r => { if (r.claimed) console.log('[HostPort] job drain: ' + JSON.stringify(r)); })
       .catch(e => console.log('[HostPort] job drain failed: ' + (e && e.message || e)));
+  },
+
+  // Bulk-job items (wrangler.toml [[queues.consumers]], one item per message,
+  // one at a time). Each item replays its API call(s) through the dispatcher
+  // above as the user who started the job. See bulk-jobs.mjs.
+  async queue(batch, env, ctx) {
+    await consumeBulkJobBatch(batch, env, ctx, handleDashboardRequest);
   },
 };
 

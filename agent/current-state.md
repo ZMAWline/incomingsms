@@ -23,7 +23,18 @@
 > 2026-09-24: Legacy vendors (Wing IoT, Helix, SkyLine, Kasa) switched OFF behind `LEGACY_VENDORS` instead of deleted (owner decision; PR #134 closed). See "Legacy vendors behind a switch (2026-09-24)".
 > 2026-09-25: Open-items sweep. PR #136 (SIMs Export → Google Sheets, recovered from the 2026-09-18 worktree) merged and DEPLOYED to PROD — dashboard `ebec9d3d`. `deployed/prod` 3e264a3 → a5528e9. The #84 invoice filename gap was already fixed by #127. Google Sheets export is configured and smoke-tested in PROD (#137, `aa290d39`). The unexplained redeploys were Cloudflare Workers Builds on 5 workers, firing on every push to main; triggers deleted 2026-09-25. See "Open-items sweep (2026-09-25)".
 
+> 2026-09-25: Server-side bulk jobs (branch `logperch`). Every per-SIM bulk button now runs on the server from a Cloudflare Queue, so locking the phone no longer fails the rest of the batch. Migration `20260925_bulk_jobs.sql` applied to TEST and PROD, queues `dashboard-bulk-jobs(-test)` created, `dashboard-test` deployed (`f5b01ded`). PROD dashboard NOT deployed yet. See "Server-side bulk jobs (2026-09-25)".
+
 ---
+
+## Server-side bulk jobs (2026-09-25)
+
+- **What changed.** Rotate, Fix, OTA, Cancel, Suspend, Resume, Reactivate, Retry Activation, Modify IMEI, Assign Reseller, Assign + Notify, Send Online, Delete and multi-SIM Query on the SIMs page, plus OTA/Cancel/Resume/Fix on the Errors page, no longer loop in the browser. The browser posts the selection once to `POST /api/bulk-jobs`; the dashboard Worker stores `bulk_jobs` + one `bulk_job_items` row per SIM and sends one message per item to the `dashboard-bulk-jobs` queue. The dashboard's own `queue()` handler replays each item's existing API call through `handleDashboardRequest` as the user who started the job (role matrix, legacy-vendor switch and per-SIM audit rows all apply). Code: `src/dashboard/bulk-jobs.mjs`.
+- **Behaviour.** Items run one at a time across all jobs (`max_concurrency = 1`), like the old loop. The modal polls every 2 s and says it is safe to close; after a reload the newest running job of that user reopens. Cancel stops every item not yet started. An item interrupted mid-run is marked failed with "outcome unknown" after 20 min and is never re-run (no double rotation).
+- **API keys** cannot start bulk jobs (`/api/bulk-jobs` is on `API_KEY_DENIED_ROUTES`).
+- **Verified on TEST 2026-09-25:** a 3-SIM job finished in ~4 s; a 40-item job kept running across a page reload and cancelled cleanly (12 ran, 28 cancelled); audit rows carry the real user per SIM. The temporary TEST operator used for this was deleted.
+- **To ship to PROD:** merge, then `/main-deploy` from the main checkout (dashboard only). The PROD queue `dashboard-bulk-jobs` and the PROD tables already exist.
+- **Not converted (already one request each):** Unassign Reseller, Reset to Provisioning, Send SMS, Hosting Port Check, Resolve Errors, Rotation eligible.
 
 ## Open-items sweep (2026-09-25)
 
@@ -1685,21 +1696,8 @@ To deploy `dashboard-test`, the `kasa-control-test` worker had to be created (wa
 
 **Files:** `src/details-finalizer/index.js` (`runReconciliationSweep` + endpoint + cron branch on `event.cron`), `src/details-finalizer/wrangler.toml` (added `30 10 * * *`), `src/dashboard/index.js` (`/api/rotation-audit`, `/api/rotation-audit/run` via `DETAILS_FINALIZER` service binding, widget on SIMs page), Supabase migration `create_rotation_audit_table`. Deployed: details-finalizer `0c0029ee`, dashboard `2e7a8ed3`.
 
-### Server-side bulk-job pattern for client-driven loops (session 39 — TODO)
-**Problem.** Several dashboard "bulk" actions loop in the browser, issuing one `fetch()` per SIM (`bulkSimAction`, `bulkAssignReseller`, `bulkAssignResellerAndNotify`, `bulkModifyImei`, etc.). When the user locks their phone or backgrounds the tab, the browser suspends timers and drops the radio — every subsequent fetch fails with `TypeError: Failed to fetch`. Today this hit `bulkAssignResellerAndNotify`: ~7 SIMs succeeded before screen-lock, then ~50+ SIMs failed in a row.
-
-**Proposed fix.** Move the loop to the worker side. Pattern:
-1. Client POSTs the full `sim_ids[]` (+ params like `reseller_id`) to a new dashboard endpoint (e.g., `/api/bulk-jobs/assign-and-notify`).
-2. Worker creates a `bulk_jobs` row (id, action, total, ok, fail, status, started_at, lines jsonb), kicks off `ctx.waitUntil(processJob(jobId))`, returns `{job_id}` immediately.
-3. `processJob` loops server-side calling existing `/assign-reseller` + `/sim-online` handlers via service binding (or refactored shared helpers), updates the `bulk_jobs` row each iteration.
-4. Client polls `GET /api/bulk-jobs/:id` (~2s interval) and renders into the existing `sim-action-modal` (lines + counters + Cancel — same UI). Cancel sets `bulk_jobs.cancel_requested=true`; loop checks it.
-5. Closing the tab/locking the phone is now harmless — work continues on Cloudflare; reopening the tab resumes polling.
-
-**Scope decision pending.** Start with `bulkAssignResellerAndNotify` only (highest pain — multi-call per SIM), or refactor all bulk actions in one pass? The current per-button shape would need `action` + per-action handler dispatch in `processJob`.
-
-**Affected files (when implemented):** `src/dashboard/index.js` (new endpoint + new `bulkAssignResellerAndNotifyServerSide()` + polling helper), one new migration for `bulk_jobs` table.
-
-**Workaround until then:** keep the dashboard tab in the foreground with the screen on for the duration of any bulk action.
+### Server-side bulk-job pattern for client-driven loops (session 39) — DONE 2026-09-25
+Implemented for every per-SIM bulk button; see "Server-side bulk jobs (2026-09-25)" at the top.
 
 ### `number.offline` webhook + ABIR online suppression (session 37 → 38) — **Live in prod**
 All four workers shipped + verified 2026-04-28. Latest deploys:
