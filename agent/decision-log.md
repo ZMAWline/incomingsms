@@ -1393,3 +1393,15 @@ everywhere by adding one registry entry.
 **Decision:** The Activation Runs page became Runs (`/runs`). Its list reads the `dashboard_runs` view (UNION of `activation_runs` and `bulk_jobs` with per-job item counts) through `GET /api/runs`; each row keeps its own detail view (`/api/activation-runs/:id`, `/api/bulk-jobs/:id?all=1`). The activation-only list endpoint was removed.
 **Why:** The owner wants one place to see every run with its run ID and source, and to click into per-SIM lines. The two run types have different detail data (activation items carry IMEI, attempts and carrier logs; bulk items carry replayed API steps), so merging the tables would lose detail for one or the other; a view gives one sorted, paginated list without that.
 **Consequence:** A new kind of run shows on the page by adding a UNION branch to `dashboard_runs` and a detail view keyed by `run_type`. Viewers can read runs (`/api/runs`, `GET /api/bulk-jobs/*` are READ_ROUTES); starting and cancelling stay operator-only.
+
+## 2026-09-29 — Branch cleanup
+
+Deleted 7 remote branches whose work is already on main (squash-merged: #139 logperch, #140 runs-page, #122 rotation fix, #138 supersedes feat/trustotp-weekly-invoice), already fixed on main (patch-dashboard skill), notes copied into current-state.md (trustotp recon notes), or against the keep-legacy-vendors rule (chore/remove-legacy-vendors). Recover any with `git push origin <sha>:refs/heads/<branch>`:
+
+- runs-page 1c9170e522d9115ca929c8a0175b292a7ec165b4
+- logperch de89b965017ce310c93457977b709ab0083b4ea9
+- worktree-trustotp-recon-notes 9da37cacf05ffaeae525d5e4638010752c35cde1
+- chore/remove-legacy-vendors 8658f99f49c0073611616b6fd381e8be04dae865
+- fix/patch-dashboard-skill-stale c0481b38eb64751df3bcaa4987eb6ae3b5d5cd31
+- feat/trustotp-weekly-invoice e08709266a5a5c574bc1697f7d9c35fdb4be4b8c
+- fix/rotation-stamp-and-db-write-checks 3bf195095a27b534897edb4d08342d83cc5c0640
