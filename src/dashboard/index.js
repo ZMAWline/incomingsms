@@ -45,6 +45,13 @@ function normalizeImeiPoolPort(port) {
 async function handleDashboardRequest(request, env, ctx, audit, asUser) {
     const url = new URL(request.url);
 
+    // Intuit's OAuth redirect after QuickBooks consent: a plain browser
+    // navigation with no dashboard session, so it must run BEFORE the auth
+    // gate. The quickbooks Worker rejects any `state` it did not issue.
+    if (url.pathname === '/api/qbo/callback' && request.method === 'GET') {
+      return handleQboCallback(env, url);
+    }
+
     // WING gateway-status: external partner endpoint with its own API-key auth.
     // Must run BEFORE the operator Basic-auth gate so WING never needs operator creds.
     if (url.pathname === '/api/gateway-status') {
@@ -506,6 +513,15 @@ async function handleDashboardRequest(request, env, ctx, audit, asUser) {
 
     if (url.pathname === '/api/imei-gateway-sync' && request.method === 'POST') {
       return handleImeiGatewaySync(request, env, corsHeaders);
+    }
+
+    // Admin-only (portal-auth ADMIN_ONLY_ALL). Open /api/qbo/connect in a
+    // browser to (re)connect QuickBooks; /api/qbo/status confirms it.
+    if (url.pathname === '/api/qbo/connect' && request.method === 'GET') {
+      return handleQboConnect(env);
+    }
+    if (url.pathname === '/api/qbo/status' && request.method === 'GET') {
+      return handleQboStatus(env, corsHeaders);
     }
 
     if (url.pathname === '/api/qbo-mappings' && request.method === 'GET') {
@@ -7700,30 +7716,27 @@ async function handleFixIncompatibleImei(request, env, corsHeaders) {
   }
 }
 
-async function handleQboRoute(request, env, corsHeaders, url) {
-  try {
-    if (!env.QUICKBOOKS) return new Response(JSON.stringify({ error: 'QUICKBOOKS binding not configured' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+// The quickbooks Worker has no public URL; these reach it via the service binding.
+async function handleQboConnect(env) {
+  const res = await env.QUICKBOOKS.fetch('https://quickbooks/auth-url');
+  const { url } = await res.json();
+  return Response.redirect(url, 302);
+}
 
-    const qboPath = url.pathname.replace('/api/qbo', '');
-    const qboUrl = new URL(`https://quickbooks${qboPath}${url.search}`);
+async function handleQboCallback(env, url) {
+  const res = await env.QUICKBOOKS.fetch(`https://quickbooks/callback${url.search}`);
+  return new Response(res.body, {
+    status: res.status,
+    headers: { 'Content-Type': res.headers.get('Content-Type') || 'application/json' },
+  });
+}
 
-    const workerResponse = await env.QUICKBOOKS.fetch(qboUrl.toString(), {
-      method: request.method,
-      headers: request.headers,
-      body: request.method !== 'GET' ? await request.text() : undefined,
-    });
-
-    const responseText = await workerResponse.text();
-    return new Response(responseText, {
-      status: workerResponse.status,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: String(error) }), {
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-    });
-  }
+async function handleQboStatus(env, corsHeaders) {
+  const res = await env.QUICKBOOKS.fetch('https://quickbooks/status');
+  return new Response(res.body, {
+    status: res.status,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
 }
 
 async function handleSimWebhooks(env, corsHeaders, url) {

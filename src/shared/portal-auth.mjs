@@ -168,7 +168,7 @@ export function isValidRole(role) {
 // the sense a user account is; src/dashboard/api-keys.mjs adds the second half
 // of that fence, refusing the route to API keys of any role so a leaked key
 // cannot mint its own replacement.
-const ADMIN_ONLY_ALL = ['/api/users', '/api/invites', '/api/keys'];
+const ADMIN_ONLY_ALL = ['/api/users', '/api/invites', '/api/keys', '/api/qbo/'];
 
 // Money. Readable by anyone logged in, mutable only by admins.
 const ADMIN_ONLY_WRITE = [
