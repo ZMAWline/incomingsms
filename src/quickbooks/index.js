@@ -15,7 +15,7 @@ export default {
     try {
       // OAuth: get authorization URL
       if (url.pathname === '/auth-url') {
-        return handleAuthUrl(env);
+        return await handleAuthUrl(env);
       }
 
       // OAuth: callback with authorization code
@@ -88,13 +88,21 @@ function relayFetch(env, url, init, send = carrierFetch) {
 
 // ===== OAuth Handlers =====
 
-function handleAuthUrl(env) {
+// The callback is reachable without a login (Intuit's redirect is a plain
+// browser navigation), so it only accepts a `state` this Worker issued in the
+// last 10 minutes. Without that check anyone could complete consent for their
+// own QuickBooks company and have it stored as ours.
+const OAUTH_STATE_TTL_SECONDS = 600;
+
+async function handleAuthUrl(env) {
+  const state = crypto.randomUUID();
+  await env.QBO_TOKENS.put(`oauth_state:${state}`, '1', { expirationTtl: OAUTH_STATE_TTL_SECONDS });
   const params = new URLSearchParams({
     client_id: env.QBO_CLIENT_ID,
     response_type: 'code',
     scope: 'com.intuit.quickbooks.accounting',
     redirect_uri: env.QBO_REDIRECT_URI,
-    state: crypto.randomUUID(),
+    state,
   });
   return json({ url: `${QBO_AUTH_URL}?${params}` });
 }
@@ -102,9 +110,15 @@ function handleAuthUrl(env) {
 async function handleCallback(url, env) {
   const code = url.searchParams.get('code');
   const realmId = url.searchParams.get('realmId');
+  const state = url.searchParams.get('state');
+
+  if (!state || !(await env.QBO_TOKENS.get(`oauth_state:${state}`))) {
+    return json({ error: 'Unknown or expired state. Start again from /api/qbo/connect on the dashboard.' }, 400);
+  }
+  await env.QBO_TOKENS.delete(`oauth_state:${state}`);
 
   if (!code || !realmId) {
-    return json({ error: 'Missing code or realmId' }, 400);
+    return json({ error: 'Missing code or realmId', intuit_error: url.searchParams.get('error') }, 400);
   }
 
   const tokenRes = await relayFetch(env, QBO_TOKEN_URL, {
