@@ -3,16 +3,20 @@ main = "index.js"
 compatibility_date = "2024-01-01"
 account_id = "5313f8b98e20a8915418b2683ad7278c"
 # No public URL: only the dashboard reaches this Worker, via its QUICKBOOKS
-# service binding. The OAuth callback enters through dashboard /api/qbo/callback.
+# service binding.
 workers_dev = false
 
 [observability.logs]
 enabled = true
 invocation_logs = true
 
-[[kv_namespaces]]
-binding = "QBO_TOKENS"
-id = "49d0ca1276af457d80907876b2c53775"
+# QuickBooks access is the owner's Composio connection (see index.js).
+# COMPOSIO_API_KEY is a secret: `npx wrangler secret put COMPOSIO_API_KEY`.
+[vars]
+COMPOSIO_ORG_ID = "ok_5eczhoDdDSpF"
+COMPOSIO_PROJECT_ID = "pr_EeP6iHeAG5V9"
+COMPOSIO_USER_ID = "consumer-307052ff-cc7d-4efc-b9f5-c0d04f25821b-ok_5eczhoDdDSpF"
+COMPOSIO_CONNECTED_ACCOUNT_ID = "ca_eT3qsHkOYV3V"
 
 # ============ TEST ENVIRONMENT ============
 [env.test]
@@ -23,6 +27,5 @@ workers_dev = false
 enabled = true
 invocation_logs = true
 
-[[env.test.kv_namespaces]]
-binding = "QBO_TOKENS"
-id = "49d0ca1276af457d80907876b2c53775"
+# No Composio vars or key in TEST: the only QuickBooks company is the real
+# one, so quickbooks-test fails closed instead of touching live invoices.
