@@ -45,13 +45,6 @@ function normalizeImeiPoolPort(port) {
 async function handleDashboardRequest(request, env, ctx, audit, asUser) {
     const url = new URL(request.url);
 
-    // Intuit's OAuth redirect after QuickBooks consent: a plain browser
-    // navigation with no dashboard session, so it must run BEFORE the auth
-    // gate. The quickbooks Worker rejects any `state` it did not issue.
-    if (url.pathname === '/api/qbo/callback' && request.method === 'GET') {
-      return handleQboCallback(env, url);
-    }
-
     // WING gateway-status: external partner endpoint with its own API-key auth.
     // Must run BEFORE the operator Basic-auth gate so WING never needs operator creds.
     if (url.pathname === '/api/gateway-status') {
@@ -515,11 +508,8 @@ async function handleDashboardRequest(request, env, ctx, audit, asUser) {
       return handleImeiGatewaySync(request, env, corsHeaders);
     }
 
-    // Admin-only (portal-auth ADMIN_ONLY_ALL). Open /api/qbo/connect in a
-    // browser to (re)connect QuickBooks; /api/qbo/status confirms it.
-    if (url.pathname === '/api/qbo/connect' && request.method === 'GET') {
-      return handleQboConnect(env);
-    }
+    // Admin-only (portal-auth ADMIN_ONLY_ALL): is the Composio QuickBooks
+    // connection the quickbooks Worker uses still active?
     if (url.pathname === '/api/qbo/status' && request.method === 'GET') {
       return handleQboStatus(env, corsHeaders);
     }
@@ -7716,21 +7706,7 @@ async function handleFixIncompatibleImei(request, env, corsHeaders) {
   }
 }
 
-// The quickbooks Worker has no public URL; these reach it via the service binding.
-async function handleQboConnect(env) {
-  const res = await env.QUICKBOOKS.fetch('https://quickbooks/auth-url');
-  const { url } = await res.json();
-  return Response.redirect(url, 302);
-}
-
-async function handleQboCallback(env, url) {
-  const res = await env.QUICKBOOKS.fetch(`https://quickbooks/callback${url.search}`);
-  return new Response(res.body, {
-    status: res.status,
-    headers: { 'Content-Type': res.headers.get('Content-Type') || 'application/json' },
-  });
-}
-
+// The quickbooks Worker has no public URL; it is reached via the service binding.
 async function handleQboStatus(env, corsHeaders) {
   const res = await env.QUICKBOOKS.fetch('https://quickbooks/status');
   return new Response(res.body, {

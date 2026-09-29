@@ -2,10 +2,11 @@
 //
 // The durable Friday job for the TrustOTP / HYPPE TECH weekly invoice. It uses
 // the dashboard billing engine (computeBillingBreakdown) as the source of truth
-// for line items, and creates + sends the invoice through the native
-// `quickbooks` Worker (src/quickbooks/index.js, bound as env.QUICKBOOKS on the
-// dashboard) — the already-deployed, in-repo QuickBooks Online integration,
-// not an external SaaS dependency.
+// for line items, and creates the invoice through the `quickbooks` Worker
+// (src/quickbooks/index.js, bound as env.QUICKBOOKS on the dashboard), which
+// reaches QuickBooks through the owner's Composio connection. QuickBooks emails
+// the invoice to the customer the moment it is created; this module reads the
+// invoice back and records it as 'sent' only when QuickBooks says EmailSent.
 //
 // Idempotency:
 //  - One local qbo_invoices row per (qbo_customer_map_id, week_start), enforced
@@ -14,10 +15,9 @@
 //  - Before creating in QBO, it also queries QBO directly for an Invoice with
 //    the same DocNumber, so a crash between "QBO create succeeded" and "local
 //    row written" can never produce a duplicate QBO invoice on retry.
-//  - Sending is gated the same way: a local row already marked 'sent' is never
-//    re-sent. A row that is 'created' but not yet 'sent' (e.g. create
-//    succeeded, send failed, or crashed in between) is sent on retry without
-//    creating a second invoice.
+//  - A local row already marked 'sent' is skipped. A row that is 'created' but
+//    not 'sent' is re-checked on retry; if QuickBooks still does not report
+//    EmailSent the run throws so a person looks, and nothing is created twice.
 //
 // NOTE: computeBillingBreakdown is imported lazily (not at module top) so
 // callers can inject env.computeBillingBreakdown for testing and so the module
@@ -250,22 +250,26 @@ export async function runTrustotpWeeklyInvoice(env, { dry_run = true, latestEnd 
     }
   }
 
-  // ---- Send (never twice — guarded above by local.status === 'sent') ----
-  const sentInvoice = await qbo(env, `/invoice/${encodeURIComponent(qboInvoiceId)}/send`, { method: 'POST' });
+  // ---- Confirm QuickBooks emailed it (it does so on create) ----
+  const invoice = await qbo(env, `/invoice/${encodeURIComponent(qboInvoiceId)}`);
+  if (invoice.emailStatus !== 'EmailSent') {
+    await patchLocalInvoice(env, local.id, { email_status: invoice.emailStatus || null });
+    throw new Error(`QBO invoice ${qboInvoiceId} (${docNumber}) was not emailed: EmailStatus=${invoice.emailStatus}`);
+  }
 
   await patchLocalInvoice(env, local.id, {
     status: 'sent',
-    email_status: sentInvoice.emailStatus || 'EmailSent',
-    sent_at: new Date().toISOString(),
+    email_status: invoice.emailStatus,
+    sent_at: invoice.deliveredAt || new Date().toISOString(),
   });
 
   return {
     created,
     sent: true,
     week: { start, end },
-    docNumber: sentInvoice.docNumber || docNumber,
+    docNumber: invoice.docNumber || docNumber,
     qboInvoiceId,
-    emailStatus: sentInvoice.emailStatus,
+    emailStatus: invoice.emailStatus,
     totalSimDays,
     totalAmount,
   };
