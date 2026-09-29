@@ -165,9 +165,15 @@ export async function runTrustotpWeeklyInvoice(env, { dry_run = true, latestEnd 
   const docNumber = docNumberFor(start, end);
 
   const computeBillingBreakdown = env.computeBillingBreakdown || (await import('./billing.js')).computeBillingBreakdown;
-  const breakdown = await computeBillingBreakdown(env, { resellerId, start, end });
+  // TrustOTP is billed in rental mode: it reproduces invoice 1450 (week
+  // 2026-09-04..09-10) to the cent. The default legacy SIM-day mode undercounts
+  // this customer by ~8%.
+  const breakdown = await computeBillingBreakdown(env, { resellerId, start, end, billing_mode: 'rental' });
   if (!breakdown.mapping) {
     throw new Error('No customer rate configured for TrustOTP reseller (qbo_customer_map missing)');
+  }
+  if (breakdown.rate_fallback_used) {
+    throw new Error(`TrustOTP ${start}..${end}: a carrier rate is missing and the fallback rate was used; not invoicing`);
   }
   const mapping = breakdown.mapping;
   const days = breakdown.days;
@@ -220,7 +226,7 @@ export async function runTrustotpWeeklyInvoice(env, { dry_run = true, latestEnd 
           customerMemo: `Weekly US Business phone Rental invoice for ${start} to ${end}.`,
           lineItems: days.map((d) => ({
             itemId,
-            description: d.date,
+            description: `${d.date} ${String(d.carrier || '').toUpperCase()} rentals`, // matches invoices 1199–1450
             quantity: d.sim_count,
             rate: d.rate,
             amount: d.amount,
