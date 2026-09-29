@@ -84,21 +84,23 @@ test('invoice read-back maps email status and delivery time; the send route is g
 
 // ---- TrustOTP weekly run ----
 
-function weeklyEnv(emailStatus, qboPaths) {
+function weeklyEnv(emailStatus, qboPaths, created = []) {
   return {
     SUPABASE_URL: 'https://sb', SUPABASE_SERVICE_ROLE_KEY: 'k',
-    computeBillingBreakdown: async () => ({
+    computeBillingBreakdown: async (_env, opts) => ({
+      billing_mode: opts.billing_mode,
       mapping: { id: 1, qbo_customer_id: '42' },
-      days: [{ date: '2026-09-25', sim_count: 2, rate: 1.1, amount: 2.2 }],
+      days: [{ date: '2026-09-25', carrier: 'att', sim_count: 2, rate: 1.1, amount: 2.2 }],
       total_sim_days: 2, total_amount: 2.2,
     }),
     QUICKBOOKS: {
-      async fetch(url) {
+      async fetch(url, init) {
+        const req = new Request(url, init);
         const path = new URL(url).pathname;
         qboPaths.push(path);
         if (path === '/invoice/query') return Response.json([]);
         if (path === '/items/search') return Response.json([{ id: '7', name: 'US Business phone Rental', active: true }]);
-        if (path === '/invoice/create') return Response.json({ id: '1500', docNumber: 'INV-X' });
+        if (path === '/invoice/create') { created.push(await req.json()); return Response.json({ id: '1500', docNumber: 'INV-X' }); }
         if (path === '/invoice/1500') return Response.json({ id: '1500', docNumber: 'INV-X', emailStatus, deliveredAt: emailStatus === 'EmailSent' ? '2026-10-02T13:00:00-04:00' : undefined });
         return Response.json({ error: 'Not found' }, { status: 404 });
       },
@@ -135,4 +137,25 @@ test('weekly run throws and does not mark sent when QuickBooks did not email it'
     const patches = calls.filter((c) => c.method === 'PATCH').map((c) => c.body);
     assert.ok(patches.every((p) => p.status !== 'sent'));
   });
+});
+
+test('weekly run bills in rental mode with carrier line descriptions', async () => {
+  const qboPaths = [];
+  const created = [];
+  let mode;
+  const env = weeklyEnv('EmailSent', qboPaths, created);
+  const inner = env.computeBillingBreakdown;
+  env.computeBillingBreakdown = async (e, opts) => { mode = opts.billing_mode; return inner(e, opts); };
+  await withFetch((c) => supabase([c]), async () => {
+    await runTrustotpWeeklyInvoice(env, { dry_run: false, latestEnd: '2026-09-24' });
+  });
+  assert.equal(mode, 'rental');
+  assert.equal(created[0].lineItems[0].description, '2026-09-25 ATT rentals');
+});
+
+test('weekly run refuses to invoice when a fallback rate was used', async () => {
+  const env = weeklyEnv('EmailSent', []);
+  const inner = env.computeBillingBreakdown;
+  env.computeBillingBreakdown = async (e, opts) => ({ ...(await inner(e, opts)), rate_fallback_used: true });
+  await assert.rejects(runTrustotpWeeklyInvoice(env, { dry_run: false, latestEnd: '2026-09-24' }), /fallback rate/);
 });
