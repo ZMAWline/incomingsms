@@ -1405,3 +1405,5 @@ Deleted 7 remote branches whose work is already on main (squash-merged: #139 log
 - fix/patch-dashboard-skill-stale c0481b38eb64751df3bcaa4987eb6ae3b5d5cd31
 - feat/trustotp-weekly-invoice e08709266a5a5c574bc1697f7d9c35fdb4be4b8c
 - fix/rotation-stamp-and-db-write-checks 3bf195095a27b534897edb4d08342d83cc5c0640
+- chore/recover-unimplemented-specs b0bac3e2e44e252b622e7517dde2e037a6d0ccda (deleted: 2 specs for features never built, both fail on main)
+- chore/atomic-sim-query-export-script merged into main (script only, no worker change, no deploy needed)
