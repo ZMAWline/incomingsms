@@ -30,9 +30,7 @@ const DEFAULTS = {
 // number, otherwise the default above.
 /** @param {TimeoutEnv | null | undefined} env @param {keyof typeof DEFAULTS} kind */
 export function timeoutFor(env, kind) {
-  /** @type {keyof TimeoutEnv} */
-  const key = `FETCH_TIMEOUT_${kind}_MS`;
-  const override = Number(env && env[key]);
+  const override = Number(env && env[/** @type {keyof TimeoutEnv} */ ('FETCH_TIMEOUT_' + kind + '_MS')]);
   return override > 0 ? override : DEFAULTS[kind];
 }
 
