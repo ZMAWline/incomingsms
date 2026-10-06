@@ -1456,6 +1456,14 @@ binding changes and no live operations.
 
 **Consequence:** Use `npm run check` before shipping: incremental strict type checking, all Worker bundles, browser/server syntax and tests. Annotate additional modules with `// @ts-check` as they are made type-safe; the rest of the JavaScript is not yet checked. Pricing edits reject impossible dates, non-finite prices and overlapping inclusive tiers; existing stored rates are not rewritten. Multi-step billing operations remain non-transactional and are not automatically retried. This work is local to `repo-ai-slop-vibe`, not deployed.
 
+## 2026-10-06 — Enforce remaining-admin access in the database
+
+**Decision:** Keep the friendly application preflight check, but enforce the invariant with statement-level database triggers on dashboard user updates and deletes. A private singleton guard row serializes statements that reduce the active-admin count. Count transition-table administrators rather than joining on user IDs so primary-key changes cannot bypass the check. A zero-admin result raises `last_active_dashboard_admin`, rolls back the statement and maps to HTTP 409 in the dashboard.
+
+**Why:** Separate requests can both pass an application count before either commits. An advisory lock alone also leaves REPEATABLE READ transactions using stale snapshots. Updating the shared guard row forces a serialization failure in that isolation mode; at READ COMMITTED the following count sees the previous holder's commit. Atomic handovers that preserve the number of active administrators remain allowed. Password/login updates do not contend on the guard row.
+
+**Validation:** An isolated PostgreSQL cluster exercised actual concurrent demotion, disabling and deletion under both isolation modes. Bulk removal, primary-key changes and handovers were tested; TEST enforcement was verified inside a rollback-only subtransaction. Migration installed through Supabase MCP on TEST then PROD before the dashboard deployment. Do not remove the database guard when changing the user-management API.
+
 ## 2026-09-29 — Branch cleanup
 
 Deleted 7 remote branches whose work is already on main (squash-merged: #139 logperch, #140 runs-page, #122 rotation fix, #138 supersedes feat/trustotp-weekly-invoice), already fixed on main (patch-dashboard skill), notes copied into current-state.md (trustotp recon notes), or against the keep-legacy-vendors rule (chore/remove-legacy-vendors). Recover any with `git push origin <sha>:refs/heads/<branch>`:
