@@ -1394,6 +1394,41 @@ everywhere by adding one registry entry.
 **Why:** The owner wants one place to see every run with its run ID and source, and to click into per-SIM lines. The two run types have different detail data (activation items carry IMEI, attempts and carrier logs; bulk items carry replayed API steps), so merging the tables would lose detail for one or the other; a view gives one sorted, paginated list without that.
 **Consequence:** A new kind of run shows on the page by adding a UNION branch to `dashboard_runs` and a detail view keyed by `run_type`. Viewers can read runs (`/api/runs`, `GET /api/bulk-jobs/*` are READ_ROUTES); starting and cancelling stay operator-only.
 
+## 2026-10-06 — Sequential, behavior-preserving auth refactor
+
+**Decision:** Run child agents one at a time for planning, backend extraction,
+browser extraction, then regression tests. Keep `auth-routes.mjs` as the public
+router/facade; split its implementation by session, invitation, profile and
+user-administration responsibility. Keep the central request gate, shared
+crypto/role policy and API-key implementation intact. Browser account controls
+move to a synchronous classic script served behind the existing asset gate.
+
+**Why:** Smaller modules make subsequent auth changes reviewable without
+mixing structural movement with changes to authentication behavior. Existing
+exports, route order and browser handler names remain compatible. Browser
+tests execute local scripts in document order rather than assuming the whole
+application is inline.
+
+**Follow-up findings, not fixed in this refactor:** Session revocation writes
+in logout, password change and user administration do not check response
+status. Malformed percent-encoding in a cookie can throw. Invalid stored
+expiry strings are not rejected by the current date comparison. A non-OK
+`/auth/me` response can leave an earlier browser user state in place. Last-admin
+protection performs a separate read and update, so concurrent demotions are
+not transactionally protected. Address these with dedicated behavior changes
+and regression tests; do not treat the structural extraction as fixing them.
+
+**Deployment:** Local working tree only; no schema, schedule, secrets or service
+binding changes and no live operations.
+
+## 2026-10-06 — Dashboard billing boundaries and local verification
+
+**Decision:** Customer invoices, pricing administration and carrier bill reconciliation live in separate modules under `src/dashboard/billing/`. The central dispatcher retains authentication, authorization and audit logging. Shared billing calculations remain shared with the reseller portal. Billing database writes use bounded transport and reject non-success responses.
+
+**Why:** The dashboard entry point had grown beyond 10,000 lines. Several billing writes ignored database failures, and source-text tests made safe movement harder. New endpoint tests bundle the real Worker and mock its external I/O, checking observable responses and side effects.
+
+**Consequence:** Use `npm run check` before shipping: incremental strict type checking, all Worker bundles, browser/server syntax and tests. Annotate additional modules with `// @ts-check` as they are made type-safe; the rest of the JavaScript is not yet checked. Pricing edits reject impossible dates, non-finite prices and overlapping inclusive tiers; existing stored rates are not rewritten. Multi-step billing operations remain non-transactional and are not automatically retried. This work is local to `repo-ai-slop-vibe`, not deployed.
+
 ## 2026-09-29 — Branch cleanup
 
 Deleted 7 remote branches whose work is already on main (squash-merged: #139 logperch, #140 runs-page, #122 rotation fix, #138 supersedes feat/trustotp-weekly-invoice), already fixed on main (patch-dashboard skill), notes copied into current-state.md (trustotp recon notes), or against the keep-legacy-vendors rule (chore/remove-legacy-vendors). Recover any with `git push origin <sha>:refs/heads/<branch>`:

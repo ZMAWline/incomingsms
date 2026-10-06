@@ -12,5 +12,5 @@
     "esModuleInterop": true,
     "isolatedModules": true
   },
-  "include": ["src/**/*.ts", "src/**/*.js", ".dev.vars"]
+  "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.mjs"]
 }

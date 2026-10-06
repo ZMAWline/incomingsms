@@ -77,16 +77,50 @@ printf '%s' "$VALUE" | npx wrangler secret put NAME
 ## Tests
 
 ```bash
-npm test
+npm ci
+npm run check
 ```
 
-Runs every `tests/*.test.mjs` file with Node's built-in test runner. After
-any dashboard change, also run both syntax checks:
+`check` runs strict type checking for modules marked `// @ts-check`, compiles
+all 19 Workers, checks the dashboard's server and browser syntax, and runs
+every `tests/*.test.mjs` file. It requires no production credentials and does
+not deploy. The same command runs on pull requests and before deployment.
+
+Type checking is incremental: request validation, billing input validation
+and the shared timeout transport are checked today. Other JavaScript remains
+unchecked until it is annotated; `strict: true` alone does not check it.
+
+For a targeted test run, use `node --test tests/<name>.test.mjs`; `npm test`
+runs the full test suite. The dashboard syntax checks are also available alone:
 
 ```bash
 node --input-type=module --check < src/dashboard/index.js   # Worker module
 node scripts/check-frontend-js.js                            # inline <script> blocks in public/index.html
 ```
+
+Dashboard billing is organized under `src/dashboard/billing/`: `invoices.mjs`
+owns customer invoices and downloads, `rates.mjs` owns pricing administration,
+and `ledger.mjs` owns carrier bills and reconciliation. Authentication and
+route dispatch stay in `index.js`; billing calculations remain shared with
+the reseller portal in `src/shared/billing.js` and `rentals.js`.
+
+New endpoint tests should load the real Worker using
+`tests/helpers/load-worker.mjs`, substitute external responses, and assert
+results and side effects. Avoid extracting functions with string offsets.
+
+Dashboard authentication is routed through `src/dashboard/auth-routes.mjs`.
+Its implementation is split under `src/dashboard/auth/`: `session.mjs` handles
+login/logout and session lookup, `invites.mjs` handles invitations,
+`profile.mjs` handles self-service credentials, and `users.mjs` handles user
+administration. Shared request/cookie helpers live in `common.mjs`; crypto and
+role policy remain in `src/shared/portal-auth.mjs`. The dashboard request gate
+and API-key restrictions still apply centrally.
+
+Browser account controls live in `public/static/dashboard-auth.js`, loaded
+as a classic script before the main application script. Keep that order and
+its existing global handlers until the inline application is migrated.
+`scripts/dashboard-scripts.cjs` loads inline/local scripts in document order
+for syntax checking and browser test harnesses; it does not fetch CDN scripts.
 
 ## Deploying
 

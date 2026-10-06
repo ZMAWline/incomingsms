@@ -1,3 +1,4 @@
+import { readDashboardScripts } from '../scripts/dashboard-scripts.cjs';
 // 2026-09-25: the Activation Runs page became the Runs page (/runs, loadRuns,
 // runsPage), listing activation runs and bulk jobs together. The history below
 // predates the rename; the same boot-order rules apply to the new names.
@@ -97,15 +98,7 @@ test('no bare fmt(...) date-formatter call remains in the runs renderers (fmt is
 //    /api/sims fails at the same time, proving the failure is isolated.
 // ---------------------------------------------------------------------
 
-function extractAllInlineScripts(html) {
-  const re = /<script>([\s\S]*?)<\/script>/g;
-  let js = '';
-  let m;
-  while ((m = re.exec(html))) js += m[1] + '\n;\n';
-  return js.replace('__HELIX_ENABLED__', 'false');
-}
-
-const FRONTEND_JS = extractAllInlineScripts(HTML);
+const FRONTEND_SCRIPTS = readDashboardScripts(HTML_PATH);
 
 function makeClassList() {
   const set = new Set();
@@ -209,7 +202,7 @@ async function bootDashboard(pathname, fetchRoutes) {
 
   let syncThrow = null;
   try {
-    vm.runInContext(FRONTEND_JS, sandbox, { filename: 'dashboard-inline-script.js' });
+    for (const { source, filename } of FRONTEND_SCRIPTS) vm.runInContext(source, sandbox, { filename });
   } catch (e) {
     syncThrow = e;
   }

@@ -1,3 +1,4 @@
+import { readDashboardScripts } from '../scripts/dashboard-scripts.cjs';
 // Regression tests for the port-in "default random subscriber info" +
 // "reseller dropdown applies to every row" UI work: by default a port-in
 // line needs no manual name/address entry (server auto-fills a random
@@ -53,15 +54,7 @@ test('markup: the standalone port-in reseller ID text box has been removed (supe
 //    dashboard-activation-runs-boot-render.test.mjs.
 // ---------------------------------------------------------------------
 
-function extractAllInlineScripts(html) {
-  const re = /<script>([\s\S]*?)<\/script>/g;
-  let js = '';
-  let m;
-  while ((m = re.exec(html))) js += m[1] + '\n;\n';
-  return js.replace('__HELIX_ENABLED__', 'false');
-}
-
-const FRONTEND_JS = extractAllInlineScripts(HTML);
+const FRONTEND_SCRIPTS = readDashboardScripts(HTML_PATH);
 
 function makeClassList(initial) {
   const set = new Set(initial || []);
@@ -162,7 +155,7 @@ async function bootDashboard(fetchRoutes) {
 
   let syncThrow = null;
   try {
-    vm.runInContext(FRONTEND_JS, sandbox, { filename: 'dashboard-inline-script.js' });
+    for (const { source, filename } of FRONTEND_SCRIPTS) vm.runInContext(source, sandbox, { filename });
   } catch (e) {
     syncThrow = e;
   }

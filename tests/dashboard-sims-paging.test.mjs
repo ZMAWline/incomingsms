@@ -31,12 +31,7 @@ function extractFn(signature) {
   throw new Error('unterminated function: ' + signature);
 }
 
-function extractHelpers() {
-  const start = SRC.indexOf('// ── Request values bound for a PostgREST URL');
-  const end = SRC.indexOf('async function supabaseGet(env, path, extraHeaders) {');
-  assert.ok(start !== -1 && end > start, 'helper block not found');
-  return SRC.slice(start, end);
-}
+import * as requestHelpers from '../src/dashboard/request.mjs';
 
 const HANDLERS = [
   'async function supabaseGet(env, path, extraHeaders) {',
@@ -54,6 +49,7 @@ const json = (body, headers = {}) => new Response(JSON.stringify(body), { status
 function makeSandbox(respond = () => null) {
   const calls = [];
   const sandbox = {
+    ...requestHelpers,
     console,
     Response,
     URL,
@@ -68,7 +64,7 @@ function makeSandbox(respond = () => null) {
     },
   };
   vm.createContext(sandbox);
-  vm.runInContext([extractHelpers(), ...HANDLERS.map(extractFn)].join('\n\n'), sandbox);
+  vm.runInContext(HANDLERS.map(extractFn).join('\n\n'), sandbox);
   return { sandbox, calls };
 }
 

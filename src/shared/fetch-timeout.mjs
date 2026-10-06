@@ -1,3 +1,4 @@
+// @ts-check
 // =========================================================
 // Bounded outbound fetch for every worker.
 //
@@ -23,10 +24,15 @@ const DEFAULTS = {
   WEBHOOK: WEBHOOK_TIMEOUT_MS,
 };
 
+/** @typedef {Partial<Record<'FETCH_TIMEOUT_CARRIER_MS' | 'FETCH_TIMEOUT_SUPABASE_MS' | 'FETCH_TIMEOUT_WEBHOOK_MS', string | number>>} TimeoutEnv */
+
 // Timeout for a call class: env.FETCH_TIMEOUT_<KIND>_MS when it is a positive
 // number, otherwise the default above.
+/** @param {TimeoutEnv | null | undefined} env @param {keyof typeof DEFAULTS} kind */
 export function timeoutFor(env, kind) {
-  const override = Number(env && env['FETCH_TIMEOUT_' + kind + '_MS']);
+  /** @type {keyof TimeoutEnv} */
+  const key = `FETCH_TIMEOUT_${kind}_MS`;
+  const override = Number(env && env[key]);
   return override > 0 ? override : DEFAULTS[kind];
 }
 
@@ -34,6 +40,7 @@ export function timeoutFor(env, kind) {
 // describe the real target. Query strings never appear: they can carry API
 // keys (Teltik apikey=). Webhook paths are dropped too: a Slack webhook path
 // is itself the secret.
+/** @param {RequestInfo | URL} url @param {RequestInit | undefined} init @param {boolean} withPath */
 function describe(url, init, withPath) {
   const method = (init && init.method) || 'GET';
   try {
@@ -49,6 +56,7 @@ function describe(url, init, withPath) {
 // fetch() that rejects with `<label> timeout after <ms>ms` when no response
 // headers arrive within timeoutMs. The timer is cleared once headers arrive,
 // so it bounds the connect-and-respond wait, not a slow body read.
+/** @param {RequestInfo | URL} url @param {RequestInit} [init] @param {{timeoutMs?: number, label?: string}} [options] */
 export async function fetchWithTimeout(url, init = {}, { timeoutMs, label } = {}) {
   const ctrl = new AbortController();
   const message = (label || describe(url, init, false)) + ' timeout after ' + timeoutMs + 'ms';
@@ -63,6 +71,7 @@ export async function fetchWithTimeout(url, init = {}, { timeoutMs, label } = {}
   }
 }
 
+/** @param {TimeoutEnv} env @param {RequestInfo | URL} url @param {RequestInit} [init] */
 export function supabaseFetch(env, url, init) {
   return fetchWithTimeout(url, init, {
     timeoutMs: timeoutFor(env, 'SUPABASE'),
@@ -70,6 +79,7 @@ export function supabaseFetch(env, url, init) {
   });
 }
 
+/** @param {TimeoutEnv} env @param {RequestInfo | URL} url @param {RequestInit} [init] */
 export function carrierFetch(env, url, init) {
   return fetchWithTimeout(url, init, {
     timeoutMs: timeoutFor(env, 'CARRIER'),
@@ -77,6 +87,7 @@ export function carrierFetch(env, url, init) {
   });
 }
 
+/** @param {TimeoutEnv} env @param {RequestInfo | URL} url @param {RequestInit} [init] */
 export function webhookFetch(env, url, init) {
   return fetchWithTimeout(url, init, {
     timeoutMs: timeoutFor(env, 'WEBHOOK'),
