@@ -18,28 +18,59 @@ function deferred() {
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const quiet = { error() {} };
 
-for (const fail of [false, true]) {
-  test(`SIMs start while summary is pending, even when summary ${fail ? 'fails' : 'succeeds'}`, async () => {
-    const summary = deferred();
-    const calls = [];
-    const sandbox = {
-      console: quiet, API_BASE: '/api', AbortController,
-      setTimeout: () => 1, clearTimeout() {},
-      hydrateSimsFromUrl() {},
-      loadSims: () => calls.push('sims'), loadMessages: () => calls.push('messages'),
-      fetch: () => summary.promise,
-      document: { getElementById: () => ({}) },
-      updateActiveRing() {}, renderDashboardCharts() {}, renderFreshness() {}, showToast() {},
-    };
-    vm.createContext(sandbox);
-    vm.runInContext(source('async function loadData() {', 'function renderFreshness('), sandbox);
-    const pending = sandbox.loadData();
-    assert.deepEqual(calls, ['sims', 'messages']);
-    summary.resolve(new Response(JSON.stringify({ total_sims: 4 }), { status: fail ? 500 : 200 }));
-    await pending;
-    assert.deepEqual(calls, ['sims', 'messages'], 'summary completion must not load the table twice');
-  });
+// loadData() reloads only the tab on screen; other tabs load when opened.
+function refreshHarness(tab) {
+  const calls = [];
+  const sandbox = {
+    console: quiet, API_BASE: '/api', AbortController, lastSimsFetchedAt: 123,
+    setTimeout: () => 1, clearTimeout() {},
+    hydrateSimsFromUrl() {},
+    loadSims: (force) => calls.push('sims:' + force), loadMessages: () => calls.push('messages'),
+    loadMessagesPreview: () => calls.push('preview'),
+    switchTab: (name, push) => calls.push('switchTab:' + name + ':' + push),
+    fetch: (u) => { calls.push('fetch:' + u); return Promise.resolve(new Response('{}', { status: 200 })); },
+    document: {
+      getElementById: () => ({}),
+      querySelector: () => ({ id: 'tab-' + tab }),
+    },
+    updateActiveRing() {}, renderDashboardCharts() {}, renderFreshness() {}, showToast() {},
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source('function activeTabName() {', 'function renderFreshness('), sandbox);
+  return { sandbox, calls };
 }
+
+test('Dashboard refresh loads the summary and the 5-message preview, not the SIMs table', async () => {
+  const { sandbox, calls } = refreshHarness('dashboard');
+  await sandbox.loadData();
+  assert.deepEqual(calls, ['preview', 'fetch:/api/stats']);
+});
+
+test('SIMs refresh loads only the SIMs page', async () => {
+  const { sandbox, calls } = refreshHarness('sims');
+  await sandbox.loadData();
+  assert.deepEqual(calls, ['sims:true']);
+});
+
+test('Messages refresh loads only the messages page', async () => {
+  const { sandbox, calls } = refreshHarness('messages');
+  await sandbox.loadData();
+  assert.deepEqual(calls, ['messages']);
+});
+
+test('any other tab re-runs its own loader and invalidates the cached SIMs page', async () => {
+  const { sandbox, calls } = refreshHarness('runs');
+  await sandbox.loadData();
+  assert.deepEqual(calls, ['switchTab:runs:false']);
+  assert.equal(sandbox.lastSimsFetchedAt, 0);
+});
+
+test('boot loads nothing until a tab opens it', () => {
+  const boot = html.slice(html.indexOf('setInterval(function () {'), html.indexOf("try { initTabFromUrl(); }"));
+  assert.doesNotMatch(boot, /^\s*loadData\(\);/m, 'no unconditional loadData() at boot');
+  assert.match(html, /if \(tabName === 'dashboard'\) loadDashboardHome\(\);/);
+  assert.match(html, /if \(tabName === 'messages'\) loadMessages\(\);/);
+});
 
 function tableHarness() {
   const sides = [];
