@@ -2,6 +2,18 @@
 
 > This is a living document. Update it when things break, get fixed, or change meaningfully.
 
+## Current handoff — 2026-10-06
+
+Read [Claude handoff and pending tasks](claude-handoff-2026-10-06.md) before acting on older notes below. Billing/auth refactoring, auth failure handling, SIM loading improvements and the database last-admin guard are merged and deployed. The last-admin race is resolved. Owner confirms the dashboard works and the SIMs table feels faster. Latest deployed code is `c99c777`, dashboard version `fa07d6d2-8e4b-4607-99a3-ce57c10c2b2b`; main also contains documentation commits after that deploy. Last full check passed 1,324 tests and compiled 19 Workers.
+
+Pending engineering work: systematic signed-in browser verification; bounded transport and failure semantics for SIM statistics RPCs; review login-throttle concurrency; explicit recovery for partial billing operations; continue the overhaul in focused modules with strict typing added gradually. Other Workers have not been refactored by this session. The 2026-10-06 rotation report also records aged stuck SIMs and operator/bad-rental backlogs; refresh those counts before any remediation.
+
+Production deployments must run from an up-to-date main checkout at `/root/projects/incomingsms`. Build in task worktrees. No credential values are included in the handoff.
+
+## Release history and earlier project notes
+
+Older “not deployed,” “last-admin unresolved,” OAuth, test-entrypoint and rollout statements describe their original session. Use the current handoff and newer release records to resolve contradictions; do not turn every historical TODO into a new action without checking current code/live state.
+
 > 2026-10-06 (last-admin race RESOLVED, DEPLOYED from main `c99c777`): Migration `20261006_preserve_last_dashboard_admin.sql` applied separately to TEST and PROD through official Supabase MCP `apply_migration`. Statement triggers serialize active-admin removals through a private guard row, reject removal of the final admin and roll back the whole statement. Worker maps the guard error to HTTP 409. Real isolated PostgreSQL tests passed concurrent demotion/disable/delete at READ COMMITTED and REPEATABLE READ, bulk rollback, atomic admin handover, primary-key changes, login updates, idempotent migration and privilege checks. TEST rollback-only enforcement check passed. PROD read-only verification confirms both triggers and unchanged one-user/one-active-admin counts. All 1,324 tests and build/type/syntax/DB-literal checks passed on main. Dashboard version `fa07d6d2-8e4b-4607-99a3-ce57c10c2b2b` verified at 100% traffic; deployed bundle contains guard error mapping; login page returns 200. `deployed/prod` moved `e5dde5f` → `c99c777`. Earlier notes calling this race unresolved are superseded.
 
 > 2026-10-06 (SIM table load performance, DEPLOYED from main `e5dde5f`): SIMs/messages requests now start independently of dashboard `/stats`. Ready SIM rows no longer await fleet-wide status counts and facets; these update filter controls asynchronously without rendering the rows again. Four deferred-response tests cover slow/failed summary, slow fleet counts and superseded requests. All 1,322 tests, builds, type/syntax and DB-literal checks passed on main. Dashboard version `2a1604e2-4530-4b7e-9c3c-ee068b7f914f` verified at 100% traffic; changed `/index.html` asset upload confirmed, public login returns 200. `deployed/prod` moved `404986c` → `e5dde5f`. No production signed-in latency measurement; backend SIM query and statistics aggregation costs remain unchanged.

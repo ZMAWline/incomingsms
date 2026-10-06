@@ -14,6 +14,7 @@ Owner/operator: Zalmen. Repository checks run on pull requests; dashboard PRs al
 
 1. **This file** — orientation + rules + maintenance protocol
 2. **`agent/current-state.md`** — what's broken, what's in progress right now
+   Read **`agent/claude-handoff-2026-10-06.md`** for the current overhaul status and ordered pending tasks. Its current snapshot supersedes contradictory historical notes.
 3. **`agent/project-map.md`** — if you need to understand a specific worker or data flow
 4. **`agent/constraints.md`** — before touching the dashboard or DB schema
 5. **`agent/decision-log.md`** — before questioning why something was built a certain way
@@ -49,7 +50,7 @@ CF Workers cannot reach CF-proxied origins (causes HTTP 522). The relay at `rela
 `wrangler deploy` REPLACES the whole worker with the current working copy. It is not a patch. So deploying from a checkout that is behind `main` silently reverts every commit that checkout never saw -- tests pass, nothing errors, a working feature just stops working. That is the 2026-06-12 `RENTAL_CAPTURE_ENABLED` revert (`agent/current-state.md`), and the `fix/atomic-portin-finalizer-record` branch that sat unmerged for weeks while the carrier backlog grew.
 The sequence, every time: work in your own worktree -> `git fetch origin && git rebase origin/main` (this is the step that pulls the other agents' work in) -> re-run `npm test` **after** the rebase -> merge to `main` -> deploy from a `main` checkout. To see your own branch running without touching production, use `scripts/deploy.sh <worker> --env test`.
 `scripts/deploy.sh` now enforces this: a production deploy from a non-`main` or behind-`main` checkout is refused outright. The override is `ALLOW_UNSAFE_DEPLOY=1` and it means "I accept that I may be reverting other work in production" -- never use it to get past a refusal you did not read.
-**The DB is not worktree-isolated.** There is one Supabase instance and no copies of it. Additive migrations (new column, new index, new function) are safe to land while another agent is mid-task. Renames, drops, type changes and function-signature changes are not -- the other agent's running code still expects the old shape and breaks the moment the migration lands. Hold those until the parallel work has merged, then do them in one pass.
+**The DB is not worktree-isolated.** PROD is Supabase project `lzjqegxazqlktttyybth`; TEST is the separate project `lwapudjjlwkskijefxdz`. Worktrees do not get private databases: sessions targeting the same project share its schema and data. Worker secret values still need verification before assuming a particular preview is pointed at TEST, and TEST has schema gaps (including the historically missing rentals table). ATOMIC has no sandbox; TEST Workers can still act on the live carrier account. Additive migrations (new column, new index, new function) are generally compatible with parallel code. Renames, drops, type changes and function-signature changes can break another agent's running code immediately. Coordinate those after parallel work has merged.
 
 ---
 
