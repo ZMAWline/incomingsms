@@ -189,6 +189,24 @@ test('last active admin cannot be demoted; disabling another user requests immed
 });
 
 const invitation = () => ({ id: 'invite-1', role: 'operator', expires_at: new Date(Date.now() + 3600000).toISOString(), consumed_at: null });
+test('database rejection of a concurrent last-admin update returns conflict without revoking sessions', async () => {
+  session.dashboard_users.role = 'admin';
+  expect('dashboard_users', 'GET', [{ id: 'user-2', role: 'admin', status: 'active' }]);
+  // The preflight saw another admin, but a concurrent transaction removed it.
+  expect('dashboard_users', 'GET', [{ id: 'user-1' }, { id: 'user-2' }]);
+  expect('dashboard_users', 'PATCH', { code: 'P0001', message: 'last_active_dashboard_admin' }, null, 400);
+  const response = await request('/api/users/user-2', { auth: true, body: { role: 'viewer' } });
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error, /last active admin/);
+});
+
+test('unrelated database update failures remain server errors', async () => {
+  session.dashboard_users.role = 'admin';
+  expect('dashboard_users', 'GET', [{ id: 'user-2', role: 'viewer', status: 'active' }]);
+  expect('dashboard_users', 'PATCH', { code: 'P0001', message: 'unrelated failure' }, null, 400);
+  assert.equal((await request('/api/users/user-2', { auth: true, body: { status: 'disabled' } })).status, 500);
+});
+
 const acceptance = { token: 'invitation-token', username: ' NewUser ', password };
 test('invites reject malformed expiry without creating an account', async () => {
   for (const expires_at of ['invalid', '', null, 123]) {
