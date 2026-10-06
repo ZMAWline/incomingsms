@@ -368,11 +368,14 @@ test('12h cron + manual run endpoint exist and share the sweep implementation', 
 });
 
 test('/api/sims returns latest persisted host-port status + uptime from the summary RPC', () => {
-  assert.match(DASHBOARD_SRC, /rpc\/get_hosting_port_status_summary/);
-  assert.match(DASHBOARD_SRC, /hosting_port_state: hp \? hp\.last_state : null/);
-  assert.match(DASHBOARD_SRC, /hosting_port_checked_at/);
-  assert.match(DASHBOARD_SRC, /hosting_port_checks_24h/);
-  assert.match(DASHBOARD_SRC, /hosting_port_online_7d/);
+  // The stats loader lives in sim-stats.mjs; dashboard-sim-stats.test.mjs runs it.
+  const SIM_STATS_SRC = read('src', 'dashboard', 'sim-stats.mjs');
+  assert.match(DASHBOARD_SRC, /simStatFields\(sim\.id, stats\)/);
+  assert.match(SIM_STATS_SRC, /'get_hosting_port_status_summary'/);
+  assert.match(SIM_STATS_SRC, /hosting_port_state: hp \? hp\.last_state : null/);
+  assert.match(SIM_STATS_SRC, /hosting_port_checked_at/);
+  assert.match(SIM_STATS_SRC, /hosting_port_checks_24h/);
+  assert.match(SIM_STATS_SRC, /hosting_port_online_7d/);
 });
 
 // --- UI --------------------------------------------------------------------

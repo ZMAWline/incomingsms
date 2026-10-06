@@ -37,6 +37,8 @@ import { handleSavedFilterRoutes } from './saved-filters.mjs';
 import { splitSearchTerms } from '../shared/search-terms.mjs';
 import { handlePortinOutcomes, loadLatestPortinOutcomes } from './portin-outcomes.mjs';
 import { parseSimsPageRequest, filterParam, orderParam, parseContentRangeTotal, matchesDerivedFilter, sortByDerived } from './sims-query.mjs';
+import { loadSimStats, simStatFields, statSourceFor } from './sim-stats.mjs';
+import { sbRpc } from '../shared/supabase-rest.mjs';
 import { legacyRouteResponse } from './legacy-routes.mjs';
 import { handleBulkJobRoutes, consumeBulkJobBatch } from './bulk-jobs.mjs';
 import { handleRunsList } from './runs.mjs';
@@ -1265,7 +1267,17 @@ async function handleSims(env, corsHeaders, url) {
         // filter, sort and page here.
         const candidates = await supabaseGetAllArray(env, `sims_dashboard?select=id,gateway_host,vendor${where}&${orderParam(req)}`);
         stats = await loadSimStats(env, candidates);
-        let rows = candidates.map(s => ({ id: s.id, ...simStatFields(s.id, stats.smsMap, stats.hostPortMap) }));
+        // Filtering or sorting on stats that failed to load would treat every
+        // SIM as having none, so refuse rather than return a wrong page.
+        const needed = [...req.derivedFilters.map(f => f.col), ...(req.sort.derived ? [req.sort.key] : [])];
+        const missing = [...new Set(needed.map(statSourceFor))].filter(src => stats.unavailable.includes(src));
+        if (missing.length) {
+          return new Response(JSON.stringify({ error: `${missing.map(src => src === 'sms' ? 'SMS' : 'Host port').join(' and ')} statistics are unavailable right now. Retry, or remove that filter or sort.` }), {
+            status: 503,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          });
+        }
+        let rows = candidates.map(s => ({ id: s.id, ...simStatFields(s.id, stats) }));
         rows = rows.filter(r => req.derivedFilters.every(f => matchesDerivedFilter(r, f, req.now)));
         if (req.sort.derived) rows = sortByDerived(rows, req.sort.key, req.dir, req.now);
         const pageIds = rows.slice(offset, offset + req.pageSize).map(r => r.id);
@@ -1314,7 +1326,7 @@ async function handleSims(env, corsHeaders, url) {
         rotation_pause_reason: sim.rotation_pause_reason || null,
         offline_state: sim.offline_state || 'online',
         offline_since: sim.offline_since || null,
-        ...simStatFields(sim.id, stats.smsMap, stats.hostPortMap),
+        ...simStatFields(sim.id, stats),
       };
     });
 
@@ -1327,107 +1339,12 @@ async function handleSims(env, corsHeaders, url) {
   }
 }
 
-// SMS-in-24h and Teltik hosting-port status for a list of SIMs, from two
-// DB-side aggregation RPCs, chunked into batches of 500 sim_ids per call.
-// PostgREST caps response rows at 1000, so a single call with every sim_id
-// silently truncates once >1000 SIMs have rows.
-//
-// The two RPC groups depend only on the sim id list, never on each other,
-// so they are launched together and awaited once.
-async function loadSimStats(env, sims) {
-  const CHUNK = 500;
-  const chunkIds = (ids) => {
-    const out = [];
-    for (let i = 0; i < ids.length; i += CHUNK) out.push(ids.slice(i, i + CHUNK));
-    return out;
-  };
-  const rpcHeaders = {
-    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-    Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-  };
-  const callRpc = (rpcPath, simIdChunk) => fetch(env.SUPABASE_URL + '/rest/v1/' + rpcPath, {
-    method: 'POST',
-    headers: rpcHeaders,
-    body: JSON.stringify({ sim_ids: simIdChunk }),
-  });
-
-  const simIds = sims.map(s => s.id);
-  const teltikHostedIds = sims
-    .filter(s => s.gateway_host === 'teltik' || (!s.gateway_host && s.vendor === 'teltik'))
-    .map(s => s.id);
-
-  const smsPromise = simIds.length === 0
-    ? Promise.resolve([])
-    : Promise.all(chunkIds(simIds).map(chunk =>
-        callRpc('rpc/get_sms_counts_24h', chunk).then(r => r.json())
-      ));
-
-  // Latest persisted Teltik hosting port status + uptime stats, derived from
-  // the canonical hosting_port_status_checks history across ALL check
-  // sources. A missing RPC/table (pre-migration) or a transient failure
-  // degrades to nulls rather than failing the whole SIMs request.
-  const hostPortPromise = teltikHostedIds.length === 0
-    ? Promise.resolve([])
-    : Promise.all(chunkIds(teltikHostedIds).map(chunk =>
-        callRpc('rpc/get_hosting_port_status_summary', chunk).then(r => r.ok ? r.json() : null)
-      )).catch(() => []);
-
-  const [smsResponses, hpResponses] = await Promise.all([smsPromise, hostPortPromise]);
-
-  const smsMap = {}; // sim_id -> { count, last_received }
-  for (const rows of smsResponses) {
-    if (!Array.isArray(rows)) continue;
-    for (const row of rows) {
-      smsMap[row.sim_id] = { count: Number(row.sms_count), last_received: row.last_received };
-    }
-  }
-
-  const hostPortMap = {}; // sim_id -> get_hosting_port_status_summary row
-  for (const rows of hpResponses) {
-    if (!Array.isArray(rows)) continue;
-    for (const row of rows) hostPortMap[row.sim_id] = row;
-  }
-  return { smsMap, hostPortMap };
-}
-
-// The stats fields /api/sims returns for a SIM, from the two RPC maps.
-function simStatFields(simId, smsMap, hostPortMap) {
-  const sms = smsMap[simId] || { count: 0, last_received: null };
-  const hp = hostPortMap[simId] || null;
-  return {
-    sms_count: sms.count,
-    last_sms_received: sms.last_received,
-    hosting_port_state: hp ? hp.last_state : null,
-    hosting_port_checked_at: hp ? hp.last_checked_at : null,
-    hosting_port_source: hp ? hp.last_source : null,
-    hosting_port_mdn: hp ? hp.last_mdn : null,
-    hosting_port_mdn_source: hp ? hp.last_mdn_source : null,
-    hosting_port_error: hp ? hp.last_error : null,
-    hosting_port_checks_24h: hp ? hp.checks_24h : 0,
-    hosting_port_online_24h: hp ? hp.online_24h : 0,
-    hosting_port_checks_7d: hp ? hp.checks_7d : 0,
-    hosting_port_online_7d: hp ? hp.online_7d : 0,
-  };
-}
-
 // GET /api/sims/facets — { column: { value: count } } over the whole fleet for
 // the SIMs filter menus, from one GROUP BY in the database. The table only
 // holds one page, so counting loaded rows would count that page.
 async function handleSimsFacets(env, corsHeaders) {
   try {
-    const resp = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/sims_dashboard_facets', {
-      method: 'POST',
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: 'Bearer ' + env.SUPABASE_SERVICE_ROLE_KEY,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: '{}',
-    });
-    const facets = await supabaseJson(resp);
+    const facets = await sbRpc(env, 'sims_dashboard_facets', {});
     return new Response(JSON.stringify({ ok: true, facets: facets || {} }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });

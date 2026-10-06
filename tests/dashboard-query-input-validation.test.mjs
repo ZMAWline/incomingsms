@@ -17,6 +17,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import * as simsQuery from '../src/dashboard/sims-query.mjs';
+import * as simStats from '../src/dashboard/sim-stats.mjs';
 import * as requestHelpers from '../src/dashboard/request.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -47,8 +48,6 @@ const HANDLERS = [
   'async function supabaseGetAllArray(env, pathWithoutLimit) {',
   'async function sbGet(env, path) {',
   'async function handleSims(env, corsHeaders, url) {',
-  'async function loadSimStats(env, sims) {',
-  'function simStatFields(simId, smsMap, hostPortMap) {',
   'async function handleErrors(env, corsHeaders, url) {',
   'async function handleSimOnline(request, env, corsHeaders) {',
   'async function handleAtomicSwapSim(request, env, corsHeaders) {',
@@ -67,6 +66,7 @@ function makeSandbox(respond = () => null) {
     logSystemError: async () => {}, // handleSimAction logs failures; not under test
     ...simsQuery, // handleSims imports its query builder from sims-query.mjs
     loadLatestPortinOutcomes: async () => new Map(), // imported from portin-outcomes.mjs
+    ...simStats, // imported from sim-stats.mjs
     async fetch(url) {
       const u = String(url);
       calls.push(u);
@@ -77,6 +77,8 @@ function makeSandbox(respond = () => null) {
   };
   vm.createContext(sandbox);
   vm.runInContext(HANDLERS.map(extractFn).join('\n\n'), sandbox);
+  // sim-stats.mjs calls Supabase through the shared transport's global fetch.
+  globalThis.fetch = sandbox.fetch;
   return { sandbox, calls };
 }
 
