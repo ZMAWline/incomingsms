@@ -1,3 +1,4 @@
+import { readDashboardScripts } from '../scripts/dashboard-scripts.cjs';
 // Regression tests for a live user report on dashboard-test.zalmen-531.workers.dev:
 // the Activation Runs UI truncated errors so badly (CSS max-w+truncate on the
 // item row, and no rendering at all of the run-level `error` column) that the
@@ -29,15 +30,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HTML_PATH = path.join(__dirname, '..', 'src', 'dashboard', 'public', 'index.html');
 const HTML = fs.readFileSync(HTML_PATH, 'utf8');
 
-function extractAllInlineScripts(html) {
-  const re = /<script>([\s\S]*?)<\/script>/g;
-  let js = '';
-  let m;
-  while ((m = re.exec(html))) js += m[1] + '\n;\n';
-  return js.replace('__HELIX_ENABLED__', 'false');
-}
-
-const FRONTEND_JS = extractAllInlineScripts(HTML);
+const FRONTEND_SCRIPTS = readDashboardScripts(HTML_PATH);
 
 function makeClassList() {
   const set = new Set();
@@ -133,7 +126,7 @@ async function bootDashboard(fetchRoutes) {
   sandbox.window = sandbox;
   vm.createContext(sandbox);
 
-  vm.runInContext(FRONTEND_JS, sandbox, { filename: 'dashboard-inline-script.js' });
+  for (const { source, filename } of FRONTEND_SCRIPTS) vm.runInContext(source, sandbox, { filename });
   for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
 
   return { sandbox, elementCache };

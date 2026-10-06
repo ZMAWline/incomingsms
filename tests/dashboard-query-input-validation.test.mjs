@@ -17,6 +17,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import * as simsQuery from '../src/dashboard/sims-query.mjs';
+import * as requestHelpers from '../src/dashboard/request.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -39,12 +40,6 @@ function extractFn(signature) {
 
 // The helper block: parsePositiveInt, the allow-lists, badRequest,
 // SupabaseError, supabaseJson and errorResponse.
-function extractHelpers() {
-  const start = SRC.indexOf('// ── Request values bound for a PostgREST URL');
-  const end = SRC.indexOf('async function supabaseGet(env, path, extraHeaders) {');
-  assert.ok(start !== -1 && end > start, 'helper block not found');
-  return SRC.slice(start, end);
-}
 
 const HANDLERS = [
   'async function supabaseGet(env, path, extraHeaders) {',
@@ -65,6 +60,7 @@ const HANDLERS = [
 function makeSandbox(respond = () => null) {
   const calls = [];
   const sandbox = {
+    ...requestHelpers,
     console,
     Response,
     URL,
@@ -80,7 +76,7 @@ function makeSandbox(respond = () => null) {
     },
   };
   vm.createContext(sandbox);
-  vm.runInContext([extractHelpers(), ...HANDLERS.map(extractFn)].join('\n\n'), sandbox);
+  vm.runInContext(HANDLERS.map(extractFn).join('\n\n'), sandbox);
   return { sandbox, calls };
 }
 

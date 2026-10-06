@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { UUID_RE, badRequest } from '../src/dashboard/request.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -36,6 +37,7 @@ function makeSandbox(routes) {
   const calls = [];
   const bindingCalls = [];
   const sandbox = {
+    UUID_RE, badRequest,
     console, Response, URL, URLSearchParams,
     async fetch(url, init) {
       const u = String(url);
@@ -48,8 +50,6 @@ function makeSandbox(routes) {
   };
   vm.createContext(sandbox);
   const code = [
-    SRC.match(/^const UUID_RE = .*$/m)[0],
-    extractFn(SRC, 'function badRequest(corsHeaders, error) {'),
     extractFn(SRC, 'async function supabaseGet(env, path, extraHeaders) {'),
     extractFn(SRC, 'async function handleActivationRunRetry(request, env, corsHeaders) {'),
   ].join('\n\n');

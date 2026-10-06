@@ -97,8 +97,8 @@ is_production_deploy() {
 }
 
 run_checks() {
-  echo "==> Running test suite"
-  npm test
+  echo "==> Checking types, Worker builds, dashboard syntax and tests"
+  npm run check
   echo "==> Running DB constraint drift check"
   npm run check:db-constraints
 }
@@ -174,4 +174,3 @@ fi
 run_checks
 deploy_one "$WORKER" "$@"
 echo "==> Done. Remember: production cron/queue changes need explicit operator approval."
-

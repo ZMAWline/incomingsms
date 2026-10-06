@@ -57,13 +57,10 @@ jobs:
           node-version: '20'
 
       - name: Install npm dependencies
-        run: npm ci || npm install
+        run: npm ci
 
-      - name: Install test bundler
-        run: npm install --no-save esbuild
-
-      - name: Run dashboard-safe tests
-        run: npm test
+      - name: Run repository checks
+        run: npm run check
 
       - name: Dry-run dashboard test deploy
         run: npx wrangler deploy --config src/dashboard/wrangler.toml --env test --dry-run
