@@ -1353,21 +1353,39 @@ async function handleSimsFacets(env, corsHeaders) {
   }
 }
 
+// GET /api/messages — one page of inbound SMS, newest first by default.
+//   ?page (1-based, default 1)  ?page_size (1-500, default 50)
+//   ?sort (received_at | to_number | from_number | body)  ?dir (asc | desc)
+//   ?search  substring / identifier search, as before
+// Answers { rows, page, page_size, has_more }. One extra row is read to tell
+// whether a next page exists, so no full-table count runs.
+const MESSAGE_SORTS = ['received_at', 'to_number', 'from_number', 'body'];
+
 async function handleMessages(env, corsHeaders, url) {
   try {
     const baseSelect = 'select=id,to_number,from_number,body,received_at,sim_id,sims(iccid)';
-    const search = ((url && url.searchParams && url.searchParams.get('search')) || '').trim();
+    const params = url.searchParams;
+    const search = (params.get('search') || '').trim();
+    const page = params.has('page') ? parsePositiveInt(params.get('page')) : 1;
+    const pageSize = params.has('page_size') ? parsePositiveInt(params.get('page_size')) : 50;
+    const sort = params.get('sort') || 'received_at';
+    const dir = params.get('dir') || 'desc';
+    if (!page) return badRequest(corsHeaders, 'page must be a positive whole number');
+    if (!pageSize || pageSize > 500) return badRequest(corsHeaders, 'page_size must be 1-500');
+    if (!MESSAGE_SORTS.includes(sort)) return badRequest(corsHeaders, 'sort must be one of ' + MESSAGE_SORTS.join(', '));
+    if (dir !== 'asc' && dir !== 'desc') return badRequest(corsHeaders, 'dir must be asc or desc');
+    const pageQuery = `&order=${sort}.${dir},id.${dir}&limit=${pageSize + 1}&offset=${(page - 1) * pageSize}`;
 
     let queryPath;
     if (!search) {
-      queryPath = `inbound_sms?${baseSelect}&order=received_at.desc&limit=500`;
+      queryPath = `inbound_sms?${baseSelect}${pageQuery}`;
     } else {
       // Also splits on spaces when every token looks like an identifier, so a
       // typed or mobile-pasted number list is several terms rather than one
       // long non-matching string. Free text with spaces stays one substring.
       const terms = splitSearchTerms(search, 10);
       if (!terms.length) {
-        return new Response(JSON.stringify([]), {
+        return new Response(JSON.stringify({ rows: [], page, page_size: pageSize, has_more: false }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
       }
@@ -1397,7 +1415,7 @@ async function handleMessages(env, corsHeaders, url) {
       if (simIds.size) {
         predicates.push(`sim_id.in.(${[...simIds].join(',')})`);
       }
-      queryPath = `inbound_sms?${baseSelect}&or=(${predicates.join(',')})&order=received_at.desc&limit=2000`;
+      queryPath = `inbound_sms?${baseSelect}&or=(${predicates.join(',')})${pageQuery}`;
     }
 
     const response = await supabaseGet(env, queryPath);
@@ -1408,7 +1426,7 @@ async function handleMessages(env, corsHeaders, url) {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
-    const formatted = messages.map(msg => ({
+    const rows = messages.slice(0, pageSize).map(msg => ({
       id: msg.id,
       to_number: msg.to_number,
       from_number: msg.from_number,
@@ -1418,7 +1436,7 @@ async function handleMessages(env, corsHeaders, url) {
       iccid: msg.sims?.iccid || null
     }));
 
-    return new Response(JSON.stringify(formatted), {
+    return new Response(JSON.stringify({ rows, page, page_size: pageSize, has_more: messages.length > pageSize }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
     });
   } catch (error) {
@@ -4994,8 +5012,18 @@ async function handleErrorLogs(env, corsHeaders, url) {
       }
     }
 
-    // Query helix_api_logs by iccid with correct column names
-    const query = `carrier_api_logs?select=id,step,iccid,imei,vendor,request_url,request_method,request_body,response_status,response_ok,response_body_json,response_body_text,error,created_at&iccid=eq.${encodeURIComponent(lookupIccid)}&order=created_at.desc&limit=20`;
+    // The 20 newest carrier API log rows for the SIM. By default only the last
+    // 90 days (?days=N to change, ?days=all for no floor); ?before=<created_at>
+    // continues below the oldest row already shown ("Load more").
+    const daysParam = url.searchParams.get('days') || '90';
+    const days = daysParam === 'all' ? null : parsePositiveInt(daysParam);
+    if (daysParam !== 'all' && !days) return badRequest(corsHeaders, 'days must be a positive whole number or all');
+    const before = url.searchParams.get('before');
+    if (before && !Number.isFinite(Date.parse(before))) return badRequest(corsHeaders, 'before must be a timestamp');
+    let range = '';
+    if (days) range += `&created_at=gte.${encodeURIComponent(new Date(Date.now() - days * 86400000).toISOString())}`;
+    if (before) range += `&created_at=lt.${encodeURIComponent(new Date(before).toISOString())}`;
+    const query = `carrier_api_logs?select=id,step,iccid,imei,vendor,request_url,request_method,request_body,response_status,response_ok,response_body_json,response_body_text,error,created_at&iccid=eq.${encodeURIComponent(lookupIccid)}${range}&order=created_at.desc&limit=20`;
     const response = await supabaseGet(env, query);
     const logs = await supabaseJson(response);
     return new Response(JSON.stringify(logs), {

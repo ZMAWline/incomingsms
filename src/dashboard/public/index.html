@@ -1618,7 +1618,7 @@
                                     <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','to_number')">To <span class="sort-arrow" data-table="messages" data-col="to_number"></span></th>
                                     <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','from_number')">From <span class="sort-arrow" data-table="messages" data-col="from_number"></span></th>
                                     <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','body')">Message <span class="sort-arrow" data-table="messages" data-col="body"></span></th>
-                                    <th class="px-5 py-3 font-medium cursor-pointer hover:text-gray-300 select-none" onclick="sortTable('messages','iccid')">ICCID <span class="sort-arrow" data-table="messages" data-col="iccid"></span></th>
+                                    <th class="px-5 py-3 font-medium select-none">ICCID</th>
                                 </tr>
                             </thead>
                             <tbody id="messages-table" class="text-sm">
@@ -4999,7 +4999,16 @@ set verify_pending; schedule §C.3 poll
                 try { if (tabName === 'invoicing') { loadMappings(); loadBillingResellers(); loadInvoiceHistory(); loadResellerKeys(); loadResellerRates(); loadUtilizationResellers(); } } catch(e) { console.error('switchTab autoLoad failed for invoicing', e); }
                 try { if (tabName === 'billing') { loadBillAuditHistory(); loadPlanRates(); loadBillingLedgerSummary(); loadLedgerMonths(); } } catch(e) { console.error('switchTab autoLoad failed for billing', e); }
                 try { if (tabName === 'sms-usage') loadSmsUsage(); } catch(e) { console.error('switchTab autoLoad failed for sms-usage', e); }
-                try { if (tabName === 'sims') { try { syncSimsUrl(); } catch(e){} } } catch(e) { console.error('switchTab autoLoad failed for sims', e); }
+                try { if (tabName === 'dashboard') loadDashboardHome(); } catch(e) { console.error('switchTab autoLoad failed for dashboard', e); }
+                try { if (tabName === 'messages') loadMessages(); } catch(e) { console.error('switchTab autoLoad failed for messages', e); }
+                try {
+                    if (tabName === 'sims') {
+                        try { hydrateSimsFromUrl(); } catch(e) { console.error('hydrateSimsFromUrl failed', e); }
+                        try { syncSimsUrl(); } catch(e){}
+                        // Within SIM_CACHE_MS of the last load this re-renders the cached page.
+                        loadSims();
+                    }
+                } catch(e) { console.error('switchTab autoLoad failed for sims', e); }
                 try { if (tabName === 'rotation-reviews') { loadRotationReviews(); loadRotationHealth(); } } catch(e) { console.error('switchTab autoLoad failed for rotation-reviews', e); }
                 try { if (tabName === 'workers') loadHostingPortJobs(); } catch(e) { console.error('switchTab autoLoad failed for workers', e); }
                 try { if (tabName === 'runs') { runsPage = 0; showRunsList(); } } catch(e) { console.error('switchTab autoLoad failed for runs', e); }
@@ -6380,7 +6389,7 @@ set verify_pending; schedule §C.3 poll
             state.page = 1;
             // Re-render
             if (table === 'sims') renderSims();
-            else if (table === 'messages') renderMessages();
+            else if (table === 'messages') loadMessages();
             else if (table === 'imei') renderImeiPool();
             else if (table === 'errors') renderErrors();
         }
@@ -6557,11 +6566,31 @@ set verify_pending; schedule §C.3 poll
             ]);
         }
 
-        async function loadData() {
-            try { hydrateSimsFromUrl(); } catch(e) { console.error('hydrateSimsFromUrl failed', e); }
-            // The table and messages do not depend on the summary response.
-            loadSims(true);
-            loadMessages();
+        // The tab on screen, from the one .tab-content that is not hidden.
+        function activeTabName() {
+            const el = document.querySelector('.tab-content:not(.hidden)');
+            return el && el.id ? el.id.replace(/^tab-/, '') : 'dashboard';
+        }
+
+        // Refresh button, the hourly timer and post-action refreshes: reload
+        // only the tab on screen. Other tabs load when they are opened.
+        function loadData() {
+            const tab = activeTabName();
+            // An action taken elsewhere may have changed SIMs: refetch the
+            // table next time it is shown instead of re-rendering the cache.
+            lastSimsFetchedAt = 0;
+            if (tab === 'dashboard') return loadDashboardHome();
+            if (tab === 'sims') {
+                try { hydrateSimsFromUrl(); } catch(e) { console.error('hydrateSimsFromUrl failed', e); }
+                return loadSims(true);
+            }
+            if (tab === 'messages') return loadMessages();
+            switchTab(tab, false);
+        }
+
+        // Dashboard tab: the summary counts and the five newest messages.
+        async function loadDashboardHome() {
+            loadMessagesPreview();
             try {
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 8000);
@@ -7795,41 +7824,61 @@ async function sendSimOnline(simId, phoneNumber) {
             }, 300);
         }
 
+        // Messages tab: one page from the server per request. Paging, page
+        // size, sort and search each ask /api/messages for just that page.
+        let _msgsSeq = 0;
         async function loadMessages() {
+            const state = tableState.messages;
+            const seq = ++_msgsSeq;
             try {
+                const params = new URLSearchParams({
+                    page: String(state.page), page_size: String(state.pageSize),
+                    sort: state.sortKey, dir: state.sortDir,
+                });
                 const search = (document.getElementById('messages-search')?.value || '').trim();
-                const msgsUrl = search
-                    ? `${API_BASE}/messages?search=${encodeURIComponent(search)}`
-                    : `${API_BASE}/messages`;
-                const response = await fetch(msgsUrl);
-                const messages = await response.json();
-
-                // Update main messages table
-                tableState.messages.data = Array.isArray(messages) ? messages : [];
-                renderMessages();
-                // Update preview table (first 5) — skip while a search is active so the
-                // dashboard preview always shows the most recent unfiltered messages.
-                const preview = document.getElementById('messages-preview');
-                if (search) return;
-                const previewMsgs = messages.slice(0, 5);
-                if (previewMsgs.length === 0) {
-                    preview.innerHTML = '<tr><td colspan="4" class="px-5 py-4 text-center text-gray-500">No messages</td></tr>';
-                } else {
-                    preview.innerHTML = previewMsgs.map(msg => {
-                        const date = new Date(msg.received_at);
-                        const timeStr = date.toLocaleTimeString();
-                        return `
-                            <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
-                                <td class="px-5 py-3 text-gray-400 text-xs">${timeStr}</td>
-                                <td class="px-5 py-3 text-gray-200">${msg.to_number || '-'}</td>
-                                <td class="px-5 py-3 text-gray-200">${msg.from_number}</td>
-                                <td class="px-5 py-3 text-gray-300 truncate max-w-xs cursor-pointer hover:text-white" onclick="showMsgBody(this.dataset.body)" data-body="${(msg.body||'')}">${msg.body}</td>
-                            </tr>
-                        `;
-                    }).join('');
+                if (search) params.set('search', search);
+                const response = await fetch(API_BASE + '/messages?' + params.toString());
+                const body = await response.json().catch(function () { return null; });
+                if (seq !== _msgsSeq) return; // a newer request went out
+                if (!response.ok || !body || !Array.isArray(body.rows)) {
+                    showToast('Error loading messages: ' + ((body && body.error) || ('HTTP ' + response.status)), 'error');
+                    return;
                 }
+                state.data = body.rows;
+                state.hasMore = !!body.has_more;
+                renderMessages();
             } catch (error) {
+                if (seq !== _msgsSeq) return;
                 showToast('Error loading messages', 'error');
+                console.error(error);
+            }
+        }
+
+        // The Dashboard's five most recent messages.
+        async function loadMessagesPreview() {
+            const preview = document.getElementById('messages-preview');
+            if (!preview) return;
+            try {
+                const response = await fetch(API_BASE + '/messages?page_size=5');
+                const body = await response.json().catch(function () { return null; });
+                if (!response.ok || !body || !Array.isArray(body.rows)) throw new Error((body && body.error) || ('HTTP ' + response.status));
+                if (body.rows.length === 0) {
+                    preview.innerHTML = '<tr><td colspan="4" class="px-5 py-4 text-center text-gray-500">No messages</td></tr>';
+                    return;
+                }
+                preview.innerHTML = body.rows.map(msg => {
+                    const timeStr = new Date(msg.received_at).toLocaleTimeString();
+                    return `
+                        <tr class="border-b border-dark-600 hover:bg-dark-700/50 transition">
+                            <td class="px-5 py-3 text-gray-400 text-xs">${timeStr}</td>
+                            <td class="px-5 py-3 text-gray-200">${msg.to_number || '-'}</td>
+                            <td class="px-5 py-3 text-gray-200">${msg.from_number}</td>
+                            <td class="px-5 py-3 text-gray-300 truncate max-w-xs cursor-pointer hover:text-white" onclick="showMsgBody(this.dataset.body)" data-body="${(msg.body||'')}">${msg.body}</td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (error) {
+                preview.innerHTML = '<tr><td colspan="4" class="px-5 py-4 text-center text-red-400">Could not load messages</td></tr>';
                 console.error(error);
             }
         }
@@ -7857,14 +7906,8 @@ async function sendSimOnline(simId, phoneNumber) {
         }
         function renderMessages() {
             const state = tableState.messages;
-            const search = (document.getElementById('messages-search')?.value || '').trim();
-            let data = state.data;
-            if (search) data = data.filter(m => matchesSearch(m, search));
-            data = genericSort(data, state.sortKey, state.sortDir);
-
-            const totalFiltered = data.length;
-            data = paginate(data, 'messages');
-            renderPaginationControls('messages-pagination', 'messages', totalFiltered);
+            const data = state.data;
+            renderMessagesPager();
 
             const tbody = document.getElementById('messages-table');
             if (data.length === 0) {
@@ -10261,6 +10304,30 @@ async function sendSimOnline(simId, phoneNumber) {
 
 
 
+        // Messages are paged on the server without a total count, so the pager
+        // is Previous / Next plus the page size.
+        function renderMessagesPager() {
+            const container = document.getElementById('messages-pagination');
+            if (!container) return;
+            const state = tableState.messages;
+            const sizes = [25, 50, 100, 250].map(n => `<option value="${n}" ${n === state.pageSize ? 'selected' : ''}>${n}</option>`).join('');
+            const btn = (label, page, enabled) => enabled
+                ? `<button onclick="goToPage('messages', ${page})" class="px-2 py-1 text-xs rounded bg-dark-700 text-gray-300 hover:bg-dark-600">${label}</button>`
+                : `<button disabled class="px-2 py-1 text-xs rounded bg-dark-800 text-gray-600 cursor-not-allowed">${label}</button>`;
+            container.innerHTML = `
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-gray-500">Show</span>
+                    <select onchange="changePageSize('messages', this.value)" class="text-xs bg-dark-700 border border-dark-500 rounded px-2 py-1 text-gray-300">${sizes}</select>
+                    <span class="text-xs text-gray-500">per page</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    ${btn('&larr; Previous', state.page - 1, state.page > 1)}
+                    <span class="text-xs text-gray-400">Page ${state.page}</span>
+                    ${btn('Next &rarr;', state.page + 1, !!state.hasMore)}
+                </div>
+            `;
+        }
+
         // ===== Pagination =====
         function paginate(data, table) {
             const state = tableState[table];
@@ -10271,13 +10338,13 @@ async function sendSimOnline(simId, phoneNumber) {
         function changePageSize(table, size) {
             tableState[table].pageSize = parseInt(size);
             tableState[table].page = 1;
-            const renderMap = { sims: renderSims, messages: renderMessages, imei: renderImeiPool, errors: renderErrors };
+            const renderMap = { sims: renderSims, messages: loadMessages, imei: renderImeiPool, errors: renderErrors };
             if (renderMap[table]) renderMap[table]();
         }
 
         function goToPage(table, page) {
             tableState[table].page = page;
-            const renderMap = { sims: renderSims, messages: renderMessages, imei: renderImeiPool, errors: renderErrors };
+            const renderMap = { sims: renderSims, messages: loadMessages, imei: renderImeiPool, errors: renderErrors };
             if (renderMap[table]) renderMap[table]();
         }
 
@@ -11720,7 +11787,7 @@ async function sendSimOnline(simId, phoneNumber) {
             logsSection.classList.add('hidden');
             logsContainer.innerHTML = '<p class="text-gray-500 text-sm">Loading API logs...</p>';
             try {
-                const params = simId ? 'sim_id=' + simId : 'iccid=' + encodeURIComponent(iccid);
+                const params = (simId ? 'sim_id=' + simId : 'iccid=' + encodeURIComponent(iccid)) + '&days=all';
                 const resp = await fetch(`${API_BASE}/error-logs?${params}`);
                 const logs = await resp.json();
                 if (Array.isArray(logs) && logs.length > 0) {
@@ -14815,10 +14882,14 @@ async function sendSimOnline(simId, phoneNumber) {
         // Lazy-populate when the tab is opened.
         populateApiTesterDropdown();
 
-                loadData();
-        setInterval(loadData, 3600000);
-        // A thrown error here would otherwise abort every remaining top-level
-        // statement in this script block (the rest of dashboard boot wiring).
+        // Hourly, refresh the live-data tabs only; a timer must not reset the
+        // page an operator is reading on Runs, Billing and the like.
+        setInterval(function () {
+            if (['dashboard', 'sims', 'messages'].includes(activeTabName())) loadData();
+        }, 3600000);
+        // Opening the tab loads its data (switchTab autoLoad); nothing else loads
+        // at boot. A thrown error here would otherwise abort every remaining
+        // top-level statement in this script block (the rest of dashboard boot wiring).
         try { initTabFromUrl(); } catch (e) { console.error('initTabFromUrl failed', e); }
 
         // Helix UI quarantine — hide/disable Helix-specific controls when HELIX_ENABLED=false
@@ -15058,21 +15129,40 @@ async function sendSimOnline(simId, phoneNumber) {
             }
         }
 
-        async function loadSimDetailLogs(simId, iccid) {
+        // The SIM's carrier API logs, 20 at a time: the last 90 days first,
+        // then "Load more" pages further back, and once those run out a
+        // button reaches past 90 days. Nothing loads until the Logs tab opens.
+        var _sdLogs = null;
+        var SD_LOGS_PAGE = 20;
+        async function loadSimDetailLogs(simId, iccid, more) {
             currentSimActionId = simId;
             currentSimActionIccid = iccid || null;
             var container = document.getElementById('sd-logs-container');
-            container.innerHTML = '<p class="text-gray-500 text-sm">Loading API logs...</p>';
+            if (!more) {
+                _sdLogs = { simId: simId, iccid: iccid || null, oldest: null, allTime: false };
+                container.innerHTML = '<p class="text-gray-500 text-sm">Loading API logs...</p>';
+            } else {
+                if (more === 'older') _sdLogs.allTime = true;
+                var oldBtn = document.getElementById('sd-logs-more');
+                if (oldBtn) { oldBtn.disabled = true; oldBtn.textContent = 'Loading...'; }
+            }
             try {
                 var params = iccid ? 'iccid=' + encodeURIComponent(iccid) : 'sim_id=' + simId;
+                params += '&days=' + (_sdLogs.allTime ? 'all' : '90');
+                if (_sdLogs.oldest) params += '&before=' + encodeURIComponent(_sdLogs.oldest);
                 var resp = await fetch(API_BASE + '/error-logs?' + params);
                 var logs = await resp.json();
-                if (!Array.isArray(logs) || logs.length === 0) {
-                    container.innerHTML = '<p class="text-gray-500 text-sm">No API logs found for this SIM.</p>';
-                    return;
+                if (_sdLogs.simId !== simId) return; // another SIM was opened meanwhile
+                if (!resp.ok || !Array.isArray(logs)) throw new Error((logs && logs.error) || ('HTTP ' + resp.status));
+                var moreBtn = document.getElementById('sd-logs-more');
+                if (moreBtn) moreBtn.remove();
+                if (!more) container.innerHTML = '';
+                if (logs.length) _sdLogs.oldest = logs[logs.length - 1].created_at;
+                if (!more && logs.length === 0) {
+                    container.innerHTML = '<p class="text-gray-500 text-sm">No API logs for this SIM in the last 90 days.</p>';
                 }
                 var vendorColors = { atomic: 'text-orange-400', wing_iot: 'text-green-400', helix: 'text-purple-400', teltik: 'text-pink-400' };
-                container.innerHTML = logs.map(function(log) {
+                var html = logs.map(function(log) {
                     var statusColor = (log.response_status >= 200 && log.response_status < 300) ? 'text-accent' : 'text-red-400';
                     var reqBody = '-';
                     if (log.request_body) { try { reqBody = JSON.stringify(log.request_body, null, 2); } catch(e) { reqBody = String(log.request_body); } }
@@ -15097,8 +15187,23 @@ async function sendSimOnline(simId, phoneNumber) {
                         '<pre class="mt-1 text-xs font-mono text-gray-300 bg-dark-700 p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap">' + resBody.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</pre></details>' +
                         errHtml2 + retryHtml + '</div>';
                 }).join('');
+                container.insertAdjacentHTML('beforeend', html);
+                var label = logs.length === SD_LOGS_PAGE ? 'Load more'
+                    : (!_sdLogs.allTime ? 'Load logs older than 90 days' : '');
+                if (label) {
+                    var next = logs.length === SD_LOGS_PAGE ? 'more' : 'older';
+                    container.insertAdjacentHTML('beforeend', '<button id="sd-logs-more" type="button" onclick="loadSimDetailLogs(_sdLogs.simId, _sdLogs.iccid, \'' + next + '\')" class="w-full px-3 py-2 text-xs bg-dark-700 hover:bg-dark-600 text-gray-300 rounded transition">' + label + '</button>');
+                } else if (more) {
+                    container.insertAdjacentHTML('beforeend', '<p class="text-gray-500 text-xs text-center py-2">No older logs.</p>');
+                }
             } catch (err) {
-                container.innerHTML = '<p class="text-red-400 text-sm">Failed to load logs: ' + err + '</p>';
+                if (more) {
+                    var failedBtn = document.getElementById('sd-logs-more');
+                    if (failedBtn) { failedBtn.disabled = false; failedBtn.textContent = 'Retry loading logs'; }
+                    showToast('Failed to load logs: ' + err.message, 'error');
+                } else {
+                    container.innerHTML = '<p class="text-red-400 text-sm">Failed to load logs: ' + err + '</p>';
+                }
             }
         }
         function kasaKick(el) { kasaControl(el.dataset.alias, el.dataset.action); }
