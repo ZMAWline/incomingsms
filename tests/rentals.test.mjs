@@ -114,4 +114,53 @@ ok('carrierForVendor collapses vendors to att/tmobile buckets');
   ok('missing rental rate falls back to daily_rate and sets rate_fallback_used');
 }
 
+// --- repeat rentals: own line at the repeat-only rate; tier counts all ------
+{
+  const tiers = [{ rate: 1.8, min_count: 1, max_count: 3 }, { rate: 1.55, min_count: 4, max_count: null }];
+  const env = makeEnv({
+    resellers: [{ id: 3, name: 'TrustOTP' }],
+    qbo_customer_map: [{ id: 1, daily_rate: '9.99' }],
+    reseller_rates: [{ vendor: 'teltik', effective_from: '2026-05-06', effective_to: null, tiers }],
+    reseller_rental_rates: [
+      { carrier: 'att', effective_from: '2026-05-14', effective_to: null, rate: '1.1000', repeat_only: false },
+      { carrier: 'tmobile', effective_from: '2026-09-11', effective_to: null, rate: '1.0000', repeat_only: true },
+    ],
+    rentals: [
+      { carrier: 'tmobile', rental_date: '2026-09-30', reseller_rental_id: 't1', is_repeat: false },
+      { carrier: 'tmobile', rental_date: '2026-09-30', reseller_rental_id: 't2', is_repeat: false },
+      { carrier: 'tmobile', rental_date: '2026-09-30', reseller_rental_id: 't3', is_repeat: true },
+      { carrier: 'tmobile', rental_date: '2026-09-30', reseller_rental_id: 't4', is_repeat: true },
+      { carrier: 'att', rental_date: '2026-09-30', reseller_rental_id: 'a1', is_repeat: true },
+    ],
+  });
+  const r = await computeRentalBilling(env, { resellerId: 3, start: '2026-09-25', end: '2026-10-01' });
+  const line = (carrier, repeat) => r.days.find((d) => d.carrier === carrier && !!d.repeat === repeat);
+  assert.deepEqual(line('tmobile', false), { date: '2026-09-30', carrier: 'tmobile', sim_count: 2, rate: 1.55, amount: 3.1 },
+    'new T-Mobile rentals keep the tier rate; the tier counts new + repeat (4 → 1.55)');
+  assert.deepEqual(line('tmobile', true), { date: '2026-09-30', carrier: 'tmobile', sim_count: 2, rate: 1, amount: 2, repeat: true },
+    'repeat T-Mobile rentals get their own line at the repeat-only rate');
+  assert.deepEqual(line('att', true), { date: '2026-09-30', carrier: 'att', sim_count: 1, rate: 1.1, amount: 1.1, repeat: true },
+    'a repeat with no repeat-only rate for its carrier is priced like a new rental');
+  assert.equal(line('att', false), undefined, 'no empty new-rental line');
+  assert.equal(r.total_repeat_rentals, 3);
+  assert.equal(r.total_amount, 6.2);
+  assert.equal(r.rate_fallback_used, false);
+  ok('repeat rentals billed at the repeat-only rate on their own line');
+}
+
+// --- a repeat-only rate never prices new rentals ---------------------------
+{
+  const env = makeEnv({
+    resellers: [{ id: 3, name: 'TrustOTP' }],
+    qbo_customer_map: [{ id: 1, daily_rate: '9.99' }],
+    reseller_rental_rates: [
+      { carrier: 'tmobile', effective_from: '2026-09-11', effective_to: null, rate: '1.0000', repeat_only: true },
+    ],
+    rentals: [{ carrier: 'tmobile', rental_date: '2026-09-30', reseller_rental_id: 't1', is_repeat: false }],
+  });
+  const r = await computeRentalBilling(env, { resellerId: 3, start: '2026-09-25', end: '2026-10-01' });
+  assert.equal(r.rate_fallback_used, true, 'new rental with only a repeat-only rate falls back, flagged');
+  ok('repeat-only rate is not used for new rentals');
+}
+
 console.log(`\nrentals.test.mjs: ${passed} checks passed`);

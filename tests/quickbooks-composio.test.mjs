@@ -90,8 +90,11 @@ function weeklyEnv(emailStatus, qboPaths, created = []) {
     computeBillingBreakdown: async (_env, opts) => ({
       billing_mode: opts.billing_mode,
       mapping: { id: 1, qbo_customer_id: '42' },
-      days: [{ date: '2026-09-25', carrier: 'att', sim_count: 2, rate: 1.1, amount: 2.2 }],
-      total_sim_days: 2, total_amount: 2.2,
+      days: [
+        { date: '2026-09-25', carrier: 'att', sim_count: 2, rate: 1.1, amount: 2.2 },
+        { date: '2026-09-25', carrier: 'tmobile', sim_count: 3, rate: 1, amount: 3, repeat: true },
+      ],
+      total_sim_days: 5, total_amount: 5.2,
     }),
     QUICKBOOKS: {
       async fetch(url, init) {
@@ -151,6 +154,7 @@ test('weekly run bills in rental mode with carrier line descriptions', async () 
   });
   assert.equal(mode, 'rental');
   assert.equal(created[0].lineItems[0].description, '2026-09-25 ATT rentals');
+  assert.equal(created[0].lineItems[1].description, '2026-09-25 TMOBILE repeat rentals');
 });
 
 test('weekly run refuses to invoice when a fallback rate was used', async () => {

@@ -90,6 +90,11 @@ test('buildRentalUpsertBody: full mapping for an att SIM', () => {
   assert.equal(body.rental_date, '2026-06-10');
 });
 
+test('buildRentalUpsertBody: rental_date is the EST day, not the UTC day', () => {
+  const body = buildRentalUpsertBody({ ...ctx, deliveredAt: '2026-10-02T02:00:00.000Z' });
+  assert.equal(body.rental_date, '2026-10-01');
+});
+
 test('buildRentalUpsertBody: tmobile carrier normalization from payload "T-Mobile"', () => {
   const body = buildRentalUpsertBody({
     ...ctx,
