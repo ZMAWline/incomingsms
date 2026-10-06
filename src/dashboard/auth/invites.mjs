@@ -1,5 +1,5 @@
 import { hashPassword, foldUsername, randomHex, sha256Hex, isValidRole } from '../../shared/portal-auth.mjs';
-import { INVITE_TTL_HOURS, MIN_PASSWORD_LENGTH, sb, sbRows, json, readBody } from './common.mjs';
+import { INVITE_TTL_HOURS, MIN_PASSWORD_LENGTH, sb, sbRows, json, readBody, isUnexpired } from './common.mjs';
 
 // --- invites --------------------------------------------------------------
 
@@ -42,7 +42,7 @@ export async function handleAcceptInvite(request, env) {
     + '&select=id,role,expires_at,consumed_at&limit=1');
   const inv = rows[0];
   if (!inv || inv.consumed_at) return json({ ok: false, error: 'This invite is no longer valid' }, 400);
-  if (!inv.expires_at || Date.parse(inv.expires_at) < Date.now()) {
+  if (!isUnexpired(inv.expires_at)) {
     return json({ ok: false, error: 'This invite has expired' }, 400);
   }
 
@@ -79,4 +79,3 @@ export async function handleAcceptInvite(request, env) {
 
   return json({ ok: true, username: newUser.username, role: newUser.role });
 }
-

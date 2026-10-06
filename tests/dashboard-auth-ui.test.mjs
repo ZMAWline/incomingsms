@@ -9,7 +9,7 @@ import { readDashboardScripts } from '../scripts/dashboard-scripts.cjs';
 
 const source = readFileSync(new URL('../src/dashboard/public/static/dashboard-auth.js', import.meta.url), 'utf8');
 function harness(t) {
-  const elements = new Map(), steps = [], calls = [], unexpected = [], toasts = [];
+  const elements = new Map(), steps = [], calls = [], unexpected = [], toasts = [], redirects = [];
   function element(id) {
     if (!elements.has(id)) {
       const classes = new Set(['hidden']);
@@ -20,7 +20,7 @@ function harness(t) {
   }
   const ctx = vm.createContext({
     document: { getElementById: element, querySelectorAll: () => [element('write-control')] },
-    window: { location: { origin: 'https://dashboard.test' } },
+    window: { location: { origin: 'https://dashboard.test', replace(path) { redirects.push(path); } } },
     showToast: (...args) => toasts.push(args), esc: String, fmtWhen: String,
     fetch: async (path, init = {}) => {
       calls.push({ path, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : null });
@@ -32,7 +32,10 @@ function harness(t) {
   });
   vm.runInContext(source, ctx);
   t.after(() => { assert.deepEqual(unexpected, []); assert.equal(steps.length, 0); });
-  return { ctx, element, calls, toasts, expect(path, data, status = 200) { steps.push({ path, data, status }); } };
+  return { ctx, element, calls, toasts, redirects,
+    expect(path, data, status = 200) { steps.push({ path, data, status }); },
+    expectNetworkFailure(path) { steps.push({ path, error: true }); },
+  };
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 for (const role of ['viewer', 'operator', 'admin']) test(`${role} sees the corresponding navigation and write controls`, async t => {
@@ -49,6 +52,43 @@ test('break-glass profile shows its explanation and hides self-service forms', a
   await h.ctx.loadProfile();
   assert.equal(h.element('profile-forms').classList.contains('hidden'), true);
   assert.equal(h.element('profile-breakglass').classList.contains('hidden'), false);
+});
+
+for (const failure of ['http', 'network']) test(`failed ${failure} session check removes stale admin controls`, async t => {
+  const h = harness(t);
+  h.expect('/auth/me', { ok: true, username: 'Alice', role: 'admin' });
+  await h.ctx.loadCurrentUser();
+  assert.equal(h.element('write-control').classList.contains('hidden'), false);
+  if (failure === 'network') h.expectNetworkFailure('/auth/me');
+  else h.expect('/auth/me', { ok: false }, 401);
+  await h.ctx.loadProfile();
+  for (const id of ['nav-users', 'nav-audit', 'write-control', 'profile-forms']) {
+    assert.equal(h.element(id).classList.contains('hidden'), true, id);
+  }
+  assert.equal(h.element('current-user-badge').textContent, 'Not signed in');
+  assert.equal(vm.runInContext('CURRENT_USER', h.ctx), null);
+});
+
+for (const result of ['success', 'http', 'network']) test(`logout ${result} only redirects after confirmed success`, async t => {
+  const h = harness(t);
+  if (result === 'network') h.expectNetworkFailure('/auth/logout');
+  else h.expect('/auth/logout', { ok: result === 'success', error: 'Could not sign out. Try again.' }, result === 'success' ? 200 : 502);
+  await h.ctx.logout();
+  assert.equal(h.calls[0].method, 'POST');
+  assert.deepEqual(h.redirects, result === 'success' ? ['/'] : []);
+  if (result !== 'success') assert.match(h.toasts[0][0], /Could not sign out/);
+});
+
+test('password partial success clears old credentials and explains the failed sign-out', async t => {
+  const h = harness(t);
+  h.element('pf-cur-pw').value = 'old-password';
+  h.element('pf-new-pw').value = h.element('pf-new-pw2').value = 'new-long-password';
+  const message = 'Password changed, but other sessions could not be signed out. Contact an administrator.';
+  h.expect('/auth/change-password', { ok: false, password_changed: true, other_sessions_signed_out: false, error: message }, 502);
+  await h.ctx.changePassword();
+  for (const id of ['pf-cur-pw', 'pf-new-pw', 'pf-new-pw2']) assert.equal(h.element(id).value, '');
+  assert.equal(h.element('pf-password-msg').textContent, message);
+  assert.equal(h.element('pf-password-msg').style.color, '#991b1b');
 });
 
 for (const success of [true, false]) test(`password change ${success ? 'clears credentials after success' : 'shows server error without claiming success'}`, async t => {

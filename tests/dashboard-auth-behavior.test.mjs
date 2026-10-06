@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { loadModule } from './helpers/load-worker.mjs';
 import { hashPassword, verifyPassword, signDashboardSession, readDashboardSession, sha256Hex } from '../src/shared/portal-auth.mjs';
+import { isUnexpired } from '../src/dashboard/auth/common.mjs';
 
 const worker = (await loadModule('src/dashboard/index.js')).default;
 const env = { SUPABASE_URL: 'https://database.test', SUPABASE_SERVICE_ROLE_KEY: 'fake', DASHBOARD_SESSION_SECRET: 'test-secret' };
@@ -27,6 +28,7 @@ beforeEach(() => {
       unexpected.push(`${method} ${url}`); throw Error('Unexpected fetch');
     }
     if (step.check) step.check(call);
+    if (step.value instanceof Error) throw step.value;
     return json(step.value ?? {}, step.status || 200);
   };
 });
@@ -67,6 +69,80 @@ test('failed session persistence never logs the user in', async () => {
   expect('dashboard_users', 'GET', [user()]); expect('dashboard_sessions', 'POST', {}, null, 503);
   const res = await request('/auth/login', { body: { username: 'alice', password } });
   assert.equal(res.status, 500); assert.equal(res.headers.get('set-cookie'), null);
+});
+
+test('malformed auth cookies are rejected before reaching the database', async () => {
+  for (const value of ['%ZZ', '%E0%A4%A', '%']) {
+    const res = await request('/auth/me', { headers: { Cookie: 'other=1;dsh_auth=' + value } });
+    assert.equal(res.status, 401);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('cookie parsing accepts semicolons with or without whitespace', async () => {
+  for (const separator of [';', '; ', ';\t']) {
+    const res = await request('/auth/me', { headers: { Cookie: 'other=1' + separator + cookie } });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).username, 'Alice');
+  }
+});
+
+test('sessions reject malformed, missing and non-string expiry timestamps', async () => {
+  for (const expiresAt of ['invalid', '', null, 123, '2026-99-99T00:00:00Z']) {
+    session.expires_at = expiresAt;
+    assert.equal((await request('/auth/me', { auth: true })).status, 401);
+  }
+});
+
+test('expiry is exclusive: a session or invite expiring now is already invalid', () => {
+  const now = Date.parse('2026-10-06T12:00:00Z');
+  assert.equal(isUnexpired('2026-10-06T12:00:00Z', now), false);
+  assert.equal(isUnexpired('2026-10-06T12:00:00.001Z', now), true);
+  assert.equal(isUnexpired('invalid', now), false);
+});
+
+for (const failure of ['http', 'network']) {
+  test(`logout ${failure} failure keeps the cookie so revocation can be retried`, async () => {
+    expect('dashboard_sessions', 'PATCH', failure === 'network' ? new Error('offline') : {}, null, 503);
+    const res = await request('/auth/logout', { auth: true, body: {} });
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('set-cookie'), null);
+    assert.equal((await res.json()).ok, false);
+  });
+
+  test(`password change reports partial success when ${failure} revocation fails`, async () => {
+    expect('dashboard_users', 'GET', [user()]);
+    let savedHash;
+    expect('dashboard_users', 'PATCH', {}, c => { savedHash = c.body.password_hash; });
+    expect('dashboard_sessions', 'PATCH', failure === 'network' ? new Error('offline') : {}, null, 503);
+    const res = await request('/auth/change-password', { auth: true, body: { current_password: password, new_password: 'another-long-password' } });
+    assert.equal(res.status, 502);
+    const data = await res.json();
+    assert.equal(data.ok, false);
+    assert.equal(data.password_changed, true);
+    assert.equal(data.other_sessions_signed_out, false);
+    assert.equal(await verifyPassword('another-long-password', savedHash), true);
+  });
+
+  test(`user update reports partial success when ${failure} revocation fails`, async () => {
+    session.dashboard_users.role = 'admin';
+    expect('dashboard_users', 'GET', [{ id: 'user-2', role: 'viewer', status: 'active' }]);
+    expect('dashboard_users', 'PATCH', {});
+    expect('dashboard_sessions', 'PATCH', failure === 'network' ? new Error('offline') : {}, null, 503);
+    const res = await request('/api/users/user-2', { auth: true, body: { status: 'disabled' } });
+    assert.equal(res.status, 502);
+    const data = await res.json();
+    assert.equal(data.ok, false);
+    assert.equal(data.user_updated, true);
+    assert.equal(data.sessions_revoked, false);
+  });
+}
+
+test('successful logout revokes the current session and clears the cookie', async () => {
+  expect('dashboard_sessions', 'PATCH', {}, c => assert.equal(c.url.searchParams.get('id'), 'eq.session-1'));
+  const res = await request('/auth/logout', { auth: true, body: {} });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('set-cookie'), /Max-Age=0/);
 });
 
 for (const state of ['revoked', 'expired', 'disabled']) test(`${state} session cannot authenticate`, async () => {
@@ -114,6 +190,12 @@ test('last active admin cannot be demoted; disabling another user requests immed
 
 const invitation = () => ({ id: 'invite-1', role: 'operator', expires_at: new Date(Date.now() + 3600000).toISOString(), consumed_at: null });
 const acceptance = { token: 'invitation-token', username: ' NewUser ', password };
+test('invites reject malformed expiry without creating an account', async () => {
+  for (const expires_at of ['invalid', '', null, 123]) {
+    expect('dashboard_invites', 'GET', [{ ...invitation(), expires_at }]);
+    assert.equal((await request('/auth/accept-invite', { body: acceptance })).status, 400);
+  }
+});
 test('invite acceptance derives role from invite and consumes it only after creating the account', async () => {
   expect('dashboard_invites', 'GET', [invitation()], c => assert.match(c.url.searchParams.get('token_hash'), /^eq\.[a-f0-9]{64}$/));
   expect('dashboard_users', 'GET', []);

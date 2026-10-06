@@ -5,6 +5,7 @@ import {
 import {
   AUTH_COOKIE, MAX_FAILED_LOGINS, LOCKOUT_MINUTES,
   sb, sbRows, json, ttlMinutes, getCookie, setCookie, clearCookie, readBody,
+  isUnexpired, revokeSessions,
 } from './common.mjs';
 
 // --- session resolution ---------------------------------------------------
@@ -23,7 +24,7 @@ export async function resolveUser(env, request) {
     + '&select=id,expires_at,revoked_at,dashboard_users(id,username,role,status)&limit=1');
   const s = rows[0];
   if (!s || s.revoked_at) return null;
-  if (!s.expires_at || Date.parse(s.expires_at) < Date.now()) return null;
+  if (!isUnexpired(s.expires_at)) return null;
 
   const u = s.dashboard_users;
   if (!u || u.status !== 'active') return null;
@@ -108,11 +109,8 @@ export async function handleLogin(request, env) {
 
 export async function handleLogout(request, env, user) {
   if (user && user.sessionId) {
-    await sb(env, 'dashboard_sessions?id=eq.' + encodeURIComponent(user.sessionId), {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ revoked_at: new Date().toISOString() }),
-    });
+    const revoked = await revokeSessions(env, 'id=eq.' + encodeURIComponent(user.sessionId));
+    if (!revoked) return json({ ok: false, error: 'Could not sign out. Try again.' }, 502);
   }
   return json({ ok: true }, 200, { 'Set-Cookie': clearCookie() });
 }
-

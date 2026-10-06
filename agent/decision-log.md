@@ -1394,6 +1394,33 @@ everywhere by adding one registry entry.
 **Why:** The owner wants one place to see every run with its run ID and source, and to click into per-SIM lines. The two run types have different detail data (activation items carry IMEI, attempts and carrier logs; bulk items carry replayed API steps), so merging the tables would lose detail for one or the other; a view gives one sorted, paginated list without that.
 **Consequence:** A new kind of run shows on the page by adding a UNION branch to `dashboard_runs` and a detail view keyed by `run_type`. Viewers can read runs (`/api/runs`, `GET /api/bulk-jobs/*` are READ_ROUTES); starting and cancelling stay operator-only.
 
+## 2026-10-06 — Auth failure handling after the refactor checkpoint
+
+**Decision:** Commit the structural work as `88713c0`, then fix auth failure
+handling separately. Revocation checks cover HTTP errors and network failures.
+A failed logout keeps the session cookie so the caller can retry, and the UI
+redirects only after confirmed success. If a password or user change already
+succeeded, a subsequent revocation failure returns 502 with explicit partial
+result fields (`password_changed`/`user_updated`, with the revocation flag
+false), rather than claiming success or implying the original change failed.
+
+**Other fixes:** Malformed cookie encoding returns an unauthenticated result;
+session and invite expiry must be a finite future timestamp. Failed browser
+identity checks remove stale identity and hide privileged controls. Auth
+database requests use the shared bounded transport.
+
+**Verification boundary:** The test Worker's live settings point service
+bindings to the `*-test` Workers. Supabase connection values are secret and
+database isolation has not been confirmed. No live login, account mutation,
+carrier action or database write was performed during this verification.
+Last-admin concurrency still requires a transactional database solution and
+is not solved by these application-level changes.
+
+**Validation:** `npm run check` passed with 1,318 tests, all 19 Worker bundles,
+incremental type checks and dashboard syntax checks. Added 18 regression
+cases covering the failure paths and browser feedback. `git diff --check`
+passed. Tests use mocked external I/O; no hosted account changes were run.
+
 ## 2026-10-06 — Sequential, behavior-preserving auth refactor
 
 **Decision:** Run child agents one at a time for planning, backend extraction,

@@ -1,5 +1,5 @@
 import { isValidRole } from '../../shared/portal-auth.mjs';
-import { sb, sbRows, json, readBody } from './common.mjs';
+import { sb, sbRows, json, readBody, revokeSessions } from './common.mjs';
 
 // --- user administration --------------------------------------------------
 
@@ -56,11 +56,11 @@ export async function handleUpdateUser(request, env, actor, userId) {
 
   // Disabling or demoting must take effect immediately, not at token expiry.
   if (patch.status === 'disabled' || patch.role) {
-    await sb(env, 'dashboard_sessions?user_id=eq.' + encodeURIComponent(userId) + '&revoked_at=is.null', {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ revoked_at: new Date().toISOString() }),
-    });
+    const revoked = await revokeSessions(env, 'user_id=eq.' + encodeURIComponent(userId) + '&revoked_at=is.null');
+    if (!revoked) return json({
+      ok: false, user_updated: true, sessions_revoked: false,
+      error: 'User updated, but existing sessions could not be signed out. Retry the user update.',
+    }, 502);
   }
   return json({ ok: true });
 }
-

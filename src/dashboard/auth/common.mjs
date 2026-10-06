@@ -13,6 +13,8 @@
 // from elsewhere.
 // =========================================================
 
+import { supabaseFetch } from '../../shared/fetch-timeout.mjs';
+
 export const AUTH_COOKIE = 'dsh_auth';
 export const DEFAULT_TTL_MINUTES = 720;          // 12h
 export const INVITE_TTL_HOURS = 168;             // 7 days
@@ -30,7 +32,7 @@ function sbHeaders(env, extra) {
 }
 
 export async function sb(env, path, init) {
-  return fetch(env.SUPABASE_URL + '/rest/v1/' + path, {
+  return supabaseFetch(env, env.SUPABASE_URL + '/rest/v1/' + path, {
     ...(init || {}),
     headers: sbHeaders(env, init && init.headers),
   });
@@ -59,8 +61,28 @@ export function ttlMinutes(env) {
 
 export function getCookie(request, name) {
   const raw = request.headers.get('Cookie') || '';
-  const m = raw.match(new RegExp('(?:^|; )' + name + '=([^;]+)'));
-  return m ? decodeURIComponent(m[1]) : null;
+  const cookie = raw.split(';').map(value => value.trim()).find(value => value.startsWith(name + '='));
+  if (!cookie) return null;
+  try { return decodeURIComponent(cookie.slice(name.length + 1)); }
+  catch { return null; }
+}
+
+export function isUnexpired(value, now = Date.now()) {
+  if (typeof value !== 'string' || !value) return false;
+  const expiresAt = Date.parse(value);
+  return Number.isFinite(expiresAt) && expiresAt > now;
+}
+
+// Callers may already have changed a password or user record. Both HTTP
+// errors and transport failures must return a truthful partial result.
+export async function revokeSessions(env, filter) {
+  try {
+    const response = await sb(env, 'dashboard_sessions?' + filter, {
+      method: 'PATCH', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ revoked_at: new Date().toISOString() }),
+    });
+    return response.ok;
+  } catch { return false; }
 }
 
 export function setCookie(value, maxAgeSeconds) {
@@ -74,4 +96,3 @@ export function clearCookie() {
 export async function readBody(request) {
   try { return await request.json(); } catch { return {}; }
 }
-

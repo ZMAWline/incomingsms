@@ -1,5 +1,5 @@
 import { hashPassword, verifyPassword, foldUsername } from '../../shared/portal-auth.mjs';
-import { MIN_PASSWORD_LENGTH, sb, sbRows, json, readBody } from './common.mjs';
+import { MIN_PASSWORD_LENGTH, sb, sbRows, json, readBody, revokeSessions } from './common.mjs';
 
 // --- self-service profile -------------------------------------------------
 //
@@ -50,13 +50,13 @@ export async function handleChangePassword(request, env, user) {
 
   // Sign out everywhere else, keeping this session. A password change is how
   // someone reacts to a suspected compromise, so other sessions must drop.
-  await sb(env,
-    'dashboard_sessions?user_id=eq.' + encodeURIComponent(user.id)
-    + '&revoked_at=is.null&id=neq.' + encodeURIComponent(user.sessionId || ''),
-    {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ revoked_at: new Date().toISOString() }),
-    });
+  const revoked = await revokeSessions(env,
+    'user_id=eq.' + encodeURIComponent(user.id)
+    + '&revoked_at=is.null&id=neq.' + encodeURIComponent(user.sessionId || ''));
+  if (!revoked) return json({
+    ok: false, password_changed: true, other_sessions_signed_out: false,
+    error: 'Password changed, but other sessions could not be signed out. Contact an administrator.',
+  }, 502);
 
   return json({ ok: true, other_sessions_signed_out: true });
 }
@@ -94,4 +94,3 @@ export async function handleChangeUsername(request, env, user) {
   if (!r.ok) return json({ ok: false, error: 'That username is taken' }, 409);
   return json({ ok: true, username });
 }
-

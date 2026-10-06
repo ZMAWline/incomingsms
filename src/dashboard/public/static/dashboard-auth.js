@@ -9,8 +9,7 @@ let CURRENT_USER = null;
 async function loadCurrentUser() {
     try {
         const res = await fetch('/auth/me');
-        if (!res.ok) return null;
-        const data = await res.json();
+        const data = res.ok ? await res.json() : null;
         CURRENT_USER = data && data.ok
             ? { username: data.username, role: data.role, hasProfile: data.has_profile !== false }
             : null;
@@ -28,10 +27,10 @@ function applyRoleToUi() {
     // Viewers get a read-only surface: anything explicitly marked as a
     // write control is hidden rather than left to fail server-side.
     document.querySelectorAll('[data-requires-write]').forEach(function (el) {
-        el.classList.toggle('hidden', role === 'viewer');
+        el.classList.toggle('hidden', role !== 'admin' && role !== 'operator');
     });
     const badge = document.getElementById('current-user-badge');
-    if (badge && CURRENT_USER) badge.textContent = CURRENT_USER.username + ' · ' + role;
+    if (badge) badge.textContent = CURRENT_USER ? CURRENT_USER.username + ' · ' + role : 'Not signed in';
 }
 
 async function loadUsers() {
@@ -200,8 +199,17 @@ function copyApiKey() {
 }
 
 async function logout() {
-    try { await fetch('/auth/logout', { method: 'POST' }); } catch (e) { /* fall through */ }
-    window.location.replace('/');
+    try {
+        const response = await fetch('/auth/logout', { method: 'POST' });
+        const data = await response.json().catch(function () { return {}; });
+        if (!response.ok || !data.ok) {
+            showToast(data.error || 'Could not sign out. Try again.', 'error');
+            return;
+        }
+        CURRENT_USER = null;
+        applyRoleToUi();
+        window.location.replace('/');
+    } catch (e) { showToast('Could not sign out. Check your connection and try again.', 'error'); }
 }
 
 // --- Profile (self-service) ----------------------------------------
@@ -225,7 +233,7 @@ async function loadProfile() {
     const isBreakGlass = !!u && u.hasProfile === false;
     const forms = document.getElementById('profile-forms');
     const notice = document.getElementById('profile-breakglass');
-    if (forms) forms.classList.toggle('hidden', isBreakGlass);
+    if (forms) forms.classList.toggle('hidden', !u || isBreakGlass);
     if (notice) notice.classList.toggle('hidden', !isBreakGlass);
     const pf = document.getElementById('pf-username');
     if (pf && u && !isBreakGlass && !pf.value) pf.value = u.username;
@@ -264,11 +272,18 @@ async function changePassword() {
             body: JSON.stringify({ current_password: current_password, new_password: pw })
         });
         const data = await res.json().catch(function () { return {}; });
-        if (!res.ok || !data.ok) { setMsg('pf-password-msg', data.error || 'Could not update password.', false); return; }
+        if (!res.ok || !data.ok) {
+            if (data.password_changed) {
+                document.getElementById('pf-cur-pw').value = '';
+                document.getElementById('pf-new-pw').value = '';
+                document.getElementById('pf-new-pw2').value = '';
+            }
+            setMsg('pf-password-msg', data.error || 'Could not update password.', false);
+            return;
+        }
         document.getElementById('pf-cur-pw').value = '';
         document.getElementById('pf-new-pw').value = '';
         document.getElementById('pf-new-pw2').value = '';
         setMsg('pf-password-msg', 'Password updated. Other browsers have been signed out.', true);
     } catch (e) { setMsg('pf-password-msg', 'Network error. Try again.', false); }
 }
-
