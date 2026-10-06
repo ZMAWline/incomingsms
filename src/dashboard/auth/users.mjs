@@ -52,7 +52,13 @@ export async function handleUpdateUser(request, env, actor, userId) {
   const r = await sb(env, 'dashboard_users?id=eq.' + encodeURIComponent(userId), {
     method: 'PATCH', headers: { Prefer: 'return=minimal' }, body: JSON.stringify(patch),
   });
-  if (!r.ok) return json({ ok: false, error: 'Could not update user' }, 500);
+  if (!r.ok) {
+    const failure = await r.json().catch(() => null);
+    if (failure?.code === 'P0001' && failure.message === 'last_active_dashboard_admin') {
+      return json({ ok: false, error: 'This is the last active admin. Promote another admin first.' }, 409);
+    }
+    return json({ ok: false, error: 'Could not update user' }, 500);
+  }
 
   // Disabling or demoting must take effect immediately, not at token expiry.
   if (patch.status === 'disabled' || patch.role) {
