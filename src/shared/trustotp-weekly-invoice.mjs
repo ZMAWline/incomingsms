@@ -226,7 +226,8 @@ export async function runTrustotpWeeklyInvoice(env, { dry_run = true, latestEnd 
           customerMemo: `Weekly US Business phone Rental invoice for ${start} to ${end}.`,
           lineItems: days.map((d) => ({
             itemId,
-            description: `${d.date} ${String(d.carrier || '').toUpperCase()} rentals`, // matches invoices 1199–1450
+            // matches invoices 1199–1450; repeats (numbers held before) get their own line
+            description: `${d.date} ${String(d.carrier || '').toUpperCase()} ${d.repeat ? 'repeat rentals' : 'rentals'}`,
             quantity: d.sim_count,
             rate: d.rate,
             amount: d.amount,

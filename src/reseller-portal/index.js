@@ -1526,7 +1526,7 @@ async function openInvoice(id) {
   if (!data) return;
   const inv = data.invoice;
   const days = data.breakdown.days || [];
-  const dayRows = days.map(d => '<tr><td class="px-3 py-2 text-slate-300">' + esc(d.date) + '</td>' +
+  const dayRows = days.map(d => '<tr><td class="px-3 py-2 text-slate-300">' + esc(d.date) + (d.repeat ? ' (repeat numbers)' : '') + '</td>' +
     '<td class="px-3 py-2 text-slate-300 text-right">' + esc(d.sim_count) + '</td>' +
     '<td class="px-3 py-2 text-slate-300 text-right">' + fmtUsd(d.rate) + '</td>' +
     '<td class="px-3 py-2 text-slate-100 text-right">' + fmtUsd(d.amount) + '</td></tr>').join('');

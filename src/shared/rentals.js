@@ -94,11 +94,14 @@ export async function upsertRental(env, { resellerId, simId, simNumberId, vendor
   }
 }
 
-// Pick the most recent rental rate active on `day` for `carrier`.
-function pickRentalRate(rules, day, carrier) {
+// Pick the most recent rental rate active on `day` for `carrier`. repeatOnly
+// selects the rates that apply only to repeat rentals (numbers the reseller
+// held before); otherwise those rates are skipped.
+function pickRentalRate(rules, day, carrier, repeatOnly) {
   let best = null;
   for (const r of rules) {
     if (r.carrier !== carrier) continue;
+    if (!!r.repeat_only !== repeatOnly) continue;
     if (r.effective_from > day) continue;
     if (r.effective_to && r.effective_to < day) continue;
     if (!best || r.effective_from > best.effective_from) best = r;
@@ -153,7 +156,7 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
   const fallbackRate = mapping ? parseFloat(mapping.daily_rate) : 0;
 
   const rentals = await sbGetAll(env,
-    'rentals?select=carrier,rental_date,reseller_rental_id,sim_number_id' +
+    'rentals?select=carrier,rental_date,reseller_rental_id,sim_number_id,is_repeat' +
     '&reseller_id=eq.' + encodeURIComponent(resellerId) +
     '&rental_date=gte.' + encodeURIComponent(effectiveStart) +
     '&rental_date=lte.' + encodeURIComponent(end) +
@@ -162,7 +165,7 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
 
   // Flat per-carrier rental rates (fallback when no volume tier matches).
   const flatRules = await sbGetAll(env,
-    'reseller_rental_rates?select=carrier,effective_from,effective_to,rate' +
+    'reseller_rental_rates?select=carrier,effective_from,effective_to,rate,repeat_only' +
     '&reseller_id=eq.' + encodeURIComponent(resellerId) +
     '&effective_from=lte.' + end +
     '&or=(effective_to.is.null,effective_to.gte.' + effectiveStart + ')'
@@ -196,7 +199,8 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
     if (!resolvedSameDay) excludedLifetimes.add(rep.sim_number_id);
   }
 
-  // group[date][carrier] = count; carrierTotal drives the volume tier.
+  // group[date][carrier] = { new, repeat } counts; carrierTotal (new + repeat)
+  // drives the volume tier.
   const group = {};
   const carrierTotal = {};
   let withTrustotpId = 0;
@@ -205,7 +209,8 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
   for (const r of (Array.isArray(rentals) ? rentals : [])) {
     if (r.sim_number_id != null && excludedLifetimes.has(r.sim_number_id)) { excludedBad++; continue; }
     if (!group[r.rental_date]) group[r.rental_date] = {};
-    group[r.rental_date][r.carrier] = (group[r.rental_date][r.carrier] || 0) + 1;
+    if (!group[r.rental_date][r.carrier]) group[r.rental_date][r.carrier] = { new: 0, repeat: 0 };
+    group[r.rental_date][r.carrier][r.is_repeat ? 'repeat' : 'new']++;
     carrierTotal[r.carrier] = (carrierTotal[r.carrier] || 0) + 1;
     if (r.reseller_rental_id) withTrustotpId++; else withoutTrustotpId++;
   }
@@ -219,22 +224,29 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
   let missingRate = false;
   let rulesApplied = false;
   const days = [];
+  const newRentalRate = (date, carrier) => {
+    const tierRule = pickTierRule(tierRules, date, carrier in VENDOR_SCOPE ? VENDOR_SCOPE[carrier] : null);
+    if (tierRule) {
+      const tr = tierRate(tierRule.tiers, carrierTotal[carrier]);
+      if (tr != null) return tr;
+    }
+    return pickRentalRate(flatRules, date, carrier, false);
+  };
   for (const date of Object.keys(group).sort()) {
     for (const carrier of Object.keys(group[date]).sort()) {
-      const count = group[date][carrier];
-      const total = carrierTotal[carrier];
-      let rate = null;
-      const tierRule = pickTierRule(tierRules, date, carrier in VENDOR_SCOPE ? VENDOR_SCOPE[carrier] : null);
-      if (tierRule) {
-        const tr = tierRate(tierRule.tiers, total);
-        if (tr != null) { rate = tr; rulesApplied = true; }
+      for (const repeat of [false, true]) {
+        const count = group[date][carrier][repeat ? 'repeat' : 'new'];
+        if (!count) continue;
+        // A repeat rental takes its carrier's repeat-only rate when one is
+        // active; otherwise it is priced like a new rental.
+        let rate = repeat ? pickRentalRate(flatRules, date, carrier, true) : null;
+        if (rate == null) rate = newRentalRate(date, carrier);
+        if (rate != null) rulesApplied = true;
+        else { rate = fallbackRate; missingRate = true; }
+        const day = { date, carrier, sim_count: count, rate, amount: +(count * rate).toFixed(2) };
+        if (repeat) day.repeat = true;
+        days.push(day);
       }
-      if (rate == null) {
-        const fr = pickRentalRate(flatRules, date, carrier);
-        if (fr != null) { rate = fr; rulesApplied = true; }
-      }
-      if (rate == null) { rate = fallbackRate; missingRate = true; }
-      days.push({ date, carrier, sim_count: count, rate, amount: +(count * rate).toFixed(2) });
     }
   }
 
@@ -256,6 +268,8 @@ export async function computeRentalBilling(env, { resellerId, start, end, cutove
     total_without_trustotp_id: withoutTrustotpId,
     // Lifetimes excluded because they were reported bad and not resolved same-day.
     excluded_bad_rentals: excludedBad,
+    // Billed rentals for numbers the reseller held before.
+    total_repeat_rentals: days.filter((d) => d.repeat).reduce((s, d) => s + d.sim_count, 0),
     rules_applied: rulesApplied,
     rate_fallback_used: missingRate,
   };

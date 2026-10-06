@@ -52,10 +52,14 @@ function normalizeCarrier(raw) {
   return null;
 }
 
-function isoDateOnly(iso) {
-  const d = iso ? new Date(iso) : new Date();
-  if (Number.isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
-  return d.toISOString().slice(0, 10);
+// EST calendar date, the same day boundary billing uses (billing.js
+// estDateFromDate). Only the first write counts: the DB keeps rental_date
+// fixed on update (trigger trg_rentals_keep_rental_date), so a re-delivery
+// can't move an already-billed rental into a later invoice.
+function estDateOnly(iso) {
+  let d = iso ? new Date(iso) : new Date();
+  if (Number.isNaN(d.getTime())) d = new Date();
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(d);
 }
 
 export function buildRentalUpsertBody({ payload, responseBody, resellerId, sim, simNumber, deliveredAt }) {
@@ -82,7 +86,7 @@ export function buildRentalUpsertBody({ payload, responseBody, resellerId, sim, 
     carrier,
     e164,
     reseller_rental_id: String(rentalId),
-    rental_date: isoDateOnly(deliveredAt),
+    rental_date: estDateOnly(deliveredAt),
   };
 }
 
