@@ -11,6 +11,8 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import * as simsQuery from '../src/dashboard/sims-query.mjs';
+import * as simStats from '../src/dashboard/sim-stats.mjs';
+import { sbRpc } from '../src/shared/supabase-rest.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'dashboard', 'index.js'), 'utf8');
@@ -38,8 +40,6 @@ const HANDLERS = [
   'async function supabaseGetAllArraySerial(env, pathWithoutLimit) {',
   'async function supabaseGetAllArray(env, pathWithoutLimit) {',
   'async function handleSims(env, corsHeaders, url) {',
-  'async function loadSimStats(env, sims) {',
-  'function simStatFields(simId, smsMap, hostPortMap) {',
   'async function handleSimsFacets(env, corsHeaders) {',
 ];
 
@@ -55,6 +55,8 @@ function makeSandbox(respond = () => null) {
     URL,
     ...simsQuery,
     loadLatestPortinOutcomes: async () => new Map(), // imported from portin-outcomes.mjs
+    ...simStats, // imported from sim-stats.mjs
+    sbRpc, // handleSimsFacets
     async fetch(u, init) {
       const s = String(u);
       calls.push({ url: s, init });
@@ -65,6 +67,8 @@ function makeSandbox(respond = () => null) {
   };
   vm.createContext(sandbox);
   vm.runInContext(HANDLERS.map(extractFn).join('\n\n'), sandbox);
+  // sim-stats.mjs and sbRpc call Supabase through the shared transport's global fetch.
+  globalThis.fetch = sandbox.fetch;
   return { sandbox, calls };
 }
 
@@ -315,6 +319,50 @@ test('a filter and sort on SMS count is done in the Worker over every matching S
   assert.deepEqual(body.rows.map(r => r.sms_count), [30, 12]);
   const pageFetch = calls.find(c => c.url.includes('id=in.'));
   assert.ok(pageFetch.url.includes('id=in.(3,4)'), pageFetch.url);
+});
+
+// --- stats unavailable ---------------------------------------------------------
+
+const candidates = (u) => u.includes('select=id%2Cgateway_host%2Cvendor') || u.includes('select=id,gateway_host,vendor');
+const quietErrors = () => { const e = console.error; console.error = () => {}; return () => { console.error = e; }; };
+
+test('a failed SMS RPC returns the page with null SMS fields marked unavailable', async () => {
+  const restore = quietErrors();
+  const { sandbox } = makeSandbox((u) => {
+    if (u.includes('/sims_dashboard?')) return json([{ id: 9, vendor: 'atomic' }], { 'content-range': '0-0/1' });
+    if (u.endsWith('rpc/get_sms_counts_24h')) return new Response('{"message":"db down"}', { status: 503 });
+    return null;
+  });
+  const resp = await get(sandbox, '');
+  restore();
+  assert.equal(resp.status, 200);
+  const row = (await resp.json()).rows[0];
+  assert.equal(row.sms_count, null);
+  assert.deepEqual(row.stats_unavailable, ['sms']);
+});
+
+test('a filter or sort on unavailable stats is refused with 503, not answered from empty stats', async () => {
+  const restore = quietErrors();
+  const respond = (u) => {
+    if (candidates(u)) return json([{ id: 1, vendor: 'teltik', gateway_host: 'teltik' }], { 'content-range': '0-0/1' });
+    if (u.endsWith('rpc/get_sms_counts_24h')) return new Response('{"message":"db down"}', { status: 503 });
+    return null;
+  };
+  for (const qs of [
+    'filters=' + encodeURIComponent(JSON.stringify([{ col: 'no_sms_12h', op: 'is_true' }])),
+    'sort=last_sms_received&dir=desc',
+  ]) {
+    const { sandbox, calls } = makeSandbox(respond);
+    const resp = await get(sandbox, qs);
+    assert.equal(resp.status, 503, qs);
+    assert.match((await resp.json()).error, /SMS statistics are unavailable/);
+    assert.ok(!calls.some(c => c.url.includes('id=in.')), 'no page is fetched');
+  }
+  // A host-port filter does not need SMS stats, so it still answers.
+  const { sandbox } = makeSandbox(respond);
+  const resp = await get(sandbox, 'filters=' + encodeURIComponent(JSON.stringify([{ col: 'hosting_port_state', op: 'blank' }])));
+  restore();
+  assert.equal(resp.status, 200);
 });
 
 test('the no-SMS-in-12h column is derived from the last SMS time', () => {

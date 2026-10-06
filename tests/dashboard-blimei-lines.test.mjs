@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import * as simsQuery from '../src/dashboard/sims-query.mjs';
+import * as simStats from '../src/dashboard/sim-stats.mjs';
 
 const dashboardWorker = readFileSync(new URL('../src/dashboard/index.js', import.meta.url), 'utf8');
 const dashboardHtml = readFileSync(new URL('../src/dashboard/public/index.html', import.meta.url), 'utf8');
@@ -52,10 +53,10 @@ test('/api/sims reads sims.imei and returns it as blimei', async () => {
   vm.createContext(sandbox);
   Object.assign(sandbox, simsQuery);
   sandbox.loadLatestPortinOutcomes = async () => new Map(); // imported from portin-outcomes.mjs
+  Object.assign(sandbox, simStats); // imported from sim-stats.mjs
+  globalThis.fetch = sandbox.fetch; // sim-stats.mjs uses the shared transport's global fetch
   vm.runInContext([
     'async function handleSims(env, corsHeaders, url) {',
-    'async function loadSimStats(env, sims) {',
-    'function simStatFields(simId, smsMap, hostPortMap) {',
   ].map(sig => extractFn(dashboardWorker, sig)).join('\n'), sandbox);
 
   const res = await sandbox.handleSims(

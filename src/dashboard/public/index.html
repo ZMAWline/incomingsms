@@ -7031,10 +7031,17 @@ set verify_pending; schedule §C.3 poll
         function isTeltikHostedSim(sim) {
             return gatewayHostOf(sim) === 'teltik';
         }
+        // /api/sims names a stats group in stats_unavailable when its lookup
+        // failed; those fields are null, not zero, and must not read as zero.
+        const SIM_STAT_UNAVAILABLE = '<span class="text-yellow-400 text-xs" title="Statistics could not be loaded. Refresh to retry.">unavailable</span>';
+        function simStatsDown(sim, group) {
+            return Array.isArray(sim.stats_unavailable) && sim.stats_unavailable.includes(group);
+        }
         // Latest persisted Hosting Port Status across ALL sources (cron, bulk,
         // SIM query, remediator) + uptime stats, straight from /api/sims.
         function hostPortCell(sim) {
             if (!isTeltikHostedSim(sim)) return '<span class="text-gray-600">&mdash;</span>';
+            if (simStatsDown(sim, 'hosting_port')) return SIM_STAT_UNAVAILABLE;
             const st = sim.hosting_port_state;
             if (!st) return '<span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-500/20 text-gray-500" title="No hosting port-status check recorded yet">never checked</span>';
             const cls = {
@@ -7351,6 +7358,9 @@ set verify_pending; schedule §C.3 poll
                 }
                 tableState.sims.data = body.rows;
                 tableState.sims.total = body.total;
+                if (body.rows.some(function (s) { return Array.isArray(s.stats_unavailable) && s.stats_unavailable.length; })) {
+                    showToast('SMS or host port statistics could not be loaded. Those columns show "unavailable". Refresh to retry.', 'warning');
+                }
                 _simsLoaded = { filters: filtersKey, page: pageKey };
                 lastSimsFetchedAt = Date.now();
                 // Populate gateway dropdown
@@ -7420,7 +7430,8 @@ function renderSims() {
                 return;
             }
             tbody.innerHTML = data.map(sim => {
-                const lastSms = sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
+                const smsDown = simStatsDown(sim, 'sms');
+                const lastSms = smsDown ? SIM_STAT_UNAVAILABLE : sim.last_sms_received ? new Date(sim.last_sms_received).toLocaleString() : '-';
                 const canSendOnline = sim.phone_number && sim.reseller_id && sim.status === 'active';
                 const verifiedBadge = sim.verification_status === 'verified' ? '<span class="ml-1 text-accent" title="Verified">&#10003;</span>' : '';
                 // Gateway has exactly two values: a SkyLine gateway, or hosted
@@ -7467,7 +7478,7 @@ function renderSims() {
                     <td class="px-4 py-3">${hostPortCell(sim)}</td>
                     <td class="px-4 py-3">${hostCell(sim)}</td>
                     <td class="px-4 py-3 text-gray-400">${sim.reseller_name || '-'}</td>
-                    <td class="px-4 py-3 text-gray-300">${sim.sms_count || 0}</td>
+                    <td class="px-4 py-3 text-gray-300">${smsDown ? SIM_STAT_UNAVAILABLE : (sim.sms_count || 0)}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">${lastSms}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">${sim.last_rotation_at ? new Date(sim.last_rotation_at).toLocaleString() : '-'}</td>
                     <td class="px-4 py-3 text-gray-500 text-xs">${sim.activated_at ? new Date(sim.activated_at).toLocaleString() : '-'}</td>
@@ -7540,10 +7551,10 @@ function renderSims() {
                 s.verification_status || '',
                 s.status || '',
                 s.vendor || '',
-                s.hosting_port_state || '',
+                simStatsDown(s, 'hosting_port') ? 'unavailable' : (s.hosting_port_state || ''),
                 s.hosting_port_checked_at || '',
                 s.reseller_name || '',
-                s.sms_count != null ? s.sms_count : 0,
+                simStatsDown(s, 'sms') ? 'unavailable' : (s.sms_count != null ? s.sms_count : 0),
                 s.last_sms_received || '',
                 s.last_rotation_at || '',
                 s.activated_at || '',
@@ -14976,7 +14987,7 @@ async function sendSimOnline(simId, phoneNumber) {
                 _sdField('Subscription ID', '<span class="font-mono text-xs">' + (sim.mobility_subscription_id || '') + '</span>') +
                 _sdField('Host', hostCell(sim)) +
                 _sdField('Rotation Interval', sim.rotation_interval_hours ? sim.rotation_interval_hours + 'h' : '') +
-                _sdField('SMS (24h)', String(sim.sms_count || 0)) +
+                _sdField('SMS (24h)', simStatsDown(sim, 'sms') ? SIM_STAT_UNAVAILABLE : String(sim.sms_count || 0)) +
                 _sdField('Last Rotated', sim.last_rotation_at ? new Date(sim.last_rotation_at).toLocaleString() : '') +
                 _sdField('Activated', sim.activated_at ? new Date(sim.activated_at).toLocaleString() : '') +
                 _sdField('Last Notified', sim.last_notified_at ? new Date(sim.last_notified_at).toLocaleString() : '') +
