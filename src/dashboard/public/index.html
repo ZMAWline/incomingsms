@@ -6559,6 +6559,9 @@ set verify_pending; schedule §C.3 poll
 
         async function loadData() {
             try { hydrateSimsFromUrl(); } catch(e) { console.error('hydrateSimsFromUrl failed', e); }
+            // The table and messages do not depend on the summary response.
+            loadSims(true);
+            loadMessages();
             try {
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 8000);
@@ -6577,8 +6580,6 @@ set verify_pending; schedule §C.3 poll
                 renderDashboardCharts(data);
                 try { renderFreshness(data); } catch(e) { console.error('renderFreshness failed', e); }
                 document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
-                loadSims(true);
-                loadMessages();
             } catch (error) {
                 showToast('Error loading dashboard data', 'error');
                 console.error(error);
@@ -7339,7 +7340,8 @@ set verify_pending; schedule §C.3 poll
                 // fetched once, then again on a forced refresh.
                 const side = [loadSimsStatusCounts()];
                 if (force || !SIMS_FACETS) side.push(loadSimsFacets());
-                const [response] = await Promise.all([fetch(url), ...side]);
+                const sideDone = Promise.all(side).catch(function (error) { console.error(error); });
+                const response = await fetch(url);
                 const body = await response.json().catch(function () { return null; });
                 // A newer request went out while this one was in flight.
                 if (seq !== _simsFetchSeq) return;
@@ -7363,6 +7365,14 @@ set verify_pending; schedule §C.3 poll
                 const lastUpdated = document.getElementById('last-updated');
                 if (lastUpdated) lastUpdated.textContent = 'Updated ' + new Date().toLocaleTimeString();
                 renderSims();
+                // Refresh menus when fleet counts arrive, without holding the
+                // ready page behind a slower fleet-wide aggregation.
+                void sideDone.then(function () {
+                    if (seq === _simsFetchSeq) {
+                        populateSimsAddFilter();
+                        setSimsCountBadges();
+                    }
+                });
             } catch (error) {
                 if (seq !== _simsFetchSeq) return;
                 showToast('Error loading SIMs', 'error');
