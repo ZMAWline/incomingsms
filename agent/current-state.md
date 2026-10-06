@@ -4,7 +4,7 @@
 
 ## Current handoff — 2026-10-06
 
-Read [Claude handoff and pending tasks](claude-handoff-2026-10-06.md) before acting on older notes below. Billing/auth refactoring, auth failure handling, SIM loading improvements and the database last-admin guard are merged and deployed. The last-admin race is resolved. Owner confirms the dashboard works and the SIMs table feels faster. Latest deployed code is `1f716c6` (bounded SIM stats), dashboard version `5ba7a760-2ac6-4d4a-a73b-3f0b98036c49`. Last full check passed 1,335 tests.
+Read [Claude handoff and pending tasks](claude-handoff-2026-10-06.md) before acting on older notes below. Billing/auth refactoring, auth failure handling, SIM loading improvements and the database last-admin guard are merged and deployed. The last-admin race is resolved. Owner confirms the dashboard works and the SIMs table feels faster. Latest deployed code is `83e2c64` (per-tab lazy loading + DB-load fixes), dashboard version `6fc58795-6ca2-44c1-8dc6-3d2d86eedb5d`. Last full check passed 1,353 tests.
 
 Pending engineering work: systematic signed-in browser verification; bounded transport and failure semantics for SIM statistics RPCs; review login-throttle concurrency; explicit recovery for partial billing operations; continue the overhaul in focused modules with strict typing added gradually. Other Workers have not been refactored by this session. The 2026-10-06 rotation report also records aged stuck SIMs and operator/bad-rental backlogs; refresh those counts before any remediation.
 
@@ -13,6 +13,8 @@ Production deployments must run from an up-to-date main checkout at `/root/proje
 ## Release history and earlier project notes
 
 Older “not deployed,” “last-admin unresolved,” OAuth, test-entrypoint and rollout statements describe their original session. Use the current handoff and newer release records to resolve contradictions; do not turn every historical TODO into a new action without checking current code/live state.
+
+> 2026-10-06 (per-tab lazy loading + DB-load fixes, DEPLOYED from main `83e2c64`): Dashboard loads only the tab on screen and pages messages and logs. Migrations `20261006_hosting_port_summary_per_sim.sql` (index `idx_hpsc_sim_latest`, LATERAL `get_hosting_port_status_summary`) and `20261006_inbound_sms_received_at_index.sql` (index `idx_inbound_sms_received_at`) verified present in PROD before deploy. Only dashboard changed. Pre-flight: npm test 1,353/1,353, check:db-constraints pass, both dashboard syntax checks pass. Dashboard version `6fc58795-6ca2-44c1-8dc6-3d2d86eedb5d`; public URL returns 200. `deployed/prod` moved `1f716c6` → `83e2c64`.
 
 > 2026-10-06 (bounded SIM stats, DEPLOYED from main `1f716c6`): Dashboard SIM stats RPCs are bounded and report unavailable stats instead of hanging. Migration `20261006_sim_numbers_current_index.sql` (partial index `idx_sim_numbers_current`) verified present in PROD before deploy. Only dashboard changed. Pre-flight: npm test 1,335/1,335, check:db-constraints pass, both dashboard syntax checks pass. Dashboard version `5ba7a760-2ac6-4d4a-a73b-3f0b98036c49`; public URL returns 200. `deployed/prod` moved `c99c777` → `1f716c6`.
 
