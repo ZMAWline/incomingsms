@@ -4,6 +4,11 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-10-06 - Dashboard loads per tab; messages and SIM logs are paged
+**Decision:** Boot loads nothing until a tab opens; Refresh, the hourly timer and post-action refreshes reload only the tab on screen (the hourly timer only on Dashboard, SIMs and Messages). `/api/messages` pages on the server and answers `{ rows, page, page_size, has_more }` (one extra row read, no count). `/api/error-logs` defaults to the last 90 days, 20 rows, `?before=` for Load more and `?days=all` for older logs; the Errors tab asks for `days=all`.
+**Why:** The owner asked that nothing load unless needed. Boot used to fetch the SIMs page and the 500 newest messages on every tab, and a full count of `inbound_sms` would be a sequential scan.
+**Consequence:** Do not reintroduce a boot-time `loadData()` or a bare-array `/api/messages`. Anything outside the dashboard that read `/api/messages` as an array must read `rows`.
+
 ## 2026-09-24 — Keep the legacy vendor code, switch it off with LEGACY_VENDORS
 
 **Decision:** The Wing IoT, Helix, SkyLine and Kasa code stays in the repo. Every entry point that reaches one of them checks `legacyVendorEnabled(env, name)` (`src/shared/legacy-vendors.mjs`) and skips when the vendor is off. `LEGACY_VENDORS` is a comma-separated var, case-insensitive, `all` for everything; unset means all off. No `wrangler.toml` sets it; each affected worker has a commented line to uncomment. PR #134, which deleted the code, is closed unmerged; its branch `chore/remove-legacy-vendors` is kept.

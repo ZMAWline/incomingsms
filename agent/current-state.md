@@ -6,9 +6,15 @@
 
 Read [Claude handoff and pending tasks](claude-handoff-2026-10-06.md) before acting on older notes below. Billing/auth refactoring, auth failure handling, SIM loading improvements and the database last-admin guard are merged and deployed. The last-admin race is resolved. Owner confirms the dashboard works and the SIMs table feels faster. Latest deployed code is `83e2c64` (per-tab lazy loading + DB-load fixes), dashboard version `6fc58795-6ca2-44c1-8dc6-3d2d86eedb5d`. Last full check passed 1,353 tests.
 
-Pending engineering work: systematic signed-in browser verification; bounded transport and failure semantics for SIM statistics RPCs; review login-throttle concurrency; explicit recovery for partial billing operations; continue the overhaul in focused modules with strict typing added gradually. Other Workers have not been refactored by this session. The 2026-10-06 rotation report also records aged stuck SIMs and operator/bad-rental backlogs; refresh those counts before any remediation.
+Pending engineering work: systematic signed-in browser verification; review login-throttle concurrency; explicit recovery for partial billing operations; continue the overhaul in focused modules with strict typing added gradually. Other Workers have not been refactored by this session. The 2026-10-06 rotation report also records aged stuck SIMs and operator/bad-rental backlogs; refresh those counts before any remediation.
 
 Production deployments must run from an up-to-date main checkout at `/root/projects/incomingsms`. Build in task worktrees. No credential values are included in the handoff.
+
+### Open after the 2026-10-06 performance work
+
+- **Owner decision, nothing done:** PROD database is 6.9 GB on a small compute size (224 MB `shared_buffers`, 60 connections). `webhook_deliveries` (5.0M rows, 4.6 GB) and `carrier_api_logs` (1.4M rows, 1.4 GB) are 6 GB of it, which evicts SIM data from memory: the first dashboard load after idle still takes 3–6 s, later loads 0.3–0.8 s. Options: a retention policy for those two log tables (irreversible deletes; draft and get approval first) or a larger compute size.
+- **Owner OK needed:** three redundant indexes cost write time only — `idx_inbound_sms_created` duplicates `inbound_sms_pkey`; `idx_hpsc_sim_checked_at` duplicates `idx_hosting_port_status_checks_sim_checked_at`; both of the latter are covered by `idx_hpsc_sim_latest`.
+- The dashboard's own `supabaseGet` / `supabasePatch` in `src/dashboard/index.js` still use bare `fetch` (no timeout). Switching them needs the ~11 vm-sandbox tests that stub `fetch` updated.
 
 ## Release history and earlier project notes
 
