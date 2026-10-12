@@ -41,7 +41,7 @@ import { loadSimStats, simStatFields, statSourceFor } from './sim-stats.mjs';
 import { sbRpc } from '../shared/supabase-rest.mjs';
 import { legacyRouteResponse } from './legacy-routes.mjs';
 import { handleBulkJobRoutes, consumeBulkJobBatch } from './bulk-jobs.mjs';
-import { handleRunsList } from './runs.mjs';
+import { handleRunsList, handleRotationRunGet } from './runs.mjs';
 
 function normalizeImeiPoolPort(port) {
   if (!port) return port;
@@ -187,9 +187,13 @@ async function handleDashboardRequest(request, env, ctx, audit, asUser) {
     const bulkJobResponse = await handleBulkJobRoutes(request, env, url, user, corsHeaders);
     if (bulkJobResponse) return bulkJobResponse;
 
-    // Runs page: activation runs and bulk jobs in one list. See runs.mjs.
+    // Runs page: activation runs, bulk jobs and nightly rotations in one
+    // list, plus a rotation night's detail. See runs.mjs.
     if (url.pathname === '/api/runs' && request.method === 'GET') {
       return handleRunsList(url, env, corsHeaders);
+    }
+    if (url.pathname.startsWith('/api/runs/rotation/') && request.method === 'GET') {
+      return handleRotationRunGet(url.pathname.slice('/api/runs/rotation/'.length), env, corsHeaders);
     }
 
     // Who did what. Operator+ by the path-first matrix (not a READ_ROUTE).

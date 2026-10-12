@@ -11,7 +11,8 @@ import { readFile } from 'node:fs/promises';
 // URL, rewriting its one shared import to an absolute file: URL.
 const src = (await readFile(new URL('../src/teltik-worker/index.js', import.meta.url), 'utf8'))
   .replace("'../shared/fetch-timeout.mjs'", JSON.stringify(new URL('../src/shared/fetch-timeout.mjs', import.meta.url).href))
-  .replace("'../shared/supabase-rest.mjs'", JSON.stringify(new URL('../src/shared/supabase-rest.mjs', import.meta.url).href));
+  .replace("'../shared/supabase-rest.mjs'", JSON.stringify(new URL('../src/shared/supabase-rest.mjs', import.meta.url).href))
+  .replace("'../shared/rotation-runs.mjs'", JSON.stringify(new URL('../src/shared/rotation-runs.mjs', import.meta.url).href));
 const { importTeltikLines, looksLikeAttIccid } =
   await import('data:text/javascript;base64,' + Buffer.from(src).toString('base64'));
 

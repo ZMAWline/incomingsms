@@ -137,3 +137,51 @@ test('the Runs page replaced the Activation Runs page', () => {
   assert.ok(!HTML.includes('id="tab-activation-runs"'));
   assert.ok(HTML.includes(`switchTab('runs', true, false);\n                        showActivationRunDetail(result.job_run_id);`));
 });
+
+// --- nightly rotation runs ----------------------------------------------------
+
+import { handleRotationRunGet } from '../src/dashboard/runs.mjs';
+
+test('runs list: type=rotation filters to nightly rotation runs', async () => {
+  const res = await list('?type=rotation');
+  assert.equal(res.status, 200);
+  assert.match(calls[0].url, /run_type=eq\.rotation&order=created_at\.desc/);
+});
+
+test('rotation run detail: NY-day window for that vendor, new numbers and still-failing SIMs', async () => {
+  respond = (u) => {
+    if (u.includes('/rotation_runs?')) return new Response(JSON.stringify([{ id: JOB_ID, ny_date: '2026-10-11', vendor: 'teltik', done_items: 2 }]), { status: 200 });
+    if (u.includes('/sim_numbers?')) return new Response(JSON.stringify([{ sim_id: 7, e164: '+15550001111', valid_from: '2026-10-11T04:05:19Z', sims: { iccid: '8901', vendor: 'teltik' } }]), { status: 200 });
+    return new Response(JSON.stringify([{ id: 9, iccid: '8902', last_rotation_error: 'boom' }]), { status: 200 });
+  };
+  const res = await handleRotationRunGet(JOB_ID, ENV, {});
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.deepEqual(body.rotated, [{ sim_id: 7, iccid: '8901', new_number: '+15550001111', at: '2026-10-11T04:05:19Z' }]);
+  assert.equal(body.failing[0].id, 9);
+  // 2026-10-11 is EDT: the NY day is 04:00Z to 04:00Z next day.
+  const numbersCall = calls.find(c => c.url.includes('/sim_numbers?'));
+  assert.match(numbersCall.url, /sims\.vendor=eq\.teltik&valid_from=gte\.2026-10-11T04%3A00%3A00Z&valid_from=lt\.2026-10-12T04%3A00%3A00Z/);
+  const failingCall = calls.find(c => c.url.includes('/sims?'));
+  assert.match(failingCall.url, /rotation_status=eq\.failed&last_rotation_at=gte\.2026-10-11T04/);
+});
+
+test('rotation run detail: EST night uses the 05:00Z boundary', async () => {
+  respond = (u) => u.includes('/rotation_runs?')
+    ? new Response(JSON.stringify([{ id: JOB_ID, ny_date: '2026-12-01', vendor: 'atomic' }]), { status: 200 })
+    : new Response('[]', { status: 200 });
+  await handleRotationRunGet(JOB_ID, ENV, {});
+  const numbersCall = calls.find(c => c.url.includes('/sim_numbers?'));
+  assert.match(numbersCall.url, /valid_from=gte\.2026-12-01T05%3A00%3A00Z&valid_from=lt\.2026-12-02T05%3A00%3A00Z/);
+});
+
+test('rotation run detail: a bad id is a 400 and a missing run is a 404', async () => {
+  assert.equal((await handleRotationRunGet('1 or 1=1', ENV, {})).status, 400);
+  assert.equal(calls.length, 0);
+  respond = () => new Response('[]', { status: 200 });
+  assert.equal((await handleRotationRunGet(JOB_ID, ENV, {})).status, 404);
+});
+
+test('viewers can read a rotation run', () => {
+  assert.equal(canAccess('viewer', 'GET', '/api/runs/rotation/' + JOB_ID), true);
+});
