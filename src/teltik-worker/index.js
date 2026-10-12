@@ -1,5 +1,6 @@
 import { carrierFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbGetAll, sbPatch, sbPost, sbRpc, SupabaseError } from '../shared/supabase-rest.mjs';
+import { recordRotationTick } from '../shared/rotation-runs.mjs';
 // =========================================================
 // TELTIK WORKER
 // Manages T-Mobile SIMs via Teltik REST API (api.smsgateway.xyz)
@@ -159,6 +160,11 @@ export default {
     try {
       const result = await rotateTeltikSims(env);
       console.log(`[Cron] rotation done: rotated=${result.rotated} errors=${result.errors} skipped=${result.skipped}`);
+      await recordRotationTick(env, 'teltik', {
+        done: result.rotated + result.retried,
+        failed: result.errors,
+        breakerTripped: result.breaker_tripped,
+      });
     } catch (err) {
       console.error(`[Cron] rotation failed: ${err}`);
     }

@@ -6,6 +6,7 @@ import { buildAtomicPortInStatusRequest } from '../shared/activation-bulk.mjs';
 import { resolveMsisdn, resolveZip, buildSwapImeiRequest, isSwapSuccess, swapErrorMessage } from '../shared/sim-swap.mjs';
 import { carrierFetch, webhookFetch } from '../shared/fetch-timeout.mjs';
 import { sbGet, sbPatch, sbPost, sbRpc } from '../shared/supabase-rest.mjs';
+import { recordRotationTick } from '../shared/rotation-runs.mjs';
 import { legacyVendorEnabled, disabledLegacyVendorOfSim, legacyVendorDisabledResult, legacyVendorDisabledResponse, assertLegacyVendorEnabled } from '../shared/legacy-vendors.mjs';
 
 // =========================================================
@@ -1211,7 +1212,7 @@ return new Response("mdn-rotator ok. Use /run?secret=...&limit=1, /rotate-sim?se
       // Defaults 100 @ 6 ≈ 12.5 min worst case, inside the 15-min scheduled cap.
       const limit = Math.max(1, parseInt(env.ROTATE_TICK_LIMIT || '100', 10) || 100);
       const concurrency = Math.max(1, parseInt(env.ROTATE_TICK_CONCURRENCY || '6', 10) || 6);
-      ctx.waitUntil(processRotationBatch(env, { limit, concurrency }));
+      ctx.waitUntil(processRotationBatch(env, { limit, concurrency }).then(result => recordBatchTicks(env, result)));
     } else {
       console.log(`[Cron] outside NY rotation window (0-8); NY hour=${getNYHour()} — skipping rotation`);
     }
@@ -1618,8 +1619,10 @@ async function processRotationBatch(env, options = {}) {
       try {
         await rotateWingIotSim(env, sim, { force: true });
         stuckOk++;
+        tally(sim, 'done');
       } catch (err) {
         stuckFailed++;
+        tally(sim, 'failed');
         console.error(`[ProcessBatch/StuckWing] SIM ${sim.iccid} failed: ${err}`);
         await updateSimRotationError(env, sim.id, `Stuck-wing remediation failed: ${err}`).catch(() => {});
       }
@@ -1627,6 +1630,13 @@ async function processRotationBatch(env, options = {}) {
   }
 
   let ok = 0, skipped = 0, failed = 0;
+  // Per-vendor ok/failed for the Runs page (rotation_runs); stuck-wing
+  // remediation counts as wing_iot.
+  const byVendor = {};
+  const tally = (sim, key) => {
+    const v = sim.vendor || 'helix';
+    (byVendor[v] ||= { done: 0, failed: 0 })[key]++;
+  };
   // Outage circuit breaker: 8 CONSECUTIVE transport-level failures (relay
   // 5xx/530, timeouts, network errors) stop the batch — remaining SIMs are
   // left for the next 20-min tick instead of burning claims against a down
@@ -1647,9 +1657,11 @@ async function processRotationBatch(env, options = {}) {
       const result = await rotateSingleSim(env, token, sim);
       if (result && result.skipped) { skipped++; return; }
       ok++;
+      tally(sim, 'done');
       consecutiveTransportFails = 0;
     } catch (err) {
       failed++;
+      tally(sim, 'failed');
       console.error(`[ProcessBatch] SIM ${sim.iccid} failed: ${err}`);
       await updateSimRotationError(env, sim.id, `Rotation failed: ${err}`).catch(() => {});
       if (isTransportErr(err)) {
@@ -1664,7 +1676,15 @@ async function processRotationBatch(env, options = {}) {
   });
 
   console.log(`[ProcessBatch] attempted=${candidates.length} ok=${ok} skipped=${skipped} failed=${failed} skipped_breaker=${skippedBreaker} stuck_ok=${stuckOk} stuck_failed=${stuckFailed}`);
-  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed, skipped_breaker: skippedBreaker, breaker_tripped: breakerTripped, stuck_ok: stuckOk, stuck_failed: stuckFailed };
+  return { ok: true, attempted: candidates.length, ok_count: ok, skipped, failed, skipped_breaker: skippedBreaker, breaker_tripped: breakerTripped, stuck_ok: stuckOk, stuck_failed: stuckFailed, by_vendor: byVendor };
+}
+
+// Cron only: adds each vendor's counts from one batch to tonight's
+// rotation_runs row. Manual /run calls are not nightly runs.
+async function recordBatchTicks(env, result) {
+  for (const [vendor, counts] of Object.entries(result.by_vendor || {})) {
+    await recordRotationTick(env, vendor, { ...counts, breakerTripped: result.breaker_tripped });
+  }
 }
 
 // ===========================
