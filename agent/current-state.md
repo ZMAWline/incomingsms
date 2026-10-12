@@ -16,6 +16,15 @@ Production deployments must run from an up-to-date main checkout at `/root/proje
 - **Owner OK needed:** three redundant indexes cost write time only — `idx_inbound_sms_created` duplicates `inbound_sms_pkey`; `idx_hpsc_sim_checked_at` duplicates `idx_hosting_port_status_checks_sim_checked_at`; both of the latter are covered by `idx_hpsc_sim_latest`.
 - The dashboard's own `supabaseGet` / `supabasePatch` in `src/dashboard/index.js` still use bare `fetch` (no timeout). Switching them needs the ~11 vm-sandbox tests that stub `fetch` updated.
 
+### Repo cleanup 2026-10-09 (main checkout, no code change, nothing deployed)
+
+- `docs/session-close-2026-10-06` merged into `main` (`913f439`). Production already matched `main`; `deployed/prod` stays at `83e2c64`.
+- All 11 task worktrees removed (every branch was merged; only `pnpm-lock.yaml` noise was uncommitted). 9 idle Claude sessions in them were stopped by PID.
+- All local branches deleted; only `main` remains locally. Remote branches on GitHub were not touched.
+- `inc-15-multiline-phone-search` (`a093cbf`) reviewed and deleted: `main` already has its phone-format search and space-separated list handling, and does more (5+ digit IDs, server-side search, up to 500 terms). Its Teltik/remediator commits are superseded on `main`.
+- `task/t_f479e342-brr-dashboard` (`9e029f5`) reviewed and deleted: plain-language labels, reviewer next steps and escalation pipeline view for bad-rental reports. Not worth porting: in the last 30 days 840 of 847 reports closed as duplicates and 6 auto-remediated; all 1,495 `operator_escalations` are `delivered`. Its public CSV route is already on `main`.
+- **Open, not investigated:** `pending_review_items` has 479 open `bad_rental_escalation`, 456 `unclassified_pattern`, 410 `stuck_rotation`, 141 `human_review_failure` items (counted 2026-10-09). Likely mostly stale against closed reports — check (read-only) before any bulk dismiss.
+
 ## Release history and earlier project notes
 
 Older “not deployed,” “last-admin unresolved,” OAuth, test-entrypoint and rollout statements describe their original session. Use the current handoff and newer release records to resolve contradictions; do not turn every historical TODO into a new action without checking current code/live state.

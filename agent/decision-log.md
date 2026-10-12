@@ -4,6 +4,11 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-10-09 - Do not port the August BRR dashboard surfacing branch
+**Decision:** Branch `task/t_f479e342-brr-dashboard` (`9e029f5`: situation labels, reviewer next steps, escalation pipeline table, Inbox enrichment for bad-rental reports) was deleted, not ported.
+**Why:** It targets the pre-extraction dashboard (~1,000 lines to rebuild by hand) and the problem it solved is gone: 840 of 847 reports in the last 30 days were auto-closed as duplicates, 6 auto-remediated, and the legacy undelivered escalation backlog it surfaced is now all `delivered`.
+**Consequence:** If bad-rental reports start needing human review again, build labels/next steps fresh against the current `src/bad-rental-remediator` classifier vocabulary; the commit is recoverable from reflog only until about 2027-01.
+
 ## 2026-10-06 - Dashboard loads per tab; messages and SIM logs are paged
 **Decision:** Boot loads nothing until a tab opens; Refresh, the hourly timer and post-action refreshes reload only the tab on screen (the hourly timer only on Dashboard, SIMs and Messages). `/api/messages` pages on the server and answers `{ rows, page, page_size, has_more }` (one extra row read, no count). `/api/error-logs` defaults to the last 90 days, 20 rows, `?before=` for Load more and `?days=all` for older logs; the Errors tab asks for `days=all`.
 **Why:** The owner asked that nothing load unless needed. Boot used to fetch the SIMs page and the 500 newest messages on every tab, and a full count of `inbound_sms` would be a sequential scan.
