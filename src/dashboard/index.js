@@ -814,9 +814,14 @@ export default {
   // progress/logs; awaiting keeps the scheduled event alive until the batch
   // commits.
   async scheduled(event, env, ctx) {
-    if (event.cron === '0 17 * * 5') {
-      // Friday weekly TrustOTP invoice: generate (or find), send, and record
-      // the result. Awaited — the same reasoning as the HostPort drain below
+    if (event.cron === '0 5,6 * * FRI') {
+      // Friday 1 AM New York weekly TrustOTP invoice: generate (or find), send,
+      // and record the result. The cron fires at both 05:00 and 06:00 UTC to
+      // cover EDT and EST; only the one landing on 1 AM New York time runs.
+      const nyHour = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', hourCycle: 'h23' })
+        .format(new Date(event.scheduledTime));
+      if (nyHour !== '1') return;
+      // Awaited — the same reasoning as the HostPort drain below
       // applies: a fire-and-forget run was observed to be dropped before it
       // could finish writing state.
       await runScheduledTrustotpInvoice(env)

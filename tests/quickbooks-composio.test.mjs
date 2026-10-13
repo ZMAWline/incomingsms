@@ -163,3 +163,19 @@ test('weekly run refuses to invoice when a fallback rate was used', async () => 
   env.computeBillingBreakdown = async (e, opts) => ({ ...(await inner(e, opts)), rate_fallback_used: true });
   await assert.rejects(runTrustotpWeeklyInvoice(env, { dry_run: false, latestEnd: '2026-09-24' }), /fallback rate/);
 });
+
+test('weekly run skips a week whose Thursday has not ended in New York', async () => {
+  const env = weeklyEnv('EmailSent', []);
+  // Thu 2026-10-08 13:00 New York: the 10-02..10-08 week is still open.
+  const out = await runTrustotpWeeklyInvoice(env, { dry_run: false, latestEnd: '2026-10-01', now: new Date('2026-10-08T17:00:00Z') });
+  assert.equal(out.skipped, true);
+  assert.equal(out.reason, 'week_not_complete');
+});
+
+test('weekly run bills Friday..Thursday once Friday 1 AM New York arrives', async () => {
+  const env = weeklyEnv('EmailSent', []);
+  // Fri 2026-10-09 01:00 EDT = 05:00 UTC.
+  const out = await runTrustotpWeeklyInvoice(env, { dry_run: true, latestEnd: '2026-10-01', now: new Date('2026-10-09T05:00:00Z') });
+  assert.deepEqual(out.week, { start: '2026-10-02', end: '2026-10-08' });
+  assert.equal(out.dry_run, true);
+});
