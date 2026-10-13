@@ -16,6 +16,12 @@ Production deployments must run from an up-to-date main checkout at `/root/proje
 - **Owner OK needed:** three redundant indexes cost write time only — `idx_inbound_sms_created` duplicates `inbound_sms_pkey`; `idx_hpsc_sim_checked_at` duplicates `idx_hosting_port_status_checks_sim_checked_at`; both of the latter are covered by `idx_hpsc_sim_latest`.
 - The dashboard's own `supabaseGet` / `supabasePatch` in `src/dashboard/index.js` still use bare `fetch` (no timeout). Switching them needs the ~11 vm-sandbox tests that stub `fetch` updated.
 
+### Deployed 2026-10-13 — TrustOTP invoice runs Friday 1 AM New York (#146)
+
+- `deployed/prod` moved `e4e47b8` -> `e0a1027`. Worker: `dashboard` (`926c6aa3-fcc4-452b-b87d-b2dea0d53c52`) only; `src/shared/trustotp-weekly-invoice.mjs` has no other importer. 1,360 tests passed. No migrations.
+- Live crons: `0 */12 * * *`, `* * * * *`, `0 5,6 * * FRI` (handler runs only when the New York hour is 1). First run: Friday 2026-10-16, 1 AM ET.
+- `origin/invoice-send-status-check` shows as unmerged only because #146 was squash-merged; its work is live.
+
 ### Deployed 2026-10-12 — Runs page lists nightly MDN rotation runs (#145)
 
 - `deployed/prod` moved `83e2c64` -> `e4e47b8`. Workers: `mdn-rotator` (`6d2ca6a5-6a50-4edb-9e72-d472d7350640`), `teltik-worker` (`6f43b0f2-3c15-44ab-a573-7221a1d648be`), `dashboard` (`89743ded-3f71-46ae-b8c0-0a58ace020a7`). 1,358 tests passed.
