@@ -159,10 +159,16 @@ async function patchLocalInvoice(env, id, patch) {
 // latestEnd: the week_end of the most recently invoiced week (YYYY-MM-DD) or null.
 // dry_run (default true): compute and return the would-be invoice without
 // touching QuickBooks or Supabase.
-export async function runTrustotpWeeklyInvoice(env, { dry_run = true, latestEnd = null } = {}) {
+export async function runTrustotpWeeklyInvoice(env, { dry_run = true, latestEnd = null, now = new Date() } = {}) {
   const resellerId = TRUSTOTP_RESELLER_ID;
   const { start, end } = computeNextUninvoicedWeek(latestEnd);
   const docNumber = docNumberFor(start, end);
+  // Never bill a week whose Thursday has not fully ended in New York: the
+  // missing hours would never be billed, because the next week starts Friday.
+  const todayNY = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
+  if (end >= todayNY) {
+    return { created: false, sent: false, skipped: true, reason: 'week_not_complete', week: { start, end }, docNumber };
+  }
 
   const computeBillingBreakdown = env.computeBillingBreakdown || (await import('./billing.js')).computeBillingBreakdown;
   // TrustOTP is billed in rental mode: it reproduces invoice 1450 (week
@@ -283,7 +289,7 @@ export async function runTrustotpWeeklyInvoice(env, { dry_run = true, latestEnd 
 }
 
 // Resolves the latest invoiced week from Supabase and runs for real
-// (dry_run: false). This is what the Friday cron calls — see
+// (dry_run: false). This is what the Friday 1 AM New York cron calls — see
 // src/dashboard/index.js `scheduled()`.
 export async function runScheduledTrustotpInvoice(env) {
   const resp = await supabaseFetch(
