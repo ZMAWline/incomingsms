@@ -4,6 +4,13 @@ Each entry: **what was decided**, **why**, **consequence / what not to undo**.
 
 ---
 
+## 2026-10-14 - Rotation failures: retry or cancel automatically, by error
+**Decision:** The owner set a standing rule per failure pattern, applied every 15 min by the pg_cron job `apply-rotation-failure-decisions` (`supabase/migrations/20261014_rotation_failure_decisions.sql`). Retry, once per NY day: ATOMIC "A Resource Required By Service Is Not Available", Teltik change-number body `status=FAILED`, Teltik change-number 502. Cancel, with the same cleanup the dashboard does: ATOMIC "Cancelled" and "does not belong to this MVNO/vendor". Left alone: "MDN unchanged within 30m" on a SIM that is still active, because the next normal rotation retries it.
+**Why:** The 2026-10-13 inbox triage found 53 parked SIMs that nobody had read about in weeks. Each pattern has one correct response, so a person deciding it again every time added nothing.
+**Consequence:** A new failure pattern still lands in the inbox. Add it to this function only after the owner decides what it means. The cancel rule skips any SIM that received an SMS in the last 7 days, so do not remove that check. The first run, on 2026-10-14, retried 34 SIMs and canceled 12.
+
+---
+
 ## 2026-10-09 - Do not port the August BRR dashboard surfacing branch
 **Decision:** Branch `task/t_f479e342-brr-dashboard` (`9e029f5`: situation labels, reviewer next steps, escalation pipeline table, Inbox enrichment for bad-rental reports) was deleted, not ported.
 **Why:** It targets the pre-extraction dashboard (~1,000 lines to rebuild by hand) and the problem it solved is gone: 840 of 847 reports in the last 30 days were auto-closed as duplicates, 6 auto-remediated, and the legacy undelivered escalation backlog it surfaced is now all `delivered`.
