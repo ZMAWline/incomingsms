@@ -1,6 +1,6 @@
 ---
 name: main-deploy
-description: Safely deploy everything that has been merged to main but not yet shipped. Runs only from the main checkout, pulls first, finds which workers actually changed since the last deploy, runs the test suite, deploys each changed worker, then moves the deploy marker and removes task worktrees whose work is now in main. Flags unapplied migrations and finished-but-unmerged branches. Triggers on: "deploy", "deploy it", "main deploy", "ship it", "deploy what merged", "I just finished a job, deploy it", "deploy all completed work", "what needs deploying".
+description: Safely deploy everything that has been merged to main but not yet shipped. Runs only from the main checkout, pulls first, finds which workers actually changed since the last deploy, runs the test suite, deploys each changed worker, then moves the deploy marker, closes chat sessions in task worktrees whose work is merged and deployed, and removes those worktrees. Flags unapplied migrations and finished-but-unmerged branches. Triggers on: "deploy", "deploy it", "main deploy", "ship it", "deploy what merged", "I just finished a job, deploy it", "deploy all completed work", "what needs deploying".
 ---
 
 # Main Deploy Skill
@@ -82,7 +82,7 @@ git diff --name-only HEAD~20..HEAD | grep '^src/' | cut -d/ -f2 | sort -u
 
 Then ask which of those they actually want deployed now, deploy only those, and create the marker at the end. Say plainly that after this first run it will know by itself.
 
-**If nothing changed**, say "Nothing to deploy - production matches `main`" and stop. Do not deploy anything to prove it works.
+**If nothing changed**, say "Nothing to deploy - production matches `main`", skip to Step 9 to clear shipped worktrees, then report. Do not deploy anything to prove it works.
 
 ## Step 4 - Show the plan and get a yes
 
@@ -162,20 +162,22 @@ If some deploys succeeded and others failed, do NOT move the marker. Leave it wh
 
 ## Step 9 - Clear the shipped worktrees
 
-Only after the marker moved in Step 8:
+Run this after the marker moved in Step 8, and also when Step 3 found nothing to deploy (production already matches `main`):
 
 ```bash
 scripts/clean-shipped-worktrees.sh
 ```
 
-It removes each task worktree, and its local branch, whose work is already in `main` (merged or squash-merged). It keeps, and prints the reason for, any worktree that:
+It removes each task worktree, and its local branch, whose work is merged into `main` (merged or squash-merged) and deployed. Before removing one, it closes the chat sessions and shells still open inside it (stops their processes, TERM then KILL after 5 seconds) and re-checks the worktree is clean. Each closed worktree prints a `CLOSED` line with the stopped pids.
+
+It keeps, and prints the reason for, any worktree that:
 
 - has no commits of its own yet (a fresh task that has not started)
 - has work that is not in `main`
+- is merged, but `main` has worker code under `src/` that is not deployed yet
 - has uncommitted changes, or untracked files other than `pnpm-lock.yaml` / `pnpm-workspace.yaml`
-- has a process running inside it, such as an open Claude session
 
-Do not remove a KEPT worktree by hand. List each one with its reason in the report and let the user decide. If a session is running in one, tell the user to close that chat first, then rerun the script.
+A session in a kept worktree is never touched. Do not remove a KEPT worktree by hand. List each one with its reason in the report and let the user decide.
 
 ## Step 10 - Report, and name the loose ends
 
@@ -186,7 +188,7 @@ Do not remove a KEPT worktree by hand. List each one with its reason in the repo
 **Workers deployed:** <list>
 **Skipped (unchanged):** <count> workers
 **Migrations:** none new / <list> (confirmed applied)
-**Worktrees removed:** <list> / none
+**Worktrees removed:** <list> / none (name any chat sessions closed)
 **Worktrees kept:** <path> - <reason>
 
 ## Still not live
