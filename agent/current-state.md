@@ -16,6 +16,11 @@ Production deployments must run from an up-to-date main checkout at `/root/proje
 - **Owner OK needed:** three redundant indexes cost write time only — `idx_inbound_sms_created` duplicates `inbound_sms_pkey`; `idx_hpsc_sim_checked_at` duplicates `idx_hosting_port_status_checks_sim_checked_at`; both of the latter are covered by `idx_hpsc_sim_latest`.
 - The dashboard's own `supabaseGet` / `supabasePatch` in `src/dashboard/index.js` still use bare `fetch` (no timeout). Switching them needs the ~11 vm-sandbox tests that stub `fetch` updated.
 
+### Deploy check 2026-10-14 — nothing to deploy
+
+- No worker code changed since `e0a1027`; `deployed/prod` stays there. #147 and #148 are database-only, applied to PROD by their own sessions, and verified live: pg_cron jobs `dismiss-stale-review-items` (`7-59/15`) and `apply-rotation-failure-decisions` (`4-59/15`) are active.
+- `scripts/clean-shipped-worktrees.sh` now closes chat sessions in worktrees that are merged and deployed (`8e650ab`). It closed and removed `incomingsms-anchovy`.
+
 ### Deployed 2026-10-13 — TrustOTP invoice runs Friday 1 AM New York (#146)
 
 - `deployed/prod` moved `e4e47b8` -> `e0a1027`. Worker: `dashboard` (`926c6aa3-fcc4-452b-b87d-b2dea0d53c52`) only; `src/shared/trustotp-weekly-invoice.mjs` has no other importer. 1,360 tests passed. No migrations.
